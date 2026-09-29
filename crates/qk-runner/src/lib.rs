@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use qk_config::Workspace;
-use qk_executor::{Outcome, environment, execute, prepare};
+use qk_executor::{Display, Outcome, OutputStyle, environment, execute, prepare};
 use qk_taskgraph::TaskGraph;
 
 #[derive(Debug)]
@@ -29,6 +29,7 @@ pub fn run(
     graph: &TaskGraph,
     parallel: usize,
     skip_cache: bool,
+    style: OutputStyle,
     cancelled: Arc<AtomicBool>,
 ) -> Result<RunResult> {
     if parallel == 0 {
@@ -42,7 +43,11 @@ pub fn run(
         .map(|(id, task)| {
             prepare(workspace, task, &environment)
                 .with_context(|| format!("cannot execute {id}"))
-                .map(|task| (id.clone(), task))
+                .map(|mut prepared| {
+                    let continuous = task.definition.continuous == Some(true);
+                    prepared.display = Display::for_task(style, id, &task.project, continuous);
+                    (id.clone(), prepared)
+                })
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
     let continuous: BTreeSet<_> = graph

@@ -230,6 +230,7 @@ impl Cache {
         root: &Path,
         key: &str,
         outputs: &Outputs,
+        display: &qk_executor::Display,
     ) -> Result<Option<String>> {
         let file = match File::open(self.root.join("entries").join(format!("{key}.json"))) {
             Ok(file) => file,
@@ -325,7 +326,7 @@ impl Cache {
                 set_mode(&root.join(path), *mode)?;
             }
         }
-        qk_executor::replay(File::open(log)?)?;
+        qk_executor::replay(File::open(log)?, display)?;
         manifest.output_fingerprint().map(Some)
     }
 }

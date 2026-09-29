@@ -13,7 +13,7 @@ use qk_config::Workspace;
 use qk_taskgraph::Task;
 use serde_json::Value;
 
-pub use capture::{Capture, read_capture, replay};
+pub use capture::{Capture, Display, OutputStyle, Shown, read_capture, replay};
 pub use process::{Outcome, execute, execute_captured};
 
 /// Prints a status line to stderr in one write, so that task processes
@@ -34,6 +34,8 @@ pub struct PreparedTask {
     pub parallel: bool,
     pub cwd: PathBuf,
     pub env: BTreeMap<OsString, OsString>,
+    /// How the task's output is shown; the runner sets it per output style.
+    pub display: Display,
 }
 
 /// Read dotenv files into a child environment without changing process globals.
@@ -220,6 +222,7 @@ pub fn prepare(
         parallel,
         cwd,
         env,
+        display: Display::default(),
     })
 }
 

@@ -171,7 +171,7 @@ impl Cache {
         {
             return bypass("inputs changed while waiting for another run".into());
         }
-        match self.restore(&workspace.root, &key, &outputs) {
+        match self.restore(&workspace.root, &key, &outputs, &prepared.display) {
             Ok(Some(fingerprint)) => {
                 qk_executor::status!("qk: cache hit {}", task.id);
                 return Ok(TaskResult {
@@ -190,7 +190,7 @@ impl Cache {
             Ok(log) => log,
             Err(error) => return bypass(format!("cache log unavailable: {error}")),
         };
-        let capture = Capture::new(log.as_file().try_clone()?, true);
+        let capture = Capture::new(Some(log.as_file().try_clone()?), prepared.display.clone());
         let outcome = execute_captured(prepared, cancelled, Some(&capture))?;
         let fingerprint = if !self.unchanged(
             snapshot,
@@ -334,7 +334,9 @@ mod tests {
         assert_eq!(saved, output_fingerprint(root, &outputs, &key).unwrap());
 
         std::fs::remove_dir_all(root.join("dist")).unwrap();
-        let restored = cache.restore(root, &key, &outputs).unwrap();
+        let restored = cache
+            .restore(root, &key, &outputs, &qk_executor::Display::Stream)
+            .unwrap();
         assert_eq!(restored, Some(saved.clone()));
         assert_eq!(saved, output_fingerprint(root, &outputs, &key).unwrap());
     }

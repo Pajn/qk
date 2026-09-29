@@ -143,7 +143,20 @@ so brace globs containing commas are not supported on the command line.
 `run` requires an existing target; `run-many` skips projects without the
 requested targets and errors when nothing matches. Both accept
 `-c/--configuration`, `--parallel` (default `3`, also settable through
-`NX_PARALLEL`), `--output-style stream` and `--dry-run`.
+`NX_PARALLEL`), `--output-style` and `--dry-run`.
+
+`--output-style` takes Nx's names. `stream` prefixes each non-empty line with
+the task's project, in Nx's colour for it; `stream-without-prefixes` passes
+output through untouched; `static` holds each task's output until it ends and
+prints it under `> qk run <task>`, marked `[local cache]` for a hit, and in
+GitHub Actions folds each task into a log group unless
+`NX_SKIP_LOG_GROUPING=true`. `tui`, `dynamic` and `dynamic-legacy` render as
+`static`, since qk has no interactive terminal output. Without the option,
+`NX_DEFAULT_OUTPUT_STYLE` applies; otherwise `run` passes output through, and
+`run-many` and `affected` use `static` in CI or when stdout is not a terminal
+and `stream` on one. Continuous tasks always stream with prefixes, since their
+output would otherwise never appear. Colour follows picocolors: off with
+`NO_COLOR`, on with `FORCE_COLOR`, in CI or on a terminal.
 
 The planner expands `dependsOn` before execution: local targets, `^target`
 on project dependencies, `project:target`, and objects with `target`,
@@ -350,8 +363,7 @@ parity claim yet. In particular:
   filtered default arrays are rejected. Nx plugins and inferred targets are
   outside the design's scope.
 - Affected selection is per project; per-task affected is future work.
-- Interactive tasks, static/dynamic output styles,
-  remote cache storage, cache eviction, history, release commands and npm
+- Interactive tasks, interactive output styles, remote cache storage, cache eviction, history, release commands and npm
   binary distribution remain future work.
 
 The compatibility baseline is documented in Nx's

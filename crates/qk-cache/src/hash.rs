@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use qk_config::Workspace;
-use qk_executor::{Capture, Outcome, PreparedTask, execute_captured, read_capture};
+use qk_executor::{Capture, Display, Outcome, PreparedTask, execute_captured, read_capture};
 use qk_graph::ProjectGraph;
 use qk_lockfile::Lockfile;
 use qk_taskgraph::{Task, TaskGraph};
@@ -396,7 +396,7 @@ impl Resolver<'_> {
                 prepared.cwd = self.workspace.root.clone();
                 prepared.parallel = false;
                 let log = tempfile::NamedTempFile::new()?;
-                let capture = Capture::new(log.as_file().try_clone()?, false);
+                let capture = Capture::new(Some(log.as_file().try_clone()?), Display::Hidden);
                 if execute_captured(&prepared, self.cancelled, Some(&capture))? != Outcome::Success
                 {
                     bail!("runtime input did not succeed");

@@ -16,6 +16,7 @@ qk-config.workspace = true
 qk-graph.workspace = true
 qk-taskgraph.workspace = true
 qk-runner.workspace = true
+qk-executor.workspace = true
 qk-cache.workspace = true
 qk-affected.workspace = true
 serde.workspace = true

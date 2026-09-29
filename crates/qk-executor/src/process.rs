@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use command_group::{CommandGroup, GroupChild};
 
-use crate::{Capture, PreparedTask};
+use crate::{Capture, Display, PreparedTask, Shown};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
@@ -55,7 +55,12 @@ impl Children {
 }
 
 pub fn execute(task: &PreparedTask, cancelled: &AtomicBool) -> Result<Outcome> {
-    execute_captured(task, cancelled, None)
+    if task.display == Display::Stream {
+        // Straight through: the task writes to the terminal itself.
+        return execute_captured(task, cancelled, None);
+    }
+    let capture = Capture::new(None, task.display.clone());
+    execute_captured(task, cancelled, Some(&capture))
 }
 
 pub fn execute_captured(
@@ -118,6 +123,13 @@ pub fn execute_captured(
             reader
                 .join()
                 .map_err(|_| anyhow::anyhow!("output capture thread panicked"))??;
+        }
+        if let (Some(capture), Ok(outcome)) = (capture, &outcome) {
+            capture.finish(if *outcome == Outcome::Success {
+                Shown::Success
+            } else {
+                Shown::Failure
+            })?;
         }
         outcome
     })

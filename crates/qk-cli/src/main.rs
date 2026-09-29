@@ -94,9 +94,12 @@ struct RunOptions {
     /// Print the task graph as JSON without executing commands or loading dotenv.
     #[arg(long)]
     dry_run: bool,
-    /// Only raw streaming output is currently supported.
-    #[arg(long, value_enum, default_value = "stream")]
-    output_style: OutputStyle,
+    /// How task output is shown, as in Nx. Defaults to NX_DEFAULT_OUTPUT_STYLE,
+    /// else raw output for `run`, and for several tasks `static` in CI or when
+    /// not on a terminal, `stream` otherwise. The interactive styles render as
+    /// `static`.
+    #[arg(long, value_enum)]
+    output_style: Option<OutputStyle>,
     /// Arguments forwarded to requested tasks; dependencies require params: forward.
     #[arg(last = true, allow_hyphen_values = true)]
     args: Vec<String>,
@@ -144,9 +147,47 @@ impl ChangeOptions {
     }
 }
 
-#[derive(Clone, ValueEnum)]
+#[derive(Clone, Copy, ValueEnum)]
 enum OutputStyle {
+    Tui,
+    Dynamic,
+    DynamicLegacy,
+    Static,
     Stream,
+    StreamWithoutPrefixes,
+}
+
+impl OutputStyle {
+    /// The style qk renders; qk has no interactive terminal output.
+    fn rendered(self) -> qk_executor::OutputStyle {
+        match self {
+            Self::Stream => qk_executor::OutputStyle::Stream,
+            Self::StreamWithoutPrefixes => qk_executor::OutputStyle::StreamWithoutPrefixes,
+            Self::Tui | Self::Dynamic | Self::DynamicLegacy | Self::Static => {
+                qk_executor::OutputStyle::Static
+            }
+        }
+    }
+}
+
+/// The output style when none is given: `NX_DEFAULT_OUTPUT_STYLE`, else raw for
+/// a single `run`, else Nx's choice for several tasks without its terminal UI.
+fn default_output_style(single: bool) -> qk_executor::OutputStyle {
+    use std::io::IsTerminal;
+    if let Ok(name) = std::env::var("NX_DEFAULT_OUTPUT_STYLE")
+        && let Ok(style) = OutputStyle::from_str(&name, false)
+    {
+        return style.rendered();
+    }
+    if single {
+        qk_executor::OutputStyle::StreamWithoutPrefixes
+    } else if std::env::var_os("CI").is_some_and(|value| value != "false")
+        || !io::stdout().is_terminal()
+    {
+        qk_executor::OutputStyle::Static
+    } else {
+        qk_executor::OutputStyle::Stream
+    }
 }
 
 #[derive(Subcommand)]
@@ -343,7 +384,7 @@ fn run(cli: Cli) -> Result<i32> {
                 request.configuration = Some(configuration.clone());
             }
             request.args = options.args.clone();
-            return execute_tasks(&workspace, vec![request], &options);
+            return execute_tasks(&workspace, vec![request], &options, true);
         }
         Command::RunMany {
             targets,
@@ -353,7 +394,7 @@ fn run(cli: Cli) -> Result<i32> {
         } => {
             let selected = select_projects(&workspace.projects, &projects, &exclude)?;
             let requests = requests(&workspace, selected, &targets, &options);
-            return execute_tasks(&workspace, requests, &options);
+            return execute_tasks(&workspace, requests, &options, false);
         }
         Command::Affected {
             targets,
@@ -371,7 +412,7 @@ fn run(cli: Cli) -> Result<i32> {
                 eprintln!("qk: no affected tasks");
                 return Ok(0);
             }
-            return execute_tasks(&workspace, requests, &options);
+            return execute_tasks(&workspace, requests, &options, false);
         }
         Command::Show {
             command:
@@ -445,6 +486,7 @@ fn execute_tasks(
     workspace: &Workspace,
     requests: Vec<Request>,
     options: &RunOptions,
+    single: bool,
 ) -> Result<i32> {
     let graph = TaskGraph::build(workspace, &requests)?;
     if options.dry_run {
@@ -462,6 +504,9 @@ fn execute_tasks(
         &graph,
         options.parallel.get(),
         options.skip_cache,
+        options
+            .output_style
+            .map_or_else(|| default_output_style(single), OutputStyle::rendered),
         cancelled,
     )?;
     Ok(result.exit_code)

@@ -508,6 +508,7 @@ dependencies = [
  "qk-affected",
  "qk-cache",
  "qk-config",
+ "qk-executor",
  "qk-graph",
  "qk-runner",
  "qk-taskgraph",

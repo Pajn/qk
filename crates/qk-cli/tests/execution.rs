@@ -587,3 +587,68 @@ fn dependents_of_continuous_tasks_run_uncached_and_say_why() {
         "qk: app:bench: cache bypassed (depends on app:serve: continuous tasks are not fingerprinted)"
     ));
 }
+
+#[test]
+fn output_styles_follow_nx() {
+    let temp = fixture(json!({
+        "build": {"command": "echo one && echo two"},
+        "fail": {"command": "echo broken && exit 3"},
+        "cached": {"command": "echo cached", "cache": true, "inputs": []}
+    }));
+    let stdout = |args: &[&str]| {
+        let output = command(temp.path(), args)
+            .env_remove("NX_DEFAULT_OUTPUT_STYLE")
+            .env_remove("GITHUB_ACTIONS")
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap();
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .replace("\r\n", "\n")
+            .replace(" \n", "\n")
+    };
+    let stream = stdout(&["run-many", "-t", "build", "--output-style", "stream"]);
+    assert_eq!(stream, "app: one\napp: two\n");
+    let raw = stdout(&[
+        "run-many",
+        "-t",
+        "build",
+        "--output-style",
+        "stream-without-prefixes",
+    ]);
+    assert_eq!(raw, "one\ntwo\n");
+    // Without a terminal, several tasks default to static, and one to raw.
+    assert_eq!(
+        stdout(&["run-many", "-t", "build"]),
+        "\n> qk run app:build\n\none\ntwo\n"
+    );
+    assert_eq!(stdout(&["run", "app:build"]), "one\ntwo\n");
+    // Held output of a failing task still appears.
+    assert!(
+        stdout(&["run-many", "-t", "fail", "--output-style", "tui"])
+            .contains("> qk run app:fail\n\nbroken")
+    );
+
+    // A cache hit replays its log under the same header, marked as such.
+    stdout(&["run-many", "-t", "cached"]);
+    assert_eq!(
+        stdout(&["run-many", "-t", "cached"]),
+        "\n> qk run app:cached  [local cache]\n\ncached\n"
+    );
+
+    let grouped = command(
+        temp.path(),
+        &["run-many", "-t", "build", "--output-style", "static"],
+    )
+    .env("GITHUB_ACTIONS", "true")
+    .output()
+    .unwrap();
+    let grouped = String::from_utf8(grouped.stdout)
+        .unwrap()
+        .replace("\r\n", "\n")
+        .replace(" \n", "\n");
+    assert!(
+        grouped.starts_with("\n::group::✅ > qk run app:build\n\none\ntwo\n::endgroup::\n"),
+        "{grouped}"
+    );
+}
