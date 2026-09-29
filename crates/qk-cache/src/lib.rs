@@ -250,6 +250,7 @@ impl Cache {
         }
         match self.restore(
             &workspace.root,
+            &task.id,
             &key,
             &outputs,
             &prepared.display,
@@ -276,6 +277,7 @@ impl Cache {
                 }
                 self.restore(
                     &workspace.root,
+                    &task.id,
                     &key,
                     &outputs,
                     &prepared.display,
@@ -322,6 +324,7 @@ impl Cache {
             // The saved manifest already hashes every output; reuse it.
             match self.publish(&workspace.root, &key, &outputs, log.path()) {
                 Ok(fingerprint) => {
+                    store::record_outputs(&workspace.root, &task.id, &key, &outputs);
                     if let Some(remote) = &self.remote {
                         remote.upload(&self.root, &key);
                     }
@@ -456,6 +459,7 @@ mod tests {
         let restored = cache
             .restore(
                 root,
+                "app:build",
                 &key,
                 &outputs,
                 &qk_executor::Display::Stream,

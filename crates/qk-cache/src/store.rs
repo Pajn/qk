@@ -228,6 +228,7 @@ impl Cache {
     pub(crate) fn restore(
         &self,
         root: &Path,
+        task: &str,
         key: &str,
         outputs: &Outputs,
         display: &qk_executor::Display,
@@ -247,6 +248,12 @@ impl Cache {
             bail!("corrupt cached log");
         }
         qk_executor::read_capture(File::open(&log)?, |_, _| Ok(()))?;
+        // Outputs this worktree already holds for the key are left as they are.
+        if outputs_unchanged(root, task, key, outputs) {
+            qk_executor::replay(File::open(log)?, display, qk_executor::Shown::Kept)?;
+            crate::evict::touch(&self.root.join("entries").join(format!("{key}.json")));
+            return manifest.output_fingerprint().map(Some);
+        }
         // Stage on the destination filesystem; no existing output is touched yet.
         let stage_parent = root.join(".qk");
         if fs::symlink_metadata(&stage_parent)
@@ -327,8 +334,86 @@ impl Cache {
                 set_mode(&root.join(path), *mode)?;
             }
         }
+        record_outputs(root, task, key, outputs);
         qk_executor::replay(File::open(log)?, display, shown)?;
         crate::evict::touch(&self.root.join("entries").join(format!("{key}.json")));
         manifest.output_fingerprint().map(Some)
     }
+}
+
+/// Where a worktree records the outputs it holds for a task: in its own `.qk`,
+/// since each worktree has its own outputs.
+fn outputs_record(root: &Path, task: &str) -> std::path::PathBuf {
+    let name = blake3::hash(task.as_bytes()).to_hex();
+    root.join(".qk")
+        .join("outputs")
+        .join(format!("{}.json", &name[..32]))
+}
+
+/// Each output path with metadata that changes whenever it is written,
+/// replaced, removed or recreated.
+fn output_stamps(root: &Path, outputs: &Outputs) -> Result<BTreeMap<String, Vec<i64>>> {
+    let mut stamps = BTreeMap::new();
+    for path in outputs.paths(root)? {
+        let metadata = fs::symlink_metadata(root.join(&path))?;
+        let kind = if metadata.file_type().is_symlink() {
+            2
+        } else if metadata.is_dir() {
+            1
+        } else {
+            0
+        };
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(-1, |duration| duration.as_nanos() as i64);
+        let mut stamp = vec![
+            kind,
+            metadata.len() as i64,
+            modified,
+            i64::from(mode(&metadata)),
+        ];
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            stamp.extend([
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+                metadata.ino() as i64,
+            ]);
+        }
+        stamps.insert(path, stamp);
+    }
+    Ok(stamps)
+}
+
+/// Records the outputs a worktree now holds for a task's key.
+pub(crate) fn record_outputs(root: &Path, task: &str, key: &str, outputs: &Outputs) {
+    let record = output_stamps(root, outputs)
+        .map(|stamps| serde_json::json!({"key": key, "outputs": stamps}));
+    let path = outputs_record(root, task);
+    if let Ok(record) = record
+        && fs::create_dir_all(path.parent().expect("records have a directory")).is_ok()
+    {
+        let _ = fs::write(path, record.to_string());
+    }
+}
+
+/// Whether the outputs on disk are exactly those this worktree recorded for
+/// the key: the same paths, none written since.
+fn outputs_unchanged(root: &Path, task: &str, key: &str, outputs: &Outputs) -> bool {
+    let Ok(text) = fs::read(outputs_record(root, task)) else {
+        return false;
+    };
+    let Ok(record) = serde_json::from_slice::<serde_json::Value>(&text) else {
+        return false;
+    };
+    if record.get("key").and_then(serde_json::Value::as_str) != Some(key) {
+        return false;
+    }
+    let Ok(current) = output_stamps(root, outputs) else {
+        return false;
+    };
+    serde_json::to_value(current).ok().as_ref() == record.get("outputs")
 }

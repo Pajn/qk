@@ -330,7 +330,12 @@ On a miss, the task runs with stdout and stderr streamed through a pipe while
 they are recorded, so child processes do not see a terminal. The entry is
 saved only when the task succeeds and its inputs are unchanged afterwards.
 On a hit, qk removes existing files matching the declared outputs, copies the
-cached outputs into place and replays the recorded stdout and stderr. Restores
+cached outputs into place and replays the recorded stdout and stderr. As in
+Nx, outputs a worktree already holds for the key are left as they are: after
+each restore or save qk records, in the worktree's `.qk/outputs`, every output
+path with its size, times, inode and mode, and a hit that finds exactly those
+still in place only replays the log, marked
+`[existing outputs match the cache, left as is]`. Restores
 are staged in `.qk/` at the workspace root. Saving and restoring copy files,
 which clones them on copy-on-write filesystems such as APFS when the cache and
 the checkout share a volume. Files are never hardlinked, so editing a restored

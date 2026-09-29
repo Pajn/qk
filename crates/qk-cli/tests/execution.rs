@@ -629,11 +629,12 @@ fn output_styles_follow_nx() {
             .contains("> qk run app:fail\n\nbroken")
     );
 
-    // A cache hit replays its log under the same header, marked as such.
+    // A cache hit replays its log under the same header, marked as such; with
+    // no outputs to restore, they match what is on disk.
     stdout(&["run-many", "-t", "cached"]);
     assert_eq!(
         stdout(&["run-many", "-t", "cached"]),
-        "\n> qk run app:cached  [local cache]\n\ncached\n"
+        "\n> qk run app:cached  [existing outputs match the cache, left as is]\n\ncached\n"
     );
 
     let grouped = command(

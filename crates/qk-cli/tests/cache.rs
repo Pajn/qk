@@ -824,3 +824,29 @@ fn dependency_inputs_cover_transitive_dependencies_like_nx() {
     write("tsconfig.base.json", "{}");
     assert!(check().contains("cache miss"));
 }
+
+#[test]
+fn hits_leave_matching_outputs_in_place() {
+    let fixture = Fixture::new(target("build", json!({})));
+    success(fixture.build(&fixture.root, &[]));
+    let output = fixture.root.join("dist/nested/out.txt");
+    let before = fs::symlink_metadata(&output).unwrap();
+    let hit = success(fixture.build(&fixture.root, &["--output-style", "static"]));
+    assert!(
+        stdout(&hit).contains("[existing outputs match the cache, left as is]"),
+        "{}",
+        stdout(&hit)
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(fs::symlink_metadata(&output).unwrap().ino(), before.ino());
+    }
+    let _ = before;
+    // An edited output is restored from the cache.
+    fs::write(&output, "edited").unwrap();
+    let hit = success(fixture.build(&fixture.root, &["--output-style", "static"]));
+    assert!(stdout(&hit).contains("[local cache]"), "{}", stdout(&hit));
+    assert_eq!(artifact(&fixture.root), "built:one\n");
+    assert_eq!(fixture.runs(), 1);
+}

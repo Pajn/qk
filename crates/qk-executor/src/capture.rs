@@ -25,6 +25,8 @@ pub enum Shown {
     Failure,
     LocalCache,
     RemoteCache,
+    /// A local hit whose outputs were already in place.
+    Kept,
 }
 
 impl Display {
@@ -135,6 +137,7 @@ impl Printer {
                 let status = match shown {
                     Shown::LocalCache => "  [local cache]",
                     Shown::RemoteCache => "  [remote cache]",
+                    Shown::Kept => "  [existing outputs match the cache, left as is]",
                     Shown::Success | Shown::Failure => "",
                 };
                 let mut text = Vec::new();
@@ -144,6 +147,7 @@ impl Printer {
                         Shown::Success => "✅",
                         Shown::Failure => "❌",
                         Shown::LocalCache | Shown::RemoteCache => "🔁",
+                        Shown::Kept => "⏩",
                     };
                     text.extend_from_slice(format!("::group::{icon} ").as_bytes());
                 }
