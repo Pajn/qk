@@ -14,7 +14,7 @@ use qk_config::Workspace;
 use qk_taskgraph::Task;
 use serde_json::Value;
 
-pub use capture::{Capture, Display, OutputStyle, Shown, read_capture, replay};
+pub use capture::{Capture, Decoration, Display, OutputStyle, Shown, read_capture, replay};
 pub use process::{Outcome, execute, execute_captured};
 
 /// Reports a `qk:` warning to the installed sink; by default it is written to
@@ -41,6 +41,8 @@ pub struct PreparedTask {
     pub ready_when: Vec<String>,
     /// Set once all of `ready_when` has appeared.
     pub ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Each command's prefix and colours, by position; empty without any.
+    pub decorations: Vec<Decoration>,
     /// How the task's output is shown; the runner sets it per output style.
     pub display: Display,
 }
@@ -340,6 +342,7 @@ pub fn prepare(
         std::env::join_paths(paths).context("cannot construct task PATH")?,
     );
     let parallel = boolean(options.get("parallel"), true, "parallel")?;
+    let mut decorations = Vec::new();
     let ready_when: Vec<String> = match options.get("readyWhen") {
         None | Some(Value::Null) => Vec::new(),
         Some(Value::String(text)) => vec![text.clone()],
@@ -400,10 +403,47 @@ pub fn prepare(
                             .as_object()
                             .context("commands entries must be strings or objects")?;
                         for key in value.keys() {
-                            if !matches!(key.as_str(), "command" | "forwardAllArgs") {
+                            if !matches!(
+                                key.as_str(),
+                                "command"
+                                    | "forwardAllArgs"
+                                    | "prefix"
+                                    | "prefixColor"
+                                    | "color"
+                                    | "bgColor"
+                                    | "description"
+                            ) {
                                 bail!("unsupported command entry field {key:?}");
                             }
                         }
+                        let field =
+                            |name: &str, background: Option<bool>| -> Result<Option<String>> {
+                                let Some(value) = value.get(name) else {
+                                    return Ok(None);
+                                };
+                                let text = value.as_str().with_context(|| {
+                                    format!("command entry {name} must be a string")
+                                })?;
+                                if let Some(background) = background
+                                    && !Decoration::valid(text, background)
+                                {
+                                    bail!("command entry {name} {text:?} is not a colour");
+                                }
+                                Ok(Some(text.to_owned()))
+                            };
+                        let decoration = Decoration {
+                            prefix: field("prefix", None)?,
+                            prefix_color: field("prefixColor", Some(false))?,
+                            color: field("color", Some(false))?,
+                            bg_color: field("bgColor", Some(true))?,
+                        };
+                        if !decoration.is_empty() && !parallel {
+                            bail!(
+                                "prefix, prefixColor, color and bgColor can only be set when parallel is true"
+                            );
+                        }
+                        decorations.resize(commands.len(), Decoration::default());
+                        decorations.push(decoration);
                         (
                             value
                                 .get("command")
@@ -432,6 +472,7 @@ pub fn prepare(
         execution: BTreeMap::new(),
         ready_when,
         ready: Default::default(),
+        decorations,
         display: Display::default(),
     })
 }

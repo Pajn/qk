@@ -226,7 +226,11 @@ reached with different forwarded arguments is rejected as ambiguous.
 Supported executors:
 
 - `nx:run-commands`: `command`, or a `commands` array of strings or objects
-  with `command` and `forwardAllArgs`. Multiple commands run concurrently by
+  with `command`, `forwardAllArgs`, `description`, and, with `parallel`,
+  `prefix`, `prefixColor`, `color` and `bgColor`: as in Nx, a bold prefix
+  before each non-blank line of that command's output, then the colours,
+  which follow the same terminal rules as qk's own. A line split between
+  reads still gets one prefix. Multiple commands run concurrently by
   default; `options.parallel: false` runs them in sequence. Supports `cwd`,
   `env`, `forwardAllArgs` and `args`, extra arguments as a string of shell
   text or an array joined with spaces: forwarded after the other options and

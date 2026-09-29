@@ -914,3 +914,51 @@ fn env_files_color_and_the_options_nx_sets_itself() {
         "[] []\n"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn command_entries_prefix_and_colour_their_output_like_nx() {
+    let temp = fixture(json!({
+        "prefixed": {"executor": "nx:run-commands", "options": {"commands": [
+            {"command": "printf 'one\\n\\ntw'; sleep 0.1; printf 'o\\n'", "prefix": "[a]", "description": "documentation only"},
+            "echo plain"
+        ]}},
+        "painted": {"executor": "nx:run-commands", "options": {"commands": [
+            {"command": "echo hi", "prefix": "p", "prefixColor": "blue", "color": "red", "bgColor": "bgWhite"}
+        ]}},
+        "serial": {"executor": "nx:run-commands", "options": {"parallel": false, "commands": [
+            {"command": "echo hi", "prefix": "p"}
+        ]}},
+        "unknown": {"executor": "nx:run-commands", "options": {"commands": [
+            {"command": "echo hi", "color": "chartreuse"}
+        ]}}
+    }));
+    let output = success(
+        command(temp.path(), &["run", "app:prefixed"])
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap(),
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    // Blank lines stay bare, and a line split between reads gets one prefix.
+    let mut lines: Vec<&str> = stdout.lines().collect();
+    lines.sort_unstable();
+    assert_eq!(lines, ["", "[a] one", "[a] two", "plain"], "{stdout:?}");
+    let output = success(
+        command(temp.path(), &["run", "app:painted"])
+            .env_remove("NO_COLOR")
+            .env("FORCE_COLOR", "1")
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "\x1b[47m\x1b[31m\x1b[1m\x1b[34mp\x1b[39m\x1b[22m hi\n\x1b[39m\x1b[49m"
+    );
+    let serial = run(temp.path(), &["run", "app:serial"]);
+    assert!(
+        String::from_utf8_lossy(&serial.stderr).contains("can only be set when parallel is true")
+    );
+    let unknown = run(temp.path(), &["run", "app:unknown"]);
+    assert!(String::from_utf8_lossy(&unknown.stderr).contains("\"chartreuse\" is not a colour"));
+}

@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use command_group::{CommandGroup, GroupChild};
 
-use crate::{Capture, Display, PreparedTask, Shown};
+use crate::{Capture, Decoration, Display, PreparedTask, Shown};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
@@ -55,7 +55,10 @@ impl Children {
 }
 
 pub fn execute(task: &PreparedTask, cancelled: &AtomicBool) -> Result<Outcome> {
-    if task.display == Display::Stream && task.ready_when.is_empty() {
+    if task.display == Display::Stream
+        && task.ready_when.is_empty()
+        && task.decorations.iter().all(Decoration::is_empty)
+    {
         // Straight through: the task writes to the terminal itself.
         return execute_captured(task, cancelled, None);
     }
@@ -72,7 +75,7 @@ pub fn execute_captured(
     std::thread::scope(|scope| {
         let mut readers = Vec::new();
         let outcome = (|| {
-            let mut pending = task.commands.iter();
+            let mut pending = task.commands.iter().enumerate();
             let mut children = Children(Vec::new());
             loop {
                 if cancelled.load(Ordering::SeqCst) {
@@ -80,7 +83,7 @@ pub fn execute_captured(
                     return Ok(Outcome::Cancelled);
                 }
                 if children.0.is_empty() || task.parallel {
-                    for command in pending.by_ref() {
+                    for (index, command) in pending.by_ref() {
                         let mut child = spawn(task, command, capture.is_some())
                             .with_context(|| format!("cannot start command for {}", task.id))?;
                         if let Some(capture) = capture {
@@ -88,8 +91,11 @@ pub fn execute_captured(
                                 child.inner().stdout.take().context("missing stdout pipe")?;
                             let stderr =
                                 child.inner().stderr.take().context("missing stderr pipe")?;
-                            readers.push(scope.spawn(move || capture.copy(stdout, false)));
-                            readers.push(scope.spawn(move || capture.copy(stderr, true)));
+                            let decoration = task.decorations.get(index);
+                            readers
+                                .push(scope.spawn(move || capture.copy(stdout, false, decoration)));
+                            readers
+                                .push(scope.spawn(move || capture.copy(stderr, true, decoration)));
                         }
                         children.0.push(child);
                         if !task.parallel {

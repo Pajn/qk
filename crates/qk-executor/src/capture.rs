@@ -73,6 +73,81 @@ fn prefix(project: &str) -> String {
     format!("\x1b[1m\x1b[{colour}m{project}:\x1b[39m\x1b[22m")
 }
 
+/// Nx's per-command `prefix`, `prefixColor`, `color` and `bgColor`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Decoration {
+    pub prefix: Option<String>,
+    pub prefix_color: Option<String>,
+    pub color: Option<String>,
+    pub bg_color: Option<String>,
+}
+
+const COLOURS: [&str; 8] = [
+    "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
+];
+
+impl Decoration {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+
+    /// Whether `name` is a colour a command entry may name: `bg` names
+    /// background colours.
+    pub fn valid(name: &str, background: bool) -> bool {
+        match name.strip_prefix("bg") {
+            Some(rest) if background => {
+                let mut chars = rest.chars();
+                chars.next().is_some_and(char::is_uppercase)
+                    && COLOURS.contains(&rest.to_lowercase().as_str())
+            }
+            _ => !background && COLOURS.contains(&name),
+        }
+    }
+
+    /// As Nx's `addColorAndPrefix`: a bold, optionally coloured prefix before
+    /// each non-blank line, then the whole text in `color` and `bgColor`.
+    fn apply(&self, bytes: &[u8]) -> Vec<u8> {
+        let colours = colour();
+        let paint = |text: &str, name: Option<&str>, background: bool| -> String {
+            let index = name.and_then(|name| {
+                let name = if background {
+                    name.get(2..)?.to_lowercase()
+                } else {
+                    name.to_owned()
+                };
+                COLOURS.iter().position(|colour| *colour == name)
+            });
+            match index {
+                Some(index) if colours => {
+                    let (open, close) = if background { (40, 49) } else { (30, 39) };
+                    format!("\x1b[{}m{text}\x1b[{close}m", open + index)
+                }
+                _ => text.to_owned(),
+            }
+        };
+        let mut text = String::from_utf8_lossy(bytes).into_owned();
+        if let Some(prefix) = &self.prefix {
+            let mut prefix = paint(prefix, self.prefix_color.as_deref(), false);
+            if colours {
+                prefix = format!("\x1b[1m{prefix}\x1b[22m");
+            }
+            text = text
+                .split('\n')
+                .map(|line| {
+                    if line.trim().is_empty() {
+                        line.to_owned()
+                    } else {
+                        format!("{prefix} {line}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+        let text = paint(&text, self.color.as_deref(), false);
+        paint(&text, self.bg_color.as_deref(), true).into_bytes()
+    }
+}
+
 /// picocolors' rule: colour unless NO_COLOR, when forced, in CI, or on a
 /// terminal that is not dumb.
 fn colour() -> bool {
@@ -268,13 +343,50 @@ impl Capture {
         self.healthy.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn copy(&self, mut reader: impl Read, stderr: bool) -> io::Result<()> {
+    /// Copies one command's stream, decorated as its command entry asks.
+    pub(crate) fn copy(
+        &self,
+        mut reader: impl Read,
+        stderr: bool,
+        decoration: Option<&Decoration>,
+    ) -> io::Result<()> {
+        let decoration = decoration.filter(|decoration| !decoration.is_empty());
         let mut buffer = [0; 16 * 1024];
+        // With a prefix, whole lines, so a line split between reads gets one.
+        let mut partial = Vec::new();
         loop {
             let count = reader.read(&mut buffer)?;
-            if count == 0 {
-                return Ok(());
+            let chunk = &buffer[..count];
+            match decoration {
+                None if count == 0 => return Ok(()),
+                None => self.emit(stderr, chunk)?,
+                Some(decoration) if decoration.prefix.is_some() => {
+                    partial.extend_from_slice(chunk);
+                    let end = if count == 0 {
+                        partial.len()
+                    } else {
+                        partial
+                            .iter()
+                            .rposition(|byte| *byte == b'\n')
+                            .map_or(0, |end| end + 1)
+                    };
+                    if end > 0 {
+                        let lines: Vec<u8> = partial.drain(..end).collect();
+                        self.emit(stderr, &decoration.apply(&lines))?;
+                    }
+                    if count == 0 {
+                        return Ok(());
+                    }
+                }
+                Some(_) if count == 0 => return Ok(()),
+                Some(decoration) => self.emit(stderr, &decoration.apply(chunk))?,
             }
+        }
+    }
+
+    /// Records, shows and watches output, in frames the log reader accepts.
+    fn emit(&self, stderr: bool, bytes: &[u8]) -> io::Result<()> {
+        for frame in bytes.chunks(16 * 1024) {
             if let Some(file) = &self.file {
                 let mut file = file
                     .lock()
@@ -282,19 +394,20 @@ impl Capture {
                 if self.healthy() {
                     let result = (|| {
                         file.write_all(&[u8::from(stderr)])?;
-                        file.write_all(&(count as u32).to_le_bytes())?;
-                        file.write_all(&buffer[..count])
+                        file.write_all(&(frame.len() as u32).to_le_bytes())?;
+                        file.write_all(frame)
                     })();
                     if result.is_err() {
                         self.healthy.store(false, Ordering::Relaxed);
                     }
                 }
             }
-            self.printer.write(stderr, &buffer[..count])?;
+            self.printer.write(stderr, frame)?;
             if let Some(readiness) = &self.readiness {
-                readiness.see(stderr, &buffer[..count]);
+                readiness.see(stderr, frame);
             }
         }
+        Ok(())
     }
 
     pub(crate) fn finish(&self, shown: Shown) -> io::Result<()> {
