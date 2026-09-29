@@ -153,6 +153,21 @@ impl Snapshot {
                 );
             }
         }
+        // Warm scratch paths are never inputs either.
+        for task in graph.tasks.values() {
+            let Ok(Some(warm)) = crate::warm::config(workspace, task) else {
+                continue;
+            };
+            if let Ok(paths) = Outputs::from_paths(&warm.paths) {
+                for anchor in paths.anchors() {
+                    generated.extend(
+                        under(&files, anchor)
+                            .filter(|path| paths.matches(path))
+                            .cloned(),
+                    );
+                }
+            }
+        }
         files.retain(|path| !generated.contains(path));
         let canonical_root = workspace.root.canonicalize()?;
         let workspace_prefix = paths::git_path(&workspace.root, "--show-toplevel")
@@ -853,10 +868,13 @@ pub fn inputs(
             }
         }
     }
+    // Warm state configuration never changes a result.
+    let mut definition = task.definition.clone();
+    definition.extra.remove("qk:warm");
     let hash = json!({
         "schema":"qk-local-v1", "qk":env!("CARGO_PKG_VERSION"),
         "platform":[std::env::consts::OS, std::env::consts::ARCH], "workspace":snapshot.workspace_prefix,
-        "id":task.id, "args":task.args, "definition":task.definition, "packageManager":workspace.package_manager,
+        "id":task.id, "args":task.args, "definition":definition, "packageManager":workspace.package_manager,
         "files":files, "values":values, "dependencies":dependencies,
     });
     Ok(hash)

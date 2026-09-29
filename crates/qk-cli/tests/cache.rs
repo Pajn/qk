@@ -965,3 +965,56 @@ fn input_keys_ignore_permission_bits_other_than_executable() {
     fs::set_permissions(&input, fs::Permissions::from_mode(0o755)).unwrap();
     assert!(stderr(&success(fixture.build(&fixture.root, &[]))).contains("cache miss"));
 }
+
+#[cfg(unix)]
+fn said(fixture: &Fixture, root: &Path, args: &[&str]) -> String {
+    let mut all = vec!["run", "app:build"];
+    all.extend(args);
+    let output = success(fixture.qk(root, &all));
+    stdout(&output)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+#[cfg(unix)]
+#[test]
+fn warm_outputs_start_a_miss_from_the_previous_build() {
+    let fixture = Fixture::new(json!({
+        "command": "if [ -f dist/state ]; then cat dist/state; else echo cold; fi; mkdir -p dist; cat src/input.txt > dist/state",
+        "cache": true,
+        "inputs": ["{projectRoot}/src/**/*"],
+        "outputs": ["{projectRoot}/dist"],
+        "qk:warm": {"outputs": true}
+    }));
+    assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
+    // A fresh checkout: no outputs, and a change that misses the cache.
+    fs::remove_dir_all(fixture.root.join("dist")).unwrap();
+    fs::write(fixture.root.join("src/input.txt"), "two\n").unwrap();
+    assert_eq!(said(&fixture, &fixture.root, &[]), "one");
+    // Local state wins over the saved one.
+    fs::write(fixture.root.join("dist/state"), "local\n").unwrap();
+    fs::write(fixture.root.join("src/input.txt"), "three\n").unwrap();
+    assert_eq!(said(&fixture, &fixture.root, &[]), "local");
+}
+
+#[cfg(unix)]
+#[test]
+fn warm_directories_follow_the_task_across_worktrees() {
+    let fixture = Fixture::new(json!({
+        "command": "if [ -f \"${TOOL_CACHE:-/nonexistent}/seen\" ]; then echo warm; else echo cold; fi; if [ -n \"$TOOL_CACHE\" ]; then mkdir -p \"$TOOL_CACHE\" && touch \"$TOOL_CACHE/seen\"; fi",
+        "qk:warm": {"env": {"TOOL_CACHE": "{warm}/tool"}}
+    }));
+    assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
+    assert_eq!(said(&fixture, &fixture.root, &[]), "warm");
+    // Removed, as in a fresh clone, it is restored from the last save.
+    let state = fixture.root.join(".git/qk/warm");
+    fs::remove_dir_all(&state).unwrap();
+    assert_eq!(said(&fixture, &fixture.root, &[]), "warm");
+    // A linked worktree has its own directory, restored from the shared store.
+    let linked = fixture.worktree();
+    assert_eq!(said(&fixture, &linked, &[]), "warm");
+    // Without the cache nothing is restored and the variable is not set.
+    assert_eq!(said(&fixture, &fixture.root, &["--skip-cache"]), "cold");
+}

@@ -154,6 +154,30 @@ pub struct Outputs {
 }
 
 impl Outputs {
+    /// Paths from already-expanded workspace-relative patterns, each with a
+    /// fixed directory prefix, as outputs require.
+    pub fn from_paths(patterns: &[String]) -> Result<Self> {
+        let mut compiled = Vec::new();
+        let mut anchors = BTreeSet::new();
+        for pattern in patterns {
+            validate_path(pattern)?;
+            let anchor = pattern
+                .split('/')
+                .take_while(|part| crate::glob::is_literal(part))
+                .collect::<Vec<_>>()
+                .join("/");
+            if anchor.is_empty() {
+                bail!("{pattern:?} needs a fixed directory prefix");
+            }
+            compiled.push(Pattern::new(pattern, false)?);
+            anchors.insert(anchor);
+        }
+        Ok(Self {
+            patterns: compiled,
+            anchors,
+        })
+    }
+
     /// Outputs from already-expanded patterns, for tests without a workspace.
     #[cfg(test)]
     pub fn from_patterns(patterns: &[&str]) -> Self {

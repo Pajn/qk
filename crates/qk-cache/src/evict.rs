@@ -108,7 +108,14 @@ pub fn prune(root: &Path, limit: u64) -> Result<Pruned> {
         .and_then(|modified| SystemTime::now().duration_since(modified).ok())
         .is_some_and(|age| age < IN_FLIGHT);
     if recent {
-        let size = directory_size(&root.join("entries"))? + directory_size(&root.join("blobs"))?;
+        let warm = root.join("warm");
+        let size = directory_size(&root.join("entries"))?
+            + directory_size(&root.join("blobs"))?
+            + if warm.is_dir() {
+                directory_size(&warm)?
+            } else {
+                0
+            };
         if size <= limit {
             return Ok(Pruned {
                 size,
@@ -135,7 +142,9 @@ pub fn prune(root: &Path, limit: u64) -> Result<Pruned> {
     };
     let mut entries = Vec::new();
     let mut references: BTreeMap<String, usize> = BTreeMap::new();
-    for item in fs::read_dir(root.join("entries"))? {
+    // Warm state records cite blobs as entries do, and age out the same way.
+    let warm = fs::read_dir(root.join("warm")).into_iter().flatten();
+    for item in fs::read_dir(root.join("entries"))?.chain(warm) {
         let item = item?;
         let metadata = item.metadata()?;
         // Unreadable manifests are misses already; they only take space.
@@ -241,10 +250,17 @@ pub(crate) fn manifest_blobs(manifest: &Value) -> BTreeSet<String> {
     if let Some(log) = manifest.get("log").and_then(Value::as_str) {
         blobs.insert(log.to_owned());
     }
+    let groups = manifest
+        .get("groups")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|groups| groups.values())
+        .filter_map(|group| group.get("artifacts").and_then(Value::as_object));
     for artifact in manifest
         .get("artifacts")
         .and_then(Value::as_object)
         .into_iter()
+        .chain(groups)
         .flat_map(|artifacts| artifacts.values())
     {
         if let Some(blob) = artifact.get("blob").and_then(Value::as_str) {

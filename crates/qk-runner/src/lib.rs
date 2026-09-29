@@ -91,11 +91,19 @@ pub fn run(
     let mut stopping = BTreeSet::new();
     let mut outcomes = BTreeMap::new();
     let mut fingerprints: BTreeMap<String, qk_cache::Fingerprint> = BTreeMap::new();
+    let warm = graph
+        .tasks
+        .values()
+        .any(|task| task.definition.extra.contains_key("qk:warm"));
+    if warm && !skip_cache {
+        qk_cache::warm::check_overlaps(workspace, graph)?;
+    }
     let cache = (!skip_cache
-        && graph
-            .tasks
-            .values()
-            .any(|task| task.definition.cache == Some(true)))
+        && (warm
+            || graph
+                .tasks
+                .values()
+                .any(|task| task.definition.cache == Some(true))))
     .then(|| qk_cache::Cache::for_workspace(workspace, &environment));
     let mut skipped = BTreeSet::new();
     let mut exit_code = 0;

@@ -394,6 +394,45 @@ against its content hash; an unreadable or corrupt entry is a miss.
 A per-key lock makes concurrent runs of the same task, including runs in
 different worktrees, wait for each other and reuse the result.
 
+### Warm state
+
+A target can keep scratch state that makes it faster to rerun, without that
+state ever being part of a result, with a `qk:warm` key at target level
+(beside `inputs` and `outputs`, not in `options`; Nx ignores it):
+
+```jsonc
+"tsc": { "qk:warm": { "outputs": true } },
+"build-android": {
+  "qk:warm": {
+    "paths": ["{projectRoot}/node_modules/.cache/babel"],
+    "env": { "METRO_CACHE_DIR": "{warm}/metro" },
+    "maxSize": "2GB"
+  }
+}
+```
+
+- `outputs: true` restores the task's previous outputs before it runs, so
+  an incremental tool finds its last build, such as `tsc --build` its
+  `tsbuildinfo`.
+- `paths` are workspace scratch paths, kept beside the task's entries. They
+  are never inputs.
+- `env` sets variables for the task, with `{projectRoot}`, `{workspaceRoot}`
+  and `{warm}`, a directory qk keeps for the task in the worktree's state,
+  outside the working tree. Under Nx these variables are not set, so tools
+  that only cache when told to keep their default behaviour there.
+
+Warm state is restored before the task runs, on a cache miss and for
+targets that are not cacheable, and never on a hit. A group already present
+on disk is left alone, since it is the newest for that checkout; otherwise
+it comes from the task's most recent save, in the store linked worktrees
+share. It is saved after successful runs only; files unchanged since the
+last save or restore are recognised by their metadata and not read again.
+Groups over their `maxSize` are not saved. Warm state counts toward the
+cache's size limit and is evicted with it. `--skip-cache` neither restores
+nor saves it, and leaves the variables unset. Two tasks in one run cannot
+keep the same path. A tool must validate its own cache, as Metro, `tsc` and
+Next do: qk only guarantees that warm state never changes a key or a hit.
+
 ### Run history
 
 Every run is recorded in a SQLite database beside the cache

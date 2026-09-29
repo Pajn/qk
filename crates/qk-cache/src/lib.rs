@@ -6,6 +6,7 @@ mod hash;
 mod paths;
 mod remote;
 mod store;
+pub mod warm;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -154,6 +155,40 @@ impl Cache {
         cancelled: &AtomicBool,
     ) -> Result<TaskResult> {
         let cacheable = task.definition.cache == Some(true);
+        let warm = match warm::config(workspace, task) {
+            Ok(warm) => warm,
+            Err(error) => {
+                qk_executor::status!("qk: {}: warm state ignored ({error:#})", task.id);
+                None
+            }
+        };
+        // The warm variables point tools at their state; they are not inputs,
+        // so the key is computed from the task without them.
+        let warm_prepared = warm.as_ref().map(|warm| {
+            let mut prepared = prepared.clone();
+            for (name, value) in &warm.env {
+                prepared.env.insert(name.into(), value.into());
+            }
+            prepared
+        });
+        let running = warm_prepared.as_ref().unwrap_or(prepared);
+        let before = || {
+            if let Some(warm) = &warm
+                && let Err(error) = self
+                    .initialize()
+                    .and_then(|()| self.restore_warm(workspace, task, warm))
+            {
+                qk_executor::status!("qk: {}: warm state not restored ({error:#})", task.id);
+            }
+        };
+        let after = |outcome: Outcome| {
+            if let Some(warm) = &warm
+                && outcome == Outcome::Success
+                && let Err(error) = self.save_warm(workspace, task, warm)
+            {
+                qk_executor::status!("qk: {}: warm state not saved ({error:#})", task.id);
+            }
+        };
         let fallback = |reason: String| {
             execute(prepared, cancelled).map(|outcome| TaskResult::uncached(outcome, reason))
         };
@@ -201,7 +236,9 @@ impl Cache {
             Err(error) => return bypass(format!("{error:#}")),
         };
         if !cacheable {
-            let outcome = execute(prepared, cancelled)?;
+            before();
+            let outcome = execute(running, cancelled)?;
+            after(outcome);
             let fingerprint = if self.unchanged(
                 snapshot,
                 workspace,
@@ -319,7 +356,9 @@ impl Cache {
             Err(error) => return bypass(format!("cache log unavailable: {error}")),
         };
         let capture = Capture::new(Some(log.as_file().try_clone()?), prepared.display.clone());
-        let outcome = execute_captured(prepared, cancelled, Some(&capture))?;
+        before();
+        let outcome = execute_captured(running, cancelled, Some(&capture))?;
+        after(outcome);
         let fingerprint = if !self.unchanged(
             snapshot,
             workspace,

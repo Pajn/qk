@@ -25,9 +25,9 @@ struct Manifest {
     artifacts: BTreeMap<String, Artifact>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
-enum Artifact {
+pub(crate) enum Artifact {
     File { blob: String, mode: u32 },
     Directory { mode: u32 },
     Symlink { target: String, directory: bool },
@@ -64,7 +64,7 @@ pub(crate) fn mode(metadata: &fs::Metadata) -> u32 {
     }
 }
 
-fn set_mode(path: &Path, mode: u32) -> Result<()> {
+pub(crate) fn set_mode(path: &Path, mode: u32) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -79,7 +79,7 @@ fn set_mode(path: &Path, mode: u32) -> Result<()> {
     Ok(())
 }
 
-fn validate_link(path: &str, target: &str) -> Result<()> {
+pub(crate) fn validate_link(path: &str, target: &str) -> Result<()> {
     if target.contains(['\\', ':', '\0']) || Path::new(target).is_absolute() {
         bail!("cache symlinks must be relative");
     }
@@ -98,7 +98,7 @@ fn validate_link(path: &str, target: &str) -> Result<()> {
     Ok(())
 }
 
-fn symlink(target: &str, path: &Path, directory: bool) -> Result<()> {
+pub(crate) fn symlink(target: &str, path: &Path, directory: bool) -> Result<()> {
     #[cfg(unix)]
     {
         let _ = directory;
@@ -151,7 +151,7 @@ impl Cache {
         }
     }
 
-    fn put_blob(&self, source: &Path) -> Result<String> {
+    pub(crate) fn put_blob(&self, source: &Path) -> Result<String> {
         // fs::copy clones on copy-on-write filesystems when source and cache share
         // a volume, and falls back to a byte copy otherwise. Cloning needs a fresh
         // destination path, so copy into a private directory rather than a temp file.
