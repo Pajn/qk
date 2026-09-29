@@ -7,7 +7,8 @@ run history are planned.
 
 The current implementation supports **workspace inspection, finite task
 execution and a local task cache** shared by the worktrees of a Git
-repository. Lockfile analysis is not implemented yet. The
+repository, keyed by the packages each task's projects install according to
+the pnpm lockfile. The
 [design](docs/task-runner-design.md) describes the longer-term plan, not the
 current feature set.
 
@@ -185,6 +186,16 @@ share entries. Root workspace files (`nx.json`, `package.json`,
 the task's project and its transitive project dependencies are always
 included.
 
+A pnpm v9 `pnpm-lock.yaml` is keyed by what it installs rather than by its
+content: for the root importer and the importers of the task's project and
+its transitive project dependencies, every package installation they reach,
+by snapshot key (version, peers and patch), integrity and dependencies. The
+root importer counts for every task because its packages resolve from every
+package. A lockfile change therefore invalidates only the tasks whose
+projects install something that changed, plus every task when the lockfile
+version, pnpm's `settings` or the lock of pnpm itself changes. A lockfile qk
+cannot read is keyed by its whole content, and qk says so.
+
 Candidate input files are tracked and untracked-but-not-ignored files, minus
 any task's declared outputs. The list is taken once per run, as Nx does, so a
 file that a task creates without declaring it as an output is seen from the
@@ -194,8 +205,9 @@ next run. File contents are re-read whenever their metadata changes. Without
 
 Supported input declarations are globs with `!` exclusions, `fileset`, named
 inputs and `^named` inputs, `env`, `runtime`, `dependentTasksOutputFiles`
-with `transitive`, and `externalDependencies`, which currently hashes all
-root lockfiles. `runtime` commands run once per run for each environment.
+with `transitive`, and `externalDependencies`, which adds every installation
+of the named packages in the pnpm lockfile, whichever importer installs them.
+With another package manager, lockfiles are always keyed by content. `runtime` commands run once per run for each environment.
 `dependentTasksOutputFiles` needs no file access: every dependency's
 fingerprint already covers its declared outputs. `.` and `..` segments in
 paths are resolved within the workspace. A symlinked input is keyed by its
@@ -269,9 +281,10 @@ discovery. Hidden project directories otherwise remain discoverable.
 This is a subset of the design's compatibility surface. There is no Nx
 parity claim yet. In particular:
 
-- The graph includes **workspace projects only**. External dependencies,
-  lockfile versions, workspace dependency aliases and version-range resolution
-  await the lockfile layer. Name matching is currently conservative.
+- The graph includes **workspace projects only**, as `nx graph --file`
+  does. The pnpm lockfile is read for cache keys, not for graph nodes.
+  Workspace dependency aliases and version-range resolution are not
+  implemented; name matching is conservative.
 - Target-default glob keys and filtered defaults are not implemented;
   filtered default arrays are rejected. Nx plugins and inferred targets are
   outside the design's scope.
@@ -296,7 +309,7 @@ cargo test --workspace --locked
 cargo build --release --locked
 ```
 
-The Cargo workspace contains seven crates:
+The Cargo workspace contains eight crates:
 
 | Crate | Responsibility |
 | --- | --- |
@@ -305,6 +318,7 @@ The Cargo workspace contains seven crates:
 | `qk-taskgraph` | Dependency expansion, configuration selection and task DAG validation |
 | `qk-executor` | Command preparation, environment, argument interpolation, process groups and output capture |
 | `qk-runner` | Bounded task scheduling, dependency failure propagation and cancellation |
+| `qk-lockfile` | pnpm v9 lockfile parsing and what each importer installs |
 | `qk-cache` | Input hashing, cache entry storage, output restoration and log replay |
 | `qk-cli` | Argument parsing and output; produces the `qk` binary |
 
@@ -337,5 +351,5 @@ time of both tools for each command. GitHub Actions is
 configured for Linux, macOS and Windows. The lockfile is checked in for
 reproducible dependency resolution.
 
-Next: add pnpm v9 lockfile parsing and external graph nodes so cache keys can use
-per-package lockfile fingerprints.
+Next: affected selection, using the same installed sets to attribute
+lockfile changes to projects.

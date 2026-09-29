@@ -436,3 +436,98 @@ fn directory_symlink_inputs_track_their_target() {
     success(fixture.build(&fixture.root, &[]));
     assert_eq!(fixture.runs(), 2);
 }
+
+/// A lockfile where the root installs `lib` and another importer installs `tool`.
+fn pnpm_lock(lib: &str, tool: &str) -> String {
+    format!(
+        "lockfileVersion: '9.0'
+importers:
+  .:
+    dependencies:
+      lib:
+        specifier: ^1.0.0
+        version: {lib}
+  tools/other:
+    dependencies:
+      tool:
+        specifier: ^1.0.0
+        version: {tool}
+packages:
+  lib@{lib}:
+    resolution: {{integrity: sha512-lib}}
+  tool@{tool}:
+    resolution: {{integrity: sha512-tool}}
+snapshots:
+  lib@{lib}: {{}}
+  tool@{tool}: {{}}
+"
+    )
+}
+
+#[test]
+fn lockfile_changes_invalidate_only_tasks_installing_what_changed() {
+    // The project is the workspace root, so its default inputs would match the
+    // lockfile itself as a file.
+    let fixture = Fixture::new(target(
+        "build",
+        json!({"inputs": ["{projectRoot}/src/**/*"]}),
+    ));
+    fs::write(
+        fixture.root.join("pnpm-lock.yaml"),
+        pnpm_lock("1.0.0", "1.0.0"),
+    )
+    .unwrap();
+    success(fixture.build(&fixture.root, &[]));
+    fs::write(
+        fixture.root.join("pnpm-lock.yaml"),
+        pnpm_lock("1.0.0", "1.1.0"),
+    )
+    .unwrap();
+    assert!(
+        stderr(&success(fixture.build(&fixture.root, &[]))).contains("qk: cache hit app:build")
+    );
+    fs::write(
+        fixture.root.join("pnpm-lock.yaml"),
+        pnpm_lock("1.1.0", "1.1.0"),
+    )
+    .unwrap();
+    success(fixture.build(&fixture.root, &[]));
+    assert_eq!(fixture.runs(), 2);
+
+    // A lockfile qk cannot read keys tasks by its whole content.
+    fs::write(
+        fixture.root.join("pnpm-lock.yaml"),
+        "lockfileVersion: '6.0'\n",
+    )
+    .unwrap();
+    let output = success(fixture.build(&fixture.root, &[]));
+    assert!(stderr(&output).contains("pnpm-lock.yaml: keying tasks by the whole file"));
+    fs::write(
+        fixture.root.join("pnpm-lock.yaml"),
+        "lockfileVersion: '6.0'\n# edit\n",
+    )
+    .unwrap();
+    success(fixture.build(&fixture.root, &[]));
+    assert_eq!(fixture.runs(), 4);
+}
+
+#[test]
+fn external_dependency_inputs_track_packages_any_importer_installs() {
+    let fixture = Fixture::new(target(
+        "build",
+        json!({"inputs": ["{projectRoot}/src/**/*", {"externalDependencies": ["tool"]}]}),
+    ));
+    fs::write(
+        fixture.root.join("pnpm-lock.yaml"),
+        pnpm_lock("1.0.0", "1.0.0"),
+    )
+    .unwrap();
+    success(fixture.build(&fixture.root, &[]));
+    fs::write(
+        fixture.root.join("pnpm-lock.yaml"),
+        pnpm_lock("1.0.0", "1.1.0"),
+    )
+    .unwrap();
+    success(fixture.build(&fixture.root, &[]));
+    assert_eq!(fixture.runs(), 2);
+}

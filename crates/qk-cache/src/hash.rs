@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use qk_config::Workspace;
 use qk_executor::{Capture, Outcome, PreparedTask, execute_captured, read_capture};
 use qk_graph::ProjectGraph;
+use qk_lockfile::Lockfile;
 use qk_taskgraph::{Task, TaskGraph};
 use serde_json::{Value, json};
 
@@ -78,6 +79,36 @@ pub struct Snapshot {
     digests: Mutex<HashMap<String, (Stamp, String)>>,
     /// Runtime input results by command and environment, computed once per run like Nx.
     runtime: Mutex<HashMap<String, Value>>,
+    /// The parsed pnpm lockfile, replaced whenever its content changes.
+    lockfile: Mutex<Option<Arc<Installed>>>,
+}
+
+/// One revision of `pnpm-lock.yaml`, with digests of what it installs computed
+/// once and shared by every task that asks.
+struct Installed {
+    content: String,
+    /// `None` when the file cannot be read as a pnpm v9 lockfile.
+    lockfile: Option<Lockfile>,
+    digests: Mutex<HashMap<String, String>>,
+}
+
+impl Installed {
+    fn digest(&self, key: &str, fingerprints: impl FnOnce() -> BTreeSet<String>) -> String {
+        if let Some(digest) = self.digests.lock().unwrap().get(key) {
+            return digest.clone();
+        }
+        let mut hasher = blake3::Hasher::new();
+        for fingerprint in fingerprints() {
+            hasher.update(fingerprint.as_bytes());
+            hasher.update(b"\n");
+        }
+        let digest = hasher.finalize().to_hex().to_string();
+        self.digests
+            .lock()
+            .unwrap()
+            .insert(key.to_owned(), digest.clone());
+        digest
+    }
 }
 
 impl Snapshot {
@@ -115,7 +146,42 @@ impl Snapshot {
             patterns: Mutex::default(),
             digests: Mutex::default(),
             runtime: Mutex::default(),
+            lockfile: Mutex::default(),
         })
+    }
+
+    fn installed(&self, root: &Path) -> Result<Option<Arc<Installed>>> {
+        let absolute = root.join("pnpm-lock.yaml");
+        let Ok(metadata) = std::fs::symlink_metadata(&absolute) else {
+            return Ok(None);
+        };
+        if !metadata.is_file() {
+            return Ok(None);
+        }
+        let content = self.digest("pnpm-lock.yaml", &absolute, &metadata)?;
+        let mut current = self.lockfile.lock().unwrap();
+        if let Some(installed) = &*current
+            && installed.content == content
+        {
+            return Ok(Some(installed.clone()));
+        }
+        let text = std::fs::read_to_string(&absolute)?;
+        let lockfile = match Lockfile::parse(&text) {
+            Ok(lockfile) => Some(lockfile),
+            Err(error) => {
+                qk_executor::status!(
+                    "qk: pnpm-lock.yaml: keying tasks by the whole file ({error:#})"
+                );
+                None
+            }
+        };
+        let installed = Arc::new(Installed {
+            content: blake3::hash(text.as_bytes()).to_hex().to_string(),
+            lockfile,
+            digests: Mutex::default(),
+        });
+        *current = Some(installed.clone());
+        Ok(Some(installed))
     }
 
     fn pattern(&self, pattern: &str, negated: bool) -> Result<Arc<Pattern>> {
@@ -262,6 +328,7 @@ struct Resolver<'a> {
     selected: BTreeSet<String>,
     values: BTreeMap<String, Value>,
     named_stack: Vec<(String, String)>,
+    external: BTreeSet<String>,
     prepared: &'a PreparedTask,
     cancelled: &'a AtomicBool,
 }
@@ -382,9 +449,9 @@ impl Resolver<'_> {
             Value::Object(object)
                 if object.len() == 1 && object.contains_key("externalDependencies") =>
             {
-                let _: Vec<String> =
+                let names: Vec<String> =
                     serde_json::from_value(object["externalDependencies"].clone())?;
-                // All root lockfiles are hashed conservatively below.
+                self.external.extend(names);
             }
             _ => bail!("unsupported task input declaration"),
         }
@@ -453,6 +520,7 @@ pub fn fingerprint(
         selected: BTreeSet::new(),
         values: BTreeMap::new(),
         named_stack: Vec::new(),
+        external: BTreeSet::new(),
         prepared,
         cancelled,
     };
@@ -460,7 +528,12 @@ pub fn fingerprint(
     for input in task.definition.inputs.as_ref().unwrap_or(&default) {
         resolver.input(&task.project, input)?;
     }
+    let installed = snapshot.installed(&workspace.root)?;
+    let lockfile = installed
+        .as_ref()
+        .and_then(|installed| Some((installed, installed.lockfile.as_ref()?)));
     // Always include workspace resolution/configuration, including ignored dotenv files.
+    // A pnpm lockfile qk can read is keyed by what the task's projects install instead.
     for path in [
         "nx.json",
         "package.json",
@@ -472,7 +545,8 @@ pub fn fingerprint(
         ".env",
         ".env.local",
     ] {
-        if workspace.root.join(path).is_file() {
+        if workspace.root.join(path).is_file() && !(path == "pnpm-lock.yaml" && lockfile.is_some())
+        {
             resolver.selected.insert(path.into());
         }
     }
@@ -485,6 +559,44 @@ pub fn fingerprint(
                 pending.insert(edge.target.clone());
             }
         }
+    }
+    if let Some((installed, lockfile)) = lockfile {
+        // The root importer's packages resolve from every package in the
+        // workspace, so they count for every task.
+        let importers: BTreeSet<&str> = std::iter::once(".")
+            .chain(
+                packages
+                    .iter()
+                    .map(|project| workspace.projects[project].root.as_str()),
+            )
+            .filter(|importer| lockfile.has_importer(importer))
+            .collect();
+        let importers: BTreeMap<_, _> = importers
+            .into_iter()
+            .map(|importer| {
+                let digest = installed.digest(&format!("importer:{importer}"), || {
+                    lockfile.installed(importer).unwrap_or_default()
+                });
+                (importer, digest)
+            })
+            .collect();
+        let external: BTreeMap<_, _> = resolver
+            .external
+            .iter()
+            .map(|name| {
+                let digest =
+                    installed.digest(&format!("package:{name}"), || lockfile.package(name));
+                (name.as_str(), digest)
+            })
+            .collect();
+        resolver.values.insert(
+            "lockfile".into(),
+            json!({
+                "global": installed.digest("global", || BTreeSet::from([lockfile.global().to_string()])),
+                "importers": importers,
+                "external": external,
+            }),
+        );
     }
     for project in packages {
         for name in ["project.json", "package.json"] {

@@ -474,6 +474,7 @@ dependencies = [
  "qk-config",
  "qk-executor",
  "qk-graph",
+ "qk-lockfile",
  "qk-taskgraph",
  "serde",
  "serde_json",
