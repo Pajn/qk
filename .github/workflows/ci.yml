@@ -57,3 +57,25 @@ jobs:
       - run: pnpm install --frozen-lockfile
         working-directory: tools/parity/nx
       - run: node tools/parity/parity.mjs capture --check
+
+  # qk's hot paths on a generated workspace, recorded per commit in the job
+  # summary and as an artifact.
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: sudo apt-get update && sudo apt-get install -y hyperfine
+      - run: cargo build --release --locked -p qk-cli
+      - run: node tools/bench/bench.mjs --qk target/release/qk --json bench.json --markdown bench.md
+      - run: cat bench.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ github.sha }}
+          path: bench.json

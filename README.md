@@ -528,7 +528,21 @@ node tools/parity/parity.mjs compare --workspace <dir> --goldens <dir> --qk targ
 For an external workspace, capture also records Nx's median wall times, and
 compare prints them beside qk's.
 
+### Benchmarks
+
+`tools/bench/bench.mjs` generates a workspace of 300 projects, 3,300 files
+and a 3,000-package pnpm lockfile, populates the cache, and measures with
+hyperfine: `show projects`, `graph`, `show projects --affected` with no
+changes, and a fully cached `run-many`. It needs hyperfine, git and Node:
+
+```sh
+node tools/bench/bench.mjs --qk target/release/qk [--projects 300] [--json out.json] [--markdown out.md]
+```
+
+CI runs it on every push, writing the table to the job summary and the
+numbers to an artifact.
+
 GitHub Actions is configured for Linux, macOS and Windows. The lockfile is
 checked in for reproducible dependency resolution.
 
-Next: benchmarks and binary distribution.
+Next: binary distribution.
