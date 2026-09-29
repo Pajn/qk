@@ -106,3 +106,22 @@ fn rejects_conflicting_arguments_for_shared_task() {
             .contains("conflicting")
     );
 }
+
+#[test]
+fn reaches_through_dependencies_without_the_target_like_nx() {
+    let (_temp, workspace) = workspace(json!({
+        "app": {"implicitDependencies":["mid"], "targets":{"tsc":{"dependsOn":["^tsc", "^codegen"]}}},
+        // mid has neither target, and leads back to app as well as on to base.
+        "mid": {"implicitDependencies":["base", "app"], "targets":{}},
+        "base": {"targets":{"tsc":{}, "codegen":{}}}
+    }));
+    let graph = TaskGraph::build(&workspace, &[Request::parse("app:tsc").unwrap()]).unwrap();
+    assert_eq!(
+        graph.tasks["app:tsc"]
+            .dependencies
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["base:codegen", "base:tsc"]
+    );
+}

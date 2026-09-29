@@ -168,16 +168,12 @@ impl Builder<'_> {
         };
         self.visiting.push(id.clone());
         let mut dependencies = BTreeSet::new();
-        for dependency in task.definition.depends_on.as_deref().unwrap_or_default() {
-            for request in self
-                .dependencies(&task, dependency)
-                .with_context(|| format!("dependsOn of {id}"))?
-            {
-                if let Some(dependency_id) = self.visit(request, false)? {
-                    dependencies.insert(dependency_id);
-                }
-            }
-        }
+        self.collect(
+            &task,
+            &task.project,
+            &mut dependencies,
+            &mut BTreeSet::new(),
+        )?;
         self.visiting.pop();
         self.tasks.insert(
             id.clone(),
@@ -189,19 +185,63 @@ impl Builder<'_> {
         Ok(Some(id))
     }
 
-    fn dependencies(&self, task: &Task, value: &Value) -> Result<Vec<Request>> {
-        let (target, projects, forward) = match value {
+    /// Resolves `dependsOn` with project dependencies taken from `derive_from`.
+    /// Like Nx, a dependency without the target stands in for the task: the
+    /// whole `dependsOn` list is applied again from there, so `^tsc` reaches
+    /// the nearest projects that have `tsc`.
+    fn collect(
+        &mut self,
+        task: &Task,
+        derive_from: &str,
+        dependencies: &mut BTreeSet<String>,
+        seen: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        if !seen.insert(derive_from.to_owned()) {
+            return Ok(());
+        }
+        for dependency in task.definition.depends_on.as_deref().unwrap_or_default() {
+            let (requests, derived) = self
+                .dependencies(task, derive_from, dependency)
+                .with_context(|| format!("dependsOn of {}", task.id))?;
+            for request in requests {
+                let has_target = self.workspace.projects[&request.project]
+                    .targets
+                    .contains_key(&request.target);
+                if derived && !has_target {
+                    let project = request.project;
+                    self.collect(task, &project, dependencies, seen)?;
+                } else if request.project == task.project && request.target == task.target {
+                    // Reached back to itself through a dependency cycle.
+                    continue;
+                } else if let Some(id) = self.visit(request, false)? {
+                    dependencies.insert(id);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The requests one `dependsOn` entry makes, and whether its projects are
+    /// `derive_from`'s dependencies rather than named ones.
+    fn dependencies(
+        &self,
+        task: &Task,
+        derive_from: &str,
+        value: &Value,
+    ) -> Result<(Vec<Request>, bool)> {
+        let (target, projects, forward, derived) = match value {
             Value::String(value) => {
                 if let Some(target) = value.strip_prefix('^') {
                     (
                         target.to_owned(),
-                        self.project_dependencies(&task.project),
+                        self.project_dependencies(derive_from),
                         false,
+                        true,
                     )
                 } else if let Some((project, target)) = value.split_once(':') {
-                    (target.to_owned(), vec![project.to_owned()], false)
+                    (target.to_owned(), vec![project.to_owned()], false, false)
                 } else {
-                    (value.clone(), vec![task.project.clone()], false)
+                    (value.clone(), vec![task.project.clone()], false, false)
                 }
             }
             Value::Object(object) => {
@@ -233,7 +273,7 @@ impl Builder<'_> {
                     bail!("dependency cannot specify both projects and dependencies: true");
                 }
                 let projects = if dependencies {
-                    self.project_dependencies(&task.project)
+                    self.project_dependencies(derive_from)
                 } else if let Some(selectors) = object.get("projects") {
                     let mut selectors: Vec<String> = match selectors {
                         Value::String(selector) => vec![selector.clone()],
@@ -253,14 +293,14 @@ impl Builder<'_> {
                 } else {
                     vec![task.project.clone()]
                 };
-                (target.to_owned(), projects, forward)
+                (target.to_owned(), projects, forward, dependencies)
             }
             _ => bail!("dependency must be a string or object"),
         };
         if target.is_empty() || target.contains(':') || target.starts_with('^') {
             bail!("invalid dependency target {target:?}");
         }
-        Ok(projects
+        let requests = projects
             .into_iter()
             .map(|project| Request {
                 project,
@@ -272,7 +312,8 @@ impl Builder<'_> {
                     Vec::new()
                 },
             })
-            .collect())
+            .collect();
+        Ok((requests, derived))
     }
 
     fn project_dependencies(&self, project: &str) -> Vec<String> {
