@@ -6,6 +6,7 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+globset.workspace = true
 qk-config.workspace = true
 qk-graph.workspace = true
 serde.workspace = true

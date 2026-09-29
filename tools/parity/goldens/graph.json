@@ -495,6 +495,16 @@
                 "command": "node scripts/task.mjs web:migrate apps/web"
               },
               "configurations": {}
+            },
+            "verify": {
+              "executor": "nx:noop",
+              "dependsOn": [
+                "typecheck-*",
+                "^lin*"
+              ],
+              "configurations": {},
+              "options": {},
+              "parallelism": true
             }
           },
           "name": "web",

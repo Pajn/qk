@@ -1115,6 +1115,7 @@ name = "qk-taskgraph"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "globset",
  "qk-config",
  "qk-graph",
  "serde",

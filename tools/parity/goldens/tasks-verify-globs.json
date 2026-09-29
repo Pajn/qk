@@ -1,0 +1,38 @@
+{
+  "tasks": {
+    "tasks": {
+      "web:verify": {
+        "cache": false,
+        "continuous": false
+      },
+      "web:typecheck-app": {
+        "cache": true,
+        "continuous": false
+      },
+      "web:typecheck-strict": {
+        "cache": false,
+        "continuous": false
+      },
+      "ui:lint": {
+        "cache": true,
+        "continuous": false
+      }
+    },
+    "dependencies": {
+      "web:verify": [
+        "web:typecheck-app",
+        "web:typecheck-strict",
+        "ui:lint"
+      ],
+      "web:typecheck-app": [],
+      "web:typecheck-strict": [],
+      "ui:lint": []
+    },
+    "continuousDependencies": {
+      "web:verify": [],
+      "web:typecheck-app": [],
+      "web:typecheck-strict": [],
+      "ui:lint": []
+    }
+  }
+}

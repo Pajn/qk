@@ -124,6 +124,8 @@ pub struct Workspace {
     pub local_overrides: Vec<String>,
 }
 
+pub use normalize::is_glob;
+
 /// Merged over a project's checked-in configuration, for changes that stay on
 /// one machine. It is meant to be ignored by Git; Nx does not read it.
 pub const LOCAL_OVERRIDES: &str = "project.local.json";

@@ -229,6 +229,7 @@ impl Builder<'_> {
         derive_from: &str,
         value: &Value,
     ) -> Result<(Vec<Request>, bool)> {
+        let mut forward_options = false;
         let (target, projects, forward, derived) = match value {
             Value::String(value) => {
                 if let Some(target) = value.strip_prefix('^') {
@@ -255,10 +256,16 @@ impl Builder<'_> {
                     Some("forward") => true,
                     _ => bail!("dependency params must be forward or ignore"),
                 };
+                forward_options = match object.get("options").and_then(Value::as_str) {
+                    None if !object.contains_key("options") => false,
+                    Some("ignore") => false,
+                    Some("forward") => true,
+                    _ => bail!("dependency options must be forward or ignore"),
+                };
                 for key in object.keys() {
                     if !matches!(
                         key.as_str(),
-                        "target" | "projects" | "dependencies" | "params"
+                        "target" | "projects" | "dependencies" | "params" | "options"
                     ) {
                         bail!("unsupported dependency field {key:?}");
                     }
@@ -300,17 +307,45 @@ impl Builder<'_> {
         if target.is_empty() || target.contains(':') || target.starts_with('^') {
             bail!("invalid dependency target {target:?}");
         }
-        let requests = projects
-            .into_iter()
-            .map(|project| Request {
-                project,
-                target: target.clone(),
-                configuration: task.configuration.clone(),
-                args: if forward {
-                    task.args.clone()
-                } else {
-                    Vec::new()
-                },
+        // As in Nx, a glob stands for every target name in the workspace it
+        // matches, each then depended on as if named.
+        let targets: Vec<String> = if qk_config::is_glob(&target) {
+            let matcher = globset::Glob::new(&target)
+                .with_context(|| format!("invalid dependency target {target:?}"))?
+                .compile_matcher();
+            self.workspace
+                .projects
+                .values()
+                .flat_map(|project| project.targets.keys())
+                .filter(|name| matcher.is_match(name.as_str()))
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        } else {
+            vec![target]
+        };
+        // As in Nx, `options: "forward"` passes the task's options, its
+        // configuration's included, as overrides, before any forwarded
+        // arguments so that those win.
+        let mut args = Vec::new();
+        if forward_options {
+            for (key, value) in &task.definition.options {
+                option_flags(key, value, &mut args);
+            }
+        }
+        if forward {
+            args.extend(task.args.iter().cloned());
+        }
+        let requests = targets
+            .iter()
+            .flat_map(|target| {
+                projects.iter().map(|project| Request {
+                    project: project.clone(),
+                    target: target.clone(),
+                    configuration: task.configuration.clone(),
+                    args: args.clone(),
+                })
             })
             .collect();
         Ok((requests, derived))
@@ -324,5 +359,22 @@ impl Builder<'_> {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect()
+    }
+}
+
+/// An option as the flags that set it: `--name=value`, and `--name.key=value`
+/// for each field of an object. A list cannot be spelled as a flag, and is
+/// left out.
+fn option_flags(key: &str, value: &Value, flags: &mut Vec<String>) {
+    match value {
+        Value::Object(fields) => {
+            for (field, value) in fields {
+                option_flags(&format!("{key}.{field}"), value, flags);
+            }
+        }
+        Value::String(text) => flags.push(format!("--{key}={text}")),
+        Value::Number(number) => flags.push(format!("--{key}={number}")),
+        Value::Bool(flag) => flags.push(format!("--{key}={flag}")),
+        Value::Array(_) | Value::Null => {}
     }
 }

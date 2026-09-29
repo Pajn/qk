@@ -213,7 +213,14 @@ parallelism would not help.
 
 The planner expands `dependsOn` before execution: local targets, `^target`
 on project dependencies, `project:target`, and objects with `target`,
-`projects`, `dependencies` and `params`. Project selectors accept names,
+`projects`, `dependencies`, `params` and `options`. A target may be a glob,
+such as `lint-*` or `^build-*`: as in Nx, it stands for every target name in
+the workspace it matches. `options: "forward"` passes the task's options,
+its configuration's included, to the dependency as overrides, as `--name=value`
+arguments (`--env.NAME=value` for an object's fields; lists cannot be passed
+this way), before any arguments `params: "forward"` passes. As in Nx that
+includes a run-commands target's own `command`, so it suits targets of the
+same executor. Project selectors accept names,
 globs, tags, `self` and `!self`. As in Nx, a project dependency without the
 target is looked through: the task's `dependsOn` applies again from that
 project, so `^tsc` reaches the nearest dependencies that have `tsc`. Other

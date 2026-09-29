@@ -1040,3 +1040,47 @@ fn the_package_manager_is_detected_like_nx() {
         );
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn dependencies_by_glob_and_with_forwarded_options() {
+    let temp = fixture(json!({
+        "lint-js": {"command": "echo lint-js"},
+        "lint-css": {"command": "echo lint-css"},
+        "check": {"command": "echo check", "dependsOn": ["lint-*"]},
+        "bundle": {"command": "echo bundle {args.mode} {args.region}"},
+        "deploy": {
+            "executor": "nx:noop",
+            "options": {"mode": "production", "nested": {"region": "eu"}},
+            "configurations": {"staging": {"mode": "staging"}},
+            "dependsOn": [{"target": "bundle", "options": "forward"}]
+        }
+    }));
+    let output = success(run(
+        temp.path(),
+        &["run", "app:check", "--output-style", "static"],
+    ));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("lint-js\n") && stdout.contains("lint-css\n"),
+        "{stdout}"
+    );
+    let output = success(run(
+        temp.path(),
+        &["run", "app:deploy", "--output-style", "static"],
+    ));
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("bundle production\n")
+    );
+    let output = success(run(
+        temp.path(),
+        &["run", "app:deploy:staging", "--output-style", "static"],
+    ));
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("bundle staging\n")
+    );
+}

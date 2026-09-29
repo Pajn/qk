@@ -28,6 +28,13 @@
     "migrate": {
       "command": "node scripts/task.mjs web:migrate {projectRoot}",
       "parallelism": false
+    },
+    "verify": {
+      "executor": "nx:noop",
+      "dependsOn": [
+        "typecheck-*",
+        "^lin*"
+      ]
     }
   }
 }

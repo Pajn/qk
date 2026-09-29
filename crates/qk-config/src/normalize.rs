@@ -382,8 +382,8 @@ fn target_default(
     Ok(None)
 }
 
-/// Nx's `isGlobPattern`, for target default keys.
-fn is_glob(key: &str) -> bool {
+/// Nx's `isGlobPattern`, for target default keys and dependency targets.
+pub fn is_glob(key: &str) -> bool {
     key.contains(['*', '?', '[', '{']) || ["!(", "+(", "@("].iter().any(|group| key.contains(group))
 }
 
