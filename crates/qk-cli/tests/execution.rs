@@ -176,7 +176,26 @@ fn failure_preserves_exit_code_skips_dependents_and_runs_independent_roots() {
     assert_eq!(output.status.code(), Some(7));
     assert!(!temp.path().join("must-not-exist").exists());
     assert!(temp.path().join("independent").exists());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("skipped app:build"));
+    // Quiet, the default off a terminal, names both in its summary.
+    let summary = String::from_utf8_lossy(&output.stderr);
+    assert!(summary.contains("1 of 3 tasks failed"), "{summary}");
+    assert!(
+        summary.contains("since a dependency failed: app:build"),
+        "{summary}"
+    );
+    let output = run(
+        temp.path(),
+        &[
+            "run-many",
+            "-t",
+            "build,independent",
+            "--parallel",
+            "1",
+            "--output-style",
+            "static",
+        ],
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("qk: skipped app:build"));
 }
 
 #[test]
@@ -617,10 +636,12 @@ fn output_styles_follow_nx() {
         "stream-without-prefixes",
     ]);
     assert_eq!(raw, "one\ntwo\n");
-    // Without a terminal, several tasks default to static, and one to raw.
+    // Without a terminal or CI, several tasks default to quiet, which shows a
+    // failed task's output only; one task defaults to raw.
+    assert_eq!(stdout(&["run-many", "-t", "build"]), "");
     assert_eq!(
-        stdout(&["run-many", "-t", "build"]),
-        "\n> qk run app:build\n\none\ntwo\n"
+        stdout(&["run-many", "-t", "fail"]),
+        "\n✖ qk run app:fail failed\n\nbroken\n"
     );
     assert_eq!(stdout(&["run", "app:build"]), "one\ntwo\n");
     // Held output of a failing task still appears.
@@ -631,9 +652,9 @@ fn output_styles_follow_nx() {
 
     // A cache hit replays its log under the same header, marked as such; with
     // no outputs to restore, they match what is on disk.
-    stdout(&["run-many", "-t", "cached"]);
+    stdout(&["run-many", "-t", "cached", "--output-style", "static"]);
     assert_eq!(
-        stdout(&["run-many", "-t", "cached"]),
+        stdout(&["run-many", "-t", "cached", "--output-style", "static"]),
         "\n> qk run app:cached  [existing outputs match the cache, left as is]\n\ncached\n"
     );
 
@@ -724,4 +745,25 @@ fn target_names_with_colons_and_missing_arguments_resolve_like_nx() {
     );
     // A missing {args.platform} interpolates as nothing.
     assert_eq!(stdout(&["run", "app:install"]), "install done\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn quiet_output_is_plain_text_for_agents() {
+    let temp = fixture(json!({
+        "fail": {"command": "printf '\\033[31mred failure\\033[0m\\n' && exit 2"},
+        "ok": {"command": "echo fine"}
+    }));
+    let output = command(temp.path(), &["run-many", "-t", "fail", "ok"])
+        .env_remove("FORCE_COLOR")
+        .env_remove("NX_DEFAULT_OUTPUT_STYLE")
+        .env_remove("CI")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    // Only the failure, without escape sequences.
+    assert_eq!(stdout, "\n✖ qk run app:fail failed\n\nred failure\n");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("1 of 2 tasks failed"), "{stderr}");
+    assert!(!stderr.contains("qk: checking"), "{stderr}");
 }

@@ -21,6 +21,7 @@ qk-cache.workspace = true
 qk-affected.workspace = true
 qk-history.workspace = true
 qk-lockfile.workspace = true
+terminal_size.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 

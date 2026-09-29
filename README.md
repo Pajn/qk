@@ -164,18 +164,42 @@ requested targets and errors when nothing matches. Both accept
 `-c/--configuration`, `--parallel` (default `3`, also settable through
 `NX_PARALLEL`), `--output-style` and `--dry-run`.
 
-`--output-style` takes Nx's names. `stream` prefixes each non-empty line with
-the task's project, in Nx's colour for it; `stream-without-prefixes` passes
-output through untouched; `static` holds each task's output until it ends and
-prints it under `> qk run <task>`, marked `[local cache]` for a hit, and in
-GitHub Actions folds each task into a log group unless
-`NX_SKIP_LOG_GROUPING=true`. `tui`, `dynamic` and `dynamic-legacy` render as
-`static`, since qk has no interactive terminal output. Without the option,
-`NX_DEFAULT_OUTPUT_STYLE` applies; otherwise `run` passes output through, and
-`run-many` and `affected` use `static` in CI or when stdout is not a terminal
-and `stream` on one. Continuous tasks always stream with prefixes, since their
-output would otherwise never appear. Colour follows picocolors: off with
-`NO_COLOR`, on with `FORCE_COLOR`, in CI or on a terminal.
+`--output-style` takes Nx's names, and qk's own `quiet`:
+
+- `dynamic`, `tui` and `dynamic-legacy` show a live panel on stderr: how many
+  tasks are done, cached, running, queued and failed, and each running task
+  with its time. Successful tasks' output stays hidden; a failed task's
+  output is printed above the panel. Without a terminal they fall back to
+  `static`, as in Nx.
+- `quiet` prints nothing while tasks run except a failed task's output,
+  under `✖ qk run <task> failed`, with escape sequences removed when the
+  output is not a terminal and `FORCE_COLOR` is not set. It is meant for
+  agents and scripts.
+- `stream` prefixes each non-empty line with the task's project, in Nx's
+  colour for it; `stream-without-prefixes` passes output through untouched.
+- `static` holds each task's output until it ends and prints it under
+  `> qk run <task>`, marked `[local cache]` for a hit, and in GitHub Actions
+  folds each task into a log group unless `NX_SKIP_LOG_GROUPING=true`.
+
+Without the option, `NX_DEFAULT_OUTPUT_STYLE` applies; otherwise `run` passes
+output through, and `run-many` and `affected` use `static` in CI, the live
+panel on a terminal, and `quiet` otherwise. The line-based styles print
+`qk:` status lines on stderr; the panel and `quiet` collect warnings for the
+summary instead. Continuous tasks stream with prefixes under `static` and
+`stream`, since their output would otherwise never appear. Colour follows
+picocolors: off with `NO_COLOR`, on with `FORCE_COLOR`, in CI or on a
+terminal.
+
+Runs of several tasks, and any run in the panel or `quiet`, end with a
+summary on stderr: how many tasks succeeded and came from cache, or which
+failed and which were skipped because of them; the critical path with its
+three longest tasks, in the order they ran; and whether `--parallel` held the
+run back. For that, qk records how long each task waited for a free slot
+after its dependencies finished, and samples the machine's CPU use through
+the run. When tasks on the critical path waited while the machine had
+capacity to spare, it says how much sooner a higher `--parallel` could
+finish; when the machine was busy while they waited, it says more
+parallelism would not help.
 
 The planner expands `dependsOn` before execution: local targets, `^target`
 on project dependencies, `project:target`, and objects with `target`,

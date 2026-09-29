@@ -36,7 +36,7 @@ pub fn record(
     result: &RunResult,
     started: SystemTime,
     report: Option<&Path>,
-) {
+) -> RunReport {
     let mut inputs = BTreeMap::new();
     let tasks = graph
         .tasks
@@ -117,6 +117,7 @@ pub fn record(
             );
         }
     }
+    run
 }
 
 fn open(workspace: &Workspace) -> Result<History> {

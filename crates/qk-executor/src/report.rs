@@ -102,6 +102,18 @@ pub trait Sink: Send + Sync {
     fn output(&self, stderr: bool, bytes: &[u8]);
 }
 
+impl<T: Sink + ?Sized> Sink for std::sync::Arc<T> {
+    fn event(&self, event: &Event) {
+        (**self).event(event);
+    }
+    fn warning(&self, line: &str) {
+        (**self).warning(line);
+    }
+    fn output(&self, stderr: bool, bytes: &[u8]) {
+        (**self).output(stderr, bytes);
+    }
+}
+
 /// Prints events and warnings as `qk:` lines on stderr, each in one write so
 /// task processes sharing stderr cannot split them, and passes output through.
 pub struct Lines;
