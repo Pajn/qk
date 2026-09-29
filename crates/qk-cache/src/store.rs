@@ -309,6 +309,9 @@ impl Cache {
                 #[cfg(windows)]
                 if metadata.permissions().readonly() {
                     let mut permissions = metadata.permissions();
+                    // The lint is about Unix modes; on Windows this only
+                    // clears the read-only attribute so the file can be removed.
+                    #[allow(clippy::permissions_set_readonly_false)]
                     permissions.set_readonly(false);
                     fs::set_permissions(&absolute, permissions)?;
                 }
@@ -386,6 +389,8 @@ fn output_stamps(root: &Path, outputs: &Outputs) -> Result<BTreeMap<String, Vec<
             .ok()
             .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
             .map_or(-1, |duration| duration.as_nanos() as i64);
+        // Unix adds the change time, inode and mode below.
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut stamp = vec![
             kind,
             metadata.len() as i64,

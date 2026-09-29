@@ -1064,6 +1064,7 @@ fn warm_state_is_shared_through_the_remote_by_branch() {
     assert_eq!(on("feature"), "feature");
 }
 
+#[cfg(unix)]
 #[test]
 fn local_overrides_change_the_task_and_its_key() {
     let fixture = Fixture::new(json!({
@@ -1094,6 +1095,7 @@ fn local_overrides_change_the_task_and_its_key() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("cache hit app:build"));
 }
 
+#[cfg(unix)]
 #[test]
 fn a_local_workspace_file_changes_every_task_and_its_key() {
     let fixture = Fixture::new(json!({
@@ -1143,6 +1145,7 @@ fn parallel_defaults_to_the_workspace_setting() {
     assert_eq!(parallel(&fixture), "1");
 }
 
+#[cfg(unix)]
 fn threaded(command: &str, threads: Value) -> Value {
     json!({"command": format!("mkdir -p dist && {command}"), "qk:threads": threads})
 }
@@ -1522,6 +1525,7 @@ fn named_inputs_cannot_reach_other_projects() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn tasks_see_their_hash() {
     let fixture = Fixture::new(json!({
