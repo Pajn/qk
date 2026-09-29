@@ -449,8 +449,8 @@ parity claim yet. In particular:
 - Target-default glob keys and filtered defaults are not implemented;
   filtered default arrays are rejected. Nx plugins and inferred targets are
   outside the design's scope.
-- Interactive tasks, interactive output styles, release commands and npm
-  binary distribution remain future work.
+- Interactive tasks, interactive output styles and release commands remain
+  future work. The npm package name is not chosen yet.
 
 The compatibility baseline is documented in Nx's
 [project configuration](https://nx.dev/docs/reference/project-configuration)
@@ -528,6 +528,17 @@ node tools/parity/parity.mjs compare --workspace <dir> --goldens <dir> --qk targ
 For an external workspace, capture also records Nx's median wall times, and
 compare prints them beside qk's.
 
+### Releases
+
+Pushing a tag `v<version>` that matches the workspace version runs
+`.github/workflows/release.yml`: it builds qk for Linux x64 and arm64, macOS
+arm64 and Windows x64 and attaches the binaries to a GitHub release. When the
+repository variable `NPM_PACKAGE_NAME` names the npm package and the secret
+`NPM_TOKEN` can publish it, the workflow also publishes the npm packages
+`tools/npm/package.mjs` assembles: the main package, whose `qk` bin runs the
+binary for the platform, and one package per platform as an optional
+dependency. Without the variable nothing is published to npm.
+
 ### Benchmarks
 
 `tools/bench/bench.mjs` generates a workspace of 300 projects, 3,300 files
@@ -545,4 +556,4 @@ numbers to an artifact.
 GitHub Actions is configured for Linux, macOS and Windows. The lockfile is
 checked in for reproducible dependency resolution.
 
-Next: binary distribution.
+Next: choose the npm package name, and profile fully cached runs.

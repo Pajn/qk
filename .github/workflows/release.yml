@@ -1,0 +1,108 @@
+name: Release
+
+# Pushing a tag v<version> matching the workspace version builds qk for each
+# supported platform and attaches the binaries to a GitHub release. The npm
+# packages are published too once the repository variable NPM_PACKAGE_NAME
+# names the package and the secret NPM_TOKEN can publish it.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the tag matches the workspace version
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match workspace version $version"
+            exit 1
+          fi
+      - name: Set up Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+          rustup default stable
+      - run: cargo build --release --locked -p qk-cli --target ${{ matrix.target }}
+      - name: Collect the binary
+        shell: bash
+        run: |
+          mkdir -p dist/${{ matrix.target }}
+          binary=qk
+          if [ "${{ runner.os }}" = Windows ]; then binary=qk.exe; fi
+          cp target/${{ matrix.target }}/release/$binary dist/${{ matrix.target }}/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qk-${{ matrix.target }}
+          path: dist
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Archive each platform's binary
+        run: |
+          cd dist
+          for target in *; do
+            tar -czf "../qk-$GITHUB_REF_NAME-$target.tar.gz" -C "$target" .
+          done
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes qk-*.tar.gz
+
+  npm:
+    needs: build
+    if: vars.NPM_PACKAGE_NAME != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: node tools/npm/package.mjs --name "$NPM_PACKAGE_NAME" --version "${GITHUB_REF_NAME#v}" --binaries dist --out npm
+        env:
+          NPM_PACKAGE_NAME: ${{ vars.NPM_PACKAGE_NAME }}
+      - name: Publish the platform packages, then the main package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          main=$(echo "$NPM_PACKAGE_NAME" | sed 's|^@||; s|/|__|')
+          for directory in npm/*; do
+            if [ "$(basename "$directory")" != "$main" ]; then
+              npm publish --access public "$directory"
+            fi
+          done
+          npm publish --access public "npm/$main"
+        # The main package names the platform packages, so they go first.
+        shell: bash
+    env:
+      NPM_PACKAGE_NAME: ${{ vars.NPM_PACKAGE_NAME }}
