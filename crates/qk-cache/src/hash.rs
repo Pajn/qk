@@ -124,7 +124,14 @@ impl Installed {
 
 impl Snapshot {
     pub fn new(workspace: &Workspace, graph: &TaskGraph, cache_path: &Path) -> Result<Self> {
-        let mut files = source_files(&workspace.root)?;
+        // Parsing the lockfile takes as long as listing files, and every early
+        // task needs it, so the two overlap.
+        let (files, lockfile) = std::thread::scope(|scope| {
+            let lockfile = scope.spawn(|| parse_lockfile(&workspace.root.join("pnpm-lock.yaml")));
+            let files = source_files(&workspace.root);
+            (files, lockfile.join().expect("lockfile thread panicked"))
+        });
+        let mut files = files?;
         if let Ok(cache_relative) = cache_path.strip_prefix(&workspace.root) {
             files.retain(|path| !Path::new(path).starts_with(cache_relative));
         }
@@ -159,7 +166,7 @@ impl Snapshot {
             digests_changed: Default::default(),
             directories: Mutex::default(),
             runtime: Mutex::default(),
-            lockfile: Mutex::default(),
+            lockfile: Mutex::new(lockfile),
         })
     }
 
@@ -239,21 +246,9 @@ impl Snapshot {
         {
             return Ok(Some(installed.clone()));
         }
-        let text = std::fs::read_to_string(&absolute)?;
-        let lockfile = match Lockfile::parse(&text) {
-            Ok(lockfile) => Some(lockfile),
-            Err(error) => {
-                qk_executor::status!(
-                    "qk: pnpm-lock.yaml: keying tasks by the whole file ({error:#})"
-                );
-                None
-            }
+        let Some(installed) = parse_lockfile(&absolute) else {
+            return Ok(None);
         };
-        let installed = Arc::new(Installed {
-            content: blake3::hash(text.as_bytes()).to_hex().to_string(),
-            lockfile,
-            digests: Mutex::default(),
-        });
         *current = Some(installed.clone());
         Ok(Some(installed))
     }
@@ -339,6 +334,24 @@ impl Snapshot {
     }
 }
 
+/// Reads and parses a pnpm lockfile, `None` when there is none. One qk cannot
+/// read is reported, and kept as unreadable so tasks key its whole content.
+fn parse_lockfile(path: &Path) -> Option<Arc<Installed>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let lockfile = match Lockfile::parse(&text) {
+        Ok(lockfile) => Some(lockfile),
+        Err(error) => {
+            qk_executor::status!("qk: pnpm-lock.yaml: keying tasks by the whole file ({error:#})");
+            None
+        }
+    };
+    Some(Arc::new(Installed {
+        content: blake3::hash(text.as_bytes()).to_hex().to_string(),
+        lockfile,
+        digests: Mutex::default(),
+    }))
+}
+
 fn load_digests(root: &Path) -> HashMap<String, (Stamp, String)> {
     #[derive(serde::Deserialize)]
     struct Saved {
@@ -365,25 +378,46 @@ fn under<'a>(files: &'a BTreeSet<String>, prefix: &'a str) -> impl Iterator<Item
 }
 
 fn source_files(root: &Path) -> Result<BTreeSet<String>> {
-    let git = paths::git(
-        root,
-        &[
-            "ls-files",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-            "-z",
-            "--",
-            ".",
-        ],
-    );
-    let candidates = match git {
-        Ok(output) if output.status.success() => output
-            .stdout
-            .split(|byte| *byte == 0)
-            .filter(|path| !path.is_empty())
-            .map(|path| String::from_utf8(path.to_vec()).context("input paths must be UTF-8"))
-            .collect::<Result<BTreeSet<_>>>()?,
+    let lines =
+        |output: std::io::Result<std::process::Output>| -> Option<Result<BTreeSet<String>>> {
+            let output = output.ok().filter(|output| output.status.success())?;
+            Some(
+                output
+                    .stdout
+                    .split(|byte| *byte == 0)
+                    .filter(|path| !path.is_empty())
+                    .map(|path| {
+                        String::from_utf8(path.to_vec()).context("input paths must be UTF-8")
+                    })
+                    .collect(),
+            )
+        };
+    // Tracked files deleted from the working tree are listed as cached; git
+    // names them in a second listing, which is cheaper than checking each file.
+    let (listed, deleted) = std::thread::scope(|scope| {
+        let deleted = scope.spawn(|| paths::git(root, &["ls-files", "--deleted", "-z", "--", "."]));
+        let listed = paths::git(
+            root,
+            &[
+                "ls-files",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                "-z",
+                "--",
+                ".",
+            ],
+        );
+        (listed, deleted.join().expect("git listing thread panicked"))
+    });
+    let candidates = match (lines(listed), lines(deleted)) {
+        (Some(listed), Some(deleted)) => {
+            let deleted = deleted?;
+            listed?
+                .into_iter()
+                .filter(|path| !deleted.contains(path))
+                .collect()
+        }
         _ => {
             let mut files = BTreeSet::new();
             for entry in ignore::WalkBuilder::new(root)
@@ -414,7 +448,6 @@ fn source_files(root: &Path) -> Result<BTreeSet<String>> {
             !path
                 .split('/')
                 .any(|part| matches!(part, ".git" | ".qk" | "node_modules"))
-                && std::fs::symlink_metadata(root.join(path)).is_ok()
         })
         .collect())
 }
