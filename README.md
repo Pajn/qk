@@ -73,3 +73,7 @@ cargo build --release --locked
 
 See [Development](docs/src/development.md) for Nx parity checks, releases
 and benchmarks.
+
+## License
+
+Licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.

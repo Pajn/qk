@@ -1,0 +1,12 @@
+[package]
+name = "qk-cli"
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Name reservation for qk, a standalone Nx-compatible task runner under active development"
+readme = "README.md"
+include = ["Cargo.toml", "README.md", "src/lib.rs", "LICENSE-MIT", "LICENSE-APACHE"]
+publish = ["crates-io"]
+
+# Keep this metadata-only prerelease independent of the unpublished workspace.
+[workspace]

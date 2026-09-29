@@ -3,3 +3,6 @@
 node_modules/
 
 /docs/book/
+
+/tools/crates-io/qk-cli/target/
+/npm/
