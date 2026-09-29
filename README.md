@@ -225,29 +225,34 @@ reached with different forwarded arguments is rejected as ambiguous.
 
 Supported executors:
 
-- `nx:run-commands`: `command` (a string, or as in Nx an array joined with
-  spaces), or a `commands` array of strings or objects
-  with `command`, `forwardAllArgs`, `description`, and, with `parallel`,
-  `prefix`, `prefixColor`, `color` and `bgColor`: as in Nx, a bold prefix
-  before each non-blank line of that command's output, then the colours,
-  which follow the same terminal rules as qk's own. A line split between
-  reads still gets one prefix. An empty `commands` succeeds without running
-  anything. Multiple commands run concurrently by
-  default; `options.parallel: false` runs them in sequence. Supports `cwd`,
-  `env`, `forwardAllArgs` and `args`, extra arguments as a string of shell
-  text or an array joined with spaces: forwarded after the other options and
-  before the task's own arguments, and readable as `{args.name}`, also in
-  camel case (`--max-workers` as `{args.maxWorkers}`). The default cwd is the
-  workspace root. As in Nx, any other scalar option, such as `port: 3000`, is
-  forwarded to the command as `--port=3000` and available as `{args.port}`,
-  unless an argument of the same name overrides it; object values are
-  ignored. A task argument naming a run-commands option sets it rather than
-  reaching the command: `-- --args='--watch'`, `--cwd=dir`, `--no-parallel`,
-  `--env.NAME=value`. `readyWhen`, a string or an array, is described with
-  continuous tasks below. `envFile` loads a dotenv file, relative to the
-  workspace root, beneath `env`, and `color: true` sets `FORCE_COLOR=true`.
-  `tty`, `usePty`, `streamOutput` and `verbose` are accepted and have no
-  effect: qk never gives commands a terminal, and Nx sets the others itself.
+- `nx:run-commands`, with every option Nx 23 has:
+  - `command`, a string or, as in Nx, an array joined with spaces; or
+    `commands`, an array of strings or of objects with `command`,
+    `forwardAllArgs` and `description`. An empty `commands` succeeds without
+    running anything.
+  - `parallel` (default true) runs `commands` side by side; `false` runs them
+    in sequence.
+  - With `parallel`, a command object's `prefix`, `prefixColor`, `color` and
+    `bgColor` decorate its output as in Nx: a bold prefix before each
+    non-blank line, then the colours, under the same terminal rules as qk's
+    own output. A line split between reads still gets one prefix.
+  - `cwd`, relative to the workspace root, which is the default.
+  - `env`, and `envFile`, a dotenv file relative to the workspace root that
+    sets only what is not set yet. `color: true` sets `FORCE_COLOR=true`.
+  - `args`, extra arguments as shell text or an array joined with spaces:
+    forwarded after the other options and before the task's own arguments,
+    and readable as `{args.name}`, in camel case too (`--max-workers` as
+    `{args.maxWorkers}`).
+  - `forwardAllArgs` (default true), described with argument tokens below.
+  - `readyWhen`, a string or an array, described with continuous tasks below.
+  - `tty`, `usePty`, `streamOutput` and `verbose` are accepted and have no
+    effect: qk never gives commands a terminal, and Nx sets the others itself.
+  - As in Nx, any other scalar option, such as `port: 3000`, is forwarded to
+    the command as `--port=3000` and available as `{args.port}`, unless an
+    argument of the same name overrides it; object values are ignored.
+  - A task argument naming one of these options sets it rather than reaching
+    the command: `-- --args='--watch'`, `--cwd=dir`, `--no-parallel`,
+    `--env.NAME=value`.
 - `nx:run-script`: runs the script with the workspace's package manager in
   the project directory, as Nx does: `npm run <script> -- <args>`, `pnpm run
   <script> <args>`, `yarn <script> <args>` or `bun run <script> -- <args>`.
@@ -255,8 +260,9 @@ Supported executors:
   lockfile (`bun.lockb` or `bun.lock`, `yarn.lock`, `pnpm-lock.yaml`,
   `package-lock.json`), then, which Nx does not read, the root
   `packageManager` or a `pnpm-workspace.yaml`, then the manager qk was
-  invoked through (`npm_config_user_agent`), else npm. Missing scripts fail during execution
-  preflight, after explicit project target overrides have been applied.
+  invoked through (`npm_config_user_agent`), else npm. Missing scripts fail
+  during execution preflight, after explicit project target overrides have
+  been applied.
 - `nx:noop`: completes successfully after its dependencies, without a process.
 
 Commands use `/bin/sh -c` on Unix and `cmd.exe /D /S /C` on Windows. Local
