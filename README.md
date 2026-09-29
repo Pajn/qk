@@ -287,7 +287,10 @@ project root and then the workspace root, `.env.<target>.<configuration>`,
 `.<name>.env`. A file never overrides a variable an earlier source set. The
 task variables are `NX_TASK_TARGET_PROJECT`, `NX_TASK_TARGET_TARGET`,
 `NX_TASK_TARGET_CONFIGURATION`, `NX_WORKSPACE_ROOT`, `LERNA_PACKAGE_NAME`,
-`NX_TUI=false` and `FORCE_COLOR`, which is `true` unless already set.
+`NX_TUI=false` and `FORCE_COLOR`, which is `true` unless already set, and
+`NX_TASK_HASH`, the task's cache key, whenever the run computes one: for
+every task that goes through the cache, cacheable or not, but not under
+`--skip-cache` or in a run without a cacheable target.
 Dotenv is loaded into child environments without mutating qk's process
 environment; qk's own environment, where remote cache credentials arrive,
 includes the root `.env.local` and `.env`. `NX_LOAD_DOT_ENV_FILES=false`

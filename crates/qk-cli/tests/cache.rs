@@ -1520,3 +1520,24 @@ fn named_inputs_cannot_reach_other_projects() {
         stderr(&output)
     );
 }
+
+#[test]
+fn tasks_see_their_hash() {
+    let fixture = Fixture::new(json!({
+        "command": "echo hash=$NX_TASK_HASH",
+        "cache": true,
+        "inputs": ["{projectRoot}/src/**/*"]
+    }));
+    let output = success(fixture.build(&fixture.root, &["--output-style", "static"]));
+    let printed = stdout(&output)
+        .lines()
+        .find_map(|line| line.strip_prefix("hash="))
+        .unwrap()
+        .to_owned();
+    let run: Value = serde_json::from_str(&stdout(&success(
+        fixture.qk(&fixture.root, &["show", "run", "--json"]),
+    )))
+    .unwrap();
+    assert_eq!(run["tasks"][0]["key"], json!(printed));
+    assert!(!printed.is_empty());
+}

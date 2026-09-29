@@ -173,7 +173,6 @@ impl Cache {
                 running.execution.insert(name.into(), value.into());
             }
         }
-        let running = &running;
         let before = || -> Option<warm::Restored> {
             let warm = warm.as_ref()?;
             match self
@@ -247,6 +246,11 @@ impl Cache {
             Err(error) => return bypass(format!("{error:#}")),
         };
         let keyed = Some((key.clone(), inputs));
+        // As in Nx, the task sees its hash.
+        running
+            .execution
+            .insert("NX_TASK_HASH".into(), key.clone().into());
+        let running = &running;
         let outputs = match paths::Outputs::new(workspace, task) {
             Ok(outputs) => outputs,
             Err(error) => return bypass(format!("{error:#}")),
