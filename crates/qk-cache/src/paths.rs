@@ -201,6 +201,11 @@ impl Outputs {
         Ok(Self { patterns, anchors })
     }
 
+    /// Whether the task declares any outputs.
+    pub fn declared(&self) -> bool {
+        !self.patterns.is_empty()
+    }
+
     /// Fixed directory prefixes; every matching path lies below one of them.
     pub fn anchors(&self) -> impl Iterator<Item = &str> {
         self.anchors.iter().map(String::as_str)

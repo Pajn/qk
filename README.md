@@ -273,8 +273,11 @@ in `.qk/cache/v1`. `qk cache path` prints the cache's location. `--skip-cache` (
 `--skip-nx-cache` and `--skipNxCache`) bypasses all cache reads and writes.
 
 A task's key covers its ID, forwarded arguments, resolved target definition,
-declared inputs, the fingerprints of its dependency tasks (including their
-outputs), the package manager, qk's version and the platform. Files are keyed
+declared inputs, the fingerprints of its dependency tasks, the package
+manager, qk's version and the platform. A dependency that declares outputs
+is fingerprinted by the content of those outputs alone, so a run that
+reproduces them leaves its dependents cached however its own inputs changed;
+one without declared outputs is fingerprinted by its key. Files are keyed
 by workspace-relative path, content and mode. Branch names and checkout
 locations are not part of the key, so identical sources in two worktrees
 share entries. Root workspace files (the root `tsconfig.base.json` or

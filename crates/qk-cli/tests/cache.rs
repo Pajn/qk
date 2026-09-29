@@ -913,3 +913,27 @@ fn skip_worktree_files_absent_from_disk_are_not_inputs() {
         stderr(&success(fixture.build(&fixture.root, &[]))).contains("qk: cache hit app:build")
     );
 }
+
+#[test]
+fn dependents_stay_cached_when_a_dependency_reproduces_its_outputs() {
+    let fixture = Fixture::with_targets(json!({
+        "generate": target("generate", json!({
+            "outputs": ["{projectRoot}/generated"],
+            "inputs": ["{projectRoot}/src/**/*"],
+        })),
+        "build": target("build", json!({"dependsOn": ["generate"], "inputs": ["{projectRoot}/generated/**/*"]})),
+    }));
+    success(fixture.build(&fixture.root, &[]));
+    assert_eq!(fixture.runs(), 2);
+    // An input the generator does not read: it runs again, writes the same
+    // output, and the build that depends on it is still a hit.
+    fs::write(fixture.root.join("src/unrelated.txt"), "noise").unwrap();
+    let output = stderr(&success(fixture.build(&fixture.root, &[])));
+    assert!(output.contains("qk: cache miss app:generate"), "{output}");
+    assert!(output.contains("qk: cache hit app:build"), "{output}");
+    assert_eq!(fixture.runs(), 3);
+    // A change to what it generates reaches the build.
+    fs::write(fixture.root.join("src/input.txt"), "two\n").unwrap();
+    let output = stderr(&success(fixture.build(&fixture.root, &[])));
+    assert!(output.contains("qk: cache miss app:build"), "{output}");
+}

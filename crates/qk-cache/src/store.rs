@@ -35,7 +35,7 @@ enum Artifact {
 
 impl Manifest {
     /// The output fingerprint of the stored artifacts, without reading any file.
-    fn output_fingerprint(&self) -> Result<String> {
+    fn output_fingerprint(&self, declared: bool) -> Result<String> {
         let files = self
             .artifacts
             .iter()
@@ -48,7 +48,7 @@ impl Manifest {
                 (path.clone(), value)
             })
             .collect();
-        combine_outputs(&self.key, &files)
+        combine_outputs(&self.key, &files, declared)
     }
 }
 
@@ -221,7 +221,7 @@ impl Cache {
         file.flush()?;
         file.as_file().sync_all()?;
         file.persist(self.root.join("entries").join(format!("{key}.json")))?;
-        manifest.output_fingerprint()
+        manifest.output_fingerprint(outputs.declared())
     }
 
     /// Restores an entry's outputs and log, returning its output fingerprint.
@@ -253,7 +253,7 @@ impl Cache {
         if outputs_unchanged(root, task, key, outputs) {
             qk_executor::replay(File::open(log)?, display, qk_executor::Shown::Kept)?;
             crate::evict::touch(&self.root.join("entries").join(format!("{key}.json")));
-            return manifest.output_fingerprint().map(Some);
+            return manifest.output_fingerprint(outputs.declared()).map(Some);
         }
         // Stage on the destination filesystem; no existing output is touched yet.
         let stage_parent = paths::worktree_state(root).join("restore");
@@ -333,7 +333,7 @@ impl Cache {
         record_outputs(root, task, key, outputs);
         qk_executor::replay(File::open(log)?, display, shown)?;
         crate::evict::touch(&self.root.join("entries").join(format!("{key}.json")));
-        manifest.output_fingerprint().map(Some)
+        manifest.output_fingerprint(outputs.declared()).map(Some)
     }
 }
 

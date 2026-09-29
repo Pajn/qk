@@ -392,8 +392,18 @@ pub(crate) fn directory_output() -> Value {
     json!("directory")
 }
 
-pub(crate) fn combine_outputs(input: &str, files: &BTreeMap<String, Value>) -> Result<String> {
-    Ok(blake3::hash(&serde_json::to_vec(&(input, files))?)
+/// What a task's dependents are keyed on. A task that declares outputs is
+/// known to them only through those outputs, so a run that reproduces them
+/// leaves its dependents cached however its own inputs changed. A task
+/// without declared outputs may affect its dependents in ways qk cannot see,
+/// so they are keyed on its inputs.
+pub(crate) fn combine_outputs(
+    input: &str,
+    files: &BTreeMap<String, Value>,
+    declared: bool,
+) -> Result<String> {
+    let identity = if declared { "declared outputs" } else { input };
+    Ok(blake3::hash(&serde_json::to_vec(&(identity, files))?)
         .to_hex()
         .to_string())
 }
@@ -427,7 +437,7 @@ fn output_fingerprint(root: &Path, outputs: &paths::Outputs, input: &str) -> Res
         };
         files.insert(path, value);
     }
-    combine_outputs(input, &files)
+    combine_outputs(input, &files, outputs.declared())
 }
 
 #[cfg(test)]
