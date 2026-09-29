@@ -140,8 +140,13 @@ pub(crate) fn project(
             .and_then(Value::as_str)
             .and_then(|executor| config.target_defaults.get(executor))
             .or_else(|| config.target_defaults.get(&name));
+        let defaults = defaults
+            .map(|defaults| normalize_command(defaults.clone()))
+            .transpose()?
+            // Nx drops a default that would replace the target's own executor.
+            .filter(|defaults| compatible(defaults, &target));
         let target = match defaults {
-            Some(defaults) => merge_target(normalize_command(defaults.clone())?, target)?,
+            Some(defaults) => merge_target(defaults, target)?,
             None => target,
         };
         let target = normalize_command(target)?;
@@ -210,6 +215,16 @@ fn merge_target(base: Value, overlay: Value) -> Result<Value> {
         base.insert(key, value);
     }
     Ok(Value::Object(base))
+}
+
+/// Nx applies a target default unless both name an executor and they differ.
+/// Its `isCompatibleTarget` also compares commands and scripts, but Nx calls it
+/// here without the target's options, so those never take part.
+fn compatible(defaults: &Value, target: &Value) -> bool {
+    match (defaults.get("executor"), target.get("executor")) {
+        (Some(one), Some(other)) => one == other,
+        _ => true,
+    }
 }
 
 fn normalize_command(target: Value) -> Result<Value> {

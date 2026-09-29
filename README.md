@@ -86,8 +86,10 @@ requested targets and errors when nothing matches. Both accept
 The planner expands `dependsOn` before execution: local targets, `^target`
 on project dependencies, `project:target`, and objects with `target`,
 `projects`, `dependencies` and `params`. Project selectors accept names,
-globs, tags, `self` and `!self`. Missing dependency targets are skipped;
-unknown explicit projects and task cycles fail. Shared tasks run once.
+globs, tags, `self` and `!self`. As in Nx, a project dependency without the
+target is looked through: the task's `dependsOn` applies again from that
+project, so `^tsc` reaches the nearest dependencies that have `tsc`. Other
+missing dependency targets are skipped; unknown explicit projects and task cycles fail. Shared tasks run once.
 Configurations propagate to dependencies that define the same name;
 otherwise the dependency's default configuration applies. A shared task
 reached with different forwarded arguments is rejected as ambiguous.
@@ -243,7 +245,8 @@ The cache has no size limit or eviction yet. Delete the directory printed by
   projects without either use their relative directory with `/` replaced by
   `-`. Duplicate names fail with both project roots in the error.
 - Applies exact executor-keyed or target-name-keyed `targetDefaults`.
-  Executor defaults take precedence. Options merge by key; each named
+  Executor defaults take precedence. As in Nx, a default naming a different
+  executor from the target's own is not applied. Options merge by key; each named
   configuration merges by key; nested values and arrays are replaced.
   Project-level named inputs override workspace definitions by name.
 - Normalizes a target's `command` shorthand into `nx:run-commands` options.

@@ -327,3 +327,40 @@ fn nxignore_excludes_projects_with_gitignore_semantics() {
     let workspace = Workspace::load(temp.path()).unwrap();
     assert_eq!(workspace.projects.keys().collect::<Vec<_>>(), vec!["app"]);
 }
+
+#[test]
+fn skips_target_defaults_incompatible_with_the_target() {
+    let temp = TempDir::new().unwrap();
+    write(
+        temp.path(),
+        "nx.json",
+        r#"{"targetDefaults": {
+      "test": {"command": "vitest run", "cache": true},
+      "lint": {"command": "oxlint", "cache": true},
+      "build": {"executor": "nx:run-script", "options": {"script": "compile"}, "cache": true},
+      "e2e": {"cache": true, "dependsOn": ["build"]}
+    }}"#,
+    );
+    write(
+        temp.path(),
+        "package.json",
+        r#"{"name": "app", "scripts": {"test": "vitest", "build": "tsc", "e2e": "playwright"}, "nx": {}}"#,
+    );
+    write(
+        temp.path(),
+        "project.json",
+        r#"{"name": "app", "targets": {"test": {}, "lint": {"command": "eslint"}}}"#,
+    );
+    let workspace = Workspace::load(temp.path()).unwrap();
+    let targets = &workspace.projects["app"].targets;
+    // A run-commands default does not apply to a package script. Defaults for
+    // the same executor apply even with a different command or script, and a
+    // default without an executor applies to anything.
+    assert_eq!(targets["test"].executor.as_deref(), Some("nx:run-script"));
+    assert_eq!(targets["test"].cache, None);
+    assert_eq!(targets["lint"].options["command"], "eslint");
+    assert_eq!(targets["lint"].cache, Some(true));
+    assert_eq!(targets["build"].options["script"], "build");
+    assert_eq!(targets["build"].cache, Some(true));
+    assert_eq!(targets["e2e"].cache, Some(true));
+}
