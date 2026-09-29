@@ -92,7 +92,7 @@ pub fn run(
                 }) {
                     pending.remove(&id);
                     skipped.insert(id.clone());
-                    eprintln!("qk: skipped {id} (dependency failed)");
+                    qk_executor::status!("qk: skipped {id} (dependency failed)");
                     continue;
                 }
                 let is_continuous = continuous.contains(&id);
@@ -110,7 +110,7 @@ pub fn run(
                 let task = &prepared[&id];
                 let sender = sender.clone();
                 if is_continuous {
-                    eprintln!("qk: started {id} (continuous)");
+                    qk_executor::status!("qk: started {id} (continuous)");
                     // Dependents start while it runs, and its live state cannot be keyed.
                     fingerprints.insert(
                         id.clone(),
@@ -130,7 +130,7 @@ pub fn run(
                 } else {
                     "running"
                 };
-                eprintln!("qk: {verb} {id}");
+                qk_executor::status!("qk: {verb} {id}");
                 let definition = &graph.tasks[&id];
                 let dependency_keys = dependencies
                     .iter()
@@ -164,7 +164,7 @@ pub fn run(
                     })
                 });
                 if !graph.roots.contains(id) && !needed && stopping.insert(id.clone()) {
-                    eprintln!("qk: stopping {id} (no longer needed)");
+                    qk_executor::status!("qk: stopping {id} (no longer needed)");
                     stop.store(true, Ordering::SeqCst);
                 }
             }
@@ -196,19 +196,19 @@ pub fn run(
                         }
                         Err(error) => {
                             fingerprints.insert(id.clone(), Err(format!("{id}: {error:#}")));
-                            eprintln!("qk: {id}: {error:#}");
+                            qk_executor::status!("qk: {id}: {error:#}");
                             Outcome::Failed(1)
                         }
                     };
                     // Stopping a continuous task on purpose is its normal end.
                     let outcome = if stopping.contains(&id) && outcome == Outcome::Cancelled {
-                        eprintln!("qk: stopped {id}");
+                        qk_executor::status!("qk: stopped {id}");
                         Outcome::Success
                     } else {
                         match outcome {
-                            Outcome::Success => eprintln!("qk: finished {id}"),
+                            Outcome::Success => qk_executor::status!("qk: finished {id}"),
                             Outcome::Failed(code) => {
-                                eprintln!("qk: failed {id} (exit {code})");
+                                qk_executor::status!("qk: failed {id} (exit {code})");
                                 if exit_code == 0 {
                                     exit_code = code;
                                 }

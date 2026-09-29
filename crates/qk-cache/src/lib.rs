@@ -82,7 +82,7 @@ impl Cache {
         // Reports why this task runs uncached, attributing the reason to this task.
         let bypass = |reason: String| {
             if cacheable {
-                eprintln!("qk: {}: cache bypassed ({reason})", task.id);
+                qk_executor::status!("qk: {}: cache bypassed ({reason})", task.id);
             }
             fallback(format!("{}: {reason}", task.id))
         };
@@ -95,7 +95,7 @@ impl Cache {
             Err(root) => {
                 // Keep the original task and reason so chains stay readable.
                 if cacheable {
-                    eprintln!("qk: {}: cache bypassed (depends on {root})", task.id);
+                    qk_executor::status!("qk: {}: cache bypassed (depends on {root})", task.id);
                 }
                 return fallback(root);
             }
@@ -172,7 +172,7 @@ impl Cache {
         }
         match self.restore(&workspace.root, &key, &outputs) {
             Ok(Some(fingerprint)) => {
-                eprintln!("qk: cache hit {}", task.id);
+                qk_executor::status!("qk: cache hit {}", task.id);
                 return Ok(TaskResult {
                     outcome: Outcome::Success,
                     fingerprint: Ok(fingerprint),
@@ -180,9 +180,11 @@ impl Cache {
                 });
             }
             Ok(None) => {}
-            Err(error) => eprintln!("qk: {}: ignoring unusable cache entry ({error})", task.id),
+            Err(error) => {
+                qk_executor::status!("qk: {}: ignoring unusable cache entry ({error})", task.id)
+            }
         }
-        eprintln!("qk: cache miss {}", task.id);
+        qk_executor::status!("qk: cache miss {}", task.id);
         let log = match tempfile::NamedTempFile::new_in(self.root.join("tmp")) {
             Ok(log) => log,
             Err(error) => return bypass(format!("cache log unavailable: {error}")),
@@ -207,7 +209,7 @@ impl Cache {
             match self.publish(&workspace.root, &key, &outputs, log.path()) {
                 Ok(fingerprint) => Ok(fingerprint),
                 Err(error) => {
-                    eprintln!("qk: {}: could not save cache entry ({error})", task.id);
+                    qk_executor::status!("qk: {}: could not save cache entry ({error})", task.id);
                     outputs_fingerprint(task, &workspace.root, &outputs, &key)
                 }
             }
@@ -238,7 +240,7 @@ impl Cache {
         let after = hash::fingerprint(snapshot, workspace, task, prepared, dependencies, cancelled);
         if after.as_deref().ok() != Some(before) {
             if task.definition.cache == Some(true) {
-                eprintln!(
+                qk_executor::status!(
                     "qk: {}: not caching because inputs changed during execution",
                     task.id
                 );

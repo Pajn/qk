@@ -16,6 +16,17 @@ use serde_json::Value;
 pub use capture::{Capture, read_capture, replay};
 pub use process::{Outcome, execute, execute_captured};
 
+/// Prints a status line to stderr in one write, so that task processes
+/// sharing stderr cannot split it the way `eprintln!`'s piecewise writes allow.
+#[macro_export]
+macro_rules! status {
+    ($($arg:tt)*) => {{
+        use ::std::io::Write as _;
+        let line = ::std::format!("{}\n", ::std::format_args!($($arg)*));
+        let _ = ::std::io::stderr().write_all(line.as_bytes());
+    }};
+}
+
 #[derive(Clone, Debug)]
 pub struct PreparedTask {
     pub id: String,
