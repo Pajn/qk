@@ -44,7 +44,7 @@ parent workspace marker exists.
 
 | Command | Result |
 | --- | --- |
-| `qk show projects [--json]` | Sorted project names, one per line or as a JSON array |
+| `qk show projects [--json]` | Project names in Nx graph order, one per line or as a compact JSON array |
 | `qk show projects -p 'web,tag:library' --exclude 'experimental-*'` | Union of matching names, globs and tags, minus exclusions |
 | `qk show project <name> [--json]` | Normalized project configuration as JSON |
 | `qk graph --file <path>` | Workspace project graph in a `{ "graph": { "nodes": ..., "dependencies": ... } }` envelope |

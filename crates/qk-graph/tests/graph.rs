@@ -158,3 +158,58 @@ fn output_is_independent_of_insertion_order() {
     let second = serde_json::to_string(&ProjectGraph::build(&reordered).unwrap()).unwrap();
     assert_eq!(first, second);
 }
+
+#[test]
+fn nodes_follow_nx_type_tag_and_edge_rules() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let write = |path: &str, text: &str| {
+        let path = temp.path().join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    };
+    write(
+        "nx.json",
+        r#"{"workspaceLayout": {"appsDir": "apps", "libsDir": "packages"}}"#,
+    );
+    write(
+        "package.json",
+        r#"{"name": "root", "workspaces": ["apps/*", "packages/*"]}"#,
+    );
+    // workspaceLayout overrides the package's own projectType; keywords become tags.
+    write(
+        "apps/shop/package.json",
+        r#"{"name": "shop", "private": true, "keywords": ["web"],
+            "dependencies": {"kit": "*"},
+            "nx": {"projectType": "library", "tags": ["scope:shop"], "implicitDependencies": ["kit"]}}"#,
+    );
+    write(
+        "apps/shop/project.json",
+        r#"{"tags": ["scope:shop", "extra"]}"#,
+    );
+    write(
+        "apps/shop-e2e/package.json",
+        r#"{"name": "shop-e2e", "private": true}"#,
+    );
+    write(
+        "packages/kit/package.json",
+        r#"{"name": "kit", "main": "index.js"}"#,
+    );
+    let workspace = Workspace::load(temp.path()).unwrap();
+    assert_eq!(
+        workspace.projects["shop"].tags,
+        names(&["npm:private", "npm:web", "scope:shop", "extra"])
+    );
+    assert_eq!(workspace.projects["kit"].tags, names(&["npm:public"]));
+    let graph = ProjectGraph::build(&workspace).unwrap();
+    assert_eq!(graph.nodes["shop"].kind, "app");
+    assert_eq!(graph.nodes["shop-e2e"].kind, "e2e");
+    assert_eq!(graph.nodes["kit"].kind, "lib");
+    // Nx keeps both edge kinds for one pair.
+    assert_eq!(
+        graph.dependencies["shop"]
+            .iter()
+            .map(|edge| (edge.target.as_str(), edge.kind.as_str()))
+            .collect::<Vec<_>>(),
+        [("kit", "implicit"), ("kit", "static")]
+    );
+}

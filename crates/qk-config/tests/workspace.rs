@@ -315,3 +315,15 @@ fn rejects_invalid_shapes_and_unsupported_filtered_defaults() {
         assert!(error.contains(expected), "{error}");
     }
 }
+
+#[test]
+fn nxignore_excludes_projects_with_gitignore_semantics() {
+    let temp = TempDir::new().unwrap();
+    write(temp.path(), "nx.json", "{}");
+    write(temp.path(), ".nxignore", "docs/\n!docs/kept/\n");
+    write(temp.path(), "docs/slides/project.json", "invalid JSON");
+    write(temp.path(), "docs/kept/project.json", r#"{"name":"kept"}"#);
+    write(temp.path(), "apps/app/project.json", r#"{"name":"app"}"#);
+    let workspace = Workspace::load(temp.path()).unwrap();
+    assert_eq!(workspace.projects.keys().collect::<Vec<_>>(), vec!["app"]);
+}

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use qk_config::{Workspace, find_workspace};
-use qk_graph::{GraphReport, ProjectGraph, select_projects};
+use qk_graph::{GraphReport, ProjectGraph, graph_order, select_projects};
 use qk_taskgraph::{Request, TaskGraph};
 use std::sync::{
     Arc,
@@ -43,11 +43,12 @@ enum Command {
     },
     /// Execute targets on selected projects and their dependencies.
     RunMany {
-        #[arg(short = 't', long, required = true, value_delimiter = ',')]
+        // Like Nx, lists take commas, spaces or repeated flags.
+        #[arg(short = 't', long, required = true, value_delimiter = ',', num_args = 1..)]
         targets: Vec<String>,
-        #[arg(short = 'p', long, value_delimiter = ',')]
+        #[arg(short = 'p', long, value_delimiter = ',', num_args = 1..)]
         projects: Vec<String>,
-        #[arg(long, value_delimiter = ',')]
+        #[arg(long, value_delimiter = ',', num_args = 1..)]
         exclude: Vec<String>,
         #[command(flatten)]
         options: RunOptions,
@@ -303,9 +304,15 @@ fn run(cli: Cli) -> Result<i32> {
                     json,
                 },
         } => {
-            let names = select_projects(&workspace.projects, &projects, &exclude)?;
+            let names = graph_order(
+                &workspace.projects,
+                select_projects(&workspace.projects, &projects, &exclude)?,
+            );
             if json {
-                print_json(&names)?;
+                // Compact, like `nx show projects --json`.
+                let mut stdout = io::stdout().lock();
+                serde_json::to_writer(&mut stdout, &names)?;
+                writeln!(stdout)?;
             } else {
                 let mut stdout = io::stdout().lock();
                 for name in names {

@@ -57,7 +57,10 @@ impl ProjectGraph {
                     if let Some(target) = package_names.get(dependency)
                         && *target != name
                     {
-                        edges.insert((*target).clone(), "static");
+                        edges
+                            .entry((*target).clone())
+                            .or_insert_with(BTreeSet::new)
+                            .insert("static");
                     }
                 }
             }
@@ -72,8 +75,12 @@ impl ProjectGraph {
                     bail!("project {name:?} has unknown implicit dependency {selector:?}");
                 }
                 for target in selected {
+                    // Nx keeps an implicit edge alongside a static one for the same pair.
                     if target != *name {
-                        edges.entry(target).or_insert("implicit");
+                        edges
+                            .entry(target)
+                            .or_insert_with(BTreeSet::new)
+                            .insert("implicit");
                     }
                 }
             }
@@ -90,10 +97,12 @@ impl ProjectGraph {
                 name.clone(),
                 edges
                     .into_iter()
-                    .map(|(target, kind)| Dependency {
-                        source: name.clone(),
-                        target,
-                        kind: kind.into(),
+                    .flat_map(|(target, kinds)| {
+                        kinds.into_iter().map(move |kind| Dependency {
+                            source: name.clone(),
+                            target: target.clone(),
+                            kind: kind.into(),
+                        })
                     })
                     .collect(),
             );
@@ -101,12 +110,7 @@ impl ProjectGraph {
                 name.clone(),
                 Node {
                     name: name.clone(),
-                    kind: if project.project_type.as_deref() == Some("application") {
-                        "app"
-                    } else {
-                        "lib"
-                    }
-                    .into(),
+                    kind: node_type(workspace, name, project).into(),
                     data: project.clone(),
                 },
             );
@@ -136,6 +140,51 @@ impl ProjectGraph {
         }
         Ok(visited)
     }
+}
+
+/// A node's `type`, as Nx's `getProjectType` derives it.
+fn node_type(workspace: &Workspace, name: &str, project: &Project) -> &'static str {
+    if let Some(project_type) = &project.project_type {
+        return if project_type == "library" {
+            "lib"
+        } else if name.ends_with("-e2e") || name == "e2e" {
+            "e2e"
+        } else {
+            "app"
+        };
+    }
+    let root = workspace.root.join(&project.root);
+    if root.join("tsconfig.lib.json").exists() {
+        return "lib";
+    }
+    if root.join("tsconfig.app.json").exists() {
+        return "app";
+    }
+    match workspace.packages.get(name) {
+        Some(package)
+            if package.exports.is_none()
+                && package.main.is_none()
+                && package.module.is_none()
+                && package.bin.is_none() =>
+        {
+            "app"
+        }
+        // Nx assumes an application only when it can read an entry-point-free package.
+        Some(_) => "lib",
+        None => "lib",
+    }
+}
+
+/// Orders project names as Nx orders its graph nodes: by name, then stably by
+/// descending root length (`normalizeProjectNodes` in Nx).
+pub fn graph_order(
+    projects: &BTreeMap<String, Project>,
+    names: impl IntoIterator<Item = String>,
+) -> Vec<String> {
+    let mut names: Vec<_> = names.into_iter().collect();
+    names.sort();
+    names.sort_by_key(|name| std::cmp::Reverse(projects[name].root.len()));
+    names
 }
 
 /// Positive selectors are unioned; exclusions win regardless of their order.

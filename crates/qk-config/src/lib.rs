@@ -86,6 +86,15 @@ pub struct Package {
     #[serde(default)]
     pub optional_dependencies: BTreeMap<String, String>,
     pub nx: Option<Value>,
+    #[serde(default)]
+    pub private: bool,
+    #[serde(default)]
+    pub keywords: Vec<String>,
+    // Entry points; Nx infers a library from any of them.
+    pub exports: Option<Value>,
+    pub main: Option<Value>,
+    pub module: Option<Value>,
+    pub bin: Option<Value>,
 }
 
 impl Package {

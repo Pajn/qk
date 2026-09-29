@@ -98,6 +98,8 @@ pub(crate) fn project_directories(root: &Path) -> Result<BTreeSet<PathBuf>> {
     }
     let build_directory = root.join("target");
     let walker = WalkBuilder::new(root)
+        // Nx reads .nxignore with gitignore semantics, alongside .gitignore.
+        .add_custom_ignore_filename(".nxignore")
         .hidden(false)
         .parents(false)
         .git_global(false)

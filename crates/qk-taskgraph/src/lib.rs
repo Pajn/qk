@@ -276,9 +276,12 @@ impl Builder<'_> {
     }
 
     fn project_dependencies(&self, project: &str) -> Vec<String> {
+        // A pair can have several edge kinds; each dependency counts once.
         self.projects.dependencies[project]
             .iter()
             .map(|edge| edge.target.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .collect()
     }
 }

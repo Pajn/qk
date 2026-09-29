@@ -40,7 +40,55 @@ pub(crate) fn project(
     if let Some(explicit) = value.remove("targets") {
         merge_targets(&mut targets, explicit)?;
     }
+    if let Some(package) = package {
+        // Nx's package.json plugin: `npm:` tags first, then the package's nx tags.
+        let mut tags = vec![Value::String(
+            if package.private {
+                "npm:private"
+            } else {
+                "npm:public"
+            }
+            .into(),
+        )];
+        tags.extend(
+            package
+                .keywords
+                .iter()
+                .map(|keyword| Value::String(format!("npm:{keyword}"))),
+        );
+        if let Some(Value::Array(own)) = value.remove("tags") {
+            tags.extend(own);
+        }
+        value.insert("tags".into(), Value::Array(tags));
+        // workspaceLayout decides projectType over the package's own nx value.
+        let layout = config.extra.get("workspaceLayout");
+        let apps = layout
+            .and_then(|layout| layout.get("appsDir"))
+            .and_then(Value::as_str);
+        let libs = layout
+            .and_then(|layout| layout.get("libsDir"))
+            .and_then(Value::as_str);
+        // Plain string prefixes, as in Nx.
+        if apps.is_some_and(|apps| Some(apps) != libs && relative.starts_with(apps)) {
+            value.insert("projectType".into(), json!("application"));
+        } else if libs.is_some_and(|libs| relative.starts_with(libs)) {
+            value.insert("projectType".into(), json!("library"));
+        }
+    }
     if let Some(Value::Object(mut project)) = project_json {
+        // Nx merges tags as an ordered union rather than replacing them.
+        if let Some(Value::Array(incoming)) = project.remove("tags") {
+            let mut tags = match value.remove("tags") {
+                Some(Value::Array(tags)) => tags,
+                _ => Vec::new(),
+            };
+            for tag in incoming {
+                if !tags.contains(&tag) {
+                    tags.push(tag);
+                }
+            }
+            value.insert("tags".into(), Value::Array(tags));
+        }
         if let Some(explicit) = project.remove("targets") {
             merge_targets(&mut targets, explicit)?;
         }

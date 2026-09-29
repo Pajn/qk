@@ -533,6 +533,7 @@ dependencies = [
  "qk-config",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

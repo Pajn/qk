@@ -35,16 +35,19 @@ fn successful_json(output: Output) -> Value {
 }
 
 #[test]
-fn lists_projects_as_clean_json_or_sorted_lines() {
+// Nx's graph order: names sorted, then roots by descending length.
+fn lists_projects_in_nx_graph_order_and_format() {
+    let output = qk(&["show", "projects", "--json"]);
+    assert!(output.status.success());
     assert_eq!(
-        successful_json(qk(&["show", "projects", "--json"])),
-        json!(["codegen", "core", "web", "worker"])
+        String::from_utf8(output.stdout).unwrap(),
+        "[\"worker\",\"codegen\",\"core\",\"web\"]\n"
     );
     let output = qk(&["show", "projects"]);
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "codegen\ncore\nweb\nworker\n"
+        "worker\ncodegen\ncore\nweb\n"
     );
 }
 
@@ -60,7 +63,7 @@ fn applies_cli_selectors_and_excludes() {
             "core",
             "--json"
         ])),
-        json!(["web", "worker"])
+        json!(["worker", "web"])
     );
 }
 
@@ -207,4 +210,28 @@ fn nx_shorthand_reports_unknown_targets_and_leaves_nx_commands_alone() {
     );
     let output = qk(&["format:check"]);
     assert!(String::from_utf8_lossy(&output.stderr).contains("unrecognized subcommand"));
+}
+
+#[test]
+fn run_many_accepts_space_separated_lists_like_nx() {
+    let spaced = planned(qk(&[
+        "run-many",
+        "-t",
+        "build",
+        "test",
+        "--exclude",
+        "core",
+        "worker",
+        "--dry-run",
+    ]));
+    let commas = planned(qk(&[
+        "run-many",
+        "-t",
+        "build,test",
+        "--exclude=core,worker",
+        "--dry-run",
+    ]));
+    assert_eq!(spaced, commas);
+    assert!(spaced.contains(&"web:test".to_owned()));
+    assert!(!spaced.iter().any(|task| task.starts_with("worker:")));
 }
