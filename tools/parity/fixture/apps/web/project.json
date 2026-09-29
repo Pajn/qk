@@ -1,0 +1,12 @@
+{
+  "name": "web",
+  "projectType": "application",
+  "tags": ["scope:web"],
+  "targets": {
+    "build": { "defaultConfiguration": "production", "configurations": { "production": {}, "development": {} } },
+    "test": {},
+    "lint": {},
+    "serve": {},
+    "check": {}
+  }
+}

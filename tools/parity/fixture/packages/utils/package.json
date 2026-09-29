@@ -1,0 +1,20 @@
+{
+  "name": "@fixture/utils",
+  "version": "1.0.0",
+  "exports": "./src/index.ts",
+  "keywords": [
+    "shared"
+  ],
+  "scripts": {
+    "test": "node ../../scripts/task.mjs @fixture/utils:test . "
+  },
+  "dependencies": {
+    "lodash-es": "4.17.21",
+    "debug": "4.4.0"
+  },
+  "nx": {
+    "tags": [
+      "scope:shared"
+    ]
+  }
+}

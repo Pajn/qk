@@ -23,3 +23,37 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+
+  # qk against the committed Nx goldens of the parity fixture. Run cases
+  # execute package scripts, so pnpm is needed; Nx is not.
+  parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.8.1
+      - run: cargo build --release --locked -p qk-cli
+      - run: node tools/parity/parity.mjs compare --qk target/release/qk
+
+  # The goldens still describe the pinned Nx release and the current fixture.
+  parity-goldens:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.8.1
+      - run: pnpm install --frozen-lockfile
+        working-directory: tools/parity/nx
+      - run: node tools/parity/parity.mjs capture --check

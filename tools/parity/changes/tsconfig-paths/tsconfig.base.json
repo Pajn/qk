@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "paths": {
+      "@fixture/utils": [
+        "packages/utils/src/main.ts"
+      ],
+      "@fixture/ui": [
+        "packages/ui/src/index.ts"
+      ],
+      "@fixture/native": [
+        "apps/mobile/pkg/native/index.js"
+      ]
+    }
+  }
+}

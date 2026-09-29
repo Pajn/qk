@@ -1,0 +1,6 @@
+{
+  "name": "@fixture/ui",
+  "version": "1.0.0",
+  "main": "src/index.ts",
+  "dependencies": { "@fixture/tooling": "workspace:*", "react": "catalog:" }
+}

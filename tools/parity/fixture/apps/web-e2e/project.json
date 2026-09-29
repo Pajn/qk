@@ -1,0 +1,11 @@
+{
+  "name": "web-e2e",
+  "implicitDependencies": ["web"],
+  "targets": {
+    "e2e": {
+      "dependsOn": ["web:serve", { "target": "build", "projects": ["web"] }],
+      "command": "node scripts/task.mjs web-e2e:e2e apps/web-e2e"
+    },
+    "lint": {}
+  }
+}

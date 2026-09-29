@@ -1,0 +1,9 @@
+packages:
+  - apps/*
+  - apps/mobile/pkg/*
+  - packages/*
+catalog:
+  react: 19.1.0
+  react-dom: 19.1.0
+  lodash: 4.17.21
+verifyDepsBeforeRun: false

@@ -1,0 +1,16 @@
+{
+  "outcome": "failure",
+  "ran": [
+    "@fixture/utils:test",
+    "mobile:lint",
+    "scripts:lint",
+    "tooling:lint",
+    "ui:build",
+    "ui:lint",
+    "ui:test",
+    "web-e2e:lint",
+    "web:build",
+    "web:lint",
+    "web:test"
+  ]
+}

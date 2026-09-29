@@ -1,0 +1,7 @@
+{
+  "name": "@fixture/tooling",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": { "@fixture/utils": "workspace:*" },
+  "nx": { "includedScripts": [] }
+}

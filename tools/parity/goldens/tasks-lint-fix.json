@@ -1,0 +1,46 @@
+{
+  "tasks": {
+    "tasks": {
+      "tooling:lint": {
+        "cache": true,
+        "continuous": false
+      },
+      "scripts:lint": {
+        "cache": true,
+        "continuous": false
+      },
+      "web-e2e:lint": {
+        "cache": true,
+        "continuous": false
+      },
+      "mobile:lint": {
+        "cache": true,
+        "continuous": false
+      },
+      "ui:lint": {
+        "cache": true,
+        "continuous": false
+      },
+      "web:lint": {
+        "cache": true,
+        "continuous": false
+      }
+    },
+    "dependencies": {
+      "tooling:lint": [],
+      "scripts:lint": [],
+      "web-e2e:lint": [],
+      "mobile:lint": [],
+      "ui:lint": [],
+      "web:lint": []
+    },
+    "continuousDependencies": {
+      "tooling:lint": [],
+      "scripts:lint": [],
+      "web-e2e:lint": [],
+      "mobile:lint": [],
+      "ui:lint": [],
+      "web:lint": []
+    }
+  }
+}

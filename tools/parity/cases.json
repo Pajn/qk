@@ -1,0 +1,117 @@
+{
+  "taskGraphs": {
+    "build": [
+      "-t",
+      "build"
+    ],
+    "check": [
+      "-t",
+      "check",
+      "e2e"
+    ],
+    "lint-fix": [
+      "-t",
+      "lint",
+      "-c",
+      "fix"
+    ],
+    "web-development": [
+      "-t",
+      "build",
+      "-p",
+      "web",
+      "-c",
+      "development"
+    ]
+  },
+  "affected": {
+    "source-change": {
+      "change": {}
+    },
+    "test-file-only": {
+      "change": {}
+    },
+    "root-readme": {
+      "change": {}
+    },
+    "ignored": {
+      "change": {}
+    },
+    "nested-project": {
+      "change": {}
+    },
+    "lint-config": {
+      "change": {}
+    },
+    "nx-json": {
+      "change": {}
+    },
+    "tsconfig-paths": {
+      "change": {}
+    },
+    "tsconfig-other": {
+      "change": {}
+    },
+    "deleted-project": {
+      "change": {
+        "delete": [
+          "tools/scripts/project.json"
+        ]
+      }
+    },
+    "catalog-only": {
+      "change": {},
+      "accepted": {
+        "nxOnly": [
+          "mobile",
+          "scripts",
+          "tooling",
+          "ui",
+          "web",
+          "web-e2e"
+        ],
+        "qkOnly": [],
+        "reason": "a pnpm-workspace.yaml change confined to resolution keys reaches projects only through the lockfile; stock Nx marks every project whose lint input names the file"
+      }
+    },
+    "override-transitive": {
+      "change": {},
+      "accepted": {
+        "nxOnly": [
+          "scripts"
+        ],
+        "qkOnly": [],
+        "reason": "a pnpm-workspace.yaml change confined to resolution keys reaches projects only through the lockfile; stock Nx marks every project whose lint input names the file; the override itself reaches utils and its dependents through the lockfile"
+      }
+    },
+    "root-dependency": {
+      "change": {}
+    },
+    "dependency-bump": {
+      "change": {}
+    }
+  },
+  "runs": {
+    "build": {
+      "args": [
+        "-t",
+        "build"
+      ]
+    },
+    "build-fails": {
+      "change": {},
+      "args": [
+        "-t",
+        "build"
+      ]
+    },
+    "check-fails": {
+      "change": {},
+      "args": [
+        "-t",
+        "test",
+        "lint"
+      ]
+    }
+  }
+}

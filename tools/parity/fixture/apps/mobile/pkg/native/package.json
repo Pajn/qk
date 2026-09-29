@@ -1,0 +1,7 @@
+{
+  "name": "@fixture/native",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": { "build": "node ../../../../scripts/task.mjs @fixture/native:build ." },
+  "dependencies": { "react": "catalog:" }
+}

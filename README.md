@@ -386,29 +386,51 @@ Fixture and CLI tests use self-contained workspaces.
 
 ### Parity with Nx
 
-`tools/parity/parity.mjs` measures qk against Nx on a real workspace. It needs
-Node and the workspace's own Nx installation. `capture` records Nx's output as
-golden files; `compare` checks qk against them and exits nonzero on any
-divergence:
+`tools/parity/parity.mjs` measures qk against Nx. By default it uses the
+synthetic workspace in `tools/parity/fixture` and the goldens committed in
+`tools/parity/goldens`, captured with the Nx release pinned in
+`tools/parity/nx`. It needs Node, and pnpm for the cases that run package
+scripts:
 
 ```sh
-node tools/parity/parity.mjs capture <workspace> <goldens>
-node tools/parity/parity.mjs compare <workspace> <goldens> --qk target/release/qk
+node tools/parity/parity.mjs compare --qk target/release/qk
 ```
 
-`<goldens>/parity.json` names the task graphs to compare, each as the
-`run-many` arguments both tools accept:
+Each run builds a scratch git repository from the fixture. The cases in
+`tools/parity/cases.json` compare task graphs, `show projects --affected`
+for a change applied on a branch (the files in `tools/parity/changes/<case>`,
+plus any deletions the case lists), and runs, which execute tasks without
+cache and compare whether the run failed and which tasks ran. The comparison
+requires byte-identical `show projects --json`, a `graph --file` equal after
+normalisation, and task graphs with the same tasks, dependencies, and cache
+and continuous flags. The differences it normalises away are listed at the
+top of the script. An affected or run case that differs fails unless it
+records the exact difference it accepts and why.
 
-```json
-{ "taskGraphs": { "check": ["-t", "tsc", "test", "--exclude=js"] } }
+After changing the fixture or the pinned Nx, recapture and commit the
+goldens:
+
+```sh
+(cd tools/parity/nx && pnpm install)
+node tools/parity/parity.mjs capture
 ```
 
-The comparison requires byte-identical `show projects --json`, a
-`graph --file` equal after normalisation, and task graphs with the same tasks,
-dependencies, and cache and continuous flags. The differences it normalises
-away are listed at the top of the script. Each run also reports the median wall
-time of both tools for each command. GitHub Actions is
-configured for Linux, macOS and Windows. The lockfile is checked in for
-reproducible dependency resolution.
+`capture --check` captures into a scratch directory and fails when the
+committed goldens differ. CI runs both `compare` and `capture --check`.
 
-Next: extend CI parity coverage and remote cache validation.
+The harness can also point at any workspace with its own Nx installation
+and git history, reading cases from `<goldens>/parity.json`, with affected
+cases given as `base` and `head` revisions:
+
+```sh
+node tools/parity/parity.mjs capture --workspace <dir> --goldens <dir>
+node tools/parity/parity.mjs compare --workspace <dir> --goldens <dir> --qk target/release/qk
+```
+
+For an external workspace, capture also records Nx's median wall times, and
+compare prints them beside qk's.
+
+GitHub Actions is configured for Linux, macOS and Windows. The lockfile is
+checked in for reproducible dependency resolution.
+
+Next: remote cache storage and run history.

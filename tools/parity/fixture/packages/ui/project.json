@@ -1,0 +1,5 @@
+{
+  "name": "ui",
+  "tags": ["scope:shared", "type:ui"],
+  "targets": { "build": {}, "test": {}, "lint": {}, "check": {} }
+}

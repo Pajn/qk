@@ -1,0 +1,9 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "paths": {
+      "@fixture/utils": ["packages/utils/src/index.ts"],
+      "@fixture/ui": ["packages/ui/src/index.ts"]
+    }
+  }
+}

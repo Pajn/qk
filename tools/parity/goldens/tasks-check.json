@@ -1,0 +1,88 @@
+{
+  "tasks": {
+    "tasks": {
+      "web-e2e:e2e": {
+        "cache": false,
+        "continuous": false
+      },
+      "ui:check": {
+        "cache": false,
+        "continuous": false
+      },
+      "web:check": {
+        "cache": false,
+        "continuous": false
+      },
+      "web:serve": {
+        "cache": false,
+        "continuous": true
+      },
+      "web:build:production": {
+        "cache": true,
+        "continuous": false
+      },
+      "ui:build": {
+        "cache": true,
+        "continuous": false
+      },
+      "ui:test": {
+        "cache": true,
+        "continuous": false
+      },
+      "ui:lint": {
+        "cache": true,
+        "continuous": false
+      },
+      "web:test": {
+        "cache": true,
+        "continuous": false
+      },
+      "web:lint": {
+        "cache": true,
+        "continuous": false
+      }
+    },
+    "dependencies": {
+      "web-e2e:e2e": [
+        "web:build:production"
+      ],
+      "ui:check": [
+        "ui:build",
+        "ui:test",
+        "ui:lint"
+      ],
+      "web:check": [
+        "web:build:production",
+        "web:test",
+        "web:lint"
+      ],
+      "web:serve": [],
+      "web:build:production": [
+        "ui:build"
+      ],
+      "ui:build": [],
+      "ui:test": [
+        "ui:build"
+      ],
+      "ui:lint": [],
+      "web:test": [
+        "web:build:production"
+      ],
+      "web:lint": []
+    },
+    "continuousDependencies": {
+      "web-e2e:e2e": [
+        "web:serve"
+      ],
+      "ui:check": [],
+      "web:check": [],
+      "web:serve": [],
+      "web:build:production": [],
+      "ui:build": [],
+      "ui:test": [],
+      "ui:lint": [],
+      "web:test": [],
+      "web:lint": []
+    }
+  }
+}

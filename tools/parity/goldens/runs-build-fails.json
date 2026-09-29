@@ -1,0 +1,8 @@
+{
+  "outcome": "failure",
+  "ran": [
+    "@fixture/native:build",
+    "mobile:build",
+    "ui:build"
+  ]
+}

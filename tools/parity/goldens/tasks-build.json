@@ -1,0 +1,36 @@
+{
+  "tasks": {
+    "tasks": {
+      "@fixture/native:build": {
+        "cache": false,
+        "continuous": false
+      },
+      "mobile:build": {
+        "cache": false,
+        "continuous": false
+      },
+      "ui:build": {
+        "cache": true,
+        "continuous": false
+      },
+      "web:build:production": {
+        "cache": true,
+        "continuous": false
+      }
+    },
+    "dependencies": {
+      "@fixture/native:build": [],
+      "mobile:build": [],
+      "ui:build": [],
+      "web:build:production": [
+        "ui:build"
+      ]
+    },
+    "continuousDependencies": {
+      "@fixture/native:build": [],
+      "mobile:build": [],
+      "ui:build": [],
+      "web:build:production": []
+    }
+  }
+}

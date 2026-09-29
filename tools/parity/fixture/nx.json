@@ -1,0 +1,36 @@
+{
+  // Shared defaults for the parity fixture. Comments exercise JSONC.
+  "defaultBase": "main",
+  "workspaceLayout": { "appsDir": "apps", "libsDir": "packages" },
+  "pluginsConfig": { "@nx/js": { "projectsAffectedByDependencyUpdates": "auto" } },
+  "namedInputs": {
+    "default": ["{projectRoot}/**/*", "sharedGlobals"],
+    "production": ["default", "!{projectRoot}/**/*.test.ts"],
+    "sharedGlobals": ["{workspaceRoot}/.tool-versions"]
+  },
+  "targetDefaults": {
+    "build": {
+      "cache": true,
+      "dependsOn": ["^build"],
+      "inputs": ["production", "^production"],
+      "outputs": ["{projectRoot}/dist"],
+      "command": "node scripts/task.mjs {projectName}:build {projectRoot}"
+    },
+    // A run-commands default Nx does not apply to package-script targets.
+    "test": {
+      "cache": true,
+      "dependsOn": ["build"],
+      "command": "node scripts/task.mjs {projectName}:test {projectRoot}"
+    },
+    "lint": {
+      "cache": true,
+      "inputs": ["default", "{workspaceRoot}/scripts/lint.config.mjs", "{workspaceRoot}/pnpm-workspace.yaml"],
+      "command": "node scripts/task.mjs {projectName}:lint {projectRoot}",
+      "configurations": {
+        "fix": { "command": "node scripts/task.mjs {projectName}:lint-fix {projectRoot}" }
+      }
+    },
+    "serve": { "continuous": true, "command": "node scripts/serve.mjs" },
+    "check": { "executor": "nx:noop", "dependsOn": ["build", "test", "lint"] }
+  }
+}

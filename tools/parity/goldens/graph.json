@@ -1,0 +1,500 @@
+{
+  "graph": {
+    "nodes": {
+      "@fixture/native": {
+        "name": "@fixture/native",
+        "type": "app",
+        "data": {
+          "root": "apps/mobile/pkg/native",
+          "name": "@fixture/native",
+          "projectType": "application",
+          "tags": [
+            "npm:public"
+          ],
+          "metadata": {
+            "targetGroups": {
+              "NPM Scripts": [
+                "build"
+              ]
+            },
+            "js": {
+              "packageName": "@fixture/native",
+              "packageVersion": "1.0.0",
+              "packageMain": "index.js",
+              "isInPackageManagerWorkspaces": true
+            }
+          },
+          "targets": {
+            "build": {
+              "executor": "nx:run-script",
+              "metadata": {
+                "scriptContent": "node ../../../../scripts/task.mjs @fixture/native:build .",
+                "runCommand": "pnpm run build"
+              },
+              "options": {
+                "script": "build"
+              },
+              "configurations": {},
+              "parallelism": true
+            }
+          },
+          "implicitDependencies": []
+        }
+      },
+      "tooling": {
+        "name": "tooling",
+        "type": "lib",
+        "data": {
+          "root": "packages/tooling",
+          "targets": {
+            "lint": {
+              "cache": true,
+              "inputs": [
+                "default",
+                "{workspaceRoot}/scripts/lint.config.mjs",
+                "{workspaceRoot}/pnpm-workspace.yaml"
+              ],
+              "executor": "nx:run-commands",
+              "options": {
+                "command": "node scripts/task.mjs tooling:lint packages/tooling"
+              },
+              "configurations": {
+                "fix": {
+                  "command": "node scripts/task.mjs tooling:lint-fix packages/tooling"
+                }
+              },
+              "parallelism": true
+            }
+          },
+          "name": "tooling",
+          "includedScripts": [],
+          "projectType": "library",
+          "tags": [
+            "npm:private"
+          ],
+          "metadata": {
+            "targetGroups": {},
+            "js": {
+              "packageName": "@fixture/tooling",
+              "packageVersion": "1.0.0",
+              "isInPackageManagerWorkspaces": true
+            }
+          },
+          "implicitDependencies": []
+        }
+      },
+      "@fixture/utils": {
+        "name": "@fixture/utils",
+        "type": "lib",
+        "data": {
+          "root": "packages/utils",
+          "name": "@fixture/utils",
+          "projectType": "library",
+          "tags": [
+            "npm:public",
+            "npm:shared",
+            "scope:shared"
+          ],
+          "metadata": {
+            "targetGroups": {
+              "NPM Scripts": [
+                "test"
+              ]
+            },
+            "js": {
+              "packageName": "@fixture/utils",
+              "packageVersion": "1.0.0",
+              "packageExports": "./src/index.ts",
+              "isInPackageManagerWorkspaces": true
+            }
+          },
+          "targets": {
+            "test": {
+              "executor": "nx:run-script",
+              "metadata": {
+                "scriptContent": "node ../../scripts/task.mjs @fixture/utils:test . ",
+                "runCommand": "pnpm run test"
+              },
+              "options": {
+                "script": "test"
+              },
+              "configurations": {},
+              "parallelism": true
+            }
+          },
+          "implicitDependencies": []
+        }
+      },
+      "scripts": {
+        "name": "scripts",
+        "type": "lib",
+        "data": {
+          "root": "tools/scripts",
+          "targets": {
+            "lint": {
+              "cache": true,
+              "inputs": [
+                "default",
+                "{workspaceRoot}/scripts/lint.config.mjs",
+                "{workspaceRoot}/pnpm-workspace.yaml"
+              ],
+              "executor": "nx:run-commands",
+              "options": {
+                "command": "node scripts/task.mjs scripts:lint tools/scripts"
+              },
+              "configurations": {
+                "fix": {
+                  "command": "node scripts/task.mjs scripts:lint-fix tools/scripts"
+                }
+              },
+              "parallelism": true
+            },
+            "release": {
+              "executor": "nx:run-commands",
+              "options": {
+                "command": "node scripts/task.mjs scripts:release tools/scripts"
+              },
+              "configurations": {},
+              "parallelism": true
+            }
+          },
+          "name": "scripts",
+          "implicitDependencies": [],
+          "tags": []
+        }
+      },
+      "web-e2e": {
+        "name": "web-e2e",
+        "type": "lib",
+        "data": {
+          "root": "apps/web-e2e",
+          "targets": {
+            "lint": {
+              "cache": true,
+              "inputs": [
+                "default",
+                "{workspaceRoot}/scripts/lint.config.mjs",
+                "{workspaceRoot}/pnpm-workspace.yaml"
+              ],
+              "executor": "nx:run-commands",
+              "options": {
+                "command": "node scripts/task.mjs web-e2e:lint apps/web-e2e"
+              },
+              "configurations": {
+                "fix": {
+                  "command": "node scripts/task.mjs web-e2e:lint-fix apps/web-e2e"
+                }
+              },
+              "parallelism": true
+            },
+            "e2e": {
+              "dependsOn": [
+                "web:serve",
+                {
+                  "target": "build",
+                  "projects": [
+                    "web"
+                  ]
+                }
+              ],
+              "executor": "nx:run-commands",
+              "options": {
+                "command": "node scripts/task.mjs web-e2e:e2e apps/web-e2e"
+              },
+              "configurations": {},
+              "parallelism": true
+            }
+          },
+          "name": "web-e2e",
+          "implicitDependencies": [
+            "web"
+          ],
+          "tags": []
+        }
+      },
+      "mobile": {
+        "name": "mobile",
+        "type": "app",
+        "data": {
+          "root": "apps/mobile",
+          "targets": {
+            "lint": {
+              "cache": true,
+              "inputs": [
+                "default",
+                "{workspaceRoot}/scripts/lint.config.mjs",
+                "{workspaceRoot}/pnpm-workspace.yaml"
+              ],
+              "executor": "nx:run-commands",
+              "options": {
+                "command": "node scripts/task.mjs mobile:lint apps/mobile"
+              },
+              "configurations": {
+                "fix": {
+                  "command": "node scripts/task.mjs mobile:lint-fix apps/mobile"
+                }
+              },
+              "parallelism": true
+            },
+            "build": {
+              "executor": "nx:run-script",
+              "metadata": {
+                "scriptContent": "node ../../scripts/task.mjs mobile:build .",
+                "runCommand": "pnpm run build"
+              },
+              "options": {
+                "script": "build"
+              },
+              "configurations": {},
+              "parallelism": true
+            }
+          },
+          "name": "mobile",
+          "projectType": "application",
+          "tags": [
+            "npm:private"
+          ],
+          "metadata": {
+            "targetGroups": {
+              "NPM Scripts": [
+                "build"
+              ]
+            },
+            "js": {
+              "packageName": "@fixture/mobile",
+              "isInPackageManagerWorkspaces": true
+            }
+          },
+          "implicitDependencies": []
+        }
+      },
+      "ui": {
+        "name": "ui",
+        "type": "lib",
+        "data": {
+          "root": "packages/ui",
+          "targets": {
+            "lint": {
+              "cache": true,
+              "inputs": [
+                "default",
+                "{workspaceRoot}/scripts/lint.config.mjs",
+                "{workspaceRoot}/pnpm-workspace.yaml"
+              ],
+              "executor": "nx:run-commands",
+              "options": {
+                "command": "node scripts/task.mjs ui:lint packages/ui"
+              },
+              "configurations": {
+                "fix": {
+                  "command": "node scripts/task.mjs ui:lint-fix packages/ui"
+                }
+              },
+              "parallelism": true
+            },
+            "build": {
+              "cache": true,
+              "dependsOn": [
+                "^build"
+              ],
+              "inputs": [
+                "production",
+                "^production"
+              ],
+              "outputs": [
+                "{projectRoot}/dist"
+              ],
+              "executor": "nx:run-commands",
+              "options": {
+                "command": "node scripts/task.mjs ui:build packages/ui"
+              },
+              "configurations": {},
+              "parallelism": true
+            },
+            "test": {
+              "cache": true,
+              "dependsOn": [
+                "build"
+              ],
+              "executor": "nx:run-commands",
+              "options": {
+                "command": "node scripts/task.mjs ui:test packages/ui"
+              },
+              "configurations": {},
+              "parallelism": true
+            },
+            "check": {
+              "executor": "nx:noop",
+              "dependsOn": [
+                "build",
+                "test",
+                "lint"
+              ],
+              "configurations": {},
+              "options": {},
+              "parallelism": true
+            }
+          },
+          "name": "ui",
+          "projectType": "library",
+          "tags": [
+            "npm:public",
+            "scope:shared",
+            "type:ui"
+          ],
+          "metadata": {
+            "targetGroups": {},
+            "js": {
+              "packageName": "@fixture/ui",
+              "packageVersion": "1.0.0",
+              "packageMain": "src/index.ts",
+              "isInPackageManagerWorkspaces": true
+            }
+          },
+          "implicitDependencies": []
+        }
+      },
+      "web": {
+        "name": "web",
+        "type": "app",
+        "data": {
+          "root": "apps/web",
+          "targets": {
+            "lint": {
+              "cache": true,
+              "inputs": [
+                "default",
+                "{workspaceRoot}/scripts/lint.config.mjs",
+                "{workspaceRoot}/pnpm-workspace.yaml"
+              ],
+              "executor": "nx:run-commands",
+              "options": {
+                "command": "node scripts/task.mjs web:lint apps/web"
+              },
+              "configurations": {
+                "fix": {
+                  "command": "node scripts/task.mjs web:lint-fix apps/web"
+                }
+              },
+              "parallelism": true
+            },
+            "build": {
+              "cache": true,
+              "dependsOn": [
+                "^build"
+              ],
+              "inputs": [
+                "production",
+                "^production"
+              ],
+              "outputs": [
+                "{projectRoot}/dist"
+              ],
+              "executor": "nx:run-commands",
+              "defaultConfiguration": "production",
+              "options": {
+                "command": "node scripts/task.mjs web:build apps/web"
+              },
+              "configurations": {
+                "production": {},
+                "development": {}
+              },
+              "parallelism": true
+            },
+            "test": {
+              "cache": true,
+              "dependsOn": [
+                "build"
+              ],
+              "executor": "nx:run-commands",
+              "options": {
+                "command": "node scripts/task.mjs web:test apps/web"
+              },
+              "configurations": {},
+              "parallelism": true
+            },
+            "serve": {
+              "continuous": true,
+              "executor": "nx:run-commands",
+              "options": {
+                "command": "node scripts/serve.mjs"
+              },
+              "configurations": {},
+              "parallelism": true
+            },
+            "check": {
+              "executor": "nx:noop",
+              "dependsOn": [
+                "build",
+                "test",
+                "lint"
+              ],
+              "configurations": {},
+              "options": {},
+              "parallelism": true
+            }
+          },
+          "name": "web",
+          "projectType": "application",
+          "tags": [
+            "npm:private",
+            "scope:web"
+          ],
+          "metadata": {
+            "targetGroups": {},
+            "js": {
+              "packageName": "@fixture/web",
+              "isInPackageManagerWorkspaces": true
+            }
+          },
+          "implicitDependencies": []
+        }
+      }
+    },
+    "dependencies": {
+      "@fixture/native": [],
+      "tooling": [
+        {
+          "source": "tooling",
+          "target": "@fixture/utils",
+          "type": "static"
+        }
+      ],
+      "@fixture/utils": [],
+      "scripts": [],
+      "web-e2e": [
+        {
+          "source": "web-e2e",
+          "target": "web",
+          "type": "implicit"
+        }
+      ],
+      "mobile": [
+        {
+          "source": "mobile",
+          "target": "@fixture/native",
+          "type": "static"
+        },
+        {
+          "source": "mobile",
+          "target": "@fixture/utils",
+          "type": "static"
+        }
+      ],
+      "ui": [
+        {
+          "source": "ui",
+          "target": "tooling",
+          "type": "static"
+        }
+      ],
+      "web": [
+        {
+          "source": "web",
+          "target": "ui",
+          "type": "static"
+        }
+      ]
+    }
+  }
+}

@@ -1,33 +1,56 @@
 #!/usr/bin/env node
 // Captures Nx's view of a workspace as golden files, and compares qk against
-// them. The goldens are the parity oracle of the design's phase 0: capture them
-// once per Nx upgrade or workspace change, then compare on every qk change.
+// them. The goldens are the parity oracle: capture them once per Nx upgrade or
+// workspace change, then compare on every qk change.
 //
-//   node tools/parity/parity.mjs capture <workspace> <goldens>
-//   node tools/parity/parity.mjs compare <workspace> <goldens> [--qk <binary>]
+//   node tools/parity/parity.mjs compare [--qk <binary>]
+//   node tools/parity/parity.mjs capture [--check]
 //
-// Capture runs the workspace's own Nx (node_modules/.bin/nx) with the daemon
-// off. `<goldens>/parity.json` names the task graphs to capture, each as the
-// run-many arguments both tools accept:
+// By default both work on the fixture in tools/parity/fixture, with the cases
+// in tools/parity/cases.json and the goldens in tools/parity/goldens. Each run
+// builds a throwaway git repository from the fixture: the fixture is the base
+// commit, and each case with a `change` is a branch that writes the files in
+// tools/parity/changes/<case> and deletes the paths it lists. Capture needs the
+// Nx release in tools/parity/nx installed (`pnpm install` there); compare needs
+// only the goldens. `capture --check` captures into a scratch directory and
+// fails when the committed goldens differ, which is how an Nx upgrade or a
+// fixture edit without recaptured goldens shows.
 //
-//   { "taskGraphs": { "check-all": ["--exclude=js", "-t", "tsc", "test"] } }
+//   node tools/parity/parity.mjs compare --workspace <dir> --goldens <dir>
+//   node tools/parity/parity.mjs capture --workspace <dir> --goldens <dir>
 //
-// and the revision pairs to capture `show projects --affected` for:
+// point both at a real workspace with its own Nx instead, reading the cases
+// from <goldens>/parity.json and revisions from the workspace's history.
 //
-//   { "affected": { "lockfile-bump": { "base": "<sha>", "head": "<sha>" } } }
+// Cases:
 //
-// An affected case whose sets differ fails unless it carries the difference
-// it accepts and why, which is how precision improvements are recorded:
+//   "taskGraphs": { "<name>": [<run-many arguments>] }
+//   "affected":   { "<name>": { "change": {"delete": []} } | { "base": "<rev>", "head": "<rev>" } }
+//   "runs":       { "<name>": { "change": {}, "args": [<run-many arguments>] } }
+//
+// Task graphs compare tasks, dependencies and cache and continuous flags.
+// Affected cases compare `show projects --affected` sets. Runs execute the
+// tasks without cache and compare whether the run failed and which tasks ran,
+// as recorded by the fixture's tasks. An affected or run case whose results
+// differ fails unless it carries the difference it accepts and why:
 //
 //   "accepted": { "nxOnly": ["a"], "qkOnly": [], "reason": "a installs the same" }
-//
-// Compare exits nonzero on any divergence not listed under "Known
-// differences" below, or accepted by an affected case.
 
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 // Known differences, applied to both sides before comparing:
 // - `dynamic` edges: Nx derives them from `import()` in source files. qk builds
@@ -36,8 +59,8 @@ import { join, resolve } from "node:path";
 // - Node `metadata` and target `metadata`: Nx plugin annotations.
 // - Node `namedInputs`: qk reports the merged named inputs; Nx does not.
 // - Node `includedScripts`: Nx keeps the package.json option; qk consumes it.
-// - `nx-release-publish` targets: inferred by Nx release, which stays on Nx
-//   until phase 6.
+// - `nx-release-publish` targets: inferred by Nx release, which qk does not
+//   implement.
 // - Target keys Nx fills with defaults (`parallelism: true`, empty
 //   `configurations` and `options`) and `//` comment keys, which qk drops.
 // - Tokens in target options: Nx substitutes them while building the graph,
@@ -45,59 +68,130 @@ import { join, resolve } from "node:path";
 // - Object key order, which neither tool treats as meaningful.
 // - The order of `show projects --affected`: Nx prints its traversal order, qk
 //   the graph order of `show projects`, so affected projects compare as sets.
-// - Configurations in task graphs: Nx's `--graph` leaves them out of task ids
-//   even for an explicit `project:target:configuration`, so qk's are dropped
-//   before comparing.
+// - Requested configurations in task graphs: Nx's `--graph` ignores `-c`, even
+//   for an explicit `project:target:configuration`, and plans as if none was
+//   requested; default configurations still apply. qk plans the same arguments
+//   without `-c` to match.
 const RELEASE_TARGETS = new Set(["nx-release-publish"]);
 
-const [command, workspaceArg, goldensArg, ...rest] = process.argv.slice(2);
-if (!["capture", "compare"].includes(command) || !workspaceArg || !goldensArg) {
-  console.error("usage: parity.mjs capture|compare <workspace> <goldens> [--qk <binary>]");
+const here = dirname(fileURLToPath(import.meta.url));
+const [command, ...rest] = process.argv.slice(2);
+const option = (name) => {
+  const index = rest.indexOf(name);
+  return index >= 0 ? rest[index + 1] : undefined;
+};
+if (!["capture", "compare"].includes(command)) {
+  console.error("usage: parity.mjs capture [--check] | compare [--qk <binary>] [--workspace <dir> --goldens <dir>]");
   process.exit(2);
 }
-const workspace = resolve(workspaceArg);
-const goldens = resolve(goldensArg);
-const qkIndex = rest.indexOf("--qk");
-const qk = qkIndex >= 0 ? resolve(rest[qkIndex + 1]) : "qk";
-const config = JSON.parse(readFileSync(join(goldens, "parity.json"), "utf8"));
+const external = option("--workspace");
+const qk = option("--qk") ? resolve(option("--qk")) : "qk";
+const checkOnly = rest.includes("--check");
+let goldens = resolve(external ? option("--goldens") : join(here, "goldens"));
+const config = JSON.parse(readFileSync(external ? join(goldens, "parity.json") : join(here, "cases.json"), "utf8"));
 const taskGraphs = config.taskGraphs ?? {};
 const affectedCases = config.affected ?? {};
-const affectedArgs = ({ base, head }) => ["show", "projects", "--affected", "--base", base, "--head", head, "--json"];
+const runCases = config.runs ?? {};
+const scratchRoot = mkdtempSync(join(tmpdir(), "qk-parity-"));
+process.on("exit", () => rmSync(scratchRoot, { recursive: true, force: true }));
+
+// The workspace, and the revisions of each case.
+const workspace = external ? resolve(external) : fixture();
+const nx = external ? join(workspace, "node_modules/.bin/nx") : join(here, "nx/node_modules/.bin/nx");
+
+function git(...args) {
+  const result = spawnSync("git", args, {
+    cwd: workspace,
+    encoding: "utf8",
+    env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" },
+  });
+  if (result.status !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr}`);
+  return result.stdout.trim();
+}
+
+function fixture() {
+  const root = join(scratchRoot, "workspace");
+  cpSync(join(here, "fixture"), root, { recursive: true });
+  const modules = join(here, "nx/node_modules");
+  if (existsSync(modules)) symlinkSync(modules, join(root, "node_modules"));
+  return root;
+}
+
+const commit = (message) =>
+  git("-c", "user.name=parity", "-c", "user.email=parity@example.invalid", "commit", "--quiet", "--allow-empty", "-m", message);
+
+if (!external) {
+  git("init", "--quiet", "--initial-branch=main");
+  git("add", "--all");
+  commit("fixture");
+  for (const [name, spec] of [...Object.entries(affectedCases), ...Object.entries(runCases)]) {
+    if (!spec.change) continue;
+    git("checkout", "--quiet", "-b", `case/${name}`, "main");
+    const overlay = join(here, "changes", name);
+    if (existsSync(overlay)) cpSync(overlay, workspace, { recursive: true });
+    for (const path of spec.change.delete ?? []) rmSync(join(workspace, path), { recursive: true, force: true });
+    git("add", "--all");
+    commit(name);
+    git("checkout", "--quiet", "main");
+  }
+}
+
+/// Checks out a case's head for the duration of `body`, as CI would.
+function onCase(name, spec, body) {
+  if (!spec.change) return body({ base: spec.base, head: spec.head });
+  git("checkout", "--quiet", `case/${name}`);
+  try {
+    return body({ base: "main", head: `case/${name}` });
+  } finally {
+    git("checkout", "--quiet", "main");
+  }
+}
 
 // Runs a command three times and reports the median wall time, so a cold
 // file system cache on the first run does not skew the timings.
-function run(binary, args) {
-  const times = [];
+function run(binary, args, { times = 3, allowFailure = false } = {}) {
+  const durations = [];
   let result;
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let attempt = 0; attempt < times; attempt++) {
     const started = performance.now();
     result = spawnSync(binary, args, {
       cwd: workspace,
       encoding: "utf8",
       maxBuffer: 1 << 30,
-      env: { ...process.env, NX_DAEMON: "false" },
+      env: { ...process.env, NX_DAEMON: "false", NX_NO_CLOUD: "true", NX_TUI: "false", FIXTURE_ROOT: workspace },
     });
-    times.push(performance.now() - started);
-    if (result.status !== 0) {
-      throw new Error(`${binary} ${args.join(" ")} exited ${result.status}\n${result.stderr}`);
+    durations.push(performance.now() - started);
+    if (result.status !== 0 && !allowFailure) {
+      throw new Error(`${binary} ${args.join(" ")} exited ${result.status}\n${result.stdout}\n${result.stderr}`);
     }
   }
-  return { stdout: result.stdout, milliseconds: Math.round(times.sort((a, b) => a - b)[1]) };
-}
-
-function scratch(name) {
-  const directory = join(tmpdir(), `qk-parity-${process.pid}`);
-  mkdirSync(directory, { recursive: true });
-  return join(directory, name);
+  durations.sort((a, b) => a - b);
+  return { ...result, milliseconds: Math.round(durations[Math.floor(durations.length / 2)]) };
 }
 
 function readJson(path) {
   return JSON.parse(readFileSync(path, "utf8"));
 }
 
+const affectedArgs = ({ base, head }) => ["show", "projects", "--affected", "--base", base, "--head", head, "--json"];
+const lastLine = (text) => text.trim().split("\n").pop();
+
+/// Runs a case's tasks without cache and reports the outcome and the tasks
+/// that ran, from the markers the fixture's tasks leave.
+function execute(binary, args, skipCache) {
+  rmSync(join(workspace, ".ran"), { recursive: true, force: true });
+  const result = run(binary, ["run-many", ...args, skipCache], { times: 1, allowFailure: true });
+  const markers = join(workspace, ".ran");
+  const ran = existsSync(markers) ? readdirSync(markers).map((file) => readFileSync(join(markers, file), "utf8")).sort() : [];
+  rmSync(markers, { recursive: true, force: true });
+  return { outcome: result.status === 0 ? "success" : "failure", ran };
+}
+
 if (command === "capture") {
-  const nx = join(workspace, "node_modules/.bin/nx");
-  if (!existsSync(nx)) throw new Error(`no Nx installation at ${nx}`);
+  if (!existsSync(nx)) throw new Error(`no Nx installation at ${nx}; run pnpm install in ${dirname(dirname(dirname(nx)))}`);
+  const committed = goldens;
+  if (checkOnly) goldens = join(scratchRoot, "goldens");
+  mkdirSync(goldens, { recursive: true });
   const timings = {};
   const projects = run(nx, ["show", "projects", "--json"]);
   writeFileSync(join(goldens, "projects.json"), projects.stdout);
@@ -107,22 +201,49 @@ if (command === "capture") {
   for (const [name, args] of Object.entries(taskGraphs)) {
     const file = join(goldens, `tasks-${name}.json`);
     timings[`tasks ${name}`] = run(nx, ["run-many", ...args, `--graph=${file}`]).milliseconds;
+    // Keep only what compare reads, so the goldens stay small and stable.
+    const { tasks } = readJson(file);
+    const kept = Object.fromEntries(
+      Object.entries(tasks.tasks).map(([id, task]) => [id, { cache: task.cache, continuous: Boolean(task.continuous) }]),
+    );
+    writeFileSync(
+      file,
+      `${JSON.stringify({ tasks: { tasks: kept, dependencies: tasks.dependencies, continuousDependencies: tasks.continuousDependencies } }, null, 2)}\n`,
+    );
   }
-  for (const [name, revisions] of Object.entries(affectedCases)) {
-    const affected = run(nx, affectedArgs(revisions));
-    const projects = JSON.parse(affected.stdout.trim().split("\n").pop()).sort();
-    writeFileSync(join(goldens, `affected-${name}.json`), `${JSON.stringify(projects)}\n`);
+  for (const [name, spec] of Object.entries(affectedCases)) {
+    const affected = onCase(name, spec, (revisions) => run(nx, affectedArgs(revisions)));
+    writeFileSync(join(goldens, `affected-${name}.json`), `${JSON.stringify(JSON.parse(lastLine(affected.stdout)).sort())}\n`);
     timings[`affected ${name}`] = affected.milliseconds;
   }
-  const { version } = readJson(join(workspace, "node_modules/nx/package.json"));
-  writeFileSync(join(goldens, "nx.json"), `${JSON.stringify({ version, timings }, null, 2)}\n`);
-  console.log(`captured Nx ${version} goldens in ${goldens}`);
+  for (const [name, spec] of Object.entries(runCases)) {
+    const result = onCase(name, spec, () => execute(nx, spec.args, "--skip-nx-cache"));
+    writeFileSync(join(goldens, `runs-${name}.json`), `${JSON.stringify(result, null, 2)}\n`);
+  }
+  const { version } = readJson(join(dirname(dirname(nx)), "nx/package.json"));
+  // An external workspace records timings as its Nx baseline; the fixture's
+  // goldens are committed, so they hold nothing that varies between captures.
+  const summary = external ? { version, timings } : { version };
+  writeFileSync(join(goldens, "nx.json"), `${JSON.stringify(summary, null, 2)}\n`);
+  if (checkOnly) {
+    const stale = readdirSync(goldens).filter(
+      (file) => !existsSync(join(committed, file)) || readFileSync(join(committed, file), "utf8") !== readFileSync(join(goldens, file), "utf8"),
+    );
+    const extra = readdirSync(committed).filter((file) => !existsSync(join(goldens, file)));
+    if (stale.length + extra.length > 0) {
+      console.error(`goldens are stale: ${[...stale, ...extra].join(", ")}; run capture and commit the result`);
+      process.exit(1);
+    }
+    console.log(`goldens match Nx ${version}`);
+  } else {
+    console.log(`captured Nx ${version} goldens in ${goldens}`);
+  }
   process.exit(0);
 }
 
 const failures = [];
 const timings = {};
-const nxTimings = readJson(join(goldens, "nx.json")).timings;
+const nxTimings = readJson(join(goldens, "nx.json")).timings ?? {};
 
 function check(label, differences) {
   if (differences.length === 0) {
@@ -133,6 +254,18 @@ function check(label, differences) {
   for (const difference of differences.slice(0, 20)) console.log(`       ${difference}`);
   if (differences.length > 20) console.log(`       ... ${differences.length - 20} more`);
   failures.push(label);
+}
+
+/// Sets that must match, or differ exactly as the case accepts.
+function checkSets(label, expected, actual, accepted, extra = []) {
+  const nxOnly = [...expected].filter((item) => !actual.has(item)).sort();
+  const qkOnly = [...actual].filter((item) => !expected.has(item)).sort();
+  const same = (one, other) => JSON.stringify(one) === JSON.stringify([...(other ?? [])].sort());
+  if (accepted?.reason && extra.length === 0 && nxOnly.length + qkOnly.length > 0 && same(nxOnly, accepted.nxOnly) && same(qkOnly, accepted.qkOnly)) {
+    console.log(`ok   ${label} differs as accepted: ${accepted.reason}`);
+    return;
+  }
+  check(label, [...extra, ...nxOnly.map((item) => `only in Nx: ${item}`), ...qkOnly.map((item) => `only in qk: ${item}`)]);
 }
 
 // show projects: byte-identical.
@@ -146,38 +279,32 @@ check(
 );
 
 // graph: normalised-equal.
-const graphFile = scratch("graph.json");
+const graphFile = join(scratchRoot, "graph.json");
 timings.graph = run(qk, ["graph", "--file", graphFile]).milliseconds;
 check("graph --file is normalised-equal", compareGraphs(readJson(join(goldens, "graph.json")).graph, readJson(graphFile).graph));
 
 // Task graphs: the same tasks, dependencies, and cache and continuous flags.
 for (const [name, args] of Object.entries(taskGraphs)) {
-  const plan = run(qk, ["run-many", ...args, "--dry-run"]);
+  const plan = run(qk, ["run-many", ...withoutConfiguration(args), "--dry-run"]);
   timings[`tasks ${name}`] = plan.milliseconds;
   check(`task graph ${name} matches`, compareTaskGraphs(readJson(join(goldens, `tasks-${name}.json`)).tasks, JSON.parse(plan.stdout)));
 }
 
 // Affected projects: the same set, or exactly the accepted difference.
-for (const [name, revisions] of Object.entries(affectedCases)) {
-  const affected = run(qk, affectedArgs(revisions));
+for (const [name, spec] of Object.entries(affectedCases)) {
+  const affected = onCase(name, spec, (revisions) => run(qk, affectedArgs(revisions)));
   timings[`affected ${name}`] = affected.milliseconds;
-  const expected = new Set(readJson(join(goldens, `affected-${name}.json`)));
-  const actual = new Set(JSON.parse(affected.stdout));
-  const nxOnly = [...expected].filter((project) => !actual.has(project)).sort();
-  const qkOnly = [...actual].filter((project) => !expected.has(project)).sort();
-  const accepted = revisions.accepted;
-  const same = (one, other) => JSON.stringify(one) === JSON.stringify([...(other ?? [])].sort());
-  if (accepted?.reason && same(nxOnly, accepted.nxOnly) && same(qkOnly, accepted.qkOnly) && nxOnly.length + qkOnly.length > 0) {
-    console.log(`ok   affected ${name} differs as accepted: ${accepted.reason}`);
-    continue;
-  }
-  check(`affected ${name} matches`, [
-    ...nxOnly.map((project) => `only in Nx: ${project}`),
-    ...qkOnly.map((project) => `only in qk: ${project}`),
-  ]);
+  checkSets(`affected ${name}`, new Set(readJson(join(goldens, `affected-${name}.json`))), new Set(JSON.parse(affected.stdout)), spec.accepted);
 }
 
-rmSync(join(tmpdir(), `qk-parity-${process.pid}`), { recursive: true, force: true });
+// Runs: the same outcome and the same tasks run.
+for (const [name, spec] of Object.entries(runCases)) {
+  const expected = readJson(join(goldens, `runs-${name}.json`));
+  const actual = onCase(name, spec, () => execute(qk, spec.args, "--skip-cache"));
+  const outcome = expected.outcome === actual.outcome ? [] : [`run ${actual.outcome === "success" ? "succeeded" : "failed"} in qk only`];
+  checkSets(`run ${name}`, new Set(expected.ran), new Set(actual.ran), spec.accepted, outcome);
+}
+
 console.log(`\n${"milliseconds".padEnd(32)}     nx      qk`);
 for (const [label, milliseconds] of Object.entries(timings)) {
   console.log(`${label.padEnd(32)} ${String(nxTimings[label] ?? "-").padStart(6)}  ${String(milliseconds).padStart(6)}`);
@@ -244,15 +371,17 @@ function resolveTokens(value, project) {
   return value;
 }
 
-function compareTaskGraphs(nx, planned) {
-  const withoutConfiguration = (id) => {
-    const task = planned.tasks[id];
-    return task.configuration ? id.slice(0, -(task.configuration.length + 1)) : id;
-  };
-  const qk = { tasks: {} };
-  for (const [id, task] of Object.entries(planned.tasks)) {
-    qk.tasks[withoutConfiguration(id)] = { ...task, dependencies: task.dependencies.map(withoutConfiguration) };
+/// run-many arguments without a requested configuration.
+function withoutConfiguration(args) {
+  const kept = [];
+  for (let index = 0; index < args.length; index++) {
+    if (["-c", "--configuration"].includes(args[index])) index++;
+    else if (!args[index].startsWith("--configuration=")) kept.push(args[index]);
   }
+  return kept;
+}
+
+function compareTaskGraphs(nx, qk) {
   const differences = [];
   diffKeys("task", Object.keys(nx.tasks), Object.keys(qk.tasks), differences);
   for (const [id, task] of Object.entries(nx.tasks)) {

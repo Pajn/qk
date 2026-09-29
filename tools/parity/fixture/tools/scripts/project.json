@@ -1,0 +1,7 @@
+{
+  "name": "scripts",
+  "targets": {
+    "lint": {},
+    "release": { "command": "node scripts/task.mjs scripts:release tools/scripts" }
+  }
+}

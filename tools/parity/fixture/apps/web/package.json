@@ -1,0 +1,9 @@
+{
+  "name": "@fixture/web",
+  "private": true,
+  "dependencies": {
+    "@fixture/ui": "workspace:*",
+    "react": "catalog:",
+    "react-dom": "catalog:"
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "tasks": {
+    "tasks": {
+      "web:build:production": {
+        "cache": true,
+        "continuous": false
+      },
+      "ui:build": {
+        "cache": true,
+        "continuous": false
+      }
+    },
+    "dependencies": {
+      "web:build:production": [
+        "ui:build"
+      ],
+      "ui:build": []
+    },
+    "continuousDependencies": {
+      "web:build:production": [],
+      "ui:build": []
+    }
+  }
+}

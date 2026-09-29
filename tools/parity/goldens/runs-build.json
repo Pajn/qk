@@ -1,0 +1,9 @@
+{
+  "outcome": "success",
+  "ran": [
+    "@fixture/native:build",
+    "mobile:build",
+    "ui:build",
+    "web:build"
+  ]
+}
