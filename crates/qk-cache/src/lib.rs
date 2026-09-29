@@ -33,10 +33,23 @@ pub struct Cache {
 /// `"<task id>: <reason>"` for the task where fingerprinting first failed.
 pub type Fingerprint = std::result::Result<String, String>;
 
+/// Where a task's result came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CacheStatus {
+    LocalHit,
+    RemoteHit,
+    Miss,
+    /// Ran without consulting the cache: not cacheable, bypassed or disabled.
+    Uncached,
+}
+
 pub struct TaskResult {
     pub outcome: Outcome,
     pub fingerprint: Fingerprint,
-    pub hit: bool,
+    pub cache: CacheStatus,
+    /// The task's key and what it was computed from, when it has one.
+    pub key: Option<(String, Value)>,
 }
 
 impl TaskResult {
@@ -44,7 +57,8 @@ impl TaskResult {
         Self {
             outcome,
             fingerprint: Err(reason),
-            hit: false,
+            cache: CacheStatus::Uncached,
+            key: None,
         }
     }
 }
@@ -141,17 +155,20 @@ impl Cache {
             Ok(snapshot) => snapshot,
             Err(reason) => return bypass(reason),
         };
-        let key = match hash::fingerprint(
+        let (key, inputs) = match hash::inputs(
             snapshot,
             workspace,
             task,
             prepared,
             &dependencies,
             cancelled,
-        ) {
+        )
+        .and_then(|inputs| Ok((hash::key(&inputs)?, inputs)))
+        {
             Ok(key) => key,
             Err(error) => return bypass(format!("{error:#}")),
         };
+        let keyed = Some((key.clone(), inputs));
         let outputs = match paths::Outputs::new(workspace, task) {
             Ok(outputs) => outputs,
             Err(error) => return bypass(format!("{error:#}")),
@@ -175,7 +192,8 @@ impl Cache {
             return Ok(TaskResult {
                 outcome,
                 fingerprint,
-                hit: false,
+                cache: CacheStatus::Uncached,
+                key: keyed,
             });
         }
         if let Err(error) = self.initialize() {
@@ -219,7 +237,8 @@ impl Cache {
                 return Ok(TaskResult {
                     outcome: Outcome::Success,
                     fingerprint: Ok(fingerprint),
-                    hit: true,
+                    cache: CacheStatus::LocalHit,
+                    key: keyed,
                 });
             }
             Ok(None) => {}
@@ -246,7 +265,8 @@ impl Cache {
                     return Ok(TaskResult {
                         outcome: Outcome::Success,
                         fingerprint: Ok(fingerprint),
-                        hit: true,
+                        cache: CacheStatus::RemoteHit,
+                        key: keyed,
                     });
                 }
                 Ok(None) => {}
@@ -293,7 +313,8 @@ impl Cache {
         Ok(TaskResult {
             outcome,
             fingerprint,
-            hit: false,
+            cache: CacheStatus::Miss,
+            key: keyed,
         })
     }
 

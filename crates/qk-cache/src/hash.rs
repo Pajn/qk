@@ -506,14 +506,16 @@ impl Resolver<'_> {
     }
 }
 
-pub fn fingerprint(
+/// What a task's key is computed from, as JSON: kept by the history so a
+/// changed key can be explained.
+pub fn inputs(
     snapshot: &Snapshot,
     workspace: &Workspace,
     task: &Task,
     prepared: &PreparedTask,
     dependencies: &BTreeMap<String, String>,
     cancelled: &AtomicBool,
-) -> Result<String> {
+) -> Result<Value> {
     let mut resolver = Resolver {
         workspace,
         snapshot,
@@ -622,7 +624,30 @@ pub fn fingerprint(
         "id":task.id, "args":task.args, "definition":task.definition, "packageManager":workspace.package_manager,
         "files":files, "values":resolver.values, "dependencies":dependencies,
     });
-    Ok(blake3::hash(&serde_json::to_vec(&hash)?)
+    Ok(hash)
+}
+
+/// The key for a task's inputs.
+pub fn key(inputs: &Value) -> Result<String> {
+    Ok(blake3::hash(&serde_json::to_vec(inputs)?)
         .to_hex()
         .to_string())
+}
+
+pub fn fingerprint(
+    snapshot: &Snapshot,
+    workspace: &Workspace,
+    task: &Task,
+    prepared: &PreparedTask,
+    dependencies: &BTreeMap<String, String>,
+    cancelled: &AtomicBool,
+) -> Result<String> {
+    key(&inputs(
+        snapshot,
+        workspace,
+        task,
+        prepared,
+        dependencies,
+        cancelled,
+    )?)
 }

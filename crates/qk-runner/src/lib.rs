@@ -10,18 +10,29 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use qk_config::Workspace;
 use qk_executor::{Display, Outcome, OutputStyle, environment, execute, prepare};
 use qk_taskgraph::TaskGraph;
 
-#[derive(Debug)]
 pub struct RunResult {
     pub outcomes: BTreeMap<String, Outcome>,
     pub skipped: BTreeSet<String>,
     pub exit_code: i32,
+    /// What happened to each task that started.
+    pub tasks: BTreeMap<String, TaskRecord>,
+}
+
+/// One task of a run, for history and reports.
+pub struct TaskRecord {
+    pub started: SystemTime,
+    pub ended: SystemTime,
+    pub outcome: Outcome,
+    pub cache: qk_cache::CacheStatus,
+    /// The task's key and what it was computed from, when it has one.
+    pub key: Option<(String, serde_json::Value)>,
 }
 
 pub fn run(
@@ -77,6 +88,8 @@ pub fn run(
     .then(|| qk_cache::Cache::for_workspace(workspace, &environment));
     let mut skipped = BTreeSet::new();
     let mut exit_code = 0;
+    let mut started = BTreeMap::new();
+    let mut records = BTreeMap::new();
     let (sender, receiver) = mpsc::channel();
     std::thread::scope(|scope| -> Result<()> {
         while !pending.is_empty() || !active.is_empty() {
@@ -112,6 +125,7 @@ pub fn run(
                 }
                 pending.remove(&id);
                 active.insert(id.clone());
+                started.insert(id.clone(), SystemTime::now());
                 let task = &prepared[&id];
                 let sender = sender.clone();
                 if is_continuous {
@@ -192,17 +206,17 @@ pub fn run(
                 Ok((id, result)) => {
                     active.remove(&id);
                     stops.remove(&id);
-                    let outcome = match result {
+                    let (outcome, cache, key) = match result {
                         Ok(result) => {
                             if !continuous.contains(&id) {
                                 fingerprints.insert(id.clone(), result.fingerprint);
                             }
-                            result.outcome
+                            (result.outcome, result.cache, result.key)
                         }
                         Err(error) => {
                             fingerprints.insert(id.clone(), Err(format!("{id}: {error:#}")));
                             qk_executor::status!("qk: {id}: {error:#}");
-                            Outcome::Failed(1)
+                            (Outcome::Failed(1), qk_cache::CacheStatus::Uncached, None)
                         }
                     };
                     // Stopping a continuous task on purpose is its normal end.
@@ -222,6 +236,16 @@ pub fn run(
                         }
                         outcome
                     };
+                    records.insert(
+                        id.clone(),
+                        TaskRecord {
+                            started: started.remove(&id).unwrap_or_else(SystemTime::now),
+                            ended: SystemTime::now(),
+                            outcome,
+                            cache,
+                            key,
+                        },
+                    );
                     outcomes.insert(id, outcome);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -240,5 +264,6 @@ pub fn run(
         outcomes,
         skipped,
         exit_code,
+        tasks: records,
     })
 }

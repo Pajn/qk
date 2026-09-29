@@ -57,6 +57,8 @@ parent workspace marker exists.
 | `qk show projects --affected [--base <rev>] [--head <rev>]` | Projects affected by the changes, in graph order |
 | `qk affected -t build,test [--base <rev>] [--head <rev>]` | Execute targets on the affected projects |
 | `qk show affected [project] [--json]` | Why projects are affected, or why one project is |
+| `qk show runs`, `qk show run [id]` | Recent runs; one run's tasks, cache results and critical path |
+| `qk show task <project:target>` | A task's recent runs and why its cache key changed |
 | `qk cache path` | Print the local cache directory without creating it |
 | `qk cache prune [--max-size 1GB]` | Evict least recently used entries until the cache fits |
 
@@ -312,6 +314,33 @@ against its content hash; an unreadable or corrupt entry is a miss.
 A per-key lock makes concurrent runs of the same task, including runs in
 different worktrees, wait for each other and reuse the result.
 
+### Run history
+
+Every run is recorded in a SQLite database beside the cache
+(`<git common dir>/qk/history.db`, or `.qk/history.db` outside Git), so linked
+worktrees share it. Each task's record holds its status, cache result
+(`local-hit`, `remote-hit`, `miss` or `uncached`), key, timing and cause: what
+differs from the previous key recorded for the task, grouped as `files` (with
+the paths added, removed and changed), `env`, `runtime`, `dependencies` (with
+the dependency tasks), `lockfile` (with the importers and packages),
+`inputs`, `definition`, `args` and `tooling`, or `first`, `unchanged` and
+`unknown` when the previous inputs are no longer kept. The newest 200 runs are
+kept. The schema is versioned in `schema_version`.
+
+`--report <path>` (or `NX_RUN_REPORT`) on `run`, `run-many` and `affected`
+writes the run as JSON: the command, commit, exit code, each task with its
+record, and the critical path, the dependency chain with the longest total
+duration. `qk show run --json` prints the same for a recorded run.
+
+```text
+$ qk show task web:build
+web:build, most recent first:
+  run 1790687500772-75771  2 min ago  success  miss  4.1s
+      key changed since run 1790687500464-74260: dependencies, files
+        changed packages/ui/src/index.ts
+        dependency ui:build
+```
+
 ### Remote cache
 
 nx.json's `s3` key, as `@nx/s3-cache` reads it, adds a remote store on
@@ -394,8 +423,8 @@ parity claim yet. In particular:
   filtered default arrays are rejected. Nx plugins and inferred targets are
   outside the design's scope.
 - Affected selection is per project; per-task affected is future work.
-- Interactive tasks, interactive output styles, history, release commands
-  and npm binary distribution remain future work.
+- Interactive tasks, interactive output styles, release commands and npm
+  binary distribution remain future work.
 
 The compatibility baseline is documented in Nx's
 [project configuration](https://nx.dev/docs/reference/project-configuration)
@@ -476,4 +505,4 @@ compare prints them beside qk's.
 GitHub Actions is configured for Linux, macOS and Windows. The lockfile is
 checked in for reproducible dependency resolution.
 
-Next: run history and reports.
+Next: per-task affected selection.

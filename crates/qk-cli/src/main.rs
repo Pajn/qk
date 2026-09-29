@@ -1,4 +1,5 @@
 mod explain;
+mod history;
 
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -100,6 +101,9 @@ struct RunOptions {
     /// `static`.
     #[arg(long, value_enum)]
     output_style: Option<OutputStyle>,
+    /// Write a JSON report of the run to this file; also NX_RUN_REPORT.
+    #[arg(long, env = "NX_RUN_REPORT", value_name = "PATH")]
+    report: Option<PathBuf>,
     /// Arguments forwarded to requested tasks; dependencies require params: forward.
     #[arg(last = true, allow_hyphen_values = true)]
     args: Vec<String>,
@@ -229,6 +233,28 @@ enum ShowCommand {
         #[command(flatten)]
         changes: ChangeOptions,
         /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List recent runs, newest first.
+    Runs {
+        #[arg(long, default_value = "20")]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show a recorded run, the latest by default, as `--report` writes it.
+    Run {
+        id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show a task's recent runs, and why its cache key changed in each.
+    Task {
+        /// A task id, `project:target[:configuration]`.
+        id: String,
+        #[arg(long, default_value = "10")]
+        limit: usize,
         #[arg(long)]
         json: bool,
     },
@@ -485,6 +511,15 @@ fn run(cli: Cli) -> Result<i32> {
             )?;
         }
         Command::Show {
+            command: ShowCommand::Runs { limit, json },
+        } => history::show_runs(&workspace, limit, json, &mut io::stdout().lock())?,
+        Command::Show {
+            command: ShowCommand::Run { id, json },
+        } => history::show_run(&workspace, id.as_deref(), json, &mut io::stdout().lock())?,
+        Command::Show {
+            command: ShowCommand::Task { id, limit, json },
+        } => history::show_task(&workspace, &id, limit, json, &mut io::stdout().lock())?,
+        Command::Show {
             command: ShowCommand::Project { name, .. },
         } => {
             let Some(project) = workspace.projects.get(&name) else {
@@ -525,6 +560,7 @@ fn execute_tasks(
     })
     .context("cannot register cancellation handler")?;
     let skip_cache = options.skip_cache;
+    let started = std::time::SystemTime::now();
     let result = qk_runner::run(
         workspace,
         &graph,
@@ -535,6 +571,13 @@ fn execute_tasks(
             .map_or_else(|| default_output_style(single), OutputStyle::rendered),
         cancelled,
     )?;
+    history::record(
+        workspace,
+        &graph,
+        &result,
+        started,
+        options.report.as_deref(),
+    );
     if !skip_cache {
         let cache = qk_cache::cache_directory(&workspace.root);
         let pruned = qk_cache::max_size(workspace.config.extra.get("maxCacheSize"), &cache)

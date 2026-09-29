@@ -707,3 +707,47 @@ fn remote_failures_mid_restore_are_misses() {
     assert_eq!(fixture.runs(), 2);
     assert_eq!(artifact(&fixture.root), "built:one\n");
 }
+
+#[test]
+fn history_explains_why_a_task_missed() {
+    let fixture = Fixture::new(target("build", json!({})));
+    success(fixture.build(&fixture.root, &[]));
+    fs::write(fixture.root.join("src/input.txt"), "two\n").unwrap();
+    let report = fixture.root.parent().unwrap().join("report.json");
+    success(fixture.build(&fixture.root, &["--report", report.to_str().unwrap()]));
+
+    let report: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+    let task = &report["tasks"][0];
+    assert_eq!(task["id"], "app:build");
+    assert_eq!(task["cache"], "miss");
+    assert_eq!(task["cause"]["changed"], json!(["files"]));
+    assert_eq!(task["cause"]["files"]["changed"], json!(["src/input.txt"]));
+    assert_eq!(report["criticalPath"]["tasks"], json!(["app:build"]));
+
+    let text = stdout(&success(
+        fixture.qk(&fixture.root, &["show", "task", "app:build"]),
+    ));
+    assert!(text.contains("key changed since run"), "{text}");
+    assert!(text.contains("changed src/input.txt"), "{text}");
+    assert!(text.contains("first recorded run of this task"), "{text}");
+    let text = stdout(&success(fixture.qk(&fixture.root, &["show", "run"])));
+    assert!(
+        text.contains("app:build") && text.contains("changed: files"),
+        "{text}"
+    );
+    let runs = stdout(&success(
+        fixture.qk(&fixture.root, &["show", "runs", "--json"]),
+    ));
+    assert_eq!(
+        serde_json::from_str::<Value>(&runs)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    // Linked worktrees share the history as they share the cache.
+    let linked = fixture.worktree();
+    let text = stdout(&success(fixture.qk(&linked, &["show", "runs"])));
+    assert_eq!(text.lines().count(), 2, "{text}");
+}

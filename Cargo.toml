@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/qk-cli", "crates/qk-config", "crates/qk-graph", "crates/qk-taskgraph", "crates/qk-executor", "crates/qk-runner", "crates/qk-cache", "crates/qk-lockfile", "crates/qk-affected"]
+members = ["crates/qk-cli", "crates/qk-config", "crates/qk-graph", "crates/qk-taskgraph", "crates/qk-executor", "crates/qk-runner", "crates/qk-cache", "crates/qk-lockfile", "crates/qk-affected", "crates/qk-history"]
 resolver = "3"
 
 [workspace.package]
@@ -24,6 +24,7 @@ serde_json = "1"
 serde_yaml_ng = "0.10"
 tempfile = "3"
 rusty-s3 = "0.10"
+rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }
 ureq = "3"
 url = "2"
 qk-config = { path = "crates/qk-config" }
@@ -34,6 +35,7 @@ qk-runner = { path = "crates/qk-runner" }
 qk-cache = { path = "crates/qk-cache" }
 qk-lockfile = { path = "crates/qk-lockfile" }
 qk-affected = { path = "crates/qk-affected" }
+qk-history = { path = "crates/qk-history" }
 
 [profile.release]
 lto = "thin"
