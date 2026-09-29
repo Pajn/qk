@@ -18,7 +18,8 @@ use anyhow::{Context, Result, bail};
 use qk_cache::Pattern;
 use qk_config::Workspace;
 use qk_graph::{ProjectGraph, select_projects};
-use qk_lockfile::Lockfile;
+use qk_lockfile::{Installation, Lockfile};
+use serde::Serialize;
 use serde_json::Value;
 
 use json_diff::{Change, Kind};
@@ -61,8 +62,161 @@ pub fn affected_projects(
     graph: &ProjectGraph,
     options: &Options,
 ) -> Result<BTreeSet<String>> {
+    Ok(analyse(workspace, graph, options)?
+        .projects
+        .into_keys()
+        .collect())
+}
+
+/// The affected projects and why each one is affected.
+#[derive(Debug, Serialize)]
+pub struct Analysis {
+    /// The merge base compared against.
+    pub base: Option<String>,
+    /// The head revision; `None` compares the working tree.
+    pub head: Option<String>,
+    /// The changed files considered, after ignore rules.
+    pub files: Vec<String>,
+    pub projects: BTreeMap<String, Cause>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "cause", rename_all = "camelCase")]
+pub enum Cause {
+    /// The project itself is touched by a change.
+    Touched { reasons: Vec<Reason> },
+    /// The project depends on an affected project. Of the paths to a touched
+    /// project, this is the first step of a shortest one.
+    DependsOn {
+        project: String,
+        kind: String,
+        /// The project's other affected direct dependencies.
+        also: Vec<String>,
+    },
+}
+
+/// Why a locator touches a project.
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "reason", rename_all = "camelCase")]
+pub enum Reason {
+    /// A changed file lies under the project's root.
+    File { file: String },
+    /// `nx.json` changed, which touches every project.
+    NxJson,
+    /// A changed file matches a `{workspaceRoot}` input of one of its targets.
+    WorkspaceInput {
+        file: String,
+        target: String,
+        input: String,
+    },
+    /// A project manifest was deleted, which touches every project.
+    DeletedManifest { file: String },
+    /// The lockfile changed under a `projectsAffectedByDependencyUpdates`
+    /// setting that does not look inside it.
+    DependencyUpdates { file: String, setting: Value },
+    /// The lockfile changed and qk could not compare its revisions, which
+    /// touches every project.
+    UnreadableLockfile { file: String, detail: String },
+    /// What the project's importer installs differs between the revisions.
+    Installs {
+        file: String,
+        importer: String,
+        /// Direct dependencies whose resolution changed, as `name: before -> after`.
+        direct: Vec<String>,
+        /// Snapshot keys installed only after the change.
+        added: Vec<String>,
+        /// Snapshot keys installed only before the change.
+        removed: Vec<String>,
+        /// Snapshot keys whose integrity or dependencies changed.
+        changed: Vec<String>,
+    },
+    /// A dependency in the root `package.json` changed, and the project
+    /// installs that package or is it.
+    RootDependency { name: String, path: String },
+    /// A root `package.json` change that touches every project.
+    RootPackage { detail: String },
+    /// A path mapping in the root tsconfig points into the project.
+    TsconfigPath {
+        file: String,
+        mapping: String,
+        path: String,
+    },
+    /// A root tsconfig change outside `compilerOptions.paths`, which touches
+    /// every project.
+    Tsconfig { file: String },
+}
+
+impl std::fmt::Display for Reason {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Self::File { file } => write!(f, "{file} changed"),
+            Self::NxJson => write!(f, "nx.json changed, which affects every project"),
+            Self::WorkspaceInput {
+                file,
+                target,
+                input,
+            } => write!(
+                f,
+                "{file} changed, matching input {input} of target {target}"
+            ),
+            Self::DeletedManifest { file } => write!(
+                f,
+                "{file} was deleted, which affects every project because its dependents are unknown"
+            ),
+            Self::DependencyUpdates { file, setting } => write!(
+                f,
+                "{file} changed, and projectsAffectedByDependencyUpdates is {setting}"
+            ),
+            Self::UnreadableLockfile { file, detail } => write!(
+                f,
+                "{file} changed and could not be compared ({detail}), which affects every project"
+            ),
+            Self::Installs {
+                file,
+                importer,
+                added,
+                removed,
+                changed,
+                ..
+            } => {
+                let packages: BTreeSet<&str> = added
+                    .iter()
+                    .chain(removed)
+                    .chain(changed)
+                    .map(|key| package_name(key))
+                    .collect();
+                let count = packages.len();
+                let noun = if count == 1 { "package" } else { "packages" };
+                write!(
+                    f,
+                    "what {importer} installs changed in {file} ({count} {noun})"
+                )
+            }
+            Self::RootDependency { name, path } => {
+                write!(
+                    f,
+                    "package.json changed {path}, and this project installs {name}"
+                )
+            }
+            Self::RootPackage { detail } => {
+                write!(f, "package.json {detail}, which affects every project")
+            }
+            Self::TsconfigPath {
+                file,
+                mapping,
+                path,
+            } => write!(f, "{file} path mapping {mapping} points into it ({path})"),
+            Self::Tsconfig { file } => write!(
+                f,
+                "{file} changed outside compilerOptions.paths, which affects every project"
+            ),
+        }
+    }
+}
+
+pub fn analyse(workspace: &Workspace, graph: &ProjectGraph, options: &Options) -> Result<Analysis> {
     let changes = Changes::new(workspace, options)?;
-    let mut touched = BTreeSet::new();
+    let mut touches = Touches::default();
     for locator in [
         touched_by_path,
         touched_implicitly,
@@ -71,28 +225,90 @@ pub fn affected_projects(
         touched_by_root_package,
         touched_by_root_tsconfig,
     ] {
-        touched.extend(locator(workspace, graph, &changes)?);
+        locator(workspace, &changes, &mut touches)?;
     }
-    // Dependents of a touched project are affected, transitively.
-    let mut dependents: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let mut dependents: BTreeMap<&str, Vec<(&str, &str)>> = BTreeMap::new();
     for (source, edges) in &graph.dependencies {
         for edge in edges {
-            dependents.entry(&edge.target).or_default().push(source);
+            dependents
+                .entry(&edge.target)
+                .or_default()
+                .push((source, &edge.kind));
         }
     }
-    let mut affected = BTreeSet::new();
-    let mut pending: Vec<String> = touched.into_iter().collect();
-    while let Some(project) = pending.pop() {
+    let mut projects = BTreeMap::new();
+    let mut pending = std::collections::VecDeque::new();
+    for (project, reasons) in touches.0 {
         if !workspace.projects.contains_key(&project) {
             bail!("invalid project name {project:?}");
         }
-        if affected.insert(project.clone()) {
-            for dependent in dependents.get(project.as_str()).into_iter().flatten() {
-                pending.push((*dependent).to_owned());
+        pending.push_back(project.clone());
+        projects.insert(project, Cause::Touched { reasons });
+    }
+    // Breadth first, so each dependent records a step of a shortest path.
+    while let Some(project) = pending.pop_front() {
+        for (dependent, kind) in dependents.get(project.as_str()).into_iter().flatten() {
+            if !projects.contains_key(*dependent) {
+                projects.insert(
+                    (*dependent).to_owned(),
+                    Cause::DependsOn {
+                        project: project.clone(),
+                        kind: (*kind).to_owned(),
+                        also: Vec::new(),
+                    },
+                );
+                pending.push_back((*dependent).to_owned());
             }
         }
     }
-    Ok(affected)
+    let affected: BTreeSet<String> = projects.keys().cloned().collect();
+    for (name, cause) in &mut projects {
+        if let Cause::DependsOn { project, also, .. } = cause {
+            *also = graph.dependencies[name]
+                .iter()
+                .map(|edge| &edge.target)
+                .filter(|target| *target != project && affected.contains(*target))
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+        }
+    }
+    Ok(Analysis {
+        base: changes.base,
+        head: changes.head,
+        files: changes.files,
+        projects,
+    })
+}
+
+impl Analysis {
+    /// The path from `project` to the touched project it is affected through,
+    /// starting with `project`, or `None` when it is not affected.
+    pub fn chain(&self, project: &str) -> Option<Vec<&str>> {
+        let mut chain = vec![self.projects.get_key_value(project)?.0.as_str()];
+        while let Some(Cause::DependsOn { project, .. }) = self.projects.get(*chain.last().unwrap())
+        {
+            chain.push(project);
+        }
+        Some(chain)
+    }
+}
+
+/// Reasons by touched project.
+#[derive(Default)]
+struct Touches(BTreeMap<String, Vec<Reason>>);
+
+impl Touches {
+    fn touch(&mut self, project: &str, reason: Reason) {
+        self.0.entry(project.to_owned()).or_default().push(reason);
+    }
+
+    fn all(&mut self, workspace: &Workspace, reason: Reason) {
+        for project in workspace.projects.keys() {
+            self.touch(project, reason.clone());
+        }
+    }
 }
 
 /// The changed files, and each one's content at the two revisions.
@@ -317,25 +533,18 @@ fn git_lines(root: &Path, args: &[&str]) -> Result<Vec<String>> {
         .collect())
 }
 
-fn all(workspace: &Workspace) -> BTreeSet<String> {
-    workspace.projects.keys().cloned().collect()
-}
-
-type Touched = Result<BTreeSet<String>>;
-
 /// Each file touches the project whose root most specifically contains it.
-fn touched_by_path(workspace: &Workspace, _: &ProjectGraph, changes: &Changes) -> Touched {
+fn touched_by_path(workspace: &Workspace, changes: &Changes, touches: &mut Touches) -> Result<()> {
     let roots: BTreeMap<&str, &str> = workspace
         .projects
         .values()
         .map(|project| (project.root.as_str(), project.name.as_str()))
         .collect();
-    let mut touched = BTreeSet::new();
     for file in &changes.files {
         let mut path = file.as_str();
         loop {
             if let Some(project) = roots.get(path) {
-                touched.insert((*project).to_owned());
+                touches.touch(project, Reason::File { file: file.clone() });
                 break;
             }
             match path.rfind('/') {
@@ -345,18 +554,24 @@ fn touched_by_path(workspace: &Workspace, _: &ProjectGraph, changes: &Changes) -
             }
         }
     }
-    Ok(touched)
+    Ok(())
 }
 
 /// `nx.json` touches every project; a file named by a `{workspaceRoot}` input
 /// touches the projects declaring it.
-fn touched_implicitly(workspace: &Workspace, _: &ProjectGraph, changes: &Changes) -> Touched {
+fn touched_implicitly(
+    workspace: &Workspace,
+    changes: &Changes,
+    touches: &mut Touches,
+) -> Result<()> {
     if changes.changed("nx.json") {
-        return Ok(all(workspace));
+        touches.all(workspace, Reason::NxJson);
+        return Ok(());
     }
-    let mut patterns: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    // Each glob with the targets declaring it, in the order Nx finds them.
+    let mut patterns: BTreeMap<String, Vec<(&str, &str)>> = BTreeMap::new();
     for project in workspace.projects.values() {
-        for target in project.targets.values() {
+        for (name, target) in &project.targets {
             let mut globs = Vec::new();
             workspace_inputs(
                 target.inputs.as_deref().unwrap_or_default(),
@@ -368,25 +583,33 @@ fn touched_implicitly(workspace: &Workspace, _: &ProjectGraph, changes: &Changes
                 patterns
                     .entry(glob)
                     .or_default()
-                    .insert(project.name.clone());
+                    .push((&project.name, name));
             }
         }
     }
     let mut workspace_file_reaches_tasks = None;
-    let mut touched = BTreeSet::new();
-    for (pattern, projects) in patterns {
+    for (pattern, declarations) in patterns {
         let matcher = Pattern::new(&pattern, false)?;
-        let changed = changes.files.iter().any(|file| {
+        let Some(file) = changes.files.iter().find(|file| {
             matcher.is_match(file)
-                && (file != "pnpm-workspace.yaml"
+                && (*file != "pnpm-workspace.yaml"
                     || *workspace_file_reaches_tasks
                         .get_or_insert_with(|| pnpm_workspace_change_reaches_tasks(changes)))
-        });
-        if changed {
-            touched.extend(projects);
+        }) else {
+            continue;
+        };
+        for (project, target) in declarations {
+            touches.touch(
+                project,
+                Reason::WorkspaceInput {
+                    file: file.clone(),
+                    target: target.to_owned(),
+                    input: format!("{{workspaceRoot}}/{pattern}"),
+                },
+            );
         }
     }
-    Ok(touched)
+    Ok(())
 }
 
 /// Nx's `extractFilesFromInputs`: named inputs are followed, and plain or
@@ -433,21 +656,24 @@ fn pnpm_workspace_change_reaches_tasks(changes: &Changes) -> bool {
 /// way of knowing what depended on it.
 fn touched_by_deleted_manifests(
     workspace: &Workspace,
-    _: &ProjectGraph,
     changes: &Changes,
-) -> Touched {
-    let deleted = changes.files.iter().any(|file| {
+    touches: &mut Touches,
+) -> Result<()> {
+    let deleted = changes.files.iter().find(|file| {
         let name = file.rsplit('/').next().unwrap_or(file);
         matches!(name, "project.json" | "package.json") && !workspace.root.join(file).exists()
     });
-    Ok(if deleted {
-        all(workspace)
-    } else {
-        BTreeSet::new()
-    })
+    if let Some(file) = deleted {
+        touches.all(workspace, Reason::DeletedManifest { file: file.clone() });
+    }
+    Ok(())
 }
 
-fn touched_by_lockfile(workspace: &Workspace, _: &ProjectGraph, changes: &Changes) -> Touched {
+fn touched_by_lockfile(
+    workspace: &Workspace,
+    changes: &Changes,
+    touches: &mut Touches,
+) -> Result<()> {
     let Some(file) = changes.files.iter().find(|file| {
         [
             "pnpm-lock.yaml",
@@ -457,35 +683,105 @@ fn touched_by_lockfile(workspace: &Workspace, _: &ProjectGraph, changes: &Change
         ]
         .contains(&file.as_str())
     }) else {
-        return Ok(BTreeSet::new());
+        return Ok(());
     };
-    match projects_affected_by_dependency_updates(workspace) {
+    let setting = projects_affected_by_dependency_updates(workspace);
+    let reason = Reason::DependencyUpdates {
+        file: file.clone(),
+        setting: setting.clone(),
+    };
+    match &setting {
         Value::String(mode) if mode == "auto" => {}
         Value::Array(selectors) => {
-            let selectors: Vec<String> = serde_json::from_value(Value::Array(selectors))
+            let selectors: Vec<String> = serde_json::from_value(Value::Array(selectors.clone()))
                 .context("projectsAffectedByDependencyUpdates must list project selectors")?;
-            return Ok(select_projects(&workspace.projects, &selectors, &[])?
-                .into_iter()
-                .collect());
+            for project in select_projects(&workspace.projects, &selectors, &[])? {
+                touches.touch(&project, reason.clone());
+            }
+            return Ok(());
         }
-        _ => return Ok(all(workspace)),
+        _ => {
+            touches.all(workspace, reason);
+            return Ok(());
+        }
     }
+    let unreadable = |detail: &str| Reason::UnreadableLockfile {
+        file: file.clone(),
+        detail: detail.to_owned(),
+    };
     let FileChange::Lockfile { before, after } = changes.change(file) else {
-        return Ok(all(workspace));
+        touches.all(workspace, unreadable("a revision could not be read"));
+        return Ok(());
     };
     if file != "pnpm-lock.yaml" {
-        // qk reads pnpm lockfiles only.
-        return Ok(all(workspace));
+        touches.all(workspace, unreadable("qk reads pnpm lockfiles only"));
+        return Ok(());
     }
-    let (Ok(before), Ok(after)) = (Lockfile::parse(&before), Lockfile::parse(&after)) else {
-        return Ok(all(workspace));
+    let (before, after) = match (Lockfile::parse(&before), Lockfile::parse(&after)) {
+        (Ok(before), Ok(after)) => (before, after),
+        (Err(error), _) | (_, Err(error)) => {
+            touches.all(workspace, unreadable(&format!("{error:#}")));
+            return Ok(());
+        }
     };
-    Ok(workspace
-        .projects
-        .values()
-        .filter(|project| before.installed(&project.root) != after.installed(&project.root))
-        .map(|project| project.name.clone())
-        .collect())
+    for project in workspace.projects.values() {
+        let (old, new) = (
+            before.installation(&project.root),
+            after.installation(&project.root),
+        );
+        if old == new {
+            continue;
+        }
+        let empty = || Installation {
+            direct: BTreeMap::new(),
+            snapshots: BTreeMap::new(),
+        };
+        let (old, new) = (old.unwrap_or_else(empty), new.unwrap_or_else(empty));
+        let direct = old
+            .direct
+            .keys()
+            .chain(new.direct.keys())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter(|name| old.direct.get(*name) != new.direct.get(*name))
+            .map(|name| {
+                let show = |key: Option<&String>| key.map_or("(none)", String::as_str).to_owned();
+                format!(
+                    "{name}: {} -> {}",
+                    show(old.direct.get(name)),
+                    show(new.direct.get(name))
+                )
+            })
+            .collect();
+        let only = |one: &Installation, other: &Installation| -> Vec<String> {
+            one.snapshots
+                .keys()
+                .filter(|key| !other.snapshots.contains_key(*key))
+                .cloned()
+                .collect()
+        };
+        touches.touch(
+            &project.name,
+            Reason::Installs {
+                file: file.clone(),
+                importer: project.root.clone(),
+                direct,
+                added: only(&new, &old),
+                removed: only(&old, &new),
+                changed: old
+                    .snapshots
+                    .iter()
+                    .filter(|(key, fingerprint)| {
+                        new.snapshots
+                            .get(*key)
+                            .is_some_and(|other| other != *fingerprint)
+                    })
+                    .map(|(key, _)| key.clone())
+                    .collect(),
+            },
+        );
+    }
+    Ok(())
 }
 
 /// `pluginsConfig["@nx/js"].projectsAffectedByDependencyUpdates`, which Nx
@@ -503,9 +799,13 @@ fn projects_affected_by_dependency_updates(workspace: &Workspace) -> Value {
 
 /// Nx's `getTouchedNpmPackages`: a dependency changed in the root
 /// `package.json` touches the projects installing that package.
-fn touched_by_root_package(workspace: &Workspace, _: &ProjectGraph, changes: &Changes) -> Touched {
+fn touched_by_root_package(
+    workspace: &Workspace,
+    changes: &Changes,
+    touches: &mut Touches,
+) -> Result<()> {
     if !changes.changed("package.json") {
-        return Ok(BTreeSet::new());
+        return Ok(());
     }
     let installed = installed_packages(workspace, changes);
     let installing = |name: &str| -> Option<BTreeSet<String>> {
@@ -519,50 +819,95 @@ fn touched_by_root_package(workspace: &Workspace, _: &ProjectGraph, changes: &Ch
     };
     let FileChange::Json(diff) = changes.change("package.json") else {
         // Every package is touched, so every project installing one is.
-        return Ok(match &installed {
-            Some(installed) => installed
-                .iter()
-                .filter(|(_, packages)| !packages.is_empty())
-                .map(|(project, _)| project.clone())
-                .collect(),
-            None => all(workspace),
-        });
+        let reason = Reason::RootPackage {
+            detail: "could not be compared".into(),
+        };
+        match &installed {
+            Some(installed) => {
+                for (project, packages) in installed {
+                    if !packages.is_empty() {
+                        touches.touch(project, reason.clone());
+                    }
+                }
+            }
+            None => touches.all(workspace, reason),
+        }
+        return Ok(());
     };
-    let mut touched = BTreeSet::new();
     for change in diff {
         let path: Vec<&str> = change.path.iter().map(String::as_str).collect();
+        let dotted = path.join(".");
+        let everything = |detail: String, touches: &mut Touches| {
+            touches.all(workspace, Reason::RootPackage { detail });
+        };
         match path.as_slice() {
             ["dependencies" | "devDependencies", name] => {
                 if change.kind == Kind::Deleted {
-                    return Ok(all(workspace));
+                    everything(format!("removed {dotted}"), touches);
+                    return Ok(());
                 }
                 if *name == "nx" {
-                    return Ok(all(workspace));
+                    everything(
+                        format!("changed {dotted}, which Nx treats as global"),
+                        touches,
+                    );
+                    return Ok(());
                 }
+                let mut touch = |projects: BTreeSet<String>, name: &str| {
+                    for project in projects {
+                        touches.touch(
+                            &project,
+                            Reason::RootDependency {
+                                name: name.to_owned(),
+                                path: dotted.clone(),
+                            },
+                        );
+                    }
+                };
                 if let Some(projects) = installing(name) {
-                    touched.extend(projects);
+                    touch(projects, name);
                     if let Some(implementation) = name.strip_prefix("@types/")
                         && let Some(projects) = installing(implementation)
                     {
-                        touched.extend(projects);
+                        touch(projects, implementation);
                     }
                 } else if workspace.projects.contains_key(*name) {
-                    touched.insert((*name).to_owned());
+                    touch(BTreeSet::from([(*name).to_owned()]), name);
                 }
             }
             ["overrides" | "resolutions", name, ..] | ["pnpm", "overrides", name, ..] => {
                 if *name == "nx" {
-                    return Ok(all(workspace));
+                    everything(
+                        format!("changed {dotted}, which Nx treats as global"),
+                        touches,
+                    );
+                    return Ok(());
                 }
                 match installing(name) {
-                    Some(projects) => touched.extend(projects),
-                    None => return Ok(all(workspace)),
+                    Some(projects) => {
+                        for project in projects {
+                            touches.touch(
+                                &project,
+                                Reason::RootDependency {
+                                    name: (*name).to_owned(),
+                                    path: dotted.clone(),
+                                },
+                            );
+                        }
+                    }
+                    None => {
+                        everything(
+                            format!("changed {dotted} for a package nothing installs"),
+                            touches,
+                        );
+                        return Ok(());
+                    }
                 }
             }
             _ => {}
         }
     }
-    Ok(touched)
+    Ok(())
 }
 
 /// The package names each project's importer installs, from the head revision
@@ -589,29 +934,36 @@ fn installed_packages(
 
 /// Nx's `getTouchedProjectsFromTsConfig`: changed path mappings in the root
 /// tsconfig touch the projects they point into; any other change touches all.
-fn touched_by_root_tsconfig(workspace: &Workspace, _: &ProjectGraph, changes: &Changes) -> Touched {
+fn touched_by_root_tsconfig(
+    workspace: &Workspace,
+    changes: &Changes,
+    touches: &mut Touches,
+) -> Result<()> {
     let Some(file) = ["tsconfig.base.json", "tsconfig.json"]
         .into_iter()
         .find(|name| workspace.root.join(name).exists())
     else {
-        return Ok(BTreeSet::new());
+        return Ok(());
     };
     if !changes.changed(file) {
-        return Ok(BTreeSet::new());
+        return Ok(());
     }
+    let everything = Reason::Tsconfig { file: file.into() };
     let FileChange::Json(diff) = changes.change(file) else {
-        return Ok(all(workspace));
+        touches.all(workspace, everything);
+        return Ok(());
     };
     let is_path_mapping = |change: &Change| {
         change.path[0] == "compilerOptions" && change.path.get(1).is_none_or(|key| key == "paths")
     };
     if !diff.iter().all(is_path_mapping) {
-        return Ok(all(workspace));
+        touches.all(workspace, everything);
+        return Ok(());
     }
-    let mut touched = BTreeSet::new();
     for change in diff.iter().filter(|change| change.path.len() == 4) {
         if change.kind == Kind::Deleted {
-            return Ok(all(workspace));
+            touches.all(workspace, everything);
+            return Ok(());
         }
         for value in [&change.before, &change.after].into_iter().flatten() {
             let Some(path) = value.as_str() else { continue };
@@ -619,10 +971,24 @@ fn touched_by_root_tsconfig(workspace: &Workspace, _: &ProjectGraph, changes: &C
             for project in workspace.projects.values() {
                 let root = project.root.strip_suffix('/').unwrap_or(&project.root);
                 if !root.is_empty() && (path == root || path.starts_with(&format!("{root}/"))) {
-                    touched.insert(project.name.clone());
+                    touches.touch(
+                        &project.name,
+                        Reason::TsconfigPath {
+                            file: file.into(),
+                            mapping: change.path[2].clone(),
+                            path: path.to_owned(),
+                        },
+                    );
                 }
             }
         }
     }
-    Ok(touched)
+    Ok(())
+}
+
+/// The package a snapshot key installs.
+fn package_name(key: &str) -> &str {
+    let key = &key[..key.find('(').unwrap_or(key.len())];
+    let start = usize::from(key.starts_with('@'));
+    key[start..].find('@').map_or(key, |at| &key[..start + at])
 }

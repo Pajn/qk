@@ -56,6 +56,7 @@ parent workspace marker exists.
 | `qk run web:build --dry-run` | Print the planned task graph as JSON without execution |
 | `qk show projects --affected [--base <rev>] [--head <rev>]` | Projects affected by the changes, in graph order |
 | `qk affected -t build,test [--base <rev>] [--head <rev>]` | Execute targets on the affected projects |
+| `qk show affected [project] [--json]` | Why projects are affected, or why one project is |
 | `qk cache path` | Print the local cache directory without creating it |
 
 As in Nx, `qk build web` and `qk web:build` mean `qk run web:build`, and take the
@@ -102,6 +103,32 @@ Two rules deliberately differ from Nx:
 
 `show projects --affected` prints projects in graph order; Nx prints its
 traversal order, so compare the two as sets.
+
+`qk show affected` takes the same change options and explains the result.
+Without a project it lists every affected project with the first reason it
+is touched, or the dependency it is affected through. With a project it
+prints a shortest dependency path to a touched project, the project's other
+affected dependencies, and every reason the touched project is touched. For
+a lockfile reason it lists what the importer installs differently, by
+package: versions that moved first, then packages added or removed, then
+those that kept their version but resolved different peers or patch, then
+those whose dependencies changed as a consequence.
+
+```text
+$ qk show affected web --base HEAD^ --head HEAD
+2 changed files between 3f1c0a9e2b7d and HEAD.
+web is affected because it depends on ui:
+  web -> ui (static)
+ui is touched:
+  what packages/ui installs changed in pnpm-lock.yaml (3 packages)
+      react (direct): 19.0.0 -> 19.1.0
+      react-dom (direct): 19.0.0: peers or patch changed
+      scheduler: dependencies or integrity changed
+```
+
+`--json` gives the whole analysis, or for one project its path with the
+typed reasons, including the snapshot keys a lockfile change added,
+removed or changed.
 
 Project selectors support `*`, `?`, character classes and `tag:<glob>`.
 Repeat `--projects` or use commas to combine selectors. Prefix a selector

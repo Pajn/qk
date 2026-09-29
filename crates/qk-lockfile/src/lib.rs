@@ -12,6 +12,15 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+/// What one importer installs.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Installation {
+    /// Each direct dependency's installed name and the snapshot key it resolves to.
+    pub direct: BTreeMap<String, String>,
+    /// Each snapshot reached, by key, with its fingerprint.
+    pub snapshots: BTreeMap<String, String>,
+}
+
 #[derive(Debug)]
 pub struct Lockfile {
     /// Importer path (`.` for the workspace root) to dependency name and reference.
@@ -162,14 +171,33 @@ impl Lockfile {
     /// Workspace links are left out; they are projects, not packages. `None`
     /// when the lockfile has no such importer.
     pub fn installed(&self, importer: &str) -> Option<BTreeSet<String>> {
-        let direct = self.direct(importer)?;
-        let mut fingerprints: BTreeSet<String> = direct
+        let installation = self.installation(importer)?;
+        let mut fingerprints: BTreeSet<String> = installation
+            .direct
             .iter()
             .map(|(name, key)| format!("{name} -> {key}"))
             .collect();
-        let keys = self.reach(direct.into_iter().map(|(_, key)| key).collect());
-        fingerprints.extend(keys.iter().map(|key| self.fingerprint(key)));
+        fingerprints.extend(installation.snapshots.into_values());
         Some(fingerprints)
+    }
+
+    /// What `importer` installs, keyed for comparison between revisions.
+    pub fn installation(&self, importer: &str) -> Option<Installation> {
+        let direct = self.direct(importer)?;
+        let keys = self.reach(direct.iter().map(|(_, key)| key.clone()).collect());
+        Some(Installation {
+            direct: direct
+                .into_iter()
+                .map(|(name, key)| (name.to_owned(), key))
+                .collect(),
+            snapshots: keys
+                .into_iter()
+                .map(|key| {
+                    let fingerprint = self.fingerprint(&key);
+                    (key, fingerprint)
+                })
+                .collect(),
+        })
     }
 
     /// The names of the packages `importer` installs, directly or not. `None`

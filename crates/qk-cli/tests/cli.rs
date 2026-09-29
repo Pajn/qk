@@ -278,3 +278,36 @@ fn affected_selects_touched_projects_and_their_dependents() {
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("no affected tasks"));
 }
+
+#[test]
+fn show_affected_explains_why() {
+    let files = "packages/core/index.js,tools/codegen/x.ts";
+    let output = qk(&["show", "affected", "web", "--files", files]);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.contains("web is affected because it depends on codegen:"),
+        "{text}"
+    );
+    assert!(text.contains("  web -> codegen (implicit)"), "{text}");
+    assert!(text.contains("also depends on affected core"), "{text}");
+    assert!(text.contains("  tools/codegen/x.ts changed"), "{text}");
+
+    let report = successful_json(qk(&["show", "affected", "web", "--files", files, "--json"]));
+    assert_eq!(report["affected"], true);
+    assert_eq!(report["chain"][0]["dependsOn"], "codegen");
+    assert_eq!(report["chain"][1]["reasons"][0]["reason"], "file");
+
+    // A root file touches no project here.
+    let output = qk(&["show", "affected", "--files", "README.md"]);
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.starts_with("1 changed file between"), "{text}");
+    assert_eq!(text.lines().count(), 1, "{text}");
+    let output = qk(&["show", "affected", "core", "--files", "README.md"]);
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("core is not affected.")
+    );
+    assert!(!qk(&["show", "affected", "missing"]).status.success());
+}

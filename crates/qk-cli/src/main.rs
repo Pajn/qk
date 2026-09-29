@@ -1,3 +1,5 @@
+mod explain;
+
 use std::io::{self, Write};
 use std::path::PathBuf;
 
@@ -123,8 +125,12 @@ struct ChangeOptions {
 
 impl ChangeOptions {
     fn affected(&self, workspace: &Workspace) -> Result<std::collections::BTreeSet<String>> {
+        Ok(self.analyse(workspace)?.projects.into_keys().collect())
+    }
+
+    fn analyse(&self, workspace: &Workspace) -> Result<qk_affected::Analysis> {
         let graph = ProjectGraph::build(workspace)?;
-        qk_affected::affected_projects(
+        qk_affected::analyse(
             workspace,
             &graph,
             &qk_affected::Options {
@@ -165,6 +171,16 @@ enum ShowCommand {
         #[arg(long, value_delimiter = ',', action = clap::ArgAction::Append)]
         exclude: Vec<String>,
         /// Emit a JSON array instead of one name per line.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Explain which projects are affected and why; with a project, the path
+    /// from it to the change that affects it.
+    Affected {
+        project: Option<String>,
+        #[command(flatten)]
+        changes: ChangeOptions,
+        /// Emit JSON instead of text.
         #[arg(long)]
         json: bool,
     },
@@ -384,6 +400,23 @@ fn run(cli: Cli) -> Result<i32> {
                     writeln!(stdout, "{name}")?;
                 }
             }
+        }
+        Command::Show {
+            command:
+                ShowCommand::Affected {
+                    project,
+                    changes,
+                    json,
+                },
+        } => {
+            let analysis = changes.analyse(&workspace)?;
+            explain::explain(
+                &workspace,
+                &analysis,
+                project.as_deref(),
+                json,
+                &mut io::stdout().lock(),
+            )?;
         }
         Command::Show {
             command: ShowCommand::Project { name, .. },

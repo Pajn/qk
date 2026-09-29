@@ -285,3 +285,88 @@ fn root_tsconfig_path_changes_affect_the_projects_they_map_into() {
     );
     assert_eq!(repo.committed(), names(&["app", "lib", "tool"]));
 }
+
+fn analyse(repo: &Repo, base: &str, head: &str) -> qk_affected::Analysis {
+    let workspace = Workspace::load(&repo.root).unwrap();
+    let graph = ProjectGraph::build(&workspace).unwrap();
+    qk_affected::analyse(
+        &workspace,
+        &graph,
+        &Options {
+            base: Some(base.to_owned()),
+            head: Some(head.to_owned()),
+            ..Options::default()
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn explains_each_project_through_a_shortest_path_to_its_reasons() {
+    use qk_affected::{Cause, Reason};
+    let repo = Repo::new(&[]);
+    write(&repo.root, "libs/lib/src/index.ts", "changed");
+    write(
+        &repo.root,
+        "tsconfig.app.json",
+        r#"{"compilerOptions": {}}"#,
+    );
+    let first = commit(&repo.root);
+    let analysis = analyse(&repo, &repo.base, &first);
+    assert_eq!(analysis.chain("app"), Some(vec!["app"]));
+    assert_eq!(analysis.chain("lib"), Some(vec!["lib"]));
+    assert_eq!(analysis.chain("tool"), None);
+    let Cause::Touched { reasons } = &analysis.projects["app"] else {
+        panic!("app is touched by its workspace input");
+    };
+    assert!(matches!(
+        &reasons[..],
+        [Reason::WorkspaceInput { file, target, input }]
+            if file == "tsconfig.app.json" && target == "tsc" && input == "{workspaceRoot}/tsconfig.*.json"
+    ));
+    assert_eq!(
+        reasons[0].to_string(),
+        "tsconfig.app.json changed, matching input {workspaceRoot}/tsconfig.*.json of target tsc"
+    );
+
+    write(&repo.root, "libs/lib/src/index.ts", "changed again");
+    let analysis = analyse(&repo, &first, &commit(&repo.root));
+    assert_eq!(analysis.chain("app"), Some(vec!["app", "lib"]));
+    assert!(matches!(
+        &analysis.projects["app"],
+        Cause::DependsOn { project, kind, also } if project == "lib" && kind == "implicit" && also.is_empty()
+    ));
+}
+
+#[test]
+fn explains_lockfile_touches_by_what_changed() {
+    use qk_affected::{Cause, Reason};
+    let repo = Repo::new(&[("pnpm-lock.yaml", &lockfile("19.0.0", "19.0.0"))]);
+    write(&repo.root, "pnpm-lock.yaml", &lockfile("19.0.0", "19.1.0"));
+    let analysis = analyse(&repo, &repo.base, &commit(&repo.root));
+    let Cause::Touched { reasons } = &analysis.projects["tool"] else {
+        panic!("tool is touched by the lockfile");
+    };
+    let [
+        Reason::Installs {
+            importer,
+            direct,
+            added,
+            removed,
+            changed,
+            ..
+        },
+    ] = &reasons[..]
+    else {
+        panic!("{reasons:?}");
+    };
+    assert_eq!(importer, "tools/tool");
+    assert_eq!(direct, &["react: react@19.0.0 -> react@19.1.0"]);
+    assert_eq!(added, &["react@19.1.0"]);
+    assert_eq!(removed, &["react@19.0.0"]);
+    assert!(changed.is_empty());
+    assert_eq!(
+        reasons[0].to_string(),
+        "what tools/tool installs changed in pnpm-lock.yaml (1 package)"
+    );
+}
