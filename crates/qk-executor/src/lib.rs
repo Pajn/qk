@@ -102,7 +102,12 @@ fn task_environment(
 ) -> Result<BTreeMap<OsString, OsString>> {
     let mut env = base_env.clone();
     let root = &workspace.projects[&task.project].root;
-    for file in dotenv_files(root, &task.target, task.configuration.as_deref()) {
+    let files = if loads_dotenv(base_env) {
+        dotenv_files(root, &task.target, task.configuration.as_deref())
+    } else {
+        Vec::new()
+    };
+    for file in files {
         for (name, value) in read_dotenv(&workspace.root.join(file))? {
             env.entry(name).or_insert(value);
         }
@@ -129,6 +134,13 @@ fn task_environment(
     Ok(env)
 }
 
+/// Whether dotenv files load: as in Nx, `NX_LOAD_DOT_ENV_FILES=false` turns
+/// them all off.
+fn loads_dotenv(env: &BTreeMap<OsString, OsString>) -> bool {
+    env.get(std::ffi::OsStr::new("NX_LOAD_DOT_ENV_FILES"))
+        .is_none_or(|value| value != "false")
+}
+
 /// A dotenv file's entries, or none when it does not exist.
 fn read_dotenv(path: &Path) -> Result<Vec<(OsString, OsString)>> {
     let file = match std::fs::File::open(path) {
@@ -152,7 +164,13 @@ fn read_dotenv(path: &Path) -> Result<Vec<(OsString, OsString)>> {
 /// Existing process variables win over .env.local, which wins over .env.
 pub fn environment(workspace: &Path) -> Result<BTreeMap<OsString, OsString>> {
     let mut values = BTreeMap::new();
-    for name in [".env", ".env.local"] {
+    let process: BTreeMap<OsString, OsString> = std::env::vars_os().collect();
+    let names: &[&str] = if loads_dotenv(&process) {
+        &[".env", ".env.local"]
+    } else {
+        &[]
+    };
+    for name in names {
         let path = workspace.join(name);
         let file = match std::fs::File::open(&path) {
             Ok(file) => file,
@@ -240,6 +258,19 @@ pub fn prepare(
     let interpolation =
         interpolate::Interpolation::new(workspace, task, args, &forwarded, extra.as_deref())?;
     let mut env = task_environment(workspace, task, base_env)?;
+    // As in Nx, `envFile` sets what is not set yet, beneath `env`.
+    if let Some(file) = options.get("envFile") {
+        let file = interpolation.text(file.as_str().context("envFile must be a string")?)?;
+        let path = workspace.root.join(&file);
+        if loads_dotenv(base_env) {
+            if !path.is_file() {
+                bail!("envFile {file} does not exist");
+            }
+            for (name, value) in read_dotenv(&path)? {
+                env.entry(name).or_insert(value);
+            }
+        }
+    }
     for values in [definition.extra.get("env"), options.get("env")]
         .into_iter()
         .flatten()
@@ -254,21 +285,15 @@ pub fn prepare(
             env.insert(name.into(), interpolation.text(value)?.into());
         }
     }
+    if executor == "nx:run-commands" && boolean(options.get("color"), false, "color")? {
+        env.insert("FORCE_COLOR".into(), "true".into());
+    }
     for key in options.keys() {
         let allowed = match executor {
-            "nx:run-commands" => {
-                matches!(
-                    key.as_str(),
-                    "command"
-                        | "commands"
-                        | "cwd"
-                        | "env"
-                        | "parallel"
-                        | "forwardAllArgs"
-                        | "args"
-                        | "readyWhen"
-                ) || !RUN_COMMANDS.contains(&key.as_str())
-            }
+            // Every run-commands option is supported. `tty`, `usePty`,
+            // `streamOutput` and `verbose` have no effect: qk never gives
+            // commands a terminal, and Nx sets the others itself.
+            "nx:run-commands" => true,
             "nx:run-script" => matches!(key.as_str(), "script" | "env" | "cwd"),
             "nx:noop" => true,
             _ => bail!("unsupported executor {executor:?}"),

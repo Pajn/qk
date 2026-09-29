@@ -238,9 +238,10 @@ Supported executors:
   ignored. A task argument naming a run-commands option sets it rather than
   reaching the command: `-- --args='--watch'`, `--cwd=dir`, `--no-parallel`,
   `--env.NAME=value`. `readyWhen`, a string or an array, is described with
-  continuous tasks below. The options Nx knows but qk does not implement
-  (`envFile`, `color`, `usePty`, `streamOutput`, `tty`, `verbose`) are
-  rejected.
+  continuous tasks below. `envFile` loads a dotenv file, relative to the
+  workspace root, beneath `env`, and `color: true` sets `FORCE_COLOR=true`.
+  `tty`, `usePty`, `streamOutput` and `verbose` are accepted and have no
+  effect: qk never gives commands a terminal, and Nx sets the others itself.
 - `nx:run-script`: invokes `npm run` or `pnpm run` in the project directory,
   preserving the package manager's script behavior. The manager comes from
   root `packageManager`, then pnpm workspace/lockfile markers, otherwise npm.
@@ -253,9 +254,10 @@ Commands use `/bin/sh -c` on Unix and `cmd.exe /D /S /C` on Windows. Local
 to `PATH`. Tasks currently have closed stdin; interactive tasks are not
 supported. qk writes its own status messages to stderr.
 
-Environment precedence, highest first: configuration `env`, `options.env`,
-target-level `env`, the variables Nx sets for every task, the inherited
-process environment, then the task's dotenv files in Nx's order: in the
+Environment precedence, highest first: `FORCE_COLOR` from `color: true`,
+configuration `env`, `options.env`, target-level `env`, the variables Nx sets
+for every task, the inherited process environment, `envFile`, then the
+task's dotenv files in Nx's order: in the
 project root and then the workspace root, `.env.<target>.<configuration>`,
 `.env.<configuration>`, `.env.<target>`, then `.env.local`, `.local.env` and
 `.env`, each also as `.env.<name>.local`, `.<name>.local.env` and
@@ -265,7 +267,8 @@ task variables are `NX_TASK_TARGET_PROJECT`, `NX_TASK_TARGET_TARGET`,
 `NX_TUI=false` and `FORCE_COLOR`, which is `true` unless already set.
 Dotenv is loaded into child environments without mutating qk's process
 environment; qk's own environment, where remote cache credentials arrive,
-includes the root `.env.local` and `.env`. Dotenv interpolation uses
+includes the root `.env.local` and `.env`. `NX_LOAD_DOT_ENV_FILES=false`
+turns every dotenv file off, `envFile` included, as in Nx. Dotenv interpolation uses
 dotenvy's per-file semantics; it does not provide cross-file interpolation
 against the merged child environment.
 

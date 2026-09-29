@@ -860,3 +860,57 @@ fn ready_when_starts_dependents_once_the_output_appears() {
             .contains("readyWhen can only be used when parallel is true")
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn env_files_color_and_the_options_nx_sets_itself() {
+    let temp = fixture(json!({
+        "show": {"command": "echo $FROM_FILE $BOTH $SET_OUTSIDE", "options": {
+            "envFile": "config/{projectName}.env", "env": {"BOTH": "option"}
+        }},
+        "missing": {"command": "true", "options": {"envFile": "absent.env"}},
+        "color": {"command": "echo $FORCE_COLOR", "options": {"color": true, "tty": true, "usePty": false, "streamOutput": true, "verbose": false}}
+    }));
+    fs::create_dir(temp.path().join("config")).unwrap();
+    fs::write(
+        temp.path().join("config/app.env"),
+        "FROM_FILE=file\nBOTH=file\nSET_OUTSIDE=file\n",
+    )
+    .unwrap();
+    fs::write(temp.path().join(".env"), "FROM_DOTENV=dotenv\n").unwrap();
+    let stdout = |output: Output| String::from_utf8(success(output).stdout).unwrap();
+    assert_eq!(
+        stdout(
+            command(temp.path(), &["run", "app:show"])
+                .env("SET_OUTSIDE", "process")
+                .output()
+                .unwrap()
+        ),
+        "file option process\n"
+    );
+    let missing = run(temp.path(), &["run", "app:missing"]);
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("envFile absent.env does not exist"));
+    assert_eq!(
+        stdout(
+            command(temp.path(), &["run", "app:color"])
+                .env("FORCE_COLOR", "0")
+                .output()
+                .unwrap()
+        ),
+        "true\n"
+    );
+    // NX_LOAD_DOT_ENV_FILES=false turns every dotenv file off, as in Nx.
+    let temp = fixture(
+        json!({"show": {"command": "echo [$FROM_DOTENV] [$FROM_FILE]", "options": {"envFile": "absent.env"}}}),
+    );
+    fs::write(temp.path().join(".env"), "FROM_DOTENV=dotenv\n").unwrap();
+    assert_eq!(
+        stdout(
+            command(temp.path(), &["run", "app:show"])
+                .env("NX_LOAD_DOT_ENV_FILES", "false")
+                .output()
+                .unwrap()
+        ),
+        "[] []\n"
+    );
+}
