@@ -1,0 +1,329 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+use serde_json::{Value, json};
+use tempfile::TempDir;
+
+// Spawn the test binary itself as a portable build step, without Python or Node.
+#[test]
+fn process_helper() {
+    let Ok(mode) = std::env::var("QK_CACHE_TEST_MODE") else {
+        return;
+    };
+    let counter = PathBuf::from(std::env::var("QK_CACHE_TEST_COUNTER").unwrap());
+    let runs = fs::read_to_string(&counter)
+        .map(|text| text.trim().parse::<u32>().unwrap())
+        .unwrap_or(0);
+    fs::write(&counter, (runs + 1).to_string()).unwrap();
+    let input = fs::read_to_string("src/input.txt").unwrap();
+    fs::create_dir_all("dist/nested").unwrap();
+    fs::write("dist/nested/out.txt", format!("built:{input}")).unwrap();
+    println!("building from {}", input.trim());
+    eprintln!("build diagnostics");
+    if mode == "fail" {
+        std::process::exit(4);
+    }
+}
+
+fn target(mode: &str, extra: Value) -> Value {
+    let mut target = json!({
+        "executor": "nx:run-commands",
+        "cache": true,
+        "outputs": ["{projectRoot}/dist"],
+        "options": {
+            "command": format!(
+                "\"{}\" --exact process_helper --nocapture",
+                std::env::current_exe().unwrap().display()
+            ),
+            "forwardAllArgs": false,
+            "env": {"QK_CACHE_TEST_MODE": mode},
+        },
+    });
+    for (key, value) in extra.as_object().unwrap() {
+        target[key] = value.clone();
+    }
+    target
+}
+
+struct Fixture {
+    _temp: TempDir,
+    root: PathBuf,
+    counter: PathBuf,
+    git_config: PathBuf,
+}
+
+impl Fixture {
+    fn new(target: Value) -> Self {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("repo");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("nx.json"), "{}").unwrap();
+        fs::write(
+            root.join("project.json"),
+            json!({"name": "app", "targets": {"build": target}}).to_string(),
+        )
+        .unwrap();
+        fs::write(root.join("src/input.txt"), "one\n").unwrap();
+        fs::write(root.join(".gitignore"), "dist/\n.qk/\n").unwrap();
+        let git_config = temp.path().join("gitconfig");
+        fs::write(&git_config, "").unwrap();
+        let fixture = Self {
+            counter: temp.path().join("runs"),
+            root,
+            git_config,
+            _temp: temp,
+        };
+        fixture.git(&fixture.root, &["init", "--quiet"]);
+        fixture.git(&fixture.root, &["add", "--all"]);
+        fixture.git(
+            &fixture.root,
+            &[
+                "-c",
+                "user.name=qk",
+                "-c",
+                "user.email=qk@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "fixture",
+            ],
+        );
+        fixture
+    }
+
+    fn git(&self, cwd: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", &self.git_config)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn worktree(&self) -> PathBuf {
+        let path = self.root.parent().unwrap().join("linked");
+        self.git(
+            &self.root,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                path.to_str().unwrap(),
+            ],
+        );
+        path
+    }
+
+    fn command(&self, root: &Path, args: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_qk"));
+        command
+            .current_dir(root)
+            .arg("--workspace")
+            .arg(root)
+            .args(args)
+            .env("QK_CACHE_TEST_COUNTER", &self.counter)
+            .env("GIT_CONFIG_GLOBAL", &self.git_config)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("NX_PARALLEL");
+        command
+    }
+
+    fn qk(&self, root: &Path, args: &[&str]) -> Output {
+        self.command(root, args).output().unwrap()
+    }
+
+    fn build(&self, root: &Path, args: &[&str]) -> Output {
+        let mut all = vec!["run", "app:build"];
+        all.extend(args);
+        self.qk(root, &all)
+    }
+
+    fn runs(&self) -> u32 {
+        fs::read_to_string(&self.counter)
+            .map(|text| text.parse().unwrap())
+            .unwrap_or(0)
+    }
+}
+
+fn success(output: Output) -> Output {
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+fn stdout(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn artifact(root: &Path) -> String {
+    fs::read_to_string(root.join("dist/nested/out.txt")).unwrap()
+}
+
+#[test]
+fn second_run_restores_outputs_and_replays_logs() {
+    let fixture = Fixture::new(target("build", json!({})));
+    let first = success(fixture.build(&fixture.root, &[]));
+    assert!(stderr(&first).contains("qk: cache miss app:build"));
+    assert!(stdout(&first).contains("building from one"));
+    assert_eq!(fixture.runs(), 1);
+
+    fs::remove_dir_all(fixture.root.join("dist")).unwrap();
+    let second = success(fixture.build(&fixture.root, &[]));
+    assert!(stderr(&second).contains("qk: cache hit app:build"));
+    assert!(stdout(&second).contains("building from one"));
+    assert!(stderr(&second).contains("build diagnostics"));
+    assert_eq!(fixture.runs(), 1);
+    assert_eq!(artifact(&fixture.root), "built:one\n");
+}
+
+#[test]
+fn restore_replaces_stale_outputs() {
+    let fixture = Fixture::new(target("build", json!({})));
+    success(fixture.build(&fixture.root, &[]));
+    fs::write(fixture.root.join("dist/nested/out.txt"), "edited").unwrap();
+    fs::write(fixture.root.join("dist/stale.txt"), "stale").unwrap();
+
+    success(fixture.build(&fixture.root, &[]));
+    assert_eq!(fixture.runs(), 1);
+    assert_eq!(artifact(&fixture.root), "built:one\n");
+    assert!(!fixture.root.join("dist/stale.txt").exists());
+}
+
+#[test]
+fn input_changes_invalidate_and_old_entries_remain() {
+    let fixture = Fixture::new(target("build", json!({})));
+    success(fixture.build(&fixture.root, &[]));
+    fs::write(fixture.root.join("src/input.txt"), "two\n").unwrap();
+    let changed = success(fixture.build(&fixture.root, &[]));
+    assert!(stderr(&changed).contains("qk: cache miss app:build"));
+    assert_eq!(fixture.runs(), 2);
+    assert_eq!(artifact(&fixture.root), "built:two\n");
+
+    fs::write(fixture.root.join("src/input.txt"), "one\n").unwrap();
+    success(fixture.build(&fixture.root, &[]));
+    assert_eq!(fixture.runs(), 2);
+    assert_eq!(artifact(&fixture.root), "built:one\n");
+}
+
+#[test]
+fn linked_worktrees_share_the_cache() {
+    let fixture = Fixture::new(target("build", json!({})));
+    let linked = fixture.worktree();
+    let main_path = success(fixture.qk(&fixture.root, &["cache", "path"]));
+    let linked_path = success(fixture.qk(&linked, &["cache", "path"]));
+    assert_eq!(stdout(&main_path), stdout(&linked_path));
+    let cache = PathBuf::from(stdout(&main_path).trim());
+    assert!(
+        cache.canonicalize().is_err(),
+        "cache path must not be created"
+    );
+    assert!(cache.ends_with(".git/qk/cache/v1"));
+
+    success(fixture.build(&fixture.root, &[]));
+    let reused = success(fixture.build(&linked, &[]));
+    assert!(stderr(&reused).contains("qk: cache hit app:build"));
+    assert_eq!(fixture.runs(), 1);
+    assert_eq!(artifact(&linked), "built:one\n");
+
+    // Restores copy files, so editing one checkout cannot alter the shared entry.
+    fs::write(linked.join("dist/nested/out.txt"), "edited").unwrap();
+    fs::remove_dir_all(fixture.root.join("dist")).unwrap();
+    success(fixture.build(&fixture.root, &[]));
+    assert_eq!(artifact(&fixture.root), "built:one\n");
+
+    fs::write(linked.join("src/input.txt"), "branch\n").unwrap();
+    success(fixture.build(&linked, &[]));
+    assert_eq!(fixture.runs(), 2);
+}
+
+#[test]
+fn corrupt_entries_are_misses() {
+    let fixture = Fixture::new(target("build", json!({})));
+    success(fixture.build(&fixture.root, &[]));
+    let cache =
+        PathBuf::from(stdout(&success(fixture.qk(&fixture.root, &["cache", "path"]))).trim());
+    for blob in fs::read_dir(cache.join("blobs")).unwrap() {
+        fs::write(blob.unwrap().path(), "corrupt").unwrap();
+    }
+    let rerun = success(fixture.build(&fixture.root, &[]));
+    assert!(stderr(&rerun).contains("ignoring unusable cache entry"));
+    assert_eq!(fixture.runs(), 2);
+    assert_eq!(artifact(&fixture.root), "built:one\n");
+
+    success(fixture.build(&fixture.root, &[]));
+    assert_eq!(fixture.runs(), 2);
+}
+
+#[test]
+fn skip_cache_neither_reads_nor_writes() {
+    let fixture = Fixture::new(target("build", json!({})));
+    success(fixture.build(&fixture.root, &["--skip-nx-cache"]));
+    success(fixture.build(&fixture.root, &[]));
+    assert_eq!(fixture.runs(), 2);
+    success(fixture.build(&fixture.root, &["--skip-cache"]));
+    assert_eq!(fixture.runs(), 3);
+}
+
+#[test]
+fn failures_are_not_cached() {
+    let fixture = Fixture::new(target("fail", json!({})));
+    assert_eq!(fixture.build(&fixture.root, &[]).status.code(), Some(4));
+    assert_eq!(fixture.build(&fixture.root, &[]).status.code(), Some(4));
+    assert_eq!(fixture.runs(), 2);
+}
+
+#[test]
+fn uncacheable_targets_always_execute() {
+    let fixture = Fixture::new(target("build", json!({"cache": false})));
+    success(fixture.build(&fixture.root, &[]));
+    success(fixture.build(&fixture.root, &[]));
+    assert_eq!(fixture.runs(), 2);
+}
+
+#[test]
+fn unsupported_inputs_run_uncached() {
+    let fixture = Fixture::new(target(
+        "build",
+        json!({"inputs": ["default", {"unknownInputKind": true}]}),
+    ));
+    let first = success(fixture.build(&fixture.root, &[]));
+    assert!(stderr(&first).contains("cache bypassed"));
+    success(fixture.build(&fixture.root, &[]));
+    assert_eq!(fixture.runs(), 2);
+}
+
+#[test]
+fn declared_inputs_limit_invalidation() {
+    let fixture = Fixture::new(target(
+        "build",
+        json!({"inputs": ["{projectRoot}/src/**/*", {"env": "QK_CACHE_TEST_FLAVOR"}]}),
+    ));
+    success(fixture.build(&fixture.root, &[]));
+    fs::write(fixture.root.join("README.md"), "unrelated").unwrap();
+    success(fixture.build(&fixture.root, &[]));
+    assert_eq!(fixture.runs(), 1);
+
+    let flavored = fixture
+        .command(&fixture.root, &["run", "app:build"])
+        .env("QK_CACHE_TEST_FLAVOR", "spicy")
+        .output()
+        .unwrap();
+    success(flavored);
+    assert_eq!(fixture.runs(), 2);
+}

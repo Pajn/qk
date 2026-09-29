@@ -16,7 +16,7 @@ use std::sync::{
     name = "qk",
     version,
     about = "Quick workspace task tooling",
-    long_about = "qk (quick): a standalone Rust task runner.\nInspect workspaces and execute finite tasks with dependency ordering. Caching is not implemented yet."
+    long_about = "qk (quick): a standalone Rust task runner.\nExecute finite tasks with dependency ordering and a local cache shared by Git worktrees."
 )]
 struct Cli {
     /// Workspace root; defaults to discovery from the current directory.
@@ -28,6 +28,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Inspect the local repository cache.
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommand,
+    },
     /// Execute a task and its dependencies. Forward arguments after --.
     Run {
         task: String,
@@ -60,6 +65,9 @@ enum Command {
 
 #[derive(Args)]
 struct RunOptions {
+    /// Bypass all local cache reads and writes.
+    #[arg(long, aliases = ["skip-nx-cache", "skipNxCache"])]
+    skip_cache: bool,
     #[arg(short = 'c', long)]
     configuration: Option<String>,
     /// Maximum number of tasks executing concurrently.
@@ -79,6 +87,12 @@ struct RunOptions {
 #[derive(Clone, ValueEnum)]
 enum OutputStyle {
     Stream,
+}
+
+#[derive(Subcommand)]
+enum CacheCommand {
+    /// Print the shared cache directory without creating it.
+    Path,
 }
 
 #[derive(Subcommand)]
@@ -128,6 +142,15 @@ fn run(cli: Cli) -> Result<i32> {
     };
     let workspace = Workspace::load(&root)?;
     match cli.command {
+        Command::Cache {
+            command: CacheCommand::Path,
+        } => {
+            writeln!(
+                io::stdout().lock(),
+                "{}",
+                qk_cache::cache_directory(&workspace.root).display()
+            )?;
+        }
         Command::Run { task, options } => {
             let mut request = Request::parse(&task)?;
             if let Some(configuration) = &options.configuration {
@@ -222,7 +245,13 @@ fn execute_tasks(
         signal.store(true, Ordering::SeqCst);
     })
     .context("cannot register cancellation handler")?;
-    let result = qk_runner::run(workspace, &graph, options.parallel.get(), cancelled)?;
+    let result = qk_runner::run(
+        workspace,
+        &graph,
+        options.parallel.get(),
+        options.skip_cache,
+        cancelled,
+    )?;
     Ok(result.exit_code)
 }
 

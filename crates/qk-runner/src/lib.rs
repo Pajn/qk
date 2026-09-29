@@ -24,6 +24,7 @@ pub fn run(
     workspace: &Workspace,
     graph: &TaskGraph,
     parallel: usize,
+    skip_cache: bool,
     cancelled: Arc<AtomicBool>,
 ) -> Result<RunResult> {
     if parallel == 0 {
@@ -43,6 +44,15 @@ pub fn run(
     let mut pending: BTreeSet<_> = graph.tasks.keys().cloned().collect();
     let mut active = BTreeSet::new();
     let mut outcomes = BTreeMap::new();
+    let mut fingerprints: BTreeMap<String, Option<String>> = BTreeMap::new();
+    let cache = (!skip_cache
+        && graph
+            .tasks
+            .values()
+            .any(|task| task.definition.cache == Some(true)))
+    .then(|| qk_cache::Cache {
+        root: qk_cache::cache_directory(&workspace.root),
+    });
     let mut skipped = BTreeSet::new();
     let mut exit_code = 0;
     let (sender, receiver) = mpsc::channel();
@@ -74,12 +84,38 @@ pub fn run(
                 }
                 pending.remove(&id);
                 active.insert(id.clone());
-                eprintln!("qk: running {id}");
+                let verb = if cache.is_some() {
+                    "checking"
+                } else {
+                    "running"
+                };
+                eprintln!("qk: {verb} {id}");
                 let task = &prepared[&id];
+                let definition = &graph.tasks[&id];
+                let dependency_keys = dependencies
+                    .iter()
+                    .map(|id| (id.clone(), fingerprints[id].clone()))
+                    .collect::<BTreeMap<_, _>>();
+                let cache = cache.as_ref();
                 let sender = sender.clone();
                 let cancelled = cancelled.clone();
                 scope.spawn(move || {
-                    let result = execute(task, &cancelled);
+                    let result = if let Some(cache) = cache {
+                        cache.run(
+                            workspace,
+                            graph,
+                            definition,
+                            task,
+                            &dependency_keys,
+                            &cancelled,
+                        )
+                    } else {
+                        execute(task, &cancelled).map(|outcome| qk_cache::TaskResult {
+                            outcome,
+                            fingerprint: None,
+                            hit: false,
+                        })
+                    };
                     let _ = sender.send((id, result));
                 });
             }
@@ -102,8 +138,12 @@ pub fn run(
                 Ok((id, result)) => {
                     active.remove(&id);
                     let outcome = match result {
-                        Ok(outcome) => outcome,
+                        Ok(result) => {
+                            fingerprints.insert(id.clone(), result.fingerprint);
+                            result.outcome
+                        }
                         Err(error) => {
+                            fingerprints.insert(id.clone(), None);
                             eprintln!("qk: {id}: {error:#}");
                             Outcome::Failed(1)
                         }

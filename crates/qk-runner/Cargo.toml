@@ -9,3 +9,4 @@ anyhow.workspace = true
 qk-config.workspace = true
 qk-executor.workspace = true
 qk-taskgraph.workspace = true
+qk-cache.workspace = true

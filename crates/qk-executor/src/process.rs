@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use command_group::{CommandGroup, GroupChild};
 
-use crate::PreparedTask;
+use crate::{Capture, PreparedTask};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
@@ -29,48 +29,74 @@ impl Drop for Children {
 }
 
 pub fn execute(task: &PreparedTask, cancelled: &AtomicBool) -> Result<Outcome> {
-    let mut pending = task.commands.iter();
-    let mut children = Children(Vec::new());
-    loop {
-        if cancelled.load(Ordering::SeqCst) {
-            return Ok(Outcome::Cancelled);
-        }
-        if children.0.is_empty() || task.parallel {
-            for command in pending.by_ref() {
-                children.0.push(
-                    spawn(task, command)
-                        .with_context(|| format!("cannot start command for {}", task.id))?,
-                );
-                if !task.parallel {
-                    break;
-                }
-            }
-        }
-        if children.0.is_empty() {
-            return Ok(Outcome::Success);
-        }
-        let mut index = 0;
-        while index < children.0.len() {
-            match children.0[index]
-                .try_wait()
-                .context("cannot wait for command")?
-            {
-                Some(status) => {
-                    let mut child = children.0.swap_remove(index);
-                    // Finite tasks may not leave background descendants running.
-                    let _ = child.kill();
-                    if !status.success() {
-                        return Ok(Outcome::Failed(exit_code(status)));
-                    }
-                }
-                None => index += 1,
-            }
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    execute_captured(task, cancelled, None)
 }
 
-fn spawn(task: &PreparedTask, text: &str) -> Result<GroupChild> {
+pub fn execute_captured(
+    task: &PreparedTask,
+    cancelled: &AtomicBool,
+    capture: Option<&Capture>,
+) -> Result<Outcome> {
+    std::thread::scope(|scope| {
+        let mut readers = Vec::new();
+        let outcome = (|| {
+            let mut pending = task.commands.iter();
+            let mut children = Children(Vec::new());
+            loop {
+                if cancelled.load(Ordering::SeqCst) {
+                    return Ok(Outcome::Cancelled);
+                }
+                if children.0.is_empty() || task.parallel {
+                    for command in pending.by_ref() {
+                        let mut child = spawn(task, command, capture.is_some())
+                            .with_context(|| format!("cannot start command for {}", task.id))?;
+                        if let Some(capture) = capture {
+                            let stdout =
+                                child.inner().stdout.take().context("missing stdout pipe")?;
+                            let stderr =
+                                child.inner().stderr.take().context("missing stderr pipe")?;
+                            readers.push(scope.spawn(move || capture.copy(stdout, false)));
+                            readers.push(scope.spawn(move || capture.copy(stderr, true)));
+                        }
+                        children.0.push(child);
+                        if !task.parallel {
+                            break;
+                        }
+                    }
+                }
+                if children.0.is_empty() {
+                    return Ok(Outcome::Success);
+                }
+                let mut index = 0;
+                while index < children.0.len() {
+                    match children.0[index]
+                        .try_wait()
+                        .context("cannot wait for command")?
+                    {
+                        Some(status) => {
+                            let mut child = children.0.swap_remove(index);
+                            // Finite tasks may not leave background descendants running.
+                            let _ = child.kill();
+                            if !status.success() {
+                                return Ok(Outcome::Failed(exit_code(status)));
+                            }
+                        }
+                        None => index += 1,
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        })();
+        for reader in readers {
+            reader
+                .join()
+                .map_err(|_| anyhow::anyhow!("output capture thread panicked"))??;
+        }
+        outcome
+    })
+}
+
+fn spawn(task: &PreparedTask, text: &str, capture: bool) -> Result<GroupChild> {
     #[cfg(windows)]
     let mut command = {
         use std::os::windows::process::CommandExt;
@@ -92,8 +118,16 @@ fn spawn(task: &PreparedTask, text: &str) -> Result<GroupChild> {
         .env_clear()
         .envs(&task.env)
         .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        .stdout(if capture {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        })
+        .stderr(if capture {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        });
     Ok(command.group_spawn()?)
 }
 

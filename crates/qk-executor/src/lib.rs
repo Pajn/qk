@@ -1,5 +1,6 @@
 //! Prepare finite tasks, then execute shell commands in managed process groups.
 
+mod capture;
 mod interpolate;
 mod process;
 
@@ -12,7 +13,8 @@ use qk_config::Workspace;
 use qk_taskgraph::Task;
 use serde_json::Value;
 
-pub use process::{Outcome, execute};
+pub use capture::{Capture, read_capture, replay};
+pub use process::{Outcome, execute, execute_captured};
 
 #[derive(Clone, Debug)]
 pub struct PreparedTask {

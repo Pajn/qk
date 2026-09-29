@@ -2,10 +2,12 @@
 
 **qk**, short for **quick**, is a standalone task runner written in Rust.
 It reads Nx-compatible workspace configuration and executes tasks with
-dependency ordering. Affected selection, caching and run history are planned.
+dependency ordering and a local cache. Affected selection, remote caching and
+run history are planned.
 
-The current implementation supports **workspace inspection and finite task
-execution**. Lockfile analysis and caching are not implemented yet. The
+The current implementation supports **workspace inspection, finite task
+execution and a local task cache** shared by the worktrees of a Git
+repository. Lockfile analysis is not implemented yet. The
 [design](docs/task-runner-design.md) describes the longer-term plan, not the
 current feature set.
 
@@ -50,6 +52,7 @@ parent workspace marker exists.
 | `qk run <project>:<target>[:<configuration>]` | Execute a task and its dependencies |
 | `qk run-many -t build,test -p 'web,core' --parallel 4` | Execute matching targets with bounded task concurrency |
 | `qk run web:build --dry-run` | Print the planned task graph as JSON without execution |
+| `qk cache path` | Print the local cache directory without creating it |
 
 `--workspace <path>` works before or after the subcommand. Graph output paths
 are relative to the invocation directory; their parent directories must
@@ -137,9 +140,51 @@ Parallel commands within a failed task are also terminated. Commands must
 not detach themselves into separate sessions or launch external services;
 those processes are outside the managed group.
 
-**Execution is uncached**, even for targets with `cache: true`. `--dry-run`
-only plans and prints the task graph: it does not load dotenv, validate
-executor support, execute runtime inputs, or run commands.
+`--dry-run` only plans and prints the task graph: it does not load dotenv,
+validate executor support, execute runtime inputs, or run commands.
+
+## Local cache
+
+Targets with `cache: true` are cached locally. Inside a Git repository the
+cache lives in `<git common dir>/qk/cache/v1`, so every linked worktree of the
+repository shares one cache. Outside Git it lives in `.qk/cache/v1` at the
+workspace root. `qk cache path` prints the location. `--skip-cache` (also
+`--skip-nx-cache` and `--skipNxCache`) bypasses all cache reads and writes.
+
+A task's key covers its ID, forwarded arguments, resolved target definition,
+declared inputs, the fingerprints of its dependency tasks (including their
+outputs), the package manager, qk's version and the platform. Files are keyed
+by workspace-relative path, content and mode. Branch names and checkout
+locations are not part of the key, so identical sources in two worktrees
+share entries. Root workspace files (`nx.json`, `package.json`,
+`pnpm-workspace.yaml`, lockfiles, `.env`, `.env.local`) and the manifests of
+the task's project and its transitive project dependencies are always
+included.
+
+Candidate input files are tracked and untracked-but-not-ignored files, minus
+any task's declared outputs. Without `inputs`, a task uses `default` and
+`^default`; `default` is `{projectRoot}/**/*` unless a named input overrides
+it. Supported input declarations are globs with `!` exclusions, `fileset`,
+named inputs and `^named` inputs, `env`, `runtime`,
+`dependentTasksOutputFiles` with `transitive`, and `externalDependencies`,
+which currently hashes all root lockfiles. A task with any other input
+declaration, extended globs, `{options.*}` or `{args.*}` paths, negated
+outputs, or an output without a fixed directory prefix runs uncached and
+reports why.
+
+On a miss, the task runs with stdout and stderr streamed through a pipe while
+they are recorded, so child processes do not see a terminal. The entry is
+saved only when the task succeeds and its inputs are unchanged afterwards.
+On a hit, qk removes existing files matching the declared outputs, copies the
+cached outputs into place and replays the recorded stdout and stderr. Restores
+are staged in `.qk/` at the workspace root and copied rather than linked, so
+editing a restored file never changes the cache. Every file is verified
+against its content hash; an unreadable or corrupt entry is a miss.
+A per-key lock makes concurrent runs of the same task, including runs in
+different worktrees, wait for each other and reuse the result.
+
+The cache has no size limit or eviction yet. Delete the directory printed by
+`qk cache path` to clear it. `NX_CACHE_DIRECTORY` is not read.
 
 ## Configuration and graph support
 
@@ -187,11 +232,11 @@ parity claim yet. In particular:
 - Target-default glob keys and filtered defaults are not implemented;
   filtered default arrays are rejected. Nx plugins and inferred targets are
   outside the design's scope.
-- Input expressions and runtime inputs are preserved for inspection; hashing
-  and affected semantics are not resolved yet.
-- `affected`, continuous and interactive tasks, output capture/replay,
-  static/dynamic output styles, cache storage, remote storage, history,
-  release commands and npm binary distribution remain future work.
+- Inputs are resolved for local caching only; affected semantics are not
+  implemented yet.
+- `affected`, continuous and interactive tasks, static/dynamic output styles,
+  remote cache storage, cache eviction, history, release commands and npm
+  binary distribution remain future work.
 
 The compatibility baseline is documented in Nx's
 [project configuration](https://nx.dev/docs/reference/project-configuration)
@@ -208,15 +253,16 @@ cargo test --workspace --locked
 cargo build --release --locked
 ```
 
-The Cargo workspace contains six crates:
+The Cargo workspace contains seven crates:
 
 | Crate | Responsibility |
 | --- | --- |
 | `qk-config` | Workspace discovery, JSONC/YAML parsing, typed project configuration and normalization |
 | `qk-graph` | Workspace edges, project selection, reverse reachability and graph export |
 | `qk-taskgraph` | Dependency expansion, configuration selection and task DAG validation |
-| `qk-executor` | Command preparation, environment, argument interpolation and process groups |
+| `qk-executor` | Command preparation, environment, argument interpolation, process groups and output capture |
 | `qk-runner` | Bounded task scheduling, dependency failure propagation and cancellation |
+| `qk-cache` | Input hashing, cache entry storage, output restoration and log replay |
 | `qk-cli` | Argument parsing and output; produces the `qk` binary |
 
 Fixture and CLI tests use self-contained workspaces. GitHub Actions is
@@ -224,4 +270,5 @@ configured for Linux, macOS and Windows. The lockfile is checked in for
 reproducible dependency resolution.
 
 Next: expand execution parity and continuous-task lifecycle handling, then add
-pnpm v9 lockfile parsing and external graph nodes before hashing and caching.
+pnpm v9 lockfile parsing and external graph nodes so cache keys can use
+per-package lockfile fingerprints.
