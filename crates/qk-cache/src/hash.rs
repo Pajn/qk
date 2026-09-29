@@ -329,7 +329,9 @@ struct Resolver<'a> {
     values: BTreeMap<String, Value>,
     named_stack: Vec<(String, String)>,
     external: BTreeSet<String>,
-    prepared: &'a PreparedTask,
+    /// `None` resolves which inputs a task has without evaluating env or
+    /// runtime inputs.
+    prepared: Option<&'a PreparedTask>,
     cancelled: &'a AtomicBool,
 }
 
@@ -361,8 +363,11 @@ impl Resolver<'_> {
                 let name = object["env"]
                     .as_str()
                     .context("env input must name a variable")?;
-                let value = self
-                    .prepared
+                let Some(prepared) = self.prepared else {
+                    self.values.insert(format!("env:{name}"), Value::Null);
+                    return Ok(());
+                };
+                let value = prepared
                     .env
                     .get(std::ffi::OsStr::new(name))
                     .map(|value| {
@@ -378,9 +383,14 @@ impl Resolver<'_> {
                 let command = object["runtime"]
                     .as_str()
                     .context("runtime input must be a command")?;
+                let Some(prepared) = self.prepared else {
+                    self.values
+                        .insert(format!("runtime:{command}"), Value::Null);
+                    return Ok(());
+                };
                 let memo = serde_json::to_string(&(
                     command,
-                    self.prepared
+                    prepared
                         .env
                         .iter()
                         .map(|(name, value)| (name.to_string_lossy(), value.to_string_lossy()))
@@ -391,7 +401,7 @@ impl Resolver<'_> {
                         .insert(format!("runtime:{command}"), value.clone());
                     return Ok(());
                 }
-                let mut prepared = self.prepared.clone();
+                let mut prepared = prepared.clone();
                 prepared.commands = vec![command.into()];
                 prepared.cwd = self.workspace.root.clone();
                 prepared.parallel = false;
@@ -508,14 +518,28 @@ impl Resolver<'_> {
 
 /// What a task's key is computed from, as JSON: kept by the history so a
 /// changed key can be explained.
-pub fn inputs(
+/// What a task's key depends on, before any file is read.
+pub struct Resolved {
+    /// Workspace-relative files whose content is part of the key.
+    pub files: BTreeSet<String>,
+    /// Env, runtime and other named values; env and runtime are evaluated only
+    /// with a prepared task.
+    pub values: BTreeMap<String, Value>,
+    /// With a readable pnpm lockfile: the importers whose installs count, and
+    /// packages named by `externalDependencies`.
+    pub lockfile: Option<(BTreeSet<String>, BTreeSet<String>)>,
+    /// `pnpm-workspace.yaml` counts without its resolution keys, which reach
+    /// tasks through the lockfile instead.
+    pub workspace_file: bool,
+}
+
+pub fn resolve(
     snapshot: &Snapshot,
     workspace: &Workspace,
     task: &Task,
-    prepared: &PreparedTask,
-    dependencies: &BTreeMap<String, String>,
+    prepared: Option<&PreparedTask>,
     cancelled: &AtomicBool,
-) -> Result<Value> {
+) -> Result<Resolved> {
     let mut resolver = Resolver {
         workspace,
         snapshot,
@@ -530,10 +554,9 @@ pub fn inputs(
     for input in task.definition.inputs.as_ref().unwrap_or(&default) {
         resolver.input(&task.project, input)?;
     }
-    let installed = snapshot.installed(&workspace.root)?;
-    let lockfile = installed
-        .as_ref()
-        .and_then(|installed| Some((installed, installed.lockfile.as_ref()?)));
+    let readable = snapshot
+        .installed(&workspace.root)?
+        .is_some_and(|installed| installed.lockfile.is_some());
     // Always include workspace resolution/configuration, including ignored dotenv files.
     // A pnpm lockfile qk can read is keyed by what the task's projects install instead.
     for path in [
@@ -547,8 +570,7 @@ pub fn inputs(
         ".env",
         ".env.local",
     ] {
-        if workspace.root.join(path).is_file() && !(path == "pnpm-lock.yaml" && lockfile.is_some())
-        {
+        if workspace.root.join(path).is_file() && !(path == "pnpm-lock.yaml" && readable) {
             resolver.selected.insert(path.into());
         }
     }
@@ -562,47 +584,9 @@ pub fn inputs(
             }
         }
     }
-    if let Some((installed, lockfile)) = lockfile {
-        // The root importer's packages resolve from every package in the
-        // workspace, so they count for every task.
-        let importers: BTreeSet<&str> = std::iter::once(".")
-            .chain(
-                packages
-                    .iter()
-                    .map(|project| workspace.projects[project].root.as_str()),
-            )
-            .filter(|importer| lockfile.has_importer(importer))
-            .collect();
-        let importers: BTreeMap<_, _> = importers
-            .into_iter()
-            .map(|importer| {
-                let digest = installed.digest(&format!("importer:{importer}"), || {
-                    lockfile.installed(importer).unwrap_or_default()
-                });
-                (importer, digest)
-            })
-            .collect();
-        let external: BTreeMap<_, _> = resolver
-            .external
-            .iter()
-            .map(|name| {
-                let digest =
-                    installed.digest(&format!("package:{name}"), || lockfile.package(name));
-                (name.as_str(), digest)
-            })
-            .collect();
-        resolver.values.insert(
-            "lockfile".into(),
-            json!({
-                "global": installed.digest("global", || BTreeSet::from([lockfile.global().to_string()])),
-                "importers": importers,
-                "external": external,
-            }),
-        );
-    }
-    for project in packages {
+    for project in &packages {
         for name in ["project.json", "package.json"] {
-            let path = Path::new(&workspace.projects[&project].root).join(name);
+            let path = Path::new(&workspace.projects[project].root).join(name);
             let path = path.strip_prefix(".").unwrap_or(&path).to_owned();
             if workspace.root.join(&path).is_file() {
                 resolver.selected.insert(
@@ -613,18 +597,116 @@ pub fn inputs(
             }
         }
     }
-    let files = resolver
-        .selected
+    // However it was selected, the workspace file's resolution keys reach the
+    // task through the lockfile when qk can read it.
+    let workspace_file = readable && resolver.selected.remove("pnpm-workspace.yaml");
+    let lockfile = readable.then(|| {
+        // The root importer's packages resolve from every package in the
+        // workspace, so they count for every task.
+        let importers = std::iter::once(".".to_owned())
+            .chain(
+                packages
+                    .iter()
+                    .map(|project| workspace.projects[project].root.clone()),
+            )
+            .collect();
+        (importers, resolver.external.clone())
+    });
+    Ok(Resolved {
+        files: resolver.selected,
+        values: resolver.values,
+        lockfile,
+        workspace_file,
+    })
+}
+
+/// What a task's key is computed from, as JSON: kept by the history so a
+/// changed key can be explained.
+pub fn inputs(
+    snapshot: &Snapshot,
+    workspace: &Workspace,
+    task: &Task,
+    prepared: &PreparedTask,
+    dependencies: &BTreeMap<String, String>,
+    cancelled: &AtomicBool,
+) -> Result<Value> {
+    let Resolved {
+        files,
+        mut values,
+        lockfile,
+        workspace_file,
+    } = resolve(snapshot, workspace, task, Some(prepared), cancelled)?;
+    let installed = snapshot.installed(&workspace.root)?;
+    if let (Some((importers, external)), Some(installed)) = (lockfile, &installed)
+        && let Some(lockfile) = &installed.lockfile
+    {
+        let importers: BTreeMap<_, _> = importers
+            .iter()
+            .filter(|importer| lockfile.has_importer(importer))
+            .map(|importer| {
+                let digest = installed.digest(&format!("importer:{importer}"), || {
+                    lockfile.installed(importer).unwrap_or_default()
+                });
+                (importer.clone(), digest)
+            })
+            .collect();
+        let external: BTreeMap<_, _> = external
+            .iter()
+            .map(|name| {
+                let digest =
+                    installed.digest(&format!("package:{name}"), || lockfile.package(name));
+                (name.clone(), digest)
+            })
+            .collect();
+        values.insert(
+            "lockfile".into(),
+            json!({
+                "global": installed.digest("global", || BTreeSet::from([lockfile.global().to_string()])),
+                "importers": importers,
+                "external": external,
+            }),
+        );
+    }
+    let mut files = files
         .iter()
         .map(|path| Ok((path.clone(), snapshot.file_value(&workspace.root, path)?)))
         .collect::<Result<BTreeMap<_, _>>>()?;
+    if workspace_file {
+        match workspace_without_resolution(&workspace.root) {
+            Some(value) => {
+                values.insert("pnpm-workspace".into(), value);
+            }
+            None => {
+                files.insert(
+                    "pnpm-workspace.yaml".into(),
+                    snapshot.file_value(&workspace.root, "pnpm-workspace.yaml")?,
+                );
+            }
+        }
+    }
     let hash = json!({
         "schema":"qk-local-v1", "qk":env!("CARGO_PKG_VERSION"),
         "platform":[std::env::consts::OS, std::env::consts::ARCH], "workspace":snapshot.workspace_prefix,
         "id":task.id, "args":task.args, "definition":task.definition, "packageManager":workspace.package_manager,
-        "files":files, "values":resolver.values, "dependencies":dependencies,
+        "files":files, "values":values, "dependencies":dependencies,
     });
     Ok(hash)
+}
+
+/// `pnpm-workspace.yaml` without the keys that configure resolution, or `None`
+/// when it cannot be read as YAML.
+pub fn workspace_without_resolution(root: &Path) -> Option<Value> {
+    let text = std::fs::read_to_string(root.join("pnpm-workspace.yaml")).ok()?;
+    without_resolution(&text)
+}
+
+/// A `pnpm-workspace.yaml` text without its resolution keys.
+pub fn without_resolution(text: &str) -> Option<Value> {
+    let mut value: Value = serde_yaml_ng::from_str(text).ok()?;
+    if let Some(object) = value.as_object_mut() {
+        object.retain(|key, _| !qk_lockfile::RESOLUTION_KEYS.contains(&key.as_str()));
+    }
+    Some(value)
 }
 
 /// The key for a task's inputs.

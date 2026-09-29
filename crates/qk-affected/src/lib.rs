@@ -34,21 +34,6 @@ pub struct Options {
     pub untracked: bool,
 }
 
-/// Keys of `pnpm-workspace.yaml` that configure resolution. A change confined
-/// to them reaches tasks only through `pnpm-lock.yaml`.
-const PNPM_RESOLUTION_KEYS: &[&str] = &[
-    "catalog",
-    "catalogs",
-    "dedupePeerDependents",
-    "dedupePeers",
-    "minimumReleaseAge",
-    "minimumReleaseAgeExclude",
-    "overrides",
-    "patchedDependencies",
-    "peerDependencyRules",
-    "resolutionMode",
-];
-
 const LOCKFILES: &[&str] = &[
     "pnpm-lock.yaml",
     "package-lock.json",
@@ -647,7 +632,7 @@ fn pnpm_workspace_change_reaches_tasks(changes: &Changes) -> bool {
     match changes.change("pnpm-workspace.yaml") {
         FileChange::Json(changes) => changes
             .iter()
-            .any(|change| !PNPM_RESOLUTION_KEYS.contains(&change.path[0].as_str())),
+            .any(|change| !qk_lockfile::RESOLUTION_KEYS.contains(&change.path[0].as_str())),
         _ => true,
     }
 }

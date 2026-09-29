@@ -751,3 +751,38 @@ fn history_explains_why_a_task_missed() {
     let text = stdout(&success(fixture.qk(&linked, &["show", "runs"])));
     assert_eq!(text.lines().count(), 2, "{text}");
 }
+
+#[test]
+fn workspace_file_resolution_keys_reach_tasks_through_the_lockfile() {
+    let fixture = Fixture::new(target(
+        "build",
+        json!({"inputs": ["{projectRoot}/src/**/*", "{workspaceRoot}/pnpm-workspace.yaml"]}),
+    ));
+    fs::write(
+        fixture.root.join("pnpm-lock.yaml"),
+        pnpm_lock("1.0.0", "1.0.0"),
+    )
+    .unwrap();
+    let workspace = |catalog: &str, packages: &str| {
+        format!("packages:\n  - {packages}\ncatalog:\n  lib: {catalog}\n")
+    };
+    fs::write(
+        fixture.root.join("pnpm-workspace.yaml"),
+        workspace("1.0.0", "apps/*"),
+    )
+    .unwrap();
+    success(fixture.build(&fixture.root, &[]));
+    fs::write(
+        fixture.root.join("pnpm-workspace.yaml"),
+        workspace("1.1.0", "apps/*"),
+    )
+    .unwrap();
+    assert!(stderr(&success(fixture.build(&fixture.root, &[]))).contains("cache hit"));
+    fs::write(
+        fixture.root.join("pnpm-workspace.yaml"),
+        workspace("1.1.0", "libs/*"),
+    )
+    .unwrap();
+    assert!(stderr(&success(fixture.build(&fixture.root, &[]))).contains("cache miss"));
+    assert_eq!(fixture.runs(), 2);
+}

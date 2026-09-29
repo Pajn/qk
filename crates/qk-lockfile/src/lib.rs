@@ -8,6 +8,22 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Keys of `pnpm-workspace.yaml` that configure how pnpm resolves
+/// dependencies. Their effect lands in the lockfile, so a change confined to
+/// them reaches tasks only through what the lockfile says is installed.
+pub const RESOLUTION_KEYS: &[&str] = &[
+    "catalog",
+    "catalogs",
+    "dedupePeerDependents",
+    "dedupePeers",
+    "minimumReleaseAge",
+    "minimumReleaseAgeExclude",
+    "overrides",
+    "patchedDependencies",
+    "peerDependencyRules",
+    "resolutionMode",
+];
+
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};

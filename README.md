@@ -273,6 +273,13 @@ projects install something that changed, plus every task when the lockfile
 version, pnpm's `settings` or the lock of pnpm itself changes. A lockfile qk
 cannot read is keyed by its whole content, and qk says so.
 
+With such a lockfile, `pnpm-workspace.yaml` is keyed without the keys that
+configure resolution (`catalog`, `catalogs`, `overrides`,
+`patchedDependencies`, `peerDependencyRules` and the like), whether it is
+always included or named by an input: their effect lands in the lockfile, so
+a catalog bump invalidates only the tasks whose installs change. This is the
+same rule affected selection applies.
+
 Candidate input files are tracked and untracked-but-not-ignored files, minus
 any task's declared outputs. The list is taken once per run, as Nx does, so a
 file that a task creates without declaring it as an output is seen from the
