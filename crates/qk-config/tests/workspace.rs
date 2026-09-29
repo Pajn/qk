@@ -295,13 +295,13 @@ fn rejects_root_outside_configuration_directory() {
 }
 
 #[test]
-fn rejects_invalid_shapes_and_unsupported_filtered_defaults() {
+fn rejects_invalid_shapes() {
     for (file, text, expected) in [
         ("project.json", "[]", "JSON object"),
         (
             "nx.json",
-            r#"{"targetDefaults":{"build":[]}}"#,
-            "filtered defaults",
+            r#"{"targetDefaults":{"build":"vite build"}}"#,
+            "must be an object or an array of objects",
         ),
         (
             "project.json",
@@ -473,4 +473,107 @@ fn a_local_workspace_file_merges_over_nx_json() {
     assert_eq!(app.targets["build"].options["cwd"], "{projectRoot}");
     assert_eq!(app.targets["lint"].cache, Some(false));
     assert_eq!(workspace.local_overrides, ["nx.local.json"]);
+}
+
+#[test]
+fn target_defaults_resolve_like_nx_23() {
+    let temp = TempDir::new().unwrap();
+    write(
+        temp.path(),
+        "nx.json",
+        r#"{"targetDefaults": {
+            "test-*": {"cache": true},
+            "test-e2e*": {"options": {"shard": 1}},
+            "build": [
+                {"cache": true},
+                {"filter": {"projects": ["tag:web"]}, "options": {"mode": "web"}},
+                {"filter": {"projects": "lib"}, "options": {"mode": "lib"}},
+                {"filter": {"executor": "nx:run-script"}, "options": {"script": "never"}}
+            ],
+            "lint": [{"filter": {"plugin": "nx/core/package-json"}, "cache": true}],
+            "nx:run-commands": [{"filter": {"projects": "nothing"}, "cache": false}],
+            "b*": {"outputs": ["dist"]},
+            "deploy": [{"executor": "nx:run-script"}],
+            "d*": {"cache": true}
+        }}"#,
+    );
+    write(
+        temp.path(),
+        "apps/web/project.json",
+        r#"{"name": "web", "tags": ["web"], "targets": {
+            "build": {"command": "vite build"},
+            "test-unit": {"command": "vitest"},
+            "test-e2e-ci": {"command": "playwright test"},
+            "deploy": {"command": "wrangler deploy"},
+            "lint": {"command": "oxlint"}
+        }}"#,
+    );
+    write(
+        temp.path(),
+        "libs/lib/project.json",
+        r#"{"name": "lib", "targets": {"build": {"command": "tsc"}}}"#,
+    );
+    write(
+        temp.path(),
+        "libs/pkg/package.json",
+        r#"{"name": "pkg", "scripts": {"lint": "oxlint"}}"#,
+    );
+    write(
+        temp.path(),
+        "package.json",
+        r#"{"workspaces": ["libs/pkg"]}"#,
+    );
+    let workspace = Workspace::load(temp.path()).unwrap();
+    let web = &workspace.projects["web"].targets;
+    // Glob keys, the longest matching one winning alone.
+    assert_eq!(web["test-unit"].cache, Some(true));
+    assert_eq!(web["test-e2e-ci"].cache, None);
+    assert_eq!(web["test-e2e-ci"].options["shard"], 1);
+    // The executor key's only entry is filtered out, so the name key applies,
+    // and its matching entries merge in order; the glob key does not add.
+    assert_eq!(web["build"].cache, Some(true));
+    assert_eq!(web["build"].options["mode"], "web");
+    assert!(!web["build"].options.contains_key("script"));
+    assert_eq!(web["build"].outputs, None);
+    let lib = &workspace.projects["lib"].targets["build"];
+    assert_eq!(
+        (lib.cache, lib.options["mode"].as_str()),
+        (Some(true), Some("lib"))
+    );
+    // An entry for another executor is left out, but its key still wins.
+    assert_eq!(web["deploy"].cache, None);
+    // filter.plugin tells package.json scripts from project.json targets.
+    assert_eq!(workspace.projects["pkg"].targets["lint"].cache, Some(true));
+    assert_eq!(web["lint"].cache, None);
+}
+
+#[test]
+fn a_local_workspace_file_replaces_filtered_defaults() {
+    let temp = TempDir::new().unwrap();
+    write(
+        temp.path(),
+        "nx.json",
+        r#"{"targetDefaults": {"build": [{"cache": true}], "test": {"cache": true, "options": {"a": 1}}}}"#,
+    );
+    write(
+        temp.path(),
+        "nx.local.json",
+        r#"{"targetDefaults": {"build": [{"cache": false}], "test": {"options": {"b": 2}}}}"#,
+    );
+    write(
+        temp.path(),
+        "project.json",
+        r#"{"name": "app", "targets": {"build": {"command": "x"}, "test": {"command": "y"}}}"#,
+    );
+    let workspace = Workspace::load(temp.path()).unwrap();
+    let targets = &workspace.projects["app"].targets;
+    assert_eq!(targets["build"].cache, Some(false));
+    assert_eq!(targets["test"].cache, Some(true));
+    assert_eq!(
+        (
+            targets["test"].options["a"].clone(),
+            targets["test"].options["b"].clone()
+        ),
+        (json!(1), json!(2))
+    );
 }

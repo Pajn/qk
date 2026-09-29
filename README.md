@@ -645,10 +645,17 @@ limit. `NX_CACHE_DIRECTORY` is not read.
   same purpose: `targetDefaults` merge per entry as targets do, `namedInputs`
   by name, and other settings are replaced. Every run reports it, and every
   task is keyed by it.
-- Applies exact executor-keyed or target-name-keyed `targetDefaults`.
-  Executor defaults take precedence. As in Nx, a default naming a different
-  executor from the target's own is not applied. Options merge by key; each named
-  configuration merges by key; nested values and arrays are replaced.
+- Applies `targetDefaults` as Nx 23 does. Keys are tried in order: the
+  target's executor, its name, then glob keys matching the name, longest
+  first. A key's value is a default or an array of them, each with an
+  optional `filter` on `projects` (names, globs, `tag:` and `!` patterns),
+  `plugin` (`nx/core/project-json` or `nx/core/package-json`, by which file
+  gave the target its executor or command) and `executor`. The first key with
+  an entry whose filter matches wins, and its matching entries merge in
+  order, later ones winning. As in Nx, an entry naming a different executor
+  from the target's own is left out, though its key still wins. Options merge
+  by key; each named configuration merges by key; nested values and arrays
+  are replaced.
   Project-level named inputs override workspace definitions by name.
 - Normalizes a target's `command` shorthand into `nx:run-commands` options.
   Changing an executor drops options and configurations from the previous
@@ -675,9 +682,7 @@ parity claim yet. In particular:
   projects to what they install directly and between installations.
   Workspace dependency aliases and version-range resolution are not
   implemented; name matching is conservative.
-- Target-default glob keys and filtered defaults are not implemented;
-  filtered default arrays are rejected. Nx plugins and inferred targets are
-  outside the design's scope.
+- Nx plugins and inferred targets are outside the design's scope.
 - Interactive tasks, interactive output styles and release commands remain
   future work. The npm package name is not chosen yet.
 

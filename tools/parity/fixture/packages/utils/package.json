@@ -6,7 +6,8 @@
     "shared"
   ],
   "scripts": {
-    "test": "node ../../scripts/task.mjs @fixture/utils:test . "
+    "test": "node ../../scripts/task.mjs @fixture/utils:test . ",
+    "format": "node ../../scripts/task.mjs @fixture/utils:format ."
   },
   "dependencies": {
     "lodash-es": "4.17.21",

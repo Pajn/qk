@@ -159,10 +159,13 @@ impl Workspace {
             None => WorkspaceConfig::default(),
         };
         for (name, defaults) in &config.target_defaults {
-            if !defaults.is_object() {
-                bail!(
-                    "nx.json: targetDefaults.{name} must be an object; filtered defaults are not supported yet"
-                );
+            let valid = match defaults {
+                Value::Object(_) => true,
+                Value::Array(entries) => entries.iter().all(Value::is_object),
+                _ => false,
+            };
+            if !valid {
+                bail!("nx.json: targetDefaults.{name} must be an object or an array of objects");
             }
         }
         let mut workspace = Self {

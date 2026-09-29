@@ -1,5 +1,16 @@
 {
   "name": "ui",
-  "tags": ["scope:shared", "type:ui"],
-  "targets": { "build": {}, "test": {}, "lint": {}, "check": {} }
+  "tags": [
+    "scope:shared",
+    "type:ui"
+  ],
+  "targets": {
+    "build": {},
+    "test": {},
+    "lint": {},
+    "check": {},
+    "format": {
+      "executor": "nx:noop"
+    }
+  }
 }

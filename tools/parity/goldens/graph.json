@@ -88,27 +88,23 @@
         "type": "lib",
         "data": {
           "root": "packages/utils",
-          "name": "@fixture/utils",
-          "projectType": "library",
-          "tags": [
-            "npm:public",
-            "npm:shared",
-            "scope:shared"
-          ],
-          "metadata": {
-            "targetGroups": {
-              "NPM Scripts": [
-                "test"
-              ]
-            },
-            "js": {
-              "packageName": "@fixture/utils",
-              "packageVersion": "1.0.0",
-              "packageExports": "./src/index.ts",
-              "isInPackageManagerWorkspaces": true
-            }
-          },
           "targets": {
+            "format": {
+              "cache": true,
+              "executor": "nx:run-script",
+              "outputs": [
+                "{projectRoot}/.format"
+              ],
+              "metadata": {
+                "scriptContent": "node ../../scripts/task.mjs @fixture/utils:format .",
+                "runCommand": "pnpm run format"
+              },
+              "options": {
+                "script": "format"
+              },
+              "configurations": {},
+              "parallelism": true
+            },
             "test": {
               "executor": "nx:run-script",
               "metadata": {
@@ -120,6 +116,27 @@
               },
               "configurations": {},
               "parallelism": true
+            }
+          },
+          "name": "@fixture/utils",
+          "projectType": "library",
+          "tags": [
+            "npm:public",
+            "npm:shared",
+            "scope:shared"
+          ],
+          "metadata": {
+            "targetGroups": {
+              "NPM Scripts": [
+                "test",
+                "format"
+              ]
+            },
+            "js": {
+              "packageName": "@fixture/utils",
+              "packageVersion": "1.0.0",
+              "packageExports": "./src/index.ts",
+              "isInPackageManagerWorkspaces": true
             }
           },
           "implicitDependencies": []
@@ -333,6 +350,13 @@
               "configurations": {},
               "options": {},
               "parallelism": true
+            },
+            "format": {
+              "cache": false,
+              "executor": "nx:noop",
+              "configurations": {},
+              "options": {},
+              "parallelism": true
             }
           },
           "name": "ui",
@@ -432,6 +456,45 @@
               "configurations": {},
               "options": {},
               "parallelism": true
+            },
+            "typecheck-app": {
+              "cache": true,
+              "inputs": [
+                "production"
+              ],
+              "executor": "nx:run-commands",
+              "options": {
+                "command": "node scripts/task.mjs web:typecheck-app apps/web"
+              },
+              "configurations": {},
+              "parallelism": true
+            },
+            "typecheck-strict": {
+              "executor": "nx:run-commands",
+              "options": {
+                "strict": true,
+                "command": "node scripts/task.mjs web:typecheck-strict apps/web"
+              },
+              "configurations": {},
+              "parallelism": true
+            },
+            "format": {
+              "cache": true,
+              "executor": "nx:run-commands",
+              "options": {
+                "command": "node scripts/task.mjs web:format apps/web",
+                "write": true
+              },
+              "configurations": {},
+              "parallelism": true
+            },
+            "migrate": {
+              "parallelism": false,
+              "executor": "nx:run-commands",
+              "options": {
+                "command": "node scripts/task.mjs web:migrate apps/web"
+              },
+              "configurations": {}
             }
           },
           "name": "web",

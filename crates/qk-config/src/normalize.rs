@@ -76,6 +76,23 @@ pub(crate) fn project(
             value.insert("projectType".into(), json!("library"));
         }
     }
+    // Which of Nx's plugins created each target, for `filter.plugin` in
+    // target defaults: package.json's, unless project.json gives the target
+    // its executor or command or adds it.
+    let from_package: std::collections::BTreeSet<String> = targets.keys().cloned().collect();
+    let mut from_project = std::collections::BTreeSet::new();
+    for file in [&project_json, &local] {
+        if let Some(Value::Object(incoming)) = file.as_ref().and_then(|file| file.get("targets")) {
+            for (name, target) in incoming {
+                if !from_package.contains(name)
+                    || target.get("executor").is_some()
+                    || target.get("command").is_some()
+                {
+                    from_project.insert(name.clone());
+                }
+            }
+        }
+    }
     if let Some(Value::Object(project)) = project_json {
         overlay(&mut value, &mut targets, project)?;
     }
@@ -114,20 +131,39 @@ pub(crate) fn project(
     }
     value.insert("namedInputs".into(), Value::Object(named_inputs));
 
+    let project_name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let project_tags: Vec<String> = value
+        .get("tags")
+        .and_then(Value::as_array)
+        .map(|tags| {
+            tags.iter()
+                .filter_map(|tag| tag.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
     let mut normalized_targets = Map::new();
     for (name, target) in targets {
         let target = normalize_command(target)?;
-        // Executor defaults take precedence over name defaults; never combine both.
-        let defaults = target
-            .get("executor")
-            .and_then(Value::as_str)
-            .and_then(|executor| config.target_defaults.get(executor))
-            .or_else(|| config.target_defaults.get(&name));
-        let defaults = defaults
-            .map(|defaults| normalize_command(defaults.clone()))
-            .transpose()?
-            // Nx drops a default that would replace the target's own executor.
-            .filter(|defaults| compatible(defaults, &target));
+        let plugin = if from_project.contains(&name) || !from_package.contains(&name) {
+            "nx/core/project-json"
+        } else {
+            "nx/core/package-json"
+        };
+        let defaults = target_default(
+            config,
+            &name,
+            &target,
+            &Filtered {
+                project: &project_name,
+                tags: &project_tags,
+                plugin,
+            },
+        )
+        .with_context(|| format!("invalid targetDefaults for {name:?}"))?;
         let target = match defaults {
             Some(defaults) => merge_target(defaults, target)?,
             None => target,
@@ -186,12 +222,22 @@ pub(crate) fn workspace(base: Value, local: Value) -> Result<Value> {
     let mut base = object(base, "nx.json")?;
     for (key, value) in object(local, "nx.local.json")? {
         let value = match key.as_str() {
+            // Entries merge as targets do; an array of filtered entries
+            // replaces what it overrides.
             "targetDefaults" => {
                 let mut defaults = object(
                     base.remove(&key).unwrap_or_else(|| json!({})),
                     "targetDefaults",
                 )?;
-                merge_targets(&mut defaults, value)?;
+                for (name, local) in object(value, "targetDefaults")? {
+                    let merged = match (defaults.remove(&name), local) {
+                        (Some(base @ Value::Object(_)), local @ Value::Object(_)) => {
+                            merge_target(normalize_command(base)?, normalize_command(local)?)?
+                        }
+                        (_, local) => local,
+                    };
+                    defaults.insert(name, merged);
+                }
                 Value::Object(defaults)
             }
             "namedInputs" => {
@@ -262,6 +308,156 @@ fn merge_target(base: Value, overlay: Value) -> Result<Value> {
         base.insert(key, value);
     }
     Ok(Value::Object(base))
+}
+
+/// What a target default's `filter` is matched against.
+struct Filtered<'a> {
+    project: &'a str,
+    tags: &'a [String],
+    plugin: &'a str,
+}
+
+/// The target default for a target, as Nx 23 resolves it. Keys are tried in
+/// order: the target's executor, its name, then glob keys matching the name,
+/// longest first. A key's value is a default or an array of them, each with
+/// an optional `filter` on `projects`, `plugin` and `executor`; the first key
+/// with an entry whose filter matches wins, and its matching entries merge in
+/// order, later winning. An entry naming a different executor from the
+/// target's is left out, but its key still wins.
+fn target_default(
+    config: &WorkspaceConfig,
+    name: &str,
+    target: &Value,
+    context: &Filtered,
+) -> Result<Option<Value>> {
+    let defaults = &config.target_defaults;
+    let executor = target.get("executor").and_then(Value::as_str);
+    let mut keys: Vec<&str> = Vec::new();
+    if let Some(executor) = executor.filter(|executor| defaults.contains_key(*executor)) {
+        keys.push(executor);
+    }
+    if defaults.contains_key(name) && Some(name) != executor {
+        keys.push(name);
+    }
+    let mut globs: Vec<&str> = defaults
+        .keys()
+        .map(String::as_str)
+        .filter(|key| *key != name && Some(*key) != executor && is_glob(key))
+        .filter(|key| {
+            globset::Glob::new(key)
+                .map(|glob| glob.compile_matcher().is_match(name))
+                .unwrap_or(false)
+        })
+        .collect();
+    globs.sort_by_key(|key| std::cmp::Reverse(key.len()));
+    keys.extend(globs);
+    for key in keys {
+        let entries = match &defaults[key] {
+            Value::Array(entries) => entries.clone(),
+            entry => vec![entry.clone()],
+        };
+        let mut matched = false;
+        let mut merged: Option<Value> = None;
+        for entry in entries {
+            let mut entry = object(entry, "target default")?;
+            let filter = entry.remove("filter");
+            if !filter_matches(filter.as_ref(), executor, context)? {
+                continue;
+            }
+            matched = true;
+            let entry = normalize_command(Value::Object(entry))?;
+            // Nx drops a default that would replace the target's own executor.
+            if !compatible(&entry, target) {
+                continue;
+            }
+            merged = Some(match merged {
+                Some(merged) => merge_target(merged, entry)?,
+                None => entry,
+            });
+        }
+        if matched {
+            return Ok(merged);
+        }
+    }
+    Ok(None)
+}
+
+/// Nx's `isGlobPattern`, for target default keys.
+fn is_glob(key: &str) -> bool {
+    key.contains(['*', '?', '[', '{']) || ["!(", "+(", "@("].iter().any(|group| key.contains(group))
+}
+
+fn filter_matches(
+    filter: Option<&Value>,
+    executor: Option<&str>,
+    context: &Filtered,
+) -> Result<bool> {
+    let Some(filter) = filter else {
+        return Ok(true);
+    };
+    let filter = filter.as_object().context("filter must be an object")?;
+    for key in filter.keys() {
+        if !matches!(key.as_str(), "projects" | "plugin" | "executor") {
+            bail!("unknown target default filter {key:?}");
+        }
+    }
+    if let Some(projects) = filter.get("projects") {
+        let patterns: Vec<String> = match projects {
+            Value::String(pattern) => vec![pattern.clone()],
+            other => serde_json::from_value(other.clone())
+                .context("filter.projects must be a string or an array")?,
+        };
+        if !project_matches(&patterns, context)? {
+            return Ok(false);
+        }
+    }
+    if let Some(plugin) = filter.get("plugin")
+        && plugin.as_str() != Some(context.plugin)
+    {
+        return Ok(false);
+    }
+    if let Some(wanted) = filter.get("executor")
+        && wanted.as_str() != executor
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Whether Nx's project patterns select this project: names and globs,
+/// `tag:` globs, and `!` exclusions, starting from every project when the
+/// first pattern excludes.
+fn project_matches(patterns: &[String], context: &Filtered) -> Result<bool> {
+    let matches = |pattern: &str| -> Result<bool> {
+        let (tag, glob) = match pattern.strip_prefix("tag:") {
+            Some(tag) => (true, tag),
+            None => (false, pattern),
+        };
+        let glob = globset::Glob::new(glob)
+            .with_context(|| format!("invalid project pattern {pattern:?}"))?
+            .compile_matcher();
+        Ok(if tag {
+            context.tags.iter().any(|tag| glob.is_match(tag))
+        } else {
+            glob.is_match(context.project)
+        })
+    };
+    let mut selected = patterns.first().is_some_and(|first| first.starts_with('!'));
+    for pattern in patterns {
+        match pattern.strip_prefix('!') {
+            Some(excluded) => {
+                if matches(excluded)? {
+                    selected = false;
+                }
+            }
+            None => {
+                if matches(pattern)? {
+                    selected = true;
+                }
+            }
+        }
+    }
+    Ok(selected)
 }
 
 /// Nx applies a target default unless both name an executor and they differ.

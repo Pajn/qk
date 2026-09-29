@@ -1,12 +1,33 @@
 {
   "name": "web",
   "projectType": "application",
-  "tags": ["scope:web"],
+  "tags": [
+    "scope:web"
+  ],
   "targets": {
-    "build": { "defaultConfiguration": "production", "configurations": { "production": {}, "development": {} } },
+    "build": {
+      "defaultConfiguration": "production",
+      "configurations": {
+        "production": {},
+        "development": {}
+      }
+    },
     "test": {},
     "lint": {},
     "serve": {},
-    "check": {}
+    "check": {},
+    "typecheck-app": {
+      "command": "node scripts/task.mjs web:typecheck-app {projectRoot}"
+    },
+    "typecheck-strict": {
+      "command": "node scripts/task.mjs web:typecheck-strict {projectRoot}"
+    },
+    "format": {
+      "command": "node scripts/task.mjs web:format {projectRoot}"
+    },
+    "migrate": {
+      "command": "node scripts/task.mjs web:migrate {projectRoot}",
+      "parallelism": false
+    }
   }
 }

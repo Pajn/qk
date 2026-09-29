@@ -31,6 +31,20 @@
       }
     },
     "serve": { "continuous": true, "command": "node scripts/serve.mjs" },
+    // Glob keys: the longest match applies, alone.
+    "typecheck-*": { "cache": true, "inputs": ["production"] },
+    "typecheck-strict*": { "options": { "strict": true } },
+    // Filtered entries merge in order when their filter matches.
+    "format": [
+      { "cache": true },
+      { "filter": { "projects": ["tag:scope:web"] }, "options": { "write": true } },
+      { "filter": { "plugin": "nx/core/package-json" }, "outputs": ["{projectRoot}/.format"] },
+      { "filter": { "executor": "nx:noop" }, "cache": false }
+    ],
+    // An entry for another executor is left out, but its key still wins over
+    // the glob below.
+    "migrate": [{ "executor": "nx:run-script", "options": { "script": "migrate" } }],
+    "m*": { "cache": true },
     "check": { "executor": "nx:noop", "dependsOn": ["build", "test", "lint"] }
   }
 }
