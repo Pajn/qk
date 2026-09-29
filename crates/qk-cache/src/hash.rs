@@ -69,10 +69,12 @@ impl Stamp {
     }
 }
 
-/// Digests persisted between runs in the worktree's `.qk`, keyed by path and
+/// Digests persisted between runs in the worktree's state, keyed by path and
 /// stamp, so a warm run reads only the files that changed. Stamps include the
 /// inode, so they belong to one worktree.
-const DIGESTS: &str = ".qk/digests.json";
+fn digests_path(root: &Path) -> PathBuf {
+    paths::worktree_state(root).join("digests.json")
+}
 
 /// Workspace state shared by every fingerprint in one run. The candidate file list
 /// is taken once, like Nx's file map; file contents are still re-read whenever
@@ -184,7 +186,7 @@ impl Snapshot {
             .filter(|(path, _)| self.files.contains(*path))
             .map(|(path, (stamp, digest))| (path, (stamp, digest)))
             .collect();
-        let path = root.join(DIGESTS);
+        let path = digests_path(root);
         let saved = (|| -> Result<()> {
             let directory = path.parent().context("digests have a directory")?;
             std::fs::create_dir_all(directory)?;
@@ -358,7 +360,7 @@ fn load_digests(root: &Path) -> HashMap<String, (Stamp, String)> {
         version: u32,
         entries: HashMap<String, (Stamp, String)>,
     }
-    std::fs::read(root.join(DIGESTS))
+    std::fs::read(digests_path(root))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Saved>(&bytes).ok())
         .filter(|saved| saved.version == 1)

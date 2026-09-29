@@ -265,8 +265,11 @@ validate executor support, execute runtime inputs, or run commands.
 
 Targets with `cache: true` are cached locally. Inside a Git repository the
 cache lives in `<git common dir>/qk/cache/v1`, so every linked worktree of the
-repository shares one cache. Outside Git it lives in `.qk/cache/v1` at the
-workspace root. `qk cache path` prints the location. `--skip-cache` (also
+repository shares one cache. What belongs to one worktree (file digests,
+records of the outputs it holds, restores in progress) lives in its own git
+directory, `$(git rev-parse --git-dir)/qk`, so nothing of qk's appears in the
+working tree. Outside Git both live in `.qk` at the workspace root, the cache
+in `.qk/cache/v1`. `qk cache path` prints the cache's location. `--skip-cache` (also
 `--skip-nx-cache` and `--skipNxCache`) bypasses all cache reads and writes.
 
 A task's key covers its ID, forwarded arguments, resolved target definition,
@@ -301,7 +304,7 @@ Candidate input files are tracked and untracked-but-not-ignored files, minus
 any task's declared outputs. The list is taken once per run, as Nx does, so a
 file that a task creates without declaring it as an output is seen from the
 next run. File contents are re-read whenever their metadata changes; their
-digests persist between runs in the worktree's `.qk/digests.json`, keyed by
+digests persist between runs in the worktree's state, keyed by
 path, size, modification time and, on Unix, change time, inode and mode, so a
 warm run reads only files whose metadata changed. Without
 `inputs`, a task uses `default` and `^default`; `default` is
@@ -335,11 +338,11 @@ saved only when the task succeeds and its inputs are unchanged afterwards.
 On a hit, qk removes existing files matching the declared outputs, copies the
 cached outputs into place and replays the recorded stdout and stderr. As in
 Nx, outputs a worktree already holds for the key are left as they are: after
-each restore or save qk records, in the worktree's `.qk/outputs`, every output
+each restore or save qk records, in the worktree's state, every output
 path with its size, times, inode and mode, and a hit that finds exactly those
 still in place only replays the log, marked
 `[existing outputs match the cache, left as is]`. Restores
-are staged in `.qk/` at the workspace root. Saving and restoring copy files,
+are staged in the worktree's state. Saving and restoring copy files,
 which clones them on copy-on-write filesystems such as APFS when the cache and
 the checkout share a volume. Files are never hardlinked, so editing a restored
 file never changes the cache. Every file is verified

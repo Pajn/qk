@@ -865,7 +865,9 @@ fn persisted_digests_notice_edits_that_restore_the_modification_time() {
         .set_modified(old)
         .unwrap();
     success(fixture.build(&fixture.root, &[]));
-    assert!(fixture.root.join(".qk/digests.json").is_file());
+    assert!(fixture.root.join(".git/qk/digests.json").is_file());
+    // Nothing of qk's appears in the working tree.
+    assert!(!fixture.root.join(".qk").exists());
     // Same size, same modification time; only the change time moves.
     fs::write(&input, "two\n").unwrap();
     fs::File::options()

@@ -256,12 +256,7 @@ impl Cache {
             return manifest.output_fingerprint().map(Some);
         }
         // Stage on the destination filesystem; no existing output is touched yet.
-        let stage_parent = root.join(".qk");
-        if fs::symlink_metadata(&stage_parent)
-            .is_ok_and(|metadata| metadata.file_type().is_symlink())
-        {
-            bail!(".qk cannot be a symlink");
-        }
+        let stage_parent = paths::worktree_state(root).join("restore");
         fs::create_dir_all(&stage_parent)?;
         let stage = tempfile::Builder::new()
             .prefix("restore-")
@@ -327,7 +322,7 @@ impl Cache {
             if matches!(artifact, Artifact::Directory { .. }) {
                 fs::create_dir_all(&destination)?;
             } else {
-                fs::rename(stage.path().join(path), &destination)?;
+                move_staged(&stage.path().join(path), &destination)?;
             }
         }
         for (path, artifact) in manifest.artifacts.iter().rev() {
@@ -342,13 +337,35 @@ impl Cache {
     }
 }
 
-/// Where a worktree records the outputs it holds for a task: in its own `.qk`,
-/// since each worktree has its own outputs.
+/// Where a worktree records the outputs it holds for a task, since each
+/// worktree has its own outputs.
 fn outputs_record(root: &Path, task: &str) -> std::path::PathBuf {
     let name = blake3::hash(task.as_bytes()).to_hex();
-    root.join(".qk")
+    paths::worktree_state(root)
         .join("outputs")
         .join(format!("{}.json", &name[..32]))
+}
+
+/// Moves a staged file or link into place, copying when the worktree's state
+/// is on another filesystem than the worktree.
+fn move_staged(staged: &Path, destination: &Path) -> Result<()> {
+    match fs::rename(staged, destination) {
+        Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {
+            let metadata = fs::symlink_metadata(staged)?;
+            if metadata.file_type().is_symlink() {
+                let target = fs::read_link(staged)?;
+                symlink(
+                    target.to_str().context("symlink target must be UTF-8")?,
+                    destination,
+                    fs::metadata(staged).is_ok_and(|metadata| metadata.is_dir()),
+                )?;
+            } else {
+                fs::copy(staged, destination)?;
+            }
+            Ok(())
+        }
+        result => Ok(result?),
+    }
 }
 
 /// Each output path with metadata that changes whenever it is written,

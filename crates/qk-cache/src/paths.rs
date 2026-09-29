@@ -27,6 +27,25 @@ pub fn git_path(root: &Path, flag: &str) -> Option<PathBuf> {
     Some(PathBuf::from(path.trim_end_matches(['\r', '\n'])))
 }
 
+/// Where qk keeps what belongs to one worktree: digests of its files, records
+/// of the outputs it holds, and restores in progress. Inside Git that is the
+/// worktree's own git directory, so nothing appears in the working tree;
+/// outside Git it is `.qk` at the workspace root.
+pub fn worktree_state(root: &Path) -> PathBuf {
+    static KNOWN: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, PathBuf>>,
+    > = std::sync::OnceLock::new();
+    let known = KNOWN.get_or_init(Default::default);
+    if let Some(state) = known.lock().unwrap().get(root) {
+        return state.clone();
+    }
+    let state = git_path(root, "--git-dir")
+        .map(|dir| dir.join("qk"))
+        .unwrap_or_else(|| root.join(".qk"));
+    known.lock().unwrap().insert(root.to_owned(), state.clone());
+    state
+}
+
 pub fn cache_directory(root: &Path) -> PathBuf {
     git_path(root, "--git-common-dir")
         .map(|dir| dir.join("qk/cache/v1"))
