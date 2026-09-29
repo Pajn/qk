@@ -394,12 +394,15 @@ fn source_files(root: &Path) -> Result<BTreeSet<String>> {
         };
     // Tracked files deleted from the working tree are listed as cached; git
     // names them in a second listing, which is cheaper than checking each file.
+    // Skip-worktree entries are listed whether or not they are on disk and never
+    // as deleted, so those few are checked; `-v` tags them `S`.
     let (listed, deleted) = std::thread::scope(|scope| {
         let deleted = scope.spawn(|| paths::git(root, &["ls-files", "--deleted", "-z", "--", "."]));
         let listed = paths::git(
             root,
             &[
                 "ls-files",
+                "-v",
                 "--cached",
                 "--others",
                 "--exclude-standard",
@@ -413,10 +416,18 @@ fn source_files(root: &Path) -> Result<BTreeSet<String>> {
     let candidates = match (lines(listed), lines(deleted)) {
         (Some(listed), Some(deleted)) => {
             let deleted = deleted?;
-            listed?
-                .into_iter()
-                .filter(|path| !deleted.contains(path))
-                .collect()
+            let mut files = BTreeSet::new();
+            for entry in listed? {
+                let Some((tag, path)) = entry.split_once(' ') else {
+                    bail!("unexpected git ls-files entry {entry:?}");
+                };
+                let absent =
+                    matches!(tag, "S" | "s") && std::fs::symlink_metadata(root.join(path)).is_err();
+                if !absent && !deleted.contains(path) {
+                    files.insert(path.to_owned());
+                }
+            }
+            files
         }
         _ => {
             let mut files = BTreeSet::new();
@@ -818,7 +829,12 @@ pub fn inputs(
     }
     let mut files = files
         .iter()
-        .map(|path| Ok((path.clone(), snapshot.file_value(&workspace.root, path)?)))
+        .map(|path| {
+            let value = snapshot
+                .file_value(&workspace.root, path)
+                .with_context(|| format!("cannot read input {path}"))?;
+            Ok((path.clone(), value))
+        })
         .collect::<Result<BTreeMap<_, _>>>()?;
     if workspace_file {
         match workspace_without_resolution(&workspace.root) {

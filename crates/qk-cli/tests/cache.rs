@@ -877,3 +877,37 @@ fn persisted_digests_notice_edits_that_restore_the_modification_time() {
     assert!(stderr(&success(fixture.build(&fixture.root, &[]))).contains("cache miss"));
     assert_eq!(fixture.runs(), 2);
 }
+
+#[test]
+fn skip_worktree_files_absent_from_disk_are_not_inputs() {
+    let fixture = Fixture::new(target("build", json!({})));
+    fs::write(fixture.root.join("src/sparse.txt"), "tracked\n").unwrap();
+    fixture.git(&fixture.root, &["add", "src/sparse.txt"]);
+    fixture.git(
+        &fixture.root,
+        &[
+            "-c",
+            "user.name=qk",
+            "-c",
+            "user.email=qk@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "sparse",
+        ],
+    );
+    fixture.git(
+        &fixture.root,
+        &["update-index", "--skip-worktree", "src/sparse.txt"],
+    );
+    fs::remove_file(fixture.root.join("src/sparse.txt")).unwrap();
+    let output = success(fixture.build(&fixture.root, &[]));
+    assert!(
+        stderr(&output).contains("qk: cache miss app:build"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        stderr(&success(fixture.build(&fixture.root, &[]))).contains("qk: cache hit app:build")
+    );
+}
