@@ -764,7 +764,7 @@ pub fn resolve(
         }
     }
     for project in &packages {
-        for name in ["project.json", "package.json"] {
+        for name in ["project.json", qk_config::LOCAL_OVERRIDES, "package.json"] {
             let path = Path::new(&workspace.projects[project].root).join(name);
             let path = path.strip_prefix(".").unwrap_or(&path).to_owned();
             if workspace.root.join(&path).is_file() {

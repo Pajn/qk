@@ -1062,3 +1062,33 @@ fn warm_state_is_shared_through_the_remote_by_branch() {
     fresh();
     assert_eq!(on("feature"), "feature");
 }
+
+#[test]
+fn local_overrides_change_the_task_and_its_key() {
+    let fixture = Fixture::new(json!({
+        "command": "cat src/input.txt",
+        "cache": true,
+        "inputs": ["{projectRoot}/src/**/*"]
+    }));
+    assert_eq!(said(&fixture, &fixture.root, &[]), "one");
+    let mut ignore = fs::read_to_string(fixture.root.join(".gitignore")).unwrap();
+    ignore.push_str("project.local.json\n");
+    fs::write(fixture.root.join(".gitignore"), ignore).unwrap();
+    fs::write(
+        fixture.root.join("project.local.json"),
+        json!({"targets": {"build": {"command": "echo local"}}}).to_string(),
+    )
+    .unwrap();
+    let output = success(fixture.build(&fixture.root, &[]));
+    assert_eq!(stdout(&output).lines().next(), Some("local"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("qk: using local overrides from project.local.json"),
+        "{stderr}"
+    );
+    // Without it, the checked-in definition's entry still applies.
+    fs::remove_file(fixture.root.join("project.local.json")).unwrap();
+    let output = success(fixture.build(&fixture.root, &["--output-style", "static"]));
+    assert!(stdout(&output).contains("one"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cache hit app:build"));
+}

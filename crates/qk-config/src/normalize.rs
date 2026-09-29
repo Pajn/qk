@@ -10,6 +10,7 @@ pub(crate) fn project(
     directory: &Path,
     config: &WorkspaceConfig,
     project_json: Option<Value>,
+    local: Option<Value>,
     package: Option<&Package>,
 ) -> Result<Project> {
     let relative = relative_path(root, directory)?;
@@ -75,33 +76,15 @@ pub(crate) fn project(
             value.insert("projectType".into(), json!("library"));
         }
     }
-    if let Some(Value::Object(mut project)) = project_json {
-        // Nx merges tags as an ordered union rather than replacing them.
-        if let Some(Value::Array(incoming)) = project.remove("tags") {
-            let mut tags = match value.remove("tags") {
-                Some(Value::Array(tags)) => tags,
-                _ => Vec::new(),
-            };
-            for tag in incoming {
-                if !tags.contains(&tag) {
-                    tags.push(tag);
-                }
-            }
-            value.insert("tags".into(), Value::Array(tags));
+    if let Some(Value::Object(project)) = project_json {
+        overlay(&mut value, &mut targets, project)?;
+    }
+    if let Some(Value::Object(local)) = local {
+        if local.contains_key("name") || local.contains_key("root") {
+            bail!("{} cannot set name or root", crate::LOCAL_OVERRIDES);
         }
-        if let Some(explicit) = project.remove("targets") {
-            merge_targets(&mut targets, explicit)?;
-        }
-        // Project named inputs override package-level definitions by name.
-        if let Some(named) = project.remove("namedInputs") {
-            let mut merged = object(
-                value.remove("namedInputs").unwrap_or_else(|| json!({})),
-                "namedInputs",
-            )?;
-            merged.extend(object(named, "namedInputs")?);
-            value.insert("namedInputs".into(), Value::Object(merged));
-        }
-        value.extend(project);
+        overlay(&mut value, &mut targets, local)
+            .with_context(|| format!("invalid {}", crate::LOCAL_OVERRIDES))?;
     }
     let inferred_name = package.and_then(|p| p.name.clone()).unwrap_or_else(|| {
         if relative == "." {
@@ -160,6 +143,41 @@ pub(crate) fn project(
         bail!("project name must not be empty");
     }
     Ok(project)
+}
+
+/// Merges one configuration file over the project so far, as Nx merges
+/// project.json over package.json: tags as an ordered union, targets through
+/// [`merge_target`], named inputs by name, and every other field replaced.
+fn overlay(
+    value: &mut Map<String, Value>,
+    targets: &mut Map<String, Value>,
+    mut project: Map<String, Value>,
+) -> Result<()> {
+    if let Some(Value::Array(incoming)) = project.remove("tags") {
+        let mut tags = match value.remove("tags") {
+            Some(Value::Array(tags)) => tags,
+            _ => Vec::new(),
+        };
+        for tag in incoming {
+            if !tags.contains(&tag) {
+                tags.push(tag);
+            }
+        }
+        value.insert("tags".into(), Value::Array(tags));
+    }
+    if let Some(explicit) = project.remove("targets") {
+        merge_targets(targets, explicit)?;
+    }
+    if let Some(named) = project.remove("namedInputs") {
+        let mut merged = object(
+            value.remove("namedInputs").unwrap_or_else(|| json!({})),
+            "namedInputs",
+        )?;
+        merged.extend(object(named, "namedInputs")?);
+        value.insert("namedInputs".into(), Value::Object(merged));
+    }
+    value.extend(project);
+    Ok(())
 }
 
 fn object(value: Value, field: &str) -> Result<Map<String, Value>> {

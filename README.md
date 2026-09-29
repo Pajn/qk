@@ -531,6 +531,13 @@ limit. `NX_CACHE_DIRECTORY` is not read.
   latter taking precedence. Explicit project names win over package names;
   projects without either use their relative directory with `/` replaced by
   `-`. Duplicate names fail with both project roots in the error.
+- Merges a `project.local.json` beside `project.json` or `package.json` over
+  both, the same way, before `targetDefaults` apply. It holds changes for one
+  machine, such as a target's options or a target only you run, and belongs
+  in `.gitignore`; Nx does not read it. It cannot set `name` or `root`. A run
+  reports each one merged into its projects (`qk: using local overrides from
+  apps/web/project.local.json`), and each is keyed like `project.json`, so an
+  overridden task never reuses the checked-in definition's cache entries.
 - Applies exact executor-keyed or target-name-keyed `targetDefaults`.
   Executor defaults take precedence. As in Nx, a default naming a different
   executor from the target's own is not applied. Options merge by key; each named

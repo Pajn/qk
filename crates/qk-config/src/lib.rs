@@ -115,7 +115,13 @@ pub struct Workspace {
     pub projects: BTreeMap<String, Project>,
     /// Package manifests indexed by normalized project name.
     pub packages: BTreeMap<String, Package>,
+    /// The `project.local.json` files merged into projects, workspace-relative.
+    pub local_overrides: Vec<String>,
 }
+
+/// Merged over a project's checked-in configuration, for changes that stay on
+/// one machine. It is meant to be ignored by Git; Nx does not read it.
+pub const LOCAL_OVERRIDES: &str = "project.local.json";
 
 impl Workspace {
     pub fn load(root: &Path) -> Result<Self> {
@@ -148,9 +154,11 @@ impl Workspace {
             config,
             projects: BTreeMap::new(),
             packages: BTreeMap::new(),
+            local_overrides: Vec::new(),
         };
         for directory in discovery::project_directories(&root)? {
             let project_json = read_optional_json(&directory.join("project.json"))?;
+            let local = read_optional_json(&directory.join(LOCAL_OVERRIDES))?;
             let package: Option<Package> = read_optional_json(&directory.join("package.json"))?
                 .map(serde_json::from_value)
                 .transpose()
@@ -160,6 +168,7 @@ impl Workspace {
                 &directory,
                 &workspace.config,
                 project_json,
+                local.clone(),
                 package.as_ref(),
             )
             .with_context(|| format!("invalid project in {}", directory.display()))?;
@@ -173,6 +182,16 @@ impl Workspace {
             }
             if let Some(package) = package {
                 workspace.packages.insert(project.name.clone(), package);
+            }
+            if local.is_some() {
+                let root = if project.root == "." {
+                    String::new()
+                } else {
+                    format!("{}/", project.root)
+                };
+                workspace
+                    .local_overrides
+                    .push(format!("{root}{LOCAL_OVERRIDES}"));
             }
             workspace.projects.insert(project.name.clone(), project);
         }

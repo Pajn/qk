@@ -753,6 +753,23 @@ fn execute_tasks(
             ui::SinkKind::Dynamic(dynamic)
         }
     };
+    // Only the overrides of projects with a task in this run.
+    let projects: std::collections::BTreeSet<&str> = graph
+        .tasks
+        .values()
+        .map(|task| task.project.as_str())
+        .collect();
+    for path in &workspace.local_overrides {
+        let root = path
+            .rsplit_once('/')
+            .map_or(".", |(directory, _)| directory);
+        if projects
+            .iter()
+            .any(|project| workspace.projects[*project].root == root)
+        {
+            qk_executor::status!("qk: using local overrides from {path}");
+        }
+    }
     let style = match rendered {
         Rendered::Lines(style) => style,
         Rendered::Quiet | Rendered::Dynamic => qk_executor::OutputStyle::Quiet,

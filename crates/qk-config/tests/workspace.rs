@@ -364,3 +364,75 @@ fn skips_target_defaults_incompatible_with_the_target() {
     assert_eq!(targets["build"].cache, Some(true));
     assert_eq!(targets["e2e"].cache, Some(true));
 }
+
+#[test]
+fn local_overrides_merge_over_the_checked_in_project() {
+    let temp = TempDir::new().unwrap();
+    write(
+        temp.path(),
+        "nx.json",
+        r#"{"targetDefaults": {"build": {"cache": true, "outputs": ["{projectRoot}/dist"]}}}"#,
+    );
+    write(
+        temp.path(),
+        "apps/app/project.json",
+        r#"{"name": "app", "tags": ["web"], "targets": {
+            "build": {"command": "vite build", "options": {"cwd": "{projectRoot}", "mode": "production"}},
+            "test": {"command": "vitest"}
+        }}"#,
+    );
+    write(
+        temp.path(),
+        "apps/app/project.local.json",
+        r#"{
+            // Comments are allowed, as in project.json.
+            "tags": ["mine"],
+            "targets": {
+                "build": {"options": {"mode": "development"}},
+                "profile": {"command": "vite build --profile"}
+            }
+        }"#,
+    );
+    write(
+        temp.path(),
+        "libs/lib/package.json",
+        r#"{"name": "lib", "scripts": {"test": "vitest"}}"#,
+    );
+    write(
+        temp.path(),
+        "libs/lib/project.local.json",
+        r#"{"targets": {"test": {"cache": false}}}"#,
+    );
+    write(temp.path(), "package.json", r#"{"workspaces": ["libs/*"]}"#);
+    let workspace = Workspace::load(temp.path()).unwrap();
+    let app = &workspace.projects["app"];
+    assert_eq!(app.tags, ["web", "mine"]);
+    let build = &app.targets["build"];
+    assert_eq!(build.options["command"], "vite build");
+    assert_eq!(build.options["mode"], "development");
+    assert_eq!(build.options["cwd"], "{projectRoot}");
+    // Target defaults still apply beneath both files.
+    assert_eq!(build.cache, Some(true));
+    assert!(app.targets.contains_key("test"));
+    assert_eq!(
+        app.targets["profile"].options["command"],
+        "vite build --profile"
+    );
+    assert_eq!(workspace.projects["lib"].targets["test"].cache, Some(false));
+    assert_eq!(
+        workspace.local_overrides,
+        ["apps/app/project.local.json", "libs/lib/project.local.json"]
+    );
+}
+
+#[test]
+fn local_overrides_cannot_rename_a_project() {
+    let temp = TempDir::new().unwrap();
+    write(temp.path(), "project.json", r#"{"name": "app"}"#);
+    write(temp.path(), "project.local.json", r#"{"name": "mine"}"#);
+    let error = format!("{:#}", Workspace::load(temp.path()).unwrap_err());
+    assert!(
+        error.contains("project.local.json cannot set name or root"),
+        "{error}"
+    );
+}
