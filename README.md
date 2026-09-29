@@ -1,11 +1,11 @@
 # qk
 
 **qk**, short for **quick**, is a standalone task runner written in Rust.
-It starts with Nx-compatible workspace configuration and will grow into task
-execution, affected selection, caching and run history.
+It reads Nx-compatible workspace configuration and executes tasks with
+dependency ordering. Affected selection, caching and run history are planned.
 
-The first implementation supports **workspace inspection**. Task execution,
-lockfile analysis and caching are not implemented yet. The
+The current implementation supports **workspace inspection and finite task
+execution**. Lockfile analysis and caching are not implemented yet. The
 [design](docs/task-runner-design.md) describes the longer-term plan, not the
 current feature set.
 
@@ -18,11 +18,12 @@ cargo run -p qk-cli -- --workspace examples/basic show projects
 cargo run -p qk-cli -- --workspace examples/basic show project web --json
 cargo run -p qk-cli -- --workspace examples/basic show projects --projects 'tag:scope:*' --json
 cargo run -p qk-cli -- --workspace examples/basic graph --file -
+cargo run -p qk-cli -- --workspace examples/basic run codegen:smoke
 ```
 
-The example is self-contained; no Node installation, package installation,
-Nx process is required. Its commands are
-configuration examples only and are not executed.
+Inspection and the `codegen:smoke` task are self-contained; no Node
+installation, package installation, Nx process is required. Other example targets demonstrate package scripts
+and require pnpm when executed.
 
 To install the binary locally:
 
@@ -46,12 +47,15 @@ parent workspace marker exists.
 | `qk show project <name> [--json]` | Normalized project configuration as JSON |
 | `qk graph --file <path>` | Workspace project graph in a `{ "graph": { "nodes": ..., "dependencies": ... } }` envelope |
 | `qk graph` or `qk graph --file -` | The same graph on stdout |
+| `qk run <project>:<target>[:<configuration>]` | Execute a task and its dependencies |
+| `qk run-many -t build,test -p 'web,core' --parallel 4` | Execute matching targets with bounded task concurrency |
+| `qk run web:build --dry-run` | Print the planned task graph as JSON without execution |
 
 `--workspace <path>` works before or after the subcommand. Graph output paths
 are relative to the invocation directory; their parent directories must
 already exist. JSON output has no progress messages mixed into stdout.
 Errors go to stderr and return a nonzero exit code. Unknown commands and
-flags, including `run` and `--affected`, fail explicitly.
+flags, including `affected` and `--affected`, fail explicitly.
 
 Project selectors support `*`, `?`, character classes and `tag:<glob>`.
 Repeat `--projects` or use commas to combine selectors. Prefix a selector
@@ -60,6 +64,82 @@ exclusions, selection starts with all projects. A selector matching nothing
 returns an empty list; `show project` requires an existing exact name.
 Quote globs so the shell does not expand them. Commas delimit CLI selectors,
 so brace globs containing commas are not supported on the command line.
+
+## Task execution
+
+`run` requires an existing target; `run-many` skips projects without the
+requested targets and errors when nothing matches. Both accept
+`-c/--configuration`, `--parallel` (default `3`, also settable through
+`NX_PARALLEL`), `--output-style stream` and `--dry-run`.
+
+The planner expands `dependsOn` before execution: local targets, `^target`
+on project dependencies, `project:target`, and objects with `target`,
+`projects`, `dependencies` and `params`. Project selectors accept names,
+globs, tags, `self` and `!self`. Missing dependency targets are skipped;
+unknown explicit projects and task cycles fail. Shared tasks run once.
+Configurations propagate to dependencies that define the same name;
+otherwise the dependency's default configuration applies. A shared task
+reached with different forwarded arguments is rejected as ambiguous.
+
+Supported executors:
+
+- `nx:run-commands`: `command`, or a `commands` array of strings or objects
+  with `command` and `forwardAllArgs`. Multiple commands run concurrently by
+  default; `options.parallel: false` runs them in sequence. Supports `cwd`,
+  `env` and `forwardAllArgs`. The default cwd is the workspace root.
+- `nx:run-script`: invokes `npm run` or `pnpm run` in the project directory,
+  preserving the package manager's script behavior. The manager comes from
+  root `packageManager`, then pnpm workspace/lockfile markers, otherwise npm.
+  Other declared managers are rejected. Missing scripts fail during execution
+  preflight, after explicit project target overrides have been applied.
+- `nx:noop`: completes successfully after its dependencies, without a process.
+
+Commands use `/bin/sh -c` on Unix and `cmd.exe /D /S /C` on Windows. Local
+`node_modules/.bin` directories from cwd up to the workspace root are added
+to `PATH`. Tasks currently have closed stdin; interactive and continuous
+tasks are not supported. stdout and stderr stream directly, with no task
+prefix added to child output. qk writes its own status messages to stderr.
+
+Environment precedence, highest first: configuration `env`, `options.env`,
+target-level `env`, inherited process environment, root `.env.local`, root
+`.env`. Dotenv is loaded into child environments without mutating qk's process
+environment. Dotenv interpolation uses dotenvy's per-file semantics; it does
+not provide cross-file interpolation against the merged child environment.
+
+Forward task arguments after `--`:
+
+```sh
+qk run app:build -- --mode=production 'two words'
+qk run app:package -c release -- --arch=arm64
+```
+
+Commands support `{projectRoot}`, `{workspaceRoot}`, `{projectName}`,
+`{args}` (all forwarded arguments), and `{args.name}` (a `--name=value` or
+`--name value` argument; a flag without a value becomes `true`). Place argument
+tokens outside quotes: qk quotes their values as shell data. Missing named
+arguments and quoted argument placeholders are errors. On Windows, forwarded
+values containing quotes, `%`, `!`, `^` or newlines are currently rejected;
+use target environment variables for those values. Workspace/project path
+tokens are substituted as written, so quote path tokens where your command
+requires it.
+
+Without argument tokens, arguments are appended by default; set
+`forwardAllArgs: false` to disable that. With argument tokens, only the
+explicit substitutions are used. Dependencies receive no arguments unless
+their dependency object sets `params: "forward"`.
+
+All selected tasks are prepared before any command starts, so unsupported
+executors, options and continuous tasks fail before dependencies run. A
+failed task skips its dependents while independent tasks continue. The CLI
+returns the first observed failing task's exit code. Ctrl-C and, on Unix,
+SIGTERM cancel the run, terminate managed process groups and return `130`.
+Parallel commands within a failed task are also terminated. Commands must
+not detach themselves into separate sessions or launch external services;
+those processes are outside the managed group.
+
+**Execution is uncached**, even for targets with `cache: true`. `--dry-run`
+only plans and prints the task graph: it does not load dotenv, validate
+executor support, execute runtime inputs, or run commands.
 
 ## Configuration and graph support
 
@@ -107,10 +187,10 @@ parity claim yet. In particular:
 - Target-default glob keys and filtered defaults are not implemented;
   filtered default arrays are rejected. Nx plugins and inferred targets are
   outside the design's scope.
-- Input expressions, task dependencies and configurations are preserved for
-  inspection; their execution semantics are not resolved yet. `.env` files
-  and runtime inputs are not evaluated.
-- `affected`, task scheduling, cache storage, remote storage, history,
+- Input expressions and runtime inputs are preserved for inspection; hashing
+  and affected semantics are not resolved yet.
+- `affected`, continuous and interactive tasks, output capture/replay,
+  static/dynamic output styles, cache storage, remote storage, history,
   release commands and npm binary distribution remain future work.
 
 The compatibility baseline is documented in Nx's
@@ -128,17 +208,20 @@ cargo test --workspace --locked
 cargo build --release --locked
 ```
 
-The Cargo workspace contains three crates:
+The Cargo workspace contains six crates:
 
 | Crate | Responsibility |
 | --- | --- |
 | `qk-config` | Workspace discovery, JSONC/YAML parsing, typed project configuration and normalization |
 | `qk-graph` | Workspace edges, project selection, reverse reachability and graph export |
+| `qk-taskgraph` | Dependency expansion, configuration selection and task DAG validation |
+| `qk-executor` | Command preparation, environment, argument interpolation and process groups |
+| `qk-runner` | Bounded task scheduling, dependency failure propagation and cancellation |
 | `qk-cli` | Argument parsing and output; produces the `qk` binary |
 
 Fixture and CLI tests use self-contained workspaces. GitHub Actions is
 configured for Linux, macOS and Windows. The lockfile is checked in for
 reproducible dependency resolution.
 
-Next: add pnpm v9 lockfile parsing and external graph nodes, then capture Nx
-parity fixtures before implementing affected selection and task execution.
+Next: expand execution parity and continuous-task lifecycle handling, then add
+pnpm v9 lockfile parsing and external graph nodes before hashing and caching.

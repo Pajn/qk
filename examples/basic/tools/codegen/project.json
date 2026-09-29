@@ -1,5 +1,8 @@
 {
   "name": "codegen",
   "tags": ["tooling"],
-  "targets": { "build": { "executor": "nx:noop", "cache": false } }
+  "targets": {
+    "build": { "executor": "nx:noop", "cache": false },
+    "smoke": { "command": "echo qk is running" }
+  }
 }

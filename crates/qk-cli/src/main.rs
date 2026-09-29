@@ -2,16 +2,21 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use qk_config::{Workspace, find_workspace};
 use qk_graph::{GraphReport, ProjectGraph, select_projects};
+use qk_taskgraph::{Request, TaskGraph};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 #[derive(Parser)]
 #[command(
     name = "qk",
     version,
     about = "Quick workspace task tooling",
-    long_about = "qk (quick): a standalone Rust task runner, under development.\nCurrently supports workspace inspection; execution and caching are not implemented yet."
+    long_about = "qk (quick): a standalone Rust task runner.\nInspect workspaces and execute finite tasks with dependency ordering. Caching is not implemented yet."
 )]
 struct Cli {
     /// Workspace root; defaults to discovery from the current directory.
@@ -23,6 +28,23 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Execute a task and its dependencies. Forward arguments after --.
+    Run {
+        task: String,
+        #[command(flatten)]
+        options: RunOptions,
+    },
+    /// Execute targets on selected projects and their dependencies.
+    RunMany {
+        #[arg(short = 't', long, required = true, value_delimiter = ',')]
+        targets: Vec<String>,
+        #[arg(short = 'p', long, value_delimiter = ',')]
+        projects: Vec<String>,
+        #[arg(long, value_delimiter = ',')]
+        exclude: Vec<String>,
+        #[command(flatten)]
+        options: RunOptions,
+    },
     /// Inspect workspace projects and normalized configuration.
     Show {
         #[command(subcommand)]
@@ -34,6 +56,29 @@ enum Command {
         #[arg(long, value_name = "PATH", default_value = "-")]
         file: PathBuf,
     },
+}
+
+#[derive(Args)]
+struct RunOptions {
+    #[arg(short = 'c', long)]
+    configuration: Option<String>,
+    /// Maximum number of tasks executing concurrently.
+    #[arg(long, env = "NX_PARALLEL", default_value = "3")]
+    parallel: std::num::NonZeroUsize,
+    /// Print the task graph as JSON without executing commands or loading dotenv.
+    #[arg(long)]
+    dry_run: bool,
+    /// Only raw streaming output is currently supported.
+    #[arg(long, value_enum, default_value = "stream")]
+    output_style: OutputStyle,
+    /// Arguments forwarded to requested tasks; dependencies require params: forward.
+    #[arg(last = true, allow_hyphen_values = true)]
+    args: Vec<String>,
+}
+
+#[derive(Clone, ValueEnum)]
+enum OutputStyle {
+    Stream,
 }
 
 #[derive(Subcommand)]
@@ -60,25 +105,66 @@ enum ShowCommand {
 }
 
 fn main() {
-    if let Err(error) = run(Cli::parse()) {
-        if error
-            .downcast_ref::<io::Error>()
-            .is_some_and(|e| e.kind() == io::ErrorKind::BrokenPipe)
-        {
-            return;
+    match run(Cli::parse()) {
+        Ok(0) => {}
+        Ok(code) => std::process::exit(code),
+        Err(error) => {
+            if error
+                .downcast_ref::<io::Error>()
+                .is_some_and(|e| e.kind() == io::ErrorKind::BrokenPipe)
+            {
+                return;
+            }
+            eprintln!("qk: {error:#}");
+            std::process::exit(1);
         }
-        eprintln!("qk: {error:#}");
-        std::process::exit(1);
     }
 }
 
-fn run(cli: Cli) -> Result<()> {
+fn run(cli: Cli) -> Result<i32> {
     let root = match cli.workspace {
         Some(path) => path,
         None => find_workspace(&std::env::current_dir().context("cannot read current directory")?)?,
     };
     let workspace = Workspace::load(&root)?;
     match cli.command {
+        Command::Run { task, options } => {
+            let mut request = Request::parse(&task)?;
+            if let Some(configuration) = &options.configuration {
+                if request
+                    .configuration
+                    .as_ref()
+                    .is_some_and(|existing| existing != configuration)
+                {
+                    bail!("configuration in task identifier conflicts with --configuration");
+                }
+                request.configuration = Some(configuration.clone());
+            }
+            request.args = options.args.clone();
+            return execute_tasks(&workspace, vec![request], &options);
+        }
+        Command::RunMany {
+            targets,
+            projects,
+            exclude,
+            options,
+        } => {
+            let selected = select_projects(&workspace.projects, &projects, &exclude)?;
+            let mut requests = Vec::new();
+            for project in selected {
+                for target in &targets {
+                    if workspace.projects[&project].targets.contains_key(target) {
+                        requests.push(Request {
+                            project: project.clone(),
+                            target: target.clone(),
+                            configuration: options.configuration.clone(),
+                            args: options.args.clone(),
+                        });
+                    }
+                }
+            }
+            return execute_tasks(&workspace, requests, &options);
+        }
         Command::Show {
             command:
                 ShowCommand::Projects {
@@ -117,7 +203,27 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
     }
-    Ok(())
+    Ok(0)
+}
+
+fn execute_tasks(
+    workspace: &Workspace,
+    requests: Vec<Request>,
+    options: &RunOptions,
+) -> Result<i32> {
+    let graph = TaskGraph::build(workspace, &requests)?;
+    if options.dry_run {
+        print_json(&graph)?;
+        return Ok(0);
+    }
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let signal = cancelled.clone();
+    ctrlc::set_handler(move || {
+        signal.store(true, Ordering::SeqCst);
+    })
+    .context("cannot register cancellation handler")?;
+    let result = qk_runner::run(workspace, &graph, options.parallel.get(), cancelled)?;
+    Ok(result.exit_code)
 }
 
 fn print_json(value: &impl serde::Serialize) -> Result<()> {

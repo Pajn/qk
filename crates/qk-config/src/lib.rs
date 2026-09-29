@@ -101,6 +101,7 @@ impl Package {
 #[derive(Debug)]
 pub struct Workspace {
     pub root: PathBuf,
+    pub package_manager: Option<String>,
     pub config: WorkspaceConfig,
     pub projects: BTreeMap<String, Project>,
     /// Package manifests indexed by normalized project name.
@@ -129,6 +130,11 @@ impl Workspace {
             }
         }
         let mut workspace = Self {
+            package_manager: read_optional_json(&root.join("package.json"))?
+                .and_then(|value| value.get("packageManager").cloned())
+                .map(serde_json::from_value)
+                .transpose()
+                .context("packageManager must be a string")?,
             root: root.clone(),
             config,
             projects: BTreeMap::new(),

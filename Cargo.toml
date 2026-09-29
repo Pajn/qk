@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/qk-cli", "crates/qk-config", "crates/qk-graph", "crates/qk-taskgraph"]
+members = ["crates/qk-cli", "crates/qk-config", "crates/qk-graph", "crates/qk-taskgraph", "crates/qk-executor", "crates/qk-runner"]
 resolver = "3"
 
 [workspace.package]
@@ -9,7 +9,10 @@ publish = false
 
 [workspace.dependencies]
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
+command-group = "5"
+ctrlc = { version = "3", features = ["termination"] }
+dotenvy = "0.15"
 globset = "0.4"
 ignore = "0.4"
 jsonc-parser = { version = "0.32", features = ["serde"] }
@@ -20,6 +23,8 @@ tempfile = "3"
 qk-config = { path = "crates/qk-config" }
 qk-graph = { path = "crates/qk-graph" }
 qk-taskgraph = { path = "crates/qk-taskgraph" }
+qk-executor = { path = "crates/qk-executor" }
+qk-runner = { path = "crates/qk-runner" }
 
 [profile.release]
 lto = "thin"

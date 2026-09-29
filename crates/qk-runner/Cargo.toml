@@ -1,0 +1,11 @@
+[package]
+name = "qk-runner"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+qk-config.workspace = true
+qk-executor.workspace = true
+qk-taskgraph.workspace = true

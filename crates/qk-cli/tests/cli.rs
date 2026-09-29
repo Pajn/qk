@@ -105,7 +105,7 @@ fn graph_file_matches_stdout_and_is_relative_to_invocation_directory() {
 fn unknown_projects_and_unimplemented_commands_fail_without_stdout() {
     for args in [
         vec!["show", "project", "missing"],
-        vec!["run", "web:build"],
+        vec!["affected", "-t", "build"],
         vec!["show", "projects", "--affected"],
     ] {
         let output = qk(&args);
