@@ -78,11 +78,16 @@ enum Command {
         #[command(subcommand)]
         command: ShowCommand,
     },
-    /// Export the workspace project graph as JSON (external nodes not yet included).
+    /// Export the workspace project graph as JSON.
     Graph {
         /// Output file; use - for stdout. Paths are relative to the current directory.
         #[arg(long, value_name = "PATH", default_value = "-")]
         file: PathBuf,
+        /// Add the packages the pnpm lockfile installs as `externalNodes`, with
+        /// edges from projects and between packages. `nx graph --file` leaves
+        /// them out.
+        #[arg(long)]
+        external: bool,
     },
 }
 
@@ -647,9 +652,13 @@ fn run(cli: Cli) -> Result<i32> {
             };
             print_json(project)?;
         }
-        Command::Graph { file } => {
+        Command::Graph { file, external } => {
             let graph = ProjectGraph::build(&workspace)?;
-            let mut bytes = serde_json::to_vec_pretty(&GraphReport { graph: &graph })?;
+            let mut report = serde_json::to_value(GraphReport { graph: &graph })?;
+            if external {
+                external_nodes(&workspace, &mut report["graph"])?;
+            }
+            let mut bytes = serde_json::to_vec_pretty(&report)?;
             bytes.push(b'\n');
             if file.as_os_str() == "-" {
                 io::stdout().lock().write_all(&bytes)?;
@@ -750,4 +759,42 @@ fn requests(
         }
     }
     requests
+}
+
+/// Adds `externalNodes` from the pnpm lockfile to a graph report: one node per
+/// installation, `npm:<name>@<version>`, edges from each project to what its
+/// importer installs directly, and edges between installations.
+fn external_nodes(workspace: &Workspace, graph: &mut serde_json::Value) -> Result<()> {
+    use serde_json::json;
+    let text = std::fs::read_to_string(workspace.root.join("pnpm-lock.yaml"))
+        .context("--external needs a pnpm-lock.yaml")?;
+    let lockfile = qk_lockfile::Lockfile::parse(&text)?;
+    let node = |key: &str| format!("npm:{key}");
+    let mut nodes = serde_json::Map::new();
+    for installed in lockfile.installations() {
+        nodes.insert(
+            node(installed.key),
+            json!({"type": "npm", "name": node(installed.key), "data": {
+                "packageName": installed.name, "version": installed.version, "hash": installed.integrity,
+            }}),
+        );
+        graph["dependencies"][node(installed.key)] = installed
+            .dependencies
+            .iter()
+            .map(|dependency| json!({"source": node(installed.key), "target": node(dependency), "type": "static"}))
+            .collect();
+    }
+    for project in workspace.projects.values() {
+        let Some(direct) = lockfile.direct_snapshots(&project.root) else {
+            continue;
+        };
+        let edges = graph["dependencies"][&project.name]
+            .as_array_mut()
+            .context("project dependencies must be an array")?;
+        for key in direct {
+            edges.push(json!({"source": project.name, "target": node(&key), "type": "static"}));
+        }
+    }
+    graph["externalNodes"] = serde_json::Value::Object(nodes);
+    Ok(())
 }

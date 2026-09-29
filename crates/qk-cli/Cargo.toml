@@ -20,6 +20,7 @@ qk-executor.workspace = true
 qk-cache.workspace = true
 qk-affected.workspace = true
 qk-history.workspace = true
+qk-lockfile.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 

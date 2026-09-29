@@ -28,6 +28,16 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+/// One installation, as [`Lockfile::installations`] lists it.
+#[derive(Debug)]
+pub struct Installed<'a> {
+    pub key: &'a str,
+    pub name: &'a str,
+    pub version: String,
+    pub integrity: Option<&'a str>,
+    pub dependencies: Vec<String>,
+}
+
 /// What one importer installs.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Installation {
@@ -214,6 +224,40 @@ impl Lockfile {
                 })
                 .collect(),
         })
+    }
+
+    /// Every installation in the lockfile: its snapshot key, package name,
+    /// version (with peers and patch), integrity when recorded, and the snapshot
+    /// keys of its dependencies.
+    pub fn installations(&self) -> impl Iterator<Item = Installed<'_>> {
+        self.snapshots.iter().map(|(key, dependencies)| {
+            let name = package_name(key);
+            Installed {
+                key,
+                name,
+                version: key[name.len() + 1..].to_owned(),
+                integrity: self
+                    .resolutions
+                    .get(package_key(key))
+                    .and_then(|resolution| resolution.get("integrity"))
+                    .and_then(Value::as_str),
+                dependencies: dependencies
+                    .iter()
+                    .filter_map(|(name, reference)| snapshot_key(name, reference))
+                    .collect(),
+            }
+        })
+    }
+
+    /// An importer's direct dependencies as snapshot keys, without workspace
+    /// links.
+    pub fn direct_snapshots(&self, importer: &str) -> Option<Vec<String>> {
+        Some(
+            self.direct(importer)?
+                .into_iter()
+                .map(|(_, key)| key)
+                .collect(),
+        )
     }
 
     /// The names of the packages `importer` installs, directly or not. `None`

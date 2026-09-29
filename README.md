@@ -50,6 +50,7 @@ parent workspace marker exists.
 | `qk show project <name> [--json]` | Normalized project configuration as JSON |
 | `qk graph --file <path>` | Workspace project graph in a `{ "graph": { "nodes": ..., "dependencies": ... } }` envelope |
 | `qk graph` or `qk graph --file -` | The same graph on stdout |
+| `qk graph --external` | The graph with the packages the pnpm lockfile installs as `externalNodes` |
 | `qk run <project>:<target>[:<configuration>]` | Execute a task and its dependencies |
 | `qk <target> [project]`, `qk <project>:<target>` | Nx-style shorthand for `qk run` |
 | `qk run-many -t build,test -p 'web,core' --parallel 4` | Execute matching targets with bounded task concurrency |
@@ -440,7 +441,9 @@ This is a subset of the design's compatibility surface. There is no Nx
 parity claim yet. In particular:
 
 - The graph includes **workspace projects only**, as `nx graph --file`
-  does. The pnpm lockfile is read for cache keys, not for graph nodes.
+  does. `--external` adds a node per installation in the pnpm lockfile,
+  `npm:<name>@<version>` with peers and patch in the version, with edges from
+  projects to what they install directly and between installations.
   Workspace dependency aliases and version-range resolution are not
   implemented; name matching is conservative.
 - Target-default glob keys and filtered defaults are not implemented;
@@ -528,4 +531,4 @@ compare prints them beside qk's.
 GitHub Actions is configured for Linux, macOS and Windows. The lockfile is
 checked in for reproducible dependency resolution.
 
-Next: external graph nodes, benchmarks and binary distribution.
+Next: benchmarks and binary distribution.

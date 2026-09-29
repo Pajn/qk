@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use serde_json::{Value, json};
@@ -367,4 +367,39 @@ fn task_granularity_selects_tasks_whose_inputs_changed() {
         "--json",
     ]));
     assert_eq!(report["tasks"], json!({}));
+}
+
+#[test]
+fn graph_can_include_the_packages_the_lockfile_installs() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/parity/fixture");
+    let output = Command::new(env!("CARGO_BIN_EXE_qk"))
+        .args(["--workspace", root.to_str().unwrap(), "graph", "--external"])
+        .output()
+        .unwrap();
+    let graph = &successful_json(output)["graph"];
+    let react_dom = "npm:react-dom@19.1.0(react@19.1.0)";
+    assert_eq!(
+        graph["externalNodes"][react_dom]["data"]["packageName"],
+        "react-dom"
+    );
+    let targets = |source: &str| -> Vec<String> {
+        graph["dependencies"][source]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|edge| edge["target"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert!(targets("web").contains(&react_dom.to_owned()));
+    assert!(targets(react_dom).contains(&"npm:scheduler@0.26.0".to_owned()));
+    // Without the flag the graph matches nx graph --file.
+    let plain = Command::new(env!("CARGO_BIN_EXE_qk"))
+        .args(["--workspace", root.to_str().unwrap(), "graph"])
+        .output()
+        .unwrap();
+    assert!(
+        successful_json(plain)["graph"]
+            .get("externalNodes")
+            .is_none()
+    );
 }
