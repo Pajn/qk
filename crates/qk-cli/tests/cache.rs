@@ -531,3 +531,51 @@ fn external_dependency_inputs_track_packages_any_importer_installs() {
     success(fixture.build(&fixture.root, &[]));
     assert_eq!(fixture.runs(), 2);
 }
+
+fn cache_size(fixture: &Fixture) -> u64 {
+    let output = success(fixture.qk(&fixture.root, &["cache", "prune", "--max-size", "1000GB"]));
+    let text = stdout(&output);
+    text.trim_end_matches(" bytes.\n")
+        .rsplit(' ')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+#[test]
+fn eviction_removes_least_recently_used_entries() {
+    let fixture = Fixture::new(target("build", json!({})));
+    success(fixture.build(&fixture.root, &[]));
+    let one = cache_size(&fixture);
+    fs::write(fixture.root.join("src/input.txt"), "two\n").unwrap();
+    success(fixture.build(&fixture.root, &[]));
+    // A hit makes the first entry the most recently used.
+    fs::write(fixture.root.join("src/input.txt"), "one\n").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    assert!(stderr(&success(fixture.build(&fixture.root, &[]))).contains("cache hit"));
+    assert_eq!(fixture.runs(), 2);
+
+    let output = success(fixture.qk(
+        &fixture.root,
+        &["cache", "prune", "--max-size", &one.to_string()],
+    ));
+    assert!(
+        stdout(&output).starts_with("Evicted 1 entries"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(stderr(&success(fixture.build(&fixture.root, &[]))).contains("cache hit"));
+    fs::write(fixture.root.join("src/input.txt"), "two\n").unwrap();
+    assert!(stderr(&success(fixture.build(&fixture.root, &[]))).contains("cache miss"));
+    assert_eq!(fixture.runs(), 3);
+
+    // Runs keep the cache under NX_MAX_CACHE_SIZE.
+    let output = fixture
+        .command(&fixture.root, &["run", "app:build"])
+        .env("NX_MAX_CACHE_SIZE", "1")
+        .output()
+        .unwrap();
+    assert!(stderr(&success(output)).contains("evicted"));
+    assert_eq!(cache_size(&fixture), 0);
+}

@@ -327,6 +327,7 @@ impl Cache {
             }
         }
         qk_executor::replay(File::open(log)?, display)?;
+        crate::evict::touch(&self.root.join("entries").join(format!("{key}.json")));
         manifest.output_fingerprint().map(Some)
     }
 }

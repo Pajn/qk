@@ -194,6 +194,13 @@ fn default_output_style(single: bool) -> qk_executor::OutputStyle {
 enum CacheCommand {
     /// Print the shared cache directory without creating it.
     Path,
+    /// Evict least recently used entries until the cache fits its size limit.
+    Prune {
+        /// Size limit for this prune, as NX_MAX_CACHE_SIZE takes it; 0 removes
+        /// everything. Defaults to the configured limit.
+        #[arg(long)]
+        max_size: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -366,6 +373,24 @@ fn run(cli: Cli) -> Result<i32> {
                 qk_cache::cache_directory(&workspace.root).display()
             )?;
         }
+        Command::Cache {
+            command: CacheCommand::Prune { max_size },
+        } => {
+            let cache = qk_cache::cache_directory(&workspace.root);
+            let limit = match max_size {
+                Some(text) => Some(qk_cache::parse_size(&text)?),
+                None => qk_cache::max_size(workspace.config.extra.get("maxCacheSize"), &cache)?,
+            };
+            let pruned = qk_cache::prune(&cache, limit.unwrap_or(u64::MAX))?;
+            writeln!(
+                io::stdout().lock(),
+                "Evicted {} entries and {} blobs, freeing {} bytes; the cache holds {} bytes.",
+                pruned.entries,
+                pruned.blobs,
+                pruned.freed,
+                pruned.size
+            )?;
+        }
         Command::Run { task, options } => {
             let task = if task.contains(':') {
                 task
@@ -499,6 +524,7 @@ fn execute_tasks(
         signal.store(true, Ordering::SeqCst);
     })
     .context("cannot register cancellation handler")?;
+    let skip_cache = options.skip_cache;
     let result = qk_runner::run(
         workspace,
         &graph,
@@ -509,6 +535,22 @@ fn execute_tasks(
             .map_or_else(|| default_output_style(single), OutputStyle::rendered),
         cancelled,
     )?;
+    if !skip_cache {
+        let cache = qk_cache::cache_directory(&workspace.root);
+        let pruned = qk_cache::max_size(workspace.config.extra.get("maxCacheSize"), &cache)
+            .and_then(|limit| match limit {
+                Some(limit) => qk_cache::prune(&cache, limit).map(Some),
+                None => Ok(None),
+            });
+        match pruned {
+            Ok(Some(pruned)) if pruned.entries > 0 => qk_executor::status!(
+                "qk: evicted {} cache entries to stay under the cache size limit",
+                pruned.entries
+            ),
+            Ok(_) => {}
+            Err(error) => qk_executor::status!("qk: could not prune the cache: {error:#}"),
+        }
+    }
     Ok(result.exit_code)
 }
 

@@ -58,6 +58,7 @@ parent workspace marker exists.
 | `qk affected -t build,test [--base <rev>] [--head <rev>]` | Execute targets on the affected projects |
 | `qk show affected [project] [--json]` | Why projects are affected, or why one project is |
 | `qk cache path` | Print the local cache directory without creating it |
+| `qk cache prune [--max-size 1GB]` | Evict least recently used entries until the cache fits |
 
 As in Nx, `qk build web` and `qk web:build` mean `qk run web:build`, and take the
 same options. Without a project, `qk build` and `qk run build` use the project
@@ -311,8 +312,17 @@ against its content hash; an unreadable or corrupt entry is a miss.
 A per-key lock makes concurrent runs of the same task, including runs in
 different worktrees, wait for each other and reuse the result.
 
-The cache has no size limit or eviction yet. Delete the directory printed by
-`qk cache path` to clear it. `NX_CACHE_DIRECTORY` is not read.
+The cache stays under a size limit: `NX_MAX_CACHE_SIZE`, else nx.json
+`maxCacheSize`, else a tenth of the disk holding it, as in Nx. Sizes are a
+number of bytes with an optional `KB`, `MB` or `GB`, in powers of 1024; `0`
+means unlimited. After each run, and on `qk cache prune [--max-size <size>]`,
+qk evicts the least recently used entries until the cache fits. A hit counts
+as a use. Outputs shared between entries are stored once and deleted only
+with the last entry citing them. Stored outputs no entry cites, scratch files
+and locks of evicted entries are removed once they are an hour old, since a
+concurrent run may still be writing them. A run under the limit only sums the
+cache's size; the full pass runs at most hourly unless the cache is over its
+limit. `NX_CACHE_DIRECTORY` is not read.
 
 ## Configuration and graph support
 
@@ -363,8 +373,8 @@ parity claim yet. In particular:
   filtered default arrays are rejected. Nx plugins and inferred targets are
   outside the design's scope.
 - Affected selection is per project; per-task affected is future work.
-- Interactive tasks, interactive output styles, remote cache storage, cache eviction, history, release commands and npm
-  binary distribution remain future work.
+- Interactive tasks, interactive output styles, remote cache storage,
+  history, release commands and npm binary distribution remain future work.
 
 The compatibility baseline is documented in Nx's
 [project configuration](https://nx.dev/docs/reference/project-configuration)
