@@ -707,3 +707,21 @@ fn unknown_run_commands_options_are_forwarded_like_nx() {
     );
     assert_eq!(stdout(&["run", "app:named"]), "port 3000\n");
 }
+
+#[cfg(unix)]
+#[test]
+fn target_names_with_colons_and_missing_arguments_resolve_like_nx() {
+    let temp = fixture(json!({
+        "install:ios": {"command": "echo installing ios"},
+        "install": {"command": "echo install {args.platform}done", "configurations": {"ios": {"command": "echo configured ios"}}}
+    }));
+    let stdout = |args: &[&str]| String::from_utf8(success(run(temp.path(), args)).stdout).unwrap();
+    // The project has a target named install:ios, so that wins.
+    assert_eq!(stdout(&["run", "app:install:ios"]), "installing ios\n");
+    assert_eq!(
+        stdout(&["run", "app:install", "-c", "ios"]),
+        "configured ios\n"
+    );
+    // A missing {args.platform} interpolates as nothing.
+    assert_eq!(stdout(&["run", "app:install"]), "install done\n");
+}

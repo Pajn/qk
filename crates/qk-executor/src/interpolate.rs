@@ -126,12 +126,13 @@ impl<'a> Interpolation<'a> {
                         .join(" ")
                 }),
                 _ if token.starts_with("args.") => {
-                    let key = &token[5..];
-                    let value = self
-                        .named
-                        .get(key)
-                        .with_context(|| format!("missing argument --{key} for {{{token}}}"))?;
-                    Some(if shell { quote(value)? } else { value.clone() })
+                    // As in Nx, an argument that was not given interpolates as nothing.
+                    let value = self.named.get(&token[5..]).map_or("", String::as_str);
+                    Some(if shell && !value.is_empty() {
+                        quote(value)?
+                    } else {
+                        value.to_owned()
+                    })
                 }
                 _ => None,
             };

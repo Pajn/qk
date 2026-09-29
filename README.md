@@ -54,7 +54,7 @@ parent workspace marker exists.
 | `qk run <project>:<target>[:<configuration>]` | Execute a task and its dependencies |
 | `qk <target> [project]`, `qk <project>:<target>` | Nx-style shorthand for `qk run` |
 | `qk run-many -t build,test -p 'web,core' --parallel 4` | Execute matching targets with bounded task concurrency |
-| `qk run web:build --dry-run` | Print the planned task graph as JSON without execution |
+| `qk run web:build --dry-run` | Prepare every planned task without running it, and print the task graph as JSON |
 | `qk show projects --affected [--base <rev>] [--head <rev>]` | Projects affected by the changes, in graph order |
 | `qk affected -t build,test [--base <rev>] [--head <rev>]` | Execute targets on the affected projects |
 | `qk show affected [project] [--json]` | Why projects are affected, or why one project is |
@@ -238,8 +238,9 @@ qk run app:package -c release -- --arch=arm64
 Commands support `{projectRoot}`, `{workspaceRoot}`, `{projectName}`,
 `{args}` (all forwarded arguments), and `{args.name}` (a `--name=value` or
 `--name value` argument; a flag without a value becomes `true`). Place argument
-tokens outside quotes: qk quotes their values as shell data. Missing named
-arguments and quoted argument placeholders are errors. On Windows, forwarded
+tokens outside quotes: qk quotes their values as shell data. A missing named
+argument interpolates as nothing, as in Nx; quoted argument placeholders are
+errors. On Windows, forwarded
 values containing quotes, `%`, `!`, `^` or newlines are currently rejected;
 use target environment variables for those values. Workspace/project path
 tokens are substituted as written, so quote path tokens where your command

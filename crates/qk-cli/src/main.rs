@@ -468,6 +468,19 @@ fn run(cli: Cli) -> Result<i32> {
                 format!("{}:{task}", current_project(&workspace)?)
             };
             let mut request = Request::parse(&task)?;
+            // As in Nx, `project:a:b` is the target `a:b` when the project has
+            // one, and the target `a` in configuration `b` otherwise.
+            if let Some(configuration) = &request.configuration {
+                let combined = format!("{}:{configuration}", request.target);
+                if workspace
+                    .projects
+                    .get(&request.project)
+                    .is_some_and(|project| project.targets.contains_key(&combined))
+                {
+                    request.target = combined;
+                    request.configuration = None;
+                }
+            }
             if let Some(configuration) = &options.configuration {
                 if request
                     .configuration
@@ -679,6 +692,12 @@ fn execute_tasks(
 ) -> Result<i32> {
     let graph = TaskGraph::build(workspace, &requests)?;
     if options.dry_run {
+        // Preparing has no side effects, and catches what would stop a real run.
+        let environment: std::collections::BTreeMap<_, _> = std::env::vars_os().collect();
+        for (id, task) in &graph.tasks {
+            qk_executor::prepare(workspace, task, &environment)
+                .with_context(|| format!("cannot execute {id}"))?;
+        }
         print_json(&graph)?;
         return Ok(0);
     }
