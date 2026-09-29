@@ -74,7 +74,7 @@ pub fn run(
             .tasks
             .values()
             .any(|task| task.definition.cache == Some(true)))
-    .then(|| qk_cache::Cache::new(qk_cache::cache_directory(&workspace.root)));
+    .then(|| qk_cache::Cache::for_workspace(workspace, &environment));
     let mut skipped = BTreeSet::new();
     let mut exit_code = 0;
     let (sender, receiver) = mpsc::channel();
@@ -230,6 +230,9 @@ pub fn run(
         }
         Ok(())
     })?;
+    if let Some(cache) = &cache {
+        cache.finish();
+    }
     if cancelled.load(Ordering::SeqCst) {
         exit_code = 130;
     }

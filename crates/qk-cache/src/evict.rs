@@ -236,7 +236,7 @@ fn directory_size(directory: &Path) -> Result<u64> {
 }
 
 /// Every blob a manifest cites: its log and its file outputs.
-fn manifest_blobs(manifest: &Value) -> BTreeSet<String> {
+pub(crate) fn manifest_blobs(manifest: &Value) -> BTreeSet<String> {
     let mut blobs = BTreeSet::new();
     if let Some(log) = manifest.get("log").and_then(Value::as_str) {
         blobs.insert(log.to_owned());

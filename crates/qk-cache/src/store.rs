@@ -115,7 +115,7 @@ fn symlink(target: &str, path: &Path, directory: bool) -> Result<()> {
     Ok(())
 }
 
-fn valid_hash(value: &str) -> bool {
+pub(crate) fn valid_hash(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
@@ -231,6 +231,7 @@ impl Cache {
         key: &str,
         outputs: &Outputs,
         display: &qk_executor::Display,
+        shown: qk_executor::Shown,
     ) -> Result<Option<String>> {
         let file = match File::open(self.root.join("entries").join(format!("{key}.json"))) {
             Ok(file) => file,
@@ -326,7 +327,7 @@ impl Cache {
                 set_mode(&root.join(path), *mode)?;
             }
         }
-        qk_executor::replay(File::open(log)?, display)?;
+        qk_executor::replay(File::open(log)?, display, shown)?;
         crate::evict::touch(&self.root.join("entries").join(format!("{key}.json")));
         manifest.output_fingerprint().map(Some)
     }

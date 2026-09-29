@@ -312,6 +312,27 @@ against its content hash; an unreadable or corrupt entry is a miss.
 A per-key lock makes concurrent runs of the same task, including runs in
 different worktrees, wait for each other and reuse the result.
 
+### Remote cache
+
+nx.json's `s3` key, as `@nx/s3-cache` reads it, adds a remote store on
+S3-compatible storage: `bucket`, `region`, `endpoint`, `forcePathStyle`,
+`cacheKeyPrefix`, `accessKeyId` and `secretAccessKey`. Credentials otherwise
+come from `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and
+`AWS_SESSION_TOKEN`, including from the workspace's `.env` files. `localMode`
+applies outside CI and `ciMode` when `CI` is set; each is `read-write` (the
+default), `read` (also spelled `read-only`) or `no-cache`, and
+`NX_POWERPACK_CACHE_MODE` overrides both. `encryptionKey` and SSO profiles are
+not supported; a store that cannot be used is reported and left out, and the
+local cache carries on.
+
+Entries are stored under `<cacheKeyPrefix>qk/v1/` in the local layout, so a
+bucket shared with Nx never mixes the two. A local miss fetches the manifest
+and only the outputs the local cache lacks, verifying each against its hash,
+and shows `[remote cache]`; any failure is a miss. After a task is saved it is
+uploaded in the background, outputs first and the manifest last, and a run
+waits for its uploads before it ends. Uploads report their failures without
+failing the run.
+
 The cache stays under a size limit: `NX_MAX_CACHE_SIZE`, else nx.json
 `maxCacheSize`, else a tenth of the disk holding it, as in Nx. Sizes are a
 number of bytes with an optional `KB`, `MB` or `GB`, in powers of 1024; `0`
@@ -373,8 +394,8 @@ parity claim yet. In particular:
   filtered default arrays are rejected. Nx plugins and inferred targets are
   outside the design's scope.
 - Affected selection is per project; per-task affected is future work.
-- Interactive tasks, interactive output styles, remote cache storage,
-  history, release commands and npm binary distribution remain future work.
+- Interactive tasks, interactive output styles, history, release commands
+  and npm binary distribution remain future work.
 
 The compatibility baseline is documented in Nx's
 [project configuration](https://nx.dev/docs/reference/project-configuration)
@@ -455,4 +476,4 @@ compare prints them beside qk's.
 GitHub Actions is configured for Linux, macOS and Windows. The lockfile is
 checked in for reproducible dependency resolution.
 
-Next: remote cache storage and run history.
+Next: run history and reports.

@@ -579,3 +579,131 @@ fn eviction_removes_least_recently_used_entries() {
     assert!(stderr(&success(output)).contains("evicted"));
     assert_eq!(cache_size(&fixture), 0);
 }
+
+#[path = "support/s3.rs"]
+mod s3;
+
+/// Points the fixture at the fake S3 store and returns a command runner with
+/// credentials set.
+fn with_remote(fixture: &Fixture, server: &s3::FakeS3, extra: Value) -> Value {
+    let mut config = json!({
+        "bucket": "cache", "region": "us-east-1",
+        "endpoint": server.endpoint, "forcePathStyle": true
+    });
+    for (key, value) in extra.as_object().unwrap() {
+        config[key] = value.clone();
+    }
+    fs::write(
+        fixture.root.join("nx.json"),
+        json!({"s3": config}).to_string(),
+    )
+    .unwrap();
+    config
+}
+
+fn remote_build(fixture: &Fixture, env: &[(&str, &str)]) -> Output {
+    let mut command = fixture.command(&fixture.root, &["run", "app:build"]);
+    command
+        .env("AWS_ACCESS_KEY_ID", "key")
+        .env("AWS_SECRET_ACCESS_KEY", "secret")
+        .env_remove("CI")
+        .env_remove("NX_POWERPACK_CACHE_MODE");
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    command.output().unwrap()
+}
+
+fn clear_local_cache(fixture: &Fixture) {
+    let path = stdout(&success(fixture.qk(&fixture.root, &["cache", "path"])));
+    fs::remove_dir_all(path.trim()).unwrap();
+}
+
+#[test]
+fn remote_cache_restores_what_another_machine_uploaded() {
+    let server = s3::FakeS3::start();
+    let fixture = Fixture::new(target("build", json!({})));
+    with_remote(&fixture, &server, json!({}));
+    let first = success(remote_build(&fixture, &[]));
+    assert!(
+        stderr(&first).contains("qk: cache miss app:build"),
+        "{}",
+        stderr(&first)
+    );
+    assert_eq!(server.objects("/cache/qk/v1/entries/").len(), 1);
+    assert!(server.objects("/cache/qk/v1/blobs/").len() >= 2);
+
+    // A machine with an empty local cache restores from the remote store.
+    clear_local_cache(&fixture);
+    fs::remove_dir_all(fixture.root.join("dist")).unwrap();
+    let second = success(remote_build(&fixture, &[]));
+    assert!(
+        stderr(&second).contains("qk: remote cache hit app:build"),
+        "{}",
+        stderr(&second)
+    );
+    assert_eq!(artifact(&fixture.root), "built:one\n");
+    assert!(stdout(&second).contains("building from one"));
+    assert_eq!(fixture.runs(), 1);
+    // And now holds the entry locally.
+    fs::remove_dir_all(fixture.root.join("dist")).unwrap();
+    assert!(stderr(&success(remote_build(&fixture, &[]))).contains("qk: cache hit app:build"));
+}
+
+#[test]
+fn remote_cache_modes_and_missing_credentials() {
+    let server = s3::FakeS3::start();
+    let fixture = Fixture::new(target("build", json!({})));
+    // Read-only local mode never writes.
+    with_remote(
+        &fixture,
+        &server,
+        json!({"localMode": "read-only", "ciMode": "read-write"}),
+    );
+    success(remote_build(&fixture, &[]));
+    assert_eq!(server.writes(), 0);
+    fs::write(fixture.root.join("src/input.txt"), "two\n").unwrap();
+    success(remote_build(&fixture, &[("CI", "true")]));
+    assert!(server.writes() > 0);
+    fs::write(fixture.root.join("src/input.txt"), "three\n").unwrap();
+    let before = server.writes();
+    success(remote_build(
+        &fixture,
+        &[("CI", "true"), ("NX_POWERPACK_CACHE_MODE", "no-cache")],
+    ));
+    assert_eq!(server.writes(), before);
+
+    // Without credentials the remote store is off and the local cache works.
+    let output = fixture
+        .command(&fixture.root, &["run", "app:build"])
+        .env_remove("AWS_ACCESS_KEY_ID")
+        .env_remove("AWS_SECRET_ACCESS_KEY")
+        .output()
+        .unwrap();
+    let output = success(output);
+    assert!(
+        stderr(&output).contains("remote cache disabled: no credentials"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(stderr(&output).contains("qk: cache hit app:build"));
+}
+
+#[test]
+fn remote_failures_mid_restore_are_misses() {
+    let server = s3::FakeS3::start();
+    let fixture = Fixture::new(target("build", json!({})));
+    with_remote(&fixture, &server, json!({}));
+    success(remote_build(&fixture, &[]));
+    clear_local_cache(&fixture);
+    server.state.lock().unwrap().fail_blob_reads = true;
+    let output = success(remote_build(&fixture, &[]));
+    assert!(
+        stderr(&output).contains("remote cache unavailable"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(stderr(&output).contains("qk: cache miss app:build"));
+    assert_eq!(fixture.runs(), 2);
+    assert_eq!(artifact(&fixture.root), "built:one\n");
+}

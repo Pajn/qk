@@ -4,6 +4,7 @@ mod evict;
 mod glob;
 mod hash;
 mod paths;
+mod remote;
 mod store;
 
 use std::collections::BTreeMap;
@@ -25,6 +26,7 @@ pub use paths::cache_directory;
 pub struct Cache {
     pub root: PathBuf,
     snapshot: OnceLock<std::result::Result<hash::Snapshot, String>>,
+    remote: Option<std::sync::Arc<remote::Remote>>,
 }
 
 /// A task's output fingerprint for its dependents' keys, or why it has none:
@@ -52,6 +54,38 @@ impl Cache {
         Self {
             root,
             snapshot: OnceLock::new(),
+            remote: None,
+        }
+    }
+
+    /// The workspace's cache, with the remote store its nx.json `s3` key
+    /// configures, if any. Credentials and modes are read from `environment`,
+    /// which includes the workspace's dotenv files. A remote store that cannot
+    /// be used is reported and left out; the local cache still works.
+    pub fn for_workspace(
+        workspace: &Workspace,
+        environment: &BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+    ) -> Self {
+        let remote = match remote::configure(workspace.config.extra.get("s3"), environment) {
+            Ok(remote) => remote.map(std::sync::Arc::new),
+            Err(error) => {
+                qk_executor::status!("qk: remote cache disabled: {error:#}");
+                None
+            }
+        };
+        Self {
+            remote,
+            ..Self::new(cache_directory(&workspace.root))
+        }
+    }
+
+    /// Waits for background uploads to the remote store, reporting failures.
+    pub fn finish(&self) {
+        if let Some(remote) = &self.remote {
+            let failures = remote.finish();
+            for failure in &failures {
+                qk_executor::status!("qk: remote cache upload failed for {failure}");
+            }
         }
     }
 
@@ -173,7 +207,13 @@ impl Cache {
         {
             return bypass("inputs changed while waiting for another run".into());
         }
-        match self.restore(&workspace.root, &key, &outputs, &prepared.display) {
+        match self.restore(
+            &workspace.root,
+            &key,
+            &outputs,
+            &prepared.display,
+            qk_executor::Shown::LocalCache,
+        ) {
             Ok(Some(fingerprint)) => {
                 qk_executor::status!("qk: cache hit {}", task.id);
                 return Ok(TaskResult {
@@ -185,6 +225,34 @@ impl Cache {
             Ok(None) => {}
             Err(error) => {
                 qk_executor::status!("qk: {}: ignoring unusable cache entry ({error})", task.id)
+            }
+        }
+        if let Some(remote) = &self.remote {
+            let fetched = remote.fetch(&self.root, &key).and_then(|found| {
+                if !found {
+                    return Ok(None);
+                }
+                self.restore(
+                    &workspace.root,
+                    &key,
+                    &outputs,
+                    &prepared.display,
+                    qk_executor::Shown::RemoteCache,
+                )
+            });
+            match fetched {
+                Ok(Some(fingerprint)) => {
+                    qk_executor::status!("qk: remote cache hit {}", task.id);
+                    return Ok(TaskResult {
+                        outcome: Outcome::Success,
+                        fingerprint: Ok(fingerprint),
+                        hit: true,
+                    });
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    qk_executor::status!("qk: {}: remote cache unavailable ({error:#})", task.id)
+                }
             }
         }
         qk_executor::status!("qk: cache miss {}", task.id);
@@ -210,7 +278,12 @@ impl Cache {
         } else {
             // The saved manifest already hashes every output; reuse it.
             match self.publish(&workspace.root, &key, &outputs, log.path()) {
-                Ok(fingerprint) => Ok(fingerprint),
+                Ok(fingerprint) => {
+                    if let Some(remote) = &self.remote {
+                        remote.upload(&self.root, &key);
+                    }
+                    Ok(fingerprint)
+                }
                 Err(error) => {
                     qk_executor::status!("qk: {}: could not save cache entry ({error})", task.id);
                     outputs_fingerprint(task, &workspace.root, &outputs, &key)
@@ -337,7 +410,13 @@ mod tests {
 
         std::fs::remove_dir_all(root.join("dist")).unwrap();
         let restored = cache
-            .restore(root, &key, &outputs, &qk_executor::Display::Stream)
+            .restore(
+                root,
+                &key,
+                &outputs,
+                &qk_executor::Display::Stream,
+                qk_executor::Shown::LocalCache,
+            )
             .unwrap();
         assert_eq!(restored, Some(saved.clone()));
         assert_eq!(saved, output_fingerprint(root, &outputs, &key).unwrap());

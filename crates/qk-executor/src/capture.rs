@@ -24,6 +24,7 @@ pub enum Shown {
     Success,
     Failure,
     LocalCache,
+    RemoteCache,
 }
 
 impl Display {
@@ -131,10 +132,10 @@ impl Printer {
             }
             Display::Static { id, group } => {
                 let held = std::mem::take(&mut *self.held.lock().unwrap());
-                let status = if shown == Shown::LocalCache {
-                    "  [local cache]"
-                } else {
-                    ""
+                let status = match shown {
+                    Shown::LocalCache => "  [local cache]",
+                    Shown::RemoteCache => "  [remote cache]",
+                    Shown::Success | Shown::Failure => "",
                 };
                 let mut text = Vec::new();
                 text.push(b'\n');
@@ -142,7 +143,7 @@ impl Printer {
                     let icon = match shown {
                         Shown::Success => "✅",
                         Shown::Failure => "❌",
-                        Shown::LocalCache => "🔁",
+                        Shown::LocalCache | Shown::RemoteCache => "🔁",
                     };
                     text.extend_from_slice(format!("::group::{icon} ").as_bytes());
                 }
@@ -262,10 +263,10 @@ pub fn read_capture(
 }
 
 /// Shows a recorded log as a cache hit.
-pub fn replay(reader: impl Read, display: &Display) -> io::Result<()> {
+pub fn replay(reader: impl Read, display: &Display, shown: Shown) -> io::Result<()> {
     let printer = Printer::new(display.clone());
     read_capture(reader, |stderr, bytes| printer.write(stderr, bytes))?;
-    printer.finish(Shown::LocalCache)
+    printer.finish(shown)
 }
 
 #[cfg(test)]

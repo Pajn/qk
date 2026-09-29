@@ -23,6 +23,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_ng = "0.10"
 tempfile = "3"
+rusty-s3 = "0.10"
+ureq = "3"
+url = "2"
 qk-config = { path = "crates/qk-config" }
 qk-graph = { path = "crates/qk-graph" }
 qk-taskgraph = { path = "crates/qk-taskgraph" }
