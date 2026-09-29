@@ -16,6 +16,7 @@ clap = { version = "4", features = ["derive", "env"] }
 command-group = "5"
 ctrlc = { version = "3", features = ["termination"] }
 dotenvy = "0.15"
+shlex = "2"
 globset = "0.4"
 ignore = "0.4"
 jsonc-parser = { version = "0.32", features = ["serde"] }

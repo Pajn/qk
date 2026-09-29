@@ -228,12 +228,18 @@ Supported executors:
 - `nx:run-commands`: `command`, or a `commands` array of strings or objects
   with `command` and `forwardAllArgs`. Multiple commands run concurrently by
   default; `options.parallel: false` runs them in sequence. Supports `cwd`,
-  `env` and `forwardAllArgs`. The default cwd is the workspace root. As in
-  Nx, any other scalar option, such as `port: 3000`, is forwarded to the
-  command as `--port=3000` and available as `{args.port}`, unless an argument
-  of the same name overrides it; object values are ignored. The options Nx
-  knows but qk does not implement (`readyWhen`, `envFile`, `color`, `usePty`,
-  `streamOutput`, `tty`, `verbose`, `args`) are rejected.
+  `env`, `forwardAllArgs` and `args`, extra arguments as a string of shell
+  text or an array joined with spaces: forwarded after the other options and
+  before the task's own arguments, and readable as `{args.name}`, also in
+  camel case (`--max-workers` as `{args.maxWorkers}`). The default cwd is the
+  workspace root. As in Nx, any other scalar option, such as `port: 3000`, is
+  forwarded to the command as `--port=3000` and available as `{args.port}`,
+  unless an argument of the same name overrides it; object values are
+  ignored. A task argument naming a run-commands option sets it rather than
+  reaching the command: `-- --args='--watch'`, `--cwd=dir`, `--no-parallel`,
+  `--env.NAME=value`. The options Nx knows but qk does not implement
+  (`readyWhen`, `envFile`, `color`, `usePty`, `streamOutput`, `tty`,
+  `verbose`) are rejected.
 - `nx:run-script`: invokes `npm run` or `pnpm run` in the project directory,
   preserving the package manager's script behavior. The manager comes from
   root `packageManager`, then pnpm workspace/lockfile markers, otherwise npm.
@@ -270,8 +276,10 @@ qk run app:package -c release -- --arch=arm64
 ```
 
 Commands support `{projectRoot}`, `{workspaceRoot}`, `{projectName}`,
-`{args}` (all forwarded arguments), and `{args.name}` (a `--name=value` or
-`--name value` argument; a flag without a value becomes `true`). Place argument
+`{args}` (all forwarded arguments, with the `args` option last, as in Nx),
+and `{args.name}` (a `--name=value` or `--name value` argument; a flag
+without a value becomes `true`, and `--no-name` sets `name` to `false`). A
+command cannot use both `{args}` and `{args.name}`. Place argument
 tokens outside quotes: qk quotes their values as shell data. A missing named
 argument interpolates as nothing, as in Nx; quoted argument placeholders are
 errors. On Windows, forwarded

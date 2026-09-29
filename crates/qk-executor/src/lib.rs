@@ -174,11 +174,16 @@ pub fn prepare(
     base_env: &BTreeMap<OsString, OsString>,
 ) -> Result<PreparedTask> {
     let definition = &task.definition;
-    let options = &definition.options;
     let executor = definition
         .executor
         .as_deref()
         .context("target has no executor or command")?;
+    let (options, args) = if executor == "nx:run-commands" {
+        run_commands_overrides(&definition.options, &task.args)
+    } else {
+        (definition.options.clone(), task.args.clone())
+    };
+    let options = &options;
     // Options Nx's run-commands knows; any other scalar option is forwarded to
     // the command as `--name=value`, and object values are ignored, as in Nx.
     const RUN_COMMANDS: &[&str] = &[
@@ -215,7 +220,20 @@ pub fn prepare(
             forwarded.insert(key.clone(), value);
         }
     }
-    let interpolation = interpolate::Interpolation::new(workspace, task, &forwarded);
+    let extra = match options.get("args") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(text)) => Some(text.clone()),
+        Some(Value::Array(words)) => Some(
+            words
+                .iter()
+                .map(|word| word.as_str().context("args entries must be strings"))
+                .collect::<Result<Vec<_>>>()?
+                .join(" "),
+        ),
+        Some(_) => bail!("args must be a string or an array of strings"),
+    };
+    let interpolation =
+        interpolate::Interpolation::new(workspace, task, args, &forwarded, extra.as_deref())?;
     let mut env = task_environment(workspace, task, base_env)?;
     for values in [definition.extra.get("env"), options.get("env")]
         .into_iter()
@@ -236,7 +254,7 @@ pub fn prepare(
             "nx:run-commands" => {
                 matches!(
                     key.as_str(),
-                    "command" | "commands" | "cwd" | "env" | "parallel" | "forwardAllArgs"
+                    "command" | "commands" | "cwd" | "env" | "parallel" | "forwardAllArgs" | "args"
                 ) || !RUN_COMMANDS.contains(&key.as_str())
             }
             "nx:run-script" => matches!(key.as_str(), "script" | "env" | "cwd"),
@@ -368,6 +386,109 @@ pub fn prepare(
         execution: BTreeMap::new(),
         display: Display::default(),
     })
+}
+
+/// The run-commands options Nx reads, which a task's arguments may set too.
+const OPTION_FLAGS: &[&str] = &[
+    "command",
+    "commands",
+    "color",
+    "parallel",
+    "readyWhen",
+    "cwd",
+    "args",
+    "envFile",
+    "__unparsed__",
+    "env",
+    "usePty",
+    "streamOutput",
+    "verbose",
+    "forwardAllArgs",
+    "tty",
+];
+
+/// The target's options with the task's arguments that name a run-commands
+/// option applied, and the arguments left for the command. As in Nx,
+/// `--cwd=dir`, `--no-parallel` or `--env.NAME=value` set the option instead
+/// of reaching the command.
+fn run_commands_overrides(
+    options: &serde_json::Map<String, Value>,
+    args: &[String],
+) -> (serde_json::Map<String, Value>, Vec<String>) {
+    const BOOLEAN: &[&str] = &[
+        "color",
+        "parallel",
+        "usePty",
+        "streamOutput",
+        "verbose",
+        "forwardAllArgs",
+        "tty",
+    ];
+    let mut options = options.clone();
+    let mut rest = Vec::new();
+    let mut ready = Vec::new();
+    let mut args = args.iter().peekable();
+    while let Some(arg) = args.next() {
+        let Some(flag) = arg.strip_prefix("--") else {
+            rest.push(arg.clone());
+            continue;
+        };
+        let (key, value) = match flag.split_once('=') {
+            Some((key, value)) => (key, Some(value.to_owned())),
+            None => (flag, None),
+        };
+        let (key, negated) = match key.strip_prefix("no-") {
+            Some(key) if OPTION_FLAGS.contains(&key) => (key, true),
+            _ => (key, false),
+        };
+        let (base, field) = match key.split_once('.') {
+            Some((base, field)) => (base, Some(field)),
+            None => (key, None),
+        };
+        if !OPTION_FLAGS.contains(&base) {
+            rest.push(arg.clone());
+            continue;
+        }
+        let boolean = BOOLEAN.contains(&base);
+        let value = match value {
+            Some(value) => value,
+            None if negated => "false".into(),
+            None if !boolean && args.peek().is_some_and(|next| !next.starts_with('-')) => {
+                args.next().unwrap().clone()
+            }
+            None => "true".into(),
+        };
+        let value = if boolean {
+            Value::Bool(value != "false")
+        } else {
+            Value::String(value)
+        };
+        match (base, field) {
+            ("env", Some(name)) => {
+                let env = options
+                    .entry("env")
+                    .or_insert_with(|| Value::Object(Default::default()));
+                if let Value::Object(env) = env {
+                    env.insert(name.to_owned(), value);
+                }
+            }
+            ("readyWhen", None) => ready.push(value),
+            // Nx sets these itself, and a list cannot come from a flag.
+            ("__unparsed__" | "commands", _) | (_, Some(_)) => {}
+            (base, None) => {
+                options.insert(base.to_owned(), value);
+            }
+        }
+    }
+    if !ready.is_empty() {
+        let ready = if ready.len() == 1 {
+            ready.pop().unwrap()
+        } else {
+            Value::Array(ready)
+        };
+        options.insert("readyWhen".into(), ready);
+    }
+    (options, rest)
 }
 
 fn boolean(value: Option<&Value>, default: bool, name: &str) -> Result<bool> {

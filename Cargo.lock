@@ -1060,6 +1060,7 @@ dependencies = [
  "qk-config",
  "qk-taskgraph",
  "serde_json",
+ "shlex",
 ]
 
 [[package]]

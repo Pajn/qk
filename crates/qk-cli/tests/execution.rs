@@ -767,3 +767,58 @@ fn quiet_output_is_plain_text_for_agents() {
     assert!(stderr.contains("1 of 2 tasks failed"), "{stderr}");
     assert!(!stderr.contains("qk: checking"), "{stderr}");
 }
+
+#[cfg(unix)]
+#[test]
+fn the_args_option_is_forwarded_and_readable_like_nx() {
+    let temp = fixture(json!({
+        "text": {"command": "echo run", "options": {"args": "--watch=false --max-workers 2"}},
+        "list": {"command": "echo run", "options": {"args": ["--one", "--two=2"]}},
+        "named": {"command": "echo workers {args.maxWorkers}", "options": {"args": "--max-workers=3"}},
+        "all": {"command": "echo all {args}", "options": {"port": 1, "args": "--last"}},
+        "both": {"command": "echo {args} {args.port}"}
+    }));
+    let stdout = |args: &[&str]| String::from_utf8(success(run(temp.path(), args)).stdout).unwrap();
+    assert_eq!(
+        stdout(&["run", "app:text"]),
+        "run --watch=false --max-workers 2\n"
+    );
+    assert_eq!(
+        stdout(&["run", "app:text", "--", "--extra"]),
+        "run --watch=false --max-workers 2 --extra\n"
+    );
+    assert_eq!(stdout(&["run", "app:list"]), "run --one --two=2\n");
+    // Read by its camel-case name too, and an argument wins.
+    assert_eq!(stdout(&["run", "app:named"]), "workers 3\n");
+    assert_eq!(
+        stdout(&["run", "app:named", "--", "--maxWorkers=5"]),
+        "workers 5\n"
+    );
+    // In {args}, as in Nx, the option comes after the arguments.
+    assert_eq!(
+        stdout(&["run", "app:all", "--", "--cli"]),
+        "all --port=1 --cli --last\n"
+    );
+    // Arguments naming a run-commands option set it instead of reaching the command.
+    assert_eq!(
+        stdout(&["run", "app:text", "--", "--args=--from-cli"]),
+        "run --from-cli\n"
+    );
+    let both = run(temp.path(), &["run", "app:both"]);
+    assert!(!both.status.success());
+    assert!(String::from_utf8_lossy(&both.stderr).contains("cannot use both {args} and {args.*}"));
+}
+
+#[cfg(unix)]
+#[test]
+fn arguments_naming_run_commands_options_set_them() {
+    let temp = fixture(json!({
+        "where": {"command": "echo $(basename \"$PWD\") $MODE"}
+    }));
+    fs::create_dir(temp.path().join("sub")).unwrap();
+    let output = success(run(
+        temp.path(),
+        &["run", "app:where", "--", "--cwd=sub", "--env.MODE=cli"],
+    ));
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "sub cli\n");
+}
