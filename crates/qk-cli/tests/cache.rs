@@ -1316,3 +1316,88 @@ fn a_task_without_parallelism_cannot_depend_on_a_continuous_task() {
         )
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn outputs_read_options_and_arguments_like_nx() {
+    let fixture = Fixture::new(json!({
+        "command": "mkdir -p {args.outputPath} && echo built > {args.outputPath}/file",
+        "cache": true,
+        "inputs": ["{projectRoot}/src/**/*"],
+        "options": {"outputPath": "out/app"},
+        // An output naming an option that is not set is left out.
+        "outputs": ["{options.outputPath}", "{options.missing}/x"]
+    }));
+    success(fixture.build(&fixture.root, &[]));
+    fs::remove_dir_all(fixture.root.join("out")).unwrap();
+    let hit = success(fixture.build(&fixture.root, &["--output-style", "static"]));
+    assert!(
+        stderr(&hit).contains("cache hit app:build"),
+        "{}",
+        stderr(&hit)
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("out/app/file")).unwrap(),
+        "built\n"
+    );
+    // An argument sets the option the output reads.
+    success(fixture.build(&fixture.root, &["--", "--outputPath=out/other"]));
+    fs::remove_dir_all(fixture.root.join("out")).unwrap();
+    success(fixture.build(&fixture.root, &["--", "--outputPath=out/other"]));
+    assert!(fixture.root.join("out/other/file").is_file());
+    assert!(!fixture.root.join("out/app").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn negated_outputs_are_neither_cached_nor_removed() {
+    let fixture = Fixture::new(json!({
+        "command": "mkdir -p dist/cache && echo kept > dist/app && echo scratch > dist/cache/tmp",
+        "cache": true,
+        "inputs": ["{projectRoot}/src/**/*"],
+        "outputs": ["{projectRoot}/dist", "!{projectRoot}/dist/cache"]
+    }));
+    success(fixture.build(&fixture.root, &[]));
+    fs::remove_file(fixture.root.join("dist/app")).unwrap();
+    fs::write(fixture.root.join("dist/cache/tmp"), "local").unwrap();
+    let hit = success(fixture.build(&fixture.root, &["--output-style", "static"]));
+    assert!(
+        stderr(&hit).contains("cache hit app:build"),
+        "{}",
+        stderr(&hit)
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("dist/app")).unwrap(),
+        "kept\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("dist/cache/tmp")).unwrap(),
+        "local"
+    );
+    fs::remove_dir_all(fixture.root.join("dist")).unwrap();
+    success(fixture.build(&fixture.root, &[]));
+    assert!(fixture.root.join("dist/app").is_file());
+    assert!(!fixture.root.join("dist/cache").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_build_target_without_outputs_caches_nx_defaults() {
+    let fixture = Fixture::new(json!({
+        "command": "mkdir -p build && echo built > build/app",
+        "cache": true,
+        "inputs": ["{projectRoot}/src/**/*"]
+    }));
+    success(fixture.build(&fixture.root, &[]));
+    fs::remove_dir_all(fixture.root.join("build")).unwrap();
+    let hit = success(fixture.build(&fixture.root, &["--output-style", "static"]));
+    assert!(
+        stderr(&hit).contains("cache hit app:build"),
+        "{}",
+        stderr(&hit)
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("build/app")).unwrap(),
+        "built\n"
+    );
+}

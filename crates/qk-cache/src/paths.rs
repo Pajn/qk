@@ -150,7 +150,12 @@ fn normalize(path: &str) -> Result<String> {
 #[derive(Clone)]
 pub struct Outputs {
     patterns: Vec<Pattern>,
+    /// Negated patterns: what they match is never an output.
+    negations: Vec<Pattern>,
     anchors: BTreeSet<String>,
+    /// Whether the target declares its outputs, rather than taking Nx's
+    /// defaults for a target without them.
+    explicit: bool,
 }
 
 impl Outputs {
@@ -174,7 +179,9 @@ impl Outputs {
         }
         Ok(Self {
             patterns: compiled,
+            negations: Vec::new(),
             anchors,
+            explicit: true,
         })
     }
 
@@ -190,20 +197,62 @@ impl Outputs {
                 .iter()
                 .map(|pattern| (*pattern).to_owned())
                 .collect(),
+            negations: Vec::new(),
+            explicit: true,
         }
     }
 
+    /// The task's outputs as Nx resolves them. `{options.name}` reads the
+    /// target's options with the task's arguments applied, and an output
+    /// naming what cannot be resolved is left out. Without `outputs`, Nx takes
+    /// `options.outputPath`, and for `build` and `prepare` targets
+    /// `dist/<root>`, `<root>/dist`, `<root>/build` and `<root>/public`.
     pub fn new(workspace: &Workspace, task: &Task) -> Result<Self> {
+        let root = &workspace.projects[&task.project].root;
+        let options = task_options(task);
+        let (templates, explicit) = match &task.definition.outputs {
+            Some(outputs) => (outputs.clone(), true),
+            None => match options.get("outputPath") {
+                Some(serde_json::Value::String(path)) => (vec![path.clone()], false),
+                Some(serde_json::Value::Array(paths)) => (
+                    paths
+                        .iter()
+                        .filter_map(|path| path.as_str().map(str::to_owned))
+                        .collect(),
+                    false,
+                ),
+                _ if matches!(task.target.as_str(), "build" | "prepare") => (
+                    [
+                        format!("dist/{root}"),
+                        format!("{root}/dist"),
+                        format!("{root}/build"),
+                        format!("{root}/public"),
+                    ]
+                    .into(),
+                    false,
+                ),
+                _ => (Vec::new(), false),
+            },
+        };
         let mut patterns = Vec::new();
+        let mut negations = Vec::new();
         let mut anchors = BTreeSet::new();
-        for pattern in task.definition.outputs.as_deref().unwrap_or_default() {
-            let pattern = expand(workspace, &task.project, pattern)?
+        for template in templates {
+            let (negated, template) = match template.strip_prefix('!') {
+                Some(rest) => (true, rest.to_owned()),
+                None => (false, template),
+            };
+            let Some(resolved) = resolve_output(task, &options, &template) else {
+                continue;
+            };
+            let pattern = expand(workspace, &task.project, &resolved)?
                 .trim_end_matches('/')
                 .to_owned();
-            if pattern.starts_with('!') {
-                bail!("negated outputs are not supported by the cache yet");
-            }
             validate_path(&pattern)?;
+            if negated {
+                negations.push(Pattern::new(&pattern, false)?);
+                continue;
+            }
             let anchor = pattern
                 .split('/')
                 .take_while(|part| crate::glob::is_literal(part))
@@ -222,12 +271,24 @@ impl Outputs {
             patterns.push(Pattern::new(&pattern, false)?);
             anchors.insert(anchor);
         }
-        Ok(Self { patterns, anchors })
+        Ok(Self {
+            patterns,
+            negations,
+            anchors,
+            explicit,
+        })
     }
 
-    /// Whether the task declares any outputs.
+    /// Whether the outputs come from the target's `outputs`.
+    pub fn is_explicit(&self) -> bool {
+        self.explicit
+    }
+
+    /// Whether the task declares outputs that hold everything it produces,
+    /// so dependents may be keyed by their content alone. Nx's defaults for a
+    /// target without `outputs` are only guesses, and do not count.
     pub fn declared(&self) -> bool {
-        !self.patterns.is_empty()
+        self.explicit && !self.patterns.is_empty()
     }
 
     /// Fixed directory prefixes; every matching path lies below one of them.
@@ -236,11 +297,12 @@ impl Outputs {
     }
 
     pub fn matches(&self, path: &str) -> bool {
-        Path::new(path).ancestors().any(|ancestor| {
-            self.patterns
-                .iter()
-                .any(|pattern| pattern.is_match(ancestor))
-        })
+        let any = |patterns: &[Pattern]| {
+            Path::new(path)
+                .ancestors()
+                .any(|ancestor| patterns.iter().any(|pattern| pattern.is_match(ancestor)))
+        };
+        any(&self.patterns) && !any(&self.negations)
     }
 
     pub fn paths(&self, root: &Path) -> Result<BTreeSet<String>> {
@@ -264,6 +326,67 @@ impl Outputs {
         }
         Ok(paths)
     }
+}
+
+/// The target's options with the task's `--name=value` arguments applied,
+/// as Nx's overrides are.
+fn task_options(task: &Task) -> serde_json::Map<String, serde_json::Value> {
+    let mut options = task.definition.options.clone();
+    let mut args = task.args.iter().peekable();
+    while let Some(arg) = args.next() {
+        let Some(flag) = arg.strip_prefix("--") else {
+            continue;
+        };
+        let (key, value) = match flag.split_once('=') {
+            Some((key, value)) => (key.to_owned(), value.to_owned()),
+            None if args.peek().is_some_and(|next| !next.starts_with('-')) => {
+                (flag.to_owned(), args.next().unwrap().clone())
+            }
+            None => (flag.to_owned(), "true".to_owned()),
+        };
+        options.insert(key, serde_json::Value::String(value));
+    }
+    options
+}
+
+/// An output with `{options.*}`, `{projectName}` and the legacy
+/// `{project.name}` and `{project.root}` replaced, or `None` when one of
+/// them has no value, which Nx leaves the output out for.
+fn resolve_output(
+    task: &Task,
+    options: &serde_json::Map<String, serde_json::Value>,
+    template: &str,
+) -> Option<String> {
+    let mut result = String::new();
+    let mut rest = template;
+    while let Some(start) = rest.find('{') {
+        result.push_str(&rest[..start]);
+        let end = rest[start..].find('}')? + start;
+        let token = rest[start + 1..end].trim();
+        let value = if let Some(path) = token.strip_prefix("options.") {
+            let mut value = options.get(path.split('.').next()?)?;
+            for part in path.split('.').skip(1) {
+                value = value.get(part)?;
+            }
+            match value {
+                serde_json::Value::String(text) if !text.is_empty() => text.clone(),
+                serde_json::Value::Number(number) => number.to_string(),
+                serde_json::Value::Bool(true) => "true".into(),
+                _ => return None,
+            }
+        } else {
+            match token {
+                "projectName" | "project.name" => task.project.clone(),
+                "project.root" => "{projectRoot}".into(),
+                "projectRoot" | "workspaceRoot" => format!("{{{token}}}"),
+                _ => return None,
+            }
+        };
+        result.push_str(&value);
+        rest = &rest[end + 1..];
+    }
+    result.push_str(rest);
+    Some(result)
 }
 
 #[cfg(test)]

@@ -430,10 +430,21 @@ exactly as Nx 23 expands them, including its approximations: `+(a|b)` matches
 one occurrence, and an omitted group in a directory segment widens that
 segment to `*`. This keeps input sets written for Nx selecting the same files.
 
+Outputs resolve as in Nx. `{options.name}` reads the target's options, with
+the task's `--name=value` arguments applied, and `{projectName}`,
+`{project.name}` and `{project.root}` work too; an output naming anything
+without a value is left out. `!` negates an output: what it matches is
+neither cached nor removed when an entry is restored. A target without
+`outputs` takes `options.outputPath`, and a `build` or `prepare` target
+`dist/<root>`, `<root>/dist`, `<root>/build` and `<root>/public`. Those
+defaults are cached and restored, but because they are guesses they stay
+inputs of other tasks, and dependents are keyed by the task's key rather
+than by those files alone.
+
 A task with any other input declaration, negation inside a glob such as
-`!(a|b)`, `{options.*}` or `{args.*}` paths, negated outputs, or an output
-without a fixed directory prefix runs uncached and reports why. Its dependents
-then run uncached too, naming the task and reason they depend on.
+`!(a|b)`, or an output without a fixed directory prefix runs uncached and
+reports why. Its dependents then run uncached too, naming the task and reason
+they depend on.
 
 On a miss, the task runs with stdout and stderr streamed through a pipe while
 they are recorded, so child processes do not see a terminal. The entry is

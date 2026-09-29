@@ -138,12 +138,14 @@ impl Snapshot {
             files.retain(|path| !Path::new(path).starts_with(cache_relative));
         }
         // Generated artifacts must not make the next invocation invalidate itself.
-        // Another task's unsupported outputs stay candidates: that only costs misses.
+        // Another task's unsupported outputs stay candidates: that only costs misses,
+        // and so do Nx's default outputs, which may well hold sources.
         let mut generated = BTreeSet::new();
         for outputs in graph
             .tasks
             .values()
             .filter_map(|task| Outputs::new(workspace, task).ok())
+            .filter(Outputs::is_explicit)
         {
             for anchor in outputs.anchors() {
                 generated.extend(
