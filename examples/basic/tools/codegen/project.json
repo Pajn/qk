@@ -1,0 +1,5 @@
+{
+  "name": "codegen",
+  "tags": ["tooling"],
+  "targets": { "build": { "executor": "nx:noop", "cache": false } }
+}

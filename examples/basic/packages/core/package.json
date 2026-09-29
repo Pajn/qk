@@ -1,0 +1,6 @@
+{
+  "name": "@example/core",
+  "private": true,
+  "scripts": { "build": "echo build core" },
+  "nx": { "name": "core", "tags": ["library", "scope:frontend"] }
+}

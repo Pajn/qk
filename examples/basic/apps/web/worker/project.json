@@ -1,0 +1,6 @@
+{
+  "name": "worker",
+  "tags": ["service"],
+  "implicitDependencies": ["web"],
+  "targets": { "check": { "executor": "nx:noop" } }
+}

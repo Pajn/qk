@@ -1,0 +1,16 @@
+{
+  // Shared defaults are merged into each project's configuration.
+  "defaultBase": "main",
+  "namedInputs": {
+    "default": ["{projectRoot}/**/*"],
+    "production": ["default", "!{projectRoot}/**/*.md"]
+  },
+  "targetDefaults": {
+    "build": {
+      "cache": true,
+      "inputs": ["production", "^production"],
+      "dependsOn": ["^build"],
+      "options": { "cwd": "{projectRoot}" }
+    }
+  }
+}

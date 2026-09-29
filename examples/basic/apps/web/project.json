@@ -1,0 +1,12 @@
+{
+  "name": "web",
+  "projectType": "application",
+  "sourceRoot": "apps/web/src",
+  "implicitDependencies": ["codegen"],
+  "targets": {
+    "build": {
+      "command": "echo build web",
+      "outputs": ["{projectRoot}/dist"]
+    }
+  }
+}

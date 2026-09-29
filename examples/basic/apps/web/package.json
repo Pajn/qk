@@ -1,0 +1,15 @@
+{
+  "name": "@example/web",
+  "private": true,
+  "scripts": {
+    "build": "echo build web",
+    "test": "echo test web",
+    "prepare": "echo prepare web"
+  },
+  "dependencies": { "@example/core": "workspace:*" },
+  "nx": {
+    "name": "web",
+    "includedScripts": ["build", "test"],
+    "tags": ["app", "scope:frontend"]
+  }
+}
