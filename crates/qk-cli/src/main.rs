@@ -763,9 +763,10 @@ fn execute_tasks(
         let root = path
             .rsplit_once('/')
             .map_or(".", |(directory, _)| directory);
-        if projects
-            .iter()
-            .any(|project| workspace.projects[*project].root == root)
+        if path == qk_config::LOCAL_WORKSPACE
+            || projects
+                .iter()
+                .any(|project| workspace.projects[*project].root == root)
         {
             qk_executor::status!("qk: using local overrides from {path}");
         }

@@ -115,13 +115,17 @@ pub struct Workspace {
     pub projects: BTreeMap<String, Project>,
     /// Package manifests indexed by normalized project name.
     pub packages: BTreeMap<String, Package>,
-    /// The `project.local.json` files merged into projects, workspace-relative.
+    /// The `nx.local.json` and `project.local.json` files merged in,
+    /// workspace-relative.
     pub local_overrides: Vec<String>,
 }
 
 /// Merged over a project's checked-in configuration, for changes that stay on
 /// one machine. It is meant to be ignored by Git; Nx does not read it.
 pub const LOCAL_OVERRIDES: &str = "project.local.json";
+
+/// Merged over nx.json in the same way, for the workspace.
+pub const LOCAL_WORKSPACE: &str = "nx.local.json";
 
 impl Workspace {
     pub fn load(root: &Path) -> Result<Self> {
@@ -131,7 +135,20 @@ impl Workspace {
         if !root.is_dir() {
             bail!("workspace is not a directory: {}", root.display());
         }
-        let config: WorkspaceConfig = match read_optional_json(&root.join("nx.json"))? {
+        let nx_json = read_optional_json(&root.join("nx.json"))?;
+        let local = read_optional_json(&root.join(LOCAL_WORKSPACE))?;
+        let has_local = local.is_some();
+        let nx_json = match (nx_json, local) {
+            (base, Some(local)) => Some(
+                normalize::workspace(
+                    base.unwrap_or_else(|| Value::Object(Default::default())),
+                    local,
+                )
+                .with_context(|| format!("invalid {LOCAL_WORKSPACE}"))?,
+            ),
+            (base, None) => base,
+        };
+        let config: WorkspaceConfig = match nx_json {
             Some(value) => {
                 serde_json::from_value(value).context("invalid nx.json configuration")?
             }
@@ -154,7 +171,11 @@ impl Workspace {
             config,
             projects: BTreeMap::new(),
             packages: BTreeMap::new(),
-            local_overrides: Vec::new(),
+            local_overrides: if has_local {
+                vec![LOCAL_WORKSPACE.to_owned()]
+            } else {
+                Vec::new()
+            },
         };
         for directory in discovery::project_directories(&root)? {
             let project_json = read_optional_json(&directory.join("project.json"))?;

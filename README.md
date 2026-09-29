@@ -538,6 +538,10 @@ limit. `NX_CACHE_DIRECTORY` is not read.
   reports each one merged into its projects (`qk: using local overrides from
   apps/web/project.local.json`), and each is keyed like `project.json`, so an
   overridden task never reuses the checked-in definition's cache entries.
+- Merges an `nx.local.json` at the workspace root over `nx.json` for the
+  same purpose: `targetDefaults` merge per entry as targets do, `namedInputs`
+  by name, and other settings are replaced. Every run reports it, and every
+  task is keyed by it.
 - Applies exact executor-keyed or target-name-keyed `targetDefaults`.
   Executor defaults take precedence. As in Nx, a default naming a different
   executor from the target's own is not applied. Options merge by key; each named

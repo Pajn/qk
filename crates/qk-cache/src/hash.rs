@@ -742,6 +742,7 @@ pub fn resolve(
         .find(|name| workspace.root.join(name).is_file());
     for path in tsconfig.into_iter().chain([
         "nx.json",
+        qk_config::LOCAL_WORKSPACE,
         "package.json",
         "pnpm-workspace.yaml",
         "pnpm-lock.yaml",

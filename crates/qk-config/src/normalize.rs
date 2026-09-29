@@ -180,6 +180,35 @@ fn overlay(
     Ok(())
 }
 
+/// nx.json with `local` merged over it: target defaults as targets merge,
+/// named inputs by name, and every other field replaced.
+pub(crate) fn workspace(base: Value, local: Value) -> Result<Value> {
+    let mut base = object(base, "nx.json")?;
+    for (key, value) in object(local, "nx.local.json")? {
+        let value = match key.as_str() {
+            "targetDefaults" => {
+                let mut defaults = object(
+                    base.remove(&key).unwrap_or_else(|| json!({})),
+                    "targetDefaults",
+                )?;
+                merge_targets(&mut defaults, value)?;
+                Value::Object(defaults)
+            }
+            "namedInputs" => {
+                let mut named = object(
+                    base.remove(&key).unwrap_or_else(|| json!({})),
+                    "namedInputs",
+                )?;
+                named.extend(object(value, "namedInputs")?);
+                Value::Object(named)
+            }
+            _ => value,
+        };
+        base.insert(key, value);
+    }
+    Ok(Value::Object(base))
+}
+
 fn object(value: Value, field: &str) -> Result<Map<String, Value>> {
     match value {
         Value::Object(object) => Ok(object),

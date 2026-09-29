@@ -1092,3 +1092,25 @@ fn local_overrides_change_the_task_and_its_key() {
     assert!(stdout(&output).contains("one"));
     assert!(String::from_utf8_lossy(&output.stderr).contains("cache hit app:build"));
 }
+
+#[test]
+fn a_local_workspace_file_changes_every_task_and_its_key() {
+    let fixture = Fixture::new(json!({
+        "command": "echo $MODE",
+        "cache": true,
+        "inputs": ["{projectRoot}/src/**/*"]
+    }));
+    assert_eq!(said(&fixture, &fixture.root, &[]), "");
+    fs::write(
+        fixture.root.join("nx.local.json"),
+        json!({"targetDefaults": {"build": {"options": {"env": {"MODE": "local"}}}}}).to_string(),
+    )
+    .unwrap();
+    let output = success(fixture.build(&fixture.root, &[]));
+    assert_eq!(stdout(&output).lines().next(), Some("local"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("qk: using local overrides from nx.local.json"),
+        "{stderr}"
+    );
+}

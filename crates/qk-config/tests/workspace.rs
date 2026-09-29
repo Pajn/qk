@@ -436,3 +436,41 @@ fn local_overrides_cannot_rename_a_project() {
         "{error}"
     );
 }
+
+#[test]
+fn a_local_workspace_file_merges_over_nx_json() {
+    let temp = TempDir::new().unwrap();
+    write(
+        temp.path(),
+        "nx.json",
+        r#"{"defaultBase": "main", "parallel": 3,
+            "namedInputs": {"default": ["{projectRoot}/**/*"], "production": ["default"]},
+            "targetDefaults": {"build": {"cache": true, "options": {"mode": "production", "cwd": "{projectRoot}"}}}}"#,
+    );
+    write(
+        temp.path(),
+        "nx.local.json",
+        r#"{"parallel": 8,
+            "namedInputs": {"production": ["default", "!{projectRoot}/**/*.test.ts"]},
+            "targetDefaults": {"build": {"options": {"mode": "development"}}, "lint": {"cache": false}}}"#,
+    );
+    write(
+        temp.path(),
+        "project.json",
+        r#"{"name": "app", "targets": {"build": {"command": "vite build"}, "lint": {"command": "oxlint"}}}"#,
+    );
+    let workspace = Workspace::load(temp.path()).unwrap();
+    assert_eq!(workspace.config.default_base.as_deref(), Some("main"));
+    assert_eq!(workspace.config.extra["parallel"], 8);
+    assert_eq!(
+        workspace.config.named_inputs["default"],
+        [json!("{projectRoot}/**/*")]
+    );
+    assert_eq!(workspace.config.named_inputs["production"].len(), 2);
+    let app = &workspace.projects["app"];
+    assert_eq!(app.targets["build"].cache, Some(true));
+    assert_eq!(app.targets["build"].options["mode"], "development");
+    assert_eq!(app.targets["build"].options["cwd"], "{projectRoot}");
+    assert_eq!(app.targets["lint"].cache, Some(false));
+    assert_eq!(workspace.local_overrides, ["nx.local.json"]);
+}
