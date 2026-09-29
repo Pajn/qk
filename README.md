@@ -308,9 +308,34 @@ The Cargo workspace contains seven crates:
 | `qk-cache` | Input hashing, cache entry storage, output restoration and log replay |
 | `qk-cli` | Argument parsing and output; produces the `qk` binary |
 
-Fixture and CLI tests use self-contained workspaces. GitHub Actions is
+Fixture and CLI tests use self-contained workspaces.
+
+### Parity with Nx
+
+`tools/parity/parity.mjs` measures qk against Nx on a real workspace. It needs
+Node and the workspace's own Nx installation. `capture` records Nx's output as
+golden files; `compare` checks qk against them and exits nonzero on any
+divergence:
+
+```sh
+node tools/parity/parity.mjs capture <workspace> <goldens>
+node tools/parity/parity.mjs compare <workspace> <goldens> --qk target/release/qk
+```
+
+`<goldens>/parity.json` names the task graphs to compare, each as the
+`run-many` arguments both tools accept:
+
+```json
+{ "taskGraphs": { "check": ["-t", "tsc", "test", "--exclude=js"] } }
+```
+
+The comparison requires byte-identical `show projects --json`, a
+`graph --file` equal after normalisation, and task graphs with the same tasks,
+dependencies, and cache and continuous flags. The differences it normalises
+away are listed at the top of the script. Each run also reports the median wall
+time of both tools for each command. GitHub Actions is
 configured for Linux, macOS and Windows. The lockfile is checked in for
 reproducible dependency resolution.
 
-Next: expand execution parity, then add pnpm v9 lockfile parsing and external graph nodes so cache keys can use
+Next: add pnpm v9 lockfile parsing and external graph nodes so cache keys can use
 per-package lockfile fingerprints.
