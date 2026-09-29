@@ -331,7 +331,9 @@ impl Snapshot {
         if !metadata.is_file() {
             bail!("input is not a regular file: {path}");
         }
-        let mode = crate::store::mode(&metadata);
+        // Only the executable bit, which is all git records: other permission
+        // bits follow the checkout's umask and would keep machines apart.
+        let mode = crate::store::mode(&metadata) & 0o111 != 0;
         Ok(json!({"content":self.digest(path, &absolute, &metadata)?, "mode":mode}))
     }
 }

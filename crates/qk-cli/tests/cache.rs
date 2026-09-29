@@ -950,3 +950,18 @@ fn dotenv_files_are_not_keyed() {
     fs::write(fixture.root.join(".env.local"), "TOKEN=two\n").unwrap();
     assert!(stderr(&success(fixture.build(&fixture.root, &[]))).contains("cache hit"));
 }
+
+#[cfg(unix)]
+#[test]
+fn input_keys_ignore_permission_bits_other_than_executable() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new(target("build", json!({})));
+    let input = fixture.root.join("src/input.txt");
+    fs::set_permissions(&input, fs::Permissions::from_mode(0o644)).unwrap();
+    success(fixture.build(&fixture.root, &[]));
+    // A group-writable checkout keys the same.
+    fs::set_permissions(&input, fs::Permissions::from_mode(0o664)).unwrap();
+    assert!(stderr(&success(fixture.build(&fixture.root, &[]))).contains("cache hit"));
+    fs::set_permissions(&input, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(stderr(&success(fixture.build(&fixture.root, &[]))).contains("cache miss"));
+}
