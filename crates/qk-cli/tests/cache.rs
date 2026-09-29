@@ -141,7 +141,8 @@ impl Fixture {
             .env("QK_CACHE_TEST_COUNTER", &self.counter)
             .env("GIT_CONFIG_GLOBAL", &self.git_config)
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env_remove("NX_PARALLEL");
+            .env_remove("NX_PARALLEL")
+            .env_remove("NX_CACHE_DIRECTORY");
         command
     }
 
@@ -1575,4 +1576,40 @@ fn skipping_the_remote_cache_keeps_to_the_local_one() {
     fs::write(fixture.root.join("src/input.txt"), "changed\n").unwrap();
     success(remote_build(&fixture, &[]));
     assert!(server.writes() > 0);
+}
+
+#[test]
+fn the_cache_directory_can_be_set_as_in_nx() {
+    let fixture = Fixture::new(json!({"command": "echo built", "cache": true}));
+    let run = |env: &[(&str, &str)]| {
+        let mut command = fixture.command(
+            &fixture.root,
+            &["run", "app:build", "--output-style", "static"],
+        );
+        for (name, value) in env {
+            command.env(name, value);
+        }
+        stderr(&success(command.output().unwrap()))
+    };
+    let env = [("NX_CACHE_DIRECTORY", "shared-cache")];
+    run(&env);
+    // The cache inside the workspace is not an input of the task it caches.
+    assert!(run(&env).contains("cache hit app:build"));
+    assert!(fixture.root.join("shared-cache/qk/v1").is_dir());
+    let path = stdout(&success(
+        fixture
+            .command(&fixture.root, &["cache", "path"])
+            .envs(env)
+            .output()
+            .unwrap(),
+    ));
+    assert!(path.trim().ends_with("shared-cache/qk/v1"), "{path}");
+    // nx.json's cacheDirectory, when the variable is not set.
+    fs::write(
+        fixture.root.join("nx.json"),
+        r#"{"cacheDirectory": "from-nx-json"}"#,
+    )
+    .unwrap();
+    run(&[]);
+    assert!(fixture.root.join("from-nx-json/qk/v1").is_dir());
 }

@@ -653,13 +653,13 @@ fn run(cli: Cli) -> Result<i32> {
             writeln!(
                 io::stdout().lock(),
                 "{}",
-                qk_cache::cache_directory(&workspace.root).display()
+                qk_cache::cache_location(&workspace).display()
             )?;
         }
         Command::Cache {
             command: CacheCommand::Prune { max_size },
         } => {
-            let cache = qk_cache::cache_directory(&workspace.root);
+            let cache = qk_cache::cache_location(&workspace);
             let limit = match max_size {
                 Some(text) => Some(qk_cache::parse_size(&text)?),
                 None => qk_cache::max_size(workspace.config.extra.get("maxCacheSize"), &cache)?,
@@ -1048,7 +1048,7 @@ fn execute_tasks(
         options.report.as_deref(),
     );
     if !skip_cache {
-        let cache = qk_cache::cache_directory(&workspace.root);
+        let cache = qk_cache::cache_location(workspace);
         let pruned = qk_cache::max_size(workspace.config.extra.get("maxCacheSize"), &cache)
             .and_then(|limit| match limit {
                 Some(limit) => qk_cache::prune(&cache, limit).map(Some),

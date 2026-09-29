@@ -27,6 +27,7 @@ fn command(root: &Path, args: &[&str]) -> Command {
         .arg(root)
         .args(args);
     command.env_remove("NX_PARALLEL");
+    command.env_remove("NX_CACHE_DIRECTORY");
     command
 }
 

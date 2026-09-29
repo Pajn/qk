@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 pub use evict::{Pruned, max_size, parse_size, prune};
 pub use glob::Pattern;
 pub use hash::{Resolved, without_resolution};
-pub use paths::{cache_directory, resolved_outputs};
+pub use paths::{cache_directory, cache_location, resolved_outputs};
 
 /// The cache for one run; its workspace snapshot is taken on first use.
 pub struct Cache {
@@ -76,7 +76,7 @@ pub fn resolve_tasks(
     graph: &TaskGraph,
     extra: &[String],
 ) -> Result<BTreeMap<String, Resolved>> {
-    let cache = cache_directory(&workspace.root);
+    let cache = paths::cache_location(workspace);
     let snapshot = hash::Snapshot::new(workspace, graph, &cache)?.with_candidates(extra);
     let cancelled = AtomicBool::new(false);
     graph
@@ -116,7 +116,7 @@ impl Cache {
         };
         Self {
             remote,
-            ..Self::new(cache_directory(&workspace.root))
+            ..Self::new(paths::cache_location(workspace))
         }
     }
 

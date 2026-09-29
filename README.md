@@ -445,7 +445,7 @@ what each threaded task was given, and `qk show task` records it.
 ## Local cache
 
 Targets with `cache: true` are cached locally. Inside a Git repository the
-cache lives in `<git common dir>/qk/cache/v1`, so every linked worktree of the
+cache lives by default in `<git common dir>/qk/cache/v1`, so every linked worktree of the
 repository shares one cache. What belongs to one worktree (file digests,
 records of the outputs it holds, restores in progress) lives in its own git
 directory, `$(git rev-parse --git-dir)/qk`, so nothing of qk's appears in the
@@ -671,7 +671,13 @@ with the last entry citing them. Stored outputs no entry cites, scratch files
 and locks of evicted entries are removed once they are an hour old, since a
 concurrent run may still be writing them. A run under the limit only sums the
 cache's size; the full pass runs at most hourly unless the cache is over its
-limit. `NX_CACHE_DIRECTORY` is not read.
+limit.
+
+`NX_CACHE_DIRECTORY`, else nx.json `cacheDirectory`, moves the cache, as in
+Nx: a path relative to the workspace root, with qk's entries in `qk/v1`
+inside it so they never mix with Nx's, and so CI steps that save and restore
+that directory keep working. A relative path gives each worktree its own
+cache; the run history and each worktree's state stay in the git directory.
 
 ## Configuration and graph support
 

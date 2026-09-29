@@ -46,6 +46,29 @@ pub fn worktree_state(root: &Path) -> PathBuf {
     state
 }
 
+/// Where the cache is: as in Nx, `NX_CACHE_DIRECTORY`, then nx.json
+/// `cacheDirectory`, relative to the workspace root, with qk's entries in
+/// `qk/v1` inside so they never mix with Nx's; otherwise
+/// [`cache_directory`], shared by the repository's worktrees.
+pub fn cache_location(workspace: &Workspace) -> PathBuf {
+    let configured = std::env::var_os("NX_CACHE_DIRECTORY")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            workspace
+                .config
+                .extra
+                .get("cacheDirectory")
+                .and_then(serde_json::Value::as_str)
+                .map(PathBuf::from)
+        });
+    match configured {
+        Some(directory) => workspace.root.join(directory).join("qk/v1"),
+        None => cache_directory(&workspace.root),
+    }
+}
+
+/// The cache's default place, in the repository's common git directory.
 pub fn cache_directory(root: &Path) -> PathBuf {
     git_path(root, "--git-common-dir")
         .map(|dir| dir.join("qk/cache/v1"))
