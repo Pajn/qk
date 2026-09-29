@@ -274,8 +274,17 @@ Supported executors:
 
 Commands use `/bin/sh -c` on Unix and `cmd.exe /D /S /C` on Windows. Local
 `node_modules/.bin` directories from cwd up to the workspace root are added
-to `PATH`. Tasks currently have closed stdin; interactive tasks are not
-supported. qk writes its own status messages to stderr.
+to `PATH`. qk writes its own status messages to stderr.
+
+The task a run is for can be interacted with, as in Nx: when a run requests
+one task, and that task has a single command whose output goes straight to
+the terminal (the default for one task), the command reads qk's stdin. On a
+terminal it also becomes the terminal's foreground while it runs, so a dev
+server's key presses and prompts work, and Ctrl-C reaches it; qk takes the
+terminal back when it ends. Every other task, and every task of a run for
+several, has closed stdin. qk does not give commands a pseudo-terminal of
+their own: with output captured, as in the static style or on a cache miss,
+a command sees pipes.
 
 Environment precedence, highest first: `FORCE_COLOR` from `color: true`,
 configuration `env`, `options.env`, target-level `env`, the variables Nx sets

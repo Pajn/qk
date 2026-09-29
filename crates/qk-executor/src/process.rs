@@ -72,6 +72,9 @@ pub fn execute_captured(
     cancelled: &AtomicBool,
     capture: Option<&Capture>,
 ) -> Result<Outcome> {
+    // Takes the terminal back from an interactive command, however it ends.
+    let _terminal = (task.interactive && task.commands.len() == 1)
+        .then(terminal::Foreground::take_back_on_drop);
     std::thread::scope(|scope| {
         let mut readers = Vec::new();
         let outcome = (|| {
@@ -84,7 +87,8 @@ pub fn execute_captured(
                 }
                 if children.0.is_empty() || task.parallel {
                     for (index, command) in pending.by_ref() {
-                        let mut child = spawn(task, command, capture.is_some())
+                        let interactive = task.interactive && task.commands.len() == 1;
+                        let mut child = spawn(task, command, capture.is_some(), interactive)
                             .with_context(|| format!("cannot start command for {}", task.id))?;
                         if let Some(capture) = capture {
                             let stdout =
@@ -152,7 +156,7 @@ pub fn execute_captured(
     })
 }
 
-fn spawn(task: &PreparedTask, text: &str, capture: bool) -> Result<GroupChild> {
+fn spawn(task: &PreparedTask, text: &str, capture: bool, interactive: bool) -> Result<GroupChild> {
     #[cfg(windows)]
     let mut command = {
         use std::os::windows::process::CommandExt;
@@ -174,7 +178,11 @@ fn spawn(task: &PreparedTask, text: &str, capture: bool) -> Result<GroupChild> {
         .env_clear()
         .envs(&task.env)
         .envs(&task.execution)
-        .stdin(Stdio::null())
+        .stdin(if interactive {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        })
         .stdout(if capture {
             Stdio::piped()
         } else {
@@ -185,7 +193,75 @@ fn spawn(task: &PreparedTask, text: &str, capture: bool) -> Result<GroupChild> {
         } else {
             Stdio::inherit()
         });
+    #[cfg(unix)]
+    if interactive && terminal::in_foreground() {
+        use std::os::unix::process::CommandExt;
+        // Each command runs in its own process group, which the terminal
+        // stops when it reads; so the command makes its group the terminal's
+        // foreground before it starts, as a shell does for a job.
+        unsafe {
+            command.pre_exec(|| {
+                terminal::claim();
+                Ok(())
+            });
+        }
+    }
     Ok(command.group_spawn()?)
+}
+
+/// Handing the terminal to an interactive command and back.
+mod terminal {
+    /// Whether stdin is a terminal whose foreground is qk's process group.
+    pub fn in_foreground() -> bool {
+        #[cfg(unix)]
+        unsafe {
+            libc::isatty(0) == 1 && libc::tcgetpgrp(0) == libc::getpgrp()
+        }
+        #[cfg(not(unix))]
+        false
+    }
+
+    /// Makes the calling process's group the terminal's foreground. Run in
+    /// the child between fork and exec, so only async-signal-safe calls.
+    #[cfg(unix)]
+    pub fn claim() {
+        unsafe { foreground(libc::getpgrp()) }
+    }
+
+    /// `tcsetpgrp` from a background group raises SIGTTOU, which would stop
+    /// the caller; it is ignored around the call.
+    #[cfg(unix)]
+    unsafe fn foreground(group: libc::pid_t) {
+        unsafe {
+            let previous = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+            libc::tcsetpgrp(0, group);
+            libc::signal(libc::SIGTTOU, previous);
+        }
+    }
+
+    /// Returns the terminal to qk's group when dropped, if qk had it.
+    pub struct Foreground {
+        #[cfg(unix)]
+        group: Option<libc::pid_t>,
+    }
+
+    impl Foreground {
+        pub fn take_back_on_drop() -> Self {
+            Self {
+                #[cfg(unix)]
+                group: in_foreground().then(|| unsafe { libc::getpgrp() }),
+            }
+        }
+    }
+
+    impl Drop for Foreground {
+        fn drop(&mut self) {
+            #[cfg(unix)]
+            if let Some(group) = self.group {
+                unsafe { foreground(group) }
+            }
+        }
+    }
 }
 
 fn exit_code(status: std::process::ExitStatus) -> i32 {

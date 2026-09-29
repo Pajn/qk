@@ -67,7 +67,7 @@ pub fn run(
     let environment = environment(&workspace.root)?;
     let process_environment: BTreeMap<_, _> = std::env::vars_os().collect();
     // Validate every task before the first command can have side effects.
-    let prepared = graph
+    let mut prepared = graph
         .tasks
         .iter()
         .map(|(id, task)| {
@@ -80,6 +80,17 @@ pub fn run(
                 })
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
+    // As in Nx, the task a run is for can be interacted with, when it is a
+    // single command writing straight to the terminal; its dependencies
+    // have finished or run beside it without the terminal's input.
+    if let [root] = graph.roots.iter().collect::<Vec<_>>()[..]
+        && let Some(task) = prepared.get_mut(root)
+        && task.display == Display::Stream
+        && task.commands.len() == 1
+    {
+        task.interactive = true;
+    }
+    let prepared = prepared;
     let threads: BTreeMap<String, Threads> = graph
         .tasks
         .iter()

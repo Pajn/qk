@@ -43,6 +43,10 @@ pub struct PreparedTask {
     pub ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Each command's prefix and colours, by position; empty without any.
     pub decorations: Vec<Decoration>,
+    /// Whether the task reads qk's stdin, and has the terminal while it runs.
+    /// The runner sets it for the one task a run is for, when that task has a
+    /// single command whose output goes straight to the terminal.
+    pub interactive: bool,
     /// How the task's output is shown; the runner sets it per output style.
     pub display: Display,
 }
@@ -482,6 +486,7 @@ pub fn prepare(
         ready_when,
         ready: Default::default(),
         decorations,
+        interactive: false,
         display: Display::default(),
     })
 }

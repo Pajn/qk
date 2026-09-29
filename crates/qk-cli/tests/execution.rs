@@ -1084,3 +1084,75 @@ fn dependencies_by_glob_and_with_forwarded_options() {
             .contains("bundle staging\n")
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn the_task_a_run_is_for_reads_its_input() {
+    use std::io::Write;
+    let temp = fixture(json!({
+        "read": {"command": "read line; echo got $line"},
+        "other": {"command": "echo other"}
+    }));
+    let piped = |args: &[&str]| {
+        let mut child = command(temp.path(), args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(b"hello\n").unwrap();
+        String::from_utf8(success(child.wait_with_output().unwrap()).stdout).unwrap()
+    };
+    assert_eq!(piped(&["run", "app:read"]), "got hello\n");
+    // Among several, no task takes the input.
+    let several = piped(&["run-many", "-t", "read,other", "--output-style", "static"]);
+    assert!(
+        several.contains("got\n") && !several.contains("hello"),
+        "{several}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn the_task_a_run_is_for_gets_the_terminal() {
+    let temp = fixture(json!({
+        "read": {"command": "if [ -t 0 ]; then echo terminal; fi; read line; echo got $line"}
+    }));
+    let qk = format!(
+        "{} --workspace {} run app:read",
+        env!("CARGO_BIN_EXE_qk"),
+        temp.path().display()
+    );
+    // script(1) runs qk on a terminal of its own.
+    let mut script = Command::new("script");
+    if cfg!(target_os = "macos") {
+        script.args(["-q", "/dev/null", "/bin/sh", "-c", &qk]);
+    } else {
+        script.args(["-qec", &qk, "/dev/null"]);
+    }
+    let mut child = script
+        .current_dir(temp.path())
+        .env_remove("NX_PARALLEL")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        let mut stdin = child.stdin.take().unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        stdin.write_all(b"typed\n").unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let started = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the task never read its input"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut output = String::new();
+    std::io::Read::read_to_string(&mut child.stdout.take().unwrap(), &mut output).unwrap();
+    assert!(output.contains("terminal"), "{output:?}");
+    assert!(output.contains("got typed"), "{output:?}");
+}

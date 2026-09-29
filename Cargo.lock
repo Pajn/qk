@@ -1058,6 +1058,7 @@ dependencies = [
  "anyhow",
  "command-group",
  "dotenvy",
+ "libc",
  "qk-config",
  "qk-taskgraph",
  "serde_json",

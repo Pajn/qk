@@ -12,3 +12,6 @@ shlex.workspace = true
 qk-config.workspace = true
 qk-taskgraph.workspace = true
 serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
