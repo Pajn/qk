@@ -524,7 +524,7 @@ paths are resolved within the workspace. A symlinked input is keyed by its
 target text and the content it resolves to, including the files below a
 linked directory; links that resolve outside the workspace are not supported.
 
-Extended globs (`?(…)`, `*(…)`, `+(…)`, `@(…)`, `(a|b)` and `{,…}`) are expanded
+Extended globs (`?(…)`, `*(…)`, `+(…)`, `@(…)`, `!(…)`, `(a|b)` and `{,…}`) are expanded
 exactly as Nx 23 expands them, including its approximations: `+(a|b)` matches
 one occurrence, and an omitted group in a directory segment widens that
 segment to `*`. This keeps input sets written for Nx selecting the same files.
@@ -540,9 +540,15 @@ defaults are cached and restored, but because they are guesses they stay
 inputs of other tasks, and dependents are keyed by the task's key rather
 than by those files alone.
 
-A task with any other input declaration, negation inside a glob such as
-`!(a|b)`, or an output without a fixed directory prefix runs uncached and
-reports why. Its dependents then run uncached too, naming the task and reason
+A negated group such as `src/**/!(*.test).ts` or `dist/!(cache)/**` expands
+as Nx expands it, into a glob with the group widened and one naming the
+group's items that excludes, so both tools select the same files, including
+where Nx's expansion is surprising: `*.!(ts)` keeps only files ending in `.`,
+as in Nx. Nx applies such exclusions to every pattern of a project at once;
+qk applies each to the pattern it comes from, which can only add inputs.
+
+A task with any other input declaration, or an output without a fixed
+directory prefix, runs uncached and reports why. Its dependents then run uncached too, naming the task and reason
 they depend on.
 
 On a miss, the task runs with stdout and stderr streamed through a pipe while

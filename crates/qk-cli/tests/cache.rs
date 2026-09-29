@@ -1613,3 +1613,25 @@ fn the_cache_directory_can_be_set_as_in_nx() {
     run(&[]);
     assert!(fixture.root.join("from-nx-json/qk/v1").is_dir());
 }
+
+#[test]
+fn negated_groups_in_inputs_leave_out_what_they_name() {
+    let fixture = Fixture::new(json!({
+        "command": "echo built",
+        "cache": true,
+        "inputs": ["{projectRoot}/src/**/!(*.test|*.spec).ts"]
+    }));
+    fs::write(fixture.root.join("src/app.ts"), "app").unwrap();
+    fs::write(fixture.root.join("src/app.test.ts"), "test").unwrap();
+    let hit = |fixture: &Fixture| {
+        stderr(&success(
+            fixture.build(&fixture.root, &["--output-style", "static"]),
+        ))
+        .contains("cache hit app:build")
+    };
+    assert!(!hit(&fixture));
+    fs::write(fixture.root.join("src/app.test.ts"), "changed test").unwrap();
+    assert!(hit(&fixture));
+    fs::write(fixture.root.join("src/app.ts"), "changed app").unwrap();
+    assert!(!hit(&fixture));
+}
