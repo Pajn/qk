@@ -255,7 +255,7 @@ pub fn run(
         Ok(())
     })?;
     if let Some(cache) = &cache {
-        cache.finish();
+        cache.finish(workspace);
     }
     if cancelled.load(Ordering::SeqCst) {
         exit_code = 130;

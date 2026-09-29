@@ -234,12 +234,13 @@ impl Cache {
         display: &qk_executor::Display,
         shown: qk_executor::Shown,
     ) -> Result<Option<String>> {
-        let file = match File::open(self.root.join("entries").join(format!("{key}.json"))) {
-            Ok(file) => file,
+        // Read whole: a File is unbuffered, and serde_json reads byte by byte.
+        let bytes = match fs::read(self.root.join("entries").join(format!("{key}.json"))) {
+            Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        let manifest: Manifest = serde_json::from_reader(file)?;
+        let manifest: Manifest = serde_json::from_slice(&bytes)?;
         if manifest.version != 1 || manifest.key != key || !valid_hash(&manifest.log) {
             bail!("invalid cache manifest");
         }

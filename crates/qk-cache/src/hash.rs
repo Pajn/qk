@@ -31,41 +31,48 @@ pub fn digest_file(path: &Path) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-/// Metadata that changes whenever a file's content can have changed.
-#[derive(Clone, PartialEq)]
-struct Stamp {
-    len: u64,
-    modified: Option<SystemTime>,
-    #[cfg(unix)]
-    unix: (i64, i64, u64, u32),
-}
+/// Metadata that changes whenever a file's content can have changed: size,
+/// modification time and, on Unix, change time, inode and mode.
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct Stamp(Vec<i64>);
 
 impl Stamp {
     fn new(metadata: &std::fs::Metadata) -> Self {
-        Self {
-            len: metadata.len(),
-            modified: metadata.modified().ok(),
-            #[cfg(unix)]
-            unix: {
-                use std::os::unix::fs::MetadataExt;
-                (
-                    metadata.ctime(),
-                    metadata.ctime_nsec(),
-                    metadata.ino(),
-                    metadata.mode(),
-                )
-            },
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map_or(-1, |duration| duration.as_nanos() as i64);
+        #[allow(unused_mut)]
+        let mut values = vec![metadata.len() as i64, modified];
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            values.extend([
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+                metadata.ino() as i64,
+                i64::from(metadata.mode()),
+            ]);
         }
+        Self(values)
     }
 
     /// A file written within the timestamp resolution window could change again
     /// without changing its stamp, so recent files are always re-read.
     fn settled(&self) -> bool {
-        self.modified
-            .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-            .is_some_and(|age| age > Duration::from_secs(2))
+        let modified = SystemTime::UNIX_EPOCH + Duration::from_nanos(self.0[1].max(0) as u64);
+        self.0[1] >= 0
+            && SystemTime::now()
+                .duration_since(modified)
+                .is_ok_and(|age| age > Duration::from_secs(2))
     }
 }
+
+/// Digests persisted between runs in the worktree's `.qk`, keyed by path and
+/// stamp, so a warm run reads only the files that changed. Stamps include the
+/// inode, so they belong to one worktree.
+const DIGESTS: &str = ".qk/digests.json";
 
 /// Workspace state shared by every fingerprint in one run. The candidate file list
 /// is taken once, like Nx's file map; file contents are still re-read whenever
@@ -77,6 +84,10 @@ pub struct Snapshot {
     workspace_prefix: Option<PathBuf>,
     patterns: Mutex<HashMap<(String, bool), Arc<Pattern>>>,
     digests: Mutex<HashMap<String, (Stamp, String)>>,
+    /// Whether `digests` gained entries worth saving.
+    digests_changed: std::sync::atomic::AtomicBool,
+    /// Directories already checked not to be symlinks.
+    directories: Mutex<std::collections::HashSet<PathBuf>>,
     /// Runtime input results by command and environment, computed once per run like Nx.
     runtime: Mutex<HashMap<String, Value>>,
     /// The parsed pnpm lockfile, replaced whenever its content changes.
@@ -144,10 +155,73 @@ impl Snapshot {
             canonical_root,
             workspace_prefix,
             patterns: Mutex::default(),
-            digests: Mutex::default(),
+            digests: Mutex::new(load_digests(&workspace.root)),
+            digests_changed: Default::default(),
+            directories: Mutex::default(),
             runtime: Mutex::default(),
             lockfile: Mutex::default(),
         })
+    }
+
+    /// Saves the digests of files that still exist, for the next run.
+    pub fn save_digests(&self, root: &Path) {
+        if !self
+            .digests_changed
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        let digests = self.digests.lock().unwrap();
+        let entries: BTreeMap<&String, (&Stamp, &String)> = digests
+            .iter()
+            .filter(|(path, _)| self.files.contains(*path))
+            .map(|(path, (stamp, digest))| (path, (stamp, digest)))
+            .collect();
+        let path = root.join(DIGESTS);
+        let saved = (|| -> Result<()> {
+            let directory = path.parent().context("digests have a directory")?;
+            std::fs::create_dir_all(directory)?;
+            let mut file = tempfile::NamedTempFile::new_in(directory)?;
+            serde_json::to_writer(
+                std::io::BufWriter::new(file.as_file_mut()),
+                &json!({"version": 1, "entries": entries}),
+            )?;
+            file.persist(&path)?;
+            Ok(())
+        })();
+        if let Err(error) = saved {
+            qk_executor::status!("qk: could not save file digests: {error:#}");
+        }
+    }
+
+    /// `paths::safe_parents`, checking each directory once per run.
+    fn safe_parents(&self, root: &Path, path: &str) -> Result<()> {
+        paths::validate_path(path)?;
+        let mut current = root.to_owned();
+        for part in Path::new(path)
+            .parent()
+            .into_iter()
+            .flat_map(Path::components)
+        {
+            current.push(part);
+            if self.directories.lock().unwrap().contains(&current) {
+                continue;
+            }
+            match std::fs::symlink_metadata(&current) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    bail!("input parent is a symlink: {}", current.display())
+                }
+                Ok(metadata) if !metadata.is_dir() => {
+                    bail!("input parent is not a directory: {}", current.display())
+                }
+                Ok(_) => {
+                    self.directories.lock().unwrap().insert(current.clone());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
     }
 
     fn installed(&self, root: &Path) -> Result<Option<Arc<Installed>>> {
@@ -216,12 +290,14 @@ impl Snapshot {
                 .lock()
                 .unwrap()
                 .insert(path.to_owned(), (stamp, digest.clone()));
+            self.digests_changed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
         Ok(digest)
     }
 
     fn file_value(&self, root: &Path, path: &str) -> Result<Value> {
-        paths::safe_parents(root, path)?;
+        self.safe_parents(root, path)?;
         let absolute = root.join(path);
         let metadata = std::fs::symlink_metadata(&absolute)?;
         if metadata.file_type().is_symlink() {
@@ -261,6 +337,20 @@ impl Snapshot {
         let mode = crate::store::mode(&metadata);
         Ok(json!({"content":self.digest(path, &absolute, &metadata)?, "mode":mode}))
     }
+}
+
+fn load_digests(root: &Path) -> HashMap<String, (Stamp, String)> {
+    #[derive(serde::Deserialize)]
+    struct Saved {
+        version: u32,
+        entries: HashMap<String, (Stamp, String)>,
+    }
+    std::fs::read(root.join(DIGESTS))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Saved>(&bytes).ok())
+        .filter(|saved| saved.version == 1)
+        .map(|saved| saved.entries)
+        .unwrap_or_default()
 }
 
 /// Files equal to `prefix` or below it, using the sorted order of the set.

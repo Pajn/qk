@@ -850,3 +850,30 @@ fn hits_leave_matching_outputs_in_place() {
     assert_eq!(artifact(&fixture.root), "built:one\n");
     assert_eq!(fixture.runs(), 1);
 }
+
+#[cfg(unix)]
+#[test]
+fn persisted_digests_notice_edits_that_restore_the_modification_time() {
+    let fixture = Fixture::new(target("build", json!({})));
+    let input = fixture.root.join("src/input.txt");
+    // Old enough that its digest is kept for the next run.
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+    fs::File::options()
+        .write(true)
+        .open(&input)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    success(fixture.build(&fixture.root, &[]));
+    assert!(fixture.root.join(".qk/digests.json").is_file());
+    // Same size, same modification time; only the change time moves.
+    fs::write(&input, "two\n").unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&input)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    assert!(stderr(&success(fixture.build(&fixture.root, &[]))).contains("cache miss"));
+    assert_eq!(fixture.runs(), 2);
+}

@@ -116,8 +116,12 @@ impl Cache {
         }
     }
 
-    /// Waits for background uploads to the remote store, reporting failures.
-    pub fn finish(&self) {
+    /// Saves what later runs reuse and waits for background uploads to the
+    /// remote store, reporting failures.
+    pub fn finish(&self, workspace: &Workspace) {
+        if let Some(Ok(snapshot)) = self.snapshot.get() {
+            snapshot.save_digests(&workspace.root);
+        }
         if let Some(remote) = &self.remote {
             let failures = remote.finish();
             for failure in &failures {

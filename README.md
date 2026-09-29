@@ -300,7 +300,10 @@ same rule affected selection applies.
 Candidate input files are tracked and untracked-but-not-ignored files, minus
 any task's declared outputs. The list is taken once per run, as Nx does, so a
 file that a task creates without declaring it as an output is seen from the
-next run. File contents are re-read whenever their metadata changes. Without
+next run. File contents are re-read whenever their metadata changes; their
+digests persist between runs in the worktree's `.qk/digests.json`, keyed by
+path, size, modification time and, on Unix, change time, inode and mode, so a
+warm run reads only files whose metadata changed. Without
 `inputs`, a task uses `default` and `^default`; `default` is
 `{projectRoot}/**/*` unless a named input overrides it.
 
