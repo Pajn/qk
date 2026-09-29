@@ -12,8 +12,17 @@
 //
 //   { "taskGraphs": { "check-all": ["--exclude=js", "-t", "tsc", "test"] } }
 //
+// and the revision pairs to capture `show projects --affected` for:
+//
+//   { "affected": { "lockfile-bump": { "base": "<sha>", "head": "<sha>" } } }
+//
+// An affected case whose sets differ fails unless it carries the difference
+// it accepts and why, which is how precision improvements are recorded:
+//
+//   "accepted": { "nxOnly": ["a"], "qkOnly": [], "reason": "a installs the same" }
+//
 // Compare exits nonzero on any divergence not listed under "Known
-// differences" below.
+// differences" below, or accepted by an affected case.
 
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -34,6 +43,8 @@ import { join, resolve } from "node:path";
 // - Tokens in target options: Nx substitutes them while building the graph,
 //   qk when running a task. qk's options are substituted as Nx does.
 // - Object key order, which neither tool treats as meaningful.
+// - The order of `show projects --affected`: Nx prints its traversal order, qk
+//   the graph order of `show projects`, so affected projects compare as sets.
 // - Configurations in task graphs: Nx's `--graph` leaves them out of task ids
 //   even for an explicit `project:target:configuration`, so qk's are dropped
 //   before comparing.
@@ -50,6 +61,8 @@ const qkIndex = rest.indexOf("--qk");
 const qk = qkIndex >= 0 ? resolve(rest[qkIndex + 1]) : "qk";
 const config = JSON.parse(readFileSync(join(goldens, "parity.json"), "utf8"));
 const taskGraphs = config.taskGraphs ?? {};
+const affectedCases = config.affected ?? {};
+const affectedArgs = ({ base, head }) => ["show", "projects", "--affected", "--base", base, "--head", head, "--json"];
 
 // Runs a command three times and reports the median wall time, so a cold
 // file system cache on the first run does not skew the timings.
@@ -95,6 +108,12 @@ if (command === "capture") {
     const file = join(goldens, `tasks-${name}.json`);
     timings[`tasks ${name}`] = run(nx, ["run-many", ...args, `--graph=${file}`]).milliseconds;
   }
+  for (const [name, revisions] of Object.entries(affectedCases)) {
+    const affected = run(nx, affectedArgs(revisions));
+    const projects = JSON.parse(affected.stdout.trim().split("\n").pop()).sort();
+    writeFileSync(join(goldens, `affected-${name}.json`), `${JSON.stringify(projects)}\n`);
+    timings[`affected ${name}`] = affected.milliseconds;
+  }
   const { version } = readJson(join(workspace, "node_modules/nx/package.json"));
   writeFileSync(join(goldens, "nx.json"), `${JSON.stringify({ version, timings }, null, 2)}\n`);
   console.log(`captured Nx ${version} goldens in ${goldens}`);
@@ -138,10 +157,30 @@ for (const [name, args] of Object.entries(taskGraphs)) {
   check(`task graph ${name} matches`, compareTaskGraphs(readJson(join(goldens, `tasks-${name}.json`)).tasks, JSON.parse(plan.stdout)));
 }
 
+// Affected projects: the same set, or exactly the accepted difference.
+for (const [name, revisions] of Object.entries(affectedCases)) {
+  const affected = run(qk, affectedArgs(revisions));
+  timings[`affected ${name}`] = affected.milliseconds;
+  const expected = new Set(readJson(join(goldens, `affected-${name}.json`)));
+  const actual = new Set(JSON.parse(affected.stdout));
+  const nxOnly = [...expected].filter((project) => !actual.has(project)).sort();
+  const qkOnly = [...actual].filter((project) => !expected.has(project)).sort();
+  const accepted = revisions.accepted;
+  const same = (one, other) => JSON.stringify(one) === JSON.stringify([...(other ?? [])].sort());
+  if (accepted?.reason && same(nxOnly, accepted.nxOnly) && same(qkOnly, accepted.qkOnly) && nxOnly.length + qkOnly.length > 0) {
+    console.log(`ok   affected ${name} differs as accepted: ${accepted.reason}`);
+    continue;
+  }
+  check(`affected ${name} matches`, [
+    ...nxOnly.map((project) => `only in Nx: ${project}`),
+    ...qkOnly.map((project) => `only in qk: ${project}`),
+  ]);
+}
+
 rmSync(join(tmpdir(), `qk-parity-${process.pid}`), { recursive: true, force: true });
-console.log("\nmilliseconds   nx      qk");
+console.log(`\n${"milliseconds".padEnd(32)}     nx      qk`);
 for (const [label, milliseconds] of Object.entries(timings)) {
-  console.log(`${label.padEnd(24)} ${String(nxTimings[label] ?? "-").padStart(6)}  ${String(milliseconds).padStart(6)}`);
+  console.log(`${label.padEnd(32)} ${String(nxTimings[label] ?? "-").padStart(6)}  ${String(milliseconds).padStart(6)}`);
 }
 process.exit(failures.length === 0 ? 0 : 1);
 

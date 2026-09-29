@@ -2,8 +2,8 @@
 
 **qk**, short for **quick**, is a standalone task runner written in Rust.
 It reads Nx-compatible workspace configuration and executes tasks with
-dependency ordering and a local cache. Affected selection, remote caching and
-run history are planned.
+dependency ordering, a local cache and Nx's affected selection. Remote
+caching and run history are planned.
 
 The current implementation supports **workspace inspection, finite task
 execution and a local task cache** shared by the worktrees of a Git
@@ -54,20 +54,54 @@ parent workspace marker exists.
 | `qk <target> [project]`, `qk <project>:<target>` | Nx-style shorthand for `qk run` |
 | `qk run-many -t build,test -p 'web,core' --parallel 4` | Execute matching targets with bounded task concurrency |
 | `qk run web:build --dry-run` | Print the planned task graph as JSON without execution |
+| `qk show projects --affected [--base <rev>] [--head <rev>]` | Projects affected by the changes, in graph order |
+| `qk affected -t build,test [--base <rev>] [--head <rev>]` | Execute targets on the affected projects |
 | `qk cache path` | Print the local cache directory without creating it |
 
 As in Nx, `qk build web` and `qk web:build` mean `qk run web:build`, and take the
 same options. Without a project, `qk build` and `qk run build` use the project
 whose root most specifically contains the current directory. qk's own
-subcommands, and Nx commands qk does not implement such as `affected`,
-`format` and `release`, are never read as targets; use `qk run` for a target
+subcommands, and Nx commands qk does not implement such as `format` and
+`release`, are never read as targets; use `qk run` for a target
 with one of those names.
 
 `--workspace <path>` works before or after the subcommand. Graph output paths
 are relative to the invocation directory; their parent directories must
 already exist. JSON output has no progress messages mixed into stdout.
 Errors go to stderr and return a nonzero exit code. Unknown commands and
-flags, including `affected` and `--affected`, fail explicitly.
+flags fail explicitly.
+
+### Affected
+
+As in Nx 23, changed files are those between the merge base of `--base` and
+`--head`, or with no head, between the merge base and the working tree,
+including uncommitted and untracked files. The base defaults to `NX_BASE`,
+then nx.json `defaultBase`, then `main`; the head to `NX_HEAD`. `--files`,
+`--uncommitted` and `--untracked` replace the comparison. Files matching the
+root `.gitignore` or `.nxignore` are left out.
+
+A changed file touches the project whose root most specifically contains it.
+`nx.json` touches every project; a file named by a `{workspaceRoot}` input
+touches the projects declaring it; a deleted `project.json` or
+`package.json` touches every project. Dependencies changed in the root
+`package.json` touch the projects installing the package, and path mappings
+changed in the root tsconfig touch the projects they point into. Every
+project depending on a touched project is affected too.
+
+Two rules deliberately differ from Nx:
+
+- A `pnpm-workspace.yaml` change confined to resolution keys (`catalog`,
+  `catalogs`, `overrides`, `patchedDependencies` and the like) reaches
+  projects only through the lockfile.
+- Under `projectsAffectedByDependencyUpdates: "auto"`, a `pnpm-lock.yaml`
+  change touches the projects whose importer installs something different,
+  by the same installed sets the cache keys use. This leaves out projects
+  that install exactly what they did before, which Nx reports, and catches
+  transitive changes such as a dependency's dependency moving version,
+  which Nx can miss. Other modes behave as in Nx.
+
+`show projects --affected` prints projects in graph order; Nx prints its
+traversal order, so compare the two as sets.
 
 Project selectors support `*`, `?`, character classes and `tag:<glob>`.
 Repeat `--projects` or use commas to combine selectors. Prefix a selector
@@ -288,9 +322,8 @@ parity claim yet. In particular:
 - Target-default glob keys and filtered defaults are not implemented;
   filtered default arrays are rejected. Nx plugins and inferred targets are
   outside the design's scope.
-- Inputs are resolved for local caching only; affected semantics are not
-  implemented yet.
-- `affected`, interactive tasks, static/dynamic output styles,
+- Affected selection is per project; per-task affected is future work.
+- Interactive tasks, static/dynamic output styles,
   remote cache storage, cache eviction, history, release commands and npm
   binary distribution remain future work.
 
@@ -351,5 +384,4 @@ time of both tools for each command. GitHub Actions is
 configured for Linux, macOS and Windows. The lockfile is checked in for
 reproducible dependency resolution.
 
-Next: affected selection, using the same installed sets to attribute
-lockfile changes to projects.
+Next: extend CI parity coverage and remote cache validation.
