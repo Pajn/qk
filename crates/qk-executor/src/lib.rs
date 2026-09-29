@@ -390,10 +390,17 @@ pub fn prepare(
             }
             let forward = boolean(options.get("forwardAllArgs"), true, "forwardAllArgs")?;
             if let Some(command) = options.get("command") {
-                commands.push(interpolation.command(
-                    command.as_str().context("command must be a string")?,
-                    forward,
-                )?);
+                // Nx also takes an array, joined with spaces.
+                let command = match command {
+                    Value::String(command) => command.clone(),
+                    Value::Array(words) => words
+                        .iter()
+                        .map(|word| word.as_str().context("command words must be strings"))
+                        .collect::<Result<Vec<_>>>()?
+                        .join(" "),
+                    _ => bail!("command must be a string or an array of strings"),
+                };
+                commands.push(interpolation.command(&command, forward)?);
             } else if let Some(values) = options.get("commands") {
                 for value in values.as_array().context("commands must be an array")? {
                     let (command, forward) = if let Some(command) = value.as_str() {
@@ -457,7 +464,8 @@ pub fn prepare(
             } else {
                 bail!("run-commands requires command or commands");
             }
-            if commands.is_empty() || commands.iter().any(|command| command.trim().is_empty()) {
+            // An empty `commands` succeeds without running anything, as in Nx.
+            if commands.iter().any(|command| command.trim().is_empty()) {
                 bail!("run-commands requires nonempty commands");
             }
         }

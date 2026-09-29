@@ -225,12 +225,14 @@ reached with different forwarded arguments is rejected as ambiguous.
 
 Supported executors:
 
-- `nx:run-commands`: `command`, or a `commands` array of strings or objects
+- `nx:run-commands`: `command` (a string, or as in Nx an array joined with
+  spaces), or a `commands` array of strings or objects
   with `command`, `forwardAllArgs`, `description`, and, with `parallel`,
   `prefix`, `prefixColor`, `color` and `bgColor`: as in Nx, a bold prefix
   before each non-blank line of that command's output, then the colours,
   which follow the same terminal rules as qk's own. A line split between
-  reads still gets one prefix. Multiple commands run concurrently by
+  reads still gets one prefix. An empty `commands` succeeds without running
+  anything. Multiple commands run concurrently by
   default; `options.parallel: false` runs them in sequence. Supports `cwd`,
   `env`, `forwardAllArgs` and `args`, extra arguments as a string of shell
   text or an array joined with spaces: forwarded after the other options and
@@ -308,7 +310,8 @@ observed failing task's exit code. Ctrl-C and, on Unix, SIGTERM cancel the
 run and return `130`. Cancelled commands receive SIGTERM on Unix and are
 killed with their process group if they have not exited within five seconds;
 on Windows they are killed directly. Parallel commands within a failed task
-are terminated immediately. Commands must
+are terminated immediately, and as in Nx the task then fails with exit code
+1; commands run in sequence stop at the first failure and keep its code. Commands must
 not detach themselves into separate sessions or launch external services;
 those processes are outside the managed group.
 

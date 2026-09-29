@@ -117,7 +117,17 @@ pub fn execute_captured(
                             // Finite tasks may not leave background descendants running.
                             let _ = child.kill();
                             if !status.success() {
-                                return Ok(Outcome::Failed(exit_code(status)));
+                                // As in Nx, commands run side by side fail the
+                                // task with 1, one after another with the code.
+                                let code = if task.parallel
+                                    && task.commands.len() > 1
+                                    && task.ready_when.is_empty()
+                                {
+                                    1
+                                } else {
+                                    exit_code(status)
+                                };
+                                return Ok(Outcome::Failed(code));
                             }
                         }
                         None => index += 1,

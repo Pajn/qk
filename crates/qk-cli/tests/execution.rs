@@ -415,7 +415,8 @@ fn failed_parallel_command_terminates_its_running_sibling() {
         "env":{"QK_TEST_ID":"tree"}
     }}}));
     let output = run(temp.path(), &["run", "app:build"]);
-    assert_eq!(output.status.code(), Some(9));
+    // As in Nx, parallel commands fail the task with 1, whatever the code.
+    assert_eq!(output.status.code(), Some(1));
     let before = fs::read(temp.path().join("heartbeat")).unwrap();
     std::thread::sleep(Duration::from_millis(100));
     assert_eq!(fs::read(temp.path().join("heartbeat")).unwrap(), before);
@@ -961,4 +962,34 @@ fn command_entries_prefix_and_colour_their_output_like_nx() {
     );
     let unknown = run(temp.path(), &["run", "app:unknown"]);
     assert!(String::from_utf8_lossy(&unknown.stderr).contains("\"chartreuse\" is not a colour"));
+}
+
+#[cfg(unix)]
+#[test]
+fn command_shapes_and_exit_codes_follow_nx() {
+    let temp = fixture(json!({
+        "words": {"executor": "nx:run-commands", "options": {"command": ["echo", "joined", "words"]}},
+        "nothing": {"executor": "nx:run-commands", "options": {"commands": []}},
+        "side": {"executor": "nx:run-commands", "options": {"commands": ["exit 4", "sleep 5"]}},
+        "serial": {"executor": "nx:run-commands", "options": {"parallel": false, "commands": ["exit 4", "echo never"]}},
+        "single": {"command": "exit 4"}
+    }));
+    let output = success(run(temp.path(), &["run", "app:words"]));
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "joined words\n");
+    success(run(temp.path(), &["run", "app:nothing"]));
+    // Side by side, a failure stops the others and the task fails with 1.
+    let started = Instant::now();
+    assert_eq!(
+        run(temp.path(), &["run", "app:side"]).status.code(),
+        Some(1)
+    );
+    assert!(started.elapsed() < Duration::from_secs(4));
+    assert_eq!(
+        run(temp.path(), &["run", "app:serial"]).status.code(),
+        Some(4)
+    );
+    assert_eq!(
+        run(temp.path(), &["run", "app:single"]).status.code(),
+        Some(4)
+    );
 }
