@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/qk-cli", "crates/qk-config", "crates/qk-graph"]
+members = ["crates/qk-cli", "crates/qk-config", "crates/qk-graph", "crates/qk-taskgraph"]
 resolver = "3"
 
 [workspace.package]
@@ -19,8 +19,8 @@ serde_yaml_ng = "0.10"
 tempfile = "3"
 qk-config = { path = "crates/qk-config" }
 qk-graph = { path = "crates/qk-graph" }
+qk-taskgraph = { path = "crates/qk-taskgraph" }
 
 [profile.release]
 lto = "thin"
 strip = true
-

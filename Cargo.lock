@@ -349,6 +349,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "qk-taskgraph"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "qk-config",
+ "qk-graph",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
