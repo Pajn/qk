@@ -955,6 +955,7 @@ dependencies = [
  "qk-config",
  "qk-graph",
  "qk-lockfile",
+ "qk-taskgraph",
  "serde",
  "serde_json",
  "serde_yaml_ng",

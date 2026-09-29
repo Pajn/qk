@@ -184,6 +184,13 @@ impl Snapshot {
         Ok(Some(installed))
     }
 
+    /// Adds paths to the candidate files, such as files deleted since a base
+    /// revision.
+    pub fn with_candidates(mut self, paths: &[String]) -> Self {
+        self.files.extend(paths.iter().cloned());
+        self
+    }
+
     fn pattern(&self, pattern: &str, negated: bool) -> Result<Arc<Pattern>> {
         let key = (pattern.to_owned(), negated);
         if let Some(pattern) = self.patterns.lock().unwrap().get(&key) {
@@ -328,6 +335,8 @@ struct Resolver<'a> {
     selected: BTreeSet<String>,
     values: BTreeMap<String, Value>,
     named_stack: Vec<(String, String)>,
+    /// Dependency named inputs already expanded for `^` inputs.
+    expanded: BTreeSet<(String, String)>,
     external: BTreeSet<String>,
     /// `None` resolves which inputs a task has without evaluating env or
     /// runtime inputs.
@@ -338,13 +347,25 @@ struct Resolver<'a> {
 impl Resolver<'_> {
     fn input(&mut self, project: &str, input: &Value) -> Result<()> {
         match input {
+            // As in Nx, `^name` is `name` of every project the project depends
+            // on, directly or not.
             Value::String(name) if name.starts_with('^') => {
-                for dependency in self.snapshot.projects.dependencies[project]
-                    .iter()
-                    .map(|edge| edge.target.clone())
-                    .collect::<Vec<_>>()
-                {
-                    self.named(&dependency, &name[1..])?;
+                let mut closure = BTreeSet::new();
+                let mut pending = vec![project.to_owned()];
+                while let Some(current) = pending.pop() {
+                    for edge in &self.snapshot.projects.dependencies[&current] {
+                        if edge.target != project && closure.insert(edge.target.clone()) {
+                            pending.push(edge.target.clone());
+                        }
+                    }
+                }
+                for dependency in closure {
+                    if self
+                        .expanded
+                        .insert((dependency.clone(), name[1..].to_owned()))
+                    {
+                        self.named(&dependency, &name[1..])?;
+                    }
                 }
             }
             Value::String(name)
@@ -546,6 +567,7 @@ pub fn resolve(
         selected: BTreeSet::new(),
         values: BTreeMap::new(),
         named_stack: Vec::new(),
+        expanded: BTreeSet::new(),
         external: BTreeSet::new(),
         prepared,
         cancelled,
@@ -559,7 +581,11 @@ pub fn resolve(
         .is_some_and(|installed| installed.lockfile.is_some());
     // Always include workspace resolution/configuration, including ignored dotenv files.
     // A pnpm lockfile qk can read is keyed by what the task's projects install instead.
-    for path in [
+    // The root tsconfig, as Nx hashes it into every task.
+    let tsconfig = ["tsconfig.base.json", "tsconfig.json"]
+        .into_iter()
+        .find(|name| workspace.root.join(name).is_file());
+    for path in tsconfig.into_iter().chain([
         "nx.json",
         "package.json",
         "pnpm-workspace.yaml",
@@ -569,7 +595,7 @@ pub fn resolve(
         "bun.lock",
         ".env",
         ".env.local",
-    ] {
+    ]) {
         if workspace.root.join(path).is_file() && !(path == "pnpm-lock.yaml" && readable) {
             resolver.selected.insert(path.into());
         }

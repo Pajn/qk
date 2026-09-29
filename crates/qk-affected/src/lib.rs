@@ -9,6 +9,9 @@
 //! exactly what they did before.
 
 mod json_diff;
+mod tasks;
+
+pub use tasks::{TaskAnalysis, TaskCause, TaskReason, affected_tasks};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;

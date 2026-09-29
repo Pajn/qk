@@ -66,6 +66,10 @@ enum Command {
         exclude: Vec<String>,
         #[command(flatten)]
         changes: ChangeOptions,
+        /// `project` selects the targets of affected projects, as Nx does;
+        /// `task` selects the tasks whose inputs changed.
+        #[arg(long, value_enum, default_value = "project")]
+        granularity: Granularity,
         #[command(flatten)]
         options: RunOptions,
     },
@@ -131,6 +135,16 @@ struct ChangeOptions {
 }
 
 impl ChangeOptions {
+    fn options(&self) -> qk_affected::Options {
+        qk_affected::Options {
+            base: self.base.clone(),
+            head: self.head.clone(),
+            files: self.files.clone(),
+            uncommitted: self.uncommitted,
+            untracked: self.untracked,
+        }
+    }
+
     fn affected(&self, workspace: &Workspace) -> Result<std::collections::BTreeSet<String>> {
         Ok(self.analyse(workspace)?.projects.into_keys().collect())
     }
@@ -149,6 +163,12 @@ impl ChangeOptions {
             },
         )
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Granularity {
+    Project,
+    Task,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -233,6 +253,25 @@ enum ShowCommand {
         #[command(flatten)]
         changes: ChangeOptions,
         /// Emit JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the tasks the targets plan, or with `--affected` the affected
+    /// ones and why.
+    Tasks {
+        #[arg(short = 't', long, required = true, value_delimiter = ',', num_args = 1..)]
+        targets: Vec<String>,
+        #[arg(short = 'p', long, value_delimiter = ',', num_args = 1..)]
+        projects: Vec<String>,
+        #[arg(long, value_delimiter = ',', num_args = 1..)]
+        exclude: Vec<String>,
+        /// Only tasks whose inputs changed, or that depend on one.
+        #[arg(long)]
+        affected: bool,
+        #[command(flatten)]
+        changes: ChangeOptions,
+        #[arg(short = 'c', long)]
+        configuration: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -444,7 +483,53 @@ fn run(cli: Cli) -> Result<i32> {
             options,
         } => {
             let selected = select_projects(&workspace.projects, &projects, &exclude)?;
-            let requests = requests(&workspace, selected, &targets, &options);
+            let requests = requests(
+                &workspace,
+                selected,
+                &targets,
+                options.configuration.as_ref(),
+                &options.args,
+            );
+            return execute_tasks(&workspace, requests, &options, false);
+        }
+        Command::Affected {
+            targets,
+            projects,
+            exclude,
+            changes,
+            granularity: Granularity::Task,
+            options,
+        } => {
+            let selected = select_projects(&workspace.projects, &projects, &exclude)?;
+            let graph = TaskGraph::build(
+                &workspace,
+                &requests(
+                    &workspace,
+                    selected,
+                    &targets,
+                    options.configuration.as_ref(),
+                    &options.args,
+                ),
+            )?;
+            let analysis = qk_affected::affected_tasks(&workspace, &graph, &changes.options())?;
+            let requests: Vec<Request> = graph
+                .roots
+                .iter()
+                .filter(|id| analysis.tasks.contains_key(*id))
+                .map(|id| {
+                    let task = &graph.tasks[id];
+                    Request {
+                        project: task.project.clone(),
+                        target: task.target.clone(),
+                        configuration: task.configuration.clone(),
+                        args: task.args.clone(),
+                    }
+                })
+                .collect();
+            if requests.is_empty() {
+                eprintln!("qk: no affected tasks");
+                return Ok(0);
+            }
             return execute_tasks(&workspace, requests, &options, false);
         }
         Command::Affected {
@@ -453,12 +538,19 @@ fn run(cli: Cli) -> Result<i32> {
             exclude,
             changes,
             options,
+            ..
         } => {
             let affected = changes.affected(&workspace)?;
             let selected = select_projects(&workspace.projects, &projects, &exclude)?
                 .into_iter()
                 .filter(|project| affected.contains(project));
-            let requests = requests(&workspace, selected, &targets, &options);
+            let requests = requests(
+                &workspace,
+                selected,
+                &targets,
+                options.configuration.as_ref(),
+                &options.args,
+            );
             if requests.is_empty() {
                 eprintln!("qk: no affected tasks");
                 return Ok(0);
@@ -506,6 +598,34 @@ fn run(cli: Cli) -> Result<i32> {
                 &workspace,
                 &analysis,
                 project.as_deref(),
+                json,
+                &mut io::stdout().lock(),
+            )?;
+        }
+        Command::Show {
+            command:
+                ShowCommand::Tasks {
+                    targets,
+                    projects,
+                    exclude,
+                    affected,
+                    changes,
+                    configuration,
+                    json,
+                },
+        } => {
+            let selected = select_projects(&workspace.projects, &projects, &exclude)?;
+            let graph = TaskGraph::build(
+                &workspace,
+                &requests(&workspace, selected, &targets, configuration.as_ref(), &[]),
+            )?;
+            explain::tasks(
+                &workspace,
+                &graph,
+                affected
+                    .then(|| qk_affected::affected_tasks(&workspace, &graph, &changes.options()))
+                    .transpose()?
+                    .as_ref(),
                 json,
                 &mut io::stdout().lock(),
             )?;
@@ -609,22 +729,22 @@ fn requests(
     workspace: &Workspace,
     projects: impl IntoIterator<Item = String>,
     targets: &[String],
-    options: &RunOptions,
+    configuration: Option<&String>,
+    args: &[String],
 ) -> Vec<Request> {
     let mut requests = Vec::new();
     for project in projects {
         for target in targets {
             if let Some(definition) = workspace.projects[&project].targets.get(target) {
                 // Like Nx, a target without the configuration runs its default.
-                let configuration = options
-                    .configuration
-                    .clone()
+                let configuration = configuration
+                    .cloned()
                     .filter(|name| definition.configurations.contains_key(name));
                 requests.push(Request {
                     project: project.clone(),
                     target: target.clone(),
                     configuration,
-                    args: options.args.clone(),
+                    args: args.to_vec(),
                 });
             }
         }

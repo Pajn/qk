@@ -786,3 +786,41 @@ fn workspace_file_resolution_keys_reach_tasks_through_the_lockfile() {
     assert!(stderr(&success(fixture.build(&fixture.root, &[]))).contains("cache miss"));
     assert_eq!(fixture.runs(), 2);
 }
+
+#[test]
+fn dependency_inputs_cover_transitive_dependencies_like_nx() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    let write = |path: &str, text: &str| {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    };
+    write("nx.json", "{}");
+    write(
+        "app/project.json",
+        r#"{"name":"app","implicitDependencies":["mid"],
+            "targets":{"check":{"command":"echo checked","cache":true,"inputs":["^default"]}}}"#,
+    );
+    write(
+        "mid/project.json",
+        r#"{"name":"mid","implicitDependencies":["base"]}"#,
+    );
+    write("base/project.json", r#"{"name":"base"}"#);
+    write("base/src/value.txt", "one");
+    let check = || {
+        let output = Command::new(env!("CARGO_BIN_EXE_qk"))
+            .args(["--workspace", root.to_str().unwrap(), "run", "app:check"])
+            .output()
+            .unwrap();
+        stderr(&success(output))
+    };
+    assert!(check().contains("cache miss"));
+    assert!(check().contains("cache hit"));
+    // base is reached only through mid, and still counts.
+    write("base/src/value.txt", "two");
+    assert!(check().contains("cache miss"));
+    // So does the root tsconfig, as in Nx.
+    write("tsconfig.base.json", "{}");
+    assert!(check().contains("cache miss"));
+}

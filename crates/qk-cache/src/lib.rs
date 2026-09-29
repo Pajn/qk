@@ -20,6 +20,7 @@ use serde_json::{Value, json};
 
 pub use evict::{Pruned, max_size, parse_size, prune};
 pub use glob::Pattern;
+pub use hash::{Resolved, without_resolution};
 pub use paths::cache_directory;
 
 /// The cache for one run; its workspace snapshot is taken on first use.
@@ -61,6 +62,28 @@ impl TaskResult {
             key: None,
         }
     }
+}
+
+/// Each task's resolved inputs, for affected selection. `extra` paths are
+/// candidates beside the workspace's files, so a deleted file still matches
+/// the inputs that named it. Env and runtime inputs are not evaluated.
+pub fn resolve_tasks(
+    workspace: &Workspace,
+    graph: &TaskGraph,
+    extra: &[String],
+) -> Result<BTreeMap<String, Resolved>> {
+    let cache = cache_directory(&workspace.root);
+    let snapshot = hash::Snapshot::new(workspace, graph, &cache)?.with_candidates(extra);
+    let cancelled = AtomicBool::new(false);
+    graph
+        .tasks
+        .iter()
+        .map(|(id, task)| {
+            let resolved = hash::resolve(&snapshot, workspace, task, None, &cancelled)
+                .with_context(|| format!("cannot resolve the inputs of {id}"))?;
+            Ok((id.clone(), resolved))
+        })
+        .collect()
 }
 
 impl Cache {

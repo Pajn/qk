@@ -216,3 +216,57 @@ fn split(key: &str) -> (&str, &str) {
         None => (key, ""),
     }
 }
+
+/// `qk show tasks`: the planned tasks, or with an analysis the affected ones
+/// and why.
+pub fn tasks(
+    _workspace: &Workspace,
+    graph: &qk_taskgraph::TaskGraph,
+    analysis: Option<&qk_affected::TaskAnalysis>,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<()> {
+    let Some(analysis) = analysis else {
+        let ids: Vec<&String> = graph.tasks.keys().collect();
+        if json {
+            serde_json::to_writer(&mut *out, &ids)?;
+            writeln!(out)?;
+        } else {
+            for id in ids {
+                writeln!(out, "{id}")?;
+            }
+        }
+        return Ok(());
+    };
+    if json {
+        serde_json::to_writer_pretty(&mut *out, analysis)?;
+        writeln!(out)?;
+        return Ok(());
+    }
+    let short = |revision: &str| revision.chars().take(12).collect::<String>();
+    writeln!(
+        out,
+        "{} changed files between {} and {}.",
+        analysis.files.len(),
+        analysis.base.as_deref().map_or("(no base)".into(), short),
+        analysis
+            .head
+            .as_deref()
+            .map_or("the working tree".into(), short),
+    )?;
+    let width = analysis.tasks.keys().map(String::len).max().unwrap_or(0);
+    for (id, cause) in &analysis.tasks {
+        let summary = match cause {
+            qk_affected::TaskCause::Touched { reasons } => {
+                let more = match reasons.len() {
+                    1 => String::new(),
+                    count => format!(" (and {} more)", count - 1),
+                };
+                format!("{}{more}", reasons[0])
+            }
+            qk_affected::TaskCause::DependsOn { task } => format!("depends on {task}"),
+        };
+        writeln!(out, "{id:width$}  {summary}")?;
+    }
+    Ok(())
+}

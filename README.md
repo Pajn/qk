@@ -258,8 +258,9 @@ declared inputs, the fingerprints of its dependency tasks (including their
 outputs), the package manager, qk's version and the platform. Files are keyed
 by workspace-relative path, content and mode. Branch names and checkout
 locations are not part of the key, so identical sources in two worktrees
-share entries. Root workspace files (`nx.json`, `package.json`,
-`pnpm-workspace.yaml`, lockfiles, `.env`, `.env.local`) and the manifests of
+share entries. Root workspace files (the root `tsconfig.base.json` or
+`tsconfig.json`, `nx.json`, `package.json`, `pnpm-workspace.yaml`,
+lockfiles, `.env`, `.env.local`) and the manifests of
 the task's project and its transitive project dependencies are always
 included.
 
@@ -288,7 +289,8 @@ next run. File contents are re-read whenever their metadata changes. Without
 `{projectRoot}/**/*` unless a named input overrides it.
 
 Supported input declarations are globs with `!` exclusions, `fileset`, named
-inputs and `^named` inputs, `env`, `runtime`, `dependentTasksOutputFiles`
+inputs and `^named` inputs, which as in Nx cover every project the project
+depends on, directly or not, `env`, `runtime`, `dependentTasksOutputFiles`
 with `transitive`, and `externalDependencies`, which adds every installation
 of the named packages in the pnpm lockfile, whichever importer installs them.
 With another package manager, lockfiles are always keyed by content. `runtime` commands run once per run for each environment.
