@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/qk-cli", "crates/qk-config", "crates/qk-graph", "crates/qk-taskgraph", "crates/qk-executor", "crates/qk-runner", "crates/qk-cache"]
+members = ["crates/qk-cli", "crates/qk-config", "crates/qk-graph", "crates/qk-taskgraph", "crates/qk-executor", "crates/qk-runner", "crates/qk-cache", "crates/qk-lockfile"]
 resolver = "3"
 
 [workspace.package]
@@ -29,6 +29,7 @@ qk-taskgraph = { path = "crates/qk-taskgraph" }
 qk-executor = { path = "crates/qk-executor" }
 qk-runner = { path = "crates/qk-runner" }
 qk-cache = { path = "crates/qk-cache" }
+qk-lockfile = { path = "crates/qk-lockfile" }
 
 [profile.release]
 lto = "thin"
