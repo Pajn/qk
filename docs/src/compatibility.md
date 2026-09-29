@@ -51,7 +51,7 @@ parity claim yet. In particular:
 - Nx plugins and inferred targets are outside the design's scope.
 - qk has its own live output panel and limited stdin/foreground terminal
   support for a single requested task. It does not provide pseudo-terminals
-  or implement Nx release commands. The npm package name is not chosen yet.
+  or implement Nx release commands.
 
 The compatibility baseline is documented in Nx's
 [project configuration](https://nx.dev/docs/reference/project-configuration)

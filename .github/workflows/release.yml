@@ -2,8 +2,8 @@ name: Release
 
 # Pushing a tag v<version> matching the workspace version builds qk for each
 # supported platform and attaches the binaries to a GitHub release. The npm
-# packages are published too once the repository variable NPM_PACKAGE_NAME
-# names the package and the secret NPM_TOKEN can publish it.
+# packages are published too once NPM_PUBLISH is true and the NPM_TOKEN
+# secret can publish runqk and the @runqk platform packages.
 
 on:
   push:
@@ -76,7 +76,7 @@ jobs:
 
   npm:
     needs: build
-    if: vars.NPM_PACKAGE_NAME != ''
+    if: vars.NPM_PUBLISH == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -88,21 +88,30 @@ jobs:
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
-      - run: node tools/npm/package.mjs --name "$NPM_PACKAGE_NAME" --version "${GITHUB_REF_NAME#v}" --binaries dist --out npm
-        env:
-          NPM_PACKAGE_NAME: ${{ vars.NPM_PACKAGE_NAME }}
-      - name: Publish the platform packages, then the main package
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Install cargo-npm
+        run: cargo install cargo-npm --version 0.1.4 --locked
+      - name: Arrange binaries for cargo-npm
+        run: |
+          for triple in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc; do
+            mkdir -p "target/$triple/release"
+            cp "dist/$triple/"* "target/$triple/release/"
+          done
+      - name: Generate npm packages
+        run: |
+          cargo npm generate -p qk-cli
+          node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            const pkg = JSON.parse(readFileSync("npm/runqk/package.json", "utf8"));
+            const expected = ["@runqk/cli-linux-x64", "@runqk/cli-linux-arm64", "@runqk/cli-darwin-arm64", "@runqk/cli-win32-x64"];
+            if (pkg.name !== "runqk" || expected.some(name => pkg.optionalDependencies?.[name] !== pkg.version) || Object.keys(pkg.optionalDependencies ?? {}).length !== expected.length) {
+              throw new Error("Missing or unexpected platform packages");
+            }
+          '
+      - name: Publish platform packages and runqk
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          main=$(echo "$NPM_PACKAGE_NAME" | sed 's|^@||; s|/|__|')
-          for directory in npm/*; do
-            if [ "$(basename "$directory")" != "$main" ]; then
-              npm publish --access public "$directory"
-            fi
-          done
-          npm publish --access public "npm/$main"
-        # The main package names the platform packages, so they go first.
-        shell: bash
-    env:
-      NPM_PACKAGE_NAME: ${{ vars.NPM_PACKAGE_NAME }}
+        run: cargo npm publish -p qk-cli -- --access public
