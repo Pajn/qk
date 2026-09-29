@@ -57,6 +57,8 @@ parent workspace marker exists.
 | `qk show projects --affected [--base <rev>] [--head <rev>]` | Projects affected by the changes, in graph order |
 | `qk affected -t build,test [--base <rev>] [--head <rev>]` | Execute targets on the affected projects |
 | `qk show affected [project] [--json]` | Why projects are affected, or why one project is |
+| `qk affected -t build --granularity task` | Execute only the tasks whose inputs changed |
+| `qk show tasks -t build,test --affected [--json]` | The affected tasks and why |
 | `qk show runs`, `qk show run [id]` | Recent runs; one run's tasks, cache results and critical path |
 | `qk show task <project:target>` | A task's recent runs and why its cache key changed |
 | `qk cache path` | Print the local cache directory without creating it |
@@ -128,6 +130,19 @@ ui is touched:
       react-dom (direct): 19.0.0: peers or patch changed
       scheduler: dependencies or integrity changed
 ```
+
+With `--granularity task`, `qk affected` selects tasks instead of projects: a
+task is affected when a changed file is one of its resolved inputs, when what
+its lockfile importers or `externalDependencies` install changed, when
+`pnpm-workspace.yaml` changed outside its resolution keys, when a project
+manifest was deleted, or when it depends on an affected task. These are the
+same inputs its cache key reads, so an unaffected task would be a cache hit,
+except that env and runtime inputs count as unchanged, since the base
+revision's environment is unknowable. A test-only change then reaches the
+test tasks and not the builds whose `production` inputs exclude tests.
+`project` stays the default, as in Nx. `qk show tasks -t <targets> --affected`
+lists the affected tasks with their first reason, or the whole analysis with
+`--json`.
 
 `--json` gives the whole analysis, or for one project its path with the
 typed reasons, including the snapshot keys a lockfile change added,
@@ -431,7 +446,6 @@ parity claim yet. In particular:
 - Target-default glob keys and filtered defaults are not implemented;
   filtered default arrays are rejected. Nx plugins and inferred targets are
   outside the design's scope.
-- Affected selection is per project; per-task affected is future work.
 - Interactive tasks, interactive output styles, release commands and npm
   binary distribution remain future work.
 
@@ -514,4 +528,4 @@ compare prints them beside qk's.
 GitHub Actions is configured for Linux, macOS and Windows. The lockfile is
 checked in for reproducible dependency resolution.
 
-Next: per-task affected selection.
+Next: external graph nodes, benchmarks and binary distribution.

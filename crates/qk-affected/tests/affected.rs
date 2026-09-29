@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -369,4 +370,69 @@ fn explains_lockfile_touches_by_what_changed() {
         reasons[0].to_string(),
         "what tools/tool installs changed in pnpm-lock.yaml (1 package)"
     );
+}
+
+fn task_graph_repo() -> Repo {
+    Repo::new(&[
+        (
+            "nx.json",
+            r#"{"namedInputs": {"default": ["{projectRoot}/**/*"], "production": ["default", "!{projectRoot}/**/*.test.ts"]},
+                "targetDefaults": {"build": {"command": "echo build", "inputs": ["production", "^production"], "dependsOn": ["^build"]},
+                                   "test": {"command": "echo test", "inputs": ["default"]}}}"#,
+        ),
+        (
+            "apps/app/project.json",
+            r#"{"name": "app", "implicitDependencies": ["lib"], "targets": {"build": {}, "test": {}}}"#,
+        ),
+        (
+            "libs/lib/project.json",
+            r#"{"name": "lib", "targets": {"build": {}, "test": {}}}"#,
+        ),
+    ])
+}
+
+fn affected_tasks(repo: &Repo) -> BTreeMap<String, qk_affected::TaskCause> {
+    use qk_taskgraph::{Request, TaskGraph};
+    let workspace = Workspace::load(&repo.root).unwrap();
+    let requests: Vec<Request> = ["app:build", "app:test", "lib:build", "lib:test"]
+        .into_iter()
+        .map(|id| Request::parse(id).unwrap())
+        .collect();
+    let graph = TaskGraph::build(&workspace, &requests).unwrap();
+    let head = commit(&repo.root);
+    qk_affected::affected_tasks(
+        &workspace,
+        &graph,
+        &Options {
+            base: Some(repo.base.clone()),
+            head: Some(head),
+            ..Options::default()
+        },
+    )
+    .unwrap()
+    .tasks
+}
+
+#[test]
+fn a_task_is_affected_when_its_inputs_change() {
+    use qk_affected::{TaskCause, TaskReason};
+    let repo = task_graph_repo();
+    write(&repo.root, "libs/lib/src/index.test.ts", "a test");
+    let tasks = affected_tasks(&repo);
+    // The test file is not a production input, so no build is affected.
+    assert_eq!(tasks.keys().collect::<Vec<_>>(), ["lib:test"]);
+    assert!(matches!(
+        &tasks["lib:test"],
+        TaskCause::Touched { reasons } if matches!(&reasons[..], [TaskReason::Input { file }] if file == "libs/lib/src/index.test.ts")
+    ));
+
+    let repo = task_graph_repo();
+    write(&repo.root, "libs/lib/src/index.ts", "source");
+    let tasks = affected_tasks(&repo);
+    assert_eq!(
+        tasks.keys().collect::<Vec<_>>(),
+        ["app:build", "lib:build", "lib:test"]
+    );
+    // app:build reads lib's production files through ^production.
+    assert!(matches!(&tasks["app:build"], TaskCause::Touched { .. }));
 }

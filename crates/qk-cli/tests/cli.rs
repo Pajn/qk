@@ -311,3 +311,60 @@ fn show_affected_explains_why() {
     );
     assert!(!qk(&["show", "affected", "missing"]).status.success());
 }
+
+#[test]
+fn task_granularity_selects_tasks_whose_inputs_changed() {
+    // README.md is not a production input, so no build reads it.
+    let readme = "packages/core/README.md";
+    let tasks = planned(qk(&[
+        "affected",
+        "-t",
+        "build",
+        "--granularity",
+        "project",
+        "--files",
+        readme,
+        "--dry-run",
+    ]));
+    assert!(tasks.contains(&"core:build".to_owned()), "{tasks:?}");
+    let output = qk(&[
+        "affected",
+        "-t",
+        "build",
+        "--granularity",
+        "task",
+        "--files",
+        readme,
+    ]);
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no affected tasks"));
+    let text = String::from_utf8(
+        qk(&[
+            "show",
+            "tasks",
+            "-t",
+            "build",
+            "test",
+            "--affected",
+            "--files",
+            "packages/core/index.js",
+        ])
+        .stdout,
+    )
+    .unwrap();
+    assert!(
+        text.contains("core:build  input packages/core/index.js changed"),
+        "{text}"
+    );
+    let report = successful_json(qk(&[
+        "show",
+        "tasks",
+        "-t",
+        "build",
+        "--affected",
+        "--files",
+        readme,
+        "--json",
+    ]));
+    assert_eq!(report["tasks"], json!({}));
+}
