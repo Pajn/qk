@@ -1,0 +1,4 @@
+# pnpm refuses to install while a dependency's build script is neither
+# allowed nor declined. Nx's postinstall is not needed to capture goldens.
+allowBuilds:
+  nx: false

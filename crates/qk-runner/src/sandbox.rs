@@ -180,7 +180,15 @@ impl Sandbox {
                     }
                 }
             }
-            sandbox.watcher = Some(Watcher::start(&sandbox.directory)?);
+            // Reports only name what enforce mode refuses, so it runs without
+            // them where the log keeps them out; audit has nothing without.
+            match Watcher::start(&sandbox.directory) {
+                Ok(watcher) => sandbox.watcher = Some(watcher),
+                Err(error) if mode == Mode::Enforce => {
+                    qk_executor::status!("qk: refused paths will not be listed: {error:#}")
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             let (shared, dotenv) = scan(&sandbox.root);
             sandbox.shared = shared;

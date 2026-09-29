@@ -234,6 +234,7 @@ fn spawn(task: &PreparedTask, text: &str, capture: bool, interactive: bool) -> R
 /// Handing the terminal to an interactive command and back.
 mod terminal {
     /// Whether stdin is a terminal whose foreground is qk's process group.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub fn in_foreground() -> bool {
         #[cfg(unix)]
         unsafe {
