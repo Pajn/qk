@@ -19,3 +19,7 @@ heading-split-level = 3
 [output.html.fold]
 enable = true
 level = 1
+
+# Search should answer questions about implemented behavior.
+[output.html.search.chapter]
+"design.md" = { enable = false }

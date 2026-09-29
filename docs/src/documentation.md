@@ -48,6 +48,8 @@ example. Give configuration keys their own headings so search results can
 link straight to the option. Explain when an accepted Nx setting has no
 effect in qk. Keep examples aligned with the fixtures and implementation.
 Use relative Markdown links between pages, and label design proposals clearly.
+The design plan is excluded from search so proposals do not
+compete with the reference for implemented behavior.
 
 Before committing, run `mdbook build docs` and check changed pages and search
 in the preview. Pull requests build the book but do not publish it.

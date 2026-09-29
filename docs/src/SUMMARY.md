@@ -24,6 +24,12 @@
 
 - [Nx compatibility](compatibility.md)
 
+# Internals
+
+- [Architecture](architecture.md)
+- [Design and implementation plan](design.md)
+
 # Contributing
 
+- [Development](development.md)
 - [Maintaining the documentation](documentation.md)

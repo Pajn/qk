@@ -7,8 +7,7 @@ dependency ordering, affected selection and a cache shared by Git worktrees.
 Start with [Getting started](getting-started.md) to inspect and run the
 self-contained example workspace.
 
-This book documents the current implementation. The repository's
-`docs/task-runner-design.md` describes the longer-term plan; planned behavior
+This book documents the current implementation. The [design and implementation plan](design.md) describes the longer-term plan; planned behavior
 should not be treated as supported functionality.
 
 Read [Running tasks](guides/running-tasks.md) for execution and dependency
