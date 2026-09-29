@@ -160,7 +160,11 @@ impl Cache {
         fs::copy(source, &temporary)?;
         // Blobs keep no meaningful mode of their own; restores apply the manifest's.
         set_mode(&temporary, if cfg!(unix) { 0o644 } else { 0 })?;
-        File::open(&temporary)?.sync_all()?;
+        // Windows flushes only through a handle open for writing.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&temporary)?
+            .sync_all()?;
         // Hash the copy, not the source, so a concurrent write cannot mislabel the blob.
         let hash = digest_file(&temporary)?;
         let target = self.root.join("blobs").join(&hash);

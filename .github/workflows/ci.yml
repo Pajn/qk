@@ -22,7 +22,8 @@ jobs:
           rustup default stable
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --locked
+      # Every failing test binary, not only the first.
+      - run: cargo test --workspace --locked --no-fail-fast
 
   # qk against the committed Nx goldens of the parity fixture. Run cases
   # execute package scripts, so pnpm is needed; Nx is not.
