@@ -79,6 +79,7 @@ pub struct WorkspaceConfig {
 #[serde(rename_all = "camelCase")]
 pub struct Package {
     pub name: Option<String>,
+    pub version: Option<String>,
     #[serde(default)]
     pub scripts: BTreeMap<String, String>,
     #[serde(default)]
@@ -102,6 +103,24 @@ pub struct Package {
 }
 
 impl Package {
+    /// Each declared dependency with its range, as Nx reads them: when a name
+    /// is in several sections, `dependencies` wins, then `devDependencies`,
+    /// then `peerDependencies`, then `optionalDependencies`.
+    pub fn dependency_ranges(&self) -> BTreeMap<&str, &str> {
+        let mut ranges = BTreeMap::new();
+        for section in [
+            &self.optional_dependencies,
+            &self.peer_dependencies,
+            &self.dev_dependencies,
+            &self.dependencies,
+        ] {
+            for (name, range) in section {
+                ranges.insert(name.as_str(), range.as_str());
+            }
+        }
+        ranges
+    }
+
     pub fn dependency_names(&self) -> impl Iterator<Item = &String> {
         self.dependencies
             .keys()

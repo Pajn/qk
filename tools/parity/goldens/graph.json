@@ -545,6 +545,11 @@
       "mobile": [
         {
           "source": "mobile",
+          "target": "tooling",
+          "type": "static"
+        },
+        {
+          "source": "mobile",
           "target": "@fixture/native",
           "type": "static"
         },
@@ -562,6 +567,11 @@
         }
       ],
       "web": [
+        {
+          "source": "web",
+          "target": "@fixture/utils",
+          "type": "static"
+        },
         {
           "source": "web",
           "target": "ui",

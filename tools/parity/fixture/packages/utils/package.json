@@ -17,5 +17,9 @@
     "tags": [
       "scope:shared"
     ]
+  },
+  "devDependencies": {
+    "@fixture/ui": "^2.0.0",
+    "ui-alias": "workspace:@fixture/ui@*"
   }
 }

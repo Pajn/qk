@@ -1,7 +1,21 @@
 {
   "name": "@fixture/mobile",
   "private": true,
-  "scripts": { "build": "node ../../scripts/task.mjs mobile:build ." },
-  "dependencies": { "@fixture/native": "workspace:*", "@fixture/utils": "workspace:*", "react": "catalog:" },
-  "nx": { "name": "mobile", "targets": { "lint": {} } }
+  "scripts": {
+    "build": "node ../../scripts/task.mjs mobile:build ."
+  },
+  "dependencies": {
+    "@fixture/native": "workspace:*",
+    "@fixture/utils": "workspace:*",
+    "react": "catalog:"
+  },
+  "nx": {
+    "name": "mobile",
+    "targets": {
+      "lint": {}
+    }
+  },
+  "devDependencies": {
+    "@fixture/tooling": "file:../../packages/tooling"
+  }
 }

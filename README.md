@@ -729,7 +729,15 @@ cache; the run history and each worktree's state stay in the git directory.
   Changing an executor drops options and configurations from the previous
   executor. Inspection preserves other executor names and unknown metadata.
 - Builds workspace edges from the four dependency sections in package
-  manifests, matching declared dependency names to workspace package names.
+  manifests as Nx does. A dependency is the workspace package of its name
+  when its range is `workspace:…` or `*`, a `file:` path to that package, or
+  a semver range the package's `version` satisfies, prereleases included, by
+  npm's rules (`^`, `~`, x-ranges, hyphen ranges, `||`). Anything else, such
+  as `catalog:`, an `npm:` alias or a range outside the version, is left to
+  npm. As in Nx, an alias key, such as `"ui": "workspace:@scope/ui@*"`, is
+  looked up by the key and so links nothing. When a name is in several
+  sections, `dependencies` wins, then `devDependencies`, then
+  `peerDependencies`, then `optionalDependencies`.
   Adds `implicitDependencies` selected by names, globs or tags; negations
   remove matching edges. Unknown exact implicit dependencies are errors.
 - Emits sorted project nodes and deduplicated dependency edges, with portable
@@ -748,8 +756,6 @@ parity claim yet. In particular:
   does. `--external` adds a node per installation in the pnpm lockfile,
   `npm:<name>@<version>` with peers and patch in the version, with edges from
   projects to what they install directly and between installations.
-  Workspace dependency aliases and version-range resolution are not
-  implemented; name matching is conservative.
 - Nx plugins and inferred targets are outside the design's scope.
 - Interactive tasks, interactive output styles and release commands remain
   future work. The npm package name is not chosen yet.

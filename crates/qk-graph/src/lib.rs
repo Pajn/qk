@@ -1,5 +1,54 @@
 //! Deterministic workspace project graphs. External lockfile nodes come later.
 
+mod npm_range;
+pub use npm_range::satisfies;
+
+/// Whether a dependency declared with `range` in the package at `root` means
+/// the workspace package at `target`, as Nx decides it: a `workspace:`
+/// range, `*`, a `file:` path to it, or a semver range its version
+/// satisfies, prereleases included. Anything else, such as `catalog:`,
+/// `npm:` aliases or a range the version is outside of, is left to npm.
+fn links(range: &str, root: &str, target: &str, version: Option<&str>) -> bool {
+    if range.starts_with("workspace:") || range == "*" {
+        return true;
+    }
+    if let Some(path) = range.strip_prefix("file:")
+        && join(root, path) == target
+    {
+        return true;
+    }
+    version.is_some_and(|version| satisfies(version, range))
+}
+
+/// Node's `path.posix.join`: segments joined and normalised, keeping a
+/// trailing slash.
+fn join(base: &str, path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    let mut up = 0;
+    for part in base.split('/').chain(path.split('/')) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if parts.pop().is_none() {
+                    up += 1;
+                }
+            }
+            part => parts.push(part),
+        }
+    }
+    let mut joined = vec![".."; up];
+    joined.extend(parts);
+    let mut result = if joined.is_empty() {
+        ".".to_owned()
+    } else {
+        joined.join("/")
+    };
+    if path.ends_with('/') && result != "." {
+        result.push('/');
+    }
+    result
+}
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, bail};
@@ -53,9 +102,15 @@ impl ProjectGraph {
         for (name, project) in &workspace.projects {
             let mut edges = BTreeMap::new();
             if let Some(package) = workspace.packages.get(name) {
-                for dependency in package.dependency_names() {
-                    if let Some(target) = package_names.get(dependency)
+                for (dependency, range) in package.dependency_ranges() {
+                    if let Some(target) = package_names.get(&dependency.to_owned())
                         && *target != name
+                        && links(
+                            range,
+                            &project.root,
+                            &workspace.projects[*target].root,
+                            workspace.packages[*target].version.as_deref(),
+                        )
                     {
                         edges
                             .entry((*target).clone())
