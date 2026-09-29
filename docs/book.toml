@@ -1,0 +1,21 @@
+[book]
+title = "qk documentation"
+description = "Guides and configuration reference for the qk task runner"
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+
+[output.html]
+site-url = "/qk/"
+no-section-label = true
+preferred-dark-theme = "navy"
+
+[output.html.search]
+enable = true
+heading-split-level = 3
+
+[output.html.fold]
+enable = true
+level = 1

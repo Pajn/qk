@@ -12,6 +12,8 @@ the pnpm lockfile. The
 [design](docs/task-runner-design.md) describes the longer-term plan, not the
 current feature set.
 
+Read the [documentation](docs/src/index.md), or [build and preview it locally](docs/src/documentation.md).
+
 ## Try it
 
 Install a current stable Rust toolchain, then run from this repository:
