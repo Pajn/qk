@@ -360,3 +360,79 @@ fn restored_dependencies_keep_dependents_cached() {
         "generated:one\n"
     );
 }
+
+#[test]
+fn extended_glob_exclusions_follow_nx() {
+    let fixture = Fixture::new(target(
+        "build",
+        json!({"inputs": [
+            "{projectRoot}/src/**/*",
+            "!{projectRoot}/src/**/?(*.)+(spec|test).[jt]s?(x)",
+        ]}),
+    ));
+    success(fixture.build(&fixture.root, &[]));
+    fs::write(fixture.root.join("src/widget.spec.tsx"), "test").unwrap();
+    let excluded = success(fixture.build(&fixture.root, &[]));
+    assert!(stderr(&excluded).contains("qk: cache hit app:build"));
+    fs::write(fixture.root.join("src/widget.tsx"), "source").unwrap();
+    success(fixture.build(&fixture.root, &[]));
+    assert_eq!(fixture.runs(), 2);
+}
+
+#[test]
+fn unsupported_outputs_elsewhere_do_not_bypass() {
+    let fixture = Fixture::with_targets(json!({
+        "build": target("build", json!({})),
+        "e2e": {
+            "executor": "nx:noop",
+            "outputs": ["{projectRoot}/e2e/../ios/build/*/App.app", "{options.dir}"],
+        },
+    }));
+    let first = success(fixture.qk(&fixture.root, &["run-many", "-t", "build,e2e"]));
+    assert!(
+        !stderr(&first).contains("cache bypassed"),
+        "{}",
+        stderr(&first)
+    );
+    success(fixture.build(&fixture.root, &[]));
+    assert_eq!(fixture.runs(), 1);
+}
+
+#[test]
+fn bypassed_dependencies_are_named() {
+    let fixture = Fixture::with_targets(json!({
+        "generate": target("generate", json!({
+            "cache": false,
+            "inputs": [{"unknownInputKind": true}],
+            "outputs": ["{projectRoot}/generated"],
+        })),
+        "build": target("build", json!({"dependsOn": ["generate"]})),
+    }));
+    let output = success(fixture.build(&fixture.root, &[]));
+    assert!(
+        stderr(&output).contains(
+            "qk: app:build: cache bypassed (depends on app:generate: unsupported task input declaration)"
+        ),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn directory_symlink_inputs_track_their_target() {
+    let fixture = Fixture::new(target(
+        "build",
+        json!({"inputs": ["{projectRoot}/src/**/*"]}),
+    ));
+    fs::create_dir_all(fixture.root.join("shared")).unwrap();
+    fs::write(fixture.root.join("shared/value.txt"), "a").unwrap();
+    std::os::unix::fs::symlink("../shared", fixture.root.join("src/linked")).unwrap();
+    success(fixture.build(&fixture.root, &[]));
+    success(fixture.build(&fixture.root, &[]));
+    assert_eq!(fixture.runs(), 1);
+
+    fs::write(fixture.root.join("shared/value.txt"), "b").unwrap();
+    success(fixture.build(&fixture.root, &[]));
+    assert_eq!(fixture.runs(), 2);
+}

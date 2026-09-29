@@ -1,8 +1,10 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use qk_config::Workspace;
@@ -11,7 +13,8 @@ use qk_graph::ProjectGraph;
 use qk_taskgraph::{Task, TaskGraph};
 use serde_json::{Value, json};
 
-use crate::paths::{self, Outputs};
+use crate::glob::is_literal;
+use crate::paths::{self, Outputs, Pattern};
 
 pub fn digest_file(path: &Path) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
@@ -27,29 +30,175 @@ pub fn digest_file(path: &Path) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-pub fn file_value(root: &Path, path: &str) -> Result<Value> {
-    paths::safe_parents(root, path)?;
-    let absolute = root.join(path);
-    let metadata = std::fs::symlink_metadata(&absolute)?;
-    if metadata.file_type().is_symlink() {
-        let target = std::fs::read_link(&absolute)?;
-        let resolved = absolute.canonicalize().context("dangling input symlink")?;
-        if !resolved.starts_with(root.canonicalize()?) || !resolved.is_file() {
-            bail!("input symlink must resolve to a file inside the workspace");
-        }
-        return Ok(json!({"link":target, "content":digest_file(&resolved)?}));
-    }
-    if !metadata.is_file() {
-        bail!("input is not a regular file: {path}");
-    }
+/// Metadata that changes whenever a file's content can have changed.
+#[derive(Clone, PartialEq)]
+struct Stamp {
+    len: u64,
+    modified: Option<SystemTime>,
     #[cfg(unix)]
-    let mode = {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o777
-    };
-    #[cfg(not(unix))]
-    let mode = u32::from(metadata.permissions().readonly());
-    Ok(json!({"content":digest_file(&absolute)?, "mode":mode}))
+    unix: (i64, i64, u64, u32),
+}
+
+impl Stamp {
+    fn new(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            unix: {
+                use std::os::unix::fs::MetadataExt;
+                (
+                    metadata.ctime(),
+                    metadata.ctime_nsec(),
+                    metadata.ino(),
+                    metadata.mode(),
+                )
+            },
+        }
+    }
+
+    /// A file written within the timestamp resolution window could change again
+    /// without changing its stamp, so recent files are always re-read.
+    fn settled(&self) -> bool {
+        self.modified
+            .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+            .is_some_and(|age| age > Duration::from_secs(2))
+    }
+}
+
+/// Workspace state shared by every fingerprint in one run. The candidate file list
+/// is taken once, like Nx's file map; file contents are still re-read whenever
+/// their metadata changes, so edits during the run are detected.
+pub struct Snapshot {
+    files: BTreeSet<String>,
+    projects: ProjectGraph,
+    canonical_root: PathBuf,
+    workspace_prefix: Option<PathBuf>,
+    patterns: Mutex<HashMap<(String, bool), Arc<Pattern>>>,
+    digests: Mutex<HashMap<String, (Stamp, String)>>,
+    /// Runtime input results by command and environment, computed once per run like Nx.
+    runtime: Mutex<HashMap<String, Value>>,
+}
+
+impl Snapshot {
+    pub fn new(workspace: &Workspace, graph: &TaskGraph, cache_path: &Path) -> Result<Self> {
+        let mut files = source_files(&workspace.root)?;
+        if let Ok(cache_relative) = cache_path.strip_prefix(&workspace.root) {
+            files.retain(|path| !Path::new(path).starts_with(cache_relative));
+        }
+        // Generated artifacts must not make the next invocation invalidate itself.
+        // Another task's unsupported outputs stay candidates: that only costs misses.
+        let mut generated = BTreeSet::new();
+        for outputs in graph
+            .tasks
+            .values()
+            .filter_map(|task| Outputs::new(workspace, task).ok())
+        {
+            for anchor in outputs.anchors() {
+                generated.extend(
+                    under(&files, anchor)
+                        .filter(|path| outputs.matches(path))
+                        .cloned(),
+                );
+            }
+        }
+        files.retain(|path| !generated.contains(path));
+        let canonical_root = workspace.root.canonicalize()?;
+        let workspace_prefix = paths::git_path(&workspace.root, "--show-toplevel")
+            .and_then(|root| root.canonicalize().ok())
+            .and_then(|root| canonical_root.strip_prefix(root).ok().map(PathBuf::from));
+        Ok(Self {
+            files,
+            projects: ProjectGraph::build(workspace)?,
+            canonical_root,
+            workspace_prefix,
+            patterns: Mutex::default(),
+            digests: Mutex::default(),
+            runtime: Mutex::default(),
+        })
+    }
+
+    fn pattern(&self, pattern: &str, negated: bool) -> Result<Arc<Pattern>> {
+        let key = (pattern.to_owned(), negated);
+        if let Some(pattern) = self.patterns.lock().unwrap().get(&key) {
+            return Ok(pattern.clone());
+        }
+        let compiled = Arc::new(Pattern::new(pattern, negated)?);
+        self.patterns.lock().unwrap().insert(key, compiled.clone());
+        Ok(compiled)
+    }
+
+    fn digest(&self, path: &str, absolute: &Path, metadata: &std::fs::Metadata) -> Result<String> {
+        let stamp = Stamp::new(metadata);
+        if let Some((known, digest)) = self.digests.lock().unwrap().get(path)
+            && *known == stamp
+        {
+            return Ok(digest.clone());
+        }
+        let digest = digest_file(absolute)?;
+        // Re-check after reading so a concurrent write is never recorded as settled.
+        let after = Stamp::new(&std::fs::symlink_metadata(absolute)?);
+        if after == stamp && stamp.settled() {
+            self.digests
+                .lock()
+                .unwrap()
+                .insert(path.to_owned(), (stamp, digest.clone()));
+        }
+        Ok(digest)
+    }
+
+    fn file_value(&self, root: &Path, path: &str) -> Result<Value> {
+        paths::safe_parents(root, path)?;
+        let absolute = root.join(path);
+        let metadata = std::fs::symlink_metadata(&absolute)?;
+        if metadata.file_type().is_symlink() {
+            let target = std::fs::read_link(&absolute)?;
+            // A dangling link is keyed as such, so the key changes once it resolves.
+            let Ok(resolved) = absolute.canonicalize() else {
+                return Ok(json!({"link":target, "dangling":true}));
+            };
+            let Ok(relative) = resolved.strip_prefix(&self.canonical_root) else {
+                bail!("input symlink resolves outside the workspace: {path}");
+            };
+            if resolved.is_file() {
+                return Ok(json!({"link":target, "content":digest_file(&resolved)?}));
+            }
+            // A directory link is keyed by the files below its target. Links found
+            // there are keyed by their text only, which rules out cycles.
+            let relative = paths::relative(Path::new(""), relative)?;
+            if relative.is_empty() {
+                bail!("input symlink resolves to the workspace root: {path}");
+            }
+            let mut contents = BTreeMap::new();
+            for file in under(&self.files, &relative) {
+                let absolute = self.canonical_root.join(file);
+                let metadata = std::fs::symlink_metadata(&absolute)?;
+                let value = if metadata.file_type().is_symlink() {
+                    json!({"link": std::fs::read_link(&absolute)?})
+                } else {
+                    json!(self.digest(file, &absolute, &metadata)?)
+                };
+                contents.insert(file.strip_prefix(&relative).unwrap_or(file), value);
+            }
+            return Ok(json!({"link":target, "directory":contents}));
+        }
+        if !metadata.is_file() {
+            bail!("input is not a regular file: {path}");
+        }
+        let mode = crate::store::mode(&metadata);
+        Ok(json!({"content":self.digest(path, &absolute, &metadata)?, "mode":mode}))
+    }
+}
+
+/// Files equal to `prefix` or below it, using the sorted order of the set.
+fn under<'a>(files: &'a BTreeSet<String>, prefix: &'a str) -> impl Iterator<Item = &'a String> {
+    files
+        .range::<str, _>((
+            std::ops::Bound::Included(prefix),
+            std::ops::Bound::Unbounded,
+        ))
+        .take_while(move |path| path.starts_with(prefix))
+        .filter(move |path| path.len() == prefix.len() || path.as_bytes()[prefix.len()] == b'/')
 }
 
 fn source_files(root: &Path) -> Result<BTreeSet<String>> {
@@ -109,10 +258,7 @@ fn source_files(root: &Path) -> Result<BTreeSet<String>> {
 
 struct Resolver<'a> {
     workspace: &'a Workspace,
-    graph: &'a TaskGraph,
-    projects: ProjectGraph,
-    task: &'a Task,
-    files: BTreeSet<String>,
+    snapshot: &'a Snapshot,
     selected: BTreeSet<String>,
     values: BTreeMap<String, Value>,
     named_stack: Vec<(String, String)>,
@@ -124,7 +270,7 @@ impl Resolver<'_> {
     fn input(&mut self, project: &str, input: &Value) -> Result<()> {
         match input {
             Value::String(name) if name.starts_with('^') => {
-                for dependency in self.projects.dependencies[project]
+                for dependency in self.snapshot.projects.dependencies[project]
                     .iter()
                     .map(|edge| edge.target.clone())
                     .collect::<Vec<_>>()
@@ -165,6 +311,19 @@ impl Resolver<'_> {
                 let command = object["runtime"]
                     .as_str()
                     .context("runtime input must be a command")?;
+                let memo = serde_json::to_string(&(
+                    command,
+                    self.prepared
+                        .env
+                        .iter()
+                        .map(|(name, value)| (name.to_string_lossy(), value.to_string_lossy()))
+                        .collect::<Vec<_>>(),
+                ))?;
+                if let Some(value) = self.snapshot.runtime.lock().unwrap().get(&memo) {
+                    self.values
+                        .insert(format!("runtime:{command}"), value.clone());
+                    return Ok(());
+                }
                 let mut prepared = self.prepared.clone();
                 prepared.commands = vec![command.into()];
                 prepared.cwd = self.workspace.root.clone();
@@ -185,13 +344,16 @@ impl Resolver<'_> {
                     }
                     Ok(())
                 })?;
-                self.values.insert(
-                    format!("runtime:{command}"),
-                    json!([
-                        stdout.finalize().to_hex().to_string(),
-                        stderr.finalize().to_hex().to_string()
-                    ]),
-                );
+                let value = json!([
+                    stdout.finalize().to_hex().to_string(),
+                    stderr.finalize().to_hex().to_string()
+                ]);
+                self.snapshot
+                    .runtime
+                    .lock()
+                    .unwrap()
+                    .insert(memo, value.clone());
+                self.values.insert(format!("runtime:{command}"), value);
             }
             Value::Object(object) if object.contains_key("dependentTasksOutputFiles") => {
                 if object
@@ -200,35 +362,22 @@ impl Resolver<'_> {
                 {
                     bail!("unsupported output input field");
                 }
-                let matcher = paths::matcher(
-                    object["dependentTasksOutputFiles"]
-                        .as_str()
-                        .context("dependentTasksOutputFiles must be a glob")?,
-                )?;
+                let pattern = object["dependentTasksOutputFiles"]
+                    .as_str()
+                    .context("dependentTasksOutputFiles must be a glob")?;
+                self.snapshot.pattern(pattern, false)?;
                 let transitive = object
                     .get("transitive")
                     .map(|value| value.as_bool().context("transitive must be boolean"))
                     .transpose()?
                     .unwrap_or(false);
-                let mut dependencies = self.task.dependencies.clone();
-                let mut visited = BTreeSet::new();
-                while let Some(id) = dependencies.pop_first() {
-                    if !visited.insert(id.clone()) {
-                        continue;
-                    }
-                    let task = &self.graph.tasks[&id];
-                    if transitive {
-                        dependencies.extend(task.dependencies.iter().cloned());
-                    }
-                    for file in Outputs::new(self.workspace, task)?.paths(&self.workspace.root)? {
-                        if matcher.is_match(&file) && !self.workspace.root.join(&file).is_dir() {
-                            self.values.insert(
-                                format!("output:{file}"),
-                                file_value(&self.workspace.root, &file)?,
-                            );
-                        }
-                    }
-                }
+                // The key already contains every dependency's fingerprint, which covers
+                // all of its declared outputs and, through its own key, those of its
+                // dependencies. Hashing matching output files again adds nothing.
+                self.values.insert(
+                    format!("dependentTasksOutputFiles:{pattern}"),
+                    json!(transitive),
+                );
             }
             Value::Object(object)
                 if object.len() == 1 && object.contains_key("externalDependencies") =>
@@ -248,14 +397,23 @@ impl Resolver<'_> {
             .map(|pattern| (true, pattern))
             .unwrap_or((false, pattern));
         let pattern = paths::expand(self.workspace, project, pattern)?;
-        let matcher = paths::matcher(&pattern)?;
-        for file in &self.files {
-            if matcher.is_match(file) {
-                if exclude {
-                    self.selected.remove(file);
-                } else {
-                    self.selected.insert(file.clone());
-                }
+        let matcher = self.snapshot.pattern(&pattern, exclude)?;
+        // Only files below the pattern's literal directory prefix can match.
+        let prefix = pattern
+            .split('/')
+            .take_while(|part| is_literal(part))
+            .collect::<Vec<_>>()
+            .join("/");
+        let candidates: Box<dyn Iterator<Item = &String>> = if prefix.is_empty() {
+            Box::new(self.snapshot.files.iter())
+        } else {
+            Box::new(under(&self.snapshot.files, &prefix))
+        };
+        for file in candidates.filter(|file| matcher.is_match(file)) {
+            if exclude {
+                self.selected.remove(file);
+            } else {
+                self.selected.insert(file.clone());
             }
         }
         Ok(())
@@ -282,30 +440,16 @@ impl Resolver<'_> {
 }
 
 pub fn fingerprint(
+    snapshot: &Snapshot,
     workspace: &Workspace,
-    graph: &TaskGraph,
     task: &Task,
     prepared: &PreparedTask,
     dependencies: &BTreeMap<String, String>,
-    cache_path: &Path,
     cancelled: &AtomicBool,
 ) -> Result<String> {
-    let mut files = source_files(&workspace.root)?;
-    if let Ok(cache_relative) = cache_path.strip_prefix(&workspace.root) {
-        files.retain(|path| !Path::new(path).starts_with(cache_relative));
-    }
-    // Generated artifacts must not make the next invocation invalidate itself.
-    for task in graph.tasks.values() {
-        let outputs = Outputs::new(workspace, task)?;
-        files.retain(|path| !outputs.matches(path));
-    }
-    let projects = ProjectGraph::build(workspace)?;
     let mut resolver = Resolver {
         workspace,
-        graph,
-        projects,
-        task,
-        files,
+        snapshot,
         selected: BTreeSet::new(),
         values: BTreeMap::new(),
         named_stack: Vec::new(),
@@ -336,7 +480,7 @@ pub fn fingerprint(
     let mut packages = BTreeSet::from([task.project.clone()]);
     let mut pending = packages.clone();
     while let Some(project) = pending.pop_first() {
-        for edge in &resolver.projects.dependencies[&project] {
+        for edge in &snapshot.projects.dependencies[&project] {
             if packages.insert(edge.target.clone()) {
                 pending.insert(edge.target.clone());
             }
@@ -358,17 +502,11 @@ pub fn fingerprint(
     let files = resolver
         .selected
         .iter()
-        .map(|path| Ok((path.clone(), file_value(&workspace.root, path)?)))
+        .map(|path| Ok((path.clone(), snapshot.file_value(&workspace.root, path)?)))
         .collect::<Result<BTreeMap<_, _>>>()?;
-    let workspace_prefix = paths::git_path(&workspace.root, "--show-toplevel")
-        .and_then(|root| root.canonicalize().ok())
-        .and_then(|root| {
-            let workspace = workspace.root.canonicalize().ok()?;
-            workspace.strip_prefix(root).ok().map(PathBuf::from)
-        });
     let hash = json!({
         "schema":"qk-local-v1", "qk":env!("CARGO_PKG_VERSION"),
-        "platform":[std::env::consts::OS, std::env::consts::ARCH], "workspace":workspace_prefix,
+        "platform":[std::env::consts::OS, std::env::consts::ARCH], "workspace":snapshot.workspace_prefix,
         "id":task.id, "args":task.args, "definition":task.definition, "packageManager":workspace.package_manager,
         "files":files, "values":resolver.values, "dependencies":dependencies,
     });

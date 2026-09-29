@@ -3,7 +3,6 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
 
 use anyhow::{Context, Result, bail};
-use globset::{GlobBuilder, GlobMatcher};
 use qk_config::Workspace;
 use qk_taskgraph::Task;
 
@@ -89,19 +88,7 @@ pub fn safe_parents(root: &Path, path: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn matcher(pattern: &str) -> Result<GlobMatcher> {
-    if ["!(", "?(", "+(", "*(", "@("]
-        .iter()
-        .any(|token| pattern.contains(token))
-    {
-        bail!("extended glob patterns are not supported by the cache yet");
-    }
-    Ok(GlobBuilder::new(pattern)
-        .literal_separator(true)
-        .backslash_escape(false)
-        .build()?
-        .compile_matcher())
-}
+pub use crate::glob::Pattern;
 
 pub fn expand(workspace: &Workspace, project: &str, text: &str) -> Result<String> {
     let project_root = &workspace.projects[project].root;
@@ -118,12 +105,32 @@ pub fn expand(workspace: &Workspace, project: &str, text: &str) -> Result<String
     if result.contains("{options.") || result.contains("{args.") {
         bail!("dynamic cache paths are not supported yet");
     }
-    Ok(result)
+    normalize(&result)
+}
+
+/// Resolves `.` and `..` segments lexically, e.g. `app/e2e/../ios` to `app/ios`.
+fn normalize(path: &str) -> Result<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "." => {}
+            ".." => match parts.pop() {
+                Some(parent) if crate::glob::is_literal(parent) => {}
+                _ => bail!("cache path {path:?} leaves the workspace or follows a glob with `..`"),
+            },
+            part => parts.push(part),
+        }
+    }
+    Ok(if parts.is_empty() {
+        ".".to_owned()
+    } else {
+        parts.join("/")
+    })
 }
 
 #[derive(Clone)]
 pub struct Outputs {
-    patterns: Vec<GlobMatcher>,
+    patterns: Vec<Pattern>,
     anchors: BTreeSet<String>,
 }
 
@@ -134,7 +141,7 @@ impl Outputs {
         Self {
             patterns: patterns
                 .iter()
-                .map(|pattern| matcher(pattern).unwrap())
+                .map(|pattern| Pattern::new(pattern, false).unwrap())
                 .collect(),
             anchors: patterns
                 .iter()
@@ -156,7 +163,7 @@ impl Outputs {
             validate_path(&pattern)?;
             let anchor = pattern
                 .split('/')
-                .take_while(|part| !part.contains(['*', '?', '[', '{']))
+                .take_while(|part| crate::glob::is_literal(part))
                 .collect::<Vec<_>>()
                 .join("/");
             if anchor.is_empty()
@@ -169,10 +176,15 @@ impl Outputs {
                     "cache outputs must have a fixed directory prefix and cannot replace a project root"
                 );
             }
-            patterns.push(matcher(&pattern)?);
+            patterns.push(Pattern::new(&pattern, false)?);
             anchors.insert(anchor);
         }
         Ok(Self { patterns, anchors })
+    }
+
+    /// Fixed directory prefixes; every matching path lies below one of them.
+    pub fn anchors(&self) -> impl Iterator<Item = &str> {
+        self.anchors.iter().map(String::as_str)
     }
 
     pub fn matches(&self, path: &str) -> bool {
@@ -203,5 +215,22 @@ impl Outputs {
             }
         }
         Ok(paths)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize;
+
+    #[test]
+    fn normalizes_relative_segments() {
+        assert_eq!(
+            normalize("apps/mobile/test-e2e/../ios/build/*/App.app").unwrap(),
+            "apps/mobile/ios/build/*/App.app"
+        );
+        assert_eq!(normalize("./dist/./a").unwrap(), "dist/a");
+        assert_eq!(normalize(".").unwrap(), ".");
+        assert!(normalize("app/../../outside").is_err());
+        assert!(normalize("app/**/../x").is_err());
     }
 }

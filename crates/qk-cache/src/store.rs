@@ -127,20 +127,23 @@ impl Cache {
         Ok(())
     }
 
-    pub(crate) fn lock(&self, key: &str, cancelled: &AtomicBool) -> Result<Option<File>> {
+    /// Takes the key's lock, reporting whether another holder made us wait.
+    pub(crate) fn lock(&self, key: &str, cancelled: &AtomicBool) -> Result<Option<(File, bool)>> {
         let file = fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
             .open(self.root.join("locks").join(key))?;
+        let mut waited = false;
         loop {
             if cancelled.load(Ordering::SeqCst) {
                 return Ok(None);
             }
             match FileExt::try_lock_exclusive(&file) {
-                Ok(()) => return Ok(Some(file)),
+                Ok(()) => return Ok(Some((file, waited))),
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    waited = true;
                     std::thread::sleep(Duration::from_millis(20))
                 }
                 Err(error) => return Err(error.into()),

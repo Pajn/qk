@@ -44,15 +44,13 @@ pub fn run(
     let mut pending: BTreeSet<_> = graph.tasks.keys().cloned().collect();
     let mut active = BTreeSet::new();
     let mut outcomes = BTreeMap::new();
-    let mut fingerprints: BTreeMap<String, Option<String>> = BTreeMap::new();
+    let mut fingerprints: BTreeMap<String, qk_cache::Fingerprint> = BTreeMap::new();
     let cache = (!skip_cache
         && graph
             .tasks
             .values()
             .any(|task| task.definition.cache == Some(true)))
-    .then(|| qk_cache::Cache {
-        root: qk_cache::cache_directory(&workspace.root),
-    });
+    .then(|| qk_cache::Cache::new(qk_cache::cache_directory(&workspace.root)));
     let mut skipped = BTreeSet::new();
     let mut exit_code = 0;
     let (sender, receiver) = mpsc::channel();
@@ -110,10 +108,8 @@ pub fn run(
                             &cancelled,
                         )
                     } else {
-                        execute(task, &cancelled).map(|outcome| qk_cache::TaskResult {
-                            outcome,
-                            fingerprint: None,
-                            hit: false,
+                        execute(task, &cancelled).map(|outcome| {
+                            qk_cache::TaskResult::uncached(outcome, "cache disabled".into())
                         })
                     };
                     let _ = sender.send((id, result));
@@ -143,7 +139,7 @@ pub fn run(
                             result.outcome
                         }
                         Err(error) => {
-                            fingerprints.insert(id.clone(), None);
+                            fingerprints.insert(id.clone(), Err(format!("{id}: {error:#}")));
                             eprintln!("qk: {id}: {error:#}");
                             Outcome::Failed(1)
                         }

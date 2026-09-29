@@ -162,23 +162,41 @@ the task's project and its transitive project dependencies are always
 included.
 
 Candidate input files are tracked and untracked-but-not-ignored files, minus
-any task's declared outputs. Without `inputs`, a task uses `default` and
-`^default`; `default` is `{projectRoot}/**/*` unless a named input overrides
-it. Supported input declarations are globs with `!` exclusions, `fileset`,
-named inputs and `^named` inputs, `env`, `runtime`,
-`dependentTasksOutputFiles` with `transitive`, and `externalDependencies`,
-which currently hashes all root lockfiles. A task with any other input
-declaration, extended globs, `{options.*}` or `{args.*}` paths, negated
-outputs, or an output without a fixed directory prefix runs uncached and
-reports why.
+any task's declared outputs. The list is taken once per run, as Nx does, so a
+file that a task creates without declaring it as an output is seen from the
+next run. File contents are re-read whenever their metadata changes. Without
+`inputs`, a task uses `default` and `^default`; `default` is
+`{projectRoot}/**/*` unless a named input overrides it.
+
+Supported input declarations are globs with `!` exclusions, `fileset`, named
+inputs and `^named` inputs, `env`, `runtime`, `dependentTasksOutputFiles`
+with `transitive`, and `externalDependencies`, which currently hashes all
+root lockfiles. `runtime` commands run once per run for each environment.
+`dependentTasksOutputFiles` needs no file access: every dependency's
+fingerprint already covers its declared outputs. `.` and `..` segments in
+paths are resolved within the workspace. A symlinked input is keyed by its
+target text and the content it resolves to, including the files below a
+linked directory; links that resolve outside the workspace are not supported.
+
+Extended globs (`?(…)`, `*(…)`, `+(…)`, `@(…)`, `(a|b)` and `{,…}`) are expanded
+exactly as Nx 23 expands them, including its approximations: `+(a|b)` matches
+one occurrence, and an omitted group in a directory segment widens that
+segment to `*`. This keeps input sets written for Nx selecting the same files.
+
+A task with any other input declaration, negation inside a glob such as
+`!(a|b)`, `{options.*}` or `{args.*}` paths, negated outputs, or an output
+without a fixed directory prefix runs uncached and reports why. Its dependents
+then run uncached too, naming the task and reason they depend on.
 
 On a miss, the task runs with stdout and stderr streamed through a pipe while
 they are recorded, so child processes do not see a terminal. The entry is
 saved only when the task succeeds and its inputs are unchanged afterwards.
 On a hit, qk removes existing files matching the declared outputs, copies the
 cached outputs into place and replays the recorded stdout and stderr. Restores
-are staged in `.qk/` at the workspace root and copied rather than linked, so
-editing a restored file never changes the cache. Every file is verified
+are staged in `.qk/` at the workspace root. Saving and restoring copy files,
+which clones them on copy-on-write filesystems such as APFS when the cache and
+the checkout share a volume. Files are never hardlinked, so editing a restored
+file never changes the cache. Every file is verified
 against its content hash; an unreadable or corrupt entry is a miss.
 A per-key lock makes concurrent runs of the same task, including runs in
 different worktrees, wait for each other and reuse the result.

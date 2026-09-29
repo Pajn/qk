@@ -1,11 +1,13 @@
 //! Local content-addressed cache shared by linked Git worktrees.
 
+mod glob;
 mod hash;
 mod paths;
 mod store;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
@@ -16,88 +18,123 @@ use serde_json::{Value, json};
 
 pub use paths::cache_directory;
 
-#[derive(Clone)]
+/// The cache for one run; its workspace snapshot is taken on first use.
 pub struct Cache {
     pub root: PathBuf,
+    snapshot: OnceLock<std::result::Result<hash::Snapshot, String>>,
 }
+
+/// A task's output fingerprint for its dependents' keys, or why it has none:
+/// `"<task id>: <reason>"` for the task where fingerprinting first failed.
+pub type Fingerprint = std::result::Result<String, String>;
 
 pub struct TaskResult {
     pub outcome: Outcome,
-    pub fingerprint: Option<String>,
+    pub fingerprint: Fingerprint,
     pub hit: bool,
 }
 
+impl TaskResult {
+    pub fn uncached(outcome: Outcome, reason: String) -> Self {
+        Self {
+            outcome,
+            fingerprint: Err(reason),
+            hit: false,
+        }
+    }
+}
+
 impl Cache {
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            snapshot: OnceLock::new(),
+        }
+    }
+
+    fn snapshot(
+        &self,
+        workspace: &Workspace,
+        graph: &TaskGraph,
+    ) -> std::result::Result<&hash::Snapshot, String> {
+        self.snapshot
+            .get_or_init(|| {
+                hash::Snapshot::new(workspace, graph, &self.root)
+                    .map_err(|error| format!("cannot snapshot the workspace: {error:#}"))
+            })
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+
     pub fn run(
         &self,
         workspace: &Workspace,
         graph: &TaskGraph,
         task: &Task,
         prepared: &PreparedTask,
-        dependencies: &BTreeMap<String, Option<String>>,
+        dependencies: &BTreeMap<String, Fingerprint>,
         cancelled: &AtomicBool,
     ) -> Result<TaskResult> {
-        let fallback = || {
-            execute(prepared, cancelled).map(|outcome| TaskResult {
-                outcome,
-                fingerprint: None,
-                hit: false,
-            })
+        let cacheable = task.definition.cache == Some(true);
+        let fallback = |reason: String| {
+            execute(prepared, cancelled).map(|outcome| TaskResult::uncached(outcome, reason))
         };
-        let Some(dependencies) = dependencies
+        // Reports why this task runs uncached, attributing the reason to this task.
+        let bypass = |reason: String| {
+            if cacheable {
+                eprintln!("qk: {}: cache bypassed ({reason})", task.id);
+            }
+            fallback(format!("{}: {reason}", task.id))
+        };
+        let dependencies = match dependencies
             .iter()
             .map(|(id, key)| key.clone().map(|key| (id.clone(), key)))
-            .collect::<Option<BTreeMap<_, _>>>()
-        else {
-            if task.definition.cache == Some(true) {
-                eprintln!(
-                    "qk: {}: cache bypassed (dependency could not be fingerprinted)",
-                    task.id
-                );
+            .collect::<std::result::Result<BTreeMap<_, _>, _>>()
+        {
+            Ok(dependencies) => dependencies,
+            Err(root) => {
+                // Keep the original task and reason so chains stay readable.
+                if cacheable {
+                    eprintln!("qk: {}: cache bypassed (depends on {root})", task.id);
+                }
+                return fallback(root);
             }
-            return fallback();
+        };
+        let snapshot = match self.snapshot(workspace, graph) {
+            Ok(snapshot) => snapshot,
+            Err(reason) => return bypass(reason),
         };
         let key = match hash::fingerprint(
+            snapshot,
             workspace,
-            graph,
             task,
             prepared,
             &dependencies,
-            &self.root,
             cancelled,
         ) {
             Ok(key) => key,
-            Err(error) => {
-                if task.definition.cache == Some(true) {
-                    eprintln!("qk: {}: cache bypassed ({error})", task.id);
-                }
-                return fallback();
-            }
+            Err(error) => return bypass(format!("{error:#}")),
         };
         let outputs = match paths::Outputs::new(workspace, task) {
             Ok(outputs) => outputs,
-            Err(error) => {
-                if task.definition.cache == Some(true) {
-                    eprintln!("qk: {}: cache bypassed ({error})", task.id);
-                }
-                return fallback();
-            }
+            Err(error) => return bypass(format!("{error:#}")),
         };
-        if task.definition.cache != Some(true) {
+        if !cacheable {
             let outcome = execute(prepared, cancelled)?;
-            let fingerprint = self
-                .unchanged(
-                    workspace,
-                    graph,
-                    task,
-                    prepared,
-                    &dependencies,
-                    &key,
-                    outcome,
-                    cancelled,
-                )
-                .then(|| output_fingerprint(&workspace.root, &outputs, &key).ok())
-                .flatten();
+            let fingerprint = if self.unchanged(
+                snapshot,
+                workspace,
+                task,
+                prepared,
+                &dependencies,
+                &key,
+                outcome,
+                cancelled,
+            ) {
+                outputs_fingerprint(task, &workspace.root, &outputs, &key)
+            } else {
+                Err(format!("{}: did not complete unchanged", task.id))
+            };
             return Ok(TaskResult {
                 outcome,
                 fingerprint,
@@ -105,45 +142,40 @@ impl Cache {
             });
         }
         if let Err(error) = self.initialize() {
-            eprintln!("qk: {}: cache unavailable ({error})", task.id);
-            return fallback();
+            return bypass(format!("cache unavailable: {error}"));
         }
-        let _lock = match self.lock(&key, cancelled) {
+        let (_lock, waited) = match self.lock(&key, cancelled) {
             Ok(Some(lock)) => lock,
             Ok(None) => {
-                return Ok(TaskResult {
-                    outcome: Outcome::Cancelled,
-                    fingerprint: None,
-                    hit: false,
-                });
+                return Ok(TaskResult::uncached(
+                    Outcome::Cancelled,
+                    format!("{}: cancelled", task.id),
+                ));
             }
-            Err(error) => {
-                eprintln!("qk: {}: cache lock unavailable ({error})", task.id);
-                return fallback();
-            }
+            Err(error) => return bypass(format!("cache lock unavailable: {error}")),
         };
         // Inputs may have changed while another worktree held this key's lock.
-        if hash::fingerprint(
-            workspace,
-            graph,
-            task,
-            prepared,
-            &dependencies,
-            &self.root,
-            cancelled,
-        )
-        .ok()
-        .as_ref()
-            != Some(&key)
+        if waited
+            && hash::fingerprint(
+                snapshot,
+                workspace,
+                task,
+                prepared,
+                &dependencies,
+                cancelled,
+            )
+            .ok()
+            .as_ref()
+                != Some(&key)
         {
-            return fallback();
+            return bypass("inputs changed while waiting for another run".into());
         }
         match self.restore(&workspace.root, &key, &outputs) {
             Ok(Some(fingerprint)) => {
                 eprintln!("qk: cache hit {}", task.id);
                 return Ok(TaskResult {
                     outcome: Outcome::Success,
-                    fingerprint: Some(fingerprint),
+                    fingerprint: Ok(fingerprint),
                     hit: true,
                 });
             }
@@ -153,16 +185,13 @@ impl Cache {
         eprintln!("qk: cache miss {}", task.id);
         let log = match tempfile::NamedTempFile::new_in(self.root.join("tmp")) {
             Ok(log) => log,
-            Err(error) => {
-                eprintln!("qk: {}: cache log unavailable ({error})", task.id);
-                return fallback();
-            }
+            Err(error) => return bypass(format!("cache log unavailable: {error}")),
         };
         let capture = Capture::new(log.as_file().try_clone()?, true);
         let outcome = execute_captured(prepared, cancelled, Some(&capture))?;
         let fingerprint = if !self.unchanged(
+            snapshot,
             workspace,
-            graph,
             task,
             prepared,
             &dependencies,
@@ -170,16 +199,16 @@ impl Cache {
             outcome,
             cancelled,
         ) {
-            None
+            Err(format!("{}: did not complete unchanged", task.id))
         } else if !capture.healthy() {
-            output_fingerprint(&workspace.root, &outputs, &key).ok()
+            outputs_fingerprint(task, &workspace.root, &outputs, &key)
         } else {
             // The saved manifest already hashes every output; reuse it.
             match self.publish(&workspace.root, &key, &outputs, log.path()) {
-                Ok(fingerprint) => Some(fingerprint),
+                Ok(fingerprint) => Ok(fingerprint),
                 Err(error) => {
                     eprintln!("qk: {}: could not save cache entry ({error})", task.id);
-                    output_fingerprint(&workspace.root, &outputs, &key).ok()
+                    outputs_fingerprint(task, &workspace.root, &outputs, &key)
                 }
             }
         };
@@ -194,8 +223,8 @@ impl Cache {
     #[allow(clippy::too_many_arguments)]
     fn unchanged(
         &self,
+        snapshot: &hash::Snapshot,
         workspace: &Workspace,
-        graph: &TaskGraph,
         task: &Task,
         prepared: &PreparedTask,
         dependencies: &BTreeMap<String, String>,
@@ -206,15 +235,7 @@ impl Cache {
         if outcome != Outcome::Success || cancelled.load(Ordering::SeqCst) {
             return false;
         }
-        let after = hash::fingerprint(
-            workspace,
-            graph,
-            task,
-            prepared,
-            dependencies,
-            &self.root,
-            cancelled,
-        );
+        let after = hash::fingerprint(snapshot, workspace, task, prepared, dependencies, cancelled);
         if after.as_deref().ok() != Some(before) {
             if task.definition.cache == Some(true) {
                 eprintln!(
@@ -246,6 +267,16 @@ pub(crate) fn combine_outputs(input: &str, files: &BTreeMap<String, Value>) -> R
     Ok(blake3::hash(&serde_json::to_vec(&(input, files))?)
         .to_hex()
         .to_string())
+}
+
+fn outputs_fingerprint(
+    task: &Task,
+    root: &Path,
+    outputs: &paths::Outputs,
+    input: &str,
+) -> Fingerprint {
+    output_fingerprint(root, outputs, input)
+        .map_err(|error| format!("{}: cannot fingerprint outputs: {error:#}", task.id))
 }
 
 fn output_fingerprint(root: &Path, outputs: &paths::Outputs, input: &str) -> Result<String> {
@@ -292,9 +323,7 @@ mod tests {
         let log = root.join("log");
         std::fs::write(&log, "").unwrap();
 
-        let cache = Cache {
-            root: root.join(".qk/cache"),
-        };
+        let cache = Cache::new(root.join(".qk/cache"));
         cache.initialize().unwrap();
         let outputs = paths::Outputs::from_patterns(&["dist"]);
         let key = "0".repeat(64);
