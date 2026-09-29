@@ -3,6 +3,7 @@ name = "qk-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "A fast standalone task runner that reads Nx workspaces"
 publish.workspace = true
 
@@ -31,7 +32,7 @@ serde_json.workspace = true
 tempfile.workspace = true
 
 [package.metadata.npm]
-name = "runqk"
+name = "@runqk/cli"
 prefix = "@runqk/cli-"
 bins = ["qk"]
 targets = [

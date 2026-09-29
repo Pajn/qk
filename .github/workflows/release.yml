@@ -1,9 +1,9 @@
 name: Release
 
 # Pushing a tag v<version> matching the workspace version builds qk for each
-# supported platform and attaches the binaries to a GitHub release. The npm
-# packages are published too once NPM_PUBLISH is true and the NPM_TOKEN
-# secret can publish runqk and the @runqk platform packages.
+# supported platform and attaches the binaries to a GitHub release.
+# npm packages publish through OIDC once NPM_PUBLISH is true and each
+# package trusts this repository and release.yml on npm.
 
 on:
   push:
@@ -78,6 +78,9 @@ jobs:
     needs: build
     if: vars.NPM_PUBLISH == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -87,7 +90,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-          registry-url: https://registry.npmjs.org
+      - name: Install npm with trusted publishing support
+        run: npm install --global npm@11.19.0
       - name: Set up Rust
         run: |
           rustup toolchain install stable --profile minimal
@@ -105,13 +109,16 @@ jobs:
           cargo npm generate -p qk-cli
           node --input-type=module -e '
             import { readFileSync } from "node:fs";
-            const pkg = JSON.parse(readFileSync("npm/runqk/package.json", "utf8"));
+            const pkg = JSON.parse(readFileSync("npm/@runqk/cli/package.json", "utf8"));
+            if (pkg.repository?.url !== "git+https://github.com/Pajn/qk.git") {
+              throw new Error("Repository metadata must match the npm trusted publisher");
+            }
             const expected = ["@runqk/cli-linux-x64", "@runqk/cli-linux-arm64", "@runqk/cli-darwin-arm64", "@runqk/cli-win32-x64"];
-            if (pkg.name !== "runqk" || expected.some(name => pkg.optionalDependencies?.[name] !== pkg.version) || Object.keys(pkg.optionalDependencies ?? {}).length !== expected.length) {
+            if (pkg.name !== "@runqk/cli" || expected.some(name => pkg.optionalDependencies?.[name] !== pkg.version) || Object.keys(pkg.optionalDependencies ?? {}).length !== expected.length) {
               throw new Error("Missing or unexpected platform packages");
             }
           '
-      - name: Publish platform packages and runqk
+      - name: Publish platform packages and @runqk/cli through OIDC
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org
         run: cargo npm publish -p qk-cli -- --access public
