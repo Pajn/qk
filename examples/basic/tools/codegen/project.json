@@ -3,6 +3,9 @@
   "tags": ["tooling"],
   "targets": {
     "build": { "executor": "nx:noop", "cache": false },
-    "smoke": { "command": "echo qk is running" }
+    "smoke": {
+      "command": "echo qk is running",
+      "configurations": { "loud": { "command": "echo QK IS RUNNING" } }
+    }
   }
 }

@@ -284,11 +284,16 @@ fn run(cli: Cli) -> Result<i32> {
             let mut requests = Vec::new();
             for project in selected {
                 for target in &targets {
-                    if workspace.projects[&project].targets.contains_key(target) {
+                    if let Some(definition) = workspace.projects[&project].targets.get(target) {
+                        // Like Nx, a target without the configuration runs its default.
+                        let configuration = options
+                            .configuration
+                            .clone()
+                            .filter(|name| definition.configurations.contains_key(name));
                         requests.push(Request {
                             project: project.clone(),
                             target: target.clone(),
-                            configuration: options.configuration.clone(),
+                            configuration,
                             args: options.args.clone(),
                         });
                     }

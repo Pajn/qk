@@ -91,7 +91,8 @@ target is looked through: the task's `dependsOn` applies again from that
 project, so `^tsc` reaches the nearest dependencies that have `tsc`. Other
 missing dependency targets are skipped; unknown explicit projects and task cycles fail. Shared tasks run once.
 Configurations propagate to dependencies that define the same name;
-otherwise the dependency's default configuration applies. A shared task
+otherwise the dependency's default configuration applies. `run-many -c`
+treats the targets it selects the same way. A shared task
 reached with different forwarded arguments is rejected as ambiguous.
 
 Supported executors:

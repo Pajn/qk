@@ -235,3 +235,21 @@ fn run_many_accepts_space_separated_lists_like_nx() {
     assert!(spaced.contains(&"web:test".to_owned()));
     assert!(!spaced.iter().any(|task| task.starts_with("worker:")));
 }
+
+#[test]
+fn run_many_configuration_applies_only_where_defined_like_nx() {
+    let tasks = planned(qk(&[
+        "run-many",
+        "-t",
+        "smoke",
+        "build",
+        "-c",
+        "loud",
+        "--dry-run",
+    ]));
+    assert!(
+        tasks.contains(&"codegen:smoke:loud".to_owned()),
+        "{tasks:?}"
+    );
+    assert!(tasks.contains(&"web:build".to_owned()), "{tasks:?}");
+}
