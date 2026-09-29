@@ -432,7 +432,10 @@ git; a checkout with no branch reads the default branch's state but saves
 none remotely. `remote: false` keeps a target's warm state local. It is
 saved after successful runs only; files unchanged since the last save or
 restore are recognised by their metadata and not read again.
-Groups over their `maxSize` are not saved. Warm state counts toward the
+Restored files are dated to the Unix epoch, older than anything in the
+checkout, so a tool that compares timestamps, as `tsc --build` does, checks
+the sources against them rather than taking them as up to date. Groups over
+their `maxSize` are not saved. Warm state counts toward the
 cache's size limit and is evicted with it. `--skip-cache` neither restores
 nor saves it, and leaves the variables unset. Two tasks in one run cannot
 keep the same path. A tool must validate its own cache, as Metro, `tsc` and

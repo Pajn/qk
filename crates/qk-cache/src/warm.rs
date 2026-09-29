@@ -25,6 +25,12 @@ use crate::paths::{self, Outputs};
 use crate::store::{Artifact, mode, set_mode, symlink, validate_link};
 use crate::{Cache, hash::digest_file};
 
+/// When restored files say they were written. Warm state comes from another
+/// checkout, so it must look older than every file in this one: tools that
+/// trust timestamps, as `tsc --build` does, then check the sources against it
+/// instead of taking a restored build for an up-to-date one.
+pub const RESTORED_AT: std::time::SystemTime = std::time::UNIX_EPOCH;
+
 /// A target's `qk:warm`.
 #[derive(Clone, Debug, Default)]
 pub struct Warm {
@@ -351,7 +357,7 @@ impl Cache {
 
     /// Restores each warm group not already on disk from the task's last save,
     /// and records what the restore left, so the next save can tell which
-    /// files are unchanged.
+    /// files are unchanged. Every file is dated [`RESTORED_AT`].
     pub(crate) fn restore_warm(
         &self,
         workspace: &Workspace,
@@ -393,6 +399,10 @@ impl Cache {
                             bail!("warm state for {} has a corrupt blob", task.id);
                         }
                         fs::copy(&source, &destination)?;
+                        fs::File::options()
+                            .write(true)
+                            .open(&destination)?
+                            .set_modified(RESTORED_AT)?;
                         set_mode(&destination, *mode)?;
                         restored.files += 1;
                         restored.bytes += fs::metadata(&destination)?.len();

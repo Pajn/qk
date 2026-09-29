@@ -982,7 +982,7 @@ fn said(fixture: &Fixture, root: &Path, args: &[&str]) -> String {
 #[test]
 fn warm_outputs_start_a_miss_from_the_previous_build() {
     let fixture = Fixture::new(json!({
-        "command": "if [ -f dist/state ]; then cat dist/state; else echo cold; fi; mkdir -p dist; cat src/input.txt > dist/state",
+        "command": "if [ -f dist/state ]; then cat dist/state; else echo cold; fi; if [ dist/state -ot src/input.txt ]; then echo older; fi; mkdir -p dist; cat src/input.txt > dist/state",
         "cache": true,
         "inputs": ["{projectRoot}/src/**/*"],
         "outputs": ["{projectRoot}/dist"],
@@ -992,7 +992,12 @@ fn warm_outputs_start_a_miss_from_the_previous_build() {
     // A fresh checkout: no outputs, and a change that misses the cache.
     fs::remove_dir_all(fixture.root.join("dist")).unwrap();
     fs::write(fixture.root.join("src/input.txt"), "two\n").unwrap();
-    assert_eq!(said(&fixture, &fixture.root, &[]), "one");
+    // Restored state looks older than the checkout, whatever the clock says.
+    let output = success(fixture.qk(&fixture.root, &["run", "app:build"]));
+    assert_eq!(
+        stdout(&output).lines().take(2).collect::<Vec<_>>(),
+        ["one", "older"]
+    );
     let text = stdout(&success(
         fixture.qk(&fixture.root, &["show", "task", "app:build"]),
     ));
