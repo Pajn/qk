@@ -104,84 +104,12 @@ reached with different forwarded arguments is rejected as ambiguous.
 
 ## Executors
 
-Supported executors:
-
-- `nx:run-commands`, with every option Nx 23 has:
-  - `command`, a string or, as in Nx, an array joined with spaces; or
-    `commands`, an array of strings or of objects with `command`,
-    `forwardAllArgs` and `description`. An empty `commands` succeeds without
-    running anything.
-  - `parallel` (default true) runs `commands` side by side; `false` runs them
-    in sequence.
-  - With `parallel`, a command object's `prefix`, `prefixColor`, `color` and
-    `bgColor` decorate its output as in Nx: a bold prefix before each
-    non-blank line, then the colours, under the same terminal rules as qk's
-    own output. A line split between reads still gets one prefix.
-  - `cwd`, relative to the workspace root, which is the default.
-  - `env`, and `envFile`, a dotenv file relative to the workspace root that
-    sets only what is not set yet. `color: true` sets `FORCE_COLOR=true`.
-  - `args`, extra arguments as shell text or an array joined with spaces:
-    forwarded after the other options and before the task's own arguments,
-    and readable as `{args.name}`, in camel case too (`--max-workers` as
-    `{args.maxWorkers}`).
-  - `forwardAllArgs` (default true), described with argument tokens below.
-  - `readyWhen`, a string or an array, described with continuous tasks below.
-  - `tty`, `usePty`, `streamOutput` and `verbose` are accepted and have no
-    effect: qk never gives commands a terminal, and Nx sets the others itself.
-  - As in Nx, any other scalar option, such as `port: 3000`, is forwarded to
-    the command as `--port=3000` and available as `{args.port}`, unless an
-    argument of the same name overrides it; object values are ignored.
-  - A task argument naming one of these options sets it rather than reaching
-    the command: `-- --args='--watch'`, `--cwd=dir`, `--no-parallel`,
-    `--env.NAME=value`.
-- `nx:run-script`: runs the script with the workspace's package manager in
-  the project directory, as Nx does: `npm run <script> -- <args>`, `pnpm run
-  <script> <args>`, `yarn <script> <args>` or `bun run <script> -- <args>`.
-  The manager is detected as in Nx: nx.json `cli.packageManager`, then the
-  lockfile (`bun.lockb` or `bun.lock`, `yarn.lock`, `pnpm-lock.yaml`,
-  `package-lock.json`), then, which Nx does not read, the root
-  `packageManager` or a `pnpm-workspace.yaml`, then the manager qk was
-  invoked through (`npm_config_user_agent`), else npm. Missing scripts fail
-  during execution preflight, after explicit project target overrides have
-  been applied.
-- `nx:noop`: completes successfully after its dependencies, without a process.
-
-Commands use `/bin/sh -c` on Unix and `cmd.exe /D /S /C` on Windows. Local
-`node_modules/.bin` directories from cwd up to the workspace root are added
-to `PATH`. qk writes its own status messages to stderr.
-
-The task a run is for can be interacted with, as in Nx: when a run requests
-one task, and that task has a single command whose output goes straight to
-the terminal (the default for one task), the command reads qk's stdin. On a
-terminal it also becomes the terminal's foreground while it runs, so a dev
-server's key presses and prompts work, and Ctrl-C reaches it; qk takes the
-terminal back when it ends. Every other task, and every task of a run for
-several, has closed stdin. qk does not give commands a pseudo-terminal of
-their own: with output captured, as in the static style or on a cache miss,
-a command sees pipes.
+See [Executors](../reference/executors.md) for supported executors and options.
 
 ## Environment
 
-Environment precedence, highest first: `FORCE_COLOR` from `color: true`,
-configuration `env`, `options.env`, target-level `env`, the variables Nx sets
-for every task, the inherited process environment, `envFile`, then the
-task's dotenv files in Nx's order: in the
-project root and then the workspace root, `.env.<target>.<configuration>`,
-`.env.<configuration>`, `.env.<target>`, then `.env.local`, `.local.env` and
-`.env`, each also as `.env.<name>.local`, `.<name>.local.env` and
-`.<name>.env`. A file never overrides a variable an earlier source set. The
-task variables are `NX_TASK_TARGET_PROJECT`, `NX_TASK_TARGET_TARGET`,
-`NX_TASK_TARGET_CONFIGURATION`, `NX_WORKSPACE_ROOT`, `LERNA_PACKAGE_NAME`,
-`NX_TUI=false` and `FORCE_COLOR`, which is `true` unless already set, and
-`NX_TASK_HASH`, the task's cache key, whenever the run computes one: for
-every task that goes through the cache, cacheable or not, but not under
-`--skip-cache` or in a run without a cacheable target.
-Dotenv is loaded into child environments without mutating qk's process
-environment; qk's own environment, where remote cache credentials arrive,
-includes the root `.env.local` and `.env`. `NX_LOAD_DOT_ENV_FILES=false`
-turns every dotenv file off, `envFile` included, as in Nx. Dotenv interpolation uses
-dotenvy's per-file semantics; it does not provide cross-file interpolation
-against the merged child environment.
+See [Environment variables](../reference/environment.md) for precedence, dotenv
+loading and task variables.
 
 ## Forwarding arguments
 

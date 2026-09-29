@@ -17,3 +17,7 @@ ordering, [Affected selection](guides/affected.md) for change detection, and
 
 qk also implements [S3-compatible remote caching](guides/remote-cache.md),
 [warm state](guides/warm-state.md) and [run history](guides/history.md).
+
+Use [Workspace configuration](reference/workspace.md),
+[Target configuration](reference/targets.md), and the [CLI reference](reference/cli.md)
+for options and defaults. [Nx compatibility](compatibility.md) explains the supported subset.

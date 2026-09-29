@@ -12,6 +12,18 @@
 - [Sharing cores](guides/threads.md)
 - [Run history and reports](guides/history.md)
 
+# Reference
+
+- [CLI](reference/cli.md)
+- [Workspace configuration](reference/workspace.md)
+- [Projects and discovery](reference/projects.md)
+- [Target configuration](reference/targets.md)
+- [Executors](reference/executors.md)
+- [Inputs and outputs](reference/inputs-outputs.md)
+- [Environment variables](reference/environment.md)
+
+- [Nx compatibility](compatibility.md)
+
 # Contributing
 
 - [Maintaining the documentation](documentation.md)
