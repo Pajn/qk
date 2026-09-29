@@ -202,52 +202,17 @@ impl Outputs {
         }
     }
 
-    /// The task's outputs as Nx resolves them. `{options.name}` reads the
-    /// target's options with the task's arguments applied, and an output
-    /// naming what cannot be resolved is left out. Without `outputs`, Nx takes
-    /// `options.outputPath`, and for `build` and `prepare` targets
-    /// `dist/<root>`, `<root>/dist`, `<root>/build` and `<root>/public`.
+    /// The task's outputs, from [`resolved_outputs`].
     pub fn new(workspace: &Workspace, task: &Task) -> Result<Self> {
-        let root = &workspace.projects[&task.project].root;
-        let options = task_options(task);
-        let (templates, explicit) = match &task.definition.outputs {
-            Some(outputs) => (outputs.clone(), true),
-            None => match options.get("outputPath") {
-                Some(serde_json::Value::String(path)) => (vec![path.clone()], false),
-                Some(serde_json::Value::Array(paths)) => (
-                    paths
-                        .iter()
-                        .filter_map(|path| path.as_str().map(str::to_owned))
-                        .collect(),
-                    false,
-                ),
-                _ if matches!(task.target.as_str(), "build" | "prepare") => (
-                    [
-                        format!("dist/{root}"),
-                        format!("{root}/dist"),
-                        format!("{root}/build"),
-                        format!("{root}/public"),
-                    ]
-                    .into(),
-                    false,
-                ),
-                _ => (Vec::new(), false),
-            },
-        };
+        let (resolved, explicit) = resolved_outputs(workspace, task)?;
         let mut patterns = Vec::new();
         let mut negations = Vec::new();
         let mut anchors = BTreeSet::new();
-        for template in templates {
-            let (negated, template) = match template.strip_prefix('!') {
+        for output in resolved {
+            let (negated, pattern) = match output.strip_prefix('!') {
                 Some(rest) => (true, rest.to_owned()),
-                None => (false, template),
+                None => (false, output),
             };
-            let Some(resolved) = resolve_output(task, &options, &template) else {
-                continue;
-            };
-            let pattern = expand(workspace, &task.project, &resolved)?
-                .trim_end_matches('/')
-                .to_owned();
             validate_path(&pattern)?;
             if negated {
                 negations.push(Pattern::new(&pattern, false)?);
@@ -326,6 +291,56 @@ impl Outputs {
         }
         Ok(paths)
     }
+}
+
+/// A task's outputs as Nx lists them: workspace-relative paths and globs,
+/// `!` for a negated one, with `{options.name}`, `{projectName}` and the
+/// project tokens replaced; an output naming what has no value is left out.
+/// Without `outputs`, Nx's defaults: `options.outputPath`, and for `build`
+/// and `prepare` targets `dist/<root>`, `<root>/dist`, `<root>/build` and
+/// `<root>/public`. The flag tells whether the target declared them.
+pub fn resolved_outputs(workspace: &Workspace, task: &Task) -> Result<(Vec<String>, bool)> {
+    let root = &workspace.projects[&task.project].root;
+    let options = task_options(task);
+    let (templates, explicit) = match &task.definition.outputs {
+        Some(outputs) => (outputs.clone(), true),
+        None => match options.get("outputPath") {
+            Some(serde_json::Value::String(path)) => (vec![path.clone()], false),
+            Some(serde_json::Value::Array(paths)) => (
+                paths
+                    .iter()
+                    .filter_map(|path| path.as_str().map(str::to_owned))
+                    .collect(),
+                false,
+            ),
+            _ if matches!(task.target.as_str(), "build" | "prepare") => (
+                [
+                    format!("dist/{root}"),
+                    format!("{root}/dist"),
+                    format!("{root}/build"),
+                    format!("{root}/public"),
+                ]
+                .into(),
+                false,
+            ),
+            _ => (Vec::new(), false),
+        },
+    };
+    let mut resolved = Vec::new();
+    for template in templates {
+        let (negated, template) = match template.strip_prefix('!') {
+            Some(rest) => (true, rest.to_owned()),
+            None => (false, template),
+        };
+        let Some(output) = resolve_output(task, &options, &template) else {
+            continue;
+        };
+        let path = expand(workspace, &task.project, &output)?
+            .trim_end_matches('/')
+            .to_owned();
+        resolved.push(if negated { format!("!{path}") } else { path });
+    }
+    Ok((resolved, explicit))
 }
 
 /// The target's options with the task's `--name=value` arguments applied,

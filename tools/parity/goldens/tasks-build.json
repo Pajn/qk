@@ -2,20 +2,63 @@
   "tasks": {
     "tasks": {
       "@fixture/native:build": {
+        "target": {
+          "project": "@fixture/native",
+          "target": "build"
+        },
+        "projectRoot": "apps/mobile/pkg/native",
+        "outputs": [
+          "dist/apps/mobile/pkg/native",
+          "apps/mobile/pkg/native/dist",
+          "apps/mobile/pkg/native/build",
+          "apps/mobile/pkg/native/public"
+        ],
         "cache": false,
-        "continuous": false
+        "continuous": false,
+        "parallelism": true
       },
       "mobile:build": {
+        "target": {
+          "project": "mobile",
+          "target": "build"
+        },
+        "projectRoot": "apps/mobile",
+        "outputs": [
+          "dist/apps/mobile",
+          "apps/mobile/dist",
+          "apps/mobile/build",
+          "apps/mobile/public"
+        ],
         "cache": false,
-        "continuous": false
+        "continuous": false,
+        "parallelism": true
       },
       "ui:build": {
+        "target": {
+          "project": "ui",
+          "target": "build"
+        },
+        "projectRoot": "packages/ui",
+        "outputs": [
+          "packages/ui/dist"
+        ],
         "cache": true,
-        "continuous": false
+        "continuous": false,
+        "parallelism": true
       },
       "web:build:production": {
+        "target": {
+          "project": "web",
+          "target": "build",
+          "configuration": "production"
+        },
+        "projectRoot": "apps/web",
+        "outputs": [
+          "apps/web/dist"
+        ],
         "cache": true,
-        "continuous": false
+        "continuous": false,
+        "parallelism": true
       }
     },
     "dependencies": {

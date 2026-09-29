@@ -28,7 +28,8 @@
 //   "affected":   { "<name>": { "change": {"delete": []} } | { "base": "<rev>", "head": "<rev>" } }
 //   "runs":       { "<name>": { "change": {}, "args": [<run-many arguments>] } }
 //
-// Task graphs compare tasks, dependencies and cache and continuous flags.
+// Task graphs compare `--graph` output: tasks, their targets, roots, outputs,
+// cache, continuous and parallelism flags, and dependencies.
 // Affected cases compare `show projects --affected` sets. Runs execute the
 // tasks without cache and compare whether the run failed and which tasks ran,
 // as recorded by the fixture's tasks. An affected or run case whose results
@@ -203,9 +204,7 @@ if (command === "capture") {
     timings[`tasks ${name}`] = run(nx, ["run-many", ...args, `--graph=${file}`]).milliseconds;
     // Keep only what compare reads, so the goldens stay small and stable.
     const { tasks } = readJson(file);
-    const kept = Object.fromEntries(
-      Object.entries(tasks.tasks).map(([id, task]) => [id, { cache: task.cache, continuous: Boolean(task.continuous) }]),
-    );
+    const kept = keptTasks(tasks.tasks);
     writeFileSync(
       file,
       `${JSON.stringify({ tasks: { tasks: kept, dependencies: tasks.dependencies, continuousDependencies: tasks.continuousDependencies } }, null, 2)}\n`,
@@ -285,9 +284,9 @@ check("graph --file is normalised-equal", compareGraphs(readJson(join(goldens, "
 
 // Task graphs: the same tasks, dependencies, and cache and continuous flags.
 for (const [name, args] of Object.entries(taskGraphs)) {
-  const plan = run(qk, ["run-many", ...withoutConfiguration(args), "--dry-run"]);
+  const plan = run(qk, ["run-many", ...withoutConfiguration(args), "--graph=stdout"]);
   timings[`tasks ${name}`] = plan.milliseconds;
-  check(`task graph ${name} matches`, compareTaskGraphs(readJson(join(goldens, `tasks-${name}.json`)).tasks, JSON.parse(plan.stdout)));
+  check(`task graph ${name} matches`, compareTaskGraphs(readJson(join(goldens, `tasks-${name}.json`)).tasks, JSON.parse(plan.stdout).tasks));
 }
 
 // Affected projects: the same set, or exactly the accepted difference.
@@ -381,23 +380,42 @@ function withoutConfiguration(args) {
   return kept;
 }
 
+// What task graphs compare: each task's target, root, outputs and flags.
+function keptTasks(tasks) {
+  return Object.fromEntries(
+    Object.entries(tasks).map(([id, task]) => [
+      id,
+      {
+        target: task.target,
+        projectRoot: task.projectRoot,
+        outputs: task.outputs,
+        cache: Boolean(task.cache),
+        continuous: Boolean(task.continuous),
+        parallelism: task.parallelism !== false,
+      },
+    ]),
+  );
+}
+
+// Both sides are `--graph` task graphs: the same tasks, with the same kept
+// fields, dependencies and continuous dependencies.
 function compareTaskGraphs(nx, qk) {
   const differences = [];
   diffKeys("task", Object.keys(nx.tasks), Object.keys(qk.tasks), differences);
+  const ours = keptTasks(qk.tasks);
   for (const [id, task] of Object.entries(nx.tasks)) {
-    const ours = qk.tasks[id];
-    if (!ours) continue;
-    const expected = [...(nx.dependencies[id] ?? []), ...(nx.continuousDependencies?.[id] ?? [])].sort();
-    const actual = [...ours.dependencies].sort();
-    for (const dependency of expected) {
-      if (!actual.includes(dependency)) differences.push(`${id}: dependency only in Nx: ${dependency}`);
+    if (!ours[id]) continue;
+    for (const [field, value] of Object.entries(task)) {
+      if (JSON.stringify(canonical(value)) !== JSON.stringify(canonical(ours[id][field]))) {
+        differences.push(`${id}: ${field} ${JSON.stringify(value)} in Nx, ${JSON.stringify(ours[id][field])} in qk`);
+      }
     }
-    for (const dependency of actual) {
-      if (!expected.includes(dependency)) differences.push(`${id}: dependency only in qk: ${dependency}`);
-    }
-    if (task.cache !== Boolean(ours.definition.cache)) differences.push(`${id}: cache ${task.cache} in Nx`);
-    if (Boolean(task.continuous) !== Boolean(ours.definition.continuous)) {
-      differences.push(`${id}: continuous ${Boolean(task.continuous)} in Nx`);
+    for (const kind of ["dependencies", "continuousDependencies"]) {
+      const expected = [...(nx[kind]?.[id] ?? [])].sort();
+      const actual = [...(qk[kind]?.[id] ?? [])].sort();
+      if (JSON.stringify(expected) !== JSON.stringify(actual)) {
+        differences.push(`${id}: ${kind} ${JSON.stringify(expected)} in Nx, ${JSON.stringify(actual)} in qk`);
+      }
     }
   }
   return differences;

@@ -2,12 +2,31 @@
   "tasks": {
     "tasks": {
       "web:build:production": {
+        "target": {
+          "project": "web",
+          "target": "build",
+          "configuration": "production"
+        },
+        "projectRoot": "apps/web",
+        "outputs": [
+          "apps/web/dist"
+        ],
         "cache": true,
-        "continuous": false
+        "continuous": false,
+        "parallelism": true
       },
       "ui:build": {
+        "target": {
+          "project": "ui",
+          "target": "build"
+        },
+        "projectRoot": "packages/ui",
+        "outputs": [
+          "packages/ui/dist"
+        ],
         "cache": true,
-        "continuous": false
+        "continuous": false,
+        "parallelism": true
       }
     },
     "dependencies": {

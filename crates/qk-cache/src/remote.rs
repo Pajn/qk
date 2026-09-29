@@ -73,6 +73,13 @@ pub fn configure(
             .map(str::to_owned)
     };
     let setting = |name: &str| config.get(name).and_then(Value::as_str).map(str::to_owned);
+    // `--skip-remote-cache` sets the first, as in Nx.
+    if ["NX_SKIP_REMOTE_CACHE", "NX_DISABLE_REMOTE_CACHE"]
+        .iter()
+        .any(|name| variable(name).as_deref() == Some("true"))
+    {
+        return Ok(None);
+    }
     let ci = variable("CI").is_some_and(|value| value != "false" && value != "0");
     let mode = variable("NX_POWERPACK_CACHE_MODE")
         .or_else(|| setting(if ci { "ciMode" } else { "localMode" }))

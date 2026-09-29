@@ -1156,3 +1156,156 @@ fn the_task_a_run_is_for_gets_the_terminal() {
     assert!(output.contains("terminal"), "{output:?}");
     assert!(output.contains("got typed"), "{output:?}");
 }
+
+#[cfg(unix)]
+#[test]
+fn nx_run_flags_work_as_in_nx() {
+    let temp = fixture(json!({
+        "a": {"command": "echo a"},
+        "b": {"command": "echo b"},
+        "fail": {"command": "exit 2"},
+        "zlast": {"command": "echo zlast"},
+        "build": {"command": "echo build", "configurations": {"production": {"command": "echo production build"}}},
+        "check": {"command": "echo check", "dependsOn": ["build"]},
+        "verbose": {"command": "echo verbose=$NX_VERBOSE_LOGGING skip=$NX_SKIP_NX_CACHE"},
+        "ping": {"command": "echo ping", "dependsOn": ["pong"]},
+        "pong": {"command": "echo pong", "dependsOn": ["ping"]}
+    }));
+    let output = |args: &[&str]| run(temp.path(), args);
+    let stdout = |args: &[&str]| String::from_utf8(success(output(args)).stdout).unwrap();
+    let parallel = |args: &[&str], env: Option<&str>| {
+        let mut command = command(
+            temp.path(),
+            &[&["run-many", "-t", "a,b", "--output-style", "quiet"], args].concat(),
+        );
+        if let Some(env) = env {
+            command.env("NX_PARALLEL", env);
+        }
+        let stderr = String::from_utf8(success(command.output().unwrap()).stderr).unwrap();
+        stderr
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Parallel ")?
+                    .split(':')
+                    .next()
+                    .map(str::to_owned)
+            })
+            .unwrap()
+    };
+    assert_eq!(parallel(&["--parallel=false"], None), "1");
+    assert_eq!(parallel(&["--parallel"], Some("2")), "2");
+    assert_eq!(parallel(&["--parallel"], None), "3");
+    assert_eq!(parallel(&["--parallel=4"], None), "4");
+    assert_eq!(
+        parallel(&["--parallel=100%"], None),
+        std::thread::available_parallelism().unwrap().to_string()
+    );
+    // --prod is -c production.
+    assert_eq!(
+        stdout(&["run", "app:build", "--prod"]),
+        "production build\n"
+    );
+    // --exclude-task-dependencies runs only what was asked for.
+    assert_eq!(
+        stdout(&["run", "app:check", "--exclude-task-dependencies"]),
+        "check\n"
+    );
+    // --nx-bail starts nothing after the first failure.
+    let bailed = output(&[
+        "run-many",
+        "-t",
+        "fail,zlast",
+        "--parallel=1",
+        "--nx-bail",
+        "--output-style",
+        "static",
+    ]);
+    assert!(!bailed.status.success());
+    assert!(!String::from_utf8_lossy(&bailed.stdout).contains("zlast\n"));
+    let continued = output(&[
+        "run-many",
+        "-t",
+        "fail,zlast",
+        "--parallel=1",
+        "--output-style",
+        "static",
+    ]);
+    assert!(String::from_utf8_lossy(&continued.stdout).contains("zlast\n"));
+    // Cycles fail unless ignored, as in Nx.
+    assert!(
+        String::from_utf8_lossy(&output(&["run", "app:ping"]).stderr)
+            .contains("task dependency cycle")
+    );
+    let ignored = success(output(&[
+        "run",
+        "app:ping",
+        "--nx-ignore-cycles",
+        "--output-style",
+        "static",
+    ]));
+    assert!(String::from_utf8_lossy(&ignored.stdout).contains("pong\n"));
+    assert!(String::from_utf8_lossy(&ignored.stderr).contains("the task graph has a cycle"));
+    // --verbose and a skipped cache reach tasks as Nx sets them.
+    assert_eq!(
+        stdout(&["run", "app:verbose", "--verbose", "--skip-nx-cache"]),
+        "verbose=true skip=true\n"
+    );
+    // Nx's own options are accepted.
+    assert_eq!(
+        stdout(&[
+            "run",
+            "app:a",
+            "--batch",
+            "--skip-sync",
+            "--no-cloud",
+            "--tui=false",
+            "--runner",
+            "default",
+            "--skip-remote-cache"
+        ]),
+        "a\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn the_task_graph_is_written_as_nx_writes_it() {
+    let temp = fixture(json!({
+        "serve": {"command": "sleep 1", "continuous": true},
+        "build": {"command": "echo build", "cache": true, "outputs": ["{projectRoot}/dist"]},
+        "e2e": {"command": "echo e2e", "dependsOn": ["build", "serve"], "parallelism": false}
+    }));
+    let graph: Value = serde_json::from_slice(
+        &success(run(
+            temp.path(),
+            &["run", "app:e2e", "--graph=stdout", "--", "--grep=x"],
+        ))
+        .stdout,
+    )
+    .unwrap();
+    assert!(graph["graph"]["nodes"]["app"].is_object());
+    let tasks = &graph["tasks"];
+    assert_eq!(tasks["roots"], json!(["app:build", "app:serve"]));
+    assert_eq!(tasks["dependencies"]["app:e2e"], json!(["app:build"]));
+    assert_eq!(
+        tasks["continuousDependencies"]["app:e2e"],
+        json!(["app:serve"])
+    );
+    let e2e = &tasks["tasks"]["app:e2e"];
+    assert_eq!(e2e["target"], json!({"project": "app", "target": "e2e"}));
+    assert_eq!(
+        e2e["overrides"]["__overrides_unparsed__"],
+        json!(["--grep=x"])
+    );
+    assert_eq!(
+        (e2e["parallelism"].clone(), e2e["cache"].clone()),
+        (json!(false), json!(false))
+    );
+    assert_eq!(tasks["tasks"]["app:build"]["outputs"], json!(["dist"]));
+    let file = temp.path().join("graph.json");
+    success(run(
+        temp.path(),
+        &["run", "app:e2e", &format!("--graph={}", file.display())],
+    ));
+    assert!(file.is_file());
+}

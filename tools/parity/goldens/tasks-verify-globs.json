@@ -2,20 +2,48 @@
   "tasks": {
     "tasks": {
       "web:verify": {
+        "target": {
+          "project": "web",
+          "target": "verify"
+        },
+        "projectRoot": "apps/web",
+        "outputs": [],
         "cache": false,
-        "continuous": false
+        "continuous": false,
+        "parallelism": true
       },
       "web:typecheck-app": {
+        "target": {
+          "project": "web",
+          "target": "typecheck-app"
+        },
+        "projectRoot": "apps/web",
+        "outputs": [],
         "cache": true,
-        "continuous": false
+        "continuous": false,
+        "parallelism": true
       },
       "web:typecheck-strict": {
+        "target": {
+          "project": "web",
+          "target": "typecheck-strict"
+        },
+        "projectRoot": "apps/web",
+        "outputs": [],
         "cache": false,
-        "continuous": false
+        "continuous": false,
+        "parallelism": true
       },
       "ui:lint": {
+        "target": {
+          "project": "ui",
+          "target": "lint"
+        },
+        "projectRoot": "packages/ui",
+        "outputs": [],
         "cache": true,
-        "continuous": false
+        "continuous": false,
+        "parallelism": true
       }
     },
     "dependencies": {

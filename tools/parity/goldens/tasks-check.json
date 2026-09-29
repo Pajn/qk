@@ -2,44 +2,119 @@
   "tasks": {
     "tasks": {
       "web-e2e:e2e": {
+        "target": {
+          "project": "web-e2e",
+          "target": "e2e"
+        },
+        "projectRoot": "apps/web-e2e",
+        "outputs": [],
         "cache": false,
-        "continuous": false
+        "continuous": false,
+        "parallelism": true
       },
       "ui:check": {
+        "target": {
+          "project": "ui",
+          "target": "check"
+        },
+        "projectRoot": "packages/ui",
+        "outputs": [],
         "cache": false,
-        "continuous": false
+        "continuous": false,
+        "parallelism": true
       },
       "web:check": {
+        "target": {
+          "project": "web",
+          "target": "check"
+        },
+        "projectRoot": "apps/web",
+        "outputs": [],
         "cache": false,
-        "continuous": false
+        "continuous": false,
+        "parallelism": true
       },
       "web:serve": {
+        "target": {
+          "project": "web",
+          "target": "serve"
+        },
+        "projectRoot": "apps/web",
+        "outputs": [],
         "cache": false,
-        "continuous": true
+        "continuous": true,
+        "parallelism": true
       },
       "web:build:production": {
+        "target": {
+          "project": "web",
+          "target": "build",
+          "configuration": "production"
+        },
+        "projectRoot": "apps/web",
+        "outputs": [
+          "apps/web/dist"
+        ],
         "cache": true,
-        "continuous": false
+        "continuous": false,
+        "parallelism": true
       },
       "ui:build": {
+        "target": {
+          "project": "ui",
+          "target": "build"
+        },
+        "projectRoot": "packages/ui",
+        "outputs": [
+          "packages/ui/dist"
+        ],
         "cache": true,
-        "continuous": false
+        "continuous": false,
+        "parallelism": true
       },
       "ui:test": {
+        "target": {
+          "project": "ui",
+          "target": "test"
+        },
+        "projectRoot": "packages/ui",
+        "outputs": [],
         "cache": true,
-        "continuous": false
+        "continuous": false,
+        "parallelism": true
       },
       "ui:lint": {
+        "target": {
+          "project": "ui",
+          "target": "lint"
+        },
+        "projectRoot": "packages/ui",
+        "outputs": [],
         "cache": true,
-        "continuous": false
+        "continuous": false,
+        "parallelism": true
       },
       "web:test": {
+        "target": {
+          "project": "web",
+          "target": "test"
+        },
+        "projectRoot": "apps/web",
+        "outputs": [],
         "cache": true,
-        "continuous": false
+        "continuous": false,
+        "parallelism": true
       },
       "web:lint": {
+        "target": {
+          "project": "web",
+          "target": "lint"
+        },
+        "projectRoot": "apps/web",
+        "outputs": [],
         "cache": true,
-        "continuous": false
+        "continuous": false,
+        "parallelism": true
       }
     },
     "dependencies": {

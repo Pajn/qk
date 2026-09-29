@@ -170,9 +170,34 @@ so brace globs containing commas are not supported on the command line.
 ## Task execution
 
 `run` requires an existing target; `run-many` skips projects without the
-requested targets and errors when nothing matches. Both accept
-`-c/--configuration`, `--parallel` (also settable through `NX_PARALLEL`;
-defaults to nx.json `parallel`, then `3`), `--output-style` and `--dry-run`.
+requested targets and errors when nothing matches. `run`, `run-many` and
+`affected` take Nx's run options:
+
+- `-c/--configuration`, and `--prod` for `-c production`.
+- `--parallel`: a number, a percentage of the cores such as `50%`, or `false`
+  for one task at a time. Without it, `NX_PARALLEL`, then nx.json
+  `parallel`, then 3; `--parallel` alone means `NX_PARALLEL`, else 3, as in
+  Nx.
+- `--skip-nx-cache` (`--skip-cache`, `--disable-nx-cache`, or
+  `NX_SKIP_NX_CACHE=true`), and `--skip-remote-cache`
+  (`--disable-remote-cache`, `NX_SKIP_REMOTE_CACHE=true` or
+  `NX_DISABLE_REMOTE_CACHE=true`) to keep to the local cache. Tasks see
+  `NX_SKIP_NX_CACHE=true` when the cache is skipped.
+- `--nx-bail` (or `NX_BAIL=true`): after a task fails, nothing else starts;
+  what is running finishes.
+- `--exclude-task-dependencies`: only the requested tasks run.
+- `--nx-ignore-cycles` (or `NX_IGNORE_CYCLES=true`): a task dependency cycle
+  is broken, as Nx does, by dropping the dependency that closes it, with a
+  warning; otherwise it is an error.
+- `--graph=<file>` or `--graph=stdout` (`--graph` alone prints too, where Nx
+  opens its viewer): writes the project graph and the task graph in the
+  shape Nx's `--graph` writes, without running anything. Nx's `taskPlans`,
+  its hashing plan, is left out.
+- `--verbose` sets `NX_VERBOSE_LOGGING=true` for tasks.
+- `--output-style` and `--dry-run`, which prints qk's own task graph.
+- Nx's own options (`--runner`, `--batch`, `--skip-sync`, `--cloud`,
+  `--dte`, `--agents`, `--tui`, `--tui-auto-exit`) are accepted and have no
+  effect.
 
 `--output-style` takes Nx's names, and qk's own `quiet`:
 
@@ -759,8 +784,9 @@ for a change applied on a branch (the files in `tools/parity/changes/<case>`,
 plus any deletions the case lists), and runs, which execute tasks without
 cache and compare whether the run failed and which tasks ran. The comparison
 requires byte-identical `show projects --json`, a `graph --file` equal after
-normalisation, and task graphs with the same tasks, dependencies, and cache
-and continuous flags. The differences it normalises away are listed at the
+normalisation, and `--graph` task graphs with the same tasks, with the same
+target, root, outputs and cache, continuous and parallelism flags, and the
+same dependencies and continuous dependencies. The differences it normalises away are listed at the
 top of the script. An affected or run case that differs fails unless it
 records the exact difference it accepts and why.
 

@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 pub use evict::{Pruned, max_size, parse_size, prune};
 pub use glob::Pattern;
 pub use hash::{Resolved, without_resolution};
-pub use paths::cache_directory;
+pub use paths::{cache_directory, resolved_outputs};
 
 /// The cache for one run; its workspace snapshot is taken on first use.
 pub struct Cache {

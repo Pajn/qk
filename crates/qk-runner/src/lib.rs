@@ -49,15 +49,31 @@ pub struct TaskRecord {
     pub threads: Option<usize>,
 }
 
+/// How a run is carried out.
+pub struct Settings {
+    /// Tasks running at once, continuous ones aside.
+    pub parallel: usize,
+    /// Cores the tasks share.
+    pub cores: usize,
+    pub skip_cache: bool,
+    /// Nx's `--nx-bail`: no task starts after one has failed.
+    pub bail: bool,
+    pub style: OutputStyle,
+}
+
 pub fn run(
     workspace: &Workspace,
     graph: &TaskGraph,
-    parallel: usize,
-    cores: usize,
-    skip_cache: bool,
-    style: OutputStyle,
+    settings: &Settings,
     cancelled: Arc<AtomicBool>,
 ) -> Result<RunResult> {
+    let Settings {
+        parallel,
+        cores,
+        skip_cache,
+        bail: bails,
+        style,
+    } = *settings;
     if parallel == 0 || cores == 0 {
         bail!("parallel and cores must be at least 1");
     }
@@ -183,6 +199,7 @@ pub fn run(
     let mut started = BTreeMap::new();
     let mut ready = BTreeMap::new();
     let mut records = BTreeMap::new();
+    let mut bailed = false;
     // Cores held by each running finite task, and the threads each was given.
     let mut held: BTreeMap<String, usize> = BTreeMap::new();
     let mut given: BTreeMap<String, usize> = BTreeMap::new();
@@ -236,6 +253,14 @@ pub fn run(
                         (finite_pending - ready_threaded).min(slots.saturating_sub(sharing));
                     Threads::even(cores.saturating_sub(held.values().sum()), sharing, reserved)
                 };
+                // After a failure under --nx-bail, what has not started is skipped
+                // and what runs finishes.
+                if bailed && !pending.is_empty() {
+                    for id in &pending {
+                        report::event(Event::Skipped { id: id.clone() });
+                    }
+                    skipped.append(&mut pending);
+                }
                 if cancelled.load(Ordering::SeqCst) {
                     skipped.append(&mut pending);
                     exit_code = 130;
@@ -427,6 +452,7 @@ pub fn run(
                                     if exit_code == 0 {
                                         exit_code = code;
                                     }
+                                    bailed |= bails;
                                 }
                                 Outcome::Cancelled => exit_code = 130,
                             }

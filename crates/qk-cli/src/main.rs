@@ -94,15 +94,43 @@ enum Command {
 
 #[derive(Args)]
 struct RunOptions {
-    /// Bypass all local cache reads and writes.
-    #[arg(long, aliases = ["skip-nx-cache", "skipNxCache"])]
+    /// Bypass all cache reads and writes; also NX_SKIP_NX_CACHE=true.
+    #[arg(long, aliases = ["skip-nx-cache", "skipNxCache", "disable-nx-cache", "disableNxCache"])]
     skip_cache: bool,
+    /// Use the local cache only; also NX_SKIP_REMOTE_CACHE=true.
+    #[arg(long, aliases = ["skipRemoteCache", "disable-remote-cache", "disableRemoteCache"])]
+    skip_remote_cache: bool,
     #[arg(short = 'c', long)]
     configuration: Option<String>,
-    /// Maximum number of tasks executing concurrently; defaults to nx.json
-    /// `parallel`, then 3.
-    #[arg(long, env = "NX_PARALLEL")]
-    parallel: Option<std::num::NonZeroUsize>,
+    /// Use the production configuration, as `-c production`.
+    #[arg(long)]
+    prod: bool,
+    /// Maximum number of tasks executing concurrently: a number, a percentage
+    /// of the cores, or `false` for one at a time. Defaults to NX_PARALLEL, then
+    /// nx.json `parallel`, then 3; `--parallel` alone means NX_PARALLEL, else 3.
+    #[arg(long, env = "NX_PARALLEL", num_args = 0..=1, default_missing_value = "true")]
+    parallel: Option<String>,
+    #[arg(long, alias = "maxParallel", hide = true)]
+    max_parallel: Option<String>,
+    /// Stop starting tasks after the first failure; also NX_BAIL=true.
+    #[arg(long, alias = "nxBail")]
+    nx_bail: bool,
+    /// Break task dependency cycles instead of failing; also NX_IGNORE_CYCLES=true.
+    #[arg(long, alias = "nxIgnoreCycles")]
+    nx_ignore_cycles: bool,
+    /// Run only the requested tasks, not the tasks they depend on.
+    #[arg(long, alias = "excludeTaskDependencies")]
+    exclude_task_dependencies: bool,
+    /// Write the task graph as Nx does, to a file or to stdout (`--graph` or
+    /// `--graph=stdout`), without running anything.
+    #[arg(long, num_args = 0..=1, default_missing_value = "stdout", value_name = "FILE")]
+    graph: Option<String>,
+    /// Set NX_VERBOSE_LOGGING=true for tasks.
+    #[arg(long)]
+    verbose: bool,
+    /// Nx options qk has no use for, accepted so Nx commands run unchanged.
+    #[command(flatten)]
+    ignored: IgnoredOptions,
     /// Cores the run's tasks share; defaults to nx.json `qk:cores`, then the
     /// cores available to qk.
     #[arg(long, env = "QK_CORES")]
@@ -176,6 +204,110 @@ impl ChangeOptions {
             },
         )
     }
+}
+
+/// Nx's own run options: its task runner, batching, sync generators, Nx
+/// Cloud and its terminal UI.
+#[derive(Args)]
+struct IgnoredOptions {
+    #[arg(long, hide = true)]
+    runner: Option<String>,
+    #[arg(long, hide = true, num_args = 0..=1, default_missing_value = "true")]
+    batch: Option<String>,
+    #[arg(long, alias = "skipSync", hide = true)]
+    skip_sync: bool,
+    #[arg(long, hide = true, num_args = 0..=1, default_missing_value = "true")]
+    cloud: Option<String>,
+    #[arg(long, hide = true)]
+    no_cloud: bool,
+    #[arg(long, hide = true, num_args = 0..=1, default_missing_value = "true")]
+    dte: Option<String>,
+    #[arg(long, hide = true)]
+    no_dte: bool,
+    #[arg(long, aliases = ["useAgents", "use-agents"], hide = true, num_args = 0..=1, default_missing_value = "true")]
+    agents: Option<String>,
+    #[arg(long, hide = true, num_args = 0..=1, default_missing_value = "true")]
+    tui: Option<String>,
+    #[arg(long, hide = true)]
+    no_tui: bool,
+    #[arg(long, alias = "tuiAutoExit", hide = true)]
+    tui_auto_exit: Option<String>,
+}
+
+impl RunOptions {
+    /// The configuration, with `--prod` meaning `production`.
+    fn configuration(&self) -> Option<String> {
+        self.configuration
+            .clone()
+            .or_else(|| self.prod.then(|| "production".to_owned()))
+    }
+
+    fn skips_cache(&self) -> bool {
+        self.skip_cache || env_flag("NX_SKIP_NX_CACHE")
+    }
+
+    /// Tasks per run, as Nx reads `--parallel`.
+    fn parallel(&self, workspace: &Workspace) -> Result<usize> {
+        let count = |value: &str| -> Result<usize> {
+            let value = value.trim();
+            let parsed = match value.strip_suffix('%') {
+                Some(percent) => {
+                    let cores =
+                        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+                    let percent: f64 = percent
+                        .parse()
+                        .with_context(|| format!("invalid --parallel {value:?}"))?;
+                    (cores as f64 * percent / 100.0).floor() as usize
+                }
+                None => value
+                    .parse()
+                    .with_context(|| format!("invalid --parallel {value:?}"))?,
+            };
+            Ok(parsed.max(1))
+        };
+        match self.parallel.as_deref() {
+            None => Ok(workspace
+                .config
+                .extra
+                .get("parallel")
+                .and_then(serde_json::Value::as_u64)
+                .filter(|parallel| *parallel > 0)
+                .map_or(3, |parallel| parallel as usize)),
+            Some("false") => Ok(1),
+            Some("true" | "") => {
+                let fallback = self
+                    .max_parallel
+                    .clone()
+                    .or_else(|| std::env::var("NX_PARALLEL").ok())
+                    .filter(|value| !matches!(value.as_str(), "true" | "false" | ""))
+                    .unwrap_or_else(|| "3".into());
+                count(&fallback)
+            }
+            Some(value) => count(value),
+        }
+    }
+
+    /// Sets what Nx sets in its own environment for these options, so tasks
+    /// and the remote cache see it. Called before any thread starts.
+    fn export(&self) {
+        let set = |name: &str| {
+            // Only this thread exists yet.
+            unsafe { std::env::set_var(name, "true") }
+        };
+        if self.verbose {
+            set("NX_VERBOSE_LOGGING");
+        }
+        if self.skips_cache() {
+            set("NX_SKIP_NX_CACHE");
+        }
+        if self.skip_remote_cache {
+            set("NX_SKIP_REMOTE_CACHE");
+        }
+    }
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| value == "true")
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -514,7 +646,7 @@ fn run(cli: Cli) -> Result<i32> {
                     request.configuration = None;
                 }
             }
-            if let Some(configuration) = &options.configuration {
+            if let Some(configuration) = &options.configuration() {
                 if request
                     .configuration
                     .as_ref()
@@ -538,7 +670,7 @@ fn run(cli: Cli) -> Result<i32> {
                 &workspace,
                 selected,
                 &targets,
-                options.configuration.as_ref(),
+                options.configuration().as_ref(),
                 &options.args,
             );
             return execute_tasks(&workspace, requests, &options, false);
@@ -558,7 +690,7 @@ fn run(cli: Cli) -> Result<i32> {
                     &workspace,
                     selected,
                     &targets,
-                    options.configuration.as_ref(),
+                    options.configuration().as_ref(),
                     &options.args,
                 ),
             )?;
@@ -600,7 +732,7 @@ fn run(cli: Cli) -> Result<i32> {
                 &workspace,
                 selected,
                 &targets,
-                options.configuration.as_ref(),
+                options.configuration().as_ref(),
                 &options.args,
             );
             if requests.is_empty() {
@@ -724,7 +856,32 @@ fn execute_tasks(
     options: &RunOptions,
     single: bool,
 ) -> Result<i32> {
-    let graph = TaskGraph::build(workspace, &requests)?;
+    options.export();
+    let graph = TaskGraph::build_with(
+        workspace,
+        &requests,
+        qk_taskgraph::BuildOptions {
+            exclude_task_dependencies: options.exclude_task_dependencies,
+            ignore_cycles: options.nx_ignore_cycles || env_flag("NX_IGNORE_CYCLES"),
+        },
+    )?;
+    for cycle in &graph.cycles {
+        qk_executor::status!(
+            "qk: the task graph has a cycle, broken as Nx does: {}",
+            cycle.join(" -> ")
+        );
+    }
+    if let Some(target) = options.graph.as_deref().filter(|target| *target != "false") {
+        let mut bytes = serde_json::to_vec_pretty(&nx_task_graph(workspace, &graph)?)?;
+        bytes.push(b'\n');
+        if target == "stdout" || target == "true" {
+            io::stdout().lock().write_all(&bytes)?;
+        } else {
+            std::fs::write(target, bytes)
+                .with_context(|| format!("cannot write the task graph to {target}"))?;
+        }
+        return Ok(0);
+    }
     if options.dry_run {
         // Preparing has no side effects, and catches what would stop a real run.
         let environment: std::collections::BTreeMap<_, _> = std::env::vars_os().collect();
@@ -741,7 +898,7 @@ fn execute_tasks(
         signal.store(true, Ordering::SeqCst);
     })
     .context("cannot register cancellation handler")?;
-    let skip_cache = options.skip_cache;
+    let skip_cache = options.skips_cache();
     let rendered = options
         .output_style
         .map_or_else(|| default_output_style(single), OutputStyle::rendered);
@@ -780,18 +937,7 @@ fn execute_tasks(
         Rendered::Lines(style) => style,
         Rendered::Quiet | Rendered::Dynamic => qk_executor::OutputStyle::Quiet,
     };
-    let parallel = options.parallel.map_or_else(
-        || {
-            workspace
-                .config
-                .extra
-                .get("parallel")
-                .and_then(serde_json::Value::as_u64)
-                .filter(|parallel| *parallel > 0)
-                .map_or(3, |parallel| parallel as usize)
-        },
-        std::num::NonZeroUsize::get,
-    );
+    let parallel = options.parallel(workspace)?;
     let cores = options.cores.map_or_else(
         || {
             workspace
@@ -811,10 +957,13 @@ fn execute_tasks(
     let result = qk_runner::run(
         workspace,
         &graph,
-        parallel,
-        cores,
-        options.skip_cache,
-        style,
+        &qk_runner::Settings {
+            parallel,
+            cores,
+            skip_cache,
+            bail: options.nx_bail || env_flag("NX_BAIL"),
+            style,
+        },
         cancelled,
     );
     if let ui::SinkKind::Dynamic(dynamic) = &sink {
@@ -862,6 +1011,59 @@ fn warn_landed(range: Option<&qk_affected::Range>) {
     if let Some(warning) = range.and_then(explain::landed_warning) {
         eprintln!("qk: warning: {warning}");
     }
+}
+
+/// The task graph as Nx's `--graph` writes it: the project graph, then each
+/// task with its target, root, overrides, outputs and flags, its dependencies
+/// with continuous ones apart, and as roots the tasks without dependencies.
+/// Nx's `taskPlans`, its hashing plan, has no counterpart in qk.
+fn nx_task_graph(workspace: &Workspace, graph: &TaskGraph) -> Result<serde_json::Value> {
+    use serde_json::json;
+    let projects = ProjectGraph::build(workspace)?;
+    let continuous = |id: &str| graph.tasks[id].definition.continuous == Some(true);
+    let mut tasks = serde_json::Map::new();
+    let mut dependencies = serde_json::Map::new();
+    let mut continuous_dependencies = serde_json::Map::new();
+    let mut roots = Vec::new();
+    for (id, task) in &graph.tasks {
+        let (outputs, _) = qk_cache::resolved_outputs(workspace, task).unwrap_or_default();
+        // As in Nx, a task without a configuration has no such key.
+        let mut target = json!({"project": task.project, "target": task.target});
+        if let Some(configuration) = &task.configuration {
+            target["configuration"] = json!(configuration);
+        }
+        tasks.insert(
+            id.clone(),
+            json!({
+                "id": id,
+                "target": target,
+                "projectRoot": workspace.projects[&task.project].root,
+                "overrides": {"__overrides_unparsed__": task.args},
+                "outputs": outputs,
+                "cache": task.definition.cache == Some(true),
+                "parallelism": task.definition.parallelism != Some(false),
+                "continuous": continuous(id),
+            }),
+        );
+        let (serving, finite): (Vec<&String>, Vec<&String>) = task
+            .dependencies
+            .iter()
+            .partition(|dependency| continuous(dependency));
+        if task.dependencies.is_empty() {
+            roots.push(id.clone());
+        }
+        dependencies.insert(id.clone(), json!(finite));
+        continuous_dependencies.insert(id.clone(), json!(serving));
+    }
+    Ok(json!({
+        "graph": serde_json::to_value(GraphReport { graph: &projects })?["graph"],
+        "tasks": {
+            "roots": roots,
+            "tasks": tasks,
+            "dependencies": dependencies,
+            "continuousDependencies": continuous_dependencies,
+        },
+    }))
 }
 
 fn print_json(value: &impl serde::Serialize) -> Result<()> {

@@ -1541,3 +1541,38 @@ fn tasks_see_their_hash() {
     assert_eq!(run["tasks"][0]["key"], json!(printed));
     assert!(!printed.is_empty());
 }
+
+#[test]
+fn skipping_the_remote_cache_keeps_to_the_local_one() {
+    let server = s3::FakeS3::start();
+    let fixture = Fixture::new(target("build", json!({})));
+    with_remote(&fixture, &server, json!({}));
+    success(remote_build(&fixture, &[("NX_SKIP_REMOTE_CACHE", "true")]));
+    assert_eq!(server.writes(), 0);
+    // The flag sets the same.
+    let mut command = fixture.command(
+        &fixture.root,
+        &[
+            "run",
+            "app:build",
+            "--skip-remote-cache",
+            "--output-style",
+            "static",
+        ],
+    );
+    command
+        .env("AWS_ACCESS_KEY_ID", "key")
+        .env("AWS_SECRET_ACCESS_KEY", "secret")
+        .env_remove("CI");
+    let output = success(command.output().unwrap());
+    assert!(
+        stderr(&output).contains("cache hit app:build"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(server.writes(), 0);
+    success(remote_build(&fixture, &[]));
+    fs::write(fixture.root.join("src/input.txt"), "changed\n").unwrap();
+    success(remote_build(&fixture, &[]));
+    assert!(server.writes() > 0);
+}

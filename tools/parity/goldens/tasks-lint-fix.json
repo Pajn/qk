@@ -2,28 +2,70 @@
   "tasks": {
     "tasks": {
       "tooling:lint": {
+        "target": {
+          "project": "tooling",
+          "target": "lint"
+        },
+        "projectRoot": "packages/tooling",
+        "outputs": [],
         "cache": true,
-        "continuous": false
+        "continuous": false,
+        "parallelism": true
       },
       "scripts:lint": {
+        "target": {
+          "project": "scripts",
+          "target": "lint"
+        },
+        "projectRoot": "tools/scripts",
+        "outputs": [],
         "cache": true,
-        "continuous": false
+        "continuous": false,
+        "parallelism": true
       },
       "web-e2e:lint": {
+        "target": {
+          "project": "web-e2e",
+          "target": "lint"
+        },
+        "projectRoot": "apps/web-e2e",
+        "outputs": [],
         "cache": true,
-        "continuous": false
+        "continuous": false,
+        "parallelism": true
       },
       "mobile:lint": {
+        "target": {
+          "project": "mobile",
+          "target": "lint"
+        },
+        "projectRoot": "apps/mobile",
+        "outputs": [],
         "cache": true,
-        "continuous": false
+        "continuous": false,
+        "parallelism": true
       },
       "ui:lint": {
+        "target": {
+          "project": "ui",
+          "target": "lint"
+        },
+        "projectRoot": "packages/ui",
+        "outputs": [],
         "cache": true,
-        "continuous": false
+        "continuous": false,
+        "parallelism": true
       },
       "web:lint": {
+        "target": {
+          "project": "web",
+          "target": "lint"
+        },
+        "projectRoot": "apps/web",
+        "outputs": [],
         "cache": true,
-        "continuous": false
+        "continuous": false,
+        "parallelism": true
       }
     },
     "dependencies": {

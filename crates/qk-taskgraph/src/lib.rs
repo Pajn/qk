@@ -46,10 +46,32 @@ pub struct Task {
 pub struct TaskGraph {
     pub roots: BTreeSet<String>,
     pub tasks: BTreeMap<String, Task>,
+    /// The cycles broken under `ignore_cycles`, each as the tasks around it.
+    #[serde(skip)]
+    pub cycles: Vec<Vec<String>>,
+}
+
+/// Nx's options for building a task graph.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BuildOptions {
+    /// `--exclude-task-dependencies`: only the requested tasks, without the
+    /// tasks they depend on.
+    pub exclude_task_dependencies: bool,
+    /// `--nx-ignore-cycles`: break each cycle rather than failing, as Nx's
+    /// `makeAcyclic` does, by dropping the dependency that closes it.
+    pub ignore_cycles: bool,
 }
 
 impl TaskGraph {
     pub fn build(workspace: &Workspace, requests: &[Request]) -> Result<Self> {
+        Self::build_with(workspace, requests, BuildOptions::default())
+    }
+
+    pub fn build_with(
+        workspace: &Workspace,
+        requests: &[Request],
+        options: BuildOptions,
+    ) -> Result<Self> {
         if requests.is_empty() {
             bail!("no tasks selected");
         }
@@ -59,6 +81,8 @@ impl TaskGraph {
             projects,
             tasks: BTreeMap::new(),
             visiting: Vec::new(),
+            ignore_cycles: options.ignore_cycles,
+            cycles: Vec::new(),
         };
         let mut roots = BTreeSet::new();
         for request in requests {
@@ -69,10 +93,53 @@ impl TaskGraph {
                 )
             })?);
         }
-        Ok(Self {
+        let mut graph = Self {
             roots,
             tasks: builder.tasks,
-        })
+            cycles: builder.cycles,
+        };
+        if !graph.cycles.is_empty() {
+            graph.make_acyclic();
+        }
+        if options.exclude_task_dependencies {
+            let roots = graph.roots.clone();
+            graph.tasks.retain(|id, _| roots.contains(id));
+            for task in graph.tasks.values_mut() {
+                task.dependencies.retain(|id| roots.contains(id));
+            }
+        }
+        Ok(graph)
+    }
+
+    /// Nx's `makeAcyclic`: from each task, depth first, a dependency on a
+    /// task already on the path is dropped.
+    fn make_acyclic(&mut self) {
+        fn visit(
+            graph: &mut BTreeMap<String, Task>,
+            id: &str,
+            visited: &mut BTreeSet<String>,
+            path: &mut Vec<String>,
+        ) {
+            if !visited.insert(id.to_owned()) {
+                return;
+            }
+            let dependencies: Vec<String> = graph[id].dependencies.iter().cloned().collect();
+            for dependency in dependencies {
+                if path.contains(&dependency) {
+                    graph.get_mut(id).unwrap().dependencies.remove(&dependency);
+                } else {
+                    path.push(dependency.clone());
+                    visit(graph, &dependency, visited, path);
+                    path.pop();
+                }
+            }
+        }
+        let ids: Vec<String> = self.tasks.keys().cloned().collect();
+        let mut visited = BTreeSet::new();
+        for id in ids {
+            let mut path = vec![id.clone()];
+            visit(&mut self.tasks, &id, &mut visited, &mut path);
+        }
     }
 }
 
@@ -81,6 +148,8 @@ struct Builder<'a> {
     projects: ProjectGraph,
     tasks: BTreeMap<String, Task>,
     visiting: Vec<String>,
+    ignore_cycles: bool,
+    cycles: Vec<Vec<String>>,
 }
 
 impl Builder<'_> {
@@ -120,8 +189,13 @@ impl Builder<'_> {
         );
         if let Some(position) = self.visiting.iter().position(|task| task == &id) {
             let mut cycle = self.visiting[position..].to_vec();
-            cycle.push(id);
-            bail!("task dependency cycle: {}", cycle.join(" -> "));
+            cycle.push(id.clone());
+            if !self.ignore_cycles {
+                bail!("task dependency cycle: {}", cycle.join(" -> "));
+            }
+            // The edge stays until the graph is complete, then the cycle is broken.
+            self.cycles.push(cycle);
+            return Ok(Some(id));
         }
         if let Some(existing) = self.tasks.get(&id) {
             if existing.args != request.args {
