@@ -1341,3 +1341,60 @@ fn a_target_without_a_project_finds_one_like_nx() {
     fs::write(temp.path().join("nx.json"), r#"{"defaultProject": "lib"}"#).unwrap();
     assert_eq!(hello(temp.path(), None), "lib\n");
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn the_sandbox_reports_and_refuses_what_a_task_does_not_declare() {
+    let temp = fixture(json!({
+        "build": {
+            "command": "cat src/in.txt other/notes.txt .env > /dev/null; mkdir -p dist && echo out > dist/out.txt && echo stray > stray.txt",
+            "inputs": ["{projectRoot}/src/**/*"],
+            "outputs": ["{projectRoot}/dist"]
+        },
+        "clean": {"command": "cat src/in.txt > /dev/null", "inputs": ["{projectRoot}/src/**/*"]}
+    }));
+    fs::create_dir_all(temp.path().join("src")).unwrap();
+    fs::create_dir_all(temp.path().join("other")).unwrap();
+    fs::write(temp.path().join("src/in.txt"), "in").unwrap();
+    fs::write(temp.path().join("other/notes.txt"), "notes").unwrap();
+    fs::write(temp.path().join(".env"), "X=1\n").unwrap();
+    let report = temp.path().join("sandbox.json");
+    success(run(
+        temp.path(),
+        &[
+            "run-many",
+            "-t",
+            "build,clean",
+            "--sandbox",
+            "--sandbox-report",
+            report.to_str().unwrap(),
+        ],
+    ));
+    let findings: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+    let build = &findings["tasks"]["app:build"];
+    assert_eq!(build["undeclaredReads"], json!(["other/notes.txt"]));
+    assert_eq!(build["unkeyedReads"], json!([".env"]));
+    assert_eq!(build["strayWrites"], json!(["stray.txt"]));
+    assert!(findings["tasks"].get("app:clean").is_none(), "{findings}");
+    // Audit lets the task do it all.
+    assert!(temp.path().join("stray.txt").is_file());
+    fs::remove_file(temp.path().join("stray.txt")).unwrap();
+    let enforced = run(
+        temp.path(),
+        &[
+            "run",
+            "app:build",
+            "--sandbox=enforce",
+            "--output-style",
+            "static",
+        ],
+    );
+    assert!(!enforced.status.success());
+    let stdout = String::from_utf8_lossy(&enforced.stdout);
+    assert!(
+        stdout.contains("other/notes.txt: Operation not permitted"),
+        "{stdout}"
+    );
+    assert!(!temp.path().join("stray.txt").exists());
+    assert!(temp.path().join("dist/out.txt").is_file());
+}

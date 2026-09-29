@@ -128,6 +128,14 @@ struct RunOptions {
     /// Set NX_VERBOSE_LOGGING=true for tasks.
     #[arg(long)]
     verbose: bool,
+    /// Run each task in macOS's sandbox: `audit` (the default) reports what it
+    /// reads and writes in the workspace beyond what it declares, `enforce`
+    /// refuses it. Tasks run without the cache.
+    #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "audit", value_name = "MODE")]
+    sandbox: Option<SandboxMode>,
+    /// Write every sandbox finding to this file as JSON.
+    #[arg(long, value_name = "PATH", requires = "sandbox")]
+    sandbox_report: Option<PathBuf>,
     /// Nx options qk has no use for, accepted so Nx commands run unchanged.
     #[command(flatten)]
     ignored: IgnoredOptions,
@@ -317,6 +325,12 @@ impl RunOptions {
 
 fn env_flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|value| value == "true")
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum SandboxMode {
+    Audit,
+    Enforce,
 }
 
 /// Nx's project types, as `show projects --type` takes them.
@@ -968,7 +982,8 @@ fn execute_tasks(
         signal.store(true, Ordering::SeqCst);
     })
     .context("cannot register cancellation handler")?;
-    let skip_cache = options.skips_cache();
+    // A sandboxed task has to run to be observed.
+    let skip_cache = options.skips_cache() || options.sandbox.is_some();
     let rendered = options
         .output_style
         .map_or_else(|| default_output_style(single), OutputStyle::rendered);
@@ -1033,6 +1048,10 @@ fn execute_tasks(
             skip_cache,
             bail: options.nx_bail || env_flag("NX_BAIL"),
             style,
+            sandbox: options.sandbox.map(|mode| match mode {
+                SandboxMode::Audit => qk_runner::sandbox::Mode::Audit,
+                SandboxMode::Enforce => qk_runner::sandbox::Mode::Enforce,
+            }),
         },
         cancelled,
     );
@@ -1073,6 +1092,20 @@ fn execute_tasks(
             ui::Paint::stderr(),
         );
         qk_executor::report::write_all(true, format!("\n{summary}").as_bytes());
+    }
+    if let Some(sandbox) = &result.sandbox {
+        let text = ui::sandbox_summary(sandbox, graph.tasks.len(), ui::Paint::stderr());
+        qk_executor::report::write_all(true, format!("\n{text}").as_bytes());
+        if let Some(path) = &options.sandbox_report {
+            let mut bytes = serde_json::to_vec_pretty(&serde_json::json!({
+                "tasks": sandbox.findings,
+                "unsandboxed": sandbox.unsandboxed,
+            }))?;
+            bytes.push(b'\n');
+            std::fs::write(path, bytes).with_context(|| {
+                format!("cannot write the sandbox report to {}", path.display())
+            })?;
+        }
     }
     Ok(result.exit_code)
 }

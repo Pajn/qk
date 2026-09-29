@@ -168,10 +168,17 @@ fn spawn(task: &PreparedTask, text: &str, capture: bool, interactive: bool) -> R
         command
     };
     #[cfg(not(windows))]
-    let mut command = {
-        let mut command = Command::new("/bin/sh");
-        command.arg("-c").arg(text);
-        command
+    let mut command = match &task.sandbox {
+        Some(profile) => {
+            let mut command = Command::new("sandbox-exec");
+            command.arg("-f").arg(profile).args(["/bin/sh", "-c", text]);
+            command
+        }
+        None => {
+            let mut command = Command::new("/bin/sh");
+            command.arg("-c").arg(text);
+            command
+        }
     };
     command
         .current_dir(&task.cwd)

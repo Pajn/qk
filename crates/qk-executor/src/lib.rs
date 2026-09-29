@@ -47,6 +47,8 @@ pub struct PreparedTask {
     /// The runner sets it for the one task a run is for, when that task has a
     /// single command whose output goes straight to the terminal.
     pub interactive: bool,
+    /// A Seatbelt profile the commands run under, for `--sandbox`.
+    pub sandbox: Option<PathBuf>,
     /// How the task's output is shown; the runner sets it per output style.
     pub display: Display,
 }
@@ -487,6 +489,7 @@ pub fn prepare(
         ready: Default::default(),
         decorations,
         interactive: false,
+        sandbox: None,
         display: Display::default(),
     })
 }

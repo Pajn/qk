@@ -5,6 +5,7 @@
 //! requested directly, it is stopped once every task depending on it has finished.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -18,6 +19,7 @@ use qk_executor::report::{self, Event};
 use qk_executor::{Display, Outcome, OutputStyle, environment, execute, prepare};
 use qk_taskgraph::TaskGraph;
 
+pub mod sandbox;
 pub mod threads;
 use threads::Threads;
 
@@ -30,6 +32,15 @@ pub struct RunResult {
     /// The machine's CPU use sampled through the run, from 0 to 1, each with
     /// whether a ready task was waiting for a free slot at the time.
     pub load: Vec<(f32, bool)>,
+    /// Under `--sandbox`, what each task did beyond its declarations, and
+    /// the tasks that ran unsandboxed with why.
+    pub sandbox: Option<SandboxResult>,
+}
+
+pub struct SandboxResult {
+    pub mode: sandbox::Mode,
+    pub findings: BTreeMap<String, sandbox::Findings>,
+    pub unsandboxed: BTreeMap<String, String>,
 }
 
 /// One task of a run, for history and reports.
@@ -59,6 +70,8 @@ pub struct Settings {
     /// Nx's `--nx-bail`: no task starts after one has failed.
     pub bail: bool,
     pub style: OutputStyle,
+    /// Run each task in macOS's sandbox, auditing or enforcing what it declares.
+    pub sandbox: Option<sandbox::Mode>,
 }
 
 pub fn run(
@@ -73,6 +86,7 @@ pub fn run(
         skip_cache,
         bail: bails,
         style,
+        sandbox: sandbox_mode,
     } = *settings;
     if parallel == 0 || cores == 0 {
         bail!("parallel and cores must be at least 1");
@@ -105,6 +119,14 @@ pub fn run(
         && task.commands.len() == 1
     {
         task.interactive = true;
+    }
+    let sandbox = sandbox_mode
+        .map(|mode| sandbox::Sandbox::start(workspace, graph, mode))
+        .transpose()?;
+    if let Some(sandbox) = &sandbox {
+        for (id, task) in &mut prepared {
+            task.sandbox = sandbox.profile(id).map(Path::to_path_buf);
+        }
     }
     let prepared = prepared;
     let threads: BTreeMap<String, Threads> = graph
@@ -488,11 +510,23 @@ pub fn run(
     if cancelled.load(Ordering::SeqCst) {
         exit_code = 130;
     }
+    let sandbox = sandbox
+        .map(|sandbox| -> Result<SandboxResult> {
+            let mode = sandbox.mode;
+            let unsandboxed = sandbox.unsandboxed.clone();
+            Ok(SandboxResult {
+                mode,
+                findings: sandbox.finish()?,
+                unsandboxed,
+            })
+        })
+        .transpose()?;
     Ok(RunResult {
         outcomes,
         skipped,
         exit_code,
         tasks: records,
         load: load.into_inner().unwrap(),
+        sandbox,
     })
 }

@@ -80,7 +80,7 @@ fn digests_path(root: &Path) -> PathBuf {
 /// is taken once, like Nx's file map; file contents are still re-read whenever
 /// their metadata changes, so edits during the run are detected.
 pub struct Snapshot {
-    files: BTreeSet<String>,
+    pub(crate) files: BTreeSet<String>,
     projects: ProjectGraph,
     canonical_root: PathBuf,
     workspace_prefix: Option<PathBuf>,

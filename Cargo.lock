@@ -1107,6 +1107,7 @@ dependencies = [
  "qk-config",
  "qk-executor",
  "qk-taskgraph",
+ "serde",
  "serde_json",
  "sysinfo",
 ]

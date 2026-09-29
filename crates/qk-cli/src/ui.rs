@@ -344,6 +344,111 @@ fn since(later: SystemTime, earlier: SystemTime) -> Duration {
 /// The lines a run ends with: the result, the critical path, and whether a
 /// higher `--parallel` could have helped, judged by how busy the machine was
 /// while ready tasks waited for a slot.
+/// What the sandbox found. Paths read by many tasks, at least a quarter of
+/// those with findings, come first, once: the
+/// package manager and version manager a command starts through read them,
+/// not the task. Then each task's own: the files it read that its key leaves
+/// out, the `.git` and dotenv files it read, and what it wrote outside its
+/// outputs, up to a few paths each.
+pub fn sandbox_summary(sandbox: &qk_runner::SandboxResult, tasks: usize, paint: Paint) -> String {
+    use std::collections::{BTreeMap, BTreeSet};
+    const SHOWN: usize = 8;
+    let mode = match sandbox.mode {
+        qk_runner::sandbox::Mode::Audit => "audit",
+        qk_runner::sandbox::Mode::Enforce => "enforce",
+    };
+    let mut readers: BTreeMap<&str, usize> = BTreeMap::new();
+    for findings in sandbox.findings.values() {
+        for path in &findings.undeclared_reads {
+            *readers.entry(path.as_str()).or_insert(0) += 1;
+        }
+    }
+    let shared: BTreeSet<&str> = readers
+        .iter()
+        .filter(|(_, count)| **count >= 3 && **count * 4 >= sandbox.findings.len())
+        .map(|(path, _)| *path)
+        .collect();
+    let mut lines = Vec::new();
+    let own: Vec<(&String, &qk_runner::sandbox::Findings, Vec<&String>)> = sandbox
+        .findings
+        .iter()
+        .map(|(id, findings)| {
+            let reads = findings
+                .undeclared_reads
+                .iter()
+                .filter(|path| !shared.contains(path.as_str()))
+                .collect::<Vec<_>>();
+            (id, findings, reads)
+        })
+        .filter(|(_, findings, reads)| {
+            !reads.is_empty()
+                || !findings.unkeyed_reads.is_empty()
+                || !findings.stray_writes.is_empty()
+        })
+        .collect();
+    if sandbox.findings.is_empty() {
+        lines.push(format!(
+            "Sandbox {mode}: {tasks} task{} kept to what {} declare{}",
+            if tasks == 1 { "" } else { "s" },
+            if tasks == 1 { "it" } else { "they" },
+            if tasks == 1 { "s" } else { "" },
+        ));
+    } else {
+        lines.push(format!(
+            "Sandbox {mode}: {} of {tasks} tasks went beyond what they declare",
+            sandbox.findings.len()
+        ));
+    }
+    let list = |label: &str, paths: &[&String], lines: &mut Vec<String>, indent: &str| {
+        if paths.is_empty() {
+            return;
+        }
+        lines.push(format!("{indent}{} {label}:", paths.len()));
+        for path in paths.iter().take(SHOWN) {
+            lines.push(format!("{indent}  {path}"));
+        }
+        if paths.len() > SHOWN {
+            lines.push(paint.dim(&format!("{indent}  … and {} more", paths.len() - SHOWN)));
+        }
+    };
+    if !shared.is_empty() {
+        let paths: Vec<&String> = sandbox
+            .findings
+            .values()
+            .flat_map(|findings| &findings.undeclared_reads)
+            .filter(|path| shared.contains(path.as_str()))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        list(
+            "read by many tasks, likely by the tools their commands start through",
+            &paths,
+            &mut lines,
+            "  ",
+        );
+    }
+    for (id, findings, reads) in own {
+        lines.push(format!("  {id}"));
+        list("read outside its inputs", &reads, &mut lines, "    ");
+        list(
+            "read, not in any key",
+            &findings.unkeyed_reads.iter().collect::<Vec<_>>(),
+            &mut lines,
+            "    ",
+        );
+        list(
+            "written outside its outputs",
+            &findings.stray_writes.iter().collect::<Vec<_>>(),
+            &mut lines,
+            "    ",
+        );
+    }
+    for (id, reason) in &sandbox.unsandboxed {
+        lines.push(paint.dim(&format!("  {id} ran unsandboxed: {reason}")));
+    }
+    lines.join("\n") + "\n"
+}
+
 pub fn summary(
     result: &RunResult,
     report: &RunReport,
@@ -617,6 +722,7 @@ mod tests {
             threads: None,
         };
         let result = RunResult {
+            sandbox: None,
             outcomes: BTreeMap::new(),
             skipped: BTreeSet::new(),
             exit_code: 0,

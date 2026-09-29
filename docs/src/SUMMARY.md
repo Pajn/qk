@@ -10,6 +10,7 @@
 - [Remote cache and storage limits](guides/remote-cache.md)
 - [Warm state](guides/warm-state.md)
 - [Sharing cores](guides/threads.md)
+- [Checking inputs in a sandbox](guides/sandbox.md)
 - [Run history and reports](guides/history.md)
 
 # Reference

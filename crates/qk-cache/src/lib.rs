@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 pub use evict::{Pruned, max_size, parse_size, prune};
 pub use glob::Pattern;
 pub use hash::{Resolved, without_resolution};
-pub use paths::{cache_directory, cache_location, resolved_outputs};
+pub use paths::{Outputs, cache_directory, cache_location, resolved_outputs, worktree_state};
 
 /// The cache for one run; its workspace snapshot is taken on first use.
 pub struct Cache {
@@ -88,6 +88,32 @@ pub fn resolve_tasks(
             Ok((id.clone(), resolved))
         })
         .collect()
+}
+
+/// Every task's resolved inputs, or why they could not be resolved, with the
+/// workspace files they were chosen from.
+pub struct Resolution {
+    pub candidates: std::collections::BTreeSet<String>,
+    pub tasks: BTreeMap<String, std::result::Result<Resolved, String>>,
+}
+
+pub fn resolve_each(workspace: &Workspace, graph: &TaskGraph) -> Result<Resolution> {
+    let cache = paths::cache_location(workspace);
+    let snapshot = hash::Snapshot::new(workspace, graph, &cache)?;
+    let cancelled = AtomicBool::new(false);
+    let tasks = graph
+        .tasks
+        .iter()
+        .map(|(id, task)| {
+            let resolved = hash::resolve(&snapshot, workspace, task, None, &cancelled)
+                .map_err(|error| format!("{error:#}"));
+            (id.clone(), resolved)
+        })
+        .collect();
+    Ok(Resolution {
+        candidates: snapshot.files.clone(),
+        tasks,
+    })
 }
 
 impl Cache {
