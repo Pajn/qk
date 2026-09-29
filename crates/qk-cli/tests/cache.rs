@@ -1607,7 +1607,10 @@ fn the_cache_directory_can_be_set_as_in_nx() {
             .output()
             .unwrap(),
     ));
-    assert!(path.trim().ends_with("shared-cache/qk/v1"), "{path}");
+    assert!(
+        Path::new(path.trim()).ends_with("shared-cache/qk/v1"),
+        "{path}"
+    );
     // nx.json's cacheDirectory, when the variable is not set.
     fs::write(
         fixture.root.join("nx.json"),

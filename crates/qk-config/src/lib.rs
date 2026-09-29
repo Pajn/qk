@@ -156,6 +156,7 @@ impl Workspace {
     pub fn load(root: &Path) -> Result<Self> {
         let root = root
             .canonicalize()
+            .map(simplified)
             .with_context(|| format!("cannot open workspace {}", root.display()))?;
         if !root.is_dir() {
             bail!("workspace is not a directory: {}", root.display());
@@ -246,6 +247,21 @@ impl Workspace {
         }
         Ok(workspace)
     }
+}
+
+/// A canonical Windows path without its verbatim `\\?\` prefix when it is
+/// an ordinary drive path. Verbatim paths take no `/` separators, and paths
+/// built from the root, such as `{workspaceRoot}/dir`, use them.
+fn simplified(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    if let Some(text) = path.to_str()
+        && let Some(rest) = text.strip_prefix(r"\\?\")
+        && rest.as_bytes().get(1) == Some(&b':')
+        && rest.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+    {
+        return PathBuf::from(rest);
+    }
+    path
 }
 
 pub(crate) fn read_optional_json(path: &Path) -> Result<Option<Value>> {
