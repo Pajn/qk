@@ -14,6 +14,9 @@ pub enum Display {
     /// Held until the task ends, then printed under `> qk run <id>`: Nx's
     /// `static`. `group` folds each task into a GitHub Actions log group.
     Static { id: String, group: bool },
+    /// Held until the task ends, and printed under a header only if it
+    /// failed: for the quiet and dynamic styles.
+    Failures { id: String },
     /// Not shown at all.
     Hidden,
 }
@@ -40,6 +43,7 @@ impl Display {
                 group: std::env::var_os("GITHUB_ACTIONS").is_some()
                     && std::env::var_os("NX_SKIP_LOG_GROUPING").is_none_or(|value| value != "true"),
             },
+            OutputStyle::Quiet => Self::Failures { id: id.to_owned() },
             OutputStyle::Static | OutputStyle::Stream => Self::Prefixed(prefix(project)),
         }
     }
@@ -51,6 +55,8 @@ pub enum OutputStyle {
     Stream,
     StreamWithoutPrefixes,
     Static,
+    /// Only failed tasks' output, for the quiet and dynamic styles.
+    Quiet,
 }
 
 /// `project:` in bold and in the colour Nx picks for the project, when the
@@ -101,7 +107,7 @@ impl Printer {
         match &self.display {
             Display::Stream => write_to(stderr, bytes),
             Display::Hidden => Ok(()),
-            Display::Static { .. } => {
+            Display::Static { .. } | Display::Failures { .. } => {
                 self.held.lock().unwrap().extend_from_slice(bytes);
                 Ok(())
             }
@@ -124,6 +130,18 @@ impl Printer {
     fn finish(&self, shown: Shown) -> io::Result<()> {
         match &self.display {
             Display::Stream | Display::Hidden => Ok(()),
+            Display::Failures { id } => {
+                let held = std::mem::take(&mut *self.held.lock().unwrap());
+                if shown == Shown::Failure {
+                    let mut text = format!("\n✖ qk run {id} failed\n\n").into_bytes();
+                    text.extend_from_slice(&held);
+                    if !held.ends_with(b"\n") {
+                        text.push(b'\n');
+                    }
+                    write_to(false, &text)?;
+                }
+                Ok(())
+            }
             Display::Prefixed(prefix) => {
                 let mut lines = self.lines.lock().unwrap();
                 for stderr in [false, true] {
@@ -180,14 +198,8 @@ fn prefixed(prefix: &str, bytes: &[u8]) -> Vec<u8> {
 }
 
 fn write_to(stderr: bool, bytes: &[u8]) -> io::Result<()> {
-    if bytes.is_empty() {
-        return Ok(());
-    }
-    if stderr {
-        io::stderr().lock().write_all(bytes)
-    } else {
-        io::stdout().lock().write_all(bytes)
-    }
+    crate::report::output(stderr, bytes);
+    Ok(())
 }
 
 /// Framed stdout/stderr chunks, optionally stored on disk without buffering the

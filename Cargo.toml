@@ -26,6 +26,8 @@ tempfile = "3"
 rusty-s3 = "0.10"
 rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }
 ureq = "3"
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+terminal_size = "0.4"
 url = "2"
 qk-config = { path = "crates/qk-config" }
 qk-graph = { path = "crates/qk-graph" }

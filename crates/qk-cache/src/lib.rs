@@ -261,7 +261,10 @@ impl Cache {
             qk_executor::Shown::LocalCache,
         ) {
             Ok(Some(fingerprint)) => {
-                qk_executor::status!("qk: cache hit {}", task.id);
+                qk_executor::report::event(qk_executor::report::Event::Cache {
+                    id: task.id.clone(),
+                    cached: qk_executor::report::Cached::Hit,
+                });
                 return Ok(TaskResult {
                     outcome: Outcome::Success,
                     fingerprint: Ok(fingerprint),
@@ -290,7 +293,10 @@ impl Cache {
             });
             match fetched {
                 Ok(Some(fingerprint)) => {
-                    qk_executor::status!("qk: remote cache hit {}", task.id);
+                    qk_executor::report::event(qk_executor::report::Event::Cache {
+                        id: task.id.clone(),
+                        cached: qk_executor::report::Cached::RemoteHit,
+                    });
                     return Ok(TaskResult {
                         outcome: Outcome::Success,
                         fingerprint: Ok(fingerprint),
@@ -304,7 +310,10 @@ impl Cache {
                 }
             }
         }
-        qk_executor::status!("qk: cache miss {}", task.id);
+        qk_executor::report::event(qk_executor::report::Event::Cache {
+            id: task.id.clone(),
+            cached: qk_executor::report::Cached::Miss,
+        });
         let log = match tempfile::NamedTempFile::new_in(self.root.join("tmp")) {
             Ok(log) => log,
             Err(error) => return bypass(format!("cache log unavailable: {error}")),
