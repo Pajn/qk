@@ -403,3 +403,38 @@ fn graph_can_include_the_packages_the_lockfile_installs() {
             .is_none()
     );
 }
+
+#[test]
+fn show_projects_filters_by_type_and_target_like_nx() {
+    let text = |args: &[&str]| {
+        let output = qk(args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    assert_eq!(text(&["show", "projects", "--type", "app"]), "web\n");
+    assert_eq!(
+        text(&["show", "projects", "-t", "build", "--sep", " "]),
+        "codegen core web\n"
+    );
+    assert_eq!(
+        text(&[
+            "show",
+            "projects",
+            "--with-target",
+            "build",
+            "--type",
+            "lib",
+            "--json"
+        ]),
+        "[\"codegen\",\"core\"]\n"
+    );
+    assert!(
+        !qk(&["show", "projects", "--json", "--sep", ","])
+            .status
+            .success()
+    );
+}

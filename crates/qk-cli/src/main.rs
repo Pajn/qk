@@ -21,7 +21,7 @@ use std::sync::{
     version,
     about = "Quick workspace task tooling",
     long_about = "qk (quick): a standalone Rust task runner.\nExecute tasks with dependency ordering and a local cache shared by Git worktrees.",
-    after_help = "Shorthand, as in Nx: `qk <target> [project]` and `qk <project>:<target>` run like `qk run`.\nWithout a project, the project containing the current directory is used."
+    after_help = "Shorthand, as in Nx: `qk <target> [project]` and `qk <project>:<target>` run like `qk run`.\nWithout a project, the project containing the current directory is used, else NX_DEFAULT_PROJECT."
 )]
 struct Cli {
     /// Workspace root; defaults to discovery from the current directory.
@@ -174,6 +174,15 @@ struct ChangeOptions {
 }
 
 impl ChangeOptions {
+    /// Whether any change option was given.
+    fn given(&self) -> bool {
+        self.base.is_some()
+            || self.head.is_some()
+            || !self.files.is_empty()
+            || self.uncommitted
+            || self.untracked
+    }
+
     fn options(&self) -> qk_affected::Options {
         qk_affected::Options {
             base: self.base.clone(),
@@ -310,6 +319,14 @@ fn env_flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|value| value == "true")
 }
 
+/// Nx's project types, as `show projects --type` takes them.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ProjectKind {
+    App,
+    Lib,
+    E2e,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Granularity {
     Project,
@@ -412,9 +429,18 @@ enum ShowCommand {
         /// Exclude matching names, globs or tags.
         #[arg(long, value_delimiter = ',', action = clap::ArgAction::Append)]
         exclude: Vec<String>,
+        /// Only projects with one of these targets.
+        #[arg(long, short = 't', alias = "withTarget", value_delimiter = ',', action = clap::ArgAction::Append)]
+        with_target: Vec<String>,
+        /// Only projects of this type.
+        #[arg(long = "type", value_enum)]
+        kind: Option<ProjectKind>,
         /// Emit a JSON array instead of one name per line.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "sep")]
         json: bool,
+        /// Separate names with this instead of a line each.
+        #[arg(long)]
+        sep: Option<String>,
     },
     /// Explain which projects are affected and why; with a project, the path
     /// from it to the change that affects it.
@@ -569,27 +595,49 @@ fn shorthand(mut args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
 }
 
 /// The project whose root most specifically contains the current directory.
+/// The project a target without one runs on, as Nx picks it: the project
+/// containing the current directory, unless that is the root project and
+/// NX_DEFAULT_PROJECT names another; without one, NX_DEFAULT_PROJECT, then
+/// nx.json `cli.defaultProjectName`, then `defaultProject`.
 fn current_project(workspace: &Workspace) -> Result<String> {
     let cwd = std::env::current_dir()
         .context("cannot read current directory")?
         .canonicalize()?;
     let root = workspace.root.canonicalize()?;
-    let relative = cwd.strip_prefix(&root).map_err(|_| {
-        anyhow::anyhow!("the current directory is outside the workspace; name a project")
-    })?;
-    workspace
-        .projects
-        .iter()
-        .filter(|(_, project)| project.root == "." || relative.starts_with(&project.root))
-        .max_by_key(|(_, project)| {
-            if project.root == "." {
-                0
-            } else {
-                project.root.len()
-            }
-        })
-        .map(|(name, _)| name.clone())
-        .context("no project contains the current directory; name one as `qk <target> <project>`")
+    let containing = cwd.strip_prefix(&root).ok().and_then(|relative| {
+        workspace
+            .projects
+            .iter()
+            .filter(|(_, project)| project.root == "." || relative.starts_with(&project.root))
+            .max_by_key(|(_, project)| {
+                if project.root == "." {
+                    0
+                } else {
+                    project.root.len()
+                }
+            })
+            .map(|(name, project)| (name.clone(), project.root == "."))
+    });
+    let fallback = std::env::var("NX_DEFAULT_PROJECT")
+        .ok()
+        .filter(|name| !name.is_empty());
+    match containing {
+        Some((name, false)) => Ok(name),
+        Some((name, true)) => Ok(fallback.unwrap_or(name)),
+        None => fallback
+            .or_else(|| {
+                let config = &workspace.config.extra;
+                config
+                    .get("cli")
+                    .and_then(|cli| cli.get("defaultProjectName"))
+                    .or_else(|| config.get("defaultProject"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .context(
+                "no project contains the current directory; name one as `qk <target> <project>`",
+            ),
+    }
 }
 
 fn run(cli: Cli) -> Result<i32> {
@@ -748,11 +796,31 @@ fn run(cli: Cli) -> Result<i32> {
                     changes,
                     projects,
                     exclude,
+                    with_target,
+                    kind,
                     json,
+                    sep,
                 },
         } => {
             let mut selected = select_projects(&workspace.projects, &projects, &exclude)?;
-            if affected {
+            if let Some(kind) = kind {
+                let graph = ProjectGraph::build(&workspace)?;
+                let wanted = match kind {
+                    ProjectKind::App => "app",
+                    ProjectKind::Lib => "lib",
+                    ProjectKind::E2e => "e2e",
+                };
+                selected.retain(|project| graph.nodes[project].kind == wanted);
+            }
+            if !with_target.is_empty() {
+                selected.retain(|project| {
+                    with_target
+                        .iter()
+                        .any(|target| workspace.projects[project].targets.contains_key(target))
+                });
+            }
+            // As in Nx, naming what changed implies --affected.
+            if affected || changes.given() {
                 let affected = changes.affected(&workspace)?;
                 selected.retain(|project| affected.contains(project));
             }
@@ -762,6 +830,8 @@ fn run(cli: Cli) -> Result<i32> {
                 let mut stdout = io::stdout().lock();
                 serde_json::to_writer(&mut stdout, &names)?;
                 writeln!(stdout)?;
+            } else if let Some(sep) = sep {
+                writeln!(io::stdout().lock(), "{}", names.join(&sep))?;
             } else {
                 let mut stdout = io::stdout().lock();
                 for name in names {

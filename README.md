@@ -47,6 +47,7 @@ parent workspace marker exists.
 | --- | --- |
 | `qk show projects [--json]` | Project names in Nx graph order, one per line or as a compact JSON array |
 | `qk show projects -p 'web,tag:library' --exclude 'experimental-*'` | Union of matching names, globs and tags, minus exclusions |
+| `qk show projects --with-target e2e --type app [--sep ,]` | Projects with one of the targets, of a type (`app`, `lib` or `e2e`, as Nx types them), joined by a separator |
 | `qk show project <name> [--json]` | Normalized project configuration as JSON |
 | `qk graph --file <path>` | Workspace project graph in a `{ "graph": { "nodes": ..., "dependencies": ... } }` envelope |
 | `qk graph` or `qk graph --file -` | The same graph on stdout |
@@ -67,7 +68,12 @@ parent workspace marker exists.
 
 As in Nx, `qk build web` and `qk web:build` mean `qk run web:build`, and take the
 same options. Without a project, `qk build` and `qk run build` use the project
-whose root most specifically contains the current directory. qk's own
+whose root most specifically contains the current directory, as Nx does:
+in the root project, `NX_DEFAULT_PROJECT` picks another, and where no
+project contains the directory, `NX_DEFAULT_PROJECT`, then nx.json
+`cli.defaultProjectName`, then `defaultProject`. As in Nx, `--base`, `--head`,
+`--files`, `--uncommitted` and `--untracked` imply `--affected` for
+`show projects`. qk's own
 subcommands, and Nx commands qk does not implement such as `format` and
 `release`, are never read as targets; use `qk run` for a target
 with one of those names.

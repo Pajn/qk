@@ -1309,3 +1309,34 @@ fn the_task_graph_is_written_as_nx_writes_it() {
     ));
     assert!(file.is_file());
 }
+
+#[cfg(unix)]
+#[test]
+fn a_target_without_a_project_finds_one_like_nx() {
+    let temp = fixture(json!({"hello": {"command": "echo root"}}));
+    fs::create_dir_all(temp.path().join("libs/lib/src")).unwrap();
+    fs::write(
+        temp.path().join("libs/lib/project.json"),
+        json!({"name": "lib", "targets": {"hello": {"command": "echo lib"}}}).to_string(),
+    )
+    .unwrap();
+    let hello = |directory: &Path, env: Option<&str>| {
+        let mut command = command(temp.path(), &["run", "hello"]);
+        command.current_dir(directory);
+        match env {
+            Some(name) => command.env("NX_DEFAULT_PROJECT", name),
+            None => command.env_remove("NX_DEFAULT_PROJECT"),
+        };
+        String::from_utf8(success(command.output().unwrap()).stdout).unwrap()
+    };
+    let lib = temp.path().join("libs/lib/src");
+    assert_eq!(hello(temp.path(), None), "root\n");
+    // In the root project, NX_DEFAULT_PROJECT picks another.
+    assert_eq!(hello(temp.path(), Some("lib")), "lib\n");
+    // Inside another project, that project, whatever the variable says.
+    assert_eq!(hello(&lib, Some("app")), "lib\n");
+    // Without a root project, nx.json's defaultProject.
+    fs::remove_file(temp.path().join("project.json")).unwrap();
+    fs::write(temp.path().join("nx.json"), r#"{"defaultProject": "lib"}"#).unwrap();
+    assert_eq!(hello(temp.path(), None), "lib\n");
+}
