@@ -152,7 +152,9 @@ impl ChangeOptions {
     }
 
     fn affected(&self, workspace: &Workspace) -> Result<std::collections::BTreeSet<String>> {
-        Ok(self.analyse(workspace)?.projects.into_keys().collect())
+        let analysis = self.analyse(workspace)?;
+        warn_landed(analysis.range.as_ref());
+        Ok(analysis.projects.into_keys().collect())
     }
 
     fn analyse(&self, workspace: &Workspace) -> Result<qk_affected::Analysis> {
@@ -556,6 +558,7 @@ fn run(cli: Cli) -> Result<i32> {
                 ),
             )?;
             let analysis = qk_affected::affected_tasks(&workspace, &graph, &changes.options())?;
+            warn_landed(analysis.range.as_ref());
             let requests: Vec<Request> = graph
                 .roots
                 .iter()
@@ -801,6 +804,12 @@ fn execute_tasks(
         qk_executor::report::write_all(true, format!("\n{summary}").as_bytes());
     }
     Ok(result.exit_code)
+}
+
+fn warn_landed(range: Option<&qk_affected::Range>) {
+    if let Some(warning) = range.and_then(explain::landed_warning) {
+        eprintln!("qk: warning: {warning}");
+    }
 }
 
 fn print_json(value: &impl serde::Serialize) -> Result<()> {

@@ -436,3 +436,71 @@ fn a_task_is_affected_when_its_inputs_change() {
     // app:build reads lib's production files through ^production.
     assert!(matches!(&tasks["app:build"], TaskCause::Touched { .. }));
 }
+
+/// A branch taken from `origin/main` after it moved on, while the local `main`
+/// stayed behind: `tool` changed on `origin/main`, `lib` on the branch.
+/// Returns the stale local `main`.
+fn behind_origin(repo: &Repo) -> String {
+    let remote = repo.root.join(".git/remote.git");
+    git(
+        &repo.root,
+        &["init", "--quiet", "--bare", remote.to_str().unwrap()],
+    );
+    git(
+        &repo.root,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(&repo.root, &["push", "--quiet", "-u", "origin", "main"]);
+    write(&repo.root, "tools/tool/README.md", "landed");
+    commit(&repo.root);
+    git(&repo.root, &["push", "--quiet", "origin", "main"]);
+    git(&repo.root, &["switch", "--quiet", "-c", "feature"]);
+    git(&repo.root, &["branch", "-f", "main", &repo.base]);
+    write(&repo.root, "libs/lib/src/index.ts", "changed");
+    commit(&repo.root);
+    repo.base.clone()
+}
+
+fn analyse_default(repo: &Repo, base: Option<&str>) -> qk_affected::Analysis {
+    let workspace = Workspace::load(&repo.root).unwrap();
+    let graph = ProjectGraph::build(&workspace).unwrap();
+    qk_affected::analyse(
+        &workspace,
+        &graph,
+        &Options {
+            base: base.map(str::to_owned),
+            ..Options::default()
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_stale_local_base_branch_is_compared_from_its_upstream() {
+    let repo = Repo::new(&[]);
+    behind_origin(&repo);
+    let analysis = analyse_default(&repo, None);
+    assert_eq!(
+        analysis.projects.keys().cloned().collect::<Vec<_>>(),
+        names(&["app", "lib"])
+    );
+    let range = analysis.range.unwrap();
+    assert_eq!(range.upstream.as_deref(), Some("origin/main"));
+    assert_eq!((range.commits, range.landed), (1, 0));
+}
+
+#[test]
+fn commits_that_already_landed_are_counted_when_the_base_predates_them() {
+    let repo = Repo::new(&[]);
+    let old = behind_origin(&repo);
+    let range = analyse_default(&repo, Some(&old)).range.unwrap();
+    assert_eq!((range.commits, range.landed), (2, 1));
+    assert_eq!(range.default_branch.as_deref(), Some("origin/main"));
+    // On the default branch itself the range is its own history.
+    git(
+        &repo.root,
+        &["switch", "--quiet", "--detach", "origin/main"],
+    );
+    let range = analyse_default(&repo, Some(&old)).range.unwrap();
+    assert_eq!((range.commits, range.landed), (1, 0));
+}

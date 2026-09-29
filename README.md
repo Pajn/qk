@@ -87,6 +87,15 @@ then nx.json `defaultBase`, then `main`; the head to `NX_HEAD`. `--files`,
 `--uncommitted` and `--untracked` replace the comparison. Files matching the
 root `.gitignore` or `.nxignore` are left out.
 
+Unlike Nx, when the base is a branch with an upstream, such as `main`
+following `origin/main`, and the head left the upstream later than the local
+branch, the base is that later point. Otherwise a local `main` that has not
+been updated would count everything that landed on `origin/main` since as
+changes. When the compared commits still include some already on the default
+branch's upstream, as with an explicit `--base` older than where the head
+branched, `affected` and `show affected` warn. On the default branch itself
+the range is its own history, and nothing is flagged.
+
 A changed file touches the project whose root most specifically contains it.
 `nx.json` touches every project; a file named by a `{workspaceRoot}` input
 touches the projects declaring it; a deleted `project.json` or
@@ -123,6 +132,7 @@ those whose dependencies changed as a consequence.
 ```text
 $ qk show affected web --base HEAD^ --head HEAD
 2 changed files between 3f1c0a9e2b7d and HEAD.
+The base is where HEAD left HEAD^, 1 commit back.
 web is affected because it depends on ui:
   web -> ui (static)
 ui is touched:

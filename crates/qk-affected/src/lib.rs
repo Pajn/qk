@@ -63,6 +63,8 @@ pub struct Analysis {
     pub base: Option<String>,
     /// The head revision; `None` compares the working tree.
     pub head: Option<String>,
+    /// How the base was found, when changes come from a commit range.
+    pub range: Option<Range>,
     /// The changed files considered, after ignore rules.
     pub files: Vec<String>,
     pub projects: BTreeMap<String, Cause>,
@@ -265,6 +267,7 @@ pub fn analyse(workspace: &Workspace, graph: &ProjectGraph, options: &Options) -
     Ok(Analysis {
         base: changes.base,
         head: changes.head,
+        range: changes.range,
         files: changes.files,
         projects,
     })
@@ -299,6 +302,25 @@ impl Touches {
     }
 }
 
+/// How the base of a commit range was found, and what the range holds.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Range {
+    /// The base as given, such as `main`.
+    pub requested: String,
+    /// The upstream the merge base was taken from instead, when the head
+    /// left it later than it left `requested`: a local `main` behind
+    /// `origin/main` would otherwise count what landed since as changes.
+    pub upstream: Option<String>,
+    /// Commits from the merge base to the head.
+    pub commits: usize,
+    /// Of those, the commits already on the default branch, with the ref they
+    /// were found on. Their changes count as the head's own; always zero when
+    /// the head itself is on the default branch.
+    pub landed: usize,
+    pub default_branch: Option<String>,
+}
+
 /// The changed files, and each one's content at the two revisions.
 struct Changes<'a> {
     workspace: &'a Workspace,
@@ -306,6 +328,7 @@ struct Changes<'a> {
     base: Option<String>,
     /// `None` reads the working tree.
     head: Option<String>,
+    range: Option<Range>,
 }
 
 enum FileChange {
@@ -322,27 +345,46 @@ enum FileChange {
 impl<'a> Changes<'a> {
     fn new(workspace: &'a Workspace, options: &Options) -> Result<Self> {
         let root = &workspace.root;
-        let mut base = options.base.clone().or_else(|| non_empty_env("NX_BASE"));
         let head = options.head.clone().or_else(|| non_empty_env("NX_HEAD"));
-        if base.is_none() {
-            base = Some(
+        let default_base = workspace
+            .config
+            .default_base
+            .clone()
+            .or_else(|| {
                 workspace
                     .config
-                    .default_base
-                    .clone()
-                    .or_else(|| {
-                        workspace
-                            .config
-                            .extra
-                            .get("affected")
-                            .and_then(|affected| affected.get("defaultBase"))
-                            .and_then(Value::as_str)
-                            .map(str::to_owned)
-                    })
-                    .unwrap_or_else(|| "main".into()),
-            );
-        }
-        let base = base.map(|base| merge_base(root, &base, head.as_deref().unwrap_or("HEAD")));
+                    .extra
+                    .get("affected")
+                    .and_then(|affected| affected.get("defaultBase"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "main".into());
+        let requested = options
+            .base
+            .clone()
+            .or_else(|| non_empty_env("NX_BASE"))
+            .unwrap_or_else(|| default_base.clone());
+        let head_revision = head.as_deref().unwrap_or("HEAD");
+        let (merged, upstream) = merge_base(root, &requested, head_revision);
+        let range =
+            (options.files.is_empty() && !options.uncommitted && !options.untracked).then(|| {
+                let default_branch = upstream_of(root, &default_base).or_else(|| {
+                    git_lines(root, &["rev-parse", "--verify", "--quiet", &default_base])
+                        .ok()
+                        .map(|_| default_base.clone())
+                });
+                Range {
+                    commits: count(root, &merged, head_revision),
+                    landed: default_branch
+                        .as_deref()
+                        .map_or(0, |branch| landed(root, &merged, head_revision, branch)),
+                    requested: requested.clone(),
+                    upstream,
+                    default_branch,
+                }
+            });
+        let base = Some(merged);
         let files = if !options.files.is_empty() {
             options.files.clone()
         } else if options.uncommitted {
@@ -396,6 +438,7 @@ impl<'a> Changes<'a> {
             files,
             base,
             head,
+            range,
         })
     }
 
@@ -467,18 +510,74 @@ fn non_empty_env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
-fn merge_base(root: &Path, base: &str, head: &str) -> String {
-    for args in [
-        vec!["merge-base", base, head],
-        vec!["merge-base", "--fork-point", base, head],
-    ] {
-        if let Ok(lines) = git_lines(root, &args)
-            && let Some(sha) = lines.into_iter().next()
-        {
-            return sha;
-        }
+/// Where `head` left `base`, as Nx finds it, unless `base` is a branch whose
+/// upstream `head` left later. Then that later point is the base, with the
+/// upstream's name.
+fn merge_base(root: &Path, base: &str, head: &str) -> (String, Option<String>) {
+    let first = |args: &[&str]| {
+        git_lines(root, args)
+            .ok()
+            .and_then(|lines| lines.into_iter().next())
+    };
+    let local = first(&["merge-base", base, head])
+        .or_else(|| first(&["merge-base", "--fork-point", base, head]))
+        .unwrap_or_else(|| base.to_owned());
+    if let Some(upstream) = upstream_of(root, base)
+        && let Some(remote) = first(&["merge-base", &upstream, head])
+        && remote != local
+        && is_ancestor(root, &local, &remote)
+    {
+        return (remote, Some(upstream));
     }
-    base.to_owned()
+    (local, None)
+}
+
+/// The remote-tracking branch `branch` follows, such as `origin/main`.
+fn upstream_of(root: &Path, branch: &str) -> Option<String> {
+    git_lines(
+        root,
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            &format!("{branch}@{{upstream}}"),
+        ],
+    )
+    .ok()?
+    .into_iter()
+    .next()
+}
+
+fn is_ancestor(root: &Path, ancestor: &str, descendant: &str) -> bool {
+    Command::new("git")
+        .current_dir(root)
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn count(root: &Path, from: &str, to: &str) -> usize {
+    git_lines(root, &["rev-list", "--count", &format!("{from}..{to}")])
+        .ok()
+        .and_then(|lines| lines.first()?.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Commits between `base` and `head` that `branch` already holds, unless
+/// `head` is on `branch` itself, where the range is the branch's own history.
+fn landed(root: &Path, base: &str, head: &str, branch: &str) -> usize {
+    if is_ancestor(root, head, branch) {
+        return 0;
+    }
+    match git_lines(root, &["merge-base", branch, head]) {
+        Ok(lines) => match lines.first() {
+            Some(shared) if shared != base && is_ancestor(root, base, shared) => {
+                count(root, base, shared)
+            }
+            _ => 0,
+        },
+        Err(_) => 0,
+    }
 }
 
 fn uncommitted(root: &Path) -> Result<Vec<String>> {

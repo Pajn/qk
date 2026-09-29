@@ -131,15 +131,66 @@ pub fn explain(
 }
 
 fn comparison(analysis: &Analysis) -> String {
+    comparison_of(
+        analysis.files.len(),
+        analysis.base.as_deref(),
+        analysis.head.as_deref(),
+        analysis.range.as_ref(),
+    )
+}
+
+/// What was compared, then how the base was found and a warning when the
+/// range holds commits that already landed.
+fn comparison_of(
+    count: usize,
+    base: Option<&str>,
+    head: Option<&str>,
+    range: Option<&qk_affected::Range>,
+) -> String {
     let short = |revision: &str| revision.chars().take(12).collect::<String>();
-    let base = analysis.base.as_deref().map_or("(no base)".into(), short);
-    let head = analysis
-        .head
-        .as_deref()
-        .map_or("the working tree".into(), short);
-    let count = analysis.files.len();
     let files = if count == 1 { "file" } else { "files" };
-    format!("{count} changed {files} between {base} and {head}.")
+    let mut text = format!(
+        "{count} changed {files} between {} and {}.",
+        base.map_or("(no base)".into(), short),
+        head.map_or("the working tree".into(), short)
+    );
+    if let Some(range) = range {
+        let left = match &range.upstream {
+            Some(upstream) => format!("{upstream}, newer than {}", range.requested),
+            None => range.requested.clone(),
+        };
+        let commits = if range.commits == 1 {
+            "commit"
+        } else {
+            "commits"
+        };
+        text.push_str(&format!(
+            "\nThe base is where {} left {left}, {} {commits} back{}.",
+            head.map_or("HEAD".into(), short),
+            range.commits,
+            if head.is_none() {
+                ", and the working tree counts too"
+            } else {
+                ""
+            }
+        ));
+        if let Some(warning) = landed_warning(range) {
+            text.push_str(&format!("\nwarning: {warning}"));
+        }
+    }
+    text
+}
+
+/// A warning when the compared commits include some already on the default
+/// branch, whose changes then count as affected.
+pub fn landed_warning(range: &qk_affected::Range) -> Option<String> {
+    let branch = range.default_branch.as_deref()?;
+    (range.landed > 0).then(|| {
+        format!(
+            "{} of the {} commits compared are already on {branch}, so what they changed counts as affected; `--base {branch}` compares from where this branch left it",
+            range.landed, range.commits
+        )
+    })
 }
 
 /// A lockfile reason by package, most telling first: versions that moved,
@@ -243,16 +294,15 @@ pub fn tasks(
         writeln!(out)?;
         return Ok(());
     }
-    let short = |revision: &str| revision.chars().take(12).collect::<String>();
     writeln!(
         out,
-        "{} changed files between {} and {}.",
-        analysis.files.len(),
-        analysis.base.as_deref().map_or("(no base)".into(), short),
-        analysis
-            .head
-            .as_deref()
-            .map_or("the working tree".into(), short),
+        "{}",
+        comparison_of(
+            analysis.files.len(),
+            analysis.base.as_deref(),
+            analysis.head.as_deref(),
+            analysis.range.as_ref(),
+        )
     )?;
     let width = analysis.tasks.keys().map(String::len).max().unwrap_or(0);
     for (id, cause) in &analysis.tasks {

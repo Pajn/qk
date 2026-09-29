@@ -19,6 +19,7 @@ use crate::{Changes, FileChange, Options};
 pub struct TaskAnalysis {
     pub base: Option<String>,
     pub head: Option<String>,
+    pub range: Option<crate::Range>,
     pub files: Vec<String>,
     pub tasks: BTreeMap<String, TaskCause>,
 }
@@ -179,6 +180,7 @@ pub fn affected_tasks(
     Ok(TaskAnalysis {
         base: changes.base,
         head: changes.head,
+        range: changes.range,
         files: changes.files,
         tasks,
     })
