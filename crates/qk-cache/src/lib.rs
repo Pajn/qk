@@ -5,13 +5,14 @@ mod paths;
 mod store;
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use qk_config::Workspace;
 use qk_executor::{Capture, Outcome, PreparedTask, execute, execute_captured};
 use qk_taskgraph::{Task, TaskGraph};
+use serde_json::{Value, json};
 
 pub use paths::cache_directory;
 
@@ -84,19 +85,22 @@ impl Cache {
         };
         if task.definition.cache != Some(true) {
             let outcome = execute(prepared, cancelled)?;
-            return Ok(TaskResult {
-                outcome,
-                fingerprint: self.after(
+            let fingerprint = self
+                .unchanged(
                     workspace,
                     graph,
                     task,
                     prepared,
                     &dependencies,
                     &key,
-                    &outputs,
                     outcome,
                     cancelled,
-                ),
+                )
+                .then(|| output_fingerprint(&workspace.root, &outputs, &key).ok())
+                .flatten();
+            return Ok(TaskResult {
+                outcome,
+                fingerprint,
                 hit: false,
             });
         }
@@ -135,15 +139,15 @@ impl Cache {
             return fallback();
         }
         match self.restore(&workspace.root, &key, &outputs) {
-            Ok(true) => {
+            Ok(Some(fingerprint)) => {
                 eprintln!("qk: cache hit {}", task.id);
                 return Ok(TaskResult {
                     outcome: Outcome::Success,
-                    fingerprint: output_fingerprint(&workspace.root, &outputs, &key).ok(),
+                    fingerprint: Some(fingerprint),
                     hit: true,
                 });
             }
-            Ok(false) => {}
+            Ok(None) => {}
             Err(error) => eprintln!("qk: {}: ignoring unusable cache entry ({error})", task.id),
         }
         eprintln!("qk: cache miss {}", task.id);
@@ -156,23 +160,29 @@ impl Cache {
         };
         let capture = Capture::new(log.as_file().try_clone()?, true);
         let outcome = execute_captured(prepared, cancelled, Some(&capture))?;
-        let fingerprint = self.after(
+        let fingerprint = if !self.unchanged(
             workspace,
             graph,
             task,
             prepared,
             &dependencies,
             &key,
-            &outputs,
             outcome,
             cancelled,
-        );
-        if fingerprint.is_some()
-            && capture.healthy()
-            && let Err(error) = self.publish(&workspace.root, &key, &outputs, log.path())
-        {
-            eprintln!("qk: {}: could not save cache entry ({error})", task.id);
-        }
+        ) {
+            None
+        } else if !capture.healthy() {
+            output_fingerprint(&workspace.root, &outputs, &key).ok()
+        } else {
+            // The saved manifest already hashes every output; reuse it.
+            match self.publish(&workspace.root, &key, &outputs, log.path()) {
+                Ok(fingerprint) => Some(fingerprint),
+                Err(error) => {
+                    eprintln!("qk: {}: could not save cache entry ({error})", task.id);
+                    output_fingerprint(&workspace.root, &outputs, &key).ok()
+                }
+            }
+        };
         Ok(TaskResult {
             outcome,
             fingerprint,
@@ -180,8 +190,9 @@ impl Cache {
         })
     }
 
+    /// Whether a successful task's inputs still match the key it ran under.
     #[allow(clippy::too_many_arguments)]
-    fn after(
+    fn unchanged(
         &self,
         workspace: &Workspace,
         graph: &TaskGraph,
@@ -189,12 +200,11 @@ impl Cache {
         prepared: &PreparedTask,
         dependencies: &BTreeMap<String, String>,
         before: &str,
-        outputs: &paths::Outputs,
         outcome: Outcome,
         cancelled: &AtomicBool,
-    ) -> Option<String> {
+    ) -> bool {
         if outcome != Outcome::Success || cancelled.load(Ordering::SeqCst) {
-            return None;
+            return false;
         }
         let after = hash::fingerprint(
             workspace,
@@ -204,42 +214,96 @@ impl Cache {
             dependencies,
             &self.root,
             cancelled,
-        )
-        .ok()?;
-        if after != before {
+        );
+        if after.as_deref().ok() != Some(before) {
             if task.definition.cache == Some(true) {
                 eprintln!(
                     "qk: {}: not caching because inputs changed during execution",
                     task.id
                 );
             }
-            return None;
+            return false;
         }
-        output_fingerprint(&workspace.root, outputs, before).ok()
+        true
     }
 }
 
-fn output_fingerprint(
-    root: &std::path::Path,
-    outputs: &paths::Outputs,
-    input: &str,
-) -> Result<String> {
-    let mut files = BTreeMap::new();
-    for path in outputs.paths(root)? {
-        let absolute = root.join(&path);
-        let metadata = std::fs::symlink_metadata(&absolute)?;
-        if metadata.file_type().is_symlink() {
-            files.insert(
-                path,
-                serde_json::json!({"link": std::fs::read_link(absolute)?}),
-            );
-        } else if metadata.is_file() {
-            files.insert(path.clone(), hash::file_value(root, &path)?);
-        } else {
-            files.insert(path, serde_json::json!("directory"));
-        }
-    }
+/// Per-output values for dependents' keys. Disk and manifest must agree exactly,
+/// so a dependent's key is the same whether this task was restored or executed.
+pub(crate) fn file_output(content: &str, mode: u32) -> Value {
+    json!({"content": content, "mode": mode})
+}
+
+pub(crate) fn link_output(target: &str) -> Value {
+    json!({"link": target})
+}
+
+pub(crate) fn directory_output() -> Value {
+    json!("directory")
+}
+
+pub(crate) fn combine_outputs(input: &str, files: &BTreeMap<String, Value>) -> Result<String> {
     Ok(blake3::hash(&serde_json::to_vec(&(input, files))?)
         .to_hex()
         .to_string())
+}
+
+fn output_fingerprint(root: &Path, outputs: &paths::Outputs, input: &str) -> Result<String> {
+    let mut files = BTreeMap::new();
+    for path in outputs.paths(root)? {
+        paths::safe_parents(root, &path)?;
+        let absolute = root.join(&path);
+        let metadata = std::fs::symlink_metadata(&absolute)?;
+        let value = if metadata.file_type().is_symlink() {
+            link_output(
+                std::fs::read_link(absolute)?
+                    .to_str()
+                    .context("symlink target must be UTF-8")?,
+            )
+        } else if metadata.is_file() {
+            file_output(&hash::digest_file(&absolute)?, store::mode(&metadata))
+        } else {
+            directory_output()
+        };
+        files.insert(path, value);
+    }
+    combine_outputs(input, &files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_and_disk_output_fingerprints_agree() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        std::fs::create_dir_all(root.join("dist/nested/empty")).unwrap();
+        std::fs::write(root.join("dist/nested/a.txt"), "a").unwrap();
+        std::fs::write(root.join("dist/b.bin"), [0, 1, 2]).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let script = root.join("dist/run.sh");
+            std::fs::write(&script, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::os::unix::fs::symlink("nested/a.txt", root.join("dist/link")).unwrap();
+        }
+        let log = root.join("log");
+        std::fs::write(&log, "").unwrap();
+
+        let cache = Cache {
+            root: root.join(".qk/cache"),
+        };
+        cache.initialize().unwrap();
+        let outputs = paths::Outputs::from_patterns(&["dist"]);
+        let key = "0".repeat(64);
+        let saved = cache.publish(root, &key, &outputs, &log).unwrap();
+        assert_eq!(saved, output_fingerprint(root, &outputs, &key).unwrap());
+
+        std::fs::remove_dir_all(root.join("dist")).unwrap();
+        let restored = cache.restore(root, &key, &outputs).unwrap();
+        assert_eq!(restored, Some(saved.clone()));
+        assert_eq!(saved, output_fingerprint(root, &outputs, &key).unwrap());
+    }
 }

@@ -128,6 +128,21 @@ pub struct Outputs {
 }
 
 impl Outputs {
+    /// Outputs from already-expanded patterns, for tests without a workspace.
+    #[cfg(test)]
+    pub fn from_patterns(patterns: &[&str]) -> Self {
+        Self {
+            patterns: patterns
+                .iter()
+                .map(|pattern| matcher(pattern).unwrap())
+                .collect(),
+            anchors: patterns
+                .iter()
+                .map(|pattern| (*pattern).to_owned())
+                .collect(),
+        }
+    }
+
     pub fn new(workspace: &Workspace, task: &Task) -> Result<Self> {
         let mut patterns = Vec::new();
         let mut anchors = BTreeSet::new();

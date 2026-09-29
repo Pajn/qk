@@ -17,6 +17,11 @@ fn process_helper() {
         .unwrap_or(0);
     fs::write(&counter, (runs + 1).to_string()).unwrap();
     let input = fs::read_to_string("src/input.txt").unwrap();
+    if mode == "generate" {
+        fs::create_dir_all("generated").unwrap();
+        fs::write("generated/value.txt", format!("generated:{input}")).unwrap();
+        return;
+    }
     fs::create_dir_all("dist/nested").unwrap();
     fs::write("dist/nested/out.txt", format!("built:{input}")).unwrap();
     println!("building from {}", input.trim());
@@ -55,17 +60,21 @@ struct Fixture {
 
 impl Fixture {
     fn new(target: Value) -> Self {
+        Self::with_targets(json!({"build": target}))
+    }
+
+    fn with_targets(targets: Value) -> Self {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("repo");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("nx.json"), "{}").unwrap();
         fs::write(
             root.join("project.json"),
-            json!({"name": "app", "targets": {"build": target}}).to_string(),
+            json!({"name": "app", "targets": targets}).to_string(),
         )
         .unwrap();
         fs::write(root.join("src/input.txt"), "one\n").unwrap();
-        fs::write(root.join(".gitignore"), "dist/\n.qk/\n").unwrap();
+        fs::write(root.join(".gitignore"), "dist/\ngenerated/\n.qk/\n").unwrap();
         let git_config = temp.path().join("gitconfig");
         fs::write(&git_config, "").unwrap();
         let fixture = Self {
@@ -326,4 +335,28 @@ fn declared_inputs_limit_invalidation() {
         .unwrap();
     success(flavored);
     assert_eq!(fixture.runs(), 2);
+}
+
+#[test]
+fn restored_dependencies_keep_dependents_cached() {
+    let fixture = Fixture::with_targets(json!({
+        "generate": target("generate", json!({"outputs": ["{projectRoot}/generated"]})),
+        "build": target("build", json!({"dependsOn": ["generate"]})),
+    }));
+    let first = success(fixture.build(&fixture.root, &[]));
+    assert!(stderr(&first).contains("qk: cache miss app:generate"));
+    assert!(stderr(&first).contains("qk: cache miss app:build"));
+    assert_eq!(fixture.runs(), 2);
+
+    // The dependency's restored fingerprint must match the one its dependent was keyed on.
+    fs::remove_dir_all(fixture.root.join("generated")).unwrap();
+    fs::remove_dir_all(fixture.root.join("dist")).unwrap();
+    let second = success(fixture.build(&fixture.root, &[]));
+    assert!(stderr(&second).contains("qk: cache hit app:generate"));
+    assert!(stderr(&second).contains("qk: cache hit app:build"));
+    assert_eq!(fixture.runs(), 2);
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("generated/value.txt")).unwrap(),
+        "generated:one\n"
+    );
 }

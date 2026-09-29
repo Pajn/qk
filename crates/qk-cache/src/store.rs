@@ -11,8 +11,9 @@ use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
 use crate::{
-    Cache,
+    Cache, combine_outputs, directory_output, file_output,
     hash::digest_file,
+    link_output,
     paths::{self, Outputs},
 };
 
@@ -32,7 +33,26 @@ enum Artifact {
     Symlink { target: String, directory: bool },
 }
 
-fn mode(metadata: &fs::Metadata) -> u32 {
+impl Manifest {
+    /// The output fingerprint of the stored artifacts, without reading any file.
+    fn output_fingerprint(&self) -> Result<String> {
+        let files = self
+            .artifacts
+            .iter()
+            .map(|(path, artifact)| {
+                let value = match artifact {
+                    Artifact::File { blob, mode } => file_output(blob, *mode),
+                    Artifact::Directory { .. } => directory_output(),
+                    Artifact::Symlink { target, .. } => link_output(target),
+                };
+                (path.clone(), value)
+            })
+            .collect();
+        combine_outputs(&self.key, &files)
+    }
+}
+
+pub(crate) fn mode(metadata: &fs::Metadata) -> u32 {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -129,13 +149,24 @@ impl Cache {
     }
 
     fn put_blob(&self, source: &Path) -> Result<String> {
-        let mut temporary = NamedTempFile::new_in(self.root.join("tmp"))?;
-        std::io::copy(&mut File::open(source)?, temporary.as_file_mut())?;
-        temporary.as_file().sync_all()?;
-        let hash = digest_file(temporary.path())?;
+        // fs::copy clones on copy-on-write filesystems when source and cache share
+        // a volume, and falls back to a byte copy otherwise. Cloning needs a fresh
+        // destination path, so copy into a private directory rather than a temp file.
+        let staging = tempfile::tempdir_in(self.root.join("tmp"))?;
+        let temporary = staging.path().join("blob");
+        fs::copy(source, &temporary)?;
+        // Blobs keep no meaningful mode of their own; restores apply the manifest's.
+        set_mode(&temporary, if cfg!(unix) { 0o644 } else { 0 })?;
+        File::open(&temporary)?.sync_all()?;
+        // Hash the copy, not the source, so a concurrent write cannot mislabel the blob.
+        let hash = digest_file(&temporary)?;
         let target = self.root.join("blobs").join(&hash);
-        if digest_file(&target).ok().as_ref() != Some(&hash) {
-            temporary.persist(target)?;
+        // Replacing is atomic and cheaper than re-reading an existing blob. Where an
+        // open blob cannot be replaced, keep it: restores verify it before use.
+        if let Err(error) = fs::rename(&temporary, &target)
+            && !target.is_file()
+        {
+            return Err(error.into());
         }
         Ok(hash)
     }
@@ -146,7 +177,7 @@ impl Cache {
         key: &str,
         outputs: &Outputs,
         log: &Path,
-    ) -> Result<()> {
+    ) -> Result<String> {
         let mut artifacts = BTreeMap::new();
         for path in outputs.paths(root)? {
             paths::safe_parents(root, &path)?;
@@ -187,13 +218,19 @@ impl Cache {
         file.flush()?;
         file.as_file().sync_all()?;
         file.persist(self.root.join("entries").join(format!("{key}.json")))?;
-        Ok(())
+        manifest.output_fingerprint()
     }
 
-    pub(crate) fn restore(&self, root: &Path, key: &str, outputs: &Outputs) -> Result<bool> {
+    /// Restores an entry's outputs and log, returning its output fingerprint.
+    pub(crate) fn restore(
+        &self,
+        root: &Path,
+        key: &str,
+        outputs: &Outputs,
+    ) -> Result<Option<String>> {
         let file = match File::open(self.root.join("entries").join(format!("{key}.json"))) {
             Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
         let manifest: Manifest = serde_json::from_reader(file)?;
@@ -233,6 +270,7 @@ impl Cache {
                     if digest_file(&source)? != *blob {
                         bail!("corrupt cached artifact");
                     }
+                    // A clone where supported: edits to the restored file never reach the blob.
                     fs::copy(source, &destination)?;
                     set_mode(&destination, *mode)?;
                 }
@@ -285,6 +323,6 @@ impl Cache {
             }
         }
         qk_executor::replay(File::open(log)?)?;
-        Ok(true)
+        manifest.output_fingerprint().map(Some)
     }
 }
