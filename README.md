@@ -248,10 +248,14 @@ Supported executors:
   workspace root, beneath `env`, and `color: true` sets `FORCE_COLOR=true`.
   `tty`, `usePty`, `streamOutput` and `verbose` are accepted and have no
   effect: qk never gives commands a terminal, and Nx sets the others itself.
-- `nx:run-script`: invokes `npm run` or `pnpm run` in the project directory,
-  preserving the package manager's script behavior. The manager comes from
-  root `packageManager`, then pnpm workspace/lockfile markers, otherwise npm.
-  Other declared managers are rejected. Missing scripts fail during execution
+- `nx:run-script`: runs the script with the workspace's package manager in
+  the project directory, as Nx does: `npm run <script> -- <args>`, `pnpm run
+  <script> <args>`, `yarn <script> <args>` or `bun run <script> -- <args>`.
+  The manager is detected as in Nx: nx.json `cli.packageManager`, then the
+  lockfile (`bun.lockb` or `bun.lock`, `yarn.lock`, `pnpm-lock.yaml`,
+  `package-lock.json`), then, which Nx does not read, the root
+  `packageManager` or a `pnpm-workspace.yaml`, then the manager qk was
+  invoked through (`npm_config_user_agent`), else npm. Missing scripts fail during execution
   preflight, after explicit project target overrides have been applied.
 - `nx:noop`: completes successfully after its dependencies, without a process.
 

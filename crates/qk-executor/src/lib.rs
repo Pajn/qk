@@ -369,20 +369,21 @@ pub fn prepare(
             }
             let manager = package_manager(workspace)?;
             let args = interpolation.arguments()?;
-            let separator = if manager == "npm" && !args.is_empty() {
-                " --"
-            } else {
-                ""
+            let script = interpolate::quote(script)?;
+            // Nx's `run` for each: npm and bun need `--` before arguments,
+            // and yarn runs a script by name.
+            let mut command = match manager {
+                "yarn" => format!("yarn {script}"),
+                manager => format!("{manager} run {script}"),
             };
-            commands.push(format!(
-                "{manager} run {}{separator}{}",
-                interpolate::quote(script)?,
-                if args.is_empty() {
-                    String::new()
-                } else {
-                    format!(" {args}")
+            if !args.is_empty() {
+                if matches!(manager, "npm" | "bun") {
+                    command.push_str(" --");
                 }
-            ));
+                command.push(' ');
+                command.push_str(&args);
+            }
+            commands.push(command);
         }
         "nx:run-commands" => {
             if options.contains_key("command") && options.contains_key("commands") {
@@ -599,22 +600,51 @@ fn boolean(value: Option<&Value>, default: bool, name: &str) -> Result<bool> {
         .map(|value| value.unwrap_or(default))
 }
 
+/// The package manager, as Nx detects it: nx.json `cli.packageManager`,
+/// then the lockfile, then the package manager qk was invoked through. qk
+/// also reads the root `packageManager` before that last step.
 fn package_manager(workspace: &Workspace) -> Result<&'static str> {
-    let declared = workspace
-        .package_manager
-        .as_deref()
-        .map(|value| value.split('@').next().unwrap_or(value));
-    match declared {
-        Some("pnpm") => Ok("pnpm"),
-        Some("npm") => Ok("npm"),
-        Some(other) => bail!(
-            "package manager {other:?} is not supported yet; run-script supports npm and pnpm"
-        ),
-        None if workspace.root.join("pnpm-workspace.yaml").is_file()
-            || workspace.root.join("pnpm-lock.yaml").is_file() =>
-        {
-            Ok("pnpm")
-        }
-        None => Ok("npm"),
+    let known = |name: &str| -> Result<&'static str> {
+        Ok(match name {
+            "npm" => "npm",
+            "pnpm" => "pnpm",
+            "yarn" => "yarn",
+            "bun" => "bun",
+            other => bail!("unknown package manager {other:?}"),
+        })
+    };
+    if let Some(name) = workspace
+        .config
+        .extra
+        .get("cli")
+        .and_then(|cli| cli.get("packageManager"))
+        .and_then(Value::as_str)
+    {
+        return known(name);
     }
+    let root = &workspace.root;
+    for (file, manager) in [
+        ("bun.lockb", "bun"),
+        ("bun.lock", "bun"),
+        ("yarn.lock", "yarn"),
+        ("pnpm-lock.yaml", "pnpm"),
+        ("package-lock.json", "npm"),
+    ] {
+        if root.join(file).is_file() {
+            return Ok(manager);
+        }
+    }
+    if let Some(declared) = &workspace.package_manager {
+        return known(declared.split('@').next().unwrap_or(declared));
+    }
+    if root.join("pnpm-workspace.yaml").is_file() {
+        return Ok("pnpm");
+    }
+    let agent = std::env::var("npm_config_user_agent").unwrap_or_default();
+    for manager in ["pnpm", "yarn", "bun"] {
+        if agent.starts_with(&format!("{manager}/")) {
+            return Ok(manager);
+        }
+    }
+    Ok("npm")
 }

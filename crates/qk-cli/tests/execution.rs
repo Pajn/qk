@@ -335,7 +335,7 @@ fn argument_tokens_and_forwarding_preserve_data_without_shell_execution() {
 #[test]
 fn script_executor_uses_package_manager_and_forwards_arguments() {
     use std::os::unix::fs::PermissionsExt;
-    for manager in ["npm", "pnpm"] {
+    for manager in ["npm", "pnpm", "yarn", "bun"] {
         let temp = fixture(json!({"test":{}}));
         fs::write(
             temp.path().join("package.json"),
@@ -359,10 +359,10 @@ fn script_executor_uses_package_manager_and_forwards_arguments() {
             temp.path(),
             &["run", "app:test", "--", "--flag", "two words"],
         ));
-        let expected = if manager == "npm" {
-            "run\ntest\n--\n--flag\ntwo words\n"
-        } else {
-            "run\ntest\n--flag\ntwo words\n"
+        let expected = match manager {
+            "npm" | "bun" => "run\ntest\n--\n--flag\ntwo words\n",
+            "yarn" => "test\n--flag\ntwo words\n",
+            _ => "run\ntest\n--flag\ntwo words\n",
         };
         assert_eq!(
             fs::read_to_string(temp.path().join("manager-args")).unwrap(),
@@ -992,4 +992,51 @@ fn command_shapes_and_exit_codes_follow_nx() {
         run(temp.path(), &["run", "app:single"]).status.code(),
         Some(4)
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn the_package_manager_is_detected_like_nx() {
+    use std::os::unix::fs::PermissionsExt;
+    // nx.json cli.packageManager, then the lockfile, then packageManager.
+    for (nx, lockfile, declared, expected) in [
+        (Some("yarn"), Some("pnpm-lock.yaml"), None, "yarn"),
+        (None, Some("bun.lock"), Some("pnpm@9.0.0"), "bun"),
+        (None, Some("yarn.lock"), None, "yarn"),
+        (None, None, Some("pnpm@9.0.0"), "pnpm"),
+        (None, None, None, "npm"),
+    ] {
+        let temp = fixture(json!({"test": {}}));
+        let mut config = json!({});
+        if let Some(nx) = nx {
+            config["cli"] = json!({"packageManager": nx});
+        }
+        fs::write(temp.path().join("nx.json"), config.to_string()).unwrap();
+        if let Some(lockfile) = lockfile {
+            fs::write(temp.path().join(lockfile), "").unwrap();
+        }
+        let mut package = json!({"name": "app", "scripts": {"test": "unused"}});
+        if let Some(declared) = declared {
+            package["packageManager"] = json!(declared);
+        }
+        fs::write(temp.path().join("package.json"), package.to_string()).unwrap();
+        let bin = temp.path().join("node_modules/.bin");
+        fs::create_dir_all(&bin).unwrap();
+        for manager in ["npm", "pnpm", "yarn", "bun"] {
+            let path = bin.join(manager);
+            fs::write(&path, format!("#!/bin/sh\necho {manager}\n")).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let output = success(
+            command(temp.path(), &["run", "app:test"])
+                .env_remove("npm_config_user_agent")
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            expected,
+            "{nx:?} {lockfile:?} {declared:?}"
+        );
+    }
 }
