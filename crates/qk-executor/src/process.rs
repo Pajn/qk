@@ -156,6 +156,7 @@ fn spawn(task: &PreparedTask, text: &str, capture: bool) -> Result<GroupChild> {
         .current_dir(&task.cwd)
         .env_clear()
         .envs(&task.env)
+        .envs(&task.execution)
         .stdin(Stdio::null())
         .stdout(if capture {
             Stdio::piped()

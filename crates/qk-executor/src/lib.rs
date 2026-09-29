@@ -33,6 +33,9 @@ pub struct PreparedTask {
     pub parallel: bool,
     pub cwd: PathBuf,
     pub env: BTreeMap<OsString, OsString>,
+    /// Variables set for the process after `env` that are not part of what
+    /// the task is: nothing reads them to key it, such as a thread count.
+    pub execution: BTreeMap<OsString, OsString>,
     /// How the task's output is shown; the runner sets it per output style.
     pub display: Display,
 }
@@ -362,6 +365,7 @@ pub fn prepare(
         parallel,
         cwd,
         env,
+        execution: BTreeMap::new(),
         display: Display::default(),
     })
 }

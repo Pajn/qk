@@ -72,6 +72,9 @@ pub fn record(
                 warm: record
                     .and_then(|record| record.warm.as_ref())
                     .and_then(|warm| serde_json::to_value(warm).ok()),
+                threads: record
+                    .and_then(|record| record.threads)
+                    .map(|threads| threads as u64),
             }
         })
         .collect();
@@ -259,6 +262,13 @@ pub fn show_task(
         }
         if let Some(warm) = record.warm.as_ref().and_then(warm_line) {
             writeln!(out, "      {warm}")?;
+        }
+        if let Some(threads) = record.threads {
+            writeln!(
+                out,
+                "      ran with {threads} thread{}",
+                if threads == 1 { "" } else { "s" }
+            )?;
         }
     }
     Ok(())

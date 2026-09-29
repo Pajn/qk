@@ -1141,3 +1141,126 @@ fn parallel_defaults_to_the_workspace_setting() {
     fs::write(fixture.root.join("nx.local.json"), r#"{"parallel": 1}"#).unwrap();
     assert_eq!(parallel(&fixture), "1");
 }
+
+fn threaded(command: &str, threads: Value) -> Value {
+    json!({"command": format!("mkdir -p dist && {command}"), "qk:threads": threads})
+}
+
+#[cfg(unix)]
+#[test]
+fn threaded_tasks_share_the_cores() {
+    let task = |name: &str| {
+        threaded(
+            &format!("echo $QK_THREADS $WORKERS > dist/{name}"),
+            json!({"env": {"WORKERS": "--maxWorkers={threads}"}}),
+        )
+    };
+    let fixture = Fixture::with_targets(json!({"a": task("a"), "b": task("b"), "c": task("c")}));
+    let output = success(fixture.qk(
+        &fixture.root,
+        &[
+            "run-many",
+            "-t",
+            "a,b,c",
+            "--parallel",
+            "3",
+            "--cores",
+            "8",
+            "--output-style",
+            "quiet",
+        ],
+    ));
+    for name in ["a", "b", "c"] {
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("dist").join(name)).unwrap(),
+            "2 --maxWorkers=2\n"
+        );
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Threads of 8 cores: app:a 2, app:b 2, app:c 2"),
+        "{stderr}"
+    );
+    success(fixture.qk(&fixture.root, &["run", "app:a", "--cores", "8"]));
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("dist/a")).unwrap(),
+        "8 --maxWorkers=8\n"
+    );
+    let text = stdout(&success(
+        fixture.qk(&fixture.root, &["show", "task", "app:a"]),
+    ));
+    assert!(text.contains("ran with 8 threads"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_threaded_task_waits_for_its_minimum() {
+    let task = |name: &str| {
+        threaded(
+            &format!(
+                "if [ -e dist/running ]; then echo overlap; fi; touch dist/running; sleep 0.3; rm dist/running; echo $QK_THREADS > dist/{name}"
+            ),
+            json!({"min": 3}),
+        )
+    };
+    let fixture = Fixture::with_targets(json!({"a": task("a"), "b": task("b")}));
+    let output = success(fixture.qk(
+        &fixture.root,
+        &[
+            "run-many",
+            "-t",
+            "a,b",
+            "--parallel",
+            "2",
+            "--cores",
+            "4",
+            "--output-style",
+            "static",
+        ],
+    ));
+    assert!(!stdout(&output).contains("overlap"), "{}", stdout(&output));
+    // The first starts with its minimum; the second with every core once it is free.
+    let threads = |name: &str| fs::read_to_string(fixture.root.join("dist").join(name)).unwrap();
+    assert_eq!((threads("a"), threads("b")), ("3\n".into(), "4\n".into()));
+}
+
+#[test]
+fn the_thread_count_is_not_part_of_the_key() {
+    let fixture = Fixture::new(json!({
+        "command": "echo built",
+        "cache": true,
+        "inputs": ["{projectRoot}/src/**/*"],
+        "qk:threads": true
+    }));
+    success(fixture.build(&fixture.root, &["--cores", "8"]));
+    let output =
+        success(fixture.build(&fixture.root, &["--cores", "2", "--output-style", "static"]));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cache hit app:build"));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_threaded_task_leaves_cores_for_the_work_still_to_come() {
+    let fixture = Fixture::with_targets(json!({
+        "tests": threaded("echo $QK_THREADS > dist/tests", json!(true)),
+        "codegen": {"command": "sleep 0.2"},
+        "tsc": {"command": "true", "dependsOn": ["codegen"]}
+    }));
+    success(fixture.qk(
+        &fixture.root,
+        &[
+            "run-many",
+            "-t",
+            "tests,tsc",
+            "--parallel",
+            "3",
+            "--cores",
+            "4",
+        ],
+    ));
+    // Two of the three slots can still be taken by codegen and tsc.
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("dist/tests")).unwrap(),
+        "2\n"
+    );
+}

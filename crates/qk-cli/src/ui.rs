@@ -348,6 +348,7 @@ pub fn summary(
     result: &RunResult,
     report: &RunReport,
     parallel: usize,
+    cores: usize,
     warnings: &[String],
     paint: Paint,
 ) -> String {
@@ -423,6 +424,18 @@ pub fn summary(
                 if warm.len() == 1 { "" } else { "s" }
             )),
             list(&warm)
+        ));
+    }
+    let threaded: Vec<String> = report
+        .tasks
+        .iter()
+        .filter_map(|task| Some(format!("{} {}", task.id, task.threads?)))
+        .collect();
+    if !threaded.is_empty() {
+        lines.push(format!(
+            "{} {}",
+            paint.dim(&format!("Threads of {cores} cores:")),
+            threaded.join(", ")
         ));
     }
     let path = &report.critical_path;
@@ -586,6 +599,7 @@ mod tests {
             cache: qk_cache::CacheStatus::Miss,
             key: None,
             warm: None,
+            threads: None,
         };
         let report = |id: &str, started: u64, ended: u64, dependencies: &[&str]| TaskReport {
             id: id.into(),
@@ -600,6 +614,7 @@ mod tests {
             dependencies: dependencies.iter().map(|id| (*id).to_owned()).collect(),
             cause: None,
             warm: None,
+            threads: None,
         };
         let result = RunResult {
             outcomes: BTreeMap::new(),
@@ -634,7 +649,7 @@ mod tests {
 
     fn verdict(wait: u64, load: f32) -> String {
         let (result, report) = run(wait, load);
-        let summary = summary(&result, &report, 4, &[], Paint(false));
+        let summary = summary(&result, &report, 4, 8, &[], Paint(false));
         summary
             .lines()
             .find(|line| line.starts_with("Parallel"))
@@ -660,11 +675,11 @@ mod tests {
     #[test]
     fn names_the_tasks_that_started_from_warm_state() {
         let (result, mut report) = run(0, 0.3);
-        assert!(!summary(&result, &report, 4, &[], Paint(false)).contains("warm"));
+        assert!(!summary(&result, &report, 4, 8, &[], Paint(false)).contains("warm"));
         report.tasks[1].warm = Some(serde_json::json!({
             "restored": {"source": "remote main", "groups": 1, "files": 3, "bytes": 10}
         }));
-        let text = summary(&result, &report, 4, &[], Paint(false));
+        let text = summary(&result, &report, 4, 8, &[], Paint(false));
         assert!(
             text.contains("1 task started from warm state: app:b"),
             "{text}"

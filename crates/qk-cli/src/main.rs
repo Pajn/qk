@@ -103,6 +103,10 @@ struct RunOptions {
     /// `parallel`, then 3.
     #[arg(long, env = "NX_PARALLEL")]
     parallel: Option<std::num::NonZeroUsize>,
+    /// Cores the run's tasks share; defaults to nx.json `qk:cores`, then the
+    /// cores available to qk.
+    #[arg(long, env = "QK_CORES")]
+    cores: Option<std::num::NonZeroUsize>,
     /// Print the task graph as JSON without executing commands or loading dotenv.
     #[arg(long)]
     dry_run: bool,
@@ -788,11 +792,27 @@ fn execute_tasks(
         },
         std::num::NonZeroUsize::get,
     );
+    let cores = options.cores.map_or_else(
+        || {
+            workspace
+                .config
+                .extra
+                .get("qk:cores")
+                .and_then(serde_json::Value::as_u64)
+                .filter(|cores| *cores > 0)
+                .map_or_else(
+                    || std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+                    |cores| cores as usize,
+                )
+        },
+        std::num::NonZeroUsize::get,
+    );
     let started = std::time::SystemTime::now();
     let result = qk_runner::run(
         workspace,
         &graph,
         parallel,
+        cores,
         options.skip_cache,
         style,
         cancelled,
@@ -829,6 +849,7 @@ fn execute_tasks(
             &result,
             &report,
             parallel,
+            cores,
             &ui::warnings(&sink),
             ui::Paint::stderr(),
         );

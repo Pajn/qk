@@ -167,14 +167,13 @@ impl Cache {
         };
         // The warm variables point tools at their state; they are not inputs,
         // so the key is computed from the task without them.
-        let warm_prepared = warm.as_ref().map(|warm| {
-            let mut prepared = prepared.clone();
+        let mut running = prepared.clone();
+        if let Some(warm) = &warm {
             for (name, value) in &warm.env {
-                prepared.env.insert(name.into(), value.into());
+                running.execution.insert(name.into(), value.into());
             }
-            prepared
-        });
-        let running = warm_prepared.as_ref().unwrap_or(prepared);
+        }
+        let running = &running;
         let before = || -> Option<warm::Restored> {
             let warm = warm.as_ref()?;
             match self

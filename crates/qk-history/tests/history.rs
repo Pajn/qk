@@ -24,6 +24,7 @@ fn task(
         dependencies: dependencies.iter().map(|id| (*id).to_owned()).collect(),
         cause: None,
         warm: None,
+        threads: None,
     }
 }
 

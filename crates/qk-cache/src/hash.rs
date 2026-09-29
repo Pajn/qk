@@ -872,6 +872,7 @@ pub fn inputs(
     // Warm state configuration never changes a result.
     let mut definition = task.definition.clone();
     definition.extra.remove("qk:warm");
+    definition.extra.remove("qk:threads");
     let hash = json!({
         "schema":"qk-local-v1", "qk":env!("CARGO_PKG_VERSION"),
         "platform":[std::env::consts::OS, std::env::consts::ARCH], "workspace":snapshot.workspace_prefix,

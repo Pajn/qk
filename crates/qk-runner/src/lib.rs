@@ -18,6 +18,9 @@ use qk_executor::report::{self, Event};
 use qk_executor::{Display, Outcome, OutputStyle, environment, execute, prepare};
 use qk_taskgraph::TaskGraph;
 
+pub mod threads;
+use threads::Threads;
+
 pub struct RunResult {
     pub outcomes: BTreeMap<String, Outcome>,
     pub skipped: BTreeSet<String>,
@@ -42,18 +45,21 @@ pub struct TaskRecord {
     pub key: Option<(String, serde_json::Value)>,
     /// What warm state did, for targets that keep it.
     pub warm: Option<qk_cache::warm::WarmReport>,
+    /// The threads it was given, for targets with `qk:threads`.
+    pub threads: Option<usize>,
 }
 
 pub fn run(
     workspace: &Workspace,
     graph: &TaskGraph,
     parallel: usize,
+    cores: usize,
     skip_cache: bool,
     style: OutputStyle,
     cancelled: Arc<AtomicBool>,
 ) -> Result<RunResult> {
-    if parallel == 0 {
-        bail!("parallel must be at least 1");
+    if parallel == 0 || cores == 0 {
+        bail!("parallel and cores must be at least 1");
     }
     // The runner's own environment includes the root dotenv files, which is
     // where remote cache credentials arrive; each task loads its own dotenv
@@ -74,6 +80,16 @@ pub fn run(
                 })
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
+    let threads: BTreeMap<String, Threads> = graph
+        .tasks
+        .iter()
+        .filter_map(|(id, task)| {
+            Threads::config(task)
+                .with_context(|| format!("invalid qk:threads for {id}"))
+                .transpose()
+                .map(|threads| threads.map(|threads| (id.clone(), threads)))
+        })
+        .collect::<Result<_>>()?;
     let continuous: BTreeSet<_> = graph
         .tasks
         .iter()
@@ -112,6 +128,9 @@ pub fn run(
     let mut started = BTreeMap::new();
     let mut ready = BTreeMap::new();
     let mut records = BTreeMap::new();
+    // Cores held by each running finite task, and the threads each was given.
+    let mut held: BTreeMap<String, usize> = BTreeMap::new();
+    let mut given: BTreeMap<String, usize> = BTreeMap::new();
     let (sender, receiver) = mpsc::channel();
     report::event(Event::Planned {
         tasks: graph.tasks.len(),
@@ -137,6 +156,29 @@ pub fn run(
         let result = (|| -> Result<()> {
             while !pending.is_empty() || !active.is_empty() {
                 let mut waiting_now = false;
+                let dependencies_done = |id: &String| {
+                    graph.tasks[id].dependencies.iter().all(|dependency| {
+                        outcomes.get(dependency) == Some(&Outcome::Success)
+                            || (continuous.contains(dependency) && active.contains(dependency))
+                    })
+                };
+                // The finite tasks that could start in this pass, which the
+                // threaded ones among them share the free cores with.
+                let finite_pending = pending.difference(&continuous).count();
+                let ready_threaded = pending
+                    .iter()
+                    .filter(|id| threads.contains_key(*id) && dependencies_done(id))
+                    .count();
+                // Threaded tasks starting in this pass split the free cores
+                // evenly, after a core for each slot other pending tasks could
+                // take, so one starting alone does not hold up what follows.
+                let even = {
+                    let slots = parallel.saturating_sub(active.difference(&continuous).count());
+                    let sharing = ready_threaded.min(slots).max(1);
+                    let reserved =
+                        (finite_pending - ready_threaded).min(slots.saturating_sub(sharing));
+                    Threads::even(cores.saturating_sub(held.values().sum()), sharing, reserved)
+                };
                 if cancelled.load(Ordering::SeqCst) {
                     skipped.append(&mut pending);
                     exit_code = 130;
@@ -170,6 +212,20 @@ pub fn run(
                         waiting_now = true;
                         continue;
                     }
+                    if !is_continuous {
+                        let free = cores.saturating_sub(held.values().sum());
+                        let cores_for = match threads.get(&id) {
+                            Some(threads) => threads.share(cores, even, free, held.is_empty()),
+                            None => (free > 0 || held.is_empty()).then_some(1),
+                        };
+                        let Some(cores_for) = cores_for else {
+                            continue;
+                        };
+                        held.insert(id.clone(), cores_for);
+                        if threads.contains_key(&id) {
+                            given.insert(id.clone(), cores_for);
+                        }
+                    }
                     pending.remove(&id);
                     active.insert(id.clone());
                     started.insert(id.clone(), SystemTime::now());
@@ -197,6 +253,10 @@ pub fn run(
                         checking: cache.is_some(),
                     });
                     let definition = &graph.tasks[&id];
+                    let mut task = task.clone();
+                    if let (Some(threads), Some(count)) = (threads.get(&id), given.get(&id)) {
+                        task.execution.extend(threads.environment(*count));
+                    }
                     let dependency_keys = dependencies
                         .iter()
                         .map(|id| (id.clone(), fingerprints[id].clone()))
@@ -209,12 +269,12 @@ pub fn run(
                                 workspace,
                                 graph,
                                 definition,
-                                task,
+                                &task,
                                 &dependency_keys,
                                 &cancelled,
                             )
                         } else {
-                            execute(task, &cancelled).map(|outcome| {
+                            execute(&task, &cancelled).map(|outcome| {
                                 qk_cache::TaskResult::uncached(outcome, "cache disabled".into())
                             })
                         };
@@ -253,6 +313,7 @@ pub fn run(
                     Ok((id, result)) => {
                         active.remove(&id);
                         stops.remove(&id);
+                        held.remove(&id);
                         let (outcome, cache, key, warm) = match result {
                             Ok(result) => {
                                 if !continuous.contains(&id) {
@@ -301,6 +362,7 @@ pub fn run(
                                 cache,
                                 key,
                                 warm,
+                                threads: given.remove(&id),
                             },
                         );
                         outcomes.insert(id, outcome);
