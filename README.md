@@ -237,9 +237,10 @@ Supported executors:
   unless an argument of the same name overrides it; object values are
   ignored. A task argument naming a run-commands option sets it rather than
   reaching the command: `-- --args='--watch'`, `--cwd=dir`, `--no-parallel`,
-  `--env.NAME=value`. The options Nx knows but qk does not implement
-  (`readyWhen`, `envFile`, `color`, `usePty`, `streamOutput`, `tty`,
-  `verbose`) are rejected.
+  `--env.NAME=value`. `readyWhen`, a string or an array, is described with
+  continuous tasks below. The options Nx knows but qk does not implement
+  (`envFile`, `color`, `usePty`, `streamOutput`, `tty`, `verbose`) are
+  rejected.
 - `nx:run-script`: invokes `npm run` or `pnpm run` in the project directory,
   preserving the package manager's script behavior. The manager comes from
   root `packageManager`, then pnpm workspace/lockfile markers, otherwise npm.
@@ -314,6 +315,18 @@ a cancelled command, once all of them have finished; that stop counts as
 success. A continuous task that exits by itself reports its exit status as
 usual. Continuous tasks are never cached, and cacheable tasks depending on one
 run uncached.
+
+With `readyWhen`, a string or an array of strings, a task is ready once every
+string has appeared in its output, on stdout or stderr. Its dependents start
+then, while its commands keep running, and qk stops it, as a success, once
+nothing still to run needs it. A requested task with `readyWhen` is done once
+ready, as in Nx, unless it is also continuous. Such a task holds a
+`--parallel` slot until it is ready, and a continuous one uses `readyWhen` to
+hold its dependents back until then. A task whose commands exit before it is
+ready ends with their status. With `commands`, `readyWhen` requires
+`parallel`. These tasks are not cached, since their commands outlive any
+result. Unlike Nx, which counts text on stderr as a failure, either stream
+makes a task ready.
 
 A target with `parallelism: false` runs alone, as in Nx: it waits until no
 other task runs, continuous ones included, and nothing starts while it runs.

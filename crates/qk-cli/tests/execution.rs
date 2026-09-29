@@ -822,3 +822,41 @@ fn arguments_naming_run_commands_options_set_them() {
     ));
     assert_eq!(String::from_utf8(output.stdout).unwrap(), "sub cli\n");
 }
+
+#[cfg(unix)]
+#[test]
+fn ready_when_starts_dependents_once_the_output_appears() {
+    let temp = fixture(json!({
+        // The marker is written just before the ready text.
+        "serve": {"command": "sleep 0.3; touch marker; echo 'listening on :3000'; sleep 30", "options": {"readyWhen": "listening"}},
+        "watch": {"command": "sleep 0.3; touch watched; echo up; sleep 30", "continuous": true, "options": {"readyWhen": ["up"]}},
+        "e2e": {"command": "test -e marker && test -e watched && echo e2e saw both", "dependsOn": ["serve", "watch"]},
+        "both": {"command": "echo one; echo two >&2; sleep 30", "options": {"readyWhen": ["one", "two"]}},
+        "crash": {"command": "exit 3", "options": {"readyWhen": "never"}},
+        "after": {"command": "echo after", "dependsOn": ["crash"]},
+        "serial": {"executor": "nx:run-commands", "options": {"commands": ["echo a"], "readyWhen": "a", "parallel": false}}
+    }));
+    let started = Instant::now();
+    let output = success(run(
+        temp.path(),
+        &["run", "app:e2e", "--output-style", "static"],
+    ));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("e2e saw both"));
+    // Both were stopped once nothing needed them.
+    assert!(started.elapsed() < Duration::from_secs(15));
+    // Requested directly, the task is done once ready.
+    let started = Instant::now();
+    success(run(temp.path(), &["run", "app:both"]));
+    assert!(started.elapsed() < Duration::from_secs(15));
+    let crashed = run(
+        temp.path(),
+        &["run", "app:after", "--output-style", "static"],
+    );
+    assert_eq!(crashed.status.code(), Some(3));
+    assert!(!String::from_utf8_lossy(&crashed.stdout).contains("after\n"));
+    let serial = run(temp.path(), &["run", "app:serial"]);
+    assert!(
+        String::from_utf8_lossy(&serial.stderr)
+            .contains("readyWhen can only be used when parallel is true")
+    );
+}

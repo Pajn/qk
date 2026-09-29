@@ -102,6 +102,24 @@ pub fn run(
         .filter(|(_, task)| task.definition.parallelism == Some(false))
         .map(|(id, _)| id.clone())
         .collect();
+    // Tasks with readyWhen run like continuous ones: their dependents start
+    // once they are ready, and they stop when no remaining task needs them.
+    // A continuous task without readyWhen is ready once it starts.
+    let announced: BTreeSet<_> = prepared
+        .iter()
+        .filter(|(_, task)| !task.ready_when.is_empty())
+        .map(|(id, _)| id.clone())
+        .collect();
+    let serving: BTreeSet<_> = continuous.union(&announced).cloned().collect();
+    let is_up = |id: &str| prepared[id].ready.load(Ordering::SeqCst);
+    // Running tasks holding a --parallel slot: as in Nx, one with readyWhen
+    // gives its slot up once ready.
+    let holding = |active: &BTreeSet<String>| {
+        active
+            .iter()
+            .filter(|id| !continuous.contains(*id) && !(announced.contains(*id) && is_up(id)))
+            .count()
+    };
     // As in Nx: a task that runs alone cannot run beside a continuous task it
     // depends on, and a continuous task others depend on runs beside them.
     for (id, task) in &graph.tasks {
@@ -182,10 +200,12 @@ pub fn run(
         let result = (|| -> Result<()> {
             while !pending.is_empty() || !active.is_empty() {
                 let mut waiting_now = false;
+                // A task that became ready gives back its core.
+                held.retain(|id, _| !(announced.contains(id) && is_up(id)));
                 let dependencies_done = |id: &String| {
                     graph.tasks[id].dependencies.iter().all(|dependency| {
                         outcomes.get(dependency) == Some(&Outcome::Success)
-                            || (continuous.contains(dependency) && active.contains(dependency))
+                            || (active.contains(dependency) && is_up(dependency))
                     })
                 };
                 // The finite tasks that could start in this pass, which the
@@ -199,7 +219,7 @@ pub fn run(
                 // evenly, after a core for each slot other pending tasks could
                 // take, so one starting alone does not hold up what follows.
                 let even = {
-                    let slots = parallel.saturating_sub(active.difference(&continuous).count());
+                    let slots = parallel.saturating_sub(holding(&active));
                     let sharing = ready_threaded.min(slots).max(1);
                     let reserved =
                         (finite_pending - ready_threaded).min(slots.saturating_sub(sharing));
@@ -226,10 +246,10 @@ pub fn run(
                         continue;
                     }
                     let is_continuous = continuous.contains(&id);
-                    let finite_active = active.difference(&continuous).count();
+                    let finite_active = holding(&active);
                     if !dependencies.iter().all(|dependency| {
                         outcomes.get(dependency) == Some(&Outcome::Success)
-                            || (continuous.contains(dependency) && active.contains(dependency))
+                            || (active.contains(dependency) && is_up(dependency))
                     }) {
                         continue;
                     }
@@ -267,12 +287,19 @@ pub fn run(
                     started.insert(id.clone(), SystemTime::now());
                     let task = &prepared[&id];
                     let sender = sender.clone();
-                    if is_continuous {
+                    if serving.contains(&id) {
                         report::event(Event::StartedContinuous { id: id.clone() });
+                        if !announced.contains(&id) {
+                            task.ready.store(true, Ordering::SeqCst);
+                        }
                         // Dependents start while it runs, and its live state cannot be keyed.
                         fingerprints.insert(
                             id.clone(),
-                            Err(format!("{id}: continuous tasks are not fingerprinted")),
+                            Err(if is_continuous {
+                                format!("{id}: continuous tasks are not fingerprinted")
+                            } else {
+                                format!("{id}: tasks with readyWhen are not fingerprinted")
+                            }),
                         );
                         let stop = Arc::new(AtomicBool::new(false));
                         stops.insert(id.clone(), stop.clone());
@@ -325,7 +352,13 @@ pub fn run(
                             pending.contains(*dependent) || active.contains(*dependent)
                         })
                     });
-                    if !graph.roots.contains(id) && !needed && stopping.insert(id.clone()) {
+                    // A requested task with readyWhen is done once ready, as in Nx.
+                    let done_when_ready = announced.contains(id) && !continuous.contains(id);
+                    if is_up(id)
+                        && !needed
+                        && (done_when_ready || !graph.roots.contains(id))
+                        && stopping.insert(id.clone())
+                    {
                         report::event(Event::Stopping { id: id.clone() });
                         stop.store(true, Ordering::SeqCst);
                     }
@@ -352,7 +385,7 @@ pub fn run(
                         held.remove(&id);
                         let (outcome, cache, key, warm) = match result {
                             Ok(result) => {
-                                if !continuous.contains(&id) {
+                                if !serving.contains(&id) {
                                     fingerprints.insert(id.clone(), result.fingerprint);
                                 }
                                 (result.outcome, result.cache, result.key, result.warm)

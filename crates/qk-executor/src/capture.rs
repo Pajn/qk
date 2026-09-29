@@ -208,6 +208,38 @@ pub struct Capture {
     file: Option<Mutex<File>>,
     printer: Printer,
     healthy: AtomicBool,
+    readiness: Option<Readiness>,
+}
+
+/// Watches output for `readyWhen` text, on either stream and across reads.
+struct Readiness {
+    patterns: Vec<String>,
+    /// Which patterns have appeared, and each stream's last bytes, so text
+    /// split between two reads still matches.
+    state: Mutex<(Vec<bool>, [Vec<u8>; 2])>,
+    ready: std::sync::Arc<AtomicBool>,
+}
+
+impl Readiness {
+    fn see(&self, stderr: bool, bytes: &[u8]) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let (found, tails) = &mut *state;
+        let tail = &mut tails[usize::from(stderr)];
+        tail.extend_from_slice(bytes);
+        let text = String::from_utf8_lossy(tail);
+        for (pattern, found) in self.patterns.iter().zip(found.iter_mut()) {
+            *found |= text.contains(pattern.as_str());
+        }
+        let keep = self.patterns.iter().map(String::len).max().unwrap_or(0);
+        if tail.len() > keep {
+            tail.drain(..tail.len() - keep);
+        }
+        if found.iter().all(|found| *found) {
+            self.ready.store(true, Ordering::SeqCst);
+        }
+    }
 }
 
 impl Capture {
@@ -216,7 +248,20 @@ impl Capture {
             file: file.map(Mutex::new),
             printer: Printer::new(display),
             healthy: AtomicBool::new(true),
+            readiness: None,
         }
+    }
+
+    /// Sets `ready` once every one of `patterns` has appeared in the output.
+    pub fn ready_when(mut self, patterns: &[String], ready: std::sync::Arc<AtomicBool>) -> Self {
+        if !patterns.is_empty() {
+            self.readiness = Some(Readiness {
+                patterns: patterns.to_vec(),
+                state: Mutex::new((vec![false; patterns.len()], [Vec::new(), Vec::new()])),
+                ready,
+            });
+        }
+        self
     }
 
     pub fn healthy(&self) -> bool {
@@ -246,6 +291,9 @@ impl Capture {
                 }
             }
             self.printer.write(stderr, &buffer[..count])?;
+            if let Some(readiness) = &self.readiness {
+                readiness.see(stderr, &buffer[..count]);
+            }
         }
     }
 

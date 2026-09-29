@@ -36,6 +36,11 @@ pub struct PreparedTask {
     /// Variables set for the process after `env` that are not part of what
     /// the task is: nothing reads them to key it, such as a thread count.
     pub execution: BTreeMap<OsString, OsString>,
+    /// Nx's `readyWhen`: text whose appearance in the output, every piece of
+    /// it, makes the task ready while its commands keep running.
+    pub ready_when: Vec<String>,
+    /// Set once all of `ready_when` has appeared.
+    pub ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// How the task's output is shown; the runner sets it per output style.
     pub display: Display,
 }
@@ -254,7 +259,14 @@ pub fn prepare(
             "nx:run-commands" => {
                 matches!(
                     key.as_str(),
-                    "command" | "commands" | "cwd" | "env" | "parallel" | "forwardAllArgs" | "args"
+                    "command"
+                        | "commands"
+                        | "cwd"
+                        | "env"
+                        | "parallel"
+                        | "forwardAllArgs"
+                        | "args"
+                        | "readyWhen"
                 ) || !RUN_COMMANDS.contains(&key.as_str())
             }
             "nx:run-script" => matches!(key.as_str(), "script" | "env" | "cwd"),
@@ -303,6 +315,15 @@ pub fn prepare(
         std::env::join_paths(paths).context("cannot construct task PATH")?,
     );
     let parallel = boolean(options.get("parallel"), true, "parallel")?;
+    let ready_when: Vec<String> = match options.get("readyWhen") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::String(text)) => vec![text.clone()],
+        Some(value) => serde_json::from_value(value.clone())
+            .context("readyWhen must be a string or an array of strings")?,
+    };
+    if !ready_when.is_empty() && options.contains_key("commands") && !parallel {
+        bail!("readyWhen can only be used when parallel is true");
+    }
     let mut commands = Vec::new();
     match executor {
         "nx:noop" => {}
@@ -384,6 +405,8 @@ pub fn prepare(
         cwd,
         env,
         execution: BTreeMap::new(),
+        ready_when,
+        ready: Default::default(),
         display: Display::default(),
     })
 }

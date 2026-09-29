@@ -55,11 +55,12 @@ impl Children {
 }
 
 pub fn execute(task: &PreparedTask, cancelled: &AtomicBool) -> Result<Outcome> {
-    if task.display == Display::Stream {
+    if task.display == Display::Stream && task.ready_when.is_empty() {
         // Straight through: the task writes to the terminal itself.
         return execute_captured(task, cancelled, None);
     }
-    let capture = Capture::new(None, task.display.clone());
+    let capture =
+        Capture::new(None, task.display.clone()).ready_when(&task.ready_when, task.ready.clone());
     execute_captured(task, cancelled, Some(&capture))
 }
 
