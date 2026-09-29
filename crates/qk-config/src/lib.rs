@@ -33,6 +33,10 @@ pub struct Target {
     pub cache: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub continuous: Option<bool>,
+    /// `false` runs the task alone: it waits for every other task, and none
+    /// starts while it runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallelism: Option<bool>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
 }

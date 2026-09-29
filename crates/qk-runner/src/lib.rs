@@ -96,6 +96,32 @@ pub fn run(
         .filter(|(_, task)| task.definition.continuous == Some(true))
         .map(|(id, _)| id.clone())
         .collect();
+    let alone: BTreeSet<_> = graph
+        .tasks
+        .iter()
+        .filter(|(_, task)| task.definition.parallelism == Some(false))
+        .map(|(id, _)| id.clone())
+        .collect();
+    // As in Nx: a task that runs alone cannot run beside a continuous task it
+    // depends on, and a continuous task others depend on runs beside them.
+    for (id, task) in &graph.tasks {
+        for dependency in task
+            .dependencies
+            .iter()
+            .filter(|id| continuous.contains(*id))
+        {
+            if alone.contains(id) {
+                bail!(
+                    "{id} does not support parallelism but depends on continuous task {dependency}"
+                );
+            }
+            if alone.contains(dependency) {
+                bail!(
+                    "continuous task {dependency} does not support parallelism but {id} depends on it"
+                );
+            }
+        }
+    }
     let mut dependents: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for (id, task) in &graph.tasks {
         for dependency in &task.dependencies {
@@ -208,6 +234,12 @@ pub fn run(
                         continue;
                     }
                     ready.entry(id.clone()).or_insert_with(SystemTime::now);
+                    // A task that runs alone waits for every other, and blocks them.
+                    if !active.is_empty()
+                        && (alone.contains(&id) || active.iter().any(|id| alone.contains(id)))
+                    {
+                        continue;
+                    }
                     if !is_continuous && finite_active >= parallel {
                         waiting_now = true;
                         continue;
@@ -215,7 +247,11 @@ pub fn run(
                     if !is_continuous {
                         let free = cores.saturating_sub(held.values().sum());
                         let cores_for = match threads.get(&id) {
-                            Some(threads) => threads.share(cores, even, free, held.is_empty()),
+                            Some(threads) => {
+                                // Alone, nothing else can take a share.
+                                let even = if alone.contains(&id) { cores } else { even };
+                                threads.share(cores, even, free, held.is_empty())
+                            }
                             None => (free > 0 || held.is_empty()).then_some(1),
                         };
                         let Some(cores_for) = cores_for else {

@@ -1264,3 +1264,55 @@ fn a_threaded_task_leaves_cores_for_the_work_still_to_come() {
         "2\n"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn a_task_without_parallelism_runs_alone() {
+    // Each task notes whether another was running when it started or ended.
+    let task = |name: &str, alone: bool| {
+        let mut task = json!({"command": format!(
+            "mkdir -p dist; ls dist | grep -q running && echo {name}-overlap; touch dist/running-{name}; sleep 0.2; ls dist | grep running | grep -vq running-{name} && echo {name}-overlap; rm dist/running-{name}"
+        )});
+        if alone {
+            task["parallelism"] = json!(false);
+        }
+        task
+    };
+    let fixture = Fixture::with_targets(json!({
+        "a": task("a", false), "b": task("b", true), "c": task("c", false)
+    }));
+    let output = success(fixture.qk(
+        &fixture.root,
+        &[
+            "run-many",
+            "-t",
+            "a,b,c",
+            "--parallel",
+            "3",
+            "--output-style",
+            "static",
+        ],
+    ));
+    let text = stdout(&output);
+    assert!(!text.contains("b-overlap"), "{text}");
+    // The others still run beside each other.
+    assert!(
+        text.contains("a-overlap") || text.contains("c-overlap"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_task_without_parallelism_cannot_depend_on_a_continuous_task() {
+    let fixture = Fixture::with_targets(json!({
+        "serve": {"command": "sleep 5", "continuous": true},
+        "e2e": {"command": "true", "parallelism": false, "dependsOn": ["serve"]}
+    }));
+    let output = fixture.qk(&fixture.root, &["run", "app:e2e"]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(
+            "app:e2e does not support parallelism but depends on continuous task app:serve"
+        )
+    );
+}

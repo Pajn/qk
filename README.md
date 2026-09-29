@@ -307,6 +307,11 @@ success. A continuous task that exits by itself reports its exit status as
 usual. Continuous tasks are never cached, and cacheable tasks depending on one
 run uncached.
 
+A target with `parallelism: false` runs alone, as in Nx: it waits until no
+other task runs, continuous ones included, and nothing starts while it runs.
+Like Nx, qk rejects a graph where such a task depends on a continuous task,
+or where a continuous task other tasks depend on has it.
+
 `--dry-run` only plans and prints the task graph: it does not load dotenv,
 validate executor support, execute runtime inputs, or run commands.
 
