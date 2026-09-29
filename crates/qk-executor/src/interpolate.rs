@@ -8,10 +8,18 @@ pub(super) struct Interpolation<'a> {
     workspace: &'a Workspace,
     task: &'a Task,
     named: BTreeMap<String, String>,
+    /// Target options run-commands does not know, as Nx forwards them:
+    /// `--name=value` after the command, unless an argument of the same name
+    /// overrides it.
+    options: Vec<String>,
 }
 
 impl<'a> Interpolation<'a> {
-    pub fn new(workspace: &'a Workspace, task: &'a Task) -> Self {
+    pub fn new(
+        workspace: &'a Workspace,
+        task: &'a Task,
+        options: &BTreeMap<String, String>,
+    ) -> Self {
         let mut named = BTreeMap::new();
         let mut args = task.args.iter().peekable();
         while let Some(arg) = args.next() {
@@ -28,11 +36,30 @@ impl<'a> Interpolation<'a> {
                 }
             }
         }
+        let forwarded = options
+            .iter()
+            .filter(|(key, _)| !named.contains_key(*key))
+            .map(|(key, value)| format!("--{key}={value}"))
+            .collect();
+        for (key, value) in options {
+            named.entry(key.clone()).or_insert_with(|| value.clone());
+        }
         Self {
             workspace,
             task,
             named,
+            options: forwarded,
         }
+    }
+
+    /// Forwarded options and then the task's arguments, quoted for the shell.
+    fn forwarded(&self) -> Result<String> {
+        self.options
+            .iter()
+            .chain(&self.task.args)
+            .map(|arg| quote(arg))
+            .collect::<Result<Vec<_>>>()
+            .map(|args| args.join(" "))
     }
 
     pub fn arguments(&self) -> Result<String> {
@@ -51,9 +78,10 @@ impl<'a> Interpolation<'a> {
     pub fn command(&self, command: &str, forward: bool) -> Result<String> {
         let interpolates_args = command.contains("{args.") || command.contains("{args}");
         let mut command = self.expand(command, true)?;
-        if forward && !interpolates_args && !self.task.args.is_empty() {
+        if forward && !interpolates_args && !(self.task.args.is_empty() && self.options.is_empty())
+        {
             command.push(' ');
-            command.push_str(&self.arguments()?);
+            command.push_str(&self.forwarded()?);
         }
         Ok(command)
     }
@@ -88,9 +116,14 @@ impl<'a> Interpolation<'a> {
                 "projectRoot" => Some(self.workspace.projects[&self.task.project].root.clone()),
                 "projectName" => Some(self.task.project.clone()),
                 "args" => Some(if shell {
-                    self.arguments()?
+                    self.forwarded()?
                 } else {
-                    self.task.args.join(" ")
+                    self.options
+                        .iter()
+                        .chain(&self.task.args)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(" ")
                 }),
                 _ if token.starts_with("args.") => {
                     let key = &token[5..];

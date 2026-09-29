@@ -194,7 +194,12 @@ Supported executors:
 - `nx:run-commands`: `command`, or a `commands` array of strings or objects
   with `command` and `forwardAllArgs`. Multiple commands run concurrently by
   default; `options.parallel: false` runs them in sequence. Supports `cwd`,
-  `env` and `forwardAllArgs`. The default cwd is the workspace root.
+  `env` and `forwardAllArgs`. The default cwd is the workspace root. As in
+  Nx, any other scalar option, such as `port: 3000`, is forwarded to the
+  command as `--port=3000` and available as `{args.port}`, unless an argument
+  of the same name overrides it; object values are ignored. The options Nx
+  knows but qk does not implement (`readyWhen`, `envFile`, `color`, `usePty`,
+  `streamOutput`, `tty`, `verbose`, `args`) are rejected.
 - `nx:run-script`: invokes `npm run` or `pnpm run` in the project directory,
   preserving the package manager's script behavior. The manager comes from
   root `packageManager`, then pnpm workspace/lockfile markers, otherwise npm.
@@ -205,14 +210,23 @@ Supported executors:
 Commands use `/bin/sh -c` on Unix and `cmd.exe /D /S /C` on Windows. Local
 `node_modules/.bin` directories from cwd up to the workspace root are added
 to `PATH`. Tasks currently have closed stdin; interactive tasks are not
-supported. stdout and stderr stream directly, with no task prefix added to
-child output. qk writes its own status messages to stderr.
+supported. qk writes its own status messages to stderr.
 
 Environment precedence, highest first: configuration `env`, `options.env`,
-target-level `env`, inherited process environment, root `.env.local`, root
-`.env`. Dotenv is loaded into child environments without mutating qk's process
-environment. Dotenv interpolation uses dotenvy's per-file semantics; it does
-not provide cross-file interpolation against the merged child environment.
+target-level `env`, the variables Nx sets for every task, the inherited
+process environment, then the task's dotenv files in Nx's order: in the
+project root and then the workspace root, `.env.<target>.<configuration>`,
+`.env.<configuration>`, `.env.<target>`, then `.env.local`, `.local.env` and
+`.env`, each also as `.env.<name>.local`, `.<name>.local.env` and
+`.<name>.env`. A file never overrides a variable an earlier source set. The
+task variables are `NX_TASK_TARGET_PROJECT`, `NX_TASK_TARGET_TARGET`,
+`NX_TASK_TARGET_CONFIGURATION`, `NX_WORKSPACE_ROOT`, `LERNA_PACKAGE_NAME`,
+`NX_TUI=false` and `FORCE_COLOR`, which is `true` unless already set.
+Dotenv is loaded into child environments without mutating qk's process
+environment; qk's own environment, where remote cache credentials arrive,
+includes the root `.env.local` and `.env`. Dotenv interpolation uses
+dotenvy's per-file semantics; it does not provide cross-file interpolation
+against the merged child environment.
 
 Forward task arguments after `--`:
 
@@ -282,9 +296,11 @@ by workspace-relative path, content and mode. Branch names and checkout
 locations are not part of the key, so identical sources in two worktrees
 share entries. Root workspace files (the root `tsconfig.base.json` or
 `tsconfig.json`, `nx.json`, `package.json`, `pnpm-workspace.yaml`,
-lockfiles, `.env`, `.env.local`) and the manifests of
+lockfiles) and the manifests of
 the task's project and its transitive project dependencies are always
-included.
+included. Dotenv files are not, as in Nx: they hold per-machine values and
+credentials, so keying them would keep machines from sharing entries; `env`
+inputs key the variables a task declares.
 
 A pnpm v9 `pnpm-lock.yaml` is keyed by what it installs rather than by its
 content: for the root importer and the importers of the task's project and

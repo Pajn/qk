@@ -653,3 +653,57 @@ fn output_styles_follow_nx() {
         "{grouped}"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn tasks_load_their_dotenv_files_and_nx_variables_like_nx() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    fs::write(root.join("nx.json"), "{}").unwrap();
+    fs::create_dir_all(root.join("app")).unwrap();
+    fs::write(
+        root.join("app/project.json"),
+        json!({"name": "app", "targets": {
+            "show": {"command": "echo $ROOT_ONLY $SHARED $SPECIFIC $FROM_PROCESS $FROM_TARGET $NX_TASK_TARGET_PROJECT:$NX_TASK_TARGET_TARGET $FORCE_COLOR",
+                     "options": {"env": {"FROM_TARGET": "target"}}}
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        root.join(".env"),
+        "ROOT_ONLY=root\nSHARED=root\nFROM_TARGET=root\nFROM_PROCESS=root\n",
+    )
+    .unwrap();
+    // The project's target-specific file wins over the root's general one.
+    fs::write(
+        root.join("app/.env.show"),
+        "SHARED=project\nSPECIFIC=show\n",
+    )
+    .unwrap();
+    let output = command(root, &["run", "app:show"])
+        .env("FROM_PROCESS", "process")
+        .env_remove("FORCE_COLOR")
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(success(output).stdout).unwrap(),
+        "root project show process target app:show true\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unknown_run_commands_options_are_forwarded_like_nx() {
+    let temp = fixture(json!({
+        "serve": {"command": "echo serving", "options": {"port": 3000, "dependsOn": ["^tsc"]}},
+        "named": {"command": "echo port {args.port}", "options": {"port": 3000}}
+    }));
+    let stdout = |args: &[&str]| String::from_utf8(success(run(temp.path(), args)).stdout).unwrap();
+    assert_eq!(stdout(&["run", "app:serve"]), "serving --port=3000\n");
+    assert_eq!(
+        stdout(&["run", "app:serve", "--", "--port=4000"]),
+        "serving --port=4000\n"
+    );
+    assert_eq!(stdout(&["run", "app:named"]), "port 3000\n");
+}

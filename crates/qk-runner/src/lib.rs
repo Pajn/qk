@@ -46,13 +46,17 @@ pub fn run(
     if parallel == 0 {
         bail!("parallel must be at least 1");
     }
+    // The runner's own environment includes the root dotenv files, which is
+    // where remote cache credentials arrive; each task loads its own dotenv
+    // files over the process environment instead.
     let environment = environment(&workspace.root)?;
+    let process_environment: BTreeMap<_, _> = std::env::vars_os().collect();
     // Validate every task before the first command can have side effects.
     let prepared = graph
         .tasks
         .iter()
         .map(|(id, task)| {
-            prepare(workspace, task, &environment)
+            prepare(workspace, task, &process_environment)
                 .with_context(|| format!("cannot execute {id}"))
                 .map(|mut prepared| {
                     let continuous = task.definition.continuous == Some(true);

@@ -937,3 +937,16 @@ fn dependents_stay_cached_when_a_dependency_reproduces_its_outputs() {
     let output = stderr(&success(fixture.build(&fixture.root, &[])));
     assert!(output.contains("qk: cache miss app:build"), "{output}");
 }
+
+#[test]
+fn dotenv_files_are_not_keyed() {
+    let fixture = Fixture::new(target(
+        "build",
+        json!({"inputs": ["{projectRoot}/src/**/*"]}),
+    ));
+    fs::write(fixture.root.join(".env.local"), "TOKEN=one\n").unwrap();
+    success(fixture.build(&fixture.root, &[]));
+    // Per-machine values and credentials: another value must not miss.
+    fs::write(fixture.root.join(".env.local"), "TOKEN=two\n").unwrap();
+    assert!(stderr(&success(fixture.build(&fixture.root, &[]))).contains("cache hit"));
+}

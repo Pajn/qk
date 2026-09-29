@@ -715,7 +715,9 @@ pub fn resolve(
     let readable = snapshot
         .installed(&workspace.root)?
         .is_some_and(|installed| installed.lockfile.is_some());
-    // Always include workspace resolution/configuration, including ignored dotenv files.
+    // Always include workspace resolution and configuration. Dotenv files are
+    // not keyed, as in Nx: they hold per-machine values and credentials, and a
+    // task's `env` inputs key the variables it declares.
     // A pnpm lockfile qk can read is keyed by what the task's projects install instead.
     // The root tsconfig, as Nx hashes it into every task.
     let tsconfig = ["tsconfig.base.json", "tsconfig.json"]
@@ -729,8 +731,6 @@ pub fn resolve(
         "package-lock.json",
         "yarn.lock",
         "bun.lock",
-        ".env",
-        ".env.local",
     ]) {
         if workspace.root.join(path).is_file() && !(path == "pnpm-lock.yaml" && readable) {
             resolver.selected.insert(path.into());

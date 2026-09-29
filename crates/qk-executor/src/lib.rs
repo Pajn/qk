@@ -38,6 +38,109 @@ pub struct PreparedTask {
     pub display: Display,
 }
 
+/// The dotenv files Nx loads for a task, most specific first: in the
+/// project root, then the workspace root, for the target and configuration
+/// (`.env.<target>.<configuration>`, `.env.<configuration>`, `.env.<target>`),
+/// then `.env.local`, `.local.env` and `.env`, each also in its `.local` and
+/// `.<name>.env` spellings.
+fn dotenv_files(project_root: &str, target: &str, configuration: Option<&str>) -> Vec<String> {
+    let mut identifiers = Vec::new();
+    if let Some(configuration) = configuration {
+        identifiers.push(format!("{target}.{configuration}"));
+        identifiers.push(configuration.to_owned());
+    }
+    identifiers.push(target.to_owned());
+    identifiers.push(String::new());
+    let variants = |identifier: &str, root: &str| -> Vec<String> {
+        let prefix = if root.is_empty() || root == "." {
+            String::new()
+        } else {
+            format!("{root}/")
+        };
+        if identifier.is_empty() {
+            [".env.local", ".local.env", ".env"]
+                .map(|name| format!("{prefix}{name}"))
+                .to_vec()
+        } else {
+            [
+                format!(".env.{identifier}.local"),
+                format!(".env.{identifier}"),
+                format!(".{identifier}.local.env"),
+                format!(".{identifier}.env"),
+            ]
+            .map(|name| format!("{prefix}{name}"))
+            .to_vec()
+        }
+    };
+    let mut files = Vec::new();
+    for root in [project_root, ""] {
+        for identifier in &identifiers {
+            for file in variants(identifier, root) {
+                if !files.contains(&file) {
+                    files.push(file);
+                }
+            }
+        }
+    }
+    files
+}
+
+/// A task's environment as Nx builds it: the process environment, then each
+/// of the task's dotenv files without overriding what is already set, then
+/// the variables Nx sets for every task. A target's `env` applies on top.
+fn task_environment(
+    workspace: &Workspace,
+    task: &Task,
+    base_env: &BTreeMap<OsString, OsString>,
+) -> Result<BTreeMap<OsString, OsString>> {
+    let mut env = base_env.clone();
+    let root = &workspace.projects[&task.project].root;
+    for file in dotenv_files(root, &task.target, task.configuration.as_deref()) {
+        for (name, value) in read_dotenv(&workspace.root.join(file))? {
+            env.entry(name).or_insert(value);
+        }
+    }
+    let force_color = env
+        .get(std::ffi::OsStr::new("FORCE_COLOR"))
+        .cloned()
+        .unwrap_or_else(|| "true".into());
+    let mut set = |name: &str, value: OsString| {
+        env.insert(name.into(), value);
+    };
+    set("FORCE_COLOR", force_color);
+    set("NX_WORKSPACE_ROOT", workspace.root.clone().into_os_string());
+    set("NX_TASK_TARGET_PROJECT", task.project.clone().into());
+    set("NX_TASK_TARGET_TARGET", task.target.clone().into());
+    set("LERNA_PACKAGE_NAME", task.project.clone().into());
+    set("NX_TUI", "false".into());
+    match &task.configuration {
+        Some(configuration) => set("NX_TASK_TARGET_CONFIGURATION", configuration.clone().into()),
+        None => {
+            env.remove(std::ffi::OsStr::new("NX_TASK_TARGET_CONFIGURATION"));
+        }
+    }
+    Ok(env)
+}
+
+/// A dotenv file's entries, or none when it does not exist.
+fn read_dotenv(path: &Path) -> Result<Vec<(OsString, OsString)>> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
+    };
+    dotenvy::from_read_iter(file)
+        .enumerate()
+        .map(|(index, entry)| {
+            // Dotenv parser errors can contain secret values; report only location.
+            let (name, value) = entry.map_err(|_| {
+                anyhow::anyhow!("invalid dotenv entry {} in {}", index + 1, path.display())
+            })?;
+            Ok((name.into(), value.into()))
+        })
+        .collect()
+}
+
 /// Read dotenv files into a child environment without changing process globals.
 /// Existing process variables win over .env.local, which wins over .env.
 pub fn environment(workspace: &Path) -> Result<BTreeMap<OsString, OsString>> {
@@ -74,8 +177,44 @@ pub fn prepare(
         .executor
         .as_deref()
         .context("target has no executor or command")?;
-    let interpolation = interpolate::Interpolation::new(workspace, task);
-    let mut env = base_env.clone();
+    // Options Nx's run-commands knows; any other scalar option is forwarded to
+    // the command as `--name=value`, and object values are ignored, as in Nx.
+    const RUN_COMMANDS: &[&str] = &[
+        "command",
+        "commands",
+        "color",
+        "no-color",
+        "parallel",
+        "no-parallel",
+        "readyWhen",
+        "cwd",
+        "args",
+        "envFile",
+        "__unparsed__",
+        "env",
+        "usePty",
+        "streamOutput",
+        "verbose",
+        "forwardAllArgs",
+        "tty",
+    ];
+    let mut forwarded = BTreeMap::new();
+    if executor == "nx:run-commands" {
+        for (key, value) in options {
+            if RUN_COMMANDS.contains(&key.as_str()) {
+                continue;
+            }
+            let value = match value {
+                Value::String(text) => text.clone(),
+                Value::Number(number) => number.to_string(),
+                Value::Bool(flag) => flag.to_string(),
+                _ => continue,
+            };
+            forwarded.insert(key.clone(), value);
+        }
+    }
+    let interpolation = interpolate::Interpolation::new(workspace, task, &forwarded);
+    let mut env = task_environment(workspace, task, base_env)?;
     for values in [definition.extra.get("env"), options.get("env")]
         .into_iter()
         .flatten()
@@ -92,10 +231,12 @@ pub fn prepare(
     }
     for key in options.keys() {
         let allowed = match executor {
-            "nx:run-commands" => matches!(
-                key.as_str(),
-                "command" | "commands" | "cwd" | "env" | "parallel" | "forwardAllArgs"
-            ),
+            "nx:run-commands" => {
+                matches!(
+                    key.as_str(),
+                    "command" | "commands" | "cwd" | "env" | "parallel" | "forwardAllArgs"
+                ) || !RUN_COMMANDS.contains(&key.as_str())
+            }
             "nx:run-script" => matches!(key.as_str(), "script" | "env" | "cwd"),
             "nx:noop" => true,
             _ => bail!("unsupported executor {executor:?}"),
