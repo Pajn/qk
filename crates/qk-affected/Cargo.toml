@@ -1,25 +1,18 @@
 [package]
-name = "qk-cli"
+name = "qk-affected"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
-[[bin]]
-name = "qk"
-path = "src/main.rs"
-
 [dependencies]
 anyhow.workspace = true
-clap.workspace = true
-ctrlc.workspace = true
+ignore.workspace = true
+qk-cache.workspace = true
 qk-config.workspace = true
 qk-graph.workspace = true
-qk-taskgraph.workspace = true
-qk-runner.workspace = true
-qk-cache.workspace = true
-qk-affected.workspace = true
-serde.workspace = true
+qk-lockfile.workspace = true
 serde_json.workspace = true
+serde_yaml_ng.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

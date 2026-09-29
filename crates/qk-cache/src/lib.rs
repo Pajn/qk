@@ -16,6 +16,7 @@ use qk_executor::{Capture, Outcome, PreparedTask, execute, execute_captured};
 use qk_taskgraph::{Task, TaskGraph};
 use serde_json::{Value, json};
 
+pub use glob::Pattern;
 pub use paths::cache_directory;
 
 /// The cache for one run; its workspace snapshot is taken on first use.

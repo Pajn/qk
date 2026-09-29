@@ -53,6 +53,19 @@ enum Command {
         #[command(flatten)]
         options: RunOptions,
     },
+    /// Execute targets on the projects affected by changes, and their dependencies.
+    Affected {
+        #[arg(short = 't', long, required = true, value_delimiter = ',', num_args = 1..)]
+        targets: Vec<String>,
+        #[arg(short = 'p', long, value_delimiter = ',', num_args = 1..)]
+        projects: Vec<String>,
+        #[arg(long, value_delimiter = ',', num_args = 1..)]
+        exclude: Vec<String>,
+        #[command(flatten)]
+        changes: ChangeOptions,
+        #[command(flatten)]
+        options: RunOptions,
+    },
     /// Inspect workspace projects and normalized configuration.
     Show {
         #[command(subcommand)]
@@ -87,6 +100,44 @@ struct RunOptions {
     args: Vec<String>,
 }
 
+/// What counts as changed, as in Nx. Without `--head`, the working tree is
+/// compared, including uncommitted and untracked files.
+#[derive(Args)]
+struct ChangeOptions {
+    /// Base revision; defaults to NX_BASE, then nx.json `defaultBase`, then `main`.
+    #[arg(long)]
+    base: Option<String>,
+    /// Head revision; defaults to NX_HEAD.
+    #[arg(long)]
+    head: Option<String>,
+    /// Treat exactly these workspace-relative files as changed.
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    files: Vec<String>,
+    /// Only uncommitted changes.
+    #[arg(long)]
+    uncommitted: bool,
+    /// Only untracked files.
+    #[arg(long)]
+    untracked: bool,
+}
+
+impl ChangeOptions {
+    fn affected(&self, workspace: &Workspace) -> Result<std::collections::BTreeSet<String>> {
+        let graph = ProjectGraph::build(workspace)?;
+        qk_affected::affected_projects(
+            workspace,
+            &graph,
+            &qk_affected::Options {
+                base: self.base.clone(),
+                head: self.head.clone(),
+                files: self.files.clone(),
+                uncommitted: self.uncommitted,
+                untracked: self.untracked,
+            },
+        )
+    }
+}
+
 #[derive(Clone, ValueEnum)]
 enum OutputStyle {
     Stream,
@@ -100,8 +151,13 @@ enum CacheCommand {
 
 #[derive(Subcommand)]
 enum ShowCommand {
-    /// List project names, sorted alphabetically.
+    /// List project names in Nx's graph order.
     Projects {
+        /// Only projects affected by changes, as `qk affected` selects them.
+        #[arg(long)]
+        affected: bool,
+        #[command(flatten)]
+        changes: ChangeOptions,
         /// Select names, globs or tag:<tag>; comma-separated or repeated.
         #[arg(long, short = 'p', value_delimiter = ',', action = clap::ArgAction::Append)]
         projects: Vec<String>,
@@ -142,7 +198,6 @@ fn main() {
 /// targets, so neither does the shorthand; they fail as unknown subcommands.
 const NX_COMMANDS: &[&str] = &[
     "add",
-    "affected",
     "connect",
     "daemon",
     "exec",
@@ -281,38 +336,43 @@ fn run(cli: Cli) -> Result<i32> {
             options,
         } => {
             let selected = select_projects(&workspace.projects, &projects, &exclude)?;
-            let mut requests = Vec::new();
-            for project in selected {
-                for target in &targets {
-                    if let Some(definition) = workspace.projects[&project].targets.get(target) {
-                        // Like Nx, a target without the configuration runs its default.
-                        let configuration = options
-                            .configuration
-                            .clone()
-                            .filter(|name| definition.configurations.contains_key(name));
-                        requests.push(Request {
-                            project: project.clone(),
-                            target: target.clone(),
-                            configuration,
-                            args: options.args.clone(),
-                        });
-                    }
-                }
+            let requests = requests(&workspace, selected, &targets, &options);
+            return execute_tasks(&workspace, requests, &options);
+        }
+        Command::Affected {
+            targets,
+            projects,
+            exclude,
+            changes,
+            options,
+        } => {
+            let affected = changes.affected(&workspace)?;
+            let selected = select_projects(&workspace.projects, &projects, &exclude)?
+                .into_iter()
+                .filter(|project| affected.contains(project));
+            let requests = requests(&workspace, selected, &targets, &options);
+            if requests.is_empty() {
+                eprintln!("qk: no affected tasks");
+                return Ok(0);
             }
             return execute_tasks(&workspace, requests, &options);
         }
         Command::Show {
             command:
                 ShowCommand::Projects {
+                    affected,
+                    changes,
                     projects,
                     exclude,
                     json,
                 },
         } => {
-            let names = graph_order(
-                &workspace.projects,
-                select_projects(&workspace.projects, &projects, &exclude)?,
-            );
+            let mut selected = select_projects(&workspace.projects, &projects, &exclude)?;
+            if affected {
+                let affected = changes.affected(&workspace)?;
+                selected.retain(|project| affected.contains(project));
+            }
+            let names = graph_order(&workspace.projects, selected);
             if json {
                 // Compact, like `nx show projects --json`.
                 let mut stdout = io::stdout().lock();
@@ -379,4 +439,32 @@ fn print_json(value: &impl serde::Serialize) -> Result<()> {
     bytes.push(b'\n');
     io::stdout().lock().write_all(&bytes)?;
     Ok(())
+}
+
+/// The requested targets of the selected projects that define them.
+fn requests(
+    workspace: &Workspace,
+    projects: impl IntoIterator<Item = String>,
+    targets: &[String],
+    options: &RunOptions,
+) -> Vec<Request> {
+    let mut requests = Vec::new();
+    for project in projects {
+        for target in targets {
+            if let Some(definition) = workspace.projects[&project].targets.get(target) {
+                // Like Nx, a target without the configuration runs its default.
+                let configuration = options
+                    .configuration
+                    .clone()
+                    .filter(|name| definition.configurations.contains_key(name));
+                requests.push(Request {
+                    project: project.clone(),
+                    target: target.clone(),
+                    configuration,
+                    args: options.args.clone(),
+                });
+            }
+        }
+    }
+    requests
 }

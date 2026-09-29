@@ -162,17 +162,26 @@ impl Lockfile {
     /// Workspace links are left out; they are projects, not packages. `None`
     /// when the lockfile has no such importer.
     pub fn installed(&self, importer: &str) -> Option<BTreeSet<String>> {
-        let direct = self.importers.get(importer)?;
-        let mut fingerprints = BTreeSet::new();
-        let mut pending = Vec::new();
-        for (name, reference) in direct {
-            if let Some(key) = snapshot_key(name, reference) {
-                fingerprints.insert(format!("{name} -> {key}"));
-                pending.push(key);
-            }
-        }
-        self.reach(pending, &mut fingerprints);
+        let direct = self.direct(importer)?;
+        let mut fingerprints: BTreeSet<String> = direct
+            .iter()
+            .map(|(name, key)| format!("{name} -> {key}"))
+            .collect();
+        let keys = self.reach(direct.into_iter().map(|(_, key)| key).collect());
+        fingerprints.extend(keys.iter().map(|key| self.fingerprint(key)));
         Some(fingerprints)
+    }
+
+    /// The names of the packages `importer` installs, directly or not. `None`
+    /// when the lockfile has no such importer.
+    pub fn installed_packages(&self, importer: &str) -> Option<BTreeSet<String>> {
+        let direct = self.direct(importer)?;
+        let keys = self.reach(direct.into_iter().map(|(_, key)| key).collect());
+        Some(
+            keys.iter()
+                .map(|key| package_name(key).to_owned())
+                .collect(),
+        )
     }
 
     /// Fingerprints of every installation of the package `name`, whichever
@@ -184,24 +193,40 @@ impl Lockfile {
             .filter(|key| package_name(key) == name)
             .cloned()
             .collect();
-        let mut fingerprints = BTreeSet::new();
-        self.reach(keys, &mut fingerprints);
-        fingerprints
+        self.reach(keys)
+            .iter()
+            .map(|key| self.fingerprint(key))
+            .collect()
     }
 
-    fn reach(&self, mut pending: Vec<String>, fingerprints: &mut BTreeSet<String>) {
+    /// An importer's dependencies as installed names and snapshot keys.
+    fn direct(&self, importer: &str) -> Option<Vec<(&str, String)>> {
+        let dependencies = self.importers.get(importer)?;
+        Some(
+            dependencies
+                .iter()
+                .filter_map(|(name, reference)| {
+                    Some((name.as_str(), snapshot_key(name, reference)?))
+                })
+                .collect(),
+        )
+    }
+
+    /// The snapshot keys reachable from `pending`, including them.
+    fn reach(&self, mut pending: Vec<String>) -> BTreeSet<String> {
         let mut seen = BTreeSet::new();
         while let Some(key) = pending.pop() {
-            if !seen.insert(key.clone()) {
+            if seen.contains(&key) {
                 continue;
             }
-            fingerprints.insert(self.fingerprint(&key));
             for (name, reference) in self.snapshots.get(&key).into_iter().flatten() {
                 if let Some(key) = snapshot_key(name, reference) {
                     pending.push(key);
                 }
             }
+            seen.insert(key);
         }
+        seen
     }
 
     /// A snapshot's key, the integrity of its package, and its dependencies

@@ -106,11 +106,7 @@ fn graph_file_matches_stdout_and_is_relative_to_invocation_directory() {
 
 #[test]
 fn unknown_projects_and_unimplemented_commands_fail_without_stdout() {
-    for args in [
-        vec!["show", "project", "missing"],
-        vec!["affected", "-t", "build"],
-        vec!["show", "projects", "--affected"],
-    ] {
+    for args in [vec!["show", "project", "missing"], vec!["release"]] {
         let output = qk(&args);
         assert!(!output.status.success());
         assert!(output.stdout.is_empty());
@@ -252,4 +248,33 @@ fn run_many_configuration_applies_only_where_defined_like_nx() {
         "{tasks:?}"
     );
     assert!(tasks.contains(&"web:build".to_owned()), "{tasks:?}");
+}
+
+#[test]
+fn affected_selects_touched_projects_and_their_dependents() {
+    let output = qk(&[
+        "show",
+        "projects",
+        "--affected",
+        "--files",
+        "packages/core/index.js",
+        "--json",
+    ]);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "[\"worker\",\"core\",\"web\"]\n"
+    );
+    let tasks = planned(qk(&[
+        "affected",
+        "-t",
+        "build",
+        "--files",
+        "packages/core/index.js",
+        "--dry-run",
+    ]));
+    // web:build still depends on codegen:build, which is not affected.
+    assert_eq!(tasks, ["codegen:build", "core:build", "web:build"]);
+    let output = qk(&["affected", "-t", "build", "--files", "README.md"]);
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no affected tasks"));
 }

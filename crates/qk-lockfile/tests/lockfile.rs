@@ -244,6 +244,10 @@ snapshots:
     assert!(!text.contains("core"), "{text}");
     assert_eq!(installed.len(), 3);
     assert!(lockfile.installed("apps/missing").is_none());
+    assert_eq!(
+        lockfile.installed_packages("apps/app-a").unwrap(),
+        ["ansi-regex".to_owned(), "string-width".to_owned()].into()
+    );
 }
 
 #[test]

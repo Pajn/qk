@@ -463,6 +463,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "qk-affected"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ignore",
+ "qk-cache",
+ "qk-config",
+ "qk-graph",
+ "qk-lockfile",
+ "serde_json",
+ "serde_yaml_ng",
+ "tempfile",
+]
+
+[[package]]
 name = "qk-cache"
 version = "0.1.0"
 dependencies = [
@@ -489,6 +504,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ctrlc",
+ "qk-affected",
  "qk-cache",
  "qk-config",
  "qk-graph",

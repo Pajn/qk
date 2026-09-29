@@ -1,0 +1,287 @@
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use qk_affected::{Options, affected_projects};
+use qk_config::Workspace;
+use qk_graph::ProjectGraph;
+use tempfile::TempDir;
+
+/// A git repository whose first commit is the base revision.
+struct Repo {
+    _temp: TempDir,
+    root: PathBuf,
+    base: String,
+}
+
+impl Repo {
+    /// `app` depends on `lib`; `tool` stands alone. `app` declares a
+    /// `{workspaceRoot}` input through a named input.
+    fn new(extra: &[(&str, &str)]) -> Self {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().to_path_buf();
+        let mut files = vec![
+            (
+                "nx.json",
+                r#"{"namedInputs": {"shared": ["{workspaceRoot}/tsconfig.*.json"]},
+                    "pluginsConfig": {"@nx/js": {"projectsAffectedByDependencyUpdates": "auto"}}}"#,
+            ),
+            (
+                "apps/app/project.json",
+                r#"{"name": "app", "implicitDependencies": ["lib"],
+                    "targets": {"tsc": {"inputs": ["default", "shared"]}}}"#,
+            ),
+            ("apps/app/src/main.ts", "app"),
+            ("libs/lib/project.json", r#"{"name": "lib"}"#),
+            ("libs/lib/src/index.ts", "lib"),
+            ("tools/tool/project.json", r#"{"name": "tool"}"#),
+            ("tools/tool/README.md", "tool"),
+            ("README.md", "root"),
+            ("tsconfig.app.json", "{}"),
+            (".gitignore", "dist/\n"),
+            (".nxignore", "libs/lib/generated/\n"),
+        ];
+        files.extend_from_slice(extra);
+        for (path, text) in files {
+            write(&root, path, text);
+        }
+        git(&root, &["init", "--quiet", "--initial-branch=main"]);
+        let base = commit(&root);
+        Self {
+            _temp: temp,
+            root,
+            base,
+        }
+    }
+
+    fn affected(&self, options: Options) -> Vec<String> {
+        let workspace = Workspace::load(&self.root).unwrap();
+        let graph = ProjectGraph::build(&workspace).unwrap();
+        affected_projects(&workspace, &graph, &options)
+            .unwrap()
+            .into_iter()
+            .collect()
+    }
+
+    /// Commits the working tree and reports what changed since the base.
+    fn committed(&self) -> Vec<String> {
+        let head = commit(&self.root);
+        self.affected(Options {
+            base: Some(self.base.clone()),
+            head: Some(head),
+            ..Options::default()
+        })
+    }
+}
+
+fn write(root: &Path, path: &str, text: &str) {
+    let path = root.join(path);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, text).unwrap();
+}
+
+fn git(root: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .current_dir(root)
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+fn commit(root: &Path) -> String {
+    git(root, &["add", "--all"]);
+    git(
+        root,
+        &[
+            "-c",
+            "user.name=qk",
+            "-c",
+            "user.email=qk@example.invalid",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "change",
+        ],
+    );
+    git(root, &["rev-parse", "HEAD"])
+}
+
+fn names(names: &[&str]) -> Vec<String> {
+    names.iter().map(|name| (*name).to_owned()).collect()
+}
+
+#[test]
+fn a_changed_file_affects_its_project_and_dependents() {
+    let repo = Repo::new(&[]);
+    write(&repo.root, "libs/lib/src/index.ts", "changed");
+    write(&repo.root, "README.md", "changed");
+    assert_eq!(repo.committed(), names(&["app", "lib"]));
+}
+
+#[test]
+fn nx_json_affects_every_project() {
+    let repo = Repo::new(&[]);
+    write(&repo.root, "nx.json", r#"{"namedInputs": {"shared": []}}"#);
+    assert_eq!(repo.committed(), names(&["app", "lib", "tool"]));
+}
+
+#[test]
+fn workspace_root_inputs_affect_the_projects_naming_them() {
+    let repo = Repo::new(&[]);
+    write(
+        &repo.root,
+        "tsconfig.app.json",
+        r#"{"compilerOptions": {}}"#,
+    );
+    assert_eq!(repo.committed(), names(&["app"]));
+}
+
+#[test]
+fn ignored_files_affect_nothing() {
+    let repo = Repo::new(&[]);
+    write(&repo.root, "libs/lib/generated/out.ts", "generated");
+    assert_eq!(repo.committed(), Vec::<String>::new());
+}
+
+#[test]
+fn deleting_a_project_manifest_affects_every_project() {
+    let repo = Repo::new(&[]);
+    std::fs::remove_dir_all(repo.root.join("tools/tool")).unwrap();
+    // The deleted project is gone from the head workspace.
+    assert_eq!(repo.committed(), names(&["app", "lib"]));
+}
+
+#[test]
+fn without_a_head_the_working_tree_counts() {
+    let repo = Repo::new(&[]);
+    write(&repo.root, "tools/tool/README.md", "edited, uncommitted");
+    write(&repo.root, "libs/lib/src/new.ts", "untracked");
+    let affected = repo.affected(Options {
+        base: Some("main".into()),
+        ..Options::default()
+    });
+    assert_eq!(affected, names(&["app", "lib", "tool"]));
+}
+
+#[test]
+fn pnpm_workspace_resolution_keys_reach_tasks_only_through_the_lockfile() {
+    let workspace_file = "packages:\n  - apps/*\ncatalog:\n  react: 19.0.0\n";
+    let repo = Repo::new(&[
+        ("pnpm-workspace.yaml", workspace_file),
+        (
+            "libs/lib/project.json",
+            r#"{"name": "lib", "targets": {"lint": {"inputs": ["{workspaceRoot}/pnpm-workspace.yaml"]}}}"#,
+        ),
+    ]);
+    write(
+        &repo.root,
+        "pnpm-workspace.yaml",
+        &workspace_file.replace("19.0.0", "19.1.0"),
+    );
+    assert_eq!(repo.committed(), Vec::<String>::new());
+    write(
+        &repo.root,
+        "pnpm-workspace.yaml",
+        "packages:\n  - apps/*\n  - libs/*\ncatalog:\n  react: 19.1.0\n",
+    );
+    assert_eq!(repo.committed(), names(&["app", "lib"]));
+}
+
+fn lockfile(app: &str, tool: &str) -> String {
+    format!(
+        "lockfileVersion: '9.0'
+importers:
+  apps/app:
+    dependencies:
+      react:
+        specifier: ^19.0.0
+        version: {app}
+  tools/tool:
+    dependencies:
+      react:
+        specifier: ^19.0.0
+        version: {tool}
+packages:
+  react@19.0.0:
+    resolution: {{integrity: sha512-a}}
+  react@19.1.0:
+    resolution: {{integrity: sha512-b}}
+snapshots:
+  react@19.0.0: {{}}
+  react@19.1.0: {{}}
+"
+    )
+}
+
+#[test]
+fn lockfile_changes_affect_the_projects_whose_installs_changed() {
+    let repo = Repo::new(&[("pnpm-lock.yaml", &lockfile("19.0.0", "19.0.0"))]);
+    write(&repo.root, "pnpm-lock.yaml", &lockfile("19.0.0", "19.1.0"));
+    assert_eq!(repo.committed(), names(&["tool"]));
+}
+
+#[test]
+fn lockfile_changes_affect_every_project_outside_auto_mode() {
+    let repo = Repo::new(&[
+        ("nx.json", "{}"),
+        ("pnpm-lock.yaml", &lockfile("19.0.0", "19.0.0")),
+    ]);
+    write(&repo.root, "pnpm-lock.yaml", &lockfile("19.0.0", "19.1.0"));
+    assert_eq!(repo.committed(), names(&["app", "lib", "tool"]));
+}
+
+#[test]
+fn root_package_dependencies_affect_the_projects_installing_them() {
+    let repo = Repo::new(&[
+        (
+            "package.json",
+            r#"{"name": "root", "devDependencies": {"react": "^19.0.0"}}"#,
+        ),
+        ("pnpm-lock.yaml", &lockfile("19.0.0", "19.0.0")),
+    ]);
+    // Only the tool installs react once the lockfile moves the app off it.
+    write(
+        &repo.root,
+        "package.json",
+        r#"{"name": "root", "devDependencies": {"react": "^19.1.0"}}"#,
+    );
+    write(
+        &repo.root,
+        "pnpm-lock.yaml",
+        &lockfile("19.0.0", "19.1.0").replace("  apps/app:\n    dependencies:\n      react:\n        specifier: ^19.0.0\n        version: 19.0.0\n", "  apps/app: {}\n"),
+    );
+    assert_eq!(repo.committed(), names(&["app", "tool"]));
+    write(&repo.root, "package.json", r#"{"name": "root"}"#);
+    assert_eq!(repo.committed(), names(&["app", "lib", "tool"]));
+}
+
+#[test]
+fn root_tsconfig_path_changes_affect_the_projects_they_map_into() {
+    let paths = |target: &str, strict: bool| {
+        format!(
+            r#"{{"compilerOptions": {{"strict": {strict}, "paths": {{"@tool": ["{target}"]}}}}}}"#
+        )
+    };
+    let repo = Repo::new(&[("tsconfig.base.json", &paths("tools/tool/a.ts", true))]);
+    write(
+        &repo.root,
+        "tsconfig.base.json",
+        &paths("tools/tool/b.ts", true),
+    );
+    // The app names the file through its `{workspaceRoot}/tsconfig.*.json` input.
+    assert_eq!(repo.committed(), names(&["app", "tool"]));
+    write(
+        &repo.root,
+        "tsconfig.base.json",
+        &paths("tools/tool/b.ts", false),
+    );
+    assert_eq!(repo.committed(), names(&["app", "lib", "tool"]));
+}
