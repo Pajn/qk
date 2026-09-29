@@ -99,9 +99,10 @@ struct RunOptions {
     skip_cache: bool,
     #[arg(short = 'c', long)]
     configuration: Option<String>,
-    /// Maximum number of tasks executing concurrently.
-    #[arg(long, env = "NX_PARALLEL", default_value = "3")]
-    parallel: std::num::NonZeroUsize,
+    /// Maximum number of tasks executing concurrently; defaults to nx.json
+    /// `parallel`, then 3.
+    #[arg(long, env = "NX_PARALLEL")]
+    parallel: Option<std::num::NonZeroUsize>,
     /// Print the task graph as JSON without executing commands or loading dotenv.
     #[arg(long)]
     dry_run: bool,
@@ -775,11 +776,23 @@ fn execute_tasks(
         Rendered::Lines(style) => style,
         Rendered::Quiet | Rendered::Dynamic => qk_executor::OutputStyle::Quiet,
     };
+    let parallel = options.parallel.map_or_else(
+        || {
+            workspace
+                .config
+                .extra
+                .get("parallel")
+                .and_then(serde_json::Value::as_u64)
+                .filter(|parallel| *parallel > 0)
+                .map_or(3, |parallel| parallel as usize)
+        },
+        std::num::NonZeroUsize::get,
+    );
     let started = std::time::SystemTime::now();
     let result = qk_runner::run(
         workspace,
         &graph,
-        options.parallel.get(),
+        parallel,
         options.skip_cache,
         style,
         cancelled,
@@ -815,7 +828,7 @@ fn execute_tasks(
         let summary = ui::summary(
             &result,
             &report,
-            options.parallel.get(),
+            parallel,
             &ui::warnings(&sink),
             ui::Paint::stderr(),
         );

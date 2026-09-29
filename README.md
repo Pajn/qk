@@ -171,8 +171,8 @@ so brace globs containing commas are not supported on the command line.
 
 `run` requires an existing target; `run-many` skips projects without the
 requested targets and errors when nothing matches. Both accept
-`-c/--configuration`, `--parallel` (default `3`, also settable through
-`NX_PARALLEL`), `--output-style` and `--dry-run`.
+`-c/--configuration`, `--parallel` (also settable through `NX_PARALLEL`;
+defaults to nx.json `parallel`, then `3`), `--output-style` and `--dry-run`.
 
 `--output-style` takes Nx's names, and qk's own `quiet`:
 

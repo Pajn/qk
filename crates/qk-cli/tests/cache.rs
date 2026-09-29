@@ -1114,3 +1114,30 @@ fn a_local_workspace_file_changes_every_task_and_its_key() {
         "{stderr}"
     );
 }
+
+#[test]
+fn parallel_defaults_to_the_workspace_setting() {
+    let fixture = Fixture::with_targets(json!({
+        "build": {"command": "echo build"},
+        "test": {"command": "echo test"}
+    }));
+    let parallel = |fixture: &Fixture| {
+        let output = success(fixture.qk(
+            &fixture.root,
+            &["run-many", "-t", "build,test", "--output-style", "quiet"],
+        ));
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        stderr
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Parallel ")?
+                    .split(':')
+                    .next()
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| panic!("{stderr}"))
+    };
+    assert_eq!(parallel(&fixture), "3");
+    fs::write(fixture.root.join("nx.local.json"), r#"{"parallel": 1}"#).unwrap();
+    assert_eq!(parallel(&fixture), "1");
+}
