@@ -62,7 +62,7 @@ These options apply to `run`, `run-many` and `affected`:
 | `--dry-run` | Print qk's task graph; no dotenv, runtime inputs or executor preflight |
 | `--output-style <style>` | Select output behavior; see [Running tasks](../guides/running-tasks.md) |
 | `--verbose` | Set `NX_VERBOSE_LOGGING=true` for tasks |
-| `--sandbox[=audit\|enforce]` | macOS: report (`audit`) or refuse (`enforce`) what tasks read and write in the workspace beyond their declarations; skips the cache. See [Checking inputs in a sandbox](../guides/sandbox.md) |
+| `--sandbox[=audit\|enforce]` | Report (`audit`, macOS only) or refuse (`enforce`, macOS and Linux) what tasks read and write in the workspace beyond their declarations; skips the cache. See [Checking inputs in a sandbox](../guides/sandbox.md) |
 | `--sandbox-report <path>` | Write every sandbox finding as JSON |
 | `--report <path>` | Save JSON run report; defaults to `NX_RUN_REPORT` when set |
 | `-- <args>` | Forward arguments to requested tasks |

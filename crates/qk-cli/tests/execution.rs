@@ -1398,3 +1398,49 @@ fn the_sandbox_reports_and_refuses_what_a_task_does_not_declare() {
     assert!(!temp.path().join("stray.txt").exists());
     assert!(temp.path().join("dist/out.txt").is_file());
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn the_sandbox_refuses_what_a_task_does_not_declare_on_linux() {
+    let temp = fixture(json!({
+        "build": {
+            "command": "cat src/in.txt .env node_modules/dep/index.js /etc/hostname > /dev/null && ls other > /dev/null && echo out > dist/out.txt && echo ok",
+            "inputs": ["{projectRoot}/src/**/*"],
+            "outputs": ["{projectRoot}/dist"]
+        },
+        "peek": {"command": "cat other/notes.txt", "inputs": ["{projectRoot}/src/**/*"]},
+        "stray": {"command": "echo stray > stray.txt", "inputs": ["{projectRoot}/src/**/*"]}
+    }));
+    for directory in ["src", "other", "node_modules/dep"] {
+        fs::create_dir_all(temp.path().join(directory)).unwrap();
+    }
+    fs::write(temp.path().join("src/in.txt"), "in").unwrap();
+    fs::write(temp.path().join("other/notes.txt"), "notes").unwrap();
+    fs::write(temp.path().join(".env"), "X=1\n").unwrap();
+    fs::write(temp.path().join("node_modules/dep/index.js"), "").unwrap();
+    let sandboxed = |target: &str| {
+        run(
+            temp.path(),
+            &[
+                "run",
+                target,
+                "--sandbox=enforce",
+                "--output-style",
+                "static",
+            ],
+        )
+    };
+    // Its inputs, dotenv files, node_modules, outside the workspace, listing,
+    // and writing its outputs, which did not exist yet.
+    let built = success(sandboxed("app:build"));
+    assert!(String::from_utf8_lossy(&built.stdout).contains("ok"));
+    assert!(temp.path().join("dist/out.txt").is_file());
+    let peek = sandboxed("app:peek");
+    assert!(!peek.status.success());
+    assert!(String::from_utf8_lossy(&peek.stdout).contains("Permission denied"));
+    assert!(!sandboxed("app:stray").status.success());
+    assert!(!temp.path().join("stray.txt").exists());
+    // Audit needs reports Landlock does not give.
+    let audit = run(temp.path(), &["run", "app:build", "--sandbox"]);
+    assert!(String::from_utf8_lossy(&audit.stderr).contains("use --sandbox=enforce"));
+}

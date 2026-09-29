@@ -26,6 +26,16 @@ macro_rules! status {
     }};
 }
 
+/// How a sandboxed task's commands are held to what it declares.
+#[derive(Clone, Debug)]
+pub enum Confinement {
+    /// macOS: a Seatbelt profile, through `sandbox-exec`.
+    Seatbelt(PathBuf),
+    /// Linux: a Landlock rule set's descriptor, which each command restricts
+    /// itself to before it starts. It stays open while the run lasts.
+    Landlock(i32),
+}
+
 #[derive(Clone, Debug)]
 pub struct PreparedTask {
     pub id: String,
@@ -47,8 +57,8 @@ pub struct PreparedTask {
     /// The runner sets it for the one task a run is for, when that task has a
     /// single command whose output goes straight to the terminal.
     pub interactive: bool,
-    /// A Seatbelt profile the commands run under, for `--sandbox`.
-    pub sandbox: Option<PathBuf>,
+    /// What the commands run under, for `--sandbox`.
+    pub sandbox: Option<Confinement>,
     /// How the task's output is shown; the runner sets it per output style.
     pub display: Display,
 }

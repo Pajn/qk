@@ -5,7 +5,6 @@
 //! requested directly, it is stopped once every task depending on it has finished.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -123,11 +122,6 @@ pub fn run(
     let sandbox = sandbox_mode
         .map(|mode| sandbox::Sandbox::start(workspace, graph, mode))
         .transpose()?;
-    if let Some(sandbox) = &sandbox {
-        for (id, task) in &mut prepared {
-            task.sandbox = sandbox.profile(id).map(Path::to_path_buf);
-        }
-    }
     let prepared = prepared;
     let threads: BTreeMap<String, Threads> = graph
         .tasks
@@ -343,12 +337,17 @@ pub fn run(
                     pending.remove(&id);
                     active.insert(id.clone());
                     started.insert(id.clone(), SystemTime::now());
-                    let task = &prepared[&id];
+                    // Sandboxed as it starts: on Linux the rules hold paths
+                    // its dependencies have just created.
+                    let mut task = prepared[&id].clone();
+                    if let Some(sandbox) = &sandbox {
+                        task.sandbox = sandbox.confine(&id);
+                    }
                     let sender = sender.clone();
                     if serving.contains(&id) {
                         report::event(Event::StartedContinuous { id: id.clone() });
                         if !announced.contains(&id) {
-                            task.ready.store(true, Ordering::SeqCst);
+                            prepared[&id].ready.store(true, Ordering::SeqCst);
                         }
                         // Dependents start while it runs, and its live state cannot be keyed.
                         fingerprints.insert(
@@ -362,7 +361,7 @@ pub fn run(
                         let stop = Arc::new(AtomicBool::new(false));
                         stops.insert(id.clone(), stop.clone());
                         scope.spawn(move || {
-                            let result = execute(task, &stop).map(|outcome| {
+                            let result = execute(&task, &stop).map(|outcome| {
                                 qk_cache::TaskResult::uncached(outcome, String::new())
                             });
                             let _ = sender.send((id, result));
@@ -374,7 +373,6 @@ pub fn run(
                         checking: cache.is_some(),
                     });
                     let definition = &graph.tasks[&id];
-                    let mut task = task.clone();
                     if let (Some(threads), Some(count)) = (threads.get(&id), given.get(&id)) {
                         task.execution.extend(threads.environment(*count));
                     }
@@ -513,10 +511,10 @@ pub fn run(
     let sandbox = sandbox
         .map(|sandbox| -> Result<SandboxResult> {
             let mode = sandbox.mode;
-            let unsandboxed = sandbox.unsandboxed.clone();
+            let (findings, unsandboxed) = sandbox.finish()?;
             Ok(SandboxResult {
                 mode,
-                findings: sandbox.finish()?,
+                findings,
                 unsandboxed,
             })
         })

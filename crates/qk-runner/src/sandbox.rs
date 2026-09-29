@@ -1,6 +1,6 @@
-//! `--sandbox`: each task runs under macOS's sandbox (Seatbelt, through
-//! `sandbox-exec`), which holds it to what it declares inside the workspace.
-//! Everything outside the workspace stays open.
+//! `--sandbox`: each task runs under the system's sandbox, which holds it to
+//! what it declares inside the workspace. Everything outside the workspace
+//! stays open.
 //!
 //! Inside it, a task may read its cache key's files, `node_modules`, the
 //! lockfile, the outputs of its own and its dependencies' tasks and its
@@ -9,8 +9,12 @@
 //! mode it is refused, except reading and writing `.git` and reading dotenv
 //! files, which a task may need although they are not keyed.
 //!
-//! Each report names the task through the rule's message, so the kernel's
-//! log, read while the run lasts, says which task did what.
+//! On macOS that is Seatbelt, through `sandbox-exec`, with a profile per
+//! task. Each report names the task through the rule's message, so the
+//! kernel's log, read while the run lasts, says which task did what. On
+//! Linux it is Landlock, which can only refuse, so only enforce mode is
+//! there; a task's rules are built as it starts, since Landlock holds paths
+//! that exist and its dependencies' outputs appear during the run.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader};
@@ -23,6 +27,15 @@ use anyhow::{Context, Result, bail};
 use qk_config::Workspace;
 use qk_taskgraph::{Task, TaskGraph};
 use serde::Serialize;
+
+#[cfg(target_os = "linux")]
+mod landlock;
+#[cfg(not(target_os = "linux"))]
+mod landlock {
+    pub fn abi() -> anyhow::Result<u32> {
+        anyhow::bail!("Landlock is Linux's")
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -52,15 +65,45 @@ impl Findings {
     }
 }
 
-/// A run's sandbox: a profile per task, and the log being read.
+#[cfg(target_os = "linux")]
+type Ruleset = std::os::fd::OwnedFd;
+#[cfg(not(target_os = "linux"))]
+type Ruleset = ();
+
+/// What one task may do in the workspace, as absolute paths.
+#[derive(Clone, Debug, Default)]
+struct Plan {
+    /// Directories whose every tracked file is an input, read whole.
+    read_directories: Vec<PathBuf>,
+    /// Input files one by one, the lockfile, and symlinked inputs' targets.
+    read_files: Vec<PathBuf>,
+    /// Its dependencies' outputs.
+    read_trees: BTreeSet<PathBuf>,
+    /// Its outputs and warm paths.
+    write_trees: BTreeSet<PathBuf>,
+}
+
+/// A run's sandbox: what each task may do, its profiles or rules, and on
+/// macOS the log being read.
 pub struct Sandbox {
     pub mode: Mode,
     root: PathBuf,
+    state: PathBuf,
+    plans: BTreeMap<String, Plan>,
     profiles: BTreeMap<String, PathBuf>,
     /// Tasks that run unsandboxed, and why.
-    pub unsandboxed: BTreeMap<String, String>,
+    unsandboxed: Mutex<BTreeMap<String, String>>,
     watcher: Option<Watcher>,
     directory: PathBuf,
+    /// Linux: every `node_modules` directory and dotenv file of the
+    /// workspace, since Landlock takes paths rather than patterns.
+    shared: Vec<PathBuf>,
+    dotenv: Vec<PathBuf>,
+    /// Linux: rule sets handed to tasks, open until the run ends, and the
+    /// output directories created so their rules had a path to hold.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    rulesets: Mutex<Vec<Ruleset>>,
+    created: Mutex<Vec<PathBuf>>,
 }
 
 /// Tag in each rule's message: the task a report belongs to.
@@ -68,10 +111,16 @@ const TAG: &str = "qk-task:";
 const SENTINEL: &str = "qk-sandbox-sentinel";
 
 impl Sandbox {
-    /// Writes a profile for each task and starts reading the log.
+    /// Works out what each task may do; on macOS writes its profile and
+    /// starts reading the log.
     pub fn start(workspace: &Workspace, graph: &TaskGraph, mode: Mode) -> Result<Self> {
-        if !cfg!(target_os = "macos") {
-            bail!("--sandbox needs macOS's sandbox-exec");
+        if cfg!(target_os = "linux") {
+            if mode == Mode::Audit {
+                bail!("on Linux the sandbox can only refuse, not report; use --sandbox=enforce");
+            }
+            landlock::abi().context("--sandbox needs Landlock, in Linux 5.13 and later")?;
+        } else if !cfg!(target_os = "macos") {
+            bail!("--sandbox needs macOS or Linux");
         }
         let root = workspace
             .root
@@ -82,54 +131,133 @@ impl Sandbox {
         std::fs::create_dir_all(&directory)?;
         let resolution = qk_cache::resolve_each(workspace, graph)?;
         let tree = Tree::new(&resolution.candidates);
-        let mut profiles = BTreeMap::new();
+        let mut plans = BTreeMap::new();
         let mut unsandboxed = BTreeMap::new();
-        for (index, (id, task)) in graph.tasks.iter().enumerate() {
-            let files = match &resolution.tasks[id] {
-                Ok(resolved) => &resolved.files,
+        for (id, task) in &graph.tasks {
+            match &resolution.tasks[id] {
+                Ok(resolved) => {
+                    plans.insert(
+                        id.clone(),
+                        plan(workspace, graph, task, &root, &tree, &resolved.files),
+                    );
+                }
                 Err(reason) => {
                     unsandboxed.insert(id.clone(), reason.clone());
-                    continue;
-                }
-            };
-            let profile = profile(workspace, graph, task, &root, &state, &tree, files, mode)?;
-            let path = directory.join(format!("{index}.sb"));
-            std::fs::write(&path, profile)?;
-            // A profile Seatbelt cannot take would fail the task; it runs
-            // unsandboxed instead, with the reason.
-            match compiles(&path) {
-                Ok(()) => {
-                    profiles.insert(id.clone(), path);
-                }
-                Err(reason) => {
-                    unsandboxed.insert(id.clone(), reason);
                 }
             }
         }
-        let watcher = Watcher::start(&directory)?;
-        Ok(Self {
+        let mut sandbox = Self {
             mode,
             root,
-            profiles,
-            unsandboxed,
-            watcher: Some(watcher),
+            state,
+            plans,
+            profiles: BTreeMap::new(),
+            unsandboxed: Mutex::new(unsandboxed),
+            watcher: None,
             directory,
-        })
+            shared: Vec::new(),
+            dotenv: Vec::new(),
+            rulesets: Mutex::new(Vec::new()),
+            created: Mutex::new(Vec::new()),
+        };
+        if cfg!(target_os = "macos") {
+            for (index, id) in sandbox.plans.keys().enumerate() {
+                let profile = profile(&sandbox.plans[id], id, &sandbox.root, &sandbox.state, mode)?;
+                let path = sandbox.directory.join(format!("{index}.sb"));
+                std::fs::write(&path, profile)?;
+                // A profile Seatbelt cannot take would fail the task; it runs
+                // unsandboxed instead, with the reason.
+                match compiles(&path) {
+                    Ok(()) => {
+                        sandbox.profiles.insert(id.clone(), path);
+                    }
+                    Err(reason) => {
+                        sandbox
+                            .unsandboxed
+                            .lock()
+                            .unwrap()
+                            .insert(id.clone(), reason);
+                    }
+                }
+            }
+            sandbox.watcher = Some(Watcher::start(&sandbox.directory)?);
+        } else {
+            let (shared, dotenv) = scan(&sandbox.root);
+            sandbox.shared = shared;
+            sandbox.dotenv = dotenv;
+        }
+        Ok(sandbox)
     }
 
-    /// The profile a task runs under, if it is sandboxed.
-    pub fn profile(&self, id: &str) -> Option<&Path> {
-        self.profiles.get(id).map(PathBuf::as_path)
+    /// How a task is held to its plan, as it starts; `None` runs it
+    /// unsandboxed, with the reason recorded.
+    pub fn confine(&self, id: &str) -> Option<qk_executor::Confinement> {
+        if !self.plans.contains_key(id) {
+            return None;
+        }
+        if cfg!(target_os = "macos") {
+            return self
+                .profiles
+                .get(id)
+                .map(|profile| qk_executor::Confinement::Seatbelt(profile.clone()));
+        }
+        match self.landlock(id) {
+            Ok(confinement) => Some(confinement),
+            Err(error) => {
+                self.unsandboxed
+                    .lock()
+                    .unwrap()
+                    .insert(id.to_owned(), format!("{error:#}"));
+                None
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn landlock(&self, id: &str) -> Result<qk_executor::Confinement> {
+        use std::os::fd::AsRawFd;
+        let plan = &self.plans[id];
+        // Landlock holds paths that exist: an output directory that does not
+        // yet is created, and removed again if the task leaves it empty.
+        for tree in &plan.write_trees {
+            if !tree.exists() && tree.extension().is_none() {
+                std::fs::create_dir_all(tree)?;
+                self.created.lock().unwrap().push(tree.clone());
+            }
+        }
+        let rules = landlock::rules(&landlock::Paths {
+            root: &self.root,
+            read_directories: &plan.read_directories,
+            read_files: plan.read_files.iter().chain(&self.dotenv),
+            read_trees: &plan.read_trees,
+            write_trees: plan
+                .write_trees
+                .iter()
+                .chain(&self.shared)
+                .chain([&self.root.join(".git"), &self.state]),
+        })?;
+        let fd = rules.as_raw_fd();
+        self.rulesets.lock().unwrap().push(rules);
+        Ok(qk_executor::Confinement::Landlock(fd))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn landlock(&self, _: &str) -> Result<qk_executor::Confinement> {
+        bail!("Landlock is Linux's")
     }
 
     /// Stops reading the log, once every report so far has arrived, and
-    /// returns each task's findings.
-    pub fn finish(mut self) -> Result<BTreeMap<String, Findings>> {
+    /// returns each task's findings, and the tasks that ran unsandboxed.
+    pub fn finish(mut self) -> Result<(BTreeMap<String, Findings>, BTreeMap<String, String>)> {
         let reports = match self.watcher.take() {
             Some(watcher) => watcher.finish(&self.directory)?,
             None => Vec::new(),
         };
         let _ = std::fs::remove_dir_all(&self.directory);
+        for directory in std::mem::take(&mut *self.created.lock().unwrap()) {
+            // Only if the task left it empty.
+            let _ = std::fs::remove_dir(directory);
+        }
         let mut findings: BTreeMap<String, Findings> = BTreeMap::new();
         for report in reports {
             let Ok(relative) = Path::new(&report.path).strip_prefix(&self.root) else {
@@ -146,8 +274,39 @@ impl Sandbox {
             }
         }
         findings.retain(|_, findings| !findings.is_empty());
-        Ok(findings)
+        let unsandboxed = std::mem::take(&mut *self.unsandboxed.lock().unwrap());
+        Ok((findings, unsandboxed))
     }
+}
+
+/// Every `node_modules` directory and dotenv file in the workspace, without
+/// looking inside `node_modules` or `.git`.
+fn scan(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut shared = Vec::new();
+    let mut dotenv = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                match name.as_ref() {
+                    "node_modules" => shared.push(entry.path()),
+                    ".git" => {}
+                    _ => pending.push(entry.path()),
+                }
+            } else if unkeyed(&name) {
+                dotenv.push(entry.path());
+            }
+        }
+    }
+    (shared, dotenv)
 }
 
 impl Drop for Sandbox {
@@ -289,26 +448,71 @@ fn parents(path: &str) -> impl Iterator<Item = &str> {
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn profile(
+/// What a task may do: its inputs, collapsed into whole directories where
+/// every tracked file is one, its dependencies' outputs, and its own outputs
+/// and warm paths.
+fn plan(
     workspace: &Workspace,
     graph: &TaskGraph,
     task: &Task,
     root: &Path,
-    state: &Path,
     tree: &Tree,
     files: &BTreeSet<String>,
-    mode: Mode,
-) -> Result<String> {
-    let root_text = root.to_str().context("the workspace path must be UTF-8")?;
-    let path = |relative: &str| -> String {
+) -> Plan {
+    let path = |relative: &str| -> PathBuf {
         if relative == "." || relative.is_empty() {
-            root_text.to_owned()
+            root.to_path_buf()
         } else {
-            format!("{root_text}/{relative}")
+            root.join(relative)
         }
     };
-    let tag = quote(&format!("{TAG}{}", task.id));
+    let (whole, singles) = tree.cover(files);
+    let mut read_files: Vec<PathBuf> = singles.iter().map(|file| path(file)).collect();
+    // Keyed through what the lockfile installs rather than as files.
+    for file in ["pnpm-lock.yaml", "pnpm-workspace.yaml", "package.json"] {
+        read_files.push(path(file));
+    }
+    // A symlinked input is read where it points.
+    for file in files {
+        let absolute = root.join(file);
+        if std::fs::symlink_metadata(&absolute).is_ok_and(|metadata| metadata.is_symlink())
+            && let Ok(target) = absolute.canonicalize()
+        {
+            read_files.push(target);
+        }
+    }
+    let anchors = |task: &Task| -> Vec<PathBuf> {
+        qk_cache::Outputs::new(workspace, task)
+            .map(|outputs| outputs.anchors().map(path).collect())
+            .unwrap_or_default()
+    };
+    let mut read_trees = BTreeSet::new();
+    for dependency in dependencies(graph, task) {
+        read_trees.extend(anchors(dependency));
+    }
+    let mut write_trees: BTreeSet<PathBuf> = anchors(task).into_iter().collect();
+    if let Ok(Some(warm)) = qk_cache::warm::config(workspace, task)
+        && let Ok(paths) = qk_cache::Outputs::from_paths(&warm.paths)
+    {
+        write_trees.extend(paths.anchors().map(path));
+    }
+    Plan {
+        read_directories: whole.iter().map(|directory| path(directory)).collect(),
+        read_files,
+        read_trees,
+        write_trees,
+    }
+}
+
+/// The Seatbelt profile for a task's plan.
+fn profile(plan: &Plan, id: &str, root: &Path, state: &Path, mode: Mode) -> Result<String> {
+    let text = |path: &Path| -> Result<String> {
+        path.to_str()
+            .map(quote)
+            .context("sandboxed paths must be UTF-8")
+    };
+    let root_text = root.to_str().context("the workspace path must be UTF-8")?;
+    let tag = quote(&format!("{TAG}{id}"));
     let mut rules = vec!["(version 1)".to_owned(), "(allow default)".to_owned()];
     match mode {
         Mode::Audit => {
@@ -333,7 +537,7 @@ fn profile(
             // Not keyed, but a task may need them.
             rules.push(format!(
                 "(allow file-read-data file-write* (subpath {}))",
-                quote(&path(".git"))
+                text(&root.join(".git"))?
             ));
             rules.push(format!(
                 "(allow file-read-data (regex #\"^{}/(.*/)?\\.(env|env\\.[^/]*|[^/]*\\.env)$\"))",
@@ -350,64 +554,30 @@ fn profile(
     // qk's own state for the worktree, where warm directories live.
     rules.push(format!(
         "(allow file-read-data file-write* (subpath {}))",
-        quote(
-            state
-                .to_str()
-                .context("the git directory path must be UTF-8")?
-        )
+        text(state)?
     ));
-    let (whole, singles) = tree.cover(files);
-    for directory in &whole {
+    for directory in &plan.read_directories {
         rules.push(format!(
             "(allow file-read-data (subpath {}))",
-            quote(&path(directory))
+            text(directory)?
         ));
-    }
-    let mut readable: Vec<String> = singles.iter().map(|file| path(file)).collect();
-    // Keyed through what the lockfile installs rather than as files.
-    for file in ["pnpm-lock.yaml", "pnpm-workspace.yaml", "package.json"] {
-        readable.push(path(file));
-    }
-    // A symlinked input is read where it points.
-    for file in files {
-        let absolute = root.join(file);
-        if std::fs::symlink_metadata(&absolute).is_ok_and(|metadata| metadata.is_symlink())
-            && let Ok(target) = absolute.canonicalize()
-        {
-            readable.push(target.to_string_lossy().into_owned());
-        }
     }
     // Seatbelt limits each rule's data to 64 KiB, so the paths are spread
     // over rules of a few hundred each.
-    for chunk in readable.chunks(200) {
+    for chunk in plan.read_files.chunks(200) {
         rules.push("(allow file-read-data".to_owned());
         for file in chunk {
-            rules.push(format!("  (literal {})", quote(file)));
+            rules.push(format!("  (literal {})", text(file)?));
         }
         rules.push(")".to_owned());
     }
-    let anchors = |task: &Task| -> Vec<String> {
-        qk_cache::Outputs::new(workspace, task)
-            .map(|outputs| outputs.anchors().map(path).collect())
-            .unwrap_or_default()
-    };
-    let mut read_trees: BTreeSet<String> = BTreeSet::new();
-    for dependency in dependencies(graph, task) {
-        read_trees.extend(anchors(dependency));
+    for tree in &plan.read_trees {
+        rules.push(format!("(allow file-read-data (subpath {}))", text(tree)?));
     }
-    let mut write_trees: BTreeSet<String> = anchors(task).into_iter().collect();
-    if let Ok(Some(warm)) = qk_cache::warm::config(workspace, task)
-        && let Ok(paths) = qk_cache::Outputs::from_paths(&warm.paths)
-    {
-        write_trees.extend(paths.anchors().map(path));
-    }
-    for tree in &read_trees {
-        rules.push(format!("(allow file-read-data (subpath {}))", quote(tree)));
-    }
-    for tree in &write_trees {
+    for tree in &plan.write_trees {
         rules.push(format!(
             "(allow file-read-data file-write* (subpath {}))",
-            quote(tree)
+            text(tree)?
         ));
     }
     Ok(rules.join("\n") + "\n")

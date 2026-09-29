@@ -169,17 +169,32 @@ fn spawn(task: &PreparedTask, text: &str, capture: bool, interactive: bool) -> R
     };
     #[cfg(not(windows))]
     let mut command = match &task.sandbox {
-        Some(profile) => {
+        Some(crate::Confinement::Seatbelt(profile)) => {
             let mut command = Command::new("sandbox-exec");
             command.arg("-f").arg(profile).args(["/bin/sh", "-c", text]);
             command
         }
-        None => {
+        _ => {
             let mut command = Command::new("/bin/sh");
             command.arg("-c").arg(text);
             command
         }
     };
+    #[cfg(target_os = "linux")]
+    if let Some(crate::Confinement::Landlock(ruleset)) = task.sandbox {
+        use std::os::unix::process::CommandExt;
+        // Between fork and exec: only system calls.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+                    || libc::syscall(libc::SYS_landlock_restrict_self, ruleset, 0u32) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
     command
         .current_dir(&task.cwd)
         .env_clear()

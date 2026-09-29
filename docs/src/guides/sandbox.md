@@ -1,8 +1,8 @@
 # Checking inputs and outputs in a sandbox
 
-On macOS, `--sandbox` runs each task under the system sandbox (Seatbelt,
-through `sandbox-exec`) to check that it declares what it reads and writes
-in the workspace. qk is not a hermetic build system: outside the workspace
+`--sandbox` runs each task under the system's sandbox to check that it
+declares what it reads and writes in the workspace: Seatbelt, through
+`sandbox-exec`, on macOS, and Landlock on Linux. qk is not a hermetic build system: outside the workspace
 everything stays open, including system files, the home directory,
 temporary files and tool caches.
 
@@ -60,4 +60,22 @@ stay allowed.
   each report is tagged with its task.
 - A task whose inputs cannot be resolved, or whose profile the sandbox
   rejects, runs unsandboxed and is listed with the reason.
-- Only macOS has a sandbox for qk so far.
+- On Windows, qk has no sandbox.
+
+## Linux
+
+Landlock, in Linux 5.13 and later, is available to any process, without
+root and inside containers. It can refuse but not report, so Linux has
+enforce mode only: `--sandbox` alone is an error there, and a refused access
+fails the task with `Permission denied` rather than being listed.
+
+Landlock holds paths that exist, so each task's rules are built as it
+starts, after its dependencies have written their outputs. An output
+directory that does not exist yet is created then, and removed again if the
+task leaves it empty. A task may write beneath its outputs, but not remove
+or rename an output directory itself, which would need rights over its
+parent: a tool should clear an output directory rather than delete and
+recreate it. Outside the workspace, Landlock allows what exists when the
+task starts; an entry created later directly in a directory above the
+workspace, such as a new file in the home directory when the workspace is
+below it, is refused.
