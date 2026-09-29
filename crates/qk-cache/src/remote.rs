@@ -49,8 +49,11 @@ struct Uploads {
 }
 
 struct Upload {
+    /// The entry's key, or the warm record's task, for reporting failures.
     key: String,
     local: PathBuf,
+    /// A warm record to write, with its object name, instead of the entry.
+    warm: Option<(String, Vec<u8>)>,
 }
 
 /// The remote store for a workspace, `Ok(None)` when none is configured or the
@@ -190,22 +193,7 @@ impl Remote {
             bail!("remote manifest is for another key");
         }
         for blob in crate::evict::manifest_blobs(&parsed) {
-            if !crate::store::valid_hash(&blob) {
-                bail!("invalid blob name in remote manifest");
-            }
-            let target = root.join("blobs").join(&blob);
-            if target.is_file() {
-                continue;
-            }
-            let mut file = tempfile::NamedTempFile::new_in(root.join("tmp"))?;
-            if !self.get(&self.object("blobs", &blob), file.as_file_mut())? {
-                bail!("remote entry is missing blob {blob}");
-            }
-            file.as_file().sync_all()?;
-            if crate::hash::digest_file(file.path())? != blob {
-                bail!("remote blob {blob} does not match its hash");
-            }
-            file.persist(&target)?;
+            self.fetch_blob(root, &blob)?;
         }
         let mut file = tempfile::NamedTempFile::new_in(root.join("tmp"))?;
         file.write_all(&manifest)?;
@@ -216,6 +204,83 @@ impl Remote {
 
     /// Queues the local entry for `key` for upload.
     pub(crate) fn upload(self: &Arc<Self>, root: &Path, key: &str) {
+        self.enqueue(Upload {
+            key: key.to_owned(),
+            local: root.to_owned(),
+            warm: None,
+        });
+    }
+
+    /// Queues a task's warm record for its branch, after the blobs it cites.
+    pub(crate) fn upload_warm(
+        self: &Arc<Self>,
+        root: &Path,
+        task: &str,
+        branch: &str,
+        record: Vec<u8>,
+    ) {
+        self.enqueue(Upload {
+            key: format!("{task} warm state"),
+            local: root.to_owned(),
+            warm: Some((self.warm_object(task, branch), record)),
+        });
+    }
+
+    fn warm_object(&self, task: &str, branch: &str) -> String {
+        let hash = |text: &str| blake3::hash(text.as_bytes()).to_hex()[..32].to_owned();
+        let identity = format!(
+            "{task}\0{}\0{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        );
+        self.object(
+            "warm",
+            &format!("{}/{}.json", hash(&identity), hash(branch)),
+        )
+    }
+
+    /// The task's warm record saved on `branch`, with every blob it cites
+    /// fetched into the local store and verified, or `None` when there is
+    /// none.
+    pub(crate) fn fetch_warm(
+        &self,
+        root: &Path,
+        task: &str,
+        branch: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let mut record = Vec::new();
+        if !self.get(&self.warm_object(task, branch), &mut record)? {
+            return Ok(None);
+        }
+        let parsed: Value =
+            serde_json::from_slice(&record).context("invalid remote warm record")?;
+        for blob in crate::evict::manifest_blobs(&parsed) {
+            self.fetch_blob(root, &blob)?;
+        }
+        Ok(Some(record))
+    }
+
+    fn fetch_blob(&self, root: &Path, blob: &str) -> Result<()> {
+        if !crate::store::valid_hash(blob) {
+            bail!("invalid blob name in remote record");
+        }
+        let target = root.join("blobs").join(blob);
+        if target.is_file() {
+            return Ok(());
+        }
+        let mut file = tempfile::NamedTempFile::new_in(root.join("tmp"))?;
+        if !self.get(&self.object("blobs", blob), file.as_file_mut())? {
+            bail!("remote record is missing blob {blob}");
+        }
+        file.as_file().sync_all()?;
+        if crate::hash::digest_file(file.path())? != blob {
+            bail!("remote blob {blob} does not match its hash");
+        }
+        file.persist(&target)?;
+        Ok(())
+    }
+
+    fn enqueue(self: &Arc<Self>, upload: Upload) {
         if self.mode != Mode::ReadWrite {
             return;
         }
@@ -249,13 +314,21 @@ impl Remote {
                 failures,
             }
         });
-        let _ = uploads.sender.send(Upload {
-            key: key.to_owned(),
-            local: root.to_owned(),
-        });
+        let _ = uploads.sender.send(upload);
     }
 
     fn send(&self, job: &Upload) -> Result<()> {
+        if let Some((object, record)) = &job.warm {
+            let parsed: Value = serde_json::from_slice(record)?;
+            for blob in crate::evict::manifest_blobs(&parsed) {
+                let remote = self.object("blobs", &blob);
+                if !self.exists(&remote)? {
+                    self.put(&remote, File::open(job.local.join("blobs").join(&blob))?)?;
+                }
+            }
+            // The newest save for the branch replaces the last one.
+            return self.put(object, record.as_slice());
+        }
         let manifest_path = job.local.join("entries").join(format!("{}.json", job.key));
         let manifest = fs::read(&manifest_path)?;
         let parsed: Value = serde_json::from_slice(&manifest)?;

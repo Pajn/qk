@@ -1018,3 +1018,34 @@ fn warm_directories_follow_the_task_across_worktrees() {
     // Without the cache nothing is restored and the variable is not set.
     assert_eq!(said(&fixture, &fixture.root, &["--skip-cache"]), "cold");
 }
+
+#[cfg(unix)]
+#[test]
+fn warm_state_is_shared_through_the_remote_by_branch() {
+    let server = s3::FakeS3::start();
+    let fixture = Fixture::new(json!({
+        "command": "if [ -f \"$TOOL_CACHE/seen\" ]; then cat \"$TOOL_CACHE/seen\"; else echo cold; fi; mkdir -p \"$TOOL_CACHE\" && echo \"$GITHUB_REF_NAME\" > \"$TOOL_CACHE/seen\"",
+        "qk:warm": {"env": {"TOOL_CACHE": "{warm}/tool"}}
+    }));
+    with_remote(&fixture, &server, json!({}));
+    let on = |branch: &str| {
+        let output = success(remote_build(&fixture, &[("GITHUB_REF_NAME", branch)]));
+        stdout(&output)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let fresh = || {
+        clear_local_cache(&fixture);
+        let _ = fs::remove_dir_all(fixture.root.join(".git/qk/warm"));
+    };
+    assert_eq!(on("main"), "cold");
+    assert_eq!(server.objects("/cache/qk/v1/warm/").len(), 1);
+    // Another machine, on a branch without its own state, starts from main's.
+    fresh();
+    assert_eq!(on("feature"), "main");
+    // Once the branch has saved state, it is preferred.
+    fresh();
+    assert_eq!(on("feature"), "feature");
+}

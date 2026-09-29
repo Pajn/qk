@@ -425,7 +425,11 @@ Warm state is restored before the task runs, on a cache miss and for
 targets that are not cacheable, and never on a hit. A group already present
 on disk is left alone, since it is the newest for that checkout; otherwise
 it comes from the task's most recent save, in the store linked worktrees
-share. It is saved after successful runs only; files unchanged since the
+share, and without one there from the remote store: the current branch's
+save, else the default branch's (nx.json `defaultBase`, else `main`). The
+branch comes from `GITHUB_HEAD_REF` or `GITHUB_REF_NAME` in CI, else from
+git; a checkout with no branch reads the default branch's state but saves
+none remotely. `remote: false` keeps a target's warm state local. It is saved after successful runs only; files unchanged since the
 last save or restore are recognised by their metadata and not read again.
 Groups over their `maxSize` are not saved. Warm state counts toward the
 cache's size limit and is evicted with it. `--skip-cache` neither restores

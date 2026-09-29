@@ -252,6 +252,40 @@ fn locations(workspace: &Workspace, task: &Task, warm: &Warm) -> Result<Vec<Loca
     Ok(locations)
 }
 
+/// The branch being built: from CI when it checks out a detached head, else
+/// from git. `None` when there is no branch to name.
+fn current_branch(workspace: &Workspace) -> Option<String> {
+    for name in ["GITHUB_HEAD_REF", "GITHUB_REF_NAME"] {
+        if let Ok(value) = std::env::var(name)
+            && !value.is_empty()
+        {
+            return Some(value);
+        }
+    }
+    let output = paths::git(&workspace.root, &["rev-parse", "--abbrev-ref", "HEAD"]).ok()?;
+    let branch = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+    (output.status.success() && !branch.is_empty() && branch != "HEAD").then_some(branch)
+}
+
+/// The branches to take warm state from, in order: the current one, then the
+/// workspace's default branch.
+fn branches(workspace: &Workspace) -> Vec<String> {
+    let default = workspace
+        .config
+        .default_base
+        .clone()
+        .unwrap_or_else(|| "main".into());
+    let default = default
+        .strip_prefix("origin/")
+        .unwrap_or(&default)
+        .to_owned();
+    let mut branches: Vec<String> = current_branch(workspace).into_iter().collect();
+    if !branches.contains(&default) {
+        branches.push(default);
+    }
+    branches
+}
+
 fn stamp(metadata: &fs::Metadata) -> Vec<i64> {
     let modified = metadata
         .modified()
@@ -313,7 +347,10 @@ impl Cache {
         warm: &Warm,
     ) -> Result<Restored> {
         let mut restored = Restored::default();
-        let Some(mut record) = self.load_warm(task) else {
+        let Some(mut record) = self
+            .load_warm(task)
+            .or_else(|| self.remote_warm(workspace, task, warm))
+        else {
             return Ok(restored);
         };
         for location in locations(workspace, task, warm)? {
@@ -364,6 +401,34 @@ impl Cache {
             self.store_warm(task, &record)?;
         }
         Ok(restored)
+    }
+
+    /// The task's warm state from the remote store: the current branch's, else
+    /// the default branch's. It is kept locally from then on.
+    fn remote_warm(&self, workspace: &Workspace, task: &Task, warm: &Warm) -> Option<Record> {
+        let remote = self.remote.as_ref().filter(|_| warm.remote)?;
+        for branch in branches(workspace) {
+            match remote.fetch_warm(&self.root, &task.id, &branch) {
+                Ok(Some(bytes)) => {
+                    let record = serde_json::from_slice::<Record>(&bytes)
+                        .ok()
+                        .filter(|record| record.version == 1 && record.task == task.id)?;
+                    if self.store_warm(task, &record).is_err() {
+                        return None;
+                    }
+                    return Some(record);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    qk_executor::status!(
+                        "qk: {}: remote warm state unavailable ({error:#})",
+                        task.id
+                    );
+                    return None;
+                }
+            }
+        }
+        None
     }
 
     /// Saves the task's warm groups after a successful run. A file whose
@@ -438,6 +503,17 @@ impl Cache {
             }
             record.groups.insert(location.name.to_owned(), group);
         }
-        self.store_warm(task, &record)
+        self.store_warm(task, &record)?;
+        // Stamps describe this machine's files; the remote record goes without.
+        if warm.remote
+            && let Some(remote) = &self.remote
+            && let Some(branch) = current_branch(workspace)
+        {
+            for group in record.groups.values_mut() {
+                group.stamps.clear();
+            }
+            remote.upload_warm(&self.root, &task.id, &branch, serde_json::to_vec(&record)?);
+        }
+        Ok(())
     }
 }
