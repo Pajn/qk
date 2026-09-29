@@ -403,6 +403,28 @@ pub fn summary(
             ));
         }
     }
+    let warm: Vec<&str> = report
+        .tasks
+        .iter()
+        .filter(|task| {
+            task.warm
+                .as_ref()
+                .and_then(|warm| warm.get("restored"))
+                .is_some_and(|restored| !restored.is_null())
+        })
+        .map(|task| task.id.as_str())
+        .collect();
+    if !warm.is_empty() {
+        lines.push(format!(
+            "{} {}",
+            paint.dim(&format!(
+                "{} task{} started from warm state:",
+                warm.len(),
+                if warm.len() == 1 { "" } else { "s" }
+            )),
+            list(&warm)
+        ));
+    }
     let path = &report.critical_path;
     if path.tasks.len() > 1 || (path.tasks.len() == 1 && total > 1) {
         let by_id: BTreeMap<&str, &qk_history::TaskReport> = report
@@ -563,6 +585,7 @@ mod tests {
             outcome: Outcome::Success,
             cache: qk_cache::CacheStatus::Miss,
             key: None,
+            warm: None,
         };
         let report = |id: &str, started: u64, ended: u64, dependencies: &[&str]| TaskReport {
             id: id.into(),
@@ -576,6 +599,7 @@ mod tests {
             ended: Some(ended),
             dependencies: dependencies.iter().map(|id| (*id).to_owned()).collect(),
             cause: None,
+            warm: None,
         };
         let result = RunResult {
             outcomes: BTreeMap::new(),
@@ -630,6 +654,20 @@ mod tests {
         assert!(
             busy.contains("95% busy") && busy.contains("would not help"),
             "{busy}"
+        );
+    }
+
+    #[test]
+    fn names_the_tasks_that_started_from_warm_state() {
+        let (result, mut report) = run(0, 0.3);
+        assert!(!summary(&result, &report, 4, &[], Paint(false)).contains("warm"));
+        report.tasks[1].warm = Some(serde_json::json!({
+            "restored": {"source": "remote main", "groups": 1, "files": 3, "bytes": 10}
+        }));
+        let text = summary(&result, &report, 4, &[], Paint(false));
+        assert!(
+            text.contains("1 task started from warm state: app:b"),
+            "{text}"
         );
     }
 }

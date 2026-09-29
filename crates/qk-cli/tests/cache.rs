@@ -993,6 +993,14 @@ fn warm_outputs_start_a_miss_from_the_previous_build() {
     fs::remove_dir_all(fixture.root.join("dist")).unwrap();
     fs::write(fixture.root.join("src/input.txt"), "two\n").unwrap();
     assert_eq!(said(&fixture, &fixture.root, &[]), "one");
+    let text = stdout(&success(
+        fixture.qk(&fixture.root, &["show", "task", "app:build"]),
+    ));
+    assert!(
+        text.contains("warm state restored from local: 1 file,"),
+        "{text}"
+    );
+    assert!(text.contains("warm state saved in"), "{text}");
     // Local state wins over the saved one.
     fs::write(fixture.root.join("dist/state"), "local\n").unwrap();
     fs::write(fixture.root.join("src/input.txt"), "three\n").unwrap();

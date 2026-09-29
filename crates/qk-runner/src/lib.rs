@@ -40,6 +40,8 @@ pub struct TaskRecord {
     pub cache: qk_cache::CacheStatus,
     /// The task's key and what it was computed from, when it has one.
     pub key: Option<(String, serde_json::Value)>,
+    /// What warm state did, for targets that keep it.
+    pub warm: Option<qk_cache::warm::WarmReport>,
 }
 
 pub fn run(
@@ -251,17 +253,22 @@ pub fn run(
                     Ok((id, result)) => {
                         active.remove(&id);
                         stops.remove(&id);
-                        let (outcome, cache, key) = match result {
+                        let (outcome, cache, key, warm) = match result {
                             Ok(result) => {
                                 if !continuous.contains(&id) {
                                     fingerprints.insert(id.clone(), result.fingerprint);
                                 }
-                                (result.outcome, result.cache, result.key)
+                                (result.outcome, result.cache, result.key, result.warm)
                             }
                             Err(error) => {
                                 fingerprints.insert(id.clone(), Err(format!("{id}: {error:#}")));
                                 qk_executor::status!("qk: {id}: {error:#}");
-                                (Outcome::Failed(1), qk_cache::CacheStatus::Uncached, None)
+                                (
+                                    Outcome::Failed(1),
+                                    qk_cache::CacheStatus::Uncached,
+                                    None,
+                                    None,
+                                )
                             }
                         };
                         // Stopping a continuous task on purpose is its normal end.
@@ -293,6 +300,7 @@ pub fn run(
                                 outcome,
                                 cache,
                                 key,
+                                warm,
                             },
                         );
                         outcomes.insert(id, outcome);

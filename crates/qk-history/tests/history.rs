@@ -23,6 +23,7 @@ fn task(
         ended: Some(ended),
         dependencies: dependencies.iter().map(|id| (*id).to_owned()).collect(),
         cause: None,
+        warm: None,
     }
 }
 
@@ -133,4 +134,52 @@ fn critical_path_follows_the_longest_dependency_chain() {
     let path = critical_path(&tasks);
     assert_eq!(path.tasks, ["lib:build", "app:build"]);
     assert_eq!(path.duration, 80);
+}
+
+#[test]
+fn upgrades_a_history_from_before_warm_state() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let path = temp.path().join("history.db");
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE schema_version (version INTEGER NOT NULL);
+             INSERT INTO schema_version (version) VALUES (1);
+             CREATE TABLE runs (
+                 id TEXT PRIMARY KEY, command TEXT NOT NULL, sha TEXT,
+                 started INTEGER NOT NULL, ended INTEGER NOT NULL,
+                 exit_code INTEGER NOT NULL, critical_path TEXT NOT NULL
+             );
+             CREATE TABLE tasks (
+                 run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                 task_id TEXT NOT NULL, project TEXT NOT NULL, target TEXT NOT NULL,
+                 configuration TEXT, status TEXT NOT NULL, cache TEXT, key TEXT,
+                 started INTEGER, ended INTEGER, dependencies TEXT NOT NULL, cause TEXT,
+                 PRIMARY KEY (run_id, task_id)
+             );
+             CREATE INDEX tasks_by_task ON tasks (task_id, started);
+             CREATE TABLE inputs (key TEXT PRIMARY KEY, inputs TEXT NOT NULL);
+             INSERT INTO runs VALUES ('old', '[\"qk\"]', NULL, 1000, 1100, 0, '{\"tasks\":[],\"duration\":0}');
+             INSERT INTO tasks VALUES ('old', 'app:build', 'app', 'build', NULL, 'success',
+                 'miss', 'k0', 1000, 1050, '[]', NULL);",
+        )
+        .unwrap();
+    let mut history = History::open(&path).unwrap();
+    let mut warm = task("app:build", Some("k1"), 2_000, 2_050, &[]);
+    warm.warm = Some(json!({"restored": {"source": "local", "files": 1}, "saveMs": 3}));
+    history
+        .record(run("new", 2_000, vec![warm]), &BTreeMap::new())
+        .unwrap();
+    let tasks = history.task("app:build", 10).unwrap();
+    let warm_of = |run: &str| {
+        tasks
+            .iter()
+            .find(|(id, _)| id == run)
+            .map(|(_, task)| task.warm.clone())
+            .unwrap()
+    };
+    assert_eq!(warm_of("old"), None);
+    assert_eq!(warm_of("new").unwrap()["saveMs"], 3);
+    drop(history);
+    History::open(&path).unwrap();
 }

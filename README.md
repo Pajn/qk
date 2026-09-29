@@ -429,8 +429,9 @@ share, and without one there from the remote store: the current branch's
 save, else the default branch's (nx.json `defaultBase`, else `main`). The
 branch comes from `GITHUB_HEAD_REF` or `GITHUB_REF_NAME` in CI, else from
 git; a checkout with no branch reads the default branch's state but saves
-none remotely. `remote: false` keeps a target's warm state local. It is saved after successful runs only; files unchanged since the
-last save or restore are recognised by their metadata and not read again.
+none remotely. `remote: false` keeps a target's warm state local. It is
+saved after successful runs only; files unchanged since the last save or
+restore are recognised by their metadata and not read again.
 Groups over their `maxSize` are not saved. Warm state counts toward the
 cache's size limit and is evicted with it. `--skip-cache` neither restores
 nor saves it, and leaves the variables unset. Two tasks in one run cannot
@@ -447,7 +448,10 @@ differs from the previous key recorded for the task, grouped as `files` (with
 the paths added, removed and changed), `env`, `runtime`, `dependencies` (with
 the dependency tasks), `lockfile` (with the importers and packages),
 `inputs`, `definition`, `args` and `tooling`, or `first`, `unchanged` and
-`unknown` when the previous inputs are no longer kept. The newest 200 runs are
+`unknown` when the previous inputs are no longer kept. For targets with warm
+state it also holds where that state came from (`local` or `remote <branch>`),
+how many files and bytes were restored, and how long saving it took; the run
+summary names the tasks that started from warm state. The newest 200 runs are
 kept. The schema is versioned in `schema_version`.
 
 `--report <path>` (or `NX_RUN_REPORT`) on `run`, `run-many` and `affected`

@@ -69,6 +69,9 @@ pub fn record(
                 ended: record.map(|record| millis(record.ended)),
                 dependencies: task.dependencies.iter().cloned().collect(),
                 cause: None,
+                warm: record
+                    .and_then(|record| record.warm.as_ref())
+                    .and_then(|warm| serde_json::to_value(warm).ok()),
             }
         })
         .collect();
@@ -254,8 +257,35 @@ pub fn show_task(
                 writeln!(out, "      {line}")?;
             }
         }
+        if let Some(warm) = record.warm.as_ref().and_then(warm_line) {
+            writeln!(out, "      {warm}")?;
+        }
     }
     Ok(())
+}
+
+/// What warm state did for a run, in words.
+pub fn warm_line(warm: &serde_json::Value) -> Option<String> {
+    let restored = warm.get("restored").filter(|value| !value.is_null());
+    let saved = warm.get("saveMs").and_then(serde_json::Value::as_u64);
+    let mut parts = Vec::new();
+    if let Some(restored) = restored {
+        let number = |field| restored.get(field).and_then(serde_json::Value::as_u64);
+        let files = number("files").unwrap_or(0);
+        parts.push(format!(
+            "warm state restored from {}: {files} file{}, {:.1} MB",
+            restored
+                .get("source")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            if files == 1 { "" } else { "s" },
+            number("bytes").unwrap_or(0) as f64 / 1e6
+        ));
+    }
+    if let Some(saved) = saved {
+        parts.push(format!("warm state saved in {}", seconds(saved)));
+    }
+    (!parts.is_empty()).then(|| parts.join("; "))
 }
 
 /// One line on why a key changed.

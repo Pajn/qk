@@ -52,6 +52,8 @@ pub struct TaskResult {
     pub cache: CacheStatus,
     /// The task's key and what it was computed from, when it has one.
     pub key: Option<(String, Value)>,
+    /// What warm state did, for targets that keep it.
+    pub warm: Option<warm::WarmReport>,
 }
 
 impl TaskResult {
@@ -61,6 +63,7 @@ impl TaskResult {
             fingerprint: Err(reason),
             cache: CacheStatus::Uncached,
             key: None,
+            warm: None,
         }
     }
 }
@@ -172,22 +175,36 @@ impl Cache {
             prepared
         });
         let running = warm_prepared.as_ref().unwrap_or(prepared);
-        let before = || {
-            if let Some(warm) = &warm
-                && let Err(error) = self
-                    .initialize()
-                    .and_then(|()| self.restore_warm(workspace, task, warm))
+        let before = || -> Option<warm::Restored> {
+            let warm = warm.as_ref()?;
+            match self
+                .initialize()
+                .and_then(|()| self.restore_warm(workspace, task, warm))
             {
-                qk_executor::status!("qk: {}: warm state not restored ({error:#})", task.id);
+                Ok(restored) => (!restored.groups.is_empty()).then_some(restored),
+                Err(error) => {
+                    qk_executor::status!("qk: {}: warm state not restored ({error:#})", task.id);
+                    None
+                }
             }
         };
-        let after = |outcome: Outcome| {
-            if let Some(warm) = &warm
-                && outcome == Outcome::Success
-                && let Err(error) = self.save_warm(workspace, task, warm)
-            {
-                qk_executor::status!("qk: {}: warm state not saved ({error:#})", task.id);
-            }
+        let after = |outcome: Outcome,
+                     restored: Option<warm::Restored>|
+         -> Option<warm::WarmReport> {
+            let warm = warm.as_ref()?;
+            let started = std::time::Instant::now();
+            let save_ms = if outcome == Outcome::Success {
+                match self.save_warm(workspace, task, warm) {
+                    Ok(()) => Some(started.elapsed().as_millis() as u64),
+                    Err(error) => {
+                        qk_executor::status!("qk: {}: warm state not saved ({error:#})", task.id);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            Some(warm::WarmReport { restored, save_ms })
         };
         let fallback = |reason: String| {
             execute(prepared, cancelled).map(|outcome| TaskResult::uncached(outcome, reason))
@@ -236,9 +253,9 @@ impl Cache {
             Err(error) => return bypass(format!("{error:#}")),
         };
         if !cacheable {
-            before();
+            let restored = before();
             let outcome = execute(running, cancelled)?;
-            after(outcome);
+            let warm_report = after(outcome, restored);
             let fingerprint = if self.unchanged(
                 snapshot,
                 workspace,
@@ -258,6 +275,7 @@ impl Cache {
                 fingerprint,
                 cache: CacheStatus::Uncached,
                 key: keyed,
+                warm: warm_report,
             });
         }
         if let Err(error) = self.initialize() {
@@ -307,6 +325,7 @@ impl Cache {
                     fingerprint: Ok(fingerprint),
                     cache: CacheStatus::LocalHit,
                     key: keyed,
+                    warm: None,
                 });
             }
             Ok(None) => {}
@@ -339,6 +358,7 @@ impl Cache {
                         fingerprint: Ok(fingerprint),
                         cache: CacheStatus::RemoteHit,
                         key: keyed,
+                        warm: None,
                     });
                 }
                 Ok(None) => {}
@@ -356,9 +376,9 @@ impl Cache {
             Err(error) => return bypass(format!("cache log unavailable: {error}")),
         };
         let capture = Capture::new(Some(log.as_file().try_clone()?), prepared.display.clone());
-        before();
+        let restored = before();
         let outcome = execute_captured(running, cancelled, Some(&capture))?;
-        after(outcome);
+        let warm_report = after(outcome, restored);
         let fingerprint = if !self.unchanged(
             snapshot,
             workspace,
@@ -393,6 +413,7 @@ impl Cache {
             fingerprint,
             cache: CacheStatus::Miss,
             key: keyed,
+            warm: warm_report,
         })
     }
 

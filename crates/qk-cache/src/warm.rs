@@ -183,9 +183,21 @@ pub(crate) struct Record {
 /// What a restore brought back.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Restored {
+    /// `local`, or `remote <branch>`.
+    pub source: String,
     pub groups: Vec<String>,
     pub files: usize,
     pub bytes: u64,
+}
+
+/// What warm state did for one run of a task.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WarmReport {
+    /// What was restored before the run, if anything.
+    pub restored: Option<Restored>,
+    /// How long saving it after the run took, when it was saved.
+    pub save_ms: Option<u64>,
 }
 
 /// A warm group: its name, the directory its paths are relative to, and
@@ -347,12 +359,14 @@ impl Cache {
         warm: &Warm,
     ) -> Result<Restored> {
         let mut restored = Restored::default();
-        let Some(mut record) = self
-            .load_warm(task)
-            .or_else(|| self.remote_warm(workspace, task, warm))
-        else {
-            return Ok(restored);
+        let (mut record, source) = match self.load_warm(task) {
+            Some(record) => (record, "local".to_owned()),
+            None => match self.remote_warm(workspace, task, warm) {
+                Some((record, branch)) => (record, format!("remote {branch}")),
+                None => return Ok(restored),
+            },
         };
+        restored.source = source;
         for location in locations(workspace, task, warm)? {
             let Some(group) = record.groups.get_mut(location.name) else {
                 continue;
@@ -405,7 +419,12 @@ impl Cache {
 
     /// The task's warm state from the remote store: the current branch's, else
     /// the default branch's. It is kept locally from then on.
-    fn remote_warm(&self, workspace: &Workspace, task: &Task, warm: &Warm) -> Option<Record> {
+    fn remote_warm(
+        &self,
+        workspace: &Workspace,
+        task: &Task,
+        warm: &Warm,
+    ) -> Option<(Record, String)> {
         let remote = self.remote.as_ref().filter(|_| warm.remote)?;
         for branch in branches(workspace) {
             match remote.fetch_warm(&self.root, &task.id, &branch) {
@@ -416,7 +435,7 @@ impl Cache {
                     if self.store_warm(task, &record).is_err() {
                         return None;
                     }
-                    return Some(record);
+                    return Some((record, branch));
                 }
                 Ok(None) => {}
                 Err(error) => {
