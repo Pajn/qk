@@ -135,3 +135,76 @@ fn help_and_version_work_without_a_workspace() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("no workspace found"));
 }
+
+fn planned(output: Output) -> Vec<String> {
+    let graph = successful_json(output);
+    let mut tasks: Vec<_> = graph["tasks"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    tasks.sort();
+    tasks
+}
+
+fn qk_in(directory: &str, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_qk"))
+        .current_dir(fixture().join(directory))
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn nx_shorthand_runs_target_of_named_project() {
+    for args in [
+        vec!["build", "web", "--dry-run"],
+        vec!["web:build", "--dry-run"],
+        vec!["run", "web:build", "--dry-run"],
+    ] {
+        assert!(
+            planned(qk(&args)).contains(&"web:build".to_owned()),
+            "{args:?}"
+        );
+    }
+    // Global options work on either side of the shorthand.
+    let output = Command::new(env!("CARGO_BIN_EXE_qk"))
+        .args(["check", "worker", "--dry-run", "--workspace"])
+        .arg(fixture())
+        .output()
+        .unwrap();
+    assert_eq!(planned(output), ["worker:check"]);
+}
+
+#[test]
+fn nx_shorthand_uses_the_most_specific_project_of_the_current_directory() {
+    assert_eq!(
+        planned(qk_in("apps/web/worker", &["check", "--dry-run"])),
+        ["worker:check"]
+    );
+    assert!(planned(qk_in("apps/web", &["build", "--dry-run"])).contains(&"web:build".to_owned()));
+    assert!(
+        planned(qk_in("apps/web", &["run", "test", "--dry-run"])).contains(&"web:test".to_owned())
+    );
+
+    let outside = qk_in(".", &["build", "--dry-run"]);
+    assert!(!outside.status.success());
+    assert!(
+        String::from_utf8_lossy(&outside.stderr)
+            .contains("no project contains the current directory")
+    );
+}
+
+#[test]
+fn nx_shorthand_reports_unknown_targets_and_leaves_nx_commands_alone() {
+    let output = qk(&["serv", "web", "--dry-run"]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(r#"project "web" has no target "serv""#),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = qk(&["format:check"]);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unrecognized subcommand"));
+}

@@ -62,11 +62,12 @@ impl TaskGraph {
         };
         let mut roots = BTreeSet::new();
         for request in requests {
-            roots.insert(
-                builder
-                    .visit(request.clone(), true)?
-                    .context("requested target does not exist")?,
-            );
+            roots.insert(builder.visit(request.clone(), true)?.with_context(|| {
+                format!(
+                    "project {:?} has no target {:?}",
+                    request.project, request.target
+                )
+            })?);
         }
         Ok(Self {
             roots,

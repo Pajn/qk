@@ -16,7 +16,8 @@ use std::sync::{
     name = "qk",
     version,
     about = "Quick workspace task tooling",
-    long_about = "qk (quick): a standalone Rust task runner.\nExecute finite tasks with dependency ordering and a local cache shared by Git worktrees."
+    long_about = "qk (quick): a standalone Rust task runner.\nExecute tasks with dependency ordering and a local cache shared by Git worktrees.",
+    after_help = "Shorthand, as in Nx: `qk <target> [project]` and `qk <project>:<target>` run like `qk run`.\nWithout a project, the project containing the current directory is used."
 )]
 struct Cli {
     /// Workspace root; defaults to discovery from the current directory.
@@ -35,6 +36,7 @@ enum Command {
     },
     /// Execute a task and its dependencies. Forward arguments after --.
     Run {
+        /// project:target[:configuration], or a target of the current directory's project.
         task: String,
         #[command(flatten)]
         options: RunOptions,
@@ -119,7 +121,7 @@ enum ShowCommand {
 }
 
 fn main() {
-    match run(Cli::parse()) {
+    match run(Cli::parse_from(shorthand(std::env::args_os().collect()))) {
         Ok(0) => {}
         Ok(code) => std::process::exit(code),
         Err(error) => {
@@ -133,6 +135,106 @@ fn main() {
             std::process::exit(1);
         }
     }
+}
+
+/// Nx's built-in commands that qk does not implement. Nx never reads these as
+/// targets, so neither does the shorthand; they fail as unknown subcommands.
+const NX_COMMANDS: &[&str] = &[
+    "add",
+    "affected",
+    "connect",
+    "daemon",
+    "exec",
+    "format",
+    "format:check",
+    "format:write",
+    "g",
+    "generate",
+    "import",
+    "init",
+    "list",
+    "mcp",
+    "migrate",
+    "release",
+    "repair",
+    "report",
+    "reset",
+    "sync",
+    "sync:check",
+    "view-logs",
+    "watch",
+];
+
+/// Rewrites Nx's shorthand into `run`: `<target> <project>` and `<project>:<target>`
+/// become `run <project>:<target>`, and a bare `<target>` becomes `run <target>`.
+/// Anything that starts with one of qk's own subcommands is left alone.
+fn shorthand(mut args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    use clap::CommandFactory;
+    let command = Cli::command();
+    let mut index = 1;
+    // Skip global options that precede the command slot.
+    while let Some(arg) = args.get(index).and_then(|arg| arg.to_str()) {
+        match arg {
+            "--workspace" => index += 2,
+            _ if arg.starts_with("--workspace=") => index += 1,
+            _ => break,
+        }
+    }
+    let Some(first) = args
+        .get(index)
+        .and_then(|arg| arg.to_str())
+        .map(str::to_owned)
+    else {
+        return args;
+    };
+    let known = first == "help"
+        || NX_COMMANDS.contains(&first.as_str())
+        || command.get_subcommands().any(|subcommand| {
+            subcommand.get_name() == first
+                || subcommand.get_all_aliases().any(|alias| alias == first)
+        });
+    if first.starts_with('-') || known {
+        return args;
+    }
+    let project = args
+        .get(index + 1)
+        .and_then(|arg| arg.to_str())
+        .filter(|arg| !first.contains(':') && !arg.starts_with('-'))
+        .map(str::to_owned);
+    match project {
+        Some(project) => {
+            args.splice(
+                index..index + 2,
+                ["run".into(), format!("{project}:{first}").into()],
+            );
+        }
+        None => args.insert(index, "run".into()),
+    }
+    args
+}
+
+/// The project whose root most specifically contains the current directory.
+fn current_project(workspace: &Workspace) -> Result<String> {
+    let cwd = std::env::current_dir()
+        .context("cannot read current directory")?
+        .canonicalize()?;
+    let root = workspace.root.canonicalize()?;
+    let relative = cwd.strip_prefix(&root).map_err(|_| {
+        anyhow::anyhow!("the current directory is outside the workspace; name a project")
+    })?;
+    workspace
+        .projects
+        .iter()
+        .filter(|(_, project)| project.root == "." || relative.starts_with(&project.root))
+        .max_by_key(|(_, project)| {
+            if project.root == "." {
+                0
+            } else {
+                project.root.len()
+            }
+        })
+        .map(|(name, _)| name.clone())
+        .context("no project contains the current directory; name one as `qk <target> <project>`")
 }
 
 fn run(cli: Cli) -> Result<i32> {
@@ -152,6 +254,11 @@ fn run(cli: Cli) -> Result<i32> {
             )?;
         }
         Command::Run { task, options } => {
+            let task = if task.contains(':') {
+                task
+            } else {
+                format!("{}:{task}", current_project(&workspace)?)
+            };
             let mut request = Request::parse(&task)?;
             if let Some(configuration) = &options.configuration {
                 if request

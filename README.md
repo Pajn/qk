@@ -50,9 +50,17 @@ parent workspace marker exists.
 | `qk graph --file <path>` | Workspace project graph in a `{ "graph": { "nodes": ..., "dependencies": ... } }` envelope |
 | `qk graph` or `qk graph --file -` | The same graph on stdout |
 | `qk run <project>:<target>[:<configuration>]` | Execute a task and its dependencies |
+| `qk <target> [project]`, `qk <project>:<target>` | Nx-style shorthand for `qk run` |
 | `qk run-many -t build,test -p 'web,core' --parallel 4` | Execute matching targets with bounded task concurrency |
 | `qk run web:build --dry-run` | Print the planned task graph as JSON without execution |
 | `qk cache path` | Print the local cache directory without creating it |
+
+As in Nx, `qk build web` and `qk web:build` mean `qk run web:build`, and take the
+same options. Without a project, `qk build` and `qk run build` use the project
+whose root most specifically contains the current directory. qk's own
+subcommands, and Nx commands qk does not implement such as `affected`,
+`format` and `release`, are never read as targets; use `qk run` for a target
+with one of those names.
 
 `--workspace <path>` works before or after the subcommand. Graph output paths
 are relative to the invocation directory; their parent directories must
