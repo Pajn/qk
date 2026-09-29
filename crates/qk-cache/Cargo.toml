@@ -15,6 +15,7 @@ qk-graph.workspace = true
 qk-taskgraph.workspace = true
 qk-executor.workspace = true
 qk-lockfile.workspace = true
+jsonc-parser.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true

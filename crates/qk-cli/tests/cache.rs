@@ -1401,3 +1401,122 @@ fn a_build_target_without_outputs_caches_nx_defaults() {
         "built\n"
     );
 }
+
+/// `app` at the root depends on `lib`, whose `src` named input is its sources.
+fn with_lib(inputs: Value) -> Fixture {
+    let fixture = Fixture::new(json!({}));
+    fs::write(
+        fixture.root.join("project.json"),
+        json!({"name": "app", "implicitDependencies": ["lib"], "targets": {"build": {
+            "command": "echo built", "cache": true, "inputs": inputs
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    fs::create_dir_all(fixture.root.join("libs/lib/src")).unwrap();
+    fs::write(
+        fixture.root.join("libs/lib/project.json"),
+        json!({"name": "lib", "namedInputs": {"src": ["{projectRoot}/src/**/*"]}}).to_string(),
+    )
+    .unwrap();
+    fs::write(fixture.root.join("libs/lib/src/a.txt"), "a").unwrap();
+    fs::write(fixture.root.join("libs/lib/other.txt"), "other").unwrap();
+    fs::write(fixture.root.join("libs/lib/config.json"), "{}").unwrap();
+    fixture
+}
+
+fn hit(fixture: &Fixture, root: &Path) -> bool {
+    let output = success(fixture.build(root, &["--output-style", "static"]));
+    stderr(&output).contains("cache hit app:build")
+}
+
+#[test]
+fn inputs_of_other_projects_by_name_or_through_dependencies() {
+    for inputs in [
+        json!([{"input": "src", "projects": ["lib"]}]),
+        json!([{"input": "src", "projects": "tag:none"}, {"input": "src", "dependencies": true}]),
+        json!([{"input": "src", "projects": "dependencies"}]),
+    ] {
+        let fixture = with_lib(inputs.clone());
+        assert!(!hit(&fixture, &fixture.root), "{inputs}");
+        fs::write(fixture.root.join("libs/lib/other.txt"), "changed").unwrap();
+        assert!(hit(&fixture, &fixture.root), "{inputs}");
+        fs::write(fixture.root.join("libs/lib/src/a.txt"), "changed").unwrap();
+        assert!(!hit(&fixture, &fixture.root), "{inputs}");
+    }
+}
+
+#[test]
+fn filesets_of_dependencies() {
+    let fixture = with_lib(json!([{"fileset": "{projectRoot}/config.json", "dependencies": true}]));
+    assert!(!hit(&fixture, &fixture.root));
+    fs::write(fixture.root.join("libs/lib/other.txt"), "changed").unwrap();
+    assert!(hit(&fixture, &fixture.root));
+    fs::write(fixture.root.join("libs/lib/config.json"), r#"{"a": 1}"#).unwrap();
+    assert!(!hit(&fixture, &fixture.root));
+}
+
+#[test]
+fn json_inputs_key_only_the_fields_they_select() {
+    let fixture = with_lib(json!([
+        {"json": "{projectRoot}/meta.json", "fields": ["version", "build.target"]},
+        {"json": "libs/lib/config.json", "excludeFields": ["comment"]}
+    ]));
+    let meta = |text: &str| fs::write(fixture.root.join("meta.json"), text).unwrap();
+    meta(r#"{"version": 1, "name": "a", "build": {"target": "es2022", "debug": false}}"#);
+    assert!(!hit(&fixture, &fixture.root));
+    meta(r#"{"version": 1, "name": "b", "build": {"target": "es2022", "debug": true}}"#);
+    assert!(hit(&fixture, &fixture.root));
+    meta(r#"{"version": 2, "name": "b", "build": {"target": "es2022", "debug": true}}"#);
+    assert!(!hit(&fixture, &fixture.root));
+    fs::write(
+        fixture.root.join("libs/lib/config.json"),
+        r#"{"comment": "x"}"#,
+    )
+    .unwrap();
+    assert!(hit(&fixture, &fixture.root));
+    fs::write(
+        fixture.root.join("libs/lib/config.json"),
+        r#"{"comment": "x", "a": 1}"#,
+    )
+    .unwrap();
+    assert!(!hit(&fixture, &fixture.root));
+}
+
+#[test]
+fn the_working_directory_can_be_an_input() {
+    let fixture = with_lib(json!([{"workingDirectory": "relative"}]));
+    let from = |directory: &Path| {
+        let output = fixture
+            .command(
+                &fixture.root,
+                &["run", "app:build", "--output-style", "static"],
+            )
+            .current_dir(directory)
+            .output()
+            .unwrap();
+        stderr(&success(output)).contains("cache hit app:build")
+    };
+    let sub = fixture.root.join("libs");
+    assert!(!from(&fixture.root));
+    assert!(from(&fixture.root));
+    assert!(!from(&sub));
+    assert!(from(&sub));
+}
+
+#[test]
+fn named_inputs_cannot_reach_other_projects() {
+    let fixture = with_lib(json!(["shared"]));
+    let mut project: Value =
+        serde_json::from_str(&fs::read_to_string(fixture.root.join("project.json")).unwrap())
+            .unwrap();
+    project["namedInputs"] = json!({"shared": [{"input": "src", "projects": ["lib"]}]});
+    fs::write(fixture.root.join("project.json"), project.to_string()).unwrap();
+    let output = success(fixture.build(&fixture.root, &["--output-style", "static"]));
+    assert!(
+        stderr(&output)
+            .contains("named inputs can only refer to named inputs of their own project"),
+        "{}",
+        stderr(&output)
+    );
+}

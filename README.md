@@ -413,12 +413,28 @@ warm run reads only files whose metadata changed. Without
 `inputs`, a task uses `default` and `^default`; `default` is
 `{projectRoot}/**/*` unless a named input overrides it.
 
-Supported input declarations are globs with `!` exclusions, `fileset`, named
-inputs and `^named` inputs, which as in Nx cover every project the project
-depends on, directly or not, `env`, `runtime`, `dependentTasksOutputFiles`
-with `transitive`, and `externalDependencies`, which adds every installation
-of the named packages in the pnpm lockfile, whichever importer installs them.
-With another package manager, lockfiles are always keyed by content. `runtime` commands run once per run for each environment.
+Every input declaration of Nx 23 is supported:
+
+- globs with `!` exclusions, and `fileset`;
+- named inputs, also as `{"input": "name"}`;
+- `^name` and `{"input": "name", "dependencies": true}` (or `"projects":
+  "dependencies"`), which as in Nx cover every project the project depends
+  on, directly or not, and `{"fileset": "…", "dependencies": true}`, a
+  fileset of each of them;
+- `{"input": "name", "projects": […]}`, the named input of the projects the
+  names, globs or `tag:` patterns select;
+- `env`, `runtime`, `dependentTasksOutputFiles` with `transitive`, and
+  `externalDependencies`, which adds every installation of the named
+  packages in the pnpm lockfile, whichever importer installs them;
+- `{"workingDirectory": "relative" | "absolute"}`, the directory qk was run
+  from;
+- `{"json": "path", "fields": […], "excludeFields": […]}`, only the selected
+  dotted fields of a JSON file. Affected selection counts any change to the
+  file.
+
+As in Nx, a named input cannot use `dependencies` or `projects`. With a
+package manager other than pnpm, lockfiles are always keyed by content.
+`runtime` commands run once per run for each environment.
 `dependentTasksOutputFiles` needs no file access: every dependency's
 fingerprint already covers its declared outputs. `.` and `..` segments in
 paths are resolved within the workspace. A symlinked input is keyed by its

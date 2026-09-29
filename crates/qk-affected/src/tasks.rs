@@ -115,6 +115,18 @@ pub fn affected_tasks(
         {
             reasons.push(TaskReason::Input { file: file.clone() });
         }
+        // A JSON input's file, by any change: coarser than the key, which only
+        // follows the fields it selects.
+        for file in inputs
+            .values
+            .keys()
+            .filter_map(|key| key.strip_prefix("json:"))
+            .filter(|file| changed.contains(file))
+        {
+            reasons.push(TaskReason::Input {
+                file: file.to_owned(),
+            });
+        }
         if inputs.workspace_file && workspace_file_changed {
             reasons.push(TaskReason::WorkspaceFile);
         }

@@ -504,3 +504,26 @@ fn commits_that_already_landed_are_counted_when_the_base_predates_them() {
     let range = analyse_default(&repo, Some(&old)).range.unwrap();
     assert_eq!((range.commits, range.landed), (1, 0));
 }
+
+#[test]
+fn a_changed_json_input_affects_the_task() {
+    let repo = Repo::new(&[
+        (
+            "nx.json",
+            r#"{"targetDefaults": {"build": {"command": "echo build", "inputs": [{"json": "{projectRoot}/meta.json", "fields": ["version"]}]},
+                                   "test": {"command": "echo test", "inputs": ["{projectRoot}/src/**/*"]}}}"#,
+        ),
+        (
+            "apps/app/project.json",
+            r#"{"name": "app", "targets": {"build": {}, "test": {}}}"#,
+        ),
+        ("apps/app/meta.json", r#"{"version": 1}"#),
+        (
+            "libs/lib/project.json",
+            r#"{"name": "lib", "targets": {"build": {}, "test": {}}}"#,
+        ),
+    ]);
+    write(&repo.root, "apps/app/meta.json", r#"{"version": 2}"#);
+    let tasks = affected_tasks(&repo);
+    assert_eq!(tasks.keys().collect::<Vec<_>>(), ["app:build"]);
+}

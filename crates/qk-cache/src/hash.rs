@@ -484,6 +484,42 @@ fn source_files(root: &Path) -> Result<BTreeSet<String>> {
         .collect())
 }
 
+fn json_path<'v>(value: &'v Value, path: &str) -> Option<&'v Value> {
+    path.split('.')
+        .try_fold(value, |value, part| value.get(part))
+}
+
+fn set_json_path(target: &mut Value, path: &str, value: Value) {
+    let mut parts = path.split('.').peekable();
+    let mut current = target;
+    while let Some(part) = parts.next() {
+        let Value::Object(object) = current else {
+            return;
+        };
+        if parts.peek().is_none() {
+            object.insert(part.to_owned(), value);
+            return;
+        }
+        current = object.entry(part).or_insert_with(|| json!({}));
+    }
+}
+
+fn remove_json_path(target: &mut Value, path: &str) {
+    let (parent, last) = match path.rsplit_once('.') {
+        Some((parent, last)) => (Some(parent), last),
+        None => (None, path),
+    };
+    let parent = match parent {
+        Some(parent) => parent
+            .split('.')
+            .try_fold(&mut *target, |value, part| value.get_mut(part)),
+        None => Some(target),
+    };
+    if let Some(Value::Object(object)) = parent {
+        object.remove(last);
+    }
+}
+
 struct Resolver<'a> {
     workspace: &'a Workspace,
     snapshot: &'a Snapshot,
@@ -505,23 +541,78 @@ impl Resolver<'_> {
             // As in Nx, `^name` is `name` of every project the project depends
             // on, directly or not.
             Value::String(name) if name.starts_with('^') => {
-                let mut closure = BTreeSet::new();
-                let mut pending = vec![project.to_owned()];
-                while let Some(current) = pending.pop() {
-                    for edge in &self.snapshot.projects.dependencies[&current] {
-                        if edge.target != project && closure.insert(edge.target.clone()) {
-                            pending.push(edge.target.clone());
+                self.dependencies_named(project, &name[1..])?;
+            }
+            // The object spellings of named inputs, as Nx reads them.
+            Value::Object(object)
+                if object.contains_key("input") && !object.contains_key("fileset") =>
+            {
+                let name = object["input"]
+                    .as_str()
+                    .context("input must name a named input")?;
+                let projects = object.get("projects");
+                let dependencies = object.get("dependencies") == Some(&json!(true))
+                    || projects == Some(&json!("dependencies"));
+                let listed = projects.filter(|projects| {
+                    **projects != json!("self") && **projects != json!("dependencies")
+                });
+                if (dependencies || listed.is_some()) && !self.named_stack.is_empty() {
+                    bail!("named inputs can only refer to named inputs of their own project");
+                }
+                if dependencies {
+                    self.dependencies_named(project, name)?;
+                } else if let Some(listed) = listed {
+                    let patterns: Vec<String> = match listed {
+                        Value::String(pattern) => vec![pattern.clone()],
+                        other => serde_json::from_value(other.clone())
+                            .context("input projects must be a string or an array")?,
+                    };
+                    for selected in
+                        qk_graph::select_projects(&self.workspace.projects, &patterns, &[])?
+                    {
+                        if self.expanded.insert((selected.clone(), name.to_owned())) {
+                            self.named(&selected, name)?;
                         }
                     }
+                } else {
+                    self.named(project, name)?;
                 }
-                for dependency in closure {
-                    if self
-                        .expanded
-                        .insert((dependency.clone(), name[1..].to_owned()))
-                    {
-                        self.named(&dependency, &name[1..])?;
+            }
+            Value::Object(object)
+                if object.contains_key("fileset")
+                    && object.get("dependencies") == Some(&json!(true)) =>
+            {
+                if !self.named_stack.is_empty() {
+                    bail!("named inputs can only refer to named inputs of their own project");
+                }
+                let pattern = object["fileset"]
+                    .as_str()
+                    .context("fileset input must be a glob")?
+                    .to_owned();
+                for dependency in self.dependency_closure(project) {
+                    self.fileset(&dependency, &pattern)?;
+                }
+            }
+            Value::Object(object)
+                if object.len() == 1 && object.contains_key("workingDirectory") =>
+            {
+                let mode = object["workingDirectory"].as_str().unwrap_or_default();
+                let directory = std::env::current_dir()?;
+                let value = match mode {
+                    "absolute" => directory.to_string_lossy().into_owned(),
+                    "relative" => {
+                        let root = self.workspace.root.canonicalize()?;
+                        let directory = directory.canonicalize()?;
+                        paths::relative(&root, &directory)
+                            .unwrap_or_else(|_| directory.to_string_lossy().into_owned())
                     }
-                }
+                    _ => bail!("workingDirectory must be \"relative\" or \"absolute\""),
+                };
+                self.values
+                    .insert(format!("workingDirectory:{mode}"), json!(value));
+            }
+            Value::Object(object) if object.contains_key("json") => {
+                self.json(project, object)?;
             }
             Value::String(name)
                 if !name.contains("{projectRoot}") && !name.contains("{workspaceRoot}") =>
@@ -669,6 +760,81 @@ impl Resolver<'_> {
                 self.selected.insert(file.clone());
             }
         }
+        Ok(())
+    }
+
+    /// Every project `project` depends on, directly or not.
+    fn dependency_closure(&self, project: &str) -> BTreeSet<String> {
+        let mut closure = BTreeSet::new();
+        let mut pending = vec![project.to_owned()];
+        while let Some(current) = pending.pop() {
+            for edge in &self.snapshot.projects.dependencies[&current] {
+                if edge.target != project && closure.insert(edge.target.clone()) {
+                    pending.push(edge.target.clone());
+                }
+            }
+        }
+        closure
+    }
+
+    /// As in Nx, `^name` is `name` of every project the project depends on.
+    fn dependencies_named(&mut self, project: &str, name: &str) -> Result<()> {
+        for dependency in self.dependency_closure(project) {
+            if self.expanded.insert((dependency.clone(), name.to_owned())) {
+                self.named(&dependency, name)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A JSON input: the fields of one JSON file, rather than all of it.
+    /// `fields` keeps only the named dotted paths; `excludeFields` removes
+    /// them.
+    fn json(&mut self, project: &str, object: &serde_json::Map<String, Value>) -> Result<()> {
+        for key in object.keys() {
+            if !matches!(key.as_str(), "json" | "fields" | "excludeFields") {
+                bail!("unsupported json input field {key:?}");
+            }
+        }
+        let path = object["json"]
+            .as_str()
+            .context("json input must name a file")?;
+        let path = paths::expand(self.workspace, project, path)?;
+        paths::validate_path(&path)?;
+        let list = |name: &str| -> Result<Option<Vec<String>>> {
+            object
+                .get(name)
+                .map(|value| {
+                    serde_json::from_value(value.clone())
+                        .with_context(|| format!("json input {name} must be an array of strings"))
+                })
+                .transpose()
+        };
+        let fields = list("fields")?;
+        let exclude = list("excludeFields")?.unwrap_or_default();
+        let value = match std::fs::read_to_string(self.workspace.root.join(&path)) {
+            Ok(text) => {
+                let mut value: Value =
+                    jsonc_parser::parse_to_serde_value(&text, &Default::default())
+                        .with_context(|| format!("cannot parse json input {path}"))?;
+                if let Some(fields) = &fields {
+                    let mut kept = json!({});
+                    for field in fields {
+                        if let Some(found) = json_path(&value, field) {
+                            set_json_path(&mut kept, field, found.clone());
+                        }
+                    }
+                    value = kept;
+                }
+                for field in &exclude {
+                    remove_json_path(&mut value, field);
+                }
+                value
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Value::Null,
+            Err(error) => return Err(error.into()),
+        };
+        self.values.insert(format!("json:{path}"), value);
         Ok(())
     }
 
