@@ -1,4 +1,8 @@
-//! Bounded scheduling of finite tasks with dependency failure propagation.
+//! Bounded scheduling of finite and continuous tasks with dependency failure propagation.
+//!
+//! A continuous task satisfies its dependents once it has started. It does not count
+//! towards the parallel limit, since it holds its slot indefinitely. Unless it was
+//! requested directly, it is stopped once every task depending on it has finished.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
@@ -41,8 +45,23 @@ pub fn run(
                 .map(|task| (id.clone(), task))
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
+    let continuous: BTreeSet<_> = graph
+        .tasks
+        .iter()
+        .filter(|(_, task)| task.definition.continuous == Some(true))
+        .map(|(id, _)| id.clone())
+        .collect();
+    let mut dependents: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (id, task) in &graph.tasks {
+        for dependency in &task.dependencies {
+            dependents.entry(dependency).or_default().push(id);
+        }
+    }
     let mut pending: BTreeSet<_> = graph.tasks.keys().cloned().collect();
     let mut active = BTreeSet::new();
+    // Stop signals for running continuous tasks, and those already asked to stop.
+    let mut stops: BTreeMap<String, Arc<AtomicBool>> = BTreeMap::new();
+    let mut stopping = BTreeSet::new();
     let mut outcomes = BTreeMap::new();
     let mut fingerprints: BTreeMap<String, qk_cache::Fingerprint> = BTreeMap::new();
     let cache = (!skip_cache
@@ -59,6 +78,9 @@ pub fn run(
             if cancelled.load(Ordering::SeqCst) {
                 skipped.append(&mut pending);
                 exit_code = 130;
+                for stop in stops.values() {
+                    stop.store(true, Ordering::SeqCst);
+                }
             }
             for id in pending.clone() {
                 let dependencies = &graph.tasks[&id].dependencies;
@@ -73,29 +95,48 @@ pub fn run(
                     eprintln!("qk: skipped {id} (dependency failed)");
                     continue;
                 }
-                if active.len() >= parallel
-                    || !dependencies
-                        .iter()
-                        .all(|dependency| outcomes.get(dependency) == Some(&Outcome::Success))
+                let is_continuous = continuous.contains(&id);
+                let finite_active = active.difference(&continuous).count();
+                if (!is_continuous && finite_active >= parallel)
+                    || !dependencies.iter().all(|dependency| {
+                        outcomes.get(dependency) == Some(&Outcome::Success)
+                            || (continuous.contains(dependency) && active.contains(dependency))
+                    })
                 {
                     continue;
                 }
                 pending.remove(&id);
                 active.insert(id.clone());
+                let task = &prepared[&id];
+                let sender = sender.clone();
+                if is_continuous {
+                    eprintln!("qk: started {id} (continuous)");
+                    // Dependents start while it runs, and its live state cannot be keyed.
+                    fingerprints.insert(
+                        id.clone(),
+                        Err(format!("{id}: continuous tasks are not fingerprinted")),
+                    );
+                    let stop = Arc::new(AtomicBool::new(false));
+                    stops.insert(id.clone(), stop.clone());
+                    scope.spawn(move || {
+                        let result = execute(task, &stop)
+                            .map(|outcome| qk_cache::TaskResult::uncached(outcome, String::new()));
+                        let _ = sender.send((id, result));
+                    });
+                    continue;
+                }
                 let verb = if cache.is_some() {
                     "checking"
                 } else {
                     "running"
                 };
                 eprintln!("qk: {verb} {id}");
-                let task = &prepared[&id];
                 let definition = &graph.tasks[&id];
                 let dependency_keys = dependencies
                     .iter()
                     .map(|id| (id.clone(), fingerprints[id].clone()))
                     .collect::<BTreeMap<_, _>>();
                 let cache = cache.as_ref();
-                let sender = sender.clone();
                 let cancelled = cancelled.clone();
                 scope.spawn(move || {
                     let result = if let Some(cache) = cache {
@@ -115,6 +156,18 @@ pub fn run(
                     let _ = sender.send((id, result));
                 });
             }
+            // Stop continuous dependencies that no remaining task needs.
+            for (id, stop) in &stops {
+                let needed = dependents.get(id.as_str()).is_some_and(|dependents| {
+                    dependents.iter().any(|dependent| {
+                        pending.contains(*dependent) || active.contains(*dependent)
+                    })
+                });
+                if !graph.roots.contains(id) && !needed && stopping.insert(id.clone()) {
+                    eprintln!("qk: stopping {id} (no longer needed)");
+                    stop.store(true, Ordering::SeqCst);
+                }
+            }
             if active.is_empty() {
                 if pending.is_empty() {
                     break;
@@ -133,9 +186,12 @@ pub fn run(
             match receiver.recv_timeout(Duration::from_millis(20)) {
                 Ok((id, result)) => {
                     active.remove(&id);
+                    stops.remove(&id);
                     let outcome = match result {
                         Ok(result) => {
-                            fingerprints.insert(id.clone(), result.fingerprint);
+                            if !continuous.contains(&id) {
+                                fingerprints.insert(id.clone(), result.fingerprint);
+                            }
                             result.outcome
                         }
                         Err(error) => {
@@ -144,16 +200,23 @@ pub fn run(
                             Outcome::Failed(1)
                         }
                     };
-                    match outcome {
-                        Outcome::Success => eprintln!("qk: finished {id}"),
-                        Outcome::Failed(code) => {
-                            eprintln!("qk: failed {id} (exit {code})");
-                            if exit_code == 0 {
-                                exit_code = code;
+                    // Stopping a continuous task on purpose is its normal end.
+                    let outcome = if stopping.contains(&id) && outcome == Outcome::Cancelled {
+                        eprintln!("qk: stopped {id}");
+                        Outcome::Success
+                    } else {
+                        match outcome {
+                            Outcome::Success => eprintln!("qk: finished {id}"),
+                            Outcome::Failed(code) => {
+                                eprintln!("qk: failed {id} (exit {code})");
+                                if exit_code == 0 {
+                                    exit_code = code;
+                                }
                             }
+                            Outcome::Cancelled => exit_code = 130,
                         }
-                        Outcome::Cancelled => exit_code = 130,
-                    }
+                        outcome
+                    };
                     outcomes.insert(id, outcome);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}

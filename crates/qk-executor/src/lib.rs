@@ -55,9 +55,6 @@ pub fn prepare(
     task: &Task,
     base_env: &BTreeMap<OsString, OsString>,
 ) -> Result<PreparedTask> {
-    if task.definition.continuous == Some(true) {
-        bail!("continuous tasks are not supported yet");
-    }
     let definition = &task.definition;
     let options = &definition.options;
     let executor = definition

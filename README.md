@@ -99,9 +99,9 @@ Supported executors:
 
 Commands use `/bin/sh -c` on Unix and `cmd.exe /D /S /C` on Windows. Local
 `node_modules/.bin` directories from cwd up to the workspace root are added
-to `PATH`. Tasks currently have closed stdin; interactive and continuous
-tasks are not supported. stdout and stderr stream directly, with no task
-prefix added to child output. qk writes its own status messages to stderr.
+to `PATH`. Tasks currently have closed stdin; interactive tasks are not
+supported. stdout and stderr stream directly, with no task prefix added to
+child output. qk writes its own status messages to stderr.
 
 Environment precedence, highest first: configuration `env`, `options.env`,
 target-level `env`, inherited process environment, root `.env.local`, root
@@ -132,13 +132,26 @@ explicit substitutions are used. Dependencies receive no arguments unless
 their dependency object sets `params: "forward"`.
 
 All selected tasks are prepared before any command starts, so unsupported
-executors, options and continuous tasks fail before dependencies run. A
-failed task skips its dependents while independent tasks continue. The CLI
-returns the first observed failing task's exit code. Ctrl-C and, on Unix,
-SIGTERM cancel the run, terminate managed process groups and return `130`.
-Parallel commands within a failed task are also terminated. Commands must
+executors and options fail before dependencies run. A failed task skips its
+dependents while independent tasks continue. The CLI returns the first
+observed failing task's exit code. Ctrl-C and, on Unix, SIGTERM cancel the
+run and return `130`. Cancelled commands receive SIGTERM on Unix and are
+killed with their process group if they have not exited within five seconds;
+on Windows they are killed directly. Parallel commands within a failed task
+are terminated immediately. Commands must
 not detach themselves into separate sessions or launch external services;
 those processes are outside the managed group.
+
+Targets with `continuous: true`, such as dev servers and watchers, run until
+they exit or are stopped. A task that depends on a continuous task starts as
+soon as that task has started, not when it finishes, so a client must wait for
+the server's readiness itself. Continuous tasks do not count towards
+`--parallel`. A requested continuous task runs until it exits or the run is
+cancelled. A continuous task that only other tasks depend on is stopped, like
+a cancelled command, once all of them have finished; that stop counts as
+success. A continuous task that exits by itself reports its exit status as
+usual. Continuous tasks are never cached, and cacheable tasks depending on one
+run uncached.
 
 `--dry-run` only plans and prints the task graph: it does not load dotenv,
 validate executor support, execute runtime inputs, or run commands.
@@ -252,7 +265,7 @@ parity claim yet. In particular:
   outside the design's scope.
 - Inputs are resolved for local caching only; affected semantics are not
   implemented yet.
-- `affected`, continuous and interactive tasks, static/dynamic output styles,
+- `affected`, interactive tasks, static/dynamic output styles,
   remote cache storage, cache eviction, history, release commands and npm
   binary distribution remain future work.
 
@@ -287,6 +300,5 @@ Fixture and CLI tests use self-contained workspaces. GitHub Actions is
 configured for Linux, macOS and Windows. The lockfile is checked in for
 reproducible dependency resolution.
 
-Next: expand execution parity and continuous-task lifecycle handling, then add
-pnpm v9 lockfile parsing and external graph nodes so cache keys can use
+Next: expand execution parity, then add pnpm v9 lockfile parsing and external graph nodes so cache keys can use
 per-package lockfile fingerprints.

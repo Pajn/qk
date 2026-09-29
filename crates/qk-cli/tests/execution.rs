@@ -104,6 +104,22 @@ fn process_helper() {
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
+        "serve" => {
+            fs::write(root.join(format!("{id}.started")), "started").unwrap();
+            // Bound lifetime even if a regression prevents stopping it.
+            for value in 0..1500 {
+                fs::write(root.join(format!("{id}.beat")), value.to_string()).unwrap();
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        "client" => {
+            wait_for(&root.join("serve.started"));
+            fs::write(root.join(format!("{id}.done")), "done").unwrap();
+        }
+        "exit-3" => {
+            fs::write(root.join(format!("{id}.started")), "started").unwrap();
+            std::process::exit(3);
+        }
         "fail-after-start" => {
             wait_for(&root.join("heartbeat.started"));
             std::process::exit(9);
@@ -167,13 +183,10 @@ fn failure_preserves_exit_code_skips_dependents_and_runs_independent_roots() {
 fn validates_entire_plan_before_running_and_dry_run_has_no_side_effects() {
     let temp = fixture(json!({
         "good":{"command":"echo wrong> must-not-exist"},
-        "bad":{"executor":"unknown:executor", "dependsOn":["good"]},
-        "continuous":{"command":"echo wrong> must-not-exist", "continuous":true}
+        "bad":{"executor":"unknown:executor", "dependsOn":["good"]}
     }));
-    for target in ["app:bad", "app:continuous"] {
-        assert!(!run(temp.path(), &["run", target]).status.success());
-        assert!(!temp.path().join("must-not-exist").exists());
-    }
+    assert!(!run(temp.path(), &["run", "app:bad"]).status.success());
+    assert!(!temp.path().join("must-not-exist").exists());
     let output = success(run(temp.path(), &["run", "app:good", "--dry-run"]));
     let graph: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(graph["tasks"]["app:good"].is_object());
@@ -429,4 +442,148 @@ fn cancellation_terminates_descendants_and_returns_130() {
             "descendant survived {signal}"
         );
     }
+}
+
+fn continuous_target(mode: &str, id: &str) -> Value {
+    let mut target = helper_target(mode, id);
+    target["continuous"] = json!(true);
+    target
+}
+
+/// Asserts a helper's heartbeat file has stopped changing.
+fn assert_stopped(path: &Path) {
+    let before = fs::read(path).unwrap();
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(
+        fs::read(path).unwrap(),
+        before,
+        "{} still running",
+        path.display()
+    );
+}
+
+#[test]
+fn finite_dependents_start_after_continuous_dependency_starts_then_stop_it() {
+    for parallel in ["1", "3"] {
+        let temp = fixture(json!({
+            "serve": continuous_target("serve", "serve"),
+            "bench": {
+                "dependsOn": ["serve"],
+                "executor": "nx:run-commands",
+                "options": helper_target("client", "bench")["options"].clone(),
+            },
+        }));
+        let started = Instant::now();
+        let output = success(run(
+            temp.path(),
+            &["run", "app:bench", "--parallel", parallel],
+        ));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(temp.path().join("bench.done").exists());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("qk: started app:serve (continuous)"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("qk: stopping app:serve (no longer needed)"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("qk: stopped app:serve"), "{stderr}");
+        assert_stopped(&temp.path().join("serve.beat"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn stopping_sends_sigterm_before_killing() {
+    let temp = fixture(json!({
+        "serve": {
+            "continuous": true,
+            "command": "trap 'echo cleaned > cleaned; exit 0' TERM; touch serve.started; while :; do sleep 0.05; done",
+        },
+        "client": {
+            "dependsOn": ["serve"],
+            "command": "while [ ! -f serve.started ]; do sleep 0.02; done",
+        },
+    }));
+    success(run(temp.path(), &["run", "app:client"]));
+    assert_eq!(
+        fs::read_to_string(temp.path().join("cleaned"))
+            .unwrap()
+            .trim(),
+        "cleaned"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn continuous_roots_run_until_cancelled() {
+    let temp = fixture(json!({
+        "watch": continuous_target("serve", "watch"),
+        "serve": {
+            "continuous": true,
+            "dependsOn": ["watch"],
+            "executor": "nx:run-commands",
+            "options": helper_target("serve", "serve")["options"].clone(),
+        },
+    }));
+    let mut child = command(temp.path(), &["run", "app:serve", "--parallel", "1"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for(&temp.path().join("serve.started"));
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "continuous root exited early"
+    );
+    assert!(
+        Command::new("/bin/kill")
+            .arg("-INT")
+            .arg(child.id().to_string())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("qk did not stop");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(status.code(), Some(130));
+    assert_stopped(&temp.path().join("serve.beat"));
+    assert_stopped(&temp.path().join("watch.beat"));
+}
+
+#[test]
+fn continuous_task_exiting_on_its_own_reports_its_exit_code() {
+    let temp = fixture(json!({"serve": continuous_target("exit-3", "serve")}));
+    let output = run(temp.path(), &["run", "app:serve"]);
+    assert_eq!(output.status.code(), Some(3));
+}
+
+#[test]
+fn dependents_of_continuous_tasks_run_uncached_and_say_why() {
+    let temp = fixture(json!({
+        "serve": continuous_target("serve", "serve"),
+        "bench": {
+            "cache": true,
+            "dependsOn": ["serve"],
+            "executor": "nx:run-commands",
+            "options": helper_target("client", "bench")["options"].clone(),
+        },
+    }));
+    let output = success(run(temp.path(), &["run", "app:bench"]));
+    assert!(String::from_utf8_lossy(&output.stderr).contains(
+        "qk: app:bench: cache bypassed (depends on app:serve: continuous tasks are not fingerprinted)"
+    ));
 }

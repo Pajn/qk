@@ -28,6 +28,32 @@ impl Drop for Children {
     }
 }
 
+/// How long a cancelled or stopped command may take to exit after SIGTERM.
+#[cfg(unix)]
+const GRACE: Duration = Duration::from_secs(5);
+
+impl Children {
+    /// Asks every process group to exit, then leaves stragglers to `Drop`.
+    fn terminate(&mut self) {
+        #[cfg(unix)]
+        {
+            use command_group::{Signal, UnixChildExt};
+            for child in &self.0 {
+                let _ = child.signal(Signal::SIGTERM);
+            }
+            let deadline = std::time::Instant::now() + GRACE;
+            while std::time::Instant::now() < deadline
+                && self
+                    .0
+                    .iter_mut()
+                    .any(|child| matches!(child.try_wait(), Ok(None)))
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+}
+
 pub fn execute(task: &PreparedTask, cancelled: &AtomicBool) -> Result<Outcome> {
     execute_captured(task, cancelled, None)
 }
@@ -44,6 +70,7 @@ pub fn execute_captured(
             let mut children = Children(Vec::new());
             loop {
                 if cancelled.load(Ordering::SeqCst) {
+                    children.terminate();
                     return Ok(Outcome::Cancelled);
                 }
                 if children.0.is_empty() || task.parallel {
