@@ -294,6 +294,8 @@ pub fn warm_line(warm: &serde_json::Value) -> Option<String> {
     }
     if let Some(saved) = saved {
         parts.push(format!("warm state saved in {}", seconds(saved)));
+    } else if warm.get("background").and_then(serde_json::Value::as_bool) == Some(true) {
+        parts.push("warm state saved in the background".to_owned());
     }
     (!parts.is_empty()).then(|| parts.join("; "))
 }

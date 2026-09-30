@@ -106,7 +106,11 @@ that names it, as one compiler cache serves several builds:
 A group keeps no `outputs` or `paths`, which belong to one task. Its
 targets may run at once and use the directory together; restoring and
 saving it are serialized, and a save holds everything the directory held.
-Groups over
+`save: "background"` saves after the task has reported, so its dependents
+start without waiting for a large group to be stored; the run waits for the
+save before it ends. Other tasks may change the paths meanwhile, so the save
+can hold files from after the task ran, and files removed before it reads
+them are left out. Groups over
 their `maxSize` are not saved. Warm state counts toward the
 cache's size limit and is evicted with it. `--skip-cache` neither restores
 nor saves it, and leaves the variables unset. Two tasks in one run cannot

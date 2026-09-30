@@ -1445,6 +1445,24 @@ fn surviving_paths_left_aside_by_a_killed_run_come_back() {
 
 #[cfg(unix)]
 #[test]
+fn a_background_save_finishes_before_the_run_does() {
+    let fixture = Fixture::new(scratch_target(
+        json!({"paths": ["{projectRoot}/scratch"], "save": "background"}),
+    ));
+    assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
+    let text = stdout(&success(
+        fixture.qk(&fixture.root, &["show", "task", "app:build"]),
+    ));
+    assert!(
+        text.contains("warm state saved in the background"),
+        "{text}"
+    );
+    fs::remove_dir_all(fixture.root.join("scratch")).unwrap();
+    assert_eq!(said(&fixture, &fixture.root, &[]), "repo");
+}
+
+#[cfg(unix)]
+#[test]
 fn local_overrides_change_the_task_and_its_key() {
     let fixture = Fixture::new(json!({
         "command": "cat src/input.txt",

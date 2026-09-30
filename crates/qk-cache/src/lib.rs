@@ -34,6 +34,8 @@ pub struct Cache {
     remote: Option<std::sync::Arc<remote::Remote>>,
     /// The tasks whose outputs this run left exactly as they were.
     kept: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    /// Warm state being saved in the background.
+    saves: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
 /// A task's output fingerprint for its dependents' keys, or why it has none:
@@ -128,6 +130,7 @@ impl Cache {
             snapshot: OnceLock::new(),
             remote: None,
             kept: Default::default(),
+            saves: Default::default(),
         }
     }
 
@@ -157,6 +160,10 @@ impl Cache {
     pub fn finish(&self, workspace: &Workspace) {
         if let Some(Ok(snapshot)) = self.snapshot.get() {
             snapshot.save_digests(&workspace.root);
+        }
+        // Before the uploads, which a save may add to.
+        for save in std::mem::take(&mut *self.saves.lock().unwrap()) {
+            let _ = save.join();
         }
         if let Some(remote) = &self.remote {
             let failures = remote.finish();
@@ -225,7 +232,18 @@ impl Cache {
          -> Option<warm::WarmReport> {
             let warm = warm.as_ref()?;
             let started = std::time::Instant::now();
-            let save_ms = if outcome == Outcome::Success {
+            let mut background = false;
+            let save_ms = if outcome != Outcome::Success {
+                None
+            } else if warm.background {
+                match self.save_warm_in_background(workspace, task, warm) {
+                    Ok(()) => background = true,
+                    Err(error) => {
+                        qk_executor::status!("qk: {}: warm state not saved ({error:#})", task.id);
+                    }
+                }
+                None
+            } else {
                 match self.save_warm(workspace, task, warm) {
                     Ok(()) => Some(started.elapsed().as_millis() as u64),
                     Err(error) => {
@@ -233,10 +251,12 @@ impl Cache {
                         None
                     }
                 }
-            } else {
-                None
             };
-            Some(warm::WarmReport { restored, save_ms })
+            Some(warm::WarmReport {
+                restored,
+                save_ms,
+                background,
+            })
         };
         let fallback = |reason: String| {
             execute(prepared, cancelled).map(|outcome| TaskResult::uncached(outcome, reason))

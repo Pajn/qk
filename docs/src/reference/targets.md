@@ -145,6 +145,7 @@ An object describing reusable scratch state:
 | `restoreKeys` | count | None; how many leading `key` parts a save must match when none matches whole |
 | `group` | string | None; share `{warm}` and its saves with every target naming the group |
 | `survive` | array of targets, `target` or `project:target` | Empty; keep `paths` across these dependencies |
+| `save` | `"wait"` or `"background"` | `"wait"`; `"background"` saves after the task has reported |
 
 Put it beside `inputs` and `outputs`, rather than in executor `options`.
 Warm state is restored on misses and uncached runs, saved after success,

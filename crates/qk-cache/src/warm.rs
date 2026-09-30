@@ -64,6 +64,9 @@ pub struct Warm {
     /// Dependencies that delete the paths, which are moved aside while one
     /// runs: `target` in the task's project, or `project:target`.
     pub survive: Vec<String>,
+    /// Whether saving happens after the task has reported, in the
+    /// background, rather than before.
+    pub background: bool,
 }
 
 /// One part of a warm key.
@@ -95,6 +98,7 @@ pub fn config(workspace: &Workspace, task: &Task) -> Result<Option<Warm>> {
                 | "restoreKeys"
                 | "group"
                 | "survive"
+                | "save"
         ) {
             bail!("unknown qk:warm field {key:?}");
         }
@@ -232,6 +236,11 @@ pub fn config(workspace: &Workspace, task: &Task) -> Result<Option<Warm>> {
                 .context("qk:warm.restoreKeys must be a count no larger than qk:warm.key")
         })
         .transpose()?;
+    let background = match object.get("save").map(Value::as_str) {
+        None | Some(Some("wait")) => false,
+        Some(Some("background")) => true,
+        Some(_) => bail!("qk:warm.save must be \"wait\" or \"background\""),
+    };
     Ok(Some(Warm {
         identity,
         outputs: flag("outputs", false)?,
@@ -245,6 +254,7 @@ pub fn config(workspace: &Workspace, task: &Task) -> Result<Option<Warm>> {
         key,
         restore_keys,
         survive,
+        background,
     }))
 }
 
@@ -538,12 +548,17 @@ pub struct Restored {
 pub struct WarmReport {
     /// What was restored before the run, if anything.
     pub restored: Option<Restored>,
-    /// How long saving it after the run took, when it was saved.
+    /// How long saving it after the run took, when it was saved before the
+    /// task reported.
     pub save_ms: Option<u64>,
+    /// Whether it was saved in the background, after the task reported.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub background: bool,
 }
 
 /// A warm group: its name, the directory its paths are relative to, and
 /// which paths below that directory belong to it.
+#[derive(Clone)]
 struct Location {
     name: &'static str,
     base: PathBuf,
@@ -1017,30 +1032,62 @@ impl Cache {
     }
 
     /// Saves the task's warm groups after a successful run, as this worktree's
-    /// save. A file whose metadata matches this worktree's last save or
-    /// restore keeps its blob unread.
+    /// save.
     pub(crate) fn save_warm(&self, workspace: &Workspace, task: &Task, warm: &Warm) -> Result<()> {
+        self.save_prepared(&Save::prepare(workspace, task, warm)?)
+    }
+
+    /// Saves the task's warm groups on a thread of its own, which
+    /// [`Cache::finish`] waits for.
+    pub(crate) fn save_warm_in_background(
+        &self,
+        workspace: &Workspace,
+        task: &Task,
+        warm: &Warm,
+    ) -> Result<()> {
+        let save = Save::prepare(workspace, task, warm)?;
+        let cache = Cache {
+            remote: self.remote.clone(),
+            ..Cache::new(self.root.clone())
+        };
+        let handle = std::thread::spawn(move || {
+            if let Err(error) = cache.save_prepared(&save) {
+                qk_executor::status!("qk: {}: warm state not saved ({error:#})", save.task);
+            }
+        });
+        self.saves.lock().unwrap().push(handle);
+        Ok(())
+    }
+
+    /// Saves what [`Save::prepare`] gathered. A file whose metadata matches
+    /// this worktree's last save or restore keeps its blob unread; one that
+    /// is gone by the time it is read, as another task may remove it, is left
+    /// out.
+    fn save_prepared(&self, save: &Save) -> Result<()> {
+        let warm = &save.warm;
         let _lock = self.lock_warm(warm)?;
-        let own = worktree(workspace);
-        let key = key_digests(workspace, warm)?;
         let records = self.warm_records(warm);
         // This worktree's save under the same key, else under any.
         let previous = records
             .iter()
-            .filter(|(_, record)| record.worktree == own)
-            .min_by_key(|(_, record)| record.key != key)
+            .filter(|(_, record)| record.worktree == save.worktree)
+            .min_by_key(|(_, record)| record.key != save.key)
             .map(|(_, record)| record);
-        let noted = read_restored_files(workspace, warm);
+        let noted: RestoredFiles = fs::read(&save.notes)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
         let mut record = Record {
             version: RECORD_VERSION,
             task: warm.identity.clone(),
-            worktree: own.clone(),
-            commit: current_commit(workspace),
+            worktree: save.worktree.clone(),
+            commit: save.commit.clone(),
             saved: now_ms(),
-            key,
+            key: save.key.clone(),
             groups: BTreeMap::new(),
         };
-        for location in locations(workspace, task, warm)? {
+        let gone = |error: &std::io::Error| error.kind() == std::io::ErrorKind::NotFound;
+        for location in &save.locations {
             if !location.base.exists() {
                 continue;
             }
@@ -1050,9 +1097,16 @@ impl Cache {
             for path in location.paths()? {
                 paths::safe_parents(&location.base, &path)?;
                 let absolute = location.base.join(&path);
-                let metadata = fs::symlink_metadata(&absolute)?;
+                let metadata = match fs::symlink_metadata(&absolute) {
+                    Err(error) if gone(&error) => continue,
+                    result => result?,
+                };
                 let artifact = if metadata.file_type().is_symlink() {
-                    let target = fs::read_link(&absolute)?
+                    let target = match fs::read_link(&absolute) {
+                        Err(error) if gone(&error) => continue,
+                        result => result?,
+                    };
+                    let target = target
                         .to_str()
                         .context("symlink target must be UTF-8")?
                         .to_owned();
@@ -1076,17 +1130,26 @@ impl Cache {
                         Artifact::File { blob, .. } => self.root.join("blobs").join(blob).is_file(),
                         _ => false,
                     });
+                    let artifact = match reused {
+                        Some(artifact) => artifact.clone(),
+                        None => match self.put_blob(&absolute) {
+                            Ok(blob) => Artifact::File {
+                                blob,
+                                mode: mode(&metadata),
+                            },
+                            Err(error)
+                                if error.downcast_ref::<std::io::Error>().is_some_and(gone) =>
+                            {
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        },
+                    };
                     group.stamps.insert(path.clone(), now);
                     if let Some(modified) = metadata.modified().ok().and_then(nanos) {
                         group.mtimes.insert(path.clone(), modified);
                     }
-                    match reused {
-                        Some(artifact) => artifact.clone(),
-                        None => Artifact::File {
-                            blob: self.put_blob(&absolute)?,
-                            mode: mode(&metadata),
-                        },
-                    }
+                    artifact
                 } else if metadata.is_dir() {
                     Artifact::Directory {
                         mode: mode(&metadata),
@@ -1101,7 +1164,7 @@ impl Cache {
             {
                 qk_executor::status!(
                     "qk: {}: warm {} is over its maxSize and was not saved",
-                    task.id,
+                    save.task,
                     location.name
                 );
                 continue;
@@ -1109,7 +1172,7 @@ impl Cache {
             record.groups.insert(location.name.to_owned(), group);
         }
         self.store_warm(&record)?;
-        let _ = fs::remove_file(restored_files_path(workspace, warm));
+        let _ = fs::remove_file(&save.notes);
         // The oldest saves beyond the kept number go; the blobs they alone
         // cite are evicted with the cache.
         let saved = self.warm_record(&record);
@@ -1124,7 +1187,7 @@ impl Cache {
         if warm.remote
             && warm.portable
             && let Some(remote) = &self.remote
-            && let Some(branch) = current_branch(workspace)
+            && let Some(branch) = &save.branch
         {
             for group in record.groups.values_mut() {
                 group.stamps.clear();
@@ -1132,10 +1195,38 @@ impl Cache {
             remote.upload_warm(
                 &self.root,
                 &warm.identity,
-                &branch,
+                branch,
                 serde_json::to_vec(&record)?,
             );
         }
         Ok(())
+    }
+}
+
+/// What a save needs from the workspace, gathered where the task ran so that
+/// the save can run elsewhere.
+struct Save {
+    task: String,
+    warm: Warm,
+    locations: Vec<Location>,
+    worktree: String,
+    commit: Option<String>,
+    branch: Option<String>,
+    key: Vec<String>,
+    notes: PathBuf,
+}
+
+impl Save {
+    fn prepare(workspace: &Workspace, task: &Task, warm: &Warm) -> Result<Self> {
+        Ok(Self {
+            task: task.id.clone(),
+            warm: warm.clone(),
+            locations: locations(workspace, task, warm)?,
+            worktree: worktree(workspace),
+            commit: current_commit(workspace),
+            branch: current_branch(workspace),
+            key: key_digests(workspace, warm)?,
+            notes: restored_files_path(workspace, warm),
+        })
     }
 }
