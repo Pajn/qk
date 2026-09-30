@@ -254,7 +254,9 @@ fn add_event(event: Event, root: &Path, view: &View, paths: &mut BTreeSet<String
     for path in event.paths {
         if let Ok(relative) = path.strip_prefix(root) {
             let relative = relative.to_string_lossy().replace('\\', "/");
-            if !relative.is_empty() && !view.ignored(&relative) {
+            // Policy changes must reload even when the old policy ignores itself.
+            let policy = matches!(relative.as_str(), ".gitignore" | ".nxignore");
+            if !relative.is_empty() && (policy || !view.ignored(&relative)) {
                 paths.insert(relative);
             }
         }
@@ -317,6 +319,52 @@ fn callbacks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Self-ignored policy files remain observable, so removing exclusions works.
+    #[test]
+    fn self_ignored_policies_can_reload_source_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir(root.join("app")).unwrap();
+        std::fs::write(root.join("nx.json"), "{}").unwrap();
+        std::fs::write(root.join("app/project.json"), r#"{"name":"app"}"#).unwrap();
+        std::fs::write(root.join("app/ignored.txt"), "source").unwrap();
+        std::fs::write(root.join(".gitignore"), ".gitignore\n").unwrap();
+        std::fs::write(root.join(".nxignore"), ".nxignore\napp/ignored.txt\n").unwrap();
+        let options = Options {
+            projects: Vec::new(),
+            all: true,
+            include_dependencies: false,
+            initial_run: false,
+            verbose: false,
+            command: vec!["echo changed".into()],
+        };
+        let view = View::load(root, &options).unwrap();
+        assert!(!view.files.contains("app/ignored.txt"));
+        let mut paths = BTreeSet::new();
+        for name in [".gitignore", ".nxignore"] {
+            assert!(view.ignored(name));
+            add_event(
+                Event::new(EventKind::Any).add_path(root.join(name)),
+                root,
+                &view,
+                &mut paths,
+            );
+            assert!(paths.contains(name));
+        }
+        std::fs::write(root.join(".nxignore"), ".nxignore\n").unwrap();
+        let reloaded = View::load(root, &options).unwrap();
+        assert!(reloaded.files.contains("app/ignored.txt"));
+        paths.clear();
+        add_event(
+            Event::new(EventKind::Any).add_path(root.join("app/ignored.txt")),
+            root,
+            &reloaded,
+            &mut paths,
+        );
+        assert!(paths.contains("app/ignored.txt"));
+        assert_eq!(reloaded.owner("app/ignored.txt").as_deref(), Some("app"));
+    }
 
     /// A backend failure queues a full rescan and subsequent events remain usable.
     #[test]
