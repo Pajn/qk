@@ -1,0 +1,91 @@
+{
+  "cache-direct": [
+    [
+      "consumer.ran",
+      "producer.ran"
+    ],
+    [],
+    [
+      "producer.ran"
+    ],
+    [
+      "consumer.ran",
+      "producer.ran"
+    ]
+  ],
+  "cache-indirect": [
+    [
+      "consumer.ran",
+      "producer.ran"
+    ],
+    [],
+    [
+      "producer.ran"
+    ],
+    [
+      "producer.ran"
+    ]
+  ],
+  "cache-transitive": [
+    [
+      "consumer.ran",
+      "producer.ran"
+    ],
+    [],
+    [
+      "producer.ran"
+    ],
+    [
+      "consumer.ran",
+      "producer.ran"
+    ]
+  ],
+  "cache-broad-glob": [
+    [
+      "consumer.ran",
+      "producer.ran"
+    ],
+    [],
+    [
+      "consumer.ran",
+      "producer.ran"
+    ],
+    [
+      "consumer.ran",
+      "producer.ran"
+    ]
+  ],
+  "cache-nxignore": [
+    [
+      "consumer.ran"
+    ],
+    [],
+    [
+      "consumer.ran"
+    ]
+  ],
+  "stdin-spaces": [
+    "app"
+  ],
+  "stdin-empty": [],
+  "watch": {
+    "initial": {
+      "project": "app",
+      "files": []
+    },
+    "first": {
+      "project": "app",
+      "files": [
+        "app/first.txt"
+      ]
+    },
+    "queued": [
+      {
+        "project": "app",
+        "files": [
+          "app/second.txt"
+        ]
+      }
+    ]
+  }
+}
