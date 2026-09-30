@@ -290,14 +290,14 @@ impl Cache {
         let stage = tempfile::Builder::new()
             .prefix("restore-")
             .tempdir_in(stage_parent)?;
+        let mut staging = StagingDirectories::new(stage.path());
         for (path, artifact) in &manifest.artifacts {
             paths::safe_parents(root, path)?;
-            paths::safe_parents(stage.path(), path)?;
+            staging.parents(path)?;
             if !outputs.matches(path) {
                 bail!("cached artifact is outside declared outputs");
             }
             let destination = stage.path().join(path);
-            fs::create_dir_all(destination.parent().context("output has no parent")?)?;
             match artifact {
                 Artifact::File { blob, mode } => {
                     if !valid_hash(blob) {
@@ -313,9 +313,7 @@ impl Cache {
                     set_modified(&destination, started)?;
                     set_mode(&destination, *mode)?;
                 }
-                Artifact::Directory { .. } => {
-                    fs::create_dir_all(destination)?;
-                }
+                Artifact::Directory { .. } => staging.directory(path)?,
                 Artifact::Symlink { target, directory } => {
                     validate_link(path, target)?;
                     symlink(target, &destination, *directory)?;
@@ -391,6 +389,61 @@ impl Cache {
     }
 }
 
+/// Directory creation is deduplicated only inside this restore's private
+/// temporary stage. Staging never replaces directories with files or links;
+/// such conflicting manifests fail. Destination validation is never cached.
+struct StagingDirectories<'a> {
+    root: &'a Path,
+    directories: BTreeSet<String>,
+}
+
+impl<'a> StagingDirectories<'a> {
+    fn new(root: &'a Path) -> Self {
+        Self {
+            root,
+            directories: BTreeSet::new(),
+        }
+    }
+
+    fn parents(&mut self, path: &str) -> Result<()> {
+        paths::validate_path(path)?;
+        if let Some((parent, _)) = path.rsplit_once('/') {
+            self.directory(parent)?;
+        }
+        Ok(())
+    }
+
+    fn directory(&mut self, path: &str) -> Result<()> {
+        paths::validate_path(path)?;
+        let mut prefix = String::new();
+        for part in path.split('/') {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(part);
+            if self.directories.contains(&prefix) {
+                continue;
+            }
+            let absolute = self.root.join(&prefix);
+            match fs::create_dir(&absolute) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let metadata = fs::symlink_metadata(&absolute)?;
+                    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                        bail!(
+                            "cache staging parent is not a real directory: {}",
+                            absolute.display()
+                        );
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+            self.directories.insert(prefix.clone());
+        }
+        Ok(())
+    }
+}
+
 /// Complete staged directories whose destinations were absent before cleanup.
 fn absent_directories(
     root: &Path,
@@ -423,18 +476,13 @@ fn promote_directory(staged: &Path, destination: &Path) -> Result<bool> {
         use rustix::fs::{CWD, RenameFlags, renameat_with};
         match renameat_with(CWD, staged, CWD, destination, RenameFlags::NOREPLACE) {
             Ok(()) => Ok(true),
-            Err(error)
-                if matches!(
-                    error,
-                    rustix::io::Errno::EXIST
-                        | rustix::io::Errno::XDEV
-                        | rustix::io::Errno::NOSYS
-                        | rustix::io::Errno::INVAL
-                        | rustix::io::Errno::OPNOTSUPP
-                ) =>
-            {
-                Ok(false)
-            }
+            Err(
+                rustix::io::Errno::EXIST
+                | rustix::io::Errno::XDEV
+                | rustix::io::Errno::NOSYS
+                | rustix::io::Errno::INVAL
+                | rustix::io::Errno::OPNOTSUPP,
+            ) => Ok(false),
             Err(error) => Err(std::io::Error::from(error).into()),
         }
     }
@@ -578,6 +626,33 @@ fn outputs_unchanged(root: &Path, task: &str, key: &str, outputs: &Outputs) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Private staging rejects unsafe paths and file/link ancestors rather
+    /// than following them, while shared ordinary parents can be reused.
+    #[test]
+    fn staging_directory_reuse_rejects_conflicting_manifest_parents() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut staging = StagingDirectories::new(temp.path());
+        staging.parents("dist/nested/a").unwrap();
+        staging.parents("dist/nested/b").unwrap();
+        staging.directory("dist/nested/empty").unwrap();
+        assert!(temp.path().join("dist/nested/empty").is_dir());
+        fs::write(temp.path().join("file"), "keep").unwrap();
+        assert!(staging.parents("file/child").is_err());
+        assert!(staging.parents("../escape").is_err());
+        assert!(staging.parents("dist/../escape").is_err());
+        assert_eq!(
+            fs::read_to_string(temp.path().join("file")).unwrap(),
+            "keep"
+        );
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(outside.path(), temp.path().join("link")).unwrap();
+            assert!(staging.parents("link/child").is_err());
+            assert!(!outside.path().join("child").exists());
+        }
+    }
 
     /// A no-replace move must leave every kind of existing destination intact.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
