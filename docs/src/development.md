@@ -180,7 +180,12 @@ hyperfine: `show projects`, `graph`, `show projects --affected` with no
 changes, and a fully cached `run-many`, once with every output in place and
 once with every output removed first, so all 9,300 are restored. Both cached
 runs also run with `.nxignore` enabled to exercise filesystem walking and
-ignored generated files. Watch samples measure each source edit to the callback's
+ignored generated files. A separate restoration matrix uses the same graph with
+both repeated and distinct blob contents, absent and stale complete output
+directories, and partial restoration with an excluded sentinel. Every measured
+restoration is followed by an untimed check of all output contents, stale-file
+removal, exclusion preservation and build counters, so cache misses cannot pass
+as restoration measurements. Preparation and verification are outside timing. Watch samples measure each source edit to the callback's
 timestamp, with Git ignore rules and with `.nxignore`, including native event
 delivery, debounce, workspace reload and Node startup. Two initial samples are
 discarded; results are observations, with no timing thresholds in CI. It needs
