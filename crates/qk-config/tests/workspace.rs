@@ -577,3 +577,65 @@ fn a_local_workspace_file_replaces_filtered_defaults() {
         (json!(1), json!(2))
     );
 }
+
+#[test]
+fn nx_json_extends_a_file_or_package_export_one_level() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    write(
+        root,
+        "nx.json",
+        r#"{"extends": "./nx.base.json", "defaultBase": "develop"}"#,
+    );
+    write(
+        root,
+        "nx.base.json",
+        r#"{
+            "extends": "./ignored.json",
+            "defaultBase": "main",
+            "parallel": 5,
+            "namedInputs": {"production": ["default"]}
+        }"#,
+    );
+    write(root, "ignored.json", r#"{"parallel": 9}"#);
+    let workspace = Workspace::load(root).unwrap();
+    // nx.json's own settings win whole, and the base's `extends` is not followed.
+    assert_eq!(workspace.config.default_base.as_deref(), Some("develop"));
+    assert_eq!(workspace.config.extra["parallel"], 5);
+    assert_eq!(
+        workspace.config.named_inputs["production"],
+        [json!("default")]
+    );
+    assert_eq!(workspace.extended.as_deref(), Some("nx.base.json"));
+
+    // A package subpath resolves through the package's exports, as Nx's
+    // `nx/presets/npm.json` does.
+    write(
+        root,
+        "nx.json",
+        r#"{"extends": "@scope/config/presets/shared.json"}"#,
+    );
+    write(
+        root,
+        "node_modules/@scope/config/package.json",
+        r#"{"exports": {
+            "./presets/*": {"custom": "./src/*.json", "default": "./dist/*.json"},
+            "./presets/*.json": {"custom": "./src/*.json", "default": "./dist/*.json"}
+        }}"#,
+    );
+    write(
+        root,
+        "node_modules/@scope/config/dist/shared.json",
+        r#"{"parallel": 2}"#,
+    );
+    let workspace = Workspace::load(root).unwrap();
+    assert_eq!(workspace.config.extra["parallel"], 2);
+    assert_eq!(
+        workspace.extended.as_deref(),
+        Some("node_modules/@scope/config/dist/shared.json")
+    );
+
+    write(root, "nx.json", r#"{"extends": "missing/preset.json"}"#);
+    let error = Workspace::load(root).unwrap_err();
+    assert!(format!("{error:#}").contains("no node_modules contains missing"));
+}

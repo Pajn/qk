@@ -23,6 +23,17 @@ Use [Nx compatibility](../compatibility.md) to check the supported surface.
 }
 ```
 
+## `extends`
+
+A file whose settings nx.json starts from, resolved as Nx resolves it with
+Node's `require.resolve` from the workspace root: a path beginning `./` or
+`../`, or a package subpath such as `nx/presets/npm.json`, found in
+`node_modules` through the package's `exports`. As in Nx, each setting
+nx.json declares replaces the extended file's whole, and the extended file's
+own `extends` is not followed. `nx.local.json` merges over the result. A
+change to an extended file inside the workspace affects every project and
+every task's key, as a change to nx.json does.
+
 ## `namedInputs`
 
 An object mapping names to arrays of [input declarations](inputs-outputs.md).

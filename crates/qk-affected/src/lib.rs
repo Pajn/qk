@@ -644,14 +644,19 @@ fn touched_by_path(workspace: &Workspace, changes: &Changes, touches: &mut Touch
     Ok(())
 }
 
-/// `nx.json` touches every project; a file named by a `{workspaceRoot}` input
-/// touches the projects declaring it.
+/// `nx.json`, or the file it extends, touches every project; a file named by
+/// a `{workspaceRoot}` input touches the projects declaring it.
 fn touched_implicitly(
     workspace: &Workspace,
     changes: &Changes,
     touches: &mut Touches,
 ) -> Result<()> {
-    if changes.changed("nx.json") {
+    if changes.changed("nx.json")
+        || workspace
+            .extended
+            .as_ref()
+            .is_some_and(|extended| changes.changed(extended))
+    {
         touches.all(workspace, Reason::NxJson);
         return Ok(());
     }
