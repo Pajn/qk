@@ -168,6 +168,7 @@ fn wait_for(path: &Path) {
 }
 
 #[test]
+/// Shared dependencies run once before both branches, and raw output stays intact.
 fn dependency_diamond_runs_once_before_dependents_and_streams_raw_output() {
     let mut targets = json!({"output":{"command":"echo raw-output"}});
     for (id, dependencies) in [
@@ -1486,6 +1487,27 @@ fn the_sandbox_refuses_what_a_task_does_not_declare_on_linux() {
 
 #[cfg(unix)]
 #[test]
+/// Nested exec uses existing confinement and rejects unconfined sandbox requests.
+fn exec_inherits_the_enclosing_task_sandbox() {
+    let executable = env!("CARGO_BIN_EXE_qk");
+    let temp = fixture(json!({
+        "build": {"command": format!("\"{executable}\" exec --sandbox=enforce -- echo built")}
+    }));
+    let output = success(run(temp.path(), &["run", "app:build", "--sandbox=enforce"]));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("built"));
+
+    // An unsandboxed task must not inherit a caller-supplied marker.
+    let output = command(temp.path(), &["run", "app:build"])
+        .env("QK_TASK_SANDBOX", "1")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot apply"));
+}
+
+#[cfg(unix)]
+#[test]
+/// Exec selects project order and switches behavior for tasks and package scripts.
 fn exec_runs_in_projects_dependencies_first_as_nx_does() {
     let temp = TempDir::new().unwrap();
     let root = temp.path();

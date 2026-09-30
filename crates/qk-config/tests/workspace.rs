@@ -579,6 +579,7 @@ fn a_local_workspace_file_replaces_filtered_defaults() {
 }
 
 #[test]
+/// Resolve file and package presets, respecting export conditions and main fallbacks.
 fn nx_json_extends_a_file_or_package_export_one_level() {
     let temp = TempDir::new().unwrap();
     let root = temp.path();
@@ -660,6 +661,43 @@ fn nx_json_extends_a_file_or_package_export_one_level() {
     write(root, "node_modules/plain/package.json", "{}");
     write(root, "node_modules/plain/index.json", r#"{"parallel": 6}"#);
     assert_eq!(Workspace::load(root).unwrap().config.extra["parallel"], 6);
+
+    write(
+        root,
+        "node_modules/plain/package.json",
+        r#"{"main": "./presets"}"#,
+    );
+    write(
+        root,
+        "node_modules/plain/presets/index.json",
+        r#"{"parallel": 8}"#,
+    );
+    assert_eq!(Workspace::load(root).unwrap().config.extra["parallel"], 8);
+    write(
+        root,
+        "node_modules/plain/package.json",
+        r#"{"main": "missing"}"#,
+    );
+    assert_eq!(Workspace::load(root).unwrap().config.extra["parallel"], 6);
+
+    for exports in [
+        r#"{".": {"require": null, "default": "./preset.json"}}"#,
+        r#"{".": {"node": {"require": null}, "default": "./preset.json"}}"#,
+    ] {
+        write(
+            root,
+            "node_modules/plain/package.json",
+            &format!(r#"{{"exports": {exports}}}"#),
+        );
+        assert!(format!("{:#}", Workspace::load(root).unwrap_err()).contains("does not export"));
+    }
+    // An unresolved nested condition allows the next active condition.
+    write(
+        root,
+        "node_modules/plain/package.json",
+        r#"{"exports": {".": {"node": {"import": null}, "default": "./preset.json"}}}"#,
+    );
+    assert_eq!(Workspace::load(root).unwrap().config.extra["parallel"], 4);
 
     write(root, "nx.json", r#"{"extends": "missing/preset.json"}"#);
     let error = Workspace::load(root).unwrap_err();

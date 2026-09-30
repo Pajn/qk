@@ -177,6 +177,7 @@ pub fn shell(text: &str) -> Command {
     }
 }
 
+/// Launch a task command with its environment, confinement and output streams.
 fn spawn(task: &PreparedTask, text: &str, capture: bool, interactive: bool) -> Result<GroupChild> {
     #[cfg(windows)]
     let mut command = shell(text);
@@ -224,6 +225,12 @@ fn spawn(task: &PreparedTask, text: &str, capture: bool, interactive: bool) -> R
         } else {
             Stdio::inherit()
         });
+    // Re-entered exec inherits confinement. Override any caller-supplied
+    // marker so an unsandboxed task cannot accidentally claim confinement.
+    command.env_remove("QK_TASK_SANDBOX");
+    if task.sandbox.is_some() {
+        command.env("QK_TASK_SANDBOX", "1");
+    }
     #[cfg(unix)]
     if interactive && terminal::in_foreground() {
         use std::os::unix::process::CommandExt;

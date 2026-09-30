@@ -232,6 +232,7 @@ fn input_changes_invalidate_and_old_entries_remain() {
 }
 
 #[test]
+/// Reset removes only the selected state and preserves recorded run history.
 fn reset_clears_the_cache_and_worktree_state_but_keeps_history() {
     let fixture = Fixture::new(target("build", json!({})));
     success(fixture.build(&fixture.root, &[]));

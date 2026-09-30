@@ -12,10 +12,12 @@ enum Export {
     Path(String),
     List(Vec<Export>),
     Map(Vec<(String, Export)>),
+    Null,
     Other,
 }
 
 impl From<JsonValue<'_>> for Export {
+    /// Preserve export declaration order and explicit null targets.
     fn from(value: JsonValue<'_>) -> Self {
         match value {
             JsonValue::String(path) => Self::Path(path.into_owned()),
@@ -26,6 +28,7 @@ impl From<JsonValue<'_>> for Export {
                     .map(|(key, value)| (key, Self::from(value)))
                     .collect(),
             ),
+            JsonValue::Null => Self::Null,
             _ => Self::Other,
         }
     }
@@ -66,22 +69,26 @@ pub fn resolve(root: &Path, specifier: &str) -> Result<PathBuf> {
             Some(JsonValue::Object(manifest)) => manifest,
             _ => jsonc_parser::JsonObject::new(Default::default()),
         };
-        let target = match manifest.take("exports") {
+        let resolved = match manifest.take("exports") {
             Some(exports) => {
                 let key = subpath.map_or_else(|| ".".to_owned(), |subpath| format!("./{subpath}"));
-                exported(&Export::from(exports), &key).with_context(|| {
+                let target = exported(&Export::from(exports), &key).with_context(|| {
                     format!("nx.json extends {specifier:?}, which {package} does not export")
-                })?
+                })?;
+                file(&location.join(target))
             }
-            // As Node loads a package directory: its `main`, else `index`.
             None => match subpath {
-                Some(subpath) => subpath.to_owned(),
+                Some(subpath) => file(&location.join(subpath)),
                 None => manifest
                     .take_string("main")
-                    .map_or_else(|| "index".to_owned(), |main| main.into_owned()),
+                    .and_then(|main| {
+                        let main = location.join(main.as_ref());
+                        file(&main).or_else(|| file(&main.join("index")))
+                    })
+                    .or_else(|| file(&location.join("index"))),
             },
         };
-        return file(&location.join(target))
+        return resolved
             .with_context(|| format!("nx.json extends {specifier:?}, which does not exist"));
     }
     bail!("nx.json extends {specifier:?}, but no node_modules contains {package}")
@@ -115,14 +122,14 @@ fn file(path: &Path) -> Option<PathBuf> {
 /// Node orders them, with the match substituted.
 fn exported(exports: &Export, key: &str) -> Option<String> {
     let Export::Map(entries) = exports else {
-        return (key == ".").then(|| target(exports)).flatten();
+        return (key == ".").then(|| target(exports)).flatten().flatten();
     };
     // Conditions alone describe the package's root export.
     if !entries.iter().any(|(name, _)| name.starts_with('.')) {
-        return (key == ".").then(|| target(exports)).flatten();
+        return (key == ".").then(|| target(exports)).flatten().flatten();
     }
     if let Some((_, value)) = entries.iter().find(|(name, _)| name == key) {
-        return target(value);
+        return target(value).flatten();
     }
     let (_, value, matched) = entries
         .iter()
@@ -132,15 +139,17 @@ fn exported(exports: &Export, key: &str) -> Option<String> {
             Some(((prefix.len(), pattern.len()), value, middle))
         })
         .max_by_key(|(order, _, _)| *order)?;
-    Some(target(value)?.replace('*', matched))
+    Some(target(value)??.replace('*', matched))
 }
 
 /// An export target: a path, the first usable entry of an array, or the
-/// first declared of the conditions `require.resolve` applies.
-fn target(value: &Export) -> Option<String> {
+/// first declared of the conditions `require.resolve` applies. Outer `None`
+/// means unresolved; `Some(None)` blocks later conditions with an explicit null.
+fn target(value: &Export) -> Option<Option<String>> {
     match value {
-        Export::Path(path) => Some(path.clone()),
-        Export::List(entries) => entries.iter().find_map(target),
+        Export::Path(path) => Some(Some(path.clone())),
+        Export::Null => Some(None),
+        Export::List(entries) => Some(entries.iter().find_map(|entry| target(entry).flatten())),
         Export::Map(conditions) => conditions.iter().find_map(|(condition, value)| {
             matches!(condition.as_str(), "node" | "require" | "default")
                 .then(|| target(value))

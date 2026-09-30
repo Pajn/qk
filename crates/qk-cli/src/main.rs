@@ -1225,8 +1225,8 @@ fn exec(
     };
     // Only a package script's target runs as a task; elsewhere the command
     // runs as it is, so options that change how tasks run cannot apply.
-    let direct = || -> Result<()> {
-        if options.sandbox.is_some() || options.dry_run || options.graph.is_some() {
+    let direct = |enclosed: bool| -> Result<()> {
+        if (options.sandbox.is_some() && !enclosed) || options.dry_run || options.graph.is_some() {
             bail!(
                 "exec runs the command directly here, so --sandbox, --dry-run and --graph cannot apply; they apply when exec runs a package script's target"
             );
@@ -1238,7 +1238,7 @@ fn exec(
         .ok()
         .filter(|project| !project.is_empty())
     {
-        direct()?;
+        direct(std::env::var("QK_TASK_SANDBOX").as_deref() == Ok("1"))?;
         return run(&project, &std::env::current_dir()?);
     }
     // From a package script, run that script's target, so it is cached. The
@@ -1275,7 +1275,7 @@ fn exec(
         };
         return execute_tasks(workspace, vec![request], &options, true);
     }
-    direct()?;
+    direct(false)?;
     let selected = select_projects(&workspace.projects, projects, exclude)?;
     for project in exec_order(workspace, selected, &options)? {
         let code = run(

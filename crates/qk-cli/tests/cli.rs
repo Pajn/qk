@@ -405,6 +405,7 @@ fn graph_can_include_the_packages_the_lockfile_installs() {
 }
 
 #[test]
+/// Graph filtering follows dependency closures and preserves Nx edge behavior.
 fn graph_focus_and_exclude_keep_what_nx_keeps() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/parity/fixture");
     let graph = |args: &[&str]| {
