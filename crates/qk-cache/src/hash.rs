@@ -1142,7 +1142,9 @@ pub(crate) fn dependency_keys(
             let outputs = Outputs::new(workspace, &graph.tasks[&id])?;
             let mut files = BTreeMap::new();
             for path in outputs.paths(&workspace.root)? {
-                if matcher.is_match(&path) {
+                if matcher.is_match(&path)
+                    && !std::fs::symlink_metadata(workspace.root.join(&path))?.is_dir()
+                {
                     files.insert(path.clone(), snapshot.file_value(&workspace.root, &path)?);
                 }
             }

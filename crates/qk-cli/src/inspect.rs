@@ -204,8 +204,10 @@ pub fn show(workspace: &Workspace, options: Options) -> Result<i32> {
 
 /// Normalize workspace-relative query paths, including directory queries.
 fn normalized(path: &str) -> String {
-    path.replace('\\', "/")
+    let path = path
+        .replace('\\', "/")
         .trim_start_matches("./")
         .trim_end_matches('/')
-        .to_owned()
+        .to_owned();
+    if path == "." { String::new() } else { path }
 }

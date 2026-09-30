@@ -18,7 +18,7 @@ fn process_helper() {
     fs::write(&counter, (runs + 1).to_string()).unwrap();
     let input = fs::read_to_string("src/input.txt").unwrap();
     if mode == "generate-types" {
-        fs::create_dir_all("types").unwrap();
+        fs::create_dir_all("types/nested/empty.d.ts").unwrap();
         fs::write("types/value.d.ts", input.lines().next().unwrap_or_default()).unwrap();
         fs::write("types/value.js", &input).unwrap();
         return;
@@ -1760,4 +1760,32 @@ fn dependency_output_inputs_hash_only_matching_artifacts() {
         };
         assert!(stderr(&output).contains(expected), "{}", stderr(&output));
     }
+}
+
+/// Broad artifact globs include directories, which must not disable caching.
+#[test]
+fn dependency_output_glob_skips_directories() {
+    let producer = target(
+        "generate-types",
+        json!({"outputs":["{projectRoot}/types"],"inputs":["{projectRoot}/src/**/*"]}),
+    );
+    let consumer = target(
+        "build",
+        json!({"inputs":[{"dependentTasksOutputFiles":"**/*"}],"dependsOn":["types"]}),
+    );
+    let fixture = Fixture::with_targets(json!({"types":producer,"build":consumer}));
+    success(fixture.build(&fixture.root, &[]));
+    let output = success(fixture.build(&fixture.root, &[]));
+    assert!(
+        stderr(&output).contains("qk: cache hit app:build"),
+        "{}",
+        stderr(&output)
+    );
+    fs::write(fixture.root.join("src/input.txt"), "changed").unwrap();
+    let output = success(fixture.build(&fixture.root, &[]));
+    assert!(
+        stderr(&output).contains("qk: cache miss app:build"),
+        "{}",
+        stderr(&output)
+    );
 }

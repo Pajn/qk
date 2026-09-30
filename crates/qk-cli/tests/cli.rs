@@ -538,7 +538,9 @@ fn inspects_targets_inputs_and_outputs_without_running_commands() {
             "app:build",
             "--check",
             "src",
-            "FOO"
+            "FOO",
+            ".",
+            "./"
         ])
         .status
         .success()

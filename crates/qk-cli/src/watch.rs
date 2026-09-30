@@ -172,7 +172,7 @@ pub fn run(workspace: &Workspace, options: Options) -> Result<i32> {
     let mut pending_paths = BTreeSet::new();
     while !cancelled.load(Ordering::SeqCst) {
         let first = match receiver.recv_timeout(Duration::from_millis(100)) {
-            Ok(event) => event?,
+            Ok(event) => watch_event(event),
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => bail!("filesystem watcher stopped"),
         };
@@ -189,7 +189,7 @@ pub fn run(workspace: &Workspace, options: Options) -> Result<i32> {
             match receiver.recv_timeout(Duration::from_millis(25)) {
                 Ok(event) => {
                     let before = paths.len();
-                    add_event(event?, &root, &view, &mut paths);
+                    add_event(watch_event(event), &root, &view, &mut paths);
                     if paths.len() != before {
                         deadline = Instant::now() + Duration::from_millis(150);
                     }
@@ -211,12 +211,11 @@ pub fn run(workspace: &Workspace, options: Options) -> Result<i32> {
         let files: BTreeSet<_> = candidates
             .into_iter()
             .filter(|file| {
-                !view.ignored(file)
+                paths.iter().any(|path| {
+                    path.is_empty() || file == path || Path::new(file).starts_with(path)
+                }) && !view.ignored(file)
                     && !next.ignored(file)
                     && (view.owner(file).is_some() || next.owner(file).is_some())
-                    && paths.iter().any(|path| {
-                        path.is_empty() || file == path || Path::new(file).starts_with(path)
-                    })
             })
             .collect();
         let projects: BTreeSet<_> = files
@@ -229,6 +228,14 @@ pub fn run(workspace: &Workspace, options: Options) -> Result<i32> {
         }
     }
     Ok(130)
+}
+
+/// Recover backend errors by rescanning rather than ending the watch session.
+fn watch_event(result: notify::Result<Event>) -> Event {
+    result.unwrap_or_else(|error| {
+        eprintln!("qk: watch event error: {error}");
+        Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan)
+    })
 }
 
 /// Collect write/create/delete/rename events; access events cannot trigger loops.
@@ -300,4 +307,41 @@ fn callbacks(
         }
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A backend failure queues a full rescan and subsequent events remain usable.
+    #[test]
+    fn backend_error_requests_rescan() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("nx.json"), "{}").unwrap();
+        let options = Options {
+            projects: Vec::new(),
+            all: true,
+            include_dependencies: false,
+            initial_run: false,
+            verbose: false,
+            command: vec!["echo changed".into()],
+        };
+        let view = View::load(temp.path(), &options).unwrap();
+        let mut paths = BTreeSet::new();
+        add_event(
+            watch_event(Err(notify::Error::generic("backend overflow"))),
+            temp.path(),
+            &view,
+            &mut paths,
+        );
+        add_event(
+            watch_event(Ok(
+                Event::new(EventKind::Any).add_path(temp.path().join("source.txt"))
+            )),
+            temp.path(),
+            &view,
+            &mut paths,
+        );
+        assert_eq!(paths, BTreeSet::from([String::new(), "source.txt".into()]));
+    }
 }
