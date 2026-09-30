@@ -193,6 +193,9 @@ Native file events are debounced and changes arriving during a callback are
 queued for the next batch. A directory event or backend rescan can include other
 eligible source files in the reported batch. Callback failures are reported;
 watch continues.
+Edits to known regular source files reuse the current project view. Configuration
+and ignore-policy changes, file creation/deletion, directories, symlinks and
+backend rescans reload discovery and selection before the next callback.
 Ctrl+C cancels callbacks and their process groups and exits with 130. Ignored
 source files, node_modules, Git/qk state, configured caches, explicit target
 outputs and warm paths do not trigger callbacks. Global files outside any

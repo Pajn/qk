@@ -44,6 +44,36 @@ struct View {
 }
 
 impl View {
+    /// Configuration and policy files can change discovery, ownership or filters.
+    fn control_file(&self, path: &str) -> bool {
+        matches!(
+            Path::new(path).file_name().and_then(|name| name.to_str()),
+            Some(
+                "nx.json"
+                    | "nx.local.json"
+                    | "project.json"
+                    | "project.local.json"
+                    | "package.json"
+                    | "pnpm-workspace.yaml"
+                    | "pnpm-lock.yaml"
+                    | ".gitignore"
+                    | ".nxignore"
+                    | ".ignore"
+            )
+        ) || self.workspace.extended.as_deref() == Some(path)
+    }
+
+    /// Existing regular source edits keep ownership and discovery unchanged.
+    /// New/deleted files, directories, symlinks and rescan requests still reload.
+    fn reusable_for(&self, paths: &BTreeSet<String>) -> bool {
+        paths.iter().all(|path| {
+            self.files.contains(path)
+                && !self.control_file(path)
+                && std::fs::symlink_metadata(self.workspace.root.join(path))
+                    .is_ok_and(|metadata| metadata.file_type().is_file())
+        })
+    }
+
     /// Reload discovery and selection so --all also sees newly created projects.
     fn load(root: &Path, options: &Options) -> Result<Self> {
         let workspace = Workspace::load(root)?;
@@ -109,10 +139,13 @@ impl View {
 
     /// Filter runner state and generated artifacts before discovery or callbacks.
     fn ignored(&self, path: &str) -> bool {
-        self.ignore.matches(path)
-            || path
-                .split('/')
-                .any(|part| matches!(part, ".git" | ".qk" | "node_modules"))
+        self.ignore.matches(path) || self.reserved(path)
+    }
+
+    /// Generated outputs and dependency/runner state cannot become source events.
+    fn reserved(&self, path: &str) -> bool {
+        path.split('/')
+            .any(|part| matches!(part, ".git" | ".qk" | "node_modules"))
             || self.workspace.root.join(path).starts_with(&self.cache)
             || self.outputs.iter().any(|outputs| outputs.matches(path))
     }
@@ -203,6 +236,14 @@ pub fn run(workspace: &Workspace, options: Options) -> Result<i32> {
                 Err(mpsc::RecvTimeoutError::Disconnected) => bail!("filesystem watcher stopped"),
             }
         }
+        if view.reusable_for(&paths) {
+            let files = changed_files(&view, &view, &paths);
+            let projects = files.iter().filter_map(|file| view.owner(file)).collect();
+            if !files.is_empty() {
+                callbacks(&command, &cwd, &projects, &files, &options, &cancelled)?;
+            }
+            continue;
+        }
         let next = match View::load(&root, &options) {
             Ok(next) => next,
             Err(error) => {
@@ -261,12 +302,31 @@ fn add_event(event: Event, root: &Path, view: &View, paths: &mut BTreeSet<String
         if let Ok(relative) = path.strip_prefix(root) {
             let relative = relative.to_string_lossy().replace('\\', "/");
             // Policy changes must reload even when the old policy ignores itself.
-            let policy = matches!(relative.as_str(), ".gitignore" | ".nxignore");
-            if policy {
+            let policy = matches!(
+                Path::new(&relative)
+                    .file_name()
+                    .and_then(|name| name.to_str()),
+                Some(".gitignore" | ".nxignore" | ".ignore")
+            );
+            let parent = Path::new(&relative).parent().unwrap_or(Path::new(""));
+            let known_control = view.control_file(&relative)
+                && (parent.as_os_str().is_empty()
+                    || view
+                        .workspace
+                        .projects
+                        .values()
+                        .any(|project| parent == Path::new(&project.root)));
+            let observable = !view.reserved(&relative)
+                || known_control
+                || view.workspace.extended.as_deref() == Some(relative.as_str());
+            if policy && observable {
                 // Source events in this batch may have been hidden by the old policy.
                 paths.insert(String::new());
             }
-            if !relative.is_empty() && (policy || !view.ignored(&relative)) {
+            if !relative.is_empty()
+                && observable
+                && (view.control_file(&relative) || !view.ignored(&relative))
+            {
                 paths.insert(relative);
             }
         }
@@ -329,6 +389,73 @@ fn callbacks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only existing source edits reuse discovery; controls and structure reload.
+    #[test]
+    fn source_edits_reuse_view_without_hiding_control_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("app/dist")).unwrap();
+        std::fs::write(root.join("nx.json"), r#"{"extends":"./preset.json"}"#).unwrap();
+        std::fs::write(root.join("preset.json"), "{}").unwrap();
+        std::fs::write(root.join(".gitignore"), "*.local.json\n").unwrap();
+        std::fs::write(
+            root.join("app/project.json"),
+            r#"{"name":"app","targets":{"build":{"command":"echo build","outputs":["{projectRoot}/dist"]}}}"#,
+        ).unwrap();
+        std::fs::write(root.join("app/source.txt"), "one").unwrap();
+        let options = Options {
+            projects: Vec::new(),
+            all: true,
+            include_dependencies: false,
+            initial_run: false,
+            verbose: false,
+            command: vec!["echo changed".into()],
+        };
+        let view = View::load(root, &options).unwrap();
+        let batch = |path: &str| BTreeSet::from([path.to_owned()]);
+        std::fs::write(root.join("app/source.txt"), "two").unwrap();
+        assert!(view.reusable_for(&batch("app/source.txt")));
+        for path in [
+            "",
+            "app",
+            "app/new.txt",
+            "app/project.json",
+            "preset.json",
+            ".gitignore",
+        ] {
+            assert!(!view.reusable_for(&batch(path)), "{path}");
+        }
+        std::fs::remove_file(root.join("app/source.txt")).unwrap();
+        assert!(!view.reusable_for(&batch("app/source.txt")));
+
+        let mut paths = BTreeSet::new();
+        assert!(view.ignored("nx.local.json"));
+        add_event(
+            Event::new(EventKind::Any).add_path(root.join("nx.local.json")),
+            root,
+            &view,
+            &mut paths,
+        );
+        assert!(paths.contains("nx.local.json"));
+        assert!(!view.reusable_for(&paths));
+        paths.clear();
+        // A generated package manifest must not bypass output exclusions.
+        add_event(
+            Event::new(EventKind::Any).add_path(root.join("app/dist/package.json")),
+            root,
+            &view,
+            &mut paths,
+        );
+        assert!(paths.is_empty());
+        add_event(
+            Event::new(EventKind::Any).add_path(root.join("node_modules/pkg/package.json")),
+            root,
+            &view,
+            &mut paths,
+        );
+        assert!(paths.is_empty());
+    }
 
     /// Self-ignored policy files remain observable, so removing exclusions works.
     #[test]
