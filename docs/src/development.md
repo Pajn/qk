@@ -158,15 +158,20 @@ workflow verifies the packages before requesting its short-lived token.
 
 ### Benchmarks
 
-`tools/bench/bench.mjs` generates a workspace of 300 projects, 3,300 files
+`tools/bench/bench.mjs` generates a workspace of 300 projects, 3,600 files
 and a 3,000-package pnpm lockfile, populates the cache, and measures with
 hyperfine: `show projects`, `graph`, `show projects --affected` with no
 changes, and a fully cached `run-many`, once with every output in place and
-once with every output removed first, so all 9,300 are restored. It needs
+once with every output removed first, so all 9,300 are restored. Both cached
+runs also run with `.nxignore` enabled to exercise filesystem walking and
+ignored generated files. Watch samples measure each source edit to the callback's
+timestamp, with Git ignore rules and with `.nxignore`, including native event
+delivery, debounce, workspace reload and Node startup. Two initial samples are
+discarded; results are observations, with no timing thresholds in CI. It needs
 hyperfine, git and Node:
 
 ```sh
-node tools/bench/bench.mjs --qk target/release/qk [--projects 300] [--json out.json] [--markdown out.md]
+node tools/bench/bench.mjs --qk target/release/qk [--projects 300] [--runs 10] [--json out.json] [--markdown out.md]
 ```
 
 CI runs it on every push, writing the table to the job summary and the
