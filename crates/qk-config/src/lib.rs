@@ -142,6 +142,10 @@ pub struct Workspace {
     /// The file nx.json `extends`, workspace-relative, when it is inside the
     /// workspace.
     pub extended: Option<String>,
+    /// The resolved preset path before symlink canonicalization, when in-workspace.
+    pub extended_logical: Option<String>,
+    /// The nx.json specifier actually resolved, before local overrides are merged.
+    pub extended_specifier: Option<String>,
     /// The `nx.local.json` and `project.local.json` files merged in,
     /// workspace-relative.
     pub local_overrides: Vec<String>,
@@ -169,6 +173,7 @@ impl Workspace {
         // As in Nx, the extended file's settings are replaced, not merged, by
         // nx.json's own, and its own `extends` is not followed.
         let mut extended = None;
+        let mut extended_specifier = None;
         if let Some(Value::Object(own)) = &mut nx_json
             && let Some(specifier) = own.get("extends")
         {
@@ -176,6 +181,7 @@ impl Workspace {
                 .as_str()
                 .context("nx.json: extends must be a string")?;
             let path = extends::resolve(&root, specifier)?;
+            extended_specifier = Some(specifier.to_owned());
             let Some(Value::Object(mut base)) = read_optional_json(&path)? else {
                 bail!("cannot read {}", path.display());
             };
@@ -223,6 +229,13 @@ impl Workspace {
             packages: BTreeMap::new(),
             // Canonical, as a package manager may link the package in: keys
             // read no input through a link.
+            extended_logical: extended.as_ref().and_then(|path| {
+                path.strip_prefix(&root)
+                    .ok()?
+                    .to_str()
+                    .map(|path| path.replace('\\', "/"))
+            }),
+            extended_specifier,
             extended: extended.and_then(|path| {
                 let path = path.canonicalize().ok().map(simplified)?;
                 let relative = path.strip_prefix(&root).ok()?.to_str()?;

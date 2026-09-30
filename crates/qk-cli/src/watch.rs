@@ -61,7 +61,13 @@ impl View {
                     | ".nxignore"
                     | ".ignore"
             )
-        ) || self.workspace.extended.as_deref() == Some(path)
+        ) || self.preset_file(path)
+    }
+
+    /// Observe a preset's logical symlink path as well as its canonical target.
+    fn preset_file(&self, path: &str) -> bool {
+        self.workspace.extended.as_deref() == Some(path)
+            || self.workspace.extended_logical.as_deref() == Some(path)
     }
 
     /// Existing regular source edits keep ownership and discovery unchanged.
@@ -71,16 +77,14 @@ impl View {
         // source set. Keep reloading those workspaces on each source batch.
         if self
             .workspace
-            .config
-            .extra
-            .get("extends")
-            .is_some_and(|value| {
-                value.as_str().is_none_or(|specifier| {
-                    self.workspace.extended.is_none()
-                        || !(specifier.starts_with("./")
-                            || specifier.starts_with("../")
-                            || Path::new(specifier).is_absolute())
-                })
+            .extended_specifier
+            .as_deref()
+            .is_some_and(|specifier| {
+                self.workspace.extended.is_none()
+                    || self.workspace.extended_logical.is_none()
+                    || !(specifier.starts_with("./")
+                        || specifier.starts_with("../")
+                        || Path::new(specifier).is_absolute())
             })
         {
             return false;
@@ -355,7 +359,7 @@ fn add_event(event: Event, root: &Path, view: &View, paths: &mut BTreeSet<String
                 Some(".gitignore" | ".nxignore" | ".ignore")
             );
             let observable = !view.reserved(&relative)
-                || (view.workspace.extended.as_deref() == Some(relative.as_str())
+                || (view.preset_file(&relative)
                     && !view.generated(&relative)
                     && !relative
                         .split('/')
@@ -565,6 +569,7 @@ mod tests {
         let root = temp.path();
         std::fs::write(root.join("nx.json"), r#"{"extends":"./preset.json"}"#).unwrap();
         std::fs::write(root.join("base.json"), r#"{"marker":"old"}"#).unwrap();
+        std::fs::write(root.join(".gitignore"), "preset.json\n").unwrap();
         std::os::unix::fs::symlink("base.json", root.join("preset.json")).unwrap();
         let options = Options {
             projects: Vec::new(),
@@ -575,12 +580,63 @@ mod tests {
             command: vec!["echo changed".into()],
         };
         let before = View::load(root, &options).unwrap();
+        assert!(before.ignored("preset.json"));
         std::fs::remove_file(root.join("preset.json")).unwrap();
         std::fs::write(root.join("preset.json"), r#"{"marker":"new"}"#).unwrap();
         assert!(!before.reusable_for(&BTreeSet::from(["preset.json".into()])));
+        let mut paths = BTreeSet::new();
+        add_event(
+            Event::new(EventKind::Any).add_path(root.join("preset.json")),
+            root,
+            &before,
+            &mut paths,
+        );
+        assert!(paths.contains("preset.json"));
         let after = View::load(root, &options).unwrap();
         assert_eq!(after.workspace.config.extra["marker"], "new");
         assert!(after.control_file("preset.json"));
+    }
+
+    /// Local merging cannot hide the specifier used for package resolution.
+    #[test]
+    fn local_extends_override_cannot_enable_reuse_for_a_package_preset() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("node_modules/plain")).unwrap();
+        std::fs::create_dir(root.join("app")).unwrap();
+        for (path, text) in [
+            ("nx.json", r#"{"extends":"plain"}"#),
+            ("nx.local.json", r#"{"extends":"./unused.json"}"#),
+            ("node_modules/plain/package.json", r#"{"main":"old.json"}"#),
+            ("node_modules/plain/old.json", r#"{"marker":"old"}"#),
+            ("node_modules/plain/new.json", r#"{"marker":"new"}"#),
+            ("app/project.json", r#"{"name":"app"}"#),
+            ("app/source.txt", "one"),
+        ] {
+            std::fs::write(root.join(path), text).unwrap();
+        }
+        let options = Options {
+            projects: Vec::new(),
+            all: true,
+            include_dependencies: false,
+            initial_run: false,
+            verbose: false,
+            command: vec!["echo changed".into()],
+        };
+        let before = View::load(root, &options).unwrap();
+        assert_eq!(before.workspace.config.extra["extends"], "./unused.json");
+        assert_eq!(
+            before.workspace.extended_specifier.as_deref(),
+            Some("plain")
+        );
+        assert!(!before.reusable_for(&BTreeSet::from(["app/source.txt".into()])));
+        std::fs::write(
+            root.join("node_modules/plain/package.json"),
+            r#"{"main":"new.json"}"#,
+        )
+        .unwrap();
+        let after = View::load(root, &options).unwrap();
+        assert_eq!(after.workspace.config.extra["marker"], "new");
     }
 
     /// Self-ignored policy files remain observable, so removing exclusions works.
