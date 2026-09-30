@@ -190,7 +190,9 @@ also runs once with an empty project name, matching Nx. Quote the shell command
 so variables expand in the callback rather than in the invoking shell.
 
 Native file events are debounced and changes arriving during a callback are
-queued for the next batch. Callback failures are reported; watch continues.
+queued for the next batch. A directory event or backend rescan can include other
+eligible source files in the reported batch. Callback failures are reported;
+watch continues.
 Ctrl+C cancels callbacks and their process groups and exits with 130. Ignored
 source files, node_modules, Git/qk state, configured caches, explicit target
 outputs and warm paths do not trigger callbacks. Global files outside any
