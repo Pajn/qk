@@ -209,11 +209,18 @@ pub struct Outputs {
 
 impl Outputs {
     /// Paths from already-expanded workspace-relative patterns, each with a
-    /// fixed directory prefix, as outputs require.
+    /// fixed directory prefix, as outputs require. A pattern starting with `!`
+    /// excludes what it matches.
     pub fn from_paths(patterns: &[String]) -> Result<Self> {
         let mut compiled = Vec::new();
+        let mut negations = Vec::new();
         let mut anchors = BTreeSet::new();
         for pattern in patterns {
+            if let Some(excluded) = pattern.strip_prefix('!') {
+                validate_path(excluded)?;
+                negations.push(Pattern::new(excluded, false)?);
+                continue;
+            }
             validate_path(pattern)?;
             let anchor = pattern
                 .split('/')
@@ -228,7 +235,7 @@ impl Outputs {
         }
         Ok(Self {
             patterns: compiled,
-            negations: Vec::new(),
+            negations,
             anchors,
             explicit: true,
         })

@@ -19,7 +19,10 @@ state ever being part of a result, with a `qk:warm` key at target level
   an incremental tool finds its last build, such as `tsc --build` its
   `tsbuildinfo`.
 - `paths` are workspace scratch paths, kept beside the task's entries. They
-  are never inputs.
+  are never inputs. Like outputs, they may be globs with a fixed directory
+  prefix, and a path starting with `!` excludes what it matches from the
+  saves, such as packaged artifacts that every build rewrites; excluded
+  files are not inputs either.
 - `env` sets variables for the task, with `{projectRoot}`, `{workspaceRoot}`
   and `{warm}`, a directory qk keeps for the task in the worktree's state,
   outside the working tree. Under Nx these variables are not set, so tools

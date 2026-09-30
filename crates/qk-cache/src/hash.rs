@@ -160,7 +160,7 @@ impl Snapshot {
             let Ok(Some(warm)) = crate::warm::config(workspace, task) else {
                 continue;
             };
-            if let Ok(paths) = Outputs::from_paths(&warm.paths) {
+            if let Ok(paths) = Outputs::from_paths(&warm.kept_paths()) {
                 for anchor in paths.anchors() {
                     generated.extend(
                         under(&files, anchor)

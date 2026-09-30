@@ -135,7 +135,7 @@ An object describing reusable scratch state:
 | Field | Type | Default |
 | --- | --- | --- |
 | `outputs` | boolean | `false`; restore previous outputs before execution |
-| `paths` | array of workspace paths | Empty; `{warm}` is not allowed here |
+| `paths` | array of workspace paths and globs | Empty; `!` excludes; `{warm}` is not allowed here |
 | `env` | object of strings | Empty; supports `{warm}`, `{workspaceRoot}`, `{projectRoot}` |
 | `maxSize` | bytes or size string | No per-group limit |
 | `remote` | boolean | `true`; permit sharing warm state remotely |

@@ -139,11 +139,15 @@ pub fn config(workspace: &Workspace, task: &Task) -> Result<Option<Warm>> {
         if path.contains("{warm}") {
             bail!("qk:warm.paths are workspace paths; {{warm}} is kept already");
         }
+        let (excluded, path) = match path.strip_prefix('!') {
+            Some(path) => (true, path),
+            None => (false, path),
+        };
         let path = paths::expand(workspace, &task.project, path)?
             .trim_end_matches('/')
             .to_owned();
         paths::validate_path(&path)?;
-        paths.push(path);
+        paths.push(if excluded { format!("!{path}") } else { path });
     }
     let mut env = BTreeMap::new();
     let mut uses_directory = false;
@@ -227,6 +231,18 @@ fn directory(workspace: &Workspace, identity: &str) -> PathBuf {
         .join(&blake3::hash(identity.as_bytes()).to_hex()[..32])
 }
 
+impl Warm {
+    /// The scratch paths without their exclusions: what the task keeps,
+    /// whether or not it is saved, and so never an input.
+    pub fn kept_paths(&self) -> Vec<String> {
+        self.paths
+            .iter()
+            .filter(|path| !path.starts_with('!'))
+            .cloned()
+            .collect()
+    }
+}
+
 /// Two tasks in a run cannot keep the same scratch path, since both would
 /// write it.
 pub fn check_overlaps(workspace: &Workspace, graph: &TaskGraph) -> Result<()> {
@@ -235,7 +251,7 @@ pub fn check_overlaps(workspace: &Workspace, graph: &TaskGraph) -> Result<()> {
         let Some(warm) = config(workspace, task)? else {
             continue;
         };
-        for path in warm.paths {
+        for path in warm.kept_paths() {
             if let Some((_, other)) = claimed.iter().find(|(known, _)| {
                 known == &path
                     || known.starts_with(&format!("{path}/"))

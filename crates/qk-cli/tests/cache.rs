@@ -1341,6 +1341,24 @@ fn a_warm_group_cannot_keep_one_task_s_paths() {
 
 #[cfg(unix)]
 #[test]
+fn excluded_warm_paths_are_neither_saved_nor_inputs() {
+    let fixture = Fixture::new(json!({
+        "command": "echo $(ls scratch 2>/dev/null); mkdir -p scratch/big; echo kept > scratch/state; echo large > scratch/big/blob",
+        "cache": true,
+        "outputs": ["{projectRoot}/dist"],
+        "qk:warm": {"paths": ["{projectRoot}/scratch", "!{projectRoot}/scratch/big"]}
+    }));
+    assert_eq!(said(&fixture, &fixture.root, &[]), "");
+    // Changing what is excluded changes no key.
+    fs::write(fixture.root.join("scratch/big/blob"), "changed\n").unwrap();
+    assert!(stderr(&success(fixture.build(&fixture.root, &[]))).contains("cache hit"));
+    fs::remove_dir_all(fixture.root.join("scratch")).unwrap();
+    fs::write(fixture.root.join("src/input.txt"), "two\n").unwrap();
+    assert_eq!(said(&fixture, &fixture.root, &[]), "state");
+}
+
+#[cfg(unix)]
+#[test]
 fn local_overrides_change_the_task_and_its_key() {
     let fixture = Fixture::new(json!({
         "command": "cat src/input.txt",
