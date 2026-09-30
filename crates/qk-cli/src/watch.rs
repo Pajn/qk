@@ -38,6 +38,7 @@ struct View {
     workspace: Workspace,
     selected: BTreeSet<String>,
     files: BTreeSet<String>,
+    regular_files: BTreeSet<String>,
     outputs: Vec<qk_cache::Outputs>,
     cache: PathBuf,
     ignore: qk_cache::SourceIgnore,
@@ -66,8 +67,26 @@ impl View {
     /// Existing regular source edits keep ownership and discovery unchanged.
     /// New/deleted files, directories, symlinks and rescan requests still reload.
     fn reusable_for(&self, paths: &BTreeSet<String>) -> bool {
+        // Package/external preset resolution has inputs outside the observed
+        // source set. Keep reloading those workspaces on each source batch.
+        if self
+            .workspace
+            .config
+            .extra
+            .get("extends")
+            .is_some_and(|value| {
+                value.as_str().is_none_or(|specifier| {
+                    self.workspace.extended.is_none()
+                        || !(specifier.starts_with("./")
+                            || specifier.starts_with("../")
+                            || Path::new(specifier).is_absolute())
+                })
+            })
+        {
+            return false;
+        }
         paths.iter().all(|path| {
-            self.files.contains(path)
+            self.regular_files.contains(path)
                 && !self.control_file(path)
                 && std::fs::symlink_metadata(self.workspace.root.join(path))
                     .is_ok_and(|metadata| metadata.file_type().is_file())
@@ -126,11 +145,20 @@ impl View {
         }
         let ignore = qk_cache::SourceIgnore::new(&workspace.root)?;
         let files = qk_cache::source_files(&workspace.root)?;
+        let regular_files = files
+            .iter()
+            .filter(|path| {
+                std::fs::symlink_metadata(workspace.root.join(path))
+                    .is_ok_and(|metadata| metadata.file_type().is_file())
+            })
+            .cloned()
+            .collect();
         let cache = qk_cache::cache_location(&workspace);
         Ok(Self {
             workspace,
             selected,
             files,
+            regular_files,
             outputs,
             cache,
             ignore,
@@ -146,7 +174,12 @@ impl View {
     fn reserved(&self, path: &str) -> bool {
         path.split('/')
             .any(|part| matches!(part, ".git" | ".qk" | "node_modules"))
-            || self.workspace.root.join(path).starts_with(&self.cache)
+            || self.generated(path)
+    }
+
+    /// Explicit outputs and cache directories remain excluded even for controls.
+    fn generated(&self, path: &str) -> bool {
+        self.workspace.root.join(path).starts_with(&self.cache)
             || self.outputs.iter().any(|outputs| outputs.matches(path))
     }
 
@@ -208,6 +241,7 @@ pub fn run(workspace: &Workspace, options: Options) -> Result<i32> {
     }
     eprintln!("qk: watching {} projects", view.selected.len());
     let mut pending_paths = BTreeSet::new();
+    let mut pending_reload = false;
     while !cancelled.load(Ordering::SeqCst) {
         let first = match receiver.recv_timeout(Duration::from_millis(100)) {
             Ok(event) => watch_event(event),
@@ -215,7 +249,8 @@ pub fn run(workspace: &Workspace, options: Options) -> Result<i32> {
             Err(mpsc::RecvTimeoutError::Disconnected) => bail!("filesystem watcher stopped"),
         };
         let mut paths = std::mem::take(&mut pending_paths);
-        add_event(first, &root, &view, &mut paths);
+        let mut reload = std::mem::take(&mut pending_reload);
+        reload |= add_event(first, &root, &view, &mut paths);
         if paths.is_empty() {
             continue;
         }
@@ -227,7 +262,7 @@ pub fn run(workspace: &Workspace, options: Options) -> Result<i32> {
             match receiver.recv_timeout(Duration::from_millis(25)) {
                 Ok(event) => {
                     let before = paths.len();
-                    add_event(watch_event(event), &root, &view, &mut paths);
+                    reload |= add_event(watch_event(event), &root, &view, &mut paths);
                     if paths.len() != before {
                         deadline = Instant::now() + Duration::from_millis(150);
                     }
@@ -236,7 +271,7 @@ pub fn run(workspace: &Workspace, options: Options) -> Result<i32> {
                 Err(mpsc::RecvTimeoutError::Disconnected) => bail!("filesystem watcher stopped"),
             }
         }
-        if view.reusable_for(&paths) {
+        if !reload && view.reusable_for(&paths) {
             let files = changed_files(&view, &view, &paths);
             let projects = files.iter().filter_map(|file| view.owner(file)).collect();
             if !files.is_empty() {
@@ -250,6 +285,7 @@ pub fn run(workspace: &Workspace, options: Options) -> Result<i32> {
                 eprintln!("qk: watch configuration not reloaded: {error:#}");
                 // Retry this batch on the next event, such as a completed save.
                 pending_paths = paths;
+                pending_reload = reload;
                 continue;
             }
         };
@@ -276,6 +312,9 @@ fn changed_files(previous: &View, next: &View, paths: &BTreeSet<String>) -> BTre
                 .iter()
                 .any(|path| path.is_empty() || *file == path || Path::new(file).starts_with(path))
                 && !next.ignored(file)
+                && (next.files.contains(*file)
+                    || std::fs::symlink_metadata(next.workspace.root.join(file))
+                        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound))
                 && (previous.owner(file).is_some() || next.owner(file).is_some())
         })
         .cloned()
@@ -291,10 +330,17 @@ fn watch_event(result: notify::Result<Event>) -> Event {
 }
 
 /// Collect write/create/delete/rename events; access events cannot trigger loops.
-fn add_event(event: Event, root: &Path, view: &View, paths: &mut BTreeSet<String>) {
+fn add_event(event: Event, root: &Path, view: &View, paths: &mut BTreeSet<String>) -> bool {
     if matches!(event.kind, EventKind::Access(_)) {
-        return;
+        return false;
     }
+    let structural = matches!(
+        event.kind,
+        EventKind::Create(_)
+            | EventKind::Remove(_)
+            | EventKind::Modify(notify::event::ModifyKind::Name(_))
+    );
+    let mut reload = event.need_rescan();
     if event.need_rescan() {
         paths.insert(String::new());
     }
@@ -308,17 +354,12 @@ fn add_event(event: Event, root: &Path, view: &View, paths: &mut BTreeSet<String
                     .and_then(|name| name.to_str()),
                 Some(".gitignore" | ".nxignore" | ".ignore")
             );
-            let parent = Path::new(&relative).parent().unwrap_or(Path::new(""));
-            let known_control = view.control_file(&relative)
-                && (parent.as_os_str().is_empty()
-                    || view
-                        .workspace
-                        .projects
-                        .values()
-                        .any(|project| parent == Path::new(&project.root)));
             let observable = !view.reserved(&relative)
-                || known_control
-                || view.workspace.extended.as_deref() == Some(relative.as_str());
+                || (view.workspace.extended.as_deref() == Some(relative.as_str())
+                    && !view.generated(&relative)
+                    && !relative
+                        .split('/')
+                        .any(|part| matches!(part, ".git" | ".qk")));
             if policy && observable {
                 // Source events in this batch may have been hidden by the old policy.
                 paths.insert(String::new());
@@ -328,9 +369,11 @@ fn add_event(event: Event, root: &Path, view: &View, paths: &mut BTreeSet<String
                 && (view.control_file(&relative) || !view.ignored(&relative))
             {
                 paths.insert(relative);
+                reload |= structural;
             }
         }
     }
+    reload
 }
 
 /// Run a batch concurrently by changed project, or once when no project variable
@@ -401,7 +444,7 @@ mod tests {
         std::fs::write(root.join(".gitignore"), "*.local.json\n").unwrap();
         std::fs::write(
             root.join("app/project.json"),
-            r#"{"name":"app","targets":{"build":{"command":"echo build","outputs":["{projectRoot}/dist"]}}}"#,
+            r#"{"name":"app","targets":{"build":{"command":"echo build","outputs":["{projectRoot}/dist","{projectRoot}/.ignore"]}}}"#,
         ).unwrap();
         std::fs::write(root.join("app/source.txt"), "one").unwrap();
         let options = Options {
@@ -428,6 +471,16 @@ mod tests {
         }
         std::fs::remove_file(root.join("app/source.txt")).unwrap();
         assert!(!view.reusable_for(&batch("app/source.txt")));
+        // Structural events still reload when the final path is a known file.
+        std::fs::write(root.join("app/source.txt"), "replacement").unwrap();
+        let mut structural_paths = BTreeSet::new();
+        assert!(add_event(
+            Event::new(EventKind::Create(notify::event::CreateKind::File))
+                .add_path(root.join("app/source.txt")),
+            root,
+            &view,
+            &mut structural_paths,
+        ));
 
         let mut paths = BTreeSet::new();
         assert!(view.ignored("nx.local.json"));
@@ -455,6 +508,79 @@ mod tests {
             &mut paths,
         );
         assert!(paths.is_empty());
+        // A generated policy at the project root cannot queue an endless rescan.
+        assert!(!add_event(
+            Event::new(EventKind::Any).add_path(root.join("app/.ignore")),
+            root,
+            &view,
+            &mut paths
+        ));
+        assert!(paths.is_empty());
+    }
+
+    /// A nested exclusion is not a deletion; actual deleted sources stay reported.
+    #[test]
+    fn nested_policy_rescans_exclude_existing_files_but_keep_deletions() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir(root.join("app")).unwrap();
+        for (path, text) in [
+            ("nx.json", "{}"),
+            (".nxignore", ""),
+            ("app/project.json", r#"{"name":"app"}"#),
+            ("app/source.txt", "one"),
+            ("app/deleted.txt", "one"),
+        ] {
+            std::fs::write(root.join(path), text).unwrap();
+        }
+        let options = Options {
+            projects: Vec::new(),
+            all: true,
+            include_dependencies: false,
+            initial_run: false,
+            verbose: false,
+            command: vec!["echo changed".into()],
+        };
+        let before = View::load(root, &options).unwrap();
+        std::fs::write(root.join("app/.nxignore"), "source.txt\n").unwrap();
+        std::fs::remove_file(root.join("app/deleted.txt")).unwrap();
+        let after = View::load(root, &options).unwrap();
+        let mut paths = BTreeSet::new();
+        add_event(
+            Event::new(EventKind::Any).add_path(root.join("app/.nxignore")),
+            root,
+            &before,
+            &mut paths,
+        );
+        let files = changed_files(&before, &after, &paths);
+        assert!(!files.contains("app/source.txt"));
+        assert!(files.contains("app/deleted.txt"));
+    }
+
+    /// Replacing a logical preset symlink reloads even when the backend says Any.
+    #[cfg(unix)]
+    #[test]
+    fn replacing_a_preset_symlink_cannot_reuse_the_old_configuration() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(root.join("nx.json"), r#"{"extends":"./preset.json"}"#).unwrap();
+        std::fs::write(root.join("base.json"), r#"{"marker":"old"}"#).unwrap();
+        std::os::unix::fs::symlink("base.json", root.join("preset.json")).unwrap();
+        let options = Options {
+            projects: Vec::new(),
+            all: true,
+            include_dependencies: false,
+            initial_run: false,
+            verbose: false,
+            command: vec!["echo changed".into()],
+        };
+        let before = View::load(root, &options).unwrap();
+        std::fs::remove_file(root.join("preset.json")).unwrap();
+        std::fs::write(root.join("preset.json"), r#"{"marker":"new"}"#).unwrap();
+        assert!(!before.reusable_for(&BTreeSet::from(["preset.json".into()])));
+        let after = View::load(root, &options).unwrap();
+        assert_eq!(after.workspace.config.extra["marker"], "new");
+        assert!(after.control_file("preset.json"));
     }
 
     /// Self-ignored policy files remain observable, so removing exclusions works.
