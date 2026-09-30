@@ -202,6 +202,8 @@ pub struct Outputs {
     /// Negated patterns: what they match is never an output.
     negations: Vec<Pattern>,
     anchors: BTreeSet<String>,
+    /// Literal output roots which include their entire subtree.
+    complete: BTreeSet<String>,
     /// Whether the target declares its outputs, rather than taking Nx's
     /// defaults for a target without them.
     explicit: bool,
@@ -213,6 +215,7 @@ impl Outputs {
     pub fn from_paths(patterns: &[String]) -> Result<Self> {
         let mut compiled = Vec::new();
         let mut anchors = BTreeSet::new();
+        let mut complete = BTreeSet::new();
         for pattern in patterns {
             validate_path(pattern)?;
             let anchor = pattern
@@ -223,6 +226,9 @@ impl Outputs {
             if anchor.is_empty() {
                 bail!("{pattern:?} needs a fixed directory prefix");
             }
+            if pattern.split('/').all(crate::glob::is_literal) {
+                complete.insert(pattern.clone());
+            }
             compiled.push(Pattern::new(pattern, false)?);
             anchors.insert(anchor);
         }
@@ -230,6 +236,7 @@ impl Outputs {
             patterns: compiled,
             negations: Vec::new(),
             anchors,
+            complete,
             explicit: true,
         })
     }
@@ -246,6 +253,11 @@ impl Outputs {
                 .iter()
                 .map(|pattern| (*pattern).to_owned())
                 .collect(),
+            complete: patterns
+                .iter()
+                .filter(|pattern| pattern.split('/').all(crate::glob::is_literal))
+                .map(|pattern| (*pattern).to_owned())
+                .collect(),
             negations: Vec::new(),
             explicit: true,
         }
@@ -257,6 +269,7 @@ impl Outputs {
         let mut patterns = Vec::new();
         let mut negations = Vec::new();
         let mut anchors = BTreeSet::new();
+        let mut complete = BTreeSet::new();
         for output in resolved {
             let (negated, pattern) = match output.strip_prefix('!') {
                 Some(rest) => (true, rest.to_owned()),
@@ -282,6 +295,9 @@ impl Outputs {
                     "cache outputs must have a fixed directory prefix and cannot replace a project root"
                 );
             }
+            if pattern.split('/').all(crate::glob::is_literal) {
+                complete.insert(pattern.clone());
+            }
             patterns.push(Pattern::new(&pattern, false)?);
             anchors.insert(anchor);
         }
@@ -289,6 +305,7 @@ impl Outputs {
             patterns,
             negations,
             anchors,
+            complete,
             explicit,
         })
     }
@@ -308,6 +325,24 @@ impl Outputs {
     /// Fixed directory prefixes; every matching path lies below one of them.
     pub fn anchors(&self) -> impl Iterator<Item = &str> {
         self.anchors.iter().map(String::as_str)
+    }
+
+    /// Complete literal roots only: globs, implicit defaults and any exclusion
+    /// retain per-artifact restoration. Nested roots are handled by their parent.
+    pub(crate) fn complete_roots(&self) -> Vec<&str> {
+        if !self.explicit || !self.negations.is_empty() {
+            return Vec::new();
+        }
+        let mut roots: Vec<&str> = Vec::new();
+        for root in &self.complete {
+            if !roots.iter().any(|parent| {
+                root.strip_prefix(parent)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+            }) {
+                roots.push(root);
+            }
+        }
+        roots
     }
 
     pub fn matches(&self, path: &str) -> bool {
@@ -455,7 +490,27 @@ fn resolve_output(
 
 #[cfg(test)]
 mod tests {
-    use super::normalize;
+    use super::{Outputs, Pattern, normalize};
+
+    /// Only unconditional literal output roots may move as complete trees.
+    #[test]
+    fn complete_roots_do_not_widen_globs_exclusions_or_defaults() {
+        let mut outputs = Outputs::from_paths(&[
+            "dist".into(),
+            "dist/nested".into(),
+            "dist2".into(),
+            "partial/**/*.js".into(),
+        ])
+        .unwrap();
+        assert_eq!(outputs.complete_roots(), ["dist", "dist2"]);
+        outputs
+            .negations
+            .push(Pattern::new("dist/private", false).unwrap());
+        assert!(outputs.complete_roots().is_empty());
+        outputs.negations.clear();
+        outputs.explicit = false;
+        assert!(outputs.complete_roots().is_empty());
+    }
 
     #[test]
     fn normalizes_relative_segments() {
