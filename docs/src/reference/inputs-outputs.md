@@ -44,8 +44,8 @@ Supported declarations:
 As in Nx, a named input cannot use `dependencies` or `projects`. With a
 package manager other than pnpm, lockfiles are always keyed by content.
 `runtime` commands run once per run for each environment.
-`dependentTasksOutputFiles` needs no file access: every dependency's
-fingerprint already covers its declared outputs. `.` and `..` segments in
+`dependentTasksOutputFiles` selects matching files from completed dependency
+outputs rather than their full output fingerprints. `.` and `..` segments in
 paths are resolved within the workspace. A symlinked input is keyed by its
 target text and the content it resolves to, including the files below a
 linked directory; links that resolve outside the workspace are not supported.
@@ -73,8 +73,11 @@ The task's root/project/transitive importer installations are already keyed.
 ### `dependentTasksOutputFiles`
 
 `{"dependentTasksOutputFiles": "**/*.d.ts", "transitive": true}` is
-supported without additional file access: dependency fingerprints already
-cover their declared outputs.
+selects matching files from declared outputs of direct task dependencies.
+`transitive: true` also includes outputs of their dependencies. Other artifacts
+do not change this input's fingerprint. Multiple patterns are combined. Without
+an output input declaration, qk retains its normal dependency fingerprints.
+Dependencies that cannot be fingerprinted still make the consumer run uncached.
 
 ### `workingDirectory`
 

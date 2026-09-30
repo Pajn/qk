@@ -264,6 +264,12 @@ impl Cache {
             Ok(snapshot) => snapshot,
             Err(reason) => return bypass(reason),
         };
+        let dependencies =
+            match hash::dependency_keys(snapshot, workspace, graph, task, &dependencies, cancelled)
+            {
+                Ok(dependencies) => dependencies,
+                Err(error) => return bypass(format!("{error:#}")),
+            };
         let (key, inputs) = match hash::inputs(
             snapshot,
             workspace,

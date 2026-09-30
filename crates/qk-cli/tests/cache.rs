@@ -17,6 +17,12 @@ fn process_helper() {
         .unwrap_or(0);
     fs::write(&counter, (runs + 1).to_string()).unwrap();
     let input = fs::read_to_string("src/input.txt").unwrap();
+    if mode == "generate-types" {
+        fs::create_dir_all("types").unwrap();
+        fs::write("types/value.d.ts", input.lines().next().unwrap_or_default()).unwrap();
+        fs::write("types/value.js", &input).unwrap();
+        return;
+    }
     if mode == "generate" {
         fs::create_dir_all("generated").unwrap();
         fs::write("generated/value.txt", format!("generated:{input}")).unwrap();
@@ -1706,4 +1712,52 @@ fn negated_groups_in_inputs_leave_out_what_they_name() {
     assert!(hit(&fixture));
     fs::write(fixture.root.join("src/app.ts"), "changed app").unwrap();
     assert!(!hit(&fixture));
+}
+
+/// Output patterns ignore unrelated artifacts and optionally reach transitive tasks.
+#[test]
+fn dependency_output_inputs_hash_only_matching_artifacts() {
+    for (through_middle, transitive) in [(false, false), (true, false), (true, true)] {
+        let producer = target(
+            "generate-types",
+            json!({"outputs":["{projectRoot}/types"],"inputs":["{projectRoot}/src/**/*"]}),
+        );
+        let consumer = target(
+            "build",
+            json!({"inputs":[{"dependentTasksOutputFiles":"**/*.d.ts","transitive":transitive}],
+            "dependsOn":[if through_middle {"middle"} else {"types"}]}),
+        );
+        let fixture = Fixture::with_targets(json!({"types":producer,
+            "middle":{"executor":"nx:noop","cache":true,"inputs":[],"outputs":[],"dependsOn":["types"]},
+            "build":consumer}));
+        fs::write(
+            fixture.root.join("src/input.txt"),
+            "declaration\nimplementation one",
+        )
+        .unwrap();
+        success(fixture.build(&fixture.root, &[]));
+        fs::write(
+            fixture.root.join("src/input.txt"),
+            "declaration\nimplementation two",
+        )
+        .unwrap();
+        let output = success(fixture.build(&fixture.root, &[]));
+        assert!(
+            stderr(&output).contains("qk: cache hit app:build"),
+            "{}",
+            stderr(&output)
+        );
+        fs::write(
+            fixture.root.join("src/input.txt"),
+            "new declaration\nimplementation two",
+        )
+        .unwrap();
+        let output = success(fixture.build(&fixture.root, &[]));
+        let expected = if through_middle && !transitive {
+            "qk: cache hit app:build"
+        } else {
+            "qk: cache miss app:build"
+        };
+        assert!(stderr(&output).contains(expected), "{}", stderr(&output));
+    }
 }

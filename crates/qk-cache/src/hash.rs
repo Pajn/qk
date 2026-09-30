@@ -715,13 +715,16 @@ impl Resolver<'_> {
                     .map(|value| value.as_bool().context("transitive must be boolean"))
                     .transpose()?
                     .unwrap_or(false);
-                // The key already contains every dependency's fingerprint, which covers
-                // all of its declared outputs and, through its own key, those of its
-                // dependencies. Hashing matching output files again adds nothing.
-                self.values.insert(
-                    format!("dependentTasksOutputFiles:{pattern}"),
-                    json!(transitive),
-                );
+                // Resolved before execution too, so inspection can display the
+                // selection without reading generated files. dependency_keys
+                // hashes these files after the dependencies finish.
+                let value = self
+                    .values
+                    .entry(format!("dependentTasksOutputFiles:{pattern}"))
+                    .or_insert(json!(false));
+                if transitive {
+                    *value = json!(true);
+                }
             }
             Value::Object(object)
                 if object.len() == 1 && object.contains_key("externalDependencies") =>
@@ -1096,4 +1099,55 @@ pub fn fingerprint(
         dependencies,
         cancelled,
     )?)
+}
+
+/// Use selected dependency artifacts when output inputs are declared; otherwise
+/// preserve the normal dependency fingerprints. All dependencies must have
+/// succeeded and be fingerprintable before this selection is applied.
+pub(crate) fn dependency_keys(
+    snapshot: &Snapshot,
+    workspace: &Workspace,
+    graph: &TaskGraph,
+    task: &Task,
+    dependencies: &BTreeMap<String, String>,
+    cancelled: &AtomicBool,
+) -> Result<BTreeMap<String, String>> {
+    let resolved = resolve(snapshot, workspace, task, None, cancelled)?;
+    let selections: Vec<_> = resolved
+        .values
+        .iter()
+        .filter_map(|(name, transitive)| {
+            name.strip_prefix("dependentTasksOutputFiles:")
+                .map(|pattern| (pattern, transitive == &json!(true)))
+        })
+        .collect();
+    if selections.is_empty() {
+        return Ok(dependencies.clone());
+    }
+    let mut keys = BTreeMap::new();
+    for (pattern, transitive) in selections {
+        let matcher = snapshot.pattern(pattern, false)?;
+        let mut selected = task.dependencies.clone();
+        if transitive {
+            let mut pending = selected.clone();
+            while let Some(id) = pending.pop_first() {
+                for dependency in &graph.tasks[&id].dependencies {
+                    if selected.insert(dependency.clone()) {
+                        pending.insert(dependency.clone());
+                    }
+                }
+            }
+        }
+        for id in selected {
+            let outputs = Outputs::new(workspace, &graph.tasks[&id])?;
+            let mut files = BTreeMap::new();
+            for path in outputs.paths(&workspace.root)? {
+                if matcher.is_match(&path) {
+                    files.insert(path.clone(), snapshot.file_value(&workspace.root, &path)?);
+                }
+            }
+            keys.insert(format!("{id}:{pattern}"), key(&json!(files))?);
+        }
+    }
+    Ok(keys)
 }
