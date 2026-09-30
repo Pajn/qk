@@ -10,6 +10,7 @@
 | `qk graph --file <path>` | Workspace project graph in a `{ "graph": { "nodes": ..., "dependencies": ... } }` envelope |
 | `qk graph` or `qk graph --file -` | The same graph on stdout |
 | `qk graph --external` | The graph with the packages the pnpm lockfile installs as `externalNodes` |
+| `qk graph --focus web --exclude 'tag:e2e'` | Only `web`, what it depends on and what depends on it, minus exclusions |
 | `qk run <project>:<target>[:<configuration>]` | Execute a task and its dependencies |
 | `qk <target> [project]`, `qk <project>:<target>` | Nx-style shorthand for `qk run` |
 | `qk run-many -t build,test -p 'web,core' --parallel 4` | Execute matching targets with bounded task concurrency |
@@ -35,6 +36,13 @@ project contains the directory, `NX_DEFAULT_PROJECT`, then nx.json
 subcommands, and Nx commands qk does not implement such as `format` and
 `release`, are never read as targets; use `qk run` for a target
 with one of those names.
+
+As in `nx graph`, `--focus` keeps the project and every project connected to
+it through dependencies in either direction, and `--exclude` takes names, globs
+and tags. The kept projects' edges are unchanged, so they can name projects
+left out. `--print` and `--file stdout` write to stdout. qk has no browser
+view, so `nx graph`'s `--affected`, `--view` and server options do not apply;
+for a task graph, use `qk run-many -t <targets> --graph`.
 
 `--workspace <path>` works before or after the subcommand. Graph output paths
 are relative to the invocation directory; their parent directories must
