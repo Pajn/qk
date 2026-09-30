@@ -214,21 +214,26 @@ impl Cache {
                 running.execution.insert(name.into(), value.into());
             }
         }
-        let before = || -> Option<warm::Restored> {
-            let warm = warm.as_ref()?;
+        // What was restored, and which groups were on disk already.
+        let before = || -> (Option<warm::Restored>, Vec<String>) {
+            let Some(warm) = warm.as_ref() else {
+                return (None, Vec::new());
+            };
             match self
                 .initialize()
                 .and_then(|()| self.restore_warm(workspace, task, warm))
             {
-                Ok(restored) => (!restored.groups.is_empty()).then_some(restored),
+                Ok((restored, present)) => {
+                    ((!restored.groups.is_empty()).then_some(restored), present)
+                }
                 Err(error) => {
                     qk_executor::status!("qk: {}: warm state not restored ({error:#})", task.id);
-                    None
+                    (None, Vec::new())
                 }
             }
         };
         let after = |outcome: Outcome,
-                     restored: Option<warm::Restored>|
+                     (restored, present): (Option<warm::Restored>, Vec<String>)|
          -> Option<warm::WarmReport> {
             let warm = warm.as_ref()?;
             let started = std::time::Instant::now();
@@ -254,6 +259,7 @@ impl Cache {
             };
             Some(warm::WarmReport {
                 restored,
+                present,
                 save_ms,
                 background,
             })

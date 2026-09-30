@@ -548,6 +548,9 @@ pub struct Restored {
 pub struct WarmReport {
     /// What was restored before the run, if anything.
     pub restored: Option<Restored>,
+    /// The groups already on disk before the run, which were left as they were.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub present: Vec<String>,
     /// How long saving it after the run took, when it was saved before the
     /// task reported.
     pub save_ms: Option<u64>,
@@ -903,28 +906,37 @@ impl Cache {
         workspace: &Workspace,
         task: &Task,
         warm: &Warm,
-    ) -> Result<Restored> {
+    ) -> Result<(Restored, Vec<String>)> {
         let mut restored = Restored::default();
         let _lock = self.lock_warm(warm)?;
+        // Local state wins: it is the newest for this checkout.
+        let mut present = Vec::new();
+        let mut missing = Vec::new();
+        for location in locations(workspace, task, warm)? {
+            if location.paths()?.is_empty() {
+                missing.push(location);
+            } else {
+                present.push(location.name.to_owned());
+            }
+        }
+        if missing.is_empty() {
+            return Ok((restored, present));
+        }
         let current = key_digests(workspace, warm)?;
         let (record, source) = match self.choose_warm(workspace, warm, &current) {
             Some(chosen) => chosen,
             None => match self.remote_warm(workspace, task, warm, &current) {
                 Some((record, branch)) => (record, format!("remote {branch}")),
-                None => return Ok(restored),
+                None => return Ok((restored, present)),
             },
         };
         let keep_mtimes = warm.preserve_mtimes && source == "local";
         restored.source = source;
         let mut noted = read_restored_files(workspace, warm);
-        for location in locations(workspace, task, warm)? {
+        for location in missing {
             let Some(group) = record.groups.get(location.name) else {
                 continue;
             };
-            // Local state wins: it is the newest for this checkout.
-            if !location.paths()?.is_empty() {
-                continue;
-            }
             fs::create_dir_all(&location.base)?;
             let mut files = BTreeMap::new();
             for (path, artifact) in &group.artifacts {
@@ -983,7 +995,7 @@ impl Cache {
             fs::create_dir_all(path.parent().context("restore notes have a directory")?)?;
             fs::write(path, serde_json::to_vec(&noted)?)?;
         }
-        Ok(restored)
+        Ok((restored, present))
     }
 
     /// The task's warm state from the remote store: the current branch's, else

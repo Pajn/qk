@@ -1463,6 +1463,26 @@ fn a_background_save_finishes_before_the_run_does() {
 
 #[cfg(unix)]
 #[test]
+fn show_task_compares_runs_from_warm_state_with_runs_without() {
+    let fixture = Fixture::new(scratch_target(json!({"paths": ["{projectRoot}/scratch"]})));
+    assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
+    let text = stdout(&success(
+        fixture.qk(&fixture.root, &["show", "task", "app:build"]),
+    ));
+    assert!(!text.contains("From warm state"), "{text}");
+    // On disk already, which counts as warm as much as a restore does.
+    assert_eq!(said(&fixture, &fixture.root, &[]), "repo");
+    let text = stdout(&success(
+        fixture.qk(&fixture.root, &["show", "task", "app:build"]),
+    ));
+    assert!(
+        text.contains("From warm state it took ") && text.contains(" over 1 run; without, "),
+        "{text}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn local_overrides_change_the_task_and_its_key() {
     let fixture = Fixture::new(json!({
         "command": "cat src/input.txt",
