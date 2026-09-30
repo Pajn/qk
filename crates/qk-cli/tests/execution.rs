@@ -1,6 +1,5 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
 use std::process::Stdio;
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
@@ -68,9 +67,48 @@ fn process_helper() {
     let Ok(mode) = std::env::var("QK_TEST_MODE") else {
         return;
     };
+    #[cfg(windows)]
+    if mode == "signal-watch" {
+        signal_windows_watch(std::env::var("QK_WATCH_PID").unwrap().parse().unwrap());
+        return;
+    }
     let id = std::env::var("QK_TEST_ID").unwrap();
     let root = std::env::current_dir().unwrap();
     match mode.as_str() {
+        "watch-portable" => {
+            let records = PathBuf::from(std::env::var("QK_WATCH_RECORDS").unwrap());
+            let n = fs::read_dir(&records)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "json")
+                })
+                .count()
+                + 1;
+            fs::write(
+                records.join(format!("{n}.tmp")),
+                json!({
+                    "project":std::env::var("NX_PROJECT_NAME").unwrap(),
+                    "files":std::env::var("NX_FILE_CHANGES").unwrap()
+                })
+                .to_string(),
+            )
+            .unwrap();
+            fs::rename(
+                records.join(format!("{n}.tmp")),
+                records.join(format!("{n}.json")),
+            )
+            .unwrap();
+            let mut ticks = 0;
+            while !records.join(format!("release-{n}")).exists() {
+                ticks += 1;
+                fs::write(records.join(format!("{n}.tick")), ticks.to_string()).unwrap();
+                std::thread::sleep(Duration::from_millis(30));
+            }
+        }
         "diamond" => {
             let dependencies: &[&str] = match id.as_str() {
                 "shared" => &[],
@@ -1727,24 +1765,26 @@ fn watch_runs_callbacks_for_project_changes_and_cancels() {
 }
 
 /// Always reap a watcher, including when an assertion fails.
-#[cfg(unix)]
 struct WatchChild(std::process::Child);
-#[cfg(unix)]
 impl std::ops::Deref for WatchChild {
     type Target = std::process::Child;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
-#[cfg(unix)]
 impl std::ops::DerefMut for WatchChild {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
-#[cfg(unix)]
 impl Drop for WatchChild {
     fn drop(&mut self) {
+        #[cfg(windows)]
+        if self.0.try_wait().ok().flatten().is_none() {
+            let _ = Command::new("taskkill")
+                .args(["/PID", &self.0.id().to_string(), "/T", "/F"])
+                .output();
+        }
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
@@ -1812,4 +1852,133 @@ fn watch_all_discovers_projects_and_queues_changes() {
         .unwrap();
     assert_eq!(child.wait().unwrap().code(), Some(130));
     reader.join().unwrap();
+}
+
+/// Exercise queued callbacks and cancellation while a callback runs on every OS.
+#[test]
+fn watch_portable_queues_changes_ignores_files_and_cancels_callback() {
+    use std::io::{BufRead, BufReader};
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("workspace");
+    fs::create_dir_all(root.join("app")).unwrap();
+    fs::write(root.join("nx.json"), "{}").unwrap();
+    fs::write(root.join(".nxignore"), "app/ignored.txt\n").unwrap();
+    fs::write(root.join("app/project.json"), r#"{"name":"app"}"#).unwrap();
+    fs::write(root.join("app/first.txt"), "one").unwrap();
+    fs::write(root.join("app/second.txt"), "one").unwrap();
+    let records = temp.path().join("records");
+    fs::create_dir_all(&records).unwrap();
+    // The libtest skip argument mentions the project variable for watch selection.
+    let callback = format!("{} --skip NX_PROJECT_NAME", helper());
+    let mut cmd = command(&root, &["watch", "--all", "--", &callback]);
+    cmd.env("QK_TEST_MODE", "watch-portable")
+        .env("QK_TEST_ID", "watch")
+        .env("QK_WATCH_RECORDS", &records)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // Isolate Ctrl+C from the test runner and other parallel test processes.
+        cmd.creation_flags(0x00000010); // CREATE_NEW_CONSOLE
+    }
+    let mut child = WatchChild(cmd.spawn().unwrap());
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let stderr = child.stderr.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            let _ = sender.send(line.unwrap());
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !receiver
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .unwrap()
+        .contains("qk: watching")
+    {}
+    fs::write(root.join("app/ignored.txt"), "ignored").unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !records.join("1.json").exists(),
+        "ignored file caused a callback"
+    );
+    fs::write(root.join("app/first.txt"), "two").unwrap();
+    wait_for(&records.join("1.json"));
+    let first: Value = serde_json::from_slice(&fs::read(records.join("1.json")).unwrap()).unwrap();
+    assert_eq!(first["project"], "app");
+    assert_eq!(first["files"], "app/first.txt");
+    fs::write(root.join("app/second.txt"), "two").unwrap();
+    fs::write(records.join("release-1"), "release").unwrap();
+    wait_for(&records.join("2.json"));
+    wait_for(&records.join("2.tick"));
+    let queued: Value = serde_json::from_slice(&fs::read(records.join("2.json")).unwrap()).unwrap();
+    assert_eq!(queued["project"], "app");
+    assert_eq!(queued["files"], "app/second.txt");
+    #[cfg(unix)]
+    assert!(
+        Command::new("kill")
+            .args(["-INT", &child.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    #[cfg(windows)]
+    success(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "process_helper", "--nocapture"])
+            .env("QK_TEST_MODE", "signal-watch")
+            .env("QK_WATCH_PID", child.id().to_string())
+            .output()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "watch did not stop on Ctrl+C");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(status.code(), Some(130));
+    let ticks = fs::read(records.join("2.tick")).unwrap();
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(
+        fs::read(records.join("2.tick")).unwrap(),
+        ticks,
+        "callback survived cancellation"
+    );
+    reader.join().unwrap();
+}
+
+/// Send Ctrl+C only to the watcher's private console from an isolated helper.
+#[cfg(windows)]
+fn signal_windows_watch(pid: u32) {
+    #[link(name = "Kernel32")]
+    unsafe extern "system" {
+        fn FreeConsole() -> i32;
+        fn AttachConsole(pid: u32) -> i32;
+        fn SetConsoleCtrlHandler(
+            handler: Option<unsafe extern "system" fn(u32) -> i32>,
+            add: i32,
+        ) -> i32;
+        fn GenerateConsoleCtrlEvent(event: u32, group: u32) -> i32;
+    }
+    unsafe extern "system" fn ignore_signal(_: u32) -> i32 {
+        1
+    }
+    unsafe {
+        FreeConsole();
+        assert_ne!(AttachConsole(pid), 0, "{}", std::io::Error::last_os_error());
+        assert_ne!(SetConsoleCtrlHandler(Some(ignore_signal), 1), 0);
+        assert_ne!(
+            GenerateConsoleCtrlEvent(0, 0),
+            0,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    unsafe {
+        FreeConsole();
+    }
 }
