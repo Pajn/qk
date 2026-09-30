@@ -484,3 +484,169 @@ fn show_projects_filters_by_type_and_target_like_nx() {
             .success()
     );
 }
+
+/// Inspection resolves configurations and memberships without executing runtime inputs.
+#[test]
+fn inspects_targets_inputs_and_outputs_without_running_commands() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    std::fs::write(
+        root.join("nx.json"),
+        r#"{"namedInputs":{"source":["{projectRoot}/src/**/*"]}}"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("dist")).unwrap();
+    std::fs::write(root.join("src/a.ts"), "source").unwrap();
+    std::fs::write(root.join("dist/a.js"), "output").unwrap();
+    std::fs::write(root.join("project.json"), json!({"name":"app", "targets":{
+        "build":{"command":"echo never", "inputs":["source",{"env":"FOO"},{"runtime":"echo ran > runtime-ran"}],
+            "outputs":["{projectRoot}/dist", "{options.missing}"],
+            "configurations":{"release":{"command":"echo release"}}}
+    }}).to_string()).unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_qk"))
+            .current_dir(root)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let target = successful_json(run(&[
+        "show",
+        "target",
+        "app:build",
+        "-c",
+        "release",
+        "--json",
+    ]));
+    assert_eq!(target["options"]["command"], "echo release");
+    let inputs = successful_json(run(&["show", "target", "inputs", "build", "--json"]));
+    assert!(
+        inputs["files"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("src/a.ts"))
+    );
+    assert_eq!(inputs["environment"], json!(["FOO"]));
+    assert_eq!(inputs["runtime"], json!(["echo ran > runtime-ran"]));
+    assert!(!root.join("runtime-ran").exists());
+    assert!(
+        run(&[
+            "show",
+            "target",
+            "inputs",
+            "app:build",
+            "--check",
+            "src",
+            "FOO",
+            ".",
+            "./"
+        ])
+        .status
+        .success()
+    );
+    assert!(
+        !run(&["show", "target", "inputs", "app:build", "--check", "absent"])
+            .status
+            .success()
+    );
+    let outputs = successful_json(run(&["show", "target", "outputs", "app:build", "--json"]));
+    assert!(
+        outputs["expandedOutputs"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("dist/a.js"))
+    );
+    assert_eq!(outputs["unresolvedOutputs"], json!(["{options.missing}"]));
+    assert!(
+        run(&[
+            "show",
+            "target",
+            "outputs",
+            "app:build",
+            "--check",
+            "dist/future.js"
+        ])
+        .status
+        .success()
+    );
+    assert!(
+        !run(&[
+            "show",
+            "target",
+            "outputs",
+            "app:build",
+            "--check",
+            "src/a.ts"
+        ])
+        .status
+        .success()
+    );
+}
+
+/// Stdin file selection preserves spaces and treats empty input as no changes.
+#[test]
+fn affected_reads_changed_paths_from_stdin() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    std::fs::write(root.join("nx.json"), "{}").unwrap();
+    std::fs::create_dir_all(root.join("app/src")).unwrap();
+    std::fs::write(
+        root.join("app/project.json"),
+        r#"{"name":"app","targets":{"build":{"executor":"nx:noop"}}}"#,
+    )
+    .unwrap();
+    std::fs::write(root.join("app/src/a file.ts"), "source").unwrap();
+    let run = |args: &[&str], input: &str| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_qk"))
+            .current_dir(root)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+    assert_eq!(
+        successful_json(run(
+            &["show", "projects", "--stdin", "--json"],
+            "app/src/a file.ts\r\n\n"
+        )),
+        json!(["app"])
+    );
+    assert_eq!(
+        successful_json(run(&["show", "projects", "--stdin", "--json"], "")),
+        json!([])
+    );
+    assert!(
+        run(
+            &["affected", "-t", "build", "--stdin"],
+            "app/src/a file.ts\n"
+        )
+        .status
+        .success()
+    );
+    assert!(
+        !run(
+            &[
+                "show",
+                "projects",
+                "--stdin",
+                "--files",
+                "app/src/a file.ts"
+            ],
+            ""
+        )
+        .status
+        .success()
+    );
+}

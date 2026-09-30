@@ -114,10 +114,12 @@ rounded down with a minimum of one task. `--skip-nx-cache` and
 | `--base <revision>` | Base: `NX_BASE`, then `defaultBase`, then `main` |
 | `--head <revision>` | Head: `NX_HEAD`, otherwise working tree |
 | `--files <paths>` | Replace Git comparison with named workspace-relative paths |
+| `--stdin` | Read changed workspace-relative paths from stdin, one per line; an empty list means no changes |
 | `--uncommitted` | Only uncommitted changes |
 | `--untracked` | Only untracked files |
 
-`show projects` change options imply `--affected`. For `show tasks`, use
+`show projects` change options imply `--affected`. `--stdin` preserves spaces
+in paths and conflicts with `--files`, `--uncommitted` and `--untracked`. For `show tasks`, use
 `--affected` to filter the planned tasks. `affected --granularity task`
 selects by task inputs; `project` is the default.
 See [Affected selection](../guides/affected.md) for merge-base behavior.
@@ -152,3 +154,44 @@ effect.
 `--runner`, `--batch`, `--skip-sync`, `--cloud`, `--no-cloud`, `--dte`,
 `--no-dte`, `--agents`, `--tui`, and `--tui-auto-exit` are accepted without
 effect. They do not enable Nx plugins, distributed execution or Nx Cloud.
+
+## Target inspection
+
+`qk show target <project:target[:configuration]> --json` shows the resolved
+executor, options, caching and concurrency settings, and task dependencies.
+`-c <configuration>` selects a configuration. A target name without a project
+uses the current project, as `run` does.
+
+`qk show target inputs <target> --json` lists files and declared environment,
+runtime and dependency-output inputs. `qk show target outputs <target> --json`
+lists resolved output patterns, existing output paths and unresolved templates.
+Without `--json`, inputs and outputs print one entry per line. Inspection does
+not load dotenv files, execute runtime inputs or require a supported executor.
+The listed inputs include qk's mandatory workspace and package configuration
+files; these can differ from Nx's hash plan.
+
+Both input and output commands accept `--check <values...>`. File and directory
+queries use workspace-relative paths. Inputs also accept declared environment
+variable names and runtime commands. The command exits with 1 if any query does
+not match. `--json` returns each query and its membership result.
+
+## Project watch
+
+`qk watch -p web --includeDependencies -- <shell command>` watches the selected
+projects and, optionally, their project dependencies. `--all` watches all projects,
+including projects created after watch starts. `--initialRun` runs once before
+waiting for edits. The kebab-case aliases also work.
+
+Callbacks run from the invocation directory with `NX_PROJECT_NAME` and
+`NX_FILE_CHANGES` (workspace-relative paths joined with spaces). If the command
+mentions `NX_PROJECT_NAME`, a batch runs concurrently once per changed project;
+otherwise it runs once for the batch with an empty project name. Initial `--all`
+also runs once with an empty project name, matching Nx. Quote the shell command
+so variables expand in the callback rather than in the invoking shell.
+
+Native file events are debounced and changes arriving during a callback are
+queued for the next batch. Callback failures are reported; watch continues.
+Ctrl+C cancels callbacks and their process groups and exits with 130. Ignored
+source files, node_modules, Git/qk state, configured caches, explicit target
+outputs and warm paths do not trigger callbacks. Global files outside any
+selected project do not trigger callbacks. Watch uses no daemon or Nx plugins.

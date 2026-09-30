@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 
 pub use evict::{Pruned, max_size, parse_size, prune};
 pub use glob::Pattern;
-pub use hash::{Resolved, without_resolution};
+pub use hash::{Resolved, source_files, without_resolution};
 pub use paths::{
     Outputs, cache_directory, cache_location, clear_worktree_state, resolved_outputs,
     worktree_state,
@@ -264,6 +264,12 @@ impl Cache {
             Ok(snapshot) => snapshot,
             Err(reason) => return bypass(reason),
         };
+        let dependencies =
+            match hash::dependency_keys(snapshot, workspace, graph, task, &dependencies, cancelled)
+            {
+                Ok(dependencies) => dependencies,
+                Err(error) => return bypass(format!("{error:#}")),
+            };
         let (key, inputs) = match hash::inputs(
             snapshot,
             workspace,

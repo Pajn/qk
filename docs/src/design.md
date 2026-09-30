@@ -181,3 +181,14 @@ CI. Compatibility checks remain useful after a feature ships.
   of result caching.
 - Keep bootstrapping independent of qk's own task graph: Cargo builds the
   runner, and installation must work before workspace tasks can execute.
+
+## Bounded project watching
+
+Project watching uses native filesystem events and the explicit project graph.
+It selects projects and optional dependency closures, refreshes discovery when
+files change, debounces event bursts, and queues edits while callbacks execute.
+Callbacks use the invocation directory and Nx's project/file-change environment
+variables. Cancellation uses the executor's process-group cleanup. It does not
+run plugins, sync generators or a daemon. Declared outputs, warm paths and runner
+state are excluded to prevent feedback loops. Tests cover dependency selection,
+new project discovery, queued changes and cancellation.

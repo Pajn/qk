@@ -17,6 +17,7 @@ walkdir = "2"
 clap = { version = "4", features = ["derive", "env"] }
 command-group = "5"
 ctrlc = { version = "3", features = ["termination"] }
+notify = "8.2"
 dotenvy = "0.15"
 libc = "0.2"
 shlex = "2"

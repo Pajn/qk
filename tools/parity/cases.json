@@ -119,5 +119,52 @@
         "lint"
       ]
     }
+  },
+  "inspections": {
+    "target-config": {
+      "args": [
+        "show",
+        "target",
+        "web:typecheck-app",
+        "--json"
+      ],
+      "fields": [
+        "project",
+        "target",
+        "executor",
+        "cache",
+        "continuous",
+        "parallelism"
+      ]
+    },
+    "target-outputs": {
+      "args": [
+        "show",
+        "target",
+        "outputs",
+        "web:build",
+        "--json"
+      ],
+      "fields": [
+        "project",
+        "target",
+        "outputPaths"
+      ]
+    },
+    "target-input-values": {
+      "args": [
+        "show",
+        "target",
+        "inputs",
+        "web:typecheck-app",
+        "--json"
+      ],
+      "fields": [
+        "project",
+        "target",
+        "environment",
+        "runtime"
+      ]
+    }
   }
 }

@@ -1,0 +1,10 @@
+{
+  "project": "web",
+  "target": "typecheck-app",
+  "environment": [
+    "TYPECHECK_MODE"
+  ],
+  "runtime": [
+    "node --version"
+  ]
+}

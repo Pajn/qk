@@ -1,6 +1,8 @@
 mod explain;
 mod history;
+mod inspect;
 mod ui;
+mod watch;
 
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -89,6 +91,11 @@ enum Command {
         exclude: Vec<String>,
         #[command(flatten)]
         options: RunOptions,
+    },
+    /// Watch selected projects and run a command when their files change.
+    Watch {
+        #[command(flatten)]
+        options: watch::Options,
     },
     /// Remove the cache and this worktree's state, as `nx reset` does. Run
     /// history is kept.
@@ -212,6 +219,9 @@ struct ChangeOptions {
     /// Treat exactly these workspace-relative files as changed.
     #[arg(long, value_delimiter = ',', num_args = 1..)]
     files: Vec<String>,
+    /// Read changed workspace-relative paths from stdin, one per line.
+    #[arg(long, conflicts_with_all = ["files", "uncommitted", "untracked"])]
+    stdin: bool,
     /// Only uncommitted changes.
     #[arg(long)]
     uncommitted: bool,
@@ -221,10 +231,26 @@ struct ChangeOptions {
 }
 
 impl ChangeOptions {
+    /// Read the explicit file list once, preserving spaces in paths and empty lists.
+    fn read_stdin(&mut self) -> Result<()> {
+        if self.stdin {
+            use std::io::BufRead;
+            self.files = io::stdin()
+                .lock()
+                .lines()
+                .collect::<std::io::Result<Vec<_>>>()?
+                .into_iter()
+                .filter(|line| !line.is_empty())
+                .collect();
+        }
+        Ok(())
+    }
+
     /// Whether any change option was given.
     fn given(&self) -> bool {
         self.base.is_some()
             || self.head.is_some()
+            || self.stdin
             || !self.files.is_empty()
             || self.uncommitted
             || self.untracked
@@ -235,6 +261,7 @@ impl ChangeOptions {
             base: self.base.clone(),
             head: self.head.clone(),
             files: self.files.clone(),
+            explicit_files: self.stdin,
             uncommitted: self.uncommitted,
             untracked: self.untracked,
         }
@@ -248,17 +275,7 @@ impl ChangeOptions {
 
     fn analyse(&self, workspace: &Workspace) -> Result<qk_affected::Analysis> {
         let graph = ProjectGraph::build(workspace)?;
-        qk_affected::analyse(
-            workspace,
-            &graph,
-            &qk_affected::Options {
-                base: self.base.clone(),
-                head: self.head.clone(),
-                files: self.files.clone(),
-                uncommitted: self.uncommitted,
-                untracked: self.untracked,
-            },
-        )
+        qk_affected::analyse(workspace, &graph, &self.options())
     }
 }
 
@@ -469,6 +486,11 @@ enum CacheCommand {
 
 #[derive(Subcommand)]
 enum ShowCommand {
+    /// Inspect a resolved target, its inputs or its outputs.
+    Target {
+        #[command(flatten)]
+        options: inspect::Options,
+    },
     /// List project names in Nx's graph order.
     Projects {
         /// Only projects affected by changes, as `qk affected` selects them.
@@ -594,7 +616,6 @@ const NX_COMMANDS: &[&str] = &[
     "sync",
     "sync:check",
     "view-logs",
-    "watch",
 ];
 
 /// Rewrites Nx's shorthand into `run`: `<target> <project>` and `<project>:<target>`
@@ -691,7 +712,17 @@ fn current_project(workspace: &Workspace) -> Result<String> {
     }
 }
 
-fn run(cli: Cli) -> Result<i32> {
+fn run(mut cli: Cli) -> Result<i32> {
+    match &mut cli.command {
+        Command::Affected { changes, .. }
+        | Command::Show {
+            command:
+                ShowCommand::Projects { changes, .. }
+                | ShowCommand::Affected { changes, .. }
+                | ShowCommand::Tasks { changes, .. },
+        } => changes.read_stdin()?,
+        _ => {}
+    }
     let root = match cli.workspace {
         Some(path) => path,
         None => find_workspace(&std::env::current_dir().context("cannot read current directory")?)?,
@@ -724,6 +755,12 @@ fn run(cli: Cli) -> Result<i32> {
                 pruned.freed,
                 pruned.size
             )?;
+        }
+        Command::Watch { options } => return watch::run(&workspace, options),
+        Command::Show {
+            command: ShowCommand::Target { options },
+        } => {
+            return inspect::show(&workspace, options);
         }
         Command::Exec {
             projects,

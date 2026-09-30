@@ -1,0 +1,7 @@
+{
+  "project": "web",
+  "target": "build",
+  "outputPaths": [
+    "apps/web/dist"
+  ]
+}

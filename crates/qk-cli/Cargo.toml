@@ -15,6 +15,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
+notify.workspace = true
 qk-config.workspace = true
 qk-graph.workspace = true
 qk-taskgraph.workspace = true

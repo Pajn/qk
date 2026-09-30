@@ -1,0 +1,8 @@
+{
+  "project": "web",
+  "target": "typecheck-app",
+  "executor": "nx:run-commands",
+  "cache": true,
+  "continuous": false,
+  "parallelism": true
+}

@@ -1609,3 +1609,207 @@ fn exec_runs_in_projects_dependencies_first_as_nx_does() {
     assert!(!root.join("ran").exists());
     assert!(!root.join("tools/other/ran").exists());
 }
+
+/// Watch includes dependencies, ignores generated files and stops on cancellation.
+#[cfg(unix)]
+#[test]
+fn watch_runs_callbacks_for_project_changes_and_cancels() {
+    use std::io::{BufRead, BufReader};
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    fs::write(root.join("nx.json"), "{}").unwrap();
+    for (directory, project) in [
+        (
+            "app",
+            json!({"name":"app","implicitDependencies":["lib"],
+        "targets":{"build":{"command":"echo build", "outputs":["{projectRoot}/dist"]}}}),
+        ),
+        ("lib", json!({"name":"lib"})),
+    ] {
+        fs::create_dir_all(root.join(directory)).unwrap();
+        fs::write(
+            root.join(directory).join("project.json"),
+            project.to_string(),
+        )
+        .unwrap();
+        fs::write(root.join(directory).join("input.txt"), "one").unwrap();
+    }
+    let callbacks = temp.path().join("callbacks");
+    // Callback records live outside the workspace, so they cannot trigger watch.
+    let script = format!(
+        "echo \"$NX_PROJECT_NAME|$NX_FILE_CHANGES\" >> '{}'; echo callback",
+        callbacks.display()
+    );
+    let mut child = WatchChild(
+        command(
+            root,
+            &[
+                "watch",
+                "-p",
+                "app",
+                "--includeDependencies",
+                "--initialRun",
+                "--",
+                &script,
+            ],
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap(),
+    );
+    let (send, receive) = std::sync::mpsc::channel();
+    let stderr = child.stderr.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            let _ = send.send(line.unwrap());
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !receive
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .unwrap()
+        .contains("qk: watching")
+    {}
+    assert_eq!(fs::read_to_string(&callbacks).unwrap(), "app|\n");
+    fs::write(root.join("lib/input.txt"), "two").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !fs::read_to_string(&callbacks)
+        .unwrap()
+        .contains("lib|lib/input.txt")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "watch did not observe dependency edit"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let count = fs::read_to_string(&callbacks).unwrap().lines().count();
+    fs::create_dir_all(root.join("app/dist")).unwrap();
+    fs::write(root.join("app/dist/out.txt"), "generated").unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        fs::read_to_string(&callbacks).unwrap().lines().count(),
+        count
+    );
+    // Retain source edits when an editor temporarily writes invalid config.
+    fs::write(root.join("nx.json"), "{").unwrap();
+    fs::write(root.join("lib/input.txt"), "three").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !receive
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .unwrap()
+        .contains("watch configuration not reloaded")
+    {}
+    fs::write(root.join("nx.json"), "{}").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while fs::read_to_string(&callbacks).unwrap().lines().count() == count {
+        assert!(
+            Instant::now() < deadline,
+            "configuration reload lost source edits"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        fs::read_to_string(&callbacks)
+            .unwrap()
+            .lines()
+            .last()
+            .unwrap()
+            .contains("lib/input.txt")
+    );
+    Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert_eq!(child.wait().unwrap().code(), Some(130));
+    reader.join().unwrap();
+}
+
+/// Always reap a watcher, including when an assertion fails.
+#[cfg(unix)]
+struct WatchChild(std::process::Child);
+#[cfg(unix)]
+impl std::ops::Deref for WatchChild {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+#[cfg(unix)]
+impl std::ops::DerefMut for WatchChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+#[cfg(unix)]
+impl Drop for WatchChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// --all discovers new projects and queues edits made during a running callback.
+#[cfg(unix)]
+#[test]
+fn watch_all_discovers_projects_and_queues_changes() {
+    use std::io::{BufRead, BufReader};
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("workspace");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("nx.json"), "{}").unwrap();
+    let records = temp.path().join("records");
+    let started = temp.path().join("started");
+    let script = format!(
+        "echo start > '{}'; sleep 0.6; echo \"$NX_PROJECT_NAME|$NX_FILE_CHANGES\" >> '{}'",
+        started.display(),
+        records.display()
+    );
+    let mut child = WatchChild(
+        command(&root, &["watch", "--all", "--", &script])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let (send, receive) = std::sync::mpsc::channel();
+    let stderr = child.stderr.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            let _ = send.send(line.unwrap());
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !receive
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .unwrap()
+        .contains("qk: watching")
+    {}
+    fs::create_dir_all(root.join("new")).unwrap();
+    fs::write(root.join("new/project.json"), r#"{"name":"new"}"#).unwrap();
+    fs::write(root.join("new/first.txt"), "first").unwrap();
+    wait_for(&started);
+    // This event arrives while the first callback is sleeping.
+    fs::write(root.join("new/second.txt"), "second").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !fs::read_to_string(&records)
+        .unwrap_or_default()
+        .contains("new/second.txt")
+    {
+        assert!(Instant::now() < deadline, "pending callback was lost");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let lines = fs::read_to_string(&records).unwrap();
+    assert!(lines.lines().count() >= 2, "{lines}");
+    assert!(
+        lines.lines().all(|line| line.starts_with("new|")),
+        "{lines}"
+    );
+    Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert_eq!(child.wait().unwrap().code(), Some(130));
+    reader.join().unwrap();
+}

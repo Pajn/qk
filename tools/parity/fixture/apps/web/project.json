@@ -17,6 +17,7 @@
     "serve": {},
     "check": {},
     "typecheck-app": {
+      "inputs": ["production", { "env": "TYPECHECK_MODE" }, { "runtime": "node --version" }],
       "command": "node scripts/task.mjs web:typecheck-app {projectRoot}"
     },
     "typecheck-strict": {
