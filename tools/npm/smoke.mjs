@@ -14,7 +14,12 @@ const binary = resolve(values.binary);
 const scratch = mkdtempSync(join(tmpdir(), 'qk install smoke '));
 const env = { ...process.env, npm_config_cache: join(scratch, 'npm-cache'), npm_config_update_notifier: 'false' };
 function run(command, args, cwd) {
-  const result = spawnSync(command, args, { cwd, env, encoding: 'utf8', timeout: 60_000 });
+  const result = spawnSync(command, args, {
+    cwd, env, encoding: 'utf8', timeout: 60_000,
+    // cmd receives an already quoted command string. Node's usual Windows
+    // argument escaping would turn those quotes into literal npm arguments.
+    windowsVerbatimArguments: process.platform === 'win32' && command === 'cmd.exe',
+  });
   if (result.status !== 0) throw new Error(`${command} ${args.join(' ')} failed: ${result.error ?? ''}\n${result.stdout}\n${result.stderr}`);
   return result.stdout;
 }
