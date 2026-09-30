@@ -1,3 +1,4 @@
+mod doctor;
 mod explain;
 mod history;
 mod inspect;
@@ -35,6 +36,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Report compatibility issues without running commands or plugins.
+    Doctor {
+        #[arg(long)]
+        json: bool,
+        /// Fail on compatibility warnings as well as unsupported executors.
+        #[arg(long)]
+        strict: bool,
+    },
     /// Inspect the local repository cache.
     Cache {
         #[command(subcommand)]
@@ -729,6 +738,7 @@ fn run(mut cli: Cli) -> Result<i32> {
     };
     let workspace = Workspace::load(&root)?;
     match cli.command {
+        Command::Doctor { json, strict } => return doctor::show(&workspace, json, strict),
         Command::Cache {
             command: CacheCommand::Path,
         } => {

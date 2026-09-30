@@ -650,3 +650,54 @@ fn affected_reads_changed_paths_from_stdin() {
         .success()
     );
 }
+
+/// Doctor reports the declared compatibility boundary without running target code.
+#[test]
+fn doctor_reports_unsupported_features_without_side_effects() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    std::fs::write(root.join("nx.json"), r#"{"plugins":["missing-plugin"]}"#).unwrap();
+    std::fs::write(
+        root.join("project.json"),
+        json!({"name":"app","targets":{
+            "build":{"command":"echo ran > ran","syncGenerators":["missing:sync"]},
+            "native":{"executor":"missing:build"}
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_qk"))
+        .current_dir(root)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["errors"], 1);
+    assert_eq!(report["warnings"], 2);
+    assert_eq!(report["schemaVersion"], 1);
+    assert!(
+        report["acceptedNoopOptions"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("--batch"))
+    );
+    assert!(!root.join("ran").exists());
+    std::fs::write(
+        root.join("project.json"),
+        r#"{"name":"app","targets":{"build":{"command":"echo never"}}}"#,
+    )
+    .unwrap();
+    let run = |strict: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_qk"));
+        command.current_dir(root).arg("doctor");
+        if strict {
+            command.arg("--strict");
+        }
+        command.output().unwrap()
+    };
+    assert!(run(false).status.success());
+    assert_eq!(run(true).status.code(), Some(1));
+    std::fs::write(root.join("nx.json"), "{}").unwrap();
+    assert!(run(true).status.success());
+}

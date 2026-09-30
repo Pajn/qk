@@ -195,3 +195,14 @@ Ctrl+C cancels callbacks and their process groups and exits with 130. Ignored
 source files, node_modules, Git/qk state, configured caches, explicit target
 outputs and warm paths do not trigger callbacks. Global files outside any
 selected project do not trigger callbacks. Watch uses no daemon or Nx plugins.
+
+## Compatibility diagnostics
+
+`qk doctor` reports unsupported executors, configured Nx plugins and sync
+generators without executing commands, loading dotenv files or running plugins.
+It also lists Nx CLI options accepted without effect. `--json` returns a
+versioned report with stable finding codes, locations and error/warning counts.
+Unsupported executors cause exit code 1; `--strict` also fails on warnings.
+
+This checks normalized explicit target definitions. A clean report does not
+establish that commands can execute or that plugin-inferred targets exist.
