@@ -1,0 +1,109 @@
+{
+  "cache-direct": [
+    [
+      "consumer.ran",
+      "producer.ran"
+    ],
+    [],
+    [
+      "producer.ran"
+    ],
+    [
+      "consumer.ran",
+      "producer.ran"
+    ]
+  ],
+  "cache-indirect": [
+    [
+      "consumer.ran",
+      "producer.ran"
+    ],
+    [],
+    [
+      "producer.ran"
+    ],
+    [
+      "producer.ran"
+    ]
+  ],
+  "cache-transitive": [
+    [
+      "consumer.ran",
+      "producer.ran"
+    ],
+    [],
+    [
+      "producer.ran"
+    ],
+    [
+      "consumer.ran",
+      "producer.ran"
+    ]
+  ],
+  "cache-broad-glob": [
+    [
+      "consumer.ran",
+      "producer.ran"
+    ],
+    [],
+    [
+      "consumer.ran",
+      "producer.ran"
+    ],
+    [
+      "consumer.ran",
+      "producer.ran"
+    ]
+  ],
+  "cache-nxignore": [
+    [
+      "consumer.ran"
+    ],
+    [],
+    [
+      "consumer.ran"
+    ]
+  ],
+  "stdin-spaces": [
+    "app"
+  ],
+  "stdin-empty": [],
+  "cache-excluded-parent": [
+    [
+      "consumer.ran"
+    ],
+    []
+  ],
+  "affected-excluded-parent": [],
+  "cache-git-negation": [
+    [
+      "consumer.ran"
+    ],
+    [
+      "consumer.ran"
+    ]
+  ],
+  "affected-git-negation": [
+    "app"
+  ],
+  "watch": {
+    "initial": {
+      "project": "app",
+      "files": []
+    },
+    "first": {
+      "project": "app",
+      "files": [
+        "app/first.txt"
+      ]
+    },
+    "queued": [
+      {
+        "project": "app",
+        "files": [
+          "app/second.txt"
+        ]
+      }
+    ]
+  }
+}

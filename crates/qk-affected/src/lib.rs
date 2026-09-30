@@ -427,16 +427,10 @@ impl<'a> Changes<'a> {
             files.extend(untracked(root)?);
             files.into_iter().collect()
         };
-        let mut ignore = ignore::gitignore::GitignoreBuilder::new(root);
-        for name in [".gitignore", ".nxignore"] {
-            if root.join(name).is_file() {
-                ignore.add(root.join(name));
-            }
-        }
-        let ignore = ignore.build()?;
+        let ignore = qk_cache::SourceIgnore::new(root)?;
         let files = files
             .into_iter()
-            .filter(|file| !ignore.matched_path_or_any_parents(file, false).is_ignore())
+            .filter(|file| !ignore.matches(file))
             .collect();
         Ok(Self {
             workspace,
@@ -600,6 +594,15 @@ fn uncommitted(root: &Path) -> Result<Vec<String>> {
 }
 
 fn untracked(root: &Path) -> Result<Vec<String>> {
+    if root.join(".nxignore").is_file() {
+        let tracked: BTreeSet<_> = git_lines(root, &["ls-files", "--cached"])?
+            .into_iter()
+            .collect();
+        return Ok(qk_cache::source_files(root)?
+            .difference(&tracked)
+            .cloned()
+            .collect());
+    }
     git_lines(root, &["ls-files", "--others", "--exclude-standard"])
 }
 

@@ -189,6 +189,15 @@ function execute(binary, args, skipCache) {
   return { outcome: result.status === 0 ? "success" : "failure", ran };
 }
 
+/// Execute the isolated cache/stdin/watch oracle against the selected tool.
+function behavioral(binary, golden) {
+  const result = spawnSync(process.execPath, [join(here, "behavior.mjs"), command, binary, golden], {
+    encoding: "utf8", timeout: 180_000,
+  });
+  if (result.status !== 0) throw new Error(`behavioral parity failed: ${result.error ?? ""}\n${result.stdout}\n${result.stderr}`);
+  process.stdout.write(result.stdout);
+}
+
 if (command === "capture") {
   if (!existsSync(nx)) throw new Error(`no Nx installation at ${nx}; run pnpm install in ${dirname(dirname(dirname(nx)))}`);
   const committed = goldens;
@@ -224,6 +233,7 @@ if (command === "capture") {
     const result = onCase(name, spec, () => execute(nx, spec.args, "--skip-nx-cache"));
     writeFileSync(join(goldens, `runs-${name}.json`), `${JSON.stringify(result, null, 2)}\n`);
   }
+  if (!external) behavioral(nx, join(goldens, "behavior.json"));
   const { version } = readJson(join(dirname(dirname(nx)), "nx/package.json"));
   // An external workspace records timings as its Nx baseline; the fixture's
   // goldens are committed, so they hold nothing that varies between captures.
@@ -247,6 +257,7 @@ if (command === "capture") {
 
 const failures = [];
 const timings = {};
+if (!external) behavioral(qk, join(goldens, "behavior.json"));
 const nxTimings = readJson(join(goldens, "nx.json")).timings ?? {};
 
 function check(label, differences) {

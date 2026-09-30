@@ -398,6 +398,37 @@ fn under<'a>(files: &'a BTreeSet<String>, prefix: &'a str) -> impl Iterator<Item
         .filter(move |path| path.len() == prefix.len() || path.as_bytes()[prefix.len()] == b'/')
 }
 
+/// Compiled root ignore rules used by input discovery and project watching.
+pub struct SourceIgnore(ignore::gitignore::Gitignore);
+
+impl SourceIgnore {
+    /// Root ignore rules shared by caching and watch, including tracked files.
+    pub fn new(root: &Path) -> Result<Self> {
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
+        for name in [".gitignore", ".nxignore"] {
+            let path = root.join(name);
+            if path.is_file()
+                && let Some(error) = builder.add(path)
+            {
+                return Err(error.into());
+            }
+        }
+        Ok(Self(builder.build()?))
+    }
+
+    /// Whether a workspace-relative file or its parent is ignored.
+    pub fn matches(&self, path: &str) -> bool {
+        // A file whitelist cannot reinclude it beneath an excluded directory.
+        Path::new(path)
+            .ancestors()
+            .skip(1)
+            .take_while(|parent| !parent.as_os_str().is_empty())
+            .any(|parent| self.0.matched(parent, true).is_ignore())
+            || self.0.matched(path, false).is_ignore()
+    }
+}
+
+/// Source files visible to Nx, with runner state and root ignore rules removed.
 pub fn source_files(root: &Path) -> Result<BTreeSet<String>> {
     let lines =
         |output: std::io::Result<std::process::Output>| -> Option<Result<BTreeSet<String>>> {
@@ -435,7 +466,7 @@ pub fn source_files(root: &Path) -> Result<BTreeSet<String>> {
         (listed, deleted.join().expect("git listing thread panicked"))
     });
     let candidates = match (lines(listed), lines(deleted)) {
-        (Some(listed), Some(deleted)) => {
+        (Some(listed), Some(deleted)) if !root.join(".nxignore").is_file() => {
             let deleted = deleted?;
             let mut files = BTreeSet::new();
             for entry in listed? {
@@ -457,6 +488,8 @@ pub fn source_files(root: &Path) -> Result<BTreeSet<String>> {
                 .parents(false)
                 .git_global(false)
                 .require_git(false)
+                .ignore(false)
+                .add_custom_ignore_filename(".nxignore")
                 .follow_links(false)
                 .filter_entry(|entry| {
                     !matches!(
@@ -474,12 +507,14 @@ pub fn source_files(root: &Path) -> Result<BTreeSet<String>> {
             files
         }
     };
+    let ignore = SourceIgnore::new(root)?;
     Ok(candidates
         .into_iter()
         .filter(|path| {
-            !path
-                .split('/')
-                .any(|part| matches!(part, ".git" | ".qk" | "node_modules"))
+            !ignore.matches(path)
+                && !path
+                    .split('/')
+                    .any(|part| matches!(part, ".git" | ".qk" | "node_modules"))
         })
         .collect())
 }

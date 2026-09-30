@@ -1789,3 +1789,92 @@ fn dependency_output_glob_skips_directories() {
         stderr(&output)
     );
 }
+
+/// Nx ignore rules exclude tracked inputs and support negated file entries.
+#[test]
+fn nxignore_filters_cache_inputs_and_reloads_rules() {
+    let fixture = Fixture::new(target(
+        "build",
+        json!({"inputs":["{projectRoot}/src/**/*"]}),
+    ));
+    fs::create_dir_all(fixture.root.join("src/ignored")).unwrap();
+    fs::write(fixture.root.join("src/ignored/skip.txt"), "one").unwrap();
+    fs::write(fixture.root.join("src/ignored/keep.txt"), "one").unwrap();
+    fs::write(
+        fixture.root.join(".nxignore"),
+        "src/ignored/**\n!src/ignored/keep.txt\n",
+    )
+    .unwrap();
+    fixture.git(&fixture.root, &["add", "src/ignored"]);
+    success(fixture.build(&fixture.root, &[]));
+    fs::write(fixture.root.join("src/ignored/skip.txt"), "two").unwrap();
+    let output = success(fixture.build(&fixture.root, &[]));
+    assert!(
+        stderr(&output).contains("qk: cache hit app:build"),
+        "{}",
+        stderr(&output)
+    );
+    fs::write(fixture.root.join("src/ignored/keep.txt"), "two").unwrap();
+    let output = success(fixture.build(&fixture.root, &[]));
+    assert!(
+        stderr(&output).contains("qk: cache miss app:build"),
+        "{}",
+        stderr(&output)
+    );
+    fs::write(fixture.root.join(".nxignore"), "").unwrap();
+    let output = success(fixture.build(&fixture.root, &[]));
+    assert!(
+        stderr(&output).contains("qk: cache miss app:build"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+/// A negated file cannot reinclude itself below an excluded parent directory.
+#[test]
+fn nxignore_excluded_parent_wins_over_tracked_file_negation() {
+    let fixture = Fixture::new(target(
+        "build",
+        json!({"inputs":["{projectRoot}/src/**/*"]}),
+    ));
+    fs::create_dir_all(fixture.root.join("src/ignored")).unwrap();
+    fs::write(fixture.root.join("src/ignored/keep.txt"), "one").unwrap();
+    fixture.git(&fixture.root, &["add", "src/ignored"]);
+    fs::write(
+        fixture.root.join(".nxignore"),
+        "src/ignored/\n!src/ignored/keep.txt\n",
+    )
+    .unwrap();
+    let ignore = qk_cache::SourceIgnore::new(&fixture.root).unwrap();
+    assert!(ignore.matches("src/ignored/keep.txt"));
+    success(fixture.build(&fixture.root, &[]));
+    fs::write(fixture.root.join("src/ignored/keep.txt"), "two").unwrap();
+    let output = success(fixture.build(&fixture.root, &[]));
+    assert!(
+        stderr(&output).contains("qk: cache hit app:build"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+/// Nx negations can bring untracked Git-ignored source files into discovery.
+#[test]
+fn nxignore_can_reinclude_untracked_gitignored_files() {
+    let fixture = Fixture::new(target(
+        "build",
+        json!({"inputs":["{projectRoot}/src/**/*"]}),
+    ));
+    fs::write(fixture.root.join(".gitignore"), "dist/\n.qk/\nsrc/*.txt\n").unwrap();
+    fs::write(fixture.root.join(".nxignore"), "!src/keep.txt\n").unwrap();
+    fs::write(fixture.root.join("src/keep.txt"), "one").unwrap();
+    let files = qk_cache::source_files(&fixture.root).unwrap();
+    assert!(files.contains("src/keep.txt"));
+    success(fixture.build(&fixture.root, &[]));
+    fs::write(fixture.root.join("src/keep.txt"), "two").unwrap();
+    let output = success(fixture.build(&fixture.root, &[]));
+    assert!(
+        stderr(&output).contains("qk: cache miss app:build"),
+        "{}",
+        stderr(&output)
+    );
+}

@@ -176,3 +176,12 @@ GitHub Actions is configured for Linux, macOS and Windows. The lockfile is
 checked in for reproducible dependency resolution.
 
 See [Maintaining the documentation](documentation.md) for book builds and Pages setup.
+
+The parity harness also captures isolated behavioral cases: direct/transitive
+selective dependency artifacts, broad output globs, `.nxignore` negations,
+stdin lists (including spaces and empty input), and watch callbacks queued
+while a command runs. Capture uses the pinned Nx daemon only for the watch
+oracle; qk remains daemon-free. Callback records live outside task inputs.
+Distinct edit timestamps avoid coarse metadata-cache timing artifacts.
+The Rust watch integration test runs on all three CI platforms; Windows uses
+a private console so cancellation cannot signal parallel tests.

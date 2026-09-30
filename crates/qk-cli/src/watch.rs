@@ -40,6 +40,7 @@ struct View {
     files: BTreeSet<String>,
     outputs: Vec<qk_cache::Outputs>,
     cache: PathBuf,
+    ignore: qk_cache::SourceIgnore,
 }
 
 impl View {
@@ -93,6 +94,7 @@ impl View {
                 }
             }
         }
+        let ignore = qk_cache::SourceIgnore::new(&workspace.root)?;
         let files = qk_cache::source_files(&workspace.root)?;
         let cache = qk_cache::cache_location(&workspace);
         Ok(Self {
@@ -101,13 +103,16 @@ impl View {
             files,
             outputs,
             cache,
+            ignore,
         })
     }
 
     /// Filter runner state and generated artifacts before discovery or callbacks.
     fn ignored(&self, path: &str) -> bool {
-        path.split('/')
-            .any(|part| matches!(part, ".git" | ".qk" | "node_modules"))
+        self.ignore.matches(path)
+            || path
+                .split('/')
+                .any(|part| matches!(part, ".git" | ".qk" | "node_modules"))
             || self.workspace.root.join(path).starts_with(&self.cache)
             || self.outputs.iter().any(|outputs| outputs.matches(path))
     }
@@ -207,17 +212,7 @@ pub fn run(workspace: &Workspace, options: Options) -> Result<i32> {
                 continue;
             }
         };
-        let candidates: BTreeSet<_> = view.files.union(&next.files).cloned().collect();
-        let files: BTreeSet<_> = candidates
-            .into_iter()
-            .filter(|file| {
-                paths.iter().any(|path| {
-                    path.is_empty() || file == path || Path::new(file).starts_with(path)
-                }) && !view.ignored(file)
-                    && !next.ignored(file)
-                    && (view.owner(file).is_some() || next.owner(file).is_some())
-            })
-            .collect();
+        let files = changed_files(&view, &next, &paths);
         let projects: BTreeSet<_> = files
             .iter()
             .filter_map(|file| next.owner(file).or_else(|| view.owner(file)))
@@ -228,6 +223,22 @@ pub fn run(workspace: &Workspace, options: Options) -> Result<i32> {
         }
     }
     Ok(130)
+}
+
+/// Select changed sources using current policy, preserving deleted-file ownership.
+fn changed_files(previous: &View, next: &View, paths: &BTreeSet<String>) -> BTreeSet<String> {
+    previous
+        .files
+        .union(&next.files)
+        .filter(|file| {
+            paths
+                .iter()
+                .any(|path| path.is_empty() || *file == path || Path::new(file).starts_with(path))
+                && !next.ignored(file)
+                && (previous.owner(file).is_some() || next.owner(file).is_some())
+        })
+        .cloned()
+        .collect()
 }
 
 /// Recover backend errors by rescanning rather than ending the watch session.
@@ -249,7 +260,13 @@ fn add_event(event: Event, root: &Path, view: &View, paths: &mut BTreeSet<String
     for path in event.paths {
         if let Ok(relative) = path.strip_prefix(root) {
             let relative = relative.to_string_lossy().replace('\\', "/");
-            if !relative.is_empty() && !view.ignored(&relative) {
+            // Policy changes must reload even when the old policy ignores itself.
+            let policy = matches!(relative.as_str(), ".gitignore" | ".nxignore");
+            if policy {
+                // Source events in this batch may have been hidden by the old policy.
+                paths.insert(String::new());
+            }
+            if !relative.is_empty() && (policy || !view.ignored(&relative)) {
                 paths.insert(relative);
             }
         }
@@ -312,6 +329,54 @@ fn callbacks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Self-ignored policy files remain observable, so removing exclusions works.
+    #[test]
+    fn self_ignored_policies_can_reload_source_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir(root.join("app")).unwrap();
+        std::fs::write(root.join("nx.json"), "{}").unwrap();
+        std::fs::write(root.join("app/project.json"), r#"{"name":"app"}"#).unwrap();
+        std::fs::write(root.join("app/ignored.txt"), "source").unwrap();
+        std::fs::write(root.join(".gitignore"), ".gitignore\n").unwrap();
+        std::fs::write(root.join(".nxignore"), ".nxignore\napp/ignored.txt\n").unwrap();
+        let options = Options {
+            projects: Vec::new(),
+            all: true,
+            include_dependencies: false,
+            initial_run: false,
+            verbose: false,
+            command: vec!["echo changed".into()],
+        };
+        let view = View::load(root, &options).unwrap();
+        assert!(!view.files.contains("app/ignored.txt"));
+        let mut paths = BTreeSet::new();
+        for name in [".gitignore", ".nxignore"] {
+            assert!(view.ignored(name));
+            add_event(
+                Event::new(EventKind::Any).add_path(root.join(name)),
+                root,
+                &view,
+                &mut paths,
+            );
+            assert!(paths.contains(name));
+        }
+        std::fs::write(root.join(".nxignore"), ".nxignore\n").unwrap();
+        let reloaded = View::load(root, &options).unwrap();
+        assert!(reloaded.files.contains("app/ignored.txt"));
+        assert!(paths.contains(""));
+        assert!(changed_files(&view, &reloaded, &paths).contains("app/ignored.txt"));
+        paths.clear();
+        add_event(
+            Event::new(EventKind::Any).add_path(root.join("app/ignored.txt")),
+            root,
+            &reloaded,
+            &mut paths,
+        );
+        assert!(paths.contains("app/ignored.txt"));
+        assert_eq!(reloaded.owner("app/ignored.txt").as_deref(), Some("app"));
+    }
 
     /// A backend failure queues a full rescan and subsequent events remain usable.
     #[test]

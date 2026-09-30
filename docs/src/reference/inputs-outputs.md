@@ -119,3 +119,8 @@ Use explicit output declarations for build artifacts. A cache hit removes
 existing matching outputs before restoring the saved result; negated outputs
 are preserved. An output pattern without a fixed directory prefix disables
 caching, with a reported reason.
+
+Root `.gitignore` and `.nxignore` rules exclude files from source input discovery,
+including tracked files. Negations use Git ignore semantics. Watch uses the same
+rules, and affected selection also applies the root ignore files. qk still hashes
+mandatory workspace/project configuration independently of source filesets.

@@ -152,7 +152,7 @@ effect.
 ## Accepted Nx options
 
 `--runner`, `--batch`, `--skip-sync`, `--cloud`, `--no-cloud`, `--dte`,
-`--no-dte`, `--agents`, `--tui`, and `--tui-auto-exit` are accepted without
+`--no-dte`, `--agents`, `--tui`, `--no-tui`, and `--tui-auto-exit` are accepted without
 effect. They do not enable Nx plugins, distributed execution or Nx Cloud.
 
 ## Target inspection
@@ -190,8 +190,21 @@ also runs once with an empty project name, matching Nx. Quote the shell command
 so variables expand in the callback rather than in the invoking shell.
 
 Native file events are debounced and changes arriving during a callback are
-queued for the next batch. Callback failures are reported; watch continues.
+queued for the next batch. A directory event or backend rescan can include other
+eligible source files in the reported batch. Callback failures are reported;
+watch continues.
 Ctrl+C cancels callbacks and their process groups and exits with 130. Ignored
 source files, node_modules, Git/qk state, configured caches, explicit target
 outputs and warm paths do not trigger callbacks. Global files outside any
 selected project do not trigger callbacks. Watch uses no daemon or Nx plugins.
+
+## Compatibility diagnostics
+
+`qk doctor` reports unsupported executors, configured Nx plugins and sync
+generators without executing commands, loading dotenv files or running plugins.
+It also lists Nx CLI options accepted without effect. `--json` returns a
+versioned report with stable finding codes, locations and error/warning counts.
+Unsupported executors cause exit code 1; `--strict` also fails on warnings.
+
+This checks normalized explicit target definitions. A clean report does not
+establish that commands can execute or that plugin-inferred targets exist.
