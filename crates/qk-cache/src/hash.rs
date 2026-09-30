@@ -448,25 +448,35 @@ pub fn source_files(root: &Path) -> Result<BTreeSet<String>> {
     // names them in a second listing, which is cheaper than checking each file.
     // Skip-worktree entries are listed whether or not they are on disk and never
     // as deleted, so those few are checked; `-v` tags them `S`.
-    let (listed, deleted) = std::thread::scope(|scope| {
-        let deleted = scope.spawn(|| paths::git(root, &["ls-files", "--deleted", "-z", "--", "."]));
-        let listed = paths::git(
-            root,
-            &[
-                "ls-files",
-                "-v",
-                "--cached",
-                "--others",
-                "--exclude-standard",
-                "-z",
-                "--",
-                ".",
-            ],
-        );
-        (listed, deleted.join().expect("git listing thread panicked"))
-    });
-    let candidates = match (lines(listed), lines(deleted)) {
-        (Some(listed), Some(deleted)) if !root.join(".nxignore").is_file() => {
+    let (listed, deleted) = if root.join(".nxignore").is_file() {
+        // Nx negations can reinclude Git-ignored files, so this policy needs
+        // the walker regardless of what Git lists. Avoid launching Git here.
+        (None, None)
+    } else {
+        std::thread::scope(|scope| {
+            let deleted =
+                scope.spawn(|| paths::git(root, &["ls-files", "--deleted", "-z", "--", "."]));
+            let listed = paths::git(
+                root,
+                &[
+                    "ls-files",
+                    "-v",
+                    "--cached",
+                    "--others",
+                    "--exclude-standard",
+                    "-z",
+                    "--",
+                    ".",
+                ],
+            );
+            (
+                lines(listed),
+                lines(deleted.join().expect("git listing thread panicked")),
+            )
+        })
+    };
+    let candidates = match (listed, deleted) {
+        (Some(listed), Some(deleted)) => {
             let deleted = deleted?;
             let mut files = BTreeSet::new();
             for entry in listed? {
