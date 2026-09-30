@@ -90,9 +90,10 @@ try {
   mkdirSync(archiveRoot);
   mkdirSync(extracted);
   copyFileSync(binary, join(archiveRoot, basename(binary)));
-  const archive = join(scratch, 'qk.tar.gz');
-  run('tar', ['-czf', archive, '-C', archiveRoot, basename(binary)], scratch);
-  run('tar', ['-xzf', archive, '-C', extracted], scratch);
+  // Relative paths also work with Git for Windows' GNU tar, which otherwise
+  // interprets a drive-letter archive path as a remote host specification.
+  run('tar', ['-czf', 'qk.tar.gz', '-C', 'archive', basename(binary)], scratch);
+  run('tar', ['-xzf', 'qk.tar.gz', '-C', 'extracted'], scratch);
   check('archive-extracted', (args, cwd) => run(join(extracted, basename(binary)), args, cwd));
 } finally {
   rmSync(scratch, { recursive: true, force: true });
