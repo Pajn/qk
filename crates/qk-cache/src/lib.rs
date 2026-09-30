@@ -556,6 +556,8 @@ fn output_fingerprint(root: &Path, outputs: &paths::Outputs, input: &str) -> Res
 mod tests {
     use super::*;
 
+    /// Complete-directory restore preserves contents, links, modes, timestamps
+    /// and fingerprints, and the subsequent hit keeps restored files in place.
     #[test]
     fn manifest_and_disk_output_fingerprints_agree() {
         let workspace = tempfile::tempdir().unwrap();
@@ -563,6 +565,8 @@ mod tests {
         std::fs::create_dir_all(root.join("dist/nested/empty")).unwrap();
         std::fs::write(root.join("dist/nested/a.txt"), "a").unwrap();
         std::fs::write(root.join("dist/b.bin"), [0, 1, 2]).unwrap();
+        std::fs::create_dir_all(root.join("bundle/empty")).unwrap();
+        std::fs::write(root.join("bundle/readonly"), "readonly").unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -570,18 +574,41 @@ mod tests {
             std::fs::write(&script, "#!/bin/sh\n").unwrap();
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
             std::os::unix::fs::symlink("nested/a.txt", root.join("dist/link")).unwrap();
+            std::fs::set_permissions(
+                root.join("dist/nested"),
+                std::fs::Permissions::from_mode(0o500),
+            )
+            .unwrap();
+            std::fs::set_permissions(
+                root.join("bundle/readonly"),
+                std::fs::Permissions::from_mode(0o444),
+            )
+            .unwrap();
         }
         let log = root.join("log");
         std::fs::write(&log, "").unwrap();
 
         let cache = Cache::new(root.join(".qk/cache"));
         cache.initialize().unwrap();
-        let outputs = paths::Outputs::from_patterns(&["dist"]);
+        let outputs = paths::Outputs::from_patterns(&["dist", "bundle"]);
         let key = "0".repeat(64);
         let saved = cache.publish(root, &key, &outputs, &log).unwrap();
         assert_eq!(saved, output_fingerprint(root, &outputs, &key).unwrap());
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // The manifest retains the restrictive mode; cleanup needs write
+            // permission on the old directory to remove its files.
+            std::fs::set_permissions(
+                root.join("dist/nested"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
         std::fs::remove_dir_all(root.join("dist")).unwrap();
+        std::fs::remove_dir_all(root.join("bundle")).unwrap();
+        let before = std::time::SystemTime::now();
         let restored = cache
             .restore(
                 root,
@@ -595,5 +622,58 @@ mod tests {
             .unwrap();
         assert_eq!(restored, Some(saved.clone()));
         assert_eq!(saved, output_fingerprint(root, &outputs, &key).unwrap());
+        assert!(root.join("dist/nested/empty").is_dir());
+        assert!(root.join("bundle/empty").is_dir());
+        assert_eq!(
+            std::fs::read_to_string(root.join("bundle/readonly")).unwrap(),
+            "readonly"
+        );
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                std::fs::read_link(root.join("dist/link")).unwrap(),
+                Path::new("nested/a.txt")
+            );
+            assert_eq!(
+                store::mode(&std::fs::metadata(root.join("dist/run.sh")).unwrap()),
+                0o755
+            );
+            assert_eq!(
+                store::mode(&std::fs::metadata(root.join("dist/nested")).unwrap()),
+                0o500
+            );
+            assert_eq!(
+                store::mode(&std::fs::metadata(root.join("bundle/readonly")).unwrap()),
+                0o444
+            );
+        }
+        let path = root.join("dist/nested/a.txt");
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(modified >= before);
+        let kept = cache
+            .restore(
+                root,
+                "app:build",
+                &Default::default(),
+                &key,
+                &outputs,
+                &qk_executor::Display::Hidden,
+                qk_executor::Shown::LocalCache,
+            )
+            .unwrap();
+        assert_eq!(kept, Some(saved));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                root.join("dist/nested"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
     }
 }
