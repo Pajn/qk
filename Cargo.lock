@@ -1125,6 +1125,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "terminal_size",
+ "walkdir",
 ]
 
 [[package]]

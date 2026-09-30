@@ -1413,9 +1413,17 @@ fn a_target_without_a_project_finds_one_like_nx() {
     assert_eq!(hello(temp.path(), None), "lib\n");
 }
 
+/// Audits read the system log, and two at once can each miss the other's
+/// reports, so the tests that audit take turns.
+#[cfg(target_os = "macos")]
+static AUDIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(target_os = "macos")]
 #[test]
 fn the_sandbox_reports_and_refuses_what_a_task_does_not_declare() {
+    let _audit = AUDIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let temp = fixture(json!({
         "build": {
             "command": "cat src/in.txt other/notes.txt .env > /dev/null; mkdir -p dist && echo out > dist/out.txt && echo stray > stray.txt",
@@ -1475,6 +1483,45 @@ fn the_sandbox_reports_and_refuses_what_a_task_does_not_declare() {
     );
     assert!(!temp.path().join("stray.txt").exists());
     assert!(temp.path().join("dist/out.txt").is_file());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn warm_suggest_lists_the_directories_a_task_wrote_outside_its_outputs() {
+    let _audit = AUDIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = fixture(json!({
+        "build": {
+            "command": "mkdir -p dist .tool/a && echo out > dist/out.txt && echo cached > .tool/a/entry && echo generated > src/generated.txt",
+            "outputs": ["{projectRoot}/dist"]
+        }
+    }));
+    fs::create_dir_all(temp.path().join("src")).unwrap();
+    fs::write(temp.path().join("src/in.txt"), "in").unwrap();
+    // A tool's directories are ignored, which is what sets them apart.
+    fs::write(temp.path().join(".gitignore"), "dist/\n.tool/\n").unwrap();
+    let git = |args: &[&str]| {
+        assert!(
+            Command::new("git")
+                .current_dir(temp.path())
+                .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .status()
+                .unwrap()
+                .success()
+        );
+    };
+    git(&["init", "--quiet"]);
+    let output = run(temp.path(), &["warm", "suggest", "app:build"]);
+    if String::from_utf8_lossy(&output.stderr).contains("did not reach the system log") {
+        eprintln!("the sandbox's reports are not in this machine's log; suggest not checked");
+        return;
+    }
+    let stdout = String::from_utf8_lossy(&success(output).stdout).into_owned();
+    assert!(stdout.contains("\n  .tool  "), "{stdout}");
+    // A write beside sources is not the task's directory to keep.
+    assert!(!stdout.contains("src"), "{stdout}");
 }
 
 #[cfg(target_os = "linux")]

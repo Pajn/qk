@@ -25,6 +25,7 @@
 | `qk show task <project:target>` | A task's recent runs and why its cache key changed |
 | `qk cache path` | Print the local cache directory without creating it |
 | `qk cache prune [--max-size 1GB]` | Evict least recently used entries until the cache fits |
+| `qk warm suggest <project:target>` | Run a task in the sandbox and list directories it wrote outside its outputs, as candidate warm paths (macOS) |
 | `qk reset [--only-cache \| --only-workspace-data]` | Remove the cache and this worktree's state, as `nx reset` does |
 
 As in Nx, `qk build web` and `qk web:build` mean `qk run web:build`, and take the

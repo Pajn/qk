@@ -52,6 +52,15 @@ path, such as CMake build directories, is useless or harmful in another
 worktree: `portable: false` restores only the worktree's own save and keeps
 it out of the remote store.
 
+Native builds write to places that are hard to guess. `qk warm suggest
+<project:target>` runs the task, and what it depends on, in the sandbox's
+audit mode and lists the directories it wrote outside its declared outputs,
+with how much each holds. Each written path is shown under its topmost
+directory that holds no source file, tracked or not ignored, since that is
+a directory the build keeps apart from the checkout; writes beside sources
+are left out. It takes the options `qk run` does and needs macOS, where the
+sandbox can report rather than refuse.
+
 A step that regenerates a directory can take build state with it, as
 `expo prebuild --clean` deletes an Android project together with Gradle's
 build directories. `survive` names such dependencies:

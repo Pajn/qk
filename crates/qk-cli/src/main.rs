@@ -3,6 +3,7 @@ mod explain;
 mod history;
 mod inspect;
 mod ui;
+mod warm_suggest;
 mod watch;
 
 use std::io::{self, Write};
@@ -48,6 +49,11 @@ enum Command {
     Cache {
         #[command(subcommand)]
         command: CacheCommand,
+    },
+    /// Help configure warm state.
+    Warm {
+        #[command(subcommand)]
+        command: WarmCommand,
     },
     /// Execute a task and its dependencies. Forward arguments after --.
     Run {
@@ -481,6 +487,18 @@ fn default_output_style(single: bool) -> Rendered {
 }
 
 #[derive(Subcommand)]
+enum WarmCommand {
+    /// Run a task in the sandbox and list the directories it wrote outside its
+    /// outputs, as candidates for its qk:warm paths. Needs macOS.
+    Suggest {
+        /// project:target[:configuration], or a target of the current directory's project.
+        task: String,
+        #[command(flatten)]
+        options: RunOptions,
+    },
+}
+
+#[derive(Subcommand)]
 enum CacheCommand {
     /// Print the shared cache directory without creating it.
     Path,
@@ -801,38 +819,60 @@ fn run(mut cli: Cli) -> Result<i32> {
                 writeln!(stdout, "Removed this worktree's state.")?;
             }
         }
-        Command::Run { task, options } => {
+        Command::Warm {
+            command: WarmCommand::Suggest { task, mut options },
+        } => {
             let task = if task.contains(':') {
                 task
             } else {
                 format!("{}:{task}", current_project(&workspace)?)
             };
-            let mut request = Request::parse(&task)?;
-            // As in Nx, `project:a:b` is the target `a:b` when the project has
-            // one, and the target `a` in configuration `b` otherwise.
-            if let Some(configuration) = &request.configuration {
-                let combined = format!("{}:{configuration}", request.target);
-                if workspace
-                    .projects
-                    .get(&request.project)
-                    .is_some_and(|project| project.targets.contains_key(&combined))
-                {
-                    request.target = combined;
-                    request.configuration = None;
+            let report =
+                std::env::temp_dir().join(format!("qk-warm-suggest-{}.json", std::process::id()));
+            options.sandbox = Some(options.sandbox.unwrap_or(SandboxMode::Audit));
+            options.sandbox_report = Some(report.clone());
+            let code = run_task(&workspace, task.clone(), &options)?;
+            let findings: serde_json::Value = std::fs::read(&report)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or_default();
+            let _ = std::fs::remove_file(&report);
+            let writes: std::collections::BTreeSet<String> = findings["tasks"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter(|(id, _)| *id == &task || id.starts_with(&format!("{task}:")))
+                .flat_map(|(_, found)| found["strayWrites"].as_array().into_iter().flatten())
+                .filter_map(|path| path.as_str().map(str::to_owned))
+                .collect();
+            let sources = qk_cache::source_files(&workspace.root)?;
+            let candidates = warm_suggest::candidates(&writes, &sources);
+            let mut stdout = io::stdout().lock();
+            if candidates.is_empty() {
+                writeln!(
+                    stdout,
+                    "{task} wrote nothing outside its outputs to keep as warm state."
+                )?;
+            } else {
+                writeln!(
+                    stdout,
+                    "Candidate warm paths for {task}, from what it wrote outside its outputs:"
+                )?;
+                for candidate in &candidates {
+                    writeln!(
+                        stdout,
+                        "  {}  {} path{} written, {:.1} MB",
+                        candidate.path,
+                        candidate.files,
+                        if candidate.files == 1 { "" } else { "s" },
+                        warm_suggest::size(&workspace.root.join(&candidate.path)) as f64 / 1e6
+                    )?;
                 }
             }
-            if let Some(configuration) = &options.configuration() {
-                if request
-                    .configuration
-                    .as_ref()
-                    .is_some_and(|existing| existing != configuration)
-                {
-                    bail!("configuration in task identifier conflicts with --configuration");
-                }
-                request.configuration = Some(configuration.clone());
-            }
-            request.args = options.args.clone();
-            return execute_tasks(&workspace, vec![request], &options, true);
+            return Ok(code);
+        }
+        Command::Run { task, options } => {
+            return run_task(&workspace, task, &options);
         }
         Command::RunMany {
             targets,
@@ -1238,6 +1278,42 @@ fn execute_tasks(
         }
     }
     Ok(result.exit_code)
+}
+
+/// `qk run`: one task, by `project:target[:configuration]` or a target of the
+/// current directory's project.
+fn run_task(workspace: &Workspace, task: String, options: &RunOptions) -> Result<i32> {
+    let task = if task.contains(':') {
+        task
+    } else {
+        format!("{}:{task}", current_project(workspace)?)
+    };
+    let mut request = Request::parse(&task)?;
+    // As in Nx, `project:a:b` is the target `a:b` when the project has
+    // one, and the target `a` in configuration `b` otherwise.
+    if let Some(configuration) = &request.configuration {
+        let combined = format!("{}:{configuration}", request.target);
+        if workspace
+            .projects
+            .get(&request.project)
+            .is_some_and(|project| project.targets.contains_key(&combined))
+        {
+            request.target = combined;
+            request.configuration = None;
+        }
+    }
+    if let Some(configuration) = &options.configuration() {
+        if request
+            .configuration
+            .as_ref()
+            .is_some_and(|existing| existing != configuration)
+        {
+            bail!("configuration in task identifier conflicts with --configuration");
+        }
+        request.configuration = Some(configuration.clone());
+    }
+    request.args = options.args.clone();
+    execute_tasks(workspace, vec![request], options, true)
 }
 
 /// `nx exec`. Its command is the arguments, each in double quotes, run in the
