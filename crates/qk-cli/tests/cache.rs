@@ -1290,6 +1290,57 @@ fn a_new_worktree_prefers_the_save_nearest_behind_its_head() {
 
 #[cfg(unix)]
 #[test]
+fn a_warm_group_is_shared_by_the_targets_that_name_it() {
+    let tool = |name: &str| {
+        json!({
+            "command": format!("if [ -f \"$TOOL_CACHE/seen\" ]; then cat \"$TOOL_CACHE/seen\"; else echo cold; fi; mkdir -p \"$TOOL_CACHE\" && echo {name} > \"$TOOL_CACHE/seen\""),
+            "qk:warm": {"group": "tool", "env": {"TOOL_CACHE": "{warm}/tool"}}
+        })
+    };
+    let fixture = Fixture::with_targets(json!({"build": tool("build"), "test": tool("test")}));
+    let run = |root: &Path, target: &str| {
+        stdout(&success(
+            fixture.qk(root, &["run", &format!("app:{target}")]),
+        ))
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+    };
+    assert_eq!(run(&fixture.root, "build"), "cold");
+    assert_eq!(run(&fixture.root, "test"), "build");
+    // Gone from the worktree, one target restores what the other saved.
+    fs::remove_dir_all(fixture.root.join(".git/qk/warm")).unwrap();
+    assert_eq!(run(&fixture.root, "build"), "test");
+    let linked = fixture.worktree();
+    assert_eq!(run(&linked, "test"), "build");
+    // Both restoring it at once is serialized.
+    fs::remove_dir_all(fixture.root.join(".git/qk/warm")).unwrap();
+    success(fixture.qk(
+        &fixture.root,
+        &["run-many", "-t", "build,test", "--parallel", "2"],
+    ));
+    assert!(fixture.root.join(".git/qk/warm").is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_warm_group_cannot_keep_one_task_s_paths() {
+    let fixture = Fixture::new(json!({
+        "command": "echo ran",
+        "qk:warm": {"group": "tool", "paths": ["{projectRoot}/scratch"]}
+    }));
+    let output = fixture.build(&fixture.root, &[]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("a qk:warm.group shares {warm} alone"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn local_overrides_change_the_task_and_its_key() {
     let fixture = Fixture::new(json!({
         "command": "cat src/input.txt",

@@ -66,7 +66,22 @@ when it matches in that many leading parts; one that matches whole is
 preferred. Among saves that suit equally, the worktree's own comes first,
 then the one made at the commit nearest behind `HEAD` in Git history, then
 the newest, so a worktree cut from `main` starts from `main`'s state rather
-than the last feature branch's. Groups over
+than the last feature branch's.
+
+A `group` shares one `{warm}` directory, and its saves, between every target
+that names it, as one compiler cache serves several builds:
+
+```jsonc
+"qk:warm": {
+  "group": "ccache",
+  "env": { "CCACHE_DIR": "{warm}/ccache", "CCACHE_BASEDIR": "{workspaceRoot}" }
+}
+```
+
+A group keeps no `outputs` or `paths`, which belong to one task. Its
+targets may run at once and use the directory together; restoring and
+saving it are serialized, and a save holds everything the directory held.
+Groups over
 their `maxSize` are not saved. Warm state counts toward the
 cache's size limit and is evicted with it. `--skip-cache` neither restores
 nor saves it, and leaves the variables unset. Two tasks in one run cannot

@@ -40,6 +40,8 @@ const KEPT: usize = 8;
 /// A target's `qk:warm`.
 #[derive(Clone, Debug, Default)]
 pub struct Warm {
+    /// What its saves belong to: the task, or the group it shares them with.
+    pub identity: String,
     pub outputs: bool,
     /// Workspace-relative scratch paths.
     pub paths: Vec<String>,
@@ -88,6 +90,7 @@ pub fn config(workspace: &Workspace, task: &Task) -> Result<Option<Warm>> {
                 | "portable"
                 | "key"
                 | "restoreKeys"
+                | "group"
         ) {
             bail!("unknown qk:warm field {key:?}");
         }
@@ -99,7 +102,20 @@ pub fn config(workspace: &Workspace, task: &Task) -> Result<Option<Warm>> {
                 .with_context(|| format!("qk:warm.{name} must be true or false"))
         })
     };
-    let directory = directory(workspace, task);
+    let group = object
+        .get("group")
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|name| !name.is_empty())
+                .context("qk:warm.group must be a name")
+        })
+        .transpose()?;
+    if group.is_some() && (object.contains_key("outputs") || object.contains_key("paths")) {
+        bail!("a qk:warm.group shares {{warm}} alone; outputs and paths belong to one task");
+    }
+    let identity = group.map_or_else(|| task.id.clone(), |group| format!("group {group}"));
+    let directory = directory(workspace, &identity);
     let directory_text = directory.to_str().context("warm directory must be UTF-8")?;
     let expand = |text: &str| -> Result<String> {
         let text = paths::expand(workspace, &task.project, text)?;
@@ -190,6 +206,7 @@ pub fn config(workspace: &Workspace, task: &Task) -> Result<Option<Warm>> {
         })
         .transpose()?;
     Ok(Some(Warm {
+        identity,
         outputs: flag("outputs", false)?,
         paths,
         env,
@@ -203,11 +220,11 @@ pub fn config(workspace: &Workspace, task: &Task) -> Result<Option<Warm>> {
     }))
 }
 
-/// The directory `{warm}` names for a task, in the worktree's state.
-pub fn directory(workspace: &Workspace, task: &Task) -> PathBuf {
+/// The directory `{warm}` names for a task or group, in the worktree's state.
+fn directory(workspace: &Workspace, identity: &str) -> PathBuf {
     paths::worktree_state(&workspace.root)
         .join("warm")
-        .join(&blake3::hash(task.id.as_bytes()).to_hex()[..32])
+        .join(&blake3::hash(identity.as_bytes()).to_hex()[..32])
 }
 
 /// Two tasks in a run cannot keep the same scratch path, since both would
@@ -366,7 +383,7 @@ fn locations(workspace: &Workspace, task: &Task, warm: &Warm) -> Result<Vec<Loca
     if warm.directory {
         locations.push(Location {
             name: "directory",
-            base: directory(workspace, task),
+            base: directory(workspace, &warm.identity),
             outputs: None,
         });
     }
@@ -511,42 +528,56 @@ fn now_ms() -> u64 {
         .map_or(0, |duration| duration.as_millis() as u64)
 }
 
-/// Where a worktree notes what it last restored for a task.
-fn restored_files_path(workspace: &Workspace, task: &Task) -> PathBuf {
+/// Where a worktree notes what it last restored for a task or group.
+fn restored_files_path(workspace: &Workspace, warm: &Warm) -> PathBuf {
     paths::worktree_state(&workspace.root)
         .join("warm-restored")
-        .join(format!("{}.json", hash32(&task.id)))
+        .join(format!("{}.json", hash32(&warm.identity)))
 }
 
-fn read_restored_files(workspace: &Workspace, task: &Task) -> RestoredFiles {
-    fs::read(restored_files_path(workspace, task))
+fn read_restored_files(workspace: &Workspace, warm: &Warm) -> RestoredFiles {
+    fs::read(restored_files_path(workspace, warm))
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default()
 }
 
 impl Cache {
-    /// The file-name prefix every save of the task shares.
-    fn warm_prefix(&self, task: &Task) -> String {
+    /// The file-name prefix every save of a task or group shares.
+    fn warm_prefix(&self, identity: &str) -> String {
         hash32(&format!(
-            "{}\0{}\0{}",
-            task.id,
+            "{identity}\0{}\0{}",
             std::env::consts::OS,
             std::env::consts::ARCH
         ))
     }
 
-    fn warm_record(&self, task: &Task, record: &Record) -> PathBuf {
+    /// Serializes restoring and saving a task's or group's state, which the
+    /// tasks of a group may do at once.
+    fn lock_warm(&self, warm: &Warm) -> Result<fs::File> {
+        let directory = self.root.join("locks");
+        fs::create_dir_all(&directory)?;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(directory.join(format!("warm-{}", self.warm_prefix(&warm.identity))))?;
+        fs2::FileExt::lock_exclusive(&file)?;
+        Ok(file)
+    }
+
+    fn warm_record(&self, record: &Record) -> PathBuf {
         self.root.join("warm").join(format!(
             "{}-{}.json",
-            self.warm_prefix(task),
+            self.warm_prefix(&record.task),
             hash32(&format!("{}\0{}", record.worktree, record.key.join("\0")))
         ))
     }
 
-    /// Every save of the task, newest first.
-    fn warm_records(&self, task: &Task) -> Vec<(PathBuf, Record)> {
-        let prefix = format!("{}-", self.warm_prefix(task));
+    /// Every save of the task or group, newest first.
+    fn warm_records(&self, warm: &Warm) -> Vec<(PathBuf, Record)> {
+        let prefix = format!("{}-", self.warm_prefix(&warm.identity));
         let mut records: Vec<(PathBuf, Record)> = fs::read_dir(self.root.join("warm"))
             .into_iter()
             .flatten()
@@ -560,7 +591,7 @@ impl Cache {
             .filter_map(|entry| {
                 let record =
                     serde_json::from_slice::<Record>(&fs::read(entry.path()).ok()?).ok()?;
-                (record.version == RECORD_VERSION && record.task == task.id)
+                (record.version == RECORD_VERSION && record.task == warm.identity)
                     .then(|| (entry.path(), record))
             })
             .collect();
@@ -576,13 +607,12 @@ impl Cache {
     fn choose_warm(
         &self,
         workspace: &Workspace,
-        task: &Task,
         warm: &Warm,
         current: &[String],
     ) -> Option<(Record, String)> {
         let own = worktree(workspace);
         let mut candidates: Vec<(u8, bool, Record)> = self
-            .warm_records(task)
+            .warm_records(warm)
             .into_iter()
             .filter_map(|(_, record)| {
                 let quality = key_match(warm, current, &record.key)?;
@@ -622,8 +652,8 @@ impl Cache {
         Some((record, source))
     }
 
-    fn store_warm(&self, task: &Task, record: &Record) -> Result<()> {
-        let path = self.warm_record(task, record);
+    fn store_warm(&self, record: &Record) -> Result<()> {
+        let path = self.warm_record(record);
         let directory = path.parent().context("warm records have a directory")?;
         fs::create_dir_all(directory)?;
         let mut file = tempfile::NamedTempFile::new_in(self.root.join("tmp"))?;
@@ -644,8 +674,9 @@ impl Cache {
         warm: &Warm,
     ) -> Result<Restored> {
         let mut restored = Restored::default();
+        let _lock = self.lock_warm(warm)?;
         let current = key_digests(workspace, warm)?;
-        let (record, source) = match self.choose_warm(workspace, task, warm, &current) {
+        let (record, source) = match self.choose_warm(workspace, warm, &current) {
             Some(chosen) => chosen,
             None => match self.remote_warm(workspace, task, warm, &current) {
                 Some((record, branch)) => (record, format!("remote {branch}")),
@@ -654,7 +685,7 @@ impl Cache {
         };
         let keep_mtimes = warm.preserve_mtimes && source == "local";
         restored.source = source;
-        let mut noted = read_restored_files(workspace, task);
+        let mut noted = read_restored_files(workspace, warm);
         for location in locations(workspace, task, warm)? {
             let Some(group) = record.groups.get(location.name) else {
                 continue;
@@ -717,7 +748,7 @@ impl Cache {
             restored.groups.push(location.name.to_owned());
         }
         if !restored.groups.is_empty() {
-            let path = restored_files_path(workspace, task);
+            let path = restored_files_path(workspace, warm);
             fs::create_dir_all(path.parent().context("restore notes have a directory")?)?;
             fs::write(path, serde_json::to_vec(&noted)?)?;
         }
@@ -738,20 +769,20 @@ impl Cache {
             .as_ref()
             .filter(|_| warm.remote && warm.portable)?;
         for branch in branches(workspace) {
-            match remote.fetch_warm(&self.root, &task.id, &branch) {
+            match remote.fetch_warm(&self.root, &warm.identity, &branch) {
                 Ok(Some(bytes)) => {
                     let record =
                         serde_json::from_slice::<Record>(&bytes)
                             .ok()
                             .filter(|record| {
-                                record.version == RECORD_VERSION && record.task == task.id
+                                record.version == RECORD_VERSION && record.task == warm.identity
                             })?;
                     // A branch's save that does not suit this checkout gives
                     // way to the next branch's.
                     if key_match(warm, current, &record.key).is_none() {
                         continue;
                     }
-                    if self.store_warm(task, &record).is_err() {
+                    if self.store_warm(&record).is_err() {
                         return None;
                     }
                     return Some((record, branch));
@@ -773,19 +804,20 @@ impl Cache {
     /// save. A file whose metadata matches this worktree's last save or
     /// restore keeps its blob unread.
     pub(crate) fn save_warm(&self, workspace: &Workspace, task: &Task, warm: &Warm) -> Result<()> {
+        let _lock = self.lock_warm(warm)?;
         let own = worktree(workspace);
         let key = key_digests(workspace, warm)?;
-        let records = self.warm_records(task);
+        let records = self.warm_records(warm);
         // This worktree's save under the same key, else under any.
         let previous = records
             .iter()
             .filter(|(_, record)| record.worktree == own)
             .min_by_key(|(_, record)| record.key != key)
             .map(|(_, record)| record);
-        let noted = read_restored_files(workspace, task);
+        let noted = read_restored_files(workspace, warm);
         let mut record = Record {
             version: RECORD_VERSION,
-            task: task.id.clone(),
+            task: warm.identity.clone(),
             worktree: own.clone(),
             commit: current_commit(workspace),
             saved: now_ms(),
@@ -860,11 +892,11 @@ impl Cache {
             }
             record.groups.insert(location.name.to_owned(), group);
         }
-        self.store_warm(task, &record)?;
-        let _ = fs::remove_file(restored_files_path(workspace, task));
+        self.store_warm(&record)?;
+        let _ = fs::remove_file(restored_files_path(workspace, warm));
         // The oldest saves beyond the kept number go; the blobs they alone
         // cite are evicted with the cache.
-        let saved = self.warm_record(task, &record);
+        let saved = self.warm_record(&record);
         for (path, _) in records
             .into_iter()
             .filter(|(path, _)| *path != saved)
@@ -881,7 +913,12 @@ impl Cache {
             for group in record.groups.values_mut() {
                 group.stamps.clear();
             }
-            remote.upload_warm(&self.root, &task.id, &branch, serde_json::to_vec(&record)?);
+            remote.upload_warm(
+                &self.root,
+                &warm.identity,
+                &branch,
+                serde_json::to_vec(&record)?,
+            );
         }
         Ok(())
     }
