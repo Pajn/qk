@@ -93,6 +93,7 @@ const config = JSON.parse(readFileSync(external ? join(goldens, "parity.json") :
 const taskGraphs = config.taskGraphs ?? {};
 const affectedCases = config.affected ?? {};
 const runCases = config.runs ?? {};
+const inspections = config.inspections ?? {};
 const scratchRoot = mkdtempSync(join(tmpdir(), "qk-parity-"));
 process.on("exit", () => rmSync(scratchRoot, { recursive: true, force: true }));
 
@@ -210,6 +211,10 @@ if (command === "capture") {
       `${JSON.stringify({ tasks: { tasks: kept, dependencies: tasks.dependencies, continuousDependencies: tasks.continuousDependencies } }, null, 2)}\n`,
     );
   }
+  for (const [name, spec] of Object.entries(inspections)) {
+    const result = run(nx, spec.args);
+    writeFileSync(join(goldens, `inspect-${name}.json`), `${JSON.stringify(inspectionFields(JSON.parse(result.stdout), spec.fields), null, 2)}\n`);
+  }
   for (const [name, spec] of Object.entries(affectedCases)) {
     const affected = onCase(name, spec, (revisions) => run(nx, affectedArgs(revisions)));
     writeFileSync(join(goldens, `affected-${name}.json`), `${JSON.stringify(JSON.parse(lastLine(affected.stdout)).sort())}\n`);
@@ -287,6 +292,12 @@ for (const [name, args] of Object.entries(taskGraphs)) {
   const plan = run(qk, ["run-many", ...withoutConfiguration(args), "--graph=stdout"]);
   timings[`tasks ${name}`] = plan.milliseconds;
   check(`task graph ${name} matches`, compareTaskGraphs(readJson(join(goldens, `tasks-${name}.json`)).tasks, JSON.parse(plan.stdout).tasks));
+}
+
+// Inspect the fields shared by both standalone configuration models.
+for (const [name, spec] of Object.entries(inspections)) {
+  const result = run(qk, spec.args);
+  check(`inspection ${name} matches`, diffValues(readJson(join(goldens, `inspect-${name}.json`)), inspectionFields(JSON.parse(result.stdout), spec.fields)));
 }
 
 // Affected projects: the same set, or exactly the accepted difference.
@@ -449,4 +460,15 @@ function diffValues(expected, actual, path = "") {
   return [...new Set([...Object.keys(expected), ...Object.keys(actual)])].flatMap((key) =>
     diffValues(expected[key], actual[key], `${path}.${key}`),
   );
+}
+
+// Nx Cloud injects this input even with NX_NO_CLOUD; distributed caching is
+// outside qk's scope. Keep declared categories and omit empty arrays.
+function inspectionFields(value, fields) {
+  return Object.fromEntries(fields.flatMap((key) => {
+    const item = key === "environment" && Array.isArray(value[key])
+      ? value[key].filter((name) => name !== "NX_CLOUD_ENCRYPTION_KEY")
+      : value[key];
+    return item === undefined || (Array.isArray(item) && item.length === 0) ? [] : [[key, item]];
+  }));
 }

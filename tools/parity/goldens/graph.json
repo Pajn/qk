@@ -460,7 +460,13 @@
             "typecheck-app": {
               "cache": true,
               "inputs": [
-                "production"
+                "production",
+                {
+                  "env": "TYPECHECK_MODE"
+                },
+                {
+                  "runtime": "node --version"
+                }
               ],
               "executor": "nx:run-commands",
               "options": {
