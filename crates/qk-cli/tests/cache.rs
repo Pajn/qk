@@ -1789,3 +1789,43 @@ fn dependency_output_glob_skips_directories() {
         stderr(&output)
     );
 }
+
+/// Nx ignore rules exclude tracked inputs and support negated file entries.
+#[test]
+fn nxignore_filters_cache_inputs_and_reloads_rules() {
+    let fixture = Fixture::new(target(
+        "build",
+        json!({"inputs":["{projectRoot}/src/**/*"]}),
+    ));
+    fs::create_dir_all(fixture.root.join("src/ignored")).unwrap();
+    fs::write(fixture.root.join("src/ignored/skip.txt"), "one").unwrap();
+    fs::write(fixture.root.join("src/ignored/keep.txt"), "one").unwrap();
+    fs::write(
+        fixture.root.join(".nxignore"),
+        "src/ignored/**\n!src/ignored/keep.txt\n",
+    )
+    .unwrap();
+    fixture.git(&fixture.root, &["add", "src/ignored"]);
+    success(fixture.build(&fixture.root, &[]));
+    fs::write(fixture.root.join("src/ignored/skip.txt"), "two").unwrap();
+    let output = success(fixture.build(&fixture.root, &[]));
+    assert!(
+        stderr(&output).contains("qk: cache hit app:build"),
+        "{}",
+        stderr(&output)
+    );
+    fs::write(fixture.root.join("src/ignored/keep.txt"), "two").unwrap();
+    let output = success(fixture.build(&fixture.root, &[]));
+    assert!(
+        stderr(&output).contains("qk: cache miss app:build"),
+        "{}",
+        stderr(&output)
+    );
+    fs::write(fixture.root.join(".nxignore"), "").unwrap();
+    let output = success(fixture.build(&fixture.root, &[]));
+    assert!(
+        stderr(&output).contains("qk: cache miss app:build"),
+        "{}",
+        stderr(&output)
+    );
+}

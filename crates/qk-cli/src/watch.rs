@@ -40,6 +40,7 @@ struct View {
     files: BTreeSet<String>,
     outputs: Vec<qk_cache::Outputs>,
     cache: PathBuf,
+    ignore: qk_cache::SourceIgnore,
 }
 
 impl View {
@@ -93,6 +94,7 @@ impl View {
                 }
             }
         }
+        let ignore = qk_cache::SourceIgnore::new(&workspace.root)?;
         let files = qk_cache::source_files(&workspace.root)?;
         let cache = qk_cache::cache_location(&workspace);
         Ok(Self {
@@ -101,13 +103,16 @@ impl View {
             files,
             outputs,
             cache,
+            ignore,
         })
     }
 
     /// Filter runner state and generated artifacts before discovery or callbacks.
     fn ignored(&self, path: &str) -> bool {
-        path.split('/')
-            .any(|part| matches!(part, ".git" | ".qk" | "node_modules"))
+        self.ignore.matches(path)
+            || path
+                .split('/')
+                .any(|part| matches!(part, ".git" | ".qk" | "node_modules"))
             || self.workspace.root.join(path).starts_with(&self.cache)
             || self.outputs.iter().any(|outputs| outputs.matches(path))
     }
