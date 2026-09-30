@@ -144,4 +144,14 @@ against its content hash; an unreadable or corrupt entry is a miss.
 A per-key lock makes concurrent runs of the same task, including runs in
 different worktrees, wait for each other and reuse the result.
 
+Restored files take the time their restore started as their modification
+time. A task restores only after its dependencies finish, and its sources
+were written before the run, so restored outputs are newer than the sources
+they were built from and newer than the outputs of the tasks they depend on.
+Tools that decide what to rebuild by comparing modification times, such as
+`tsc --build`, then find restored outputs up to date. Outputs a worktree
+already holds are stamped again when a dependency's outputs changed in the
+run, so they stay the newer. Symbolic links and directories keep their
+times.
+
 See [remote caching](remote-cache.md) for size limits and cache directory overrides.
