@@ -169,13 +169,14 @@ pub fn run(workspace: &Workspace, options: Options) -> Result<i32> {
         )?;
     }
     eprintln!("qk: watching {} projects", view.selected.len());
+    let mut pending_paths = BTreeSet::new();
     while !cancelled.load(Ordering::SeqCst) {
         let first = match receiver.recv_timeout(Duration::from_millis(100)) {
             Ok(event) => event?,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => bail!("filesystem watcher stopped"),
         };
-        let mut paths = BTreeSet::new();
+        let mut paths = std::mem::take(&mut pending_paths);
         add_event(first, &root, &view, &mut paths);
         if paths.is_empty() {
             continue;
@@ -201,6 +202,8 @@ pub fn run(workspace: &Workspace, options: Options) -> Result<i32> {
             Ok(next) => next,
             Err(error) => {
                 eprintln!("qk: watch configuration not reloaded: {error:#}");
+                // Retry this batch on the next event, such as a completed save.
+                pending_paths = paths;
                 continue;
             }
         };

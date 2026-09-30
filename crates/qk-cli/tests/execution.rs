@@ -1692,6 +1692,32 @@ fn watch_runs_callbacks_for_project_changes_and_cancels() {
         fs::read_to_string(&callbacks).unwrap().lines().count(),
         count
     );
+    // Retain source edits when an editor temporarily writes invalid config.
+    fs::write(root.join("nx.json"), "{").unwrap();
+    fs::write(root.join("lib/input.txt"), "three").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !receive
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .unwrap()
+        .contains("watch configuration not reloaded")
+    {}
+    fs::write(root.join("nx.json"), "{}").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while fs::read_to_string(&callbacks).unwrap().lines().count() == count {
+        assert!(
+            Instant::now() < deadline,
+            "configuration reload lost source edits"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        fs::read_to_string(&callbacks)
+            .unwrap()
+            .lines()
+            .last()
+            .unwrap()
+            .contains("lib/input.txt")
+    );
     Command::new("kill")
         .args(["-INT", &child.id().to_string()])
         .status()
