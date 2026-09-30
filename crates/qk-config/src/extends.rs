@@ -37,7 +37,7 @@ impl From<JsonValue<'_>> for Export {
 /// The file `specifier` names: a path relative to the workspace root, or a
 /// package subpath such as `nx/presets/npm.json`, found in the `node_modules`
 /// of the root or its ancestors through the package's `exports`.
-pub fn resolve(root: &Path, specifier: &str) -> Result<PathBuf> {
+pub fn resolve(root: &Path, specifier: &str) -> Result<Resolved> {
     let relative = specifier.starts_with("./") || specifier.starts_with("../");
     if relative || Path::new(specifier).is_absolute() {
         return file(&root.join(specifier))
@@ -96,7 +96,7 @@ pub fn resolve(root: &Path, specifier: &str) -> Result<PathBuf> {
 
 /// The path, or the path with `.json` appended, as `require.resolve` tries it,
 /// with `.` and `..` segments resolved.
-fn file(path: &Path) -> Option<PathBuf> {
+fn file(path: &Path) -> Option<Resolved> {
     let mut normal = PathBuf::new();
     for component in path.components() {
         match component {
@@ -109,12 +109,24 @@ fn file(path: &Path) -> Option<PathBuf> {
     }
     let path = normal.as_path();
     if path.is_file() {
-        return Some(path.to_owned());
+        return Some(Resolved {
+            path: path.to_owned(),
+            candidate: normal,
+        });
     }
     let mut with_extension = path.as_os_str().to_owned();
     with_extension.push(".json");
     let with_extension = PathBuf::from(with_extension);
-    with_extension.is_file().then_some(with_extension)
+    with_extension.is_file().then_some(Resolved {
+        path: with_extension,
+        candidate: normal,
+    })
+}
+
+/// The selected file and exact path tried before a possible `.json` fallback.
+pub struct Resolved {
+    pub path: PathBuf,
+    pub candidate: PathBuf,
 }
 
 /// Where a package's `exports` send `key`: an exact entry, else the pattern

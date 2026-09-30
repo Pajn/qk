@@ -144,6 +144,8 @@ pub struct Workspace {
     pub extended: Option<String>,
     /// The resolved preset path before symlink canonicalization, when in-workspace.
     pub extended_logical: Option<String>,
+    /// The exact preset candidate tried before `.json` fallback, even if absent.
+    pub extended_candidate: Option<String>,
     /// The nx.json specifier actually resolved, before local overrides are merged.
     pub extended_specifier: Option<String>,
     /// The `nx.local.json` and `project.local.json` files merged in,
@@ -174,13 +176,16 @@ impl Workspace {
         // nx.json's own, and its own `extends` is not followed.
         let mut extended = None;
         let mut extended_specifier = None;
+        let mut extended_candidate = None;
         if let Some(Value::Object(own)) = &mut nx_json
             && let Some(specifier) = own.get("extends")
         {
             let specifier = specifier
                 .as_str()
                 .context("nx.json: extends must be a string")?;
-            let path = extends::resolve(&root, specifier)?;
+            let resolved = extends::resolve(&root, specifier)?;
+            let path = resolved.path;
+            extended_candidate = Some(resolved.candidate);
             extended_specifier = Some(specifier.to_owned());
             let Some(Value::Object(mut base)) = read_optional_json(&path)? else {
                 bail!("cannot read {}", path.display());
@@ -236,6 +241,12 @@ impl Workspace {
                     .map(|path| path.replace('\\', "/"))
             }),
             extended_specifier,
+            extended_candidate: extended_candidate.and_then(|path| {
+                path.strip_prefix(&root)
+                    .ok()?
+                    .to_str()
+                    .map(|path| path.replace('\\', "/"))
+            }),
             extended: extended.and_then(|path| {
                 let path = path.canonicalize().ok().map(simplified)?;
                 let relative = path.strip_prefix(&root).ok()?.to_str()?;

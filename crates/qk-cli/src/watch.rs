@@ -64,10 +64,11 @@ impl View {
         ) || self.preset_file(path)
     }
 
-    /// Observe a preset's logical symlink path as well as its canonical target.
+    /// Observe the preset's exact candidate, logical path and canonical target.
     fn preset_file(&self, path: &str) -> bool {
         self.workspace.extended.as_deref() == Some(path)
             || self.workspace.extended_logical.as_deref() == Some(path)
+            || self.workspace.extended_candidate.as_deref() == Some(path)
     }
 
     /// Existing regular source edits keep ownership and discovery unchanged.
@@ -639,6 +640,48 @@ mod tests {
         assert_eq!(after.workspace.config.extra["marker"], "new");
     }
 
+    /// An ignored exact candidate can supersede the selected `.json` fallback.
+    #[test]
+    fn creating_an_ignored_exact_preset_candidate_reloads_the_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir(root.join("app")).unwrap();
+        for (path, text) in [
+            ("nx.json", r#"{"extends":"./preset"}"#),
+            ("preset.json", r#"{"marker":"old"}"#),
+            (".gitignore", "/preset\n"),
+            ("app/project.json", r#"{"name":"app"}"#),
+            ("app/source.txt", "one"),
+        ] {
+            std::fs::write(root.join(path), text).unwrap();
+        }
+        let options = Options {
+            projects: Vec::new(),
+            all: true,
+            include_dependencies: false,
+            initial_run: false,
+            verbose: false,
+            command: vec!["echo changed".into()],
+        };
+        let before = View::load(root, &options).unwrap();
+        assert!(before.reusable_for(&BTreeSet::from(["app/source.txt".into()])));
+        assert!(before.ignored("preset"));
+        std::fs::write(root.join("preset"), r#"{"marker":"new"}"#).unwrap();
+        let mut paths = BTreeSet::new();
+        assert!(add_event(
+            Event::new(EventKind::Create(notify::event::CreateKind::File))
+                .add_path(root.join("preset")),
+            root,
+            &before,
+            &mut paths
+        ));
+        assert!(paths.contains("preset"));
+        assert!(!before.reusable_for(&paths));
+        let after = View::load(root, &options).unwrap();
+        assert_eq!(after.workspace.config.extra["marker"], "new");
+        assert_eq!(after.workspace.extended_logical.as_deref(), Some("preset"));
+    }
+
     /// Self-ignored policy files remain observable, so removing exclusions works.
     #[test]
     fn self_ignored_policies_can_reload_source_selection() {
@@ -661,6 +704,16 @@ mod tests {
         let view = View::load(root, &options).unwrap();
         assert!(!view.files.contains("app/ignored.txt"));
         let mut paths = BTreeSet::new();
+        add_event(
+            Event::new(EventKind::Any).add_path(root.join("app/ignored.txt")),
+            root,
+            &view,
+            &mut paths,
+        );
+        assert!(
+            paths.is_empty(),
+            "a direct ignored-file event must not queue a callback"
+        );
         for name in [".gitignore", ".nxignore"] {
             assert!(view.ignored(name));
             add_event(

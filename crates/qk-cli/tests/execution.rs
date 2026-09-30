@@ -1866,8 +1866,7 @@ fn watch_portable_queues_changes_ignores_files_and_cancels_callback() {
     fs::write(root.join("app/project.json"), r#"{"name":"app"}"#).unwrap();
     fs::write(root.join("app/first.txt"), "one").unwrap();
     fs::write(root.join("app/second.txt"), "one").unwrap();
-    // Editing an existing ignored file isolates ignore filtering. Creating it
-    // can emit a directory event whose conservative batch includes siblings.
+    // Keep creation events out of the queued-callback sequence.
     fs::write(root.join("app/ignored.txt"), "before watch").unwrap();
     let records = temp.path().join("records");
     fs::create_dir_all(&records).unwrap();
@@ -1900,11 +1899,8 @@ fn watch_portable_queues_changes_ignores_files_and_cancels_callback() {
         .contains("qk: watching")
     {}
     fs::write(root.join("app/ignored.txt"), "ignored").unwrap();
-    std::thread::sleep(Duration::from_millis(500));
-    assert!(
-        !records.join("1.json").exists(),
-        "ignored file caused a callback"
-    );
+    // Native backends may report a parent directory and include eligible
+    // siblings. Check excluded paths in the callback rather than its count.
     fs::write(root.join("app/first.txt"), "two").unwrap();
     wait_for(&records.join("1.json"));
     let first: Value = serde_json::from_slice(&fs::read(records.join("1.json")).unwrap()).unwrap();
