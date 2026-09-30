@@ -232,6 +232,30 @@ fn input_changes_invalidate_and_old_entries_remain() {
 }
 
 #[test]
+fn reset_clears_the_cache_and_worktree_state_but_keeps_history() {
+    let fixture = Fixture::new(target("build", json!({})));
+    success(fixture.build(&fixture.root, &[]));
+    let git = fixture.root.join(".git/qk");
+    assert!(git.join("outputs").exists());
+
+    success(fixture.qk(&fixture.root, &["reset", "--onlyWorkspaceData"]));
+    assert!(!git.join("outputs").exists());
+    assert!(git.join("cache").exists());
+    let hit = success(fixture.build(&fixture.root, &[]));
+    assert!(stderr(&hit).contains("qk: cache hit app:build"));
+
+    success(fixture.qk(&fixture.root, &["reset"]));
+    assert!(!git.join("cache/v1").exists());
+    assert!(git.join("history.db").exists());
+    let miss = success(fixture.build(&fixture.root, &[]));
+    assert!(stderr(&miss).contains("qk: cache miss app:build"));
+    assert_eq!(fixture.runs(), 2);
+    // Nothing left to remove is not an error.
+    success(fixture.qk(&fixture.root, &["reset", "--only-cache"]));
+    success(fixture.qk(&fixture.root, &["reset", "--only-cache"]));
+}
+
+#[test]
 fn linked_worktrees_share_the_cache() {
     let fixture = Fixture::new(target("build", json!({})));
     let linked = fixture.worktree();

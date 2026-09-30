@@ -79,6 +79,22 @@ enum Command {
         #[command(subcommand)]
         command: ShowCommand,
     },
+    /// Remove the cache and this worktree's state, as `nx reset` does. Run
+    /// history is kept.
+    #[command(alias = "clear-cache")]
+    Reset {
+        /// Only the cache, which the repository's worktrees share.
+        #[arg(long, alias = "onlyCache")]
+        only_cache: bool,
+        /// Only this worktree's file digests, output records and warm directories.
+        #[arg(long, alias = "onlyWorkspaceData")]
+        only_workspace_data: bool,
+        /// Nx's daemon and Nx Cloud client, which qk has neither of.
+        #[arg(long, alias = "onlyDaemon", hide = true)]
+        only_daemon: bool,
+        #[arg(long, alias = "onlyCloud", hide = true)]
+        only_cloud: bool,
+    },
     /// Export the workspace project graph as JSON.
     Graph {
         /// Output file; use - or stdout for stdout. Paths are relative to the
@@ -565,7 +581,6 @@ const NX_COMMANDS: &[&str] = &[
     "release",
     "repair",
     "report",
-    "reset",
     "sync",
     "sync:check",
     "view-logs",
@@ -699,6 +714,30 @@ fn run(cli: Cli) -> Result<i32> {
                 pruned.freed,
                 pruned.size
             )?;
+        }
+        Command::Reset {
+            only_cache,
+            only_workspace_data,
+            only_daemon,
+            only_cloud,
+        } => {
+            // As in Nx, no `--only-*` option means everything.
+            let all = !(only_cache || only_workspace_data || only_daemon || only_cloud);
+            let mut stdout = io::stdout().lock();
+            if all || only_cache {
+                let cache = qk_cache::cache_location(&workspace);
+                match std::fs::remove_dir_all(&cache) {
+                    Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                        return Err(error)
+                            .with_context(|| format!("cannot remove {}", cache.display()));
+                    }
+                    _ => writeln!(stdout, "Removed the cache at {}.", cache.display())?,
+                }
+            }
+            if all || only_workspace_data {
+                qk_cache::clear_worktree_state(&workspace.root)?;
+                writeln!(stdout, "Removed this worktree's state.")?;
+            }
         }
         Command::Run { task, options } => {
             let task = if task.contains(':') {

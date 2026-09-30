@@ -24,6 +24,7 @@
 | `qk show task <project:target>` | A task's recent runs and why its cache key changed |
 | `qk cache path` | Print the local cache directory without creating it |
 | `qk cache prune [--max-size 1GB]` | Evict least recently used entries until the cache fits |
+| `qk reset [--only-cache \| --only-workspace-data]` | Remove the cache and this worktree's state, as `nx reset` does |
 
 As in Nx, `qk build web` and `qk web:build` mean `qk run web:build`, and take the
 same options. Without a project, `qk build` and `qk run build` use the project
@@ -114,6 +115,14 @@ Quote name/tag globs so the shell does not expand them.
 `cache path` prints the location without creating it. `cache prune` uses
 `--max-size`, else `NX_MAX_CACHE_SIZE`, else `maxCacheSize`, else the default
 disk fraction. See [Storage limits](../guides/remote-cache.md).
+
+`reset`, or its alias `clear-cache`, removes the local cache and this
+worktree's state: file digests, output records and warm directories. The
+cache is shared by the repository's worktrees, so resetting clears it for
+all of them. Run history and the remote cache are kept. `--only-cache` and
+`--only-workspace-data` (or `--onlyCache` and `--onlyWorkspaceData`) limit it
+to one of the two; `--only-daemon` and `--only-cloud` are accepted without
+effect.
 
 ## Accepted Nx options
 
