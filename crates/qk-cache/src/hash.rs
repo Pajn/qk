@@ -398,7 +398,7 @@ fn under<'a>(files: &'a BTreeSet<String>, prefix: &'a str) -> impl Iterator<Item
         .filter(move |path| path.len() == prefix.len() || path.as_bytes()[prefix.len()] == b'/')
 }
 
-fn source_files(root: &Path) -> Result<BTreeSet<String>> {
+pub fn source_files(root: &Path) -> Result<BTreeSet<String>> {
     let lines =
         |output: std::io::Result<std::process::Output>| -> Option<Result<BTreeSet<String>>> {
             let output = output.ok().filter(|output| output.status.success())?;

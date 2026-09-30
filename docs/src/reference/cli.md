@@ -174,3 +174,24 @@ Both input and output commands accept `--check <values...>`. File and directory
 queries use workspace-relative paths. Inputs also accept declared environment
 variable names and runtime commands. The command exits with 1 if any query does
 not match. `--json` returns each query and its membership result.
+
+## Project watch
+
+`qk watch -p web --includeDependencies -- <shell command>` watches the selected
+projects and, optionally, their project dependencies. `--all` watches all projects,
+including projects created after watch starts. `--initialRun` runs once before
+waiting for edits. The kebab-case aliases also work.
+
+Callbacks run from the invocation directory with `NX_PROJECT_NAME` and
+`NX_FILE_CHANGES` (workspace-relative paths joined with spaces). If the command
+mentions `NX_PROJECT_NAME`, a batch runs concurrently once per changed project;
+otherwise it runs once for the batch with an empty project name. Initial `--all`
+also runs once with an empty project name, matching Nx. Quote the shell command
+so variables expand in the callback rather than in the invoking shell.
+
+Native file events are debounced and changes arriving during a callback are
+queued for the next batch. Callback failures are reported; watch continues.
+Ctrl+C cancels callbacks and their process groups and exits with 130. Ignored
+source files, node_modules, Git/qk state, configured caches, explicit target
+outputs and warm paths do not trigger callbacks. Global files outside any
+selected project do not trigger callbacks. Watch uses no daemon or Nx plugins.

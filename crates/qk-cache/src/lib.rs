@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 
 pub use evict::{Pruned, max_size, parse_size, prune};
 pub use glob::Pattern;
-pub use hash::{Resolved, without_resolution};
+pub use hash::{Resolved, source_files, without_resolution};
 pub use paths::{
     Outputs, cache_directory, cache_location, clear_worktree_state, resolved_outputs,
     worktree_state,

@@ -2,6 +2,7 @@ mod explain;
 mod history;
 mod inspect;
 mod ui;
+mod watch;
 
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -90,6 +91,11 @@ enum Command {
         exclude: Vec<String>,
         #[command(flatten)]
         options: RunOptions,
+    },
+    /// Watch selected projects and run a command when their files change.
+    Watch {
+        #[command(flatten)]
+        options: watch::Options,
     },
     /// Remove the cache and this worktree's state, as `nx reset` does. Run
     /// history is kept.
@@ -610,7 +616,6 @@ const NX_COMMANDS: &[&str] = &[
     "sync",
     "sync:check",
     "view-logs",
-    "watch",
 ];
 
 /// Rewrites Nx's shorthand into `run`: `<target> <project>` and `<project>:<target>`
@@ -751,6 +756,7 @@ fn run(mut cli: Cli) -> Result<i32> {
                 pruned.size
             )?;
         }
+        Command::Watch { options } => return watch::run(&workspace, options),
         Command::Show {
             command: ShowCommand::Target { options },
         } => {
