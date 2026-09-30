@@ -1,5 +1,6 @@
 mod explain;
 mod history;
+mod inspect;
 mod ui;
 
 use std::io::{self, Write};
@@ -469,6 +470,11 @@ enum CacheCommand {
 
 #[derive(Subcommand)]
 enum ShowCommand {
+    /// Inspect a resolved target, its inputs or its outputs.
+    Target {
+        #[command(flatten)]
+        options: inspect::Options,
+    },
     /// List project names in Nx's graph order.
     Projects {
         /// Only projects affected by changes, as `qk affected` selects them.
@@ -724,6 +730,11 @@ fn run(cli: Cli) -> Result<i32> {
                 pruned.freed,
                 pruned.size
             )?;
+        }
+        Command::Show {
+            command: ShowCommand::Target { options },
+        } => {
+            return inspect::show(&workspace, options);
         }
         Command::Exec {
             projects,

@@ -873,6 +873,8 @@ pub struct Resolved {
     /// `pnpm-workspace.yaml` counts without its resolution keys, which reach
     /// tasks through the lockfile instead.
     pub workspace_file: bool,
+    /// Explicit external dependency names, even without a readable lockfile.
+    pub external: BTreeSet<String>,
 }
 
 pub fn resolve(
@@ -968,6 +970,7 @@ pub fn resolve(
         values: resolver.values,
         lockfile,
         workspace_file,
+        external: resolver.external,
     })
 }
 
@@ -986,6 +989,7 @@ pub fn inputs(
         mut values,
         lockfile,
         workspace_file,
+        ..
     } = resolve(snapshot, workspace, task, Some(prepared), cancelled)?;
     let installed = snapshot.installed(&workspace.root)?;
     if let (Some((importers, external)), Some(installed)) = (lockfile, &installed)

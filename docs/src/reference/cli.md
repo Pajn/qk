@@ -152,3 +152,23 @@ effect.
 `--runner`, `--batch`, `--skip-sync`, `--cloud`, `--no-cloud`, `--dte`,
 `--no-dte`, `--agents`, `--tui`, and `--tui-auto-exit` are accepted without
 effect. They do not enable Nx plugins, distributed execution or Nx Cloud.
+
+## Target inspection
+
+`qk show target <project:target[:configuration]> --json` shows the resolved
+executor, options, caching and concurrency settings, and task dependencies.
+`-c <configuration>` selects a configuration. A target name without a project
+uses the current project, as `run` does.
+
+`qk show target inputs <target> --json` lists files and declared environment,
+runtime and dependency-output inputs. `qk show target outputs <target> --json`
+lists resolved output patterns, existing output paths and unresolved templates.
+Without `--json`, inputs and outputs print one entry per line. Inspection does
+not load dotenv files, execute runtime inputs or require a supported executor.
+The listed inputs include qk's mandatory workspace and package configuration
+files; these can differ from Nx's hash plan.
+
+Both input and output commands accept `--check <values...>`. File and directory
+queries use workspace-relative paths. Inputs also accept declared environment
+variable names and runtime commands. The command exits with 1 if any query does
+not match. `--json` returns each query and its membership result.
