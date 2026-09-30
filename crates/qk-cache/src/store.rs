@@ -3,7 +3,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Component, Path};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
@@ -229,10 +229,20 @@ impl Cache {
     }
 
     /// Restores an entry's outputs and log, returning its output fingerprint.
+    ///
+    /// Restored files are stamped with the time the restore starts, which is
+    /// after the task's dependencies finished and after its sources were
+    /// written, so tools that compare modification times, such as `tsc -b`,
+    /// see outputs newer than their inputs and dependents newer than their
+    /// dependencies. Outputs a worktree already holds are kept as they are,
+    /// unless a dependency's outputs changed in this run; then they are
+    /// stamped again to stay newer.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn restore(
         &self,
         root: &Path,
         task: &str,
+        dependencies: &std::collections::BTreeSet<String>,
         key: &str,
         outputs: &Outputs,
         display: &qk_executor::Display,
@@ -253,11 +263,26 @@ impl Cache {
             bail!("corrupt cached log");
         }
         qk_executor::read_capture(File::open(&log)?, |_, _| Ok(()))?;
-        // Outputs this worktree already holds for the key are left as they are.
+        let started = SystemTime::now();
+        // Outputs this worktree already holds for the key are left as they
+        // are; when a stamp fails, they are restored anew.
         if outputs_unchanged(root, task, key, outputs) {
-            qk_executor::replay(File::open(log)?, display, qk_executor::Shown::Kept)?;
-            crate::evict::touch(&self.root.join("entries").join(format!("{key}.json")));
-            return manifest.output_fingerprint(outputs.declared()).map(Some);
+            let changed = {
+                let kept = self.kept.lock().unwrap();
+                dependencies
+                    .iter()
+                    .any(|dependency| !kept.contains(dependency))
+            };
+            if !changed || stamp_outputs(root, outputs, started).is_ok() {
+                if changed {
+                    record_outputs(root, task, key, outputs);
+                } else {
+                    self.kept.lock().unwrap().insert(task.to_owned());
+                }
+                qk_executor::replay(File::open(log)?, display, qk_executor::Shown::Kept)?;
+                crate::evict::touch(&self.root.join("entries").join(format!("{key}.json")));
+                return manifest.output_fingerprint(outputs.declared()).map(Some);
+            }
         }
         // Stage on the destination filesystem; no existing output is touched yet.
         let stage_parent = paths::worktree_state(root).join("restore");
@@ -284,6 +309,8 @@ impl Cache {
                     }
                     // A clone where supported: edits to the restored file never reach the blob.
                     fs::copy(source, &destination)?;
+                    // Before its mode, which may not let it be opened.
+                    set_modified(&destination, started)?;
                     set_mode(&destination, *mode)?;
                 }
                 Artifact::Directory { .. } => {
@@ -351,6 +378,35 @@ fn outputs_record(root: &Path, task: &str) -> std::path::PathBuf {
     paths::worktree_state(root)
         .join("outputs")
         .join(format!("{}.json", &name[..32]))
+}
+
+/// Sets a file's modification time. Unix needs a handle only to read it;
+/// Windows one that may write its attributes.
+fn set_modified(path: &Path, time: SystemTime) -> Result<()> {
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+        fs::OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .open(path)?
+    };
+    #[cfg(not(windows))]
+    let file = File::open(path)?;
+    file.set_modified(time)
+        .with_context(|| format!("cannot set the modification time of {}", path.display()))
+}
+
+/// Stamps every output file with `time`. Links are left alone, since setting
+/// a time through one would change the file it points to.
+fn stamp_outputs(root: &Path, outputs: &Outputs, time: SystemTime) -> Result<()> {
+    for path in outputs.paths(root)? {
+        let absolute = root.join(&path);
+        if fs::symlink_metadata(&absolute)?.is_file() {
+            set_modified(&absolute, time)?;
+        }
+    }
+    Ok(())
 }
 
 /// Moves a staged file or link into place, copying when the worktree's state

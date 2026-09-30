@@ -12,7 +12,9 @@
 // - show projects: configuration and graph loading
 // - graph: the full project graph as JSON
 // - affected, no changes: change detection with a base equal to the head
-// - run-many, all cached: hashing every task and restoring every output
+// - run-many, all cached: hashing every task, with every output kept in place
+// - run-many, restoring outputs: the same with every output restored from the
+//   cache, as after a checkout or a clean
 //
 // Needs hyperfine and git on PATH.
 
@@ -30,6 +32,9 @@ const qk = resolve(option("--qk", "target/release/qk"));
 const projects = Number(option("--projects", "300"));
 const externals = projects * 10;
 const filesPerProject = 10;
+// Each build writes a JavaScript file, a declaration and a source map per
+// source file, and a build info file, as tsc does.
+const outputsPerProject = filesPerProject * 3 + 1;
 
 // A small deterministic generator, so every run benchmarks the same workspace.
 let seed = 42;
@@ -58,13 +63,34 @@ write(
     targetDefaults: {
       build: {
         cache: true,
-        command: "echo built",
+        command: "node ../../build.mjs",
+        options: { cwd: "{projectRoot}" },
         dependsOn: ["^build"],
         inputs: ["production", "^production"],
         outputs: ["{projectRoot}/dist"],
       },
     },
   }),
+);
+write(
+  "build.mjs",
+  [
+    'import { mkdirSync, writeFileSync } from "node:fs";',
+    'mkdirSync("dist", { recursive: true });',
+    `for (let file = 0; file < ${filesPerProject}; file++) {`,
+    '  for (const extension of ["js", "d.ts", "js.map"]) writeFileSync(`dist/file${file}.${extension}`, "x".repeat(1500));',
+    "}",
+    'writeFileSync("dist/tsconfig.tsbuildinfo", "{}");',
+    "",
+  ].join("\n"),
+);
+write(
+  "clean.mjs",
+  [
+    'import { readdirSync, rmSync } from "node:fs";',
+    'for (const project of readdirSync("packages")) rmSync(`packages/${project}/dist`, { recursive: true, force: true });',
+    "",
+  ].join("\n"),
 );
 write("package.json", JSON.stringify({ name: "bench", private: true }));
 write("pnpm-workspace.yaml", "packages:\n  - packages/*\n");
@@ -134,6 +160,8 @@ const commands = [
   ["affected, no changes", `${qk} show projects --affected --base HEAD --head HEAD`],
   ["run-many, all cached", `${qk} run-many -t build --output-style static`],
 ];
+// Commands measured with every output removed before each run.
+const restoring = [["run-many, restoring outputs", `${qk} run-many -t build --output-style static`]];
 const results = join(root, "hyperfine.json");
 const hyperfine = spawnSync(
   "hyperfine",
@@ -142,7 +170,8 @@ const hyperfine = spawnSync(
     "--runs", "10",
     "--export-json", results,
     "--output", "null",
-    ...commands.flatMap(([label, command]) => ["--command-name", label, command]),
+    ...commands.flatMap(([label, command]) => ["--prepare", "node -e 0", "--command-name", label, command]),
+    ...restoring.flatMap(([label, command]) => ["--prepare", "node clean.mjs", "--command-name", label, command]),
   ],
   { cwd: root, stdio: ["ignore", "inherit", "inherit"] },
 );
@@ -152,6 +181,7 @@ const { results: measured } = JSON.parse(readFileSync(results, "utf8"));
 const summary = {
   projects,
   files: projects * (filesPerProject + 1),
+  outputs: projects * outputsPerProject,
   externals,
   commands: Object.fromEntries(
     measured.map((result) => [result.command, { mean: result.mean, stddev: result.stddev, min: result.min, max: result.max }]),
@@ -159,7 +189,7 @@ const summary = {
 };
 const milliseconds = (seconds) => `${(seconds * 1000).toFixed(1)} ms`;
 const markdown = [
-  `qk on ${projects} projects, ${summary.files} files and ${externals} lockfile packages:`,
+  `qk on ${projects} projects, ${summary.files} files, ${summary.outputs} outputs and ${externals} lockfile packages:`,
   "",
   "| Command | Mean | ± | Min | Max |",
   "| --- | --: | --: | --: | --: |",

@@ -29,6 +29,8 @@ pub struct Cache {
     pub root: PathBuf,
     snapshot: OnceLock<std::result::Result<hash::Snapshot, String>>,
     remote: Option<std::sync::Arc<remote::Remote>>,
+    /// The tasks whose outputs this run left exactly as they were.
+    kept: std::sync::Mutex<std::collections::BTreeSet<String>>,
 }
 
 /// A task's output fingerprint for its dependents' keys, or why it has none:
@@ -122,6 +124,7 @@ impl Cache {
             root,
             snapshot: OnceLock::new(),
             remote: None,
+            kept: Default::default(),
         }
     }
 
@@ -339,6 +342,7 @@ impl Cache {
         match self.restore(
             &workspace.root,
             &task.id,
+            &task.dependencies,
             &key,
             &outputs,
             &prepared.display,
@@ -370,6 +374,7 @@ impl Cache {
                 self.restore(
                     &workspace.root,
                     &task.id,
+                    &task.dependencies,
                     &key,
                     &outputs,
                     &prepared.display,
@@ -572,6 +577,7 @@ mod tests {
             .restore(
                 root,
                 "app:build",
+                &Default::default(),
                 &key,
                 &outputs,
                 &qk_executor::Display::Stream,

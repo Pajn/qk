@@ -231,6 +231,46 @@ fn input_changes_invalidate_and_old_entries_remain() {
     assert_eq!(artifact(&fixture.root), "built:one\n");
 }
 
+fn modified(path: &Path) -> std::time::SystemTime {
+    fs::metadata(path).unwrap().modified().unwrap()
+}
+
+#[test]
+fn restored_outputs_are_newer_than_their_inputs_and_dependencies() {
+    let fixture = Fixture::with_targets(json!({
+        "gen": target("generate", json!({"outputs": ["{projectRoot}/generated"]})),
+        "build": target("build", json!({"dependsOn": ["gen"]})),
+    }));
+    success(fixture.build(&fixture.root, &[]));
+    let generated = fixture.root.join("generated/value.txt");
+    let built = fixture.root.join("dist/nested/out.txt");
+
+    // Restored outputs are stamped when restored, not when first cached.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    fs::remove_dir_all(fixture.root.join("generated")).unwrap();
+    fs::remove_dir_all(fixture.root.join("dist")).unwrap();
+    let before = std::time::SystemTime::now();
+    success(fixture.build(&fixture.root, &[]));
+    assert_eq!(fixture.runs(), 2);
+    assert!(modified(&generated) >= before);
+    assert!(modified(&built) >= modified(&generated));
+
+    // A dependent whose outputs are kept is stamped again when its
+    // dependency's outputs are restored, so it stays the newer.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    fs::remove_dir_all(fixture.root.join("generated")).unwrap();
+    let kept = success(fixture.build(&fixture.root, &[]));
+    assert!(stderr(&kept).contains("qk: cache hit app:build"));
+    assert!(modified(&built) >= modified(&generated));
+
+    // With nothing restored, kept outputs are left as they are.
+    let times = (modified(&generated), modified(&built));
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    success(fixture.build(&fixture.root, &[]));
+    assert_eq!((modified(&generated), modified(&built)), times);
+    assert_eq!(fixture.runs(), 2);
+}
+
 #[test]
 fn linked_worktrees_share_the_cache() {
     let fixture = Fixture::new(target("build", json!({})));

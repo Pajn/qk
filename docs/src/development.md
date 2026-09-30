@@ -161,7 +161,9 @@ workflow verifies the packages before requesting its short-lived token.
 `tools/bench/bench.mjs` generates a workspace of 300 projects, 3,300 files
 and a 3,000-package pnpm lockfile, populates the cache, and measures with
 hyperfine: `show projects`, `graph`, `show projects --affected` with no
-changes, and a fully cached `run-many`. It needs hyperfine, git and Node:
+changes, and a fully cached `run-many`, once with every output in place and
+once with every output removed first, so all 9,300 are restored. It needs
+hyperfine, git and Node:
 
 ```sh
 node tools/bench/bench.mjs --qk target/release/qk [--projects 300] [--json out.json] [--markdown out.md]
