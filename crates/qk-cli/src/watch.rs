@@ -212,17 +212,7 @@ pub fn run(workspace: &Workspace, options: Options) -> Result<i32> {
                 continue;
             }
         };
-        let candidates: BTreeSet<_> = view.files.union(&next.files).cloned().collect();
-        let files: BTreeSet<_> = candidates
-            .into_iter()
-            .filter(|file| {
-                paths.iter().any(|path| {
-                    path.is_empty() || file == path || Path::new(file).starts_with(path)
-                }) && !view.ignored(file)
-                    && !next.ignored(file)
-                    && (view.owner(file).is_some() || next.owner(file).is_some())
-            })
-            .collect();
+        let files = changed_files(&view, &next, &paths);
         let projects: BTreeSet<_> = files
             .iter()
             .filter_map(|file| next.owner(file).or_else(|| view.owner(file)))
@@ -233,6 +223,22 @@ pub fn run(workspace: &Workspace, options: Options) -> Result<i32> {
         }
     }
     Ok(130)
+}
+
+/// Select changed sources using current policy, preserving deleted-file ownership.
+fn changed_files(previous: &View, next: &View, paths: &BTreeSet<String>) -> BTreeSet<String> {
+    previous
+        .files
+        .union(&next.files)
+        .filter(|file| {
+            paths
+                .iter()
+                .any(|path| path.is_empty() || *file == path || Path::new(file).starts_with(path))
+                && !next.ignored(file)
+                && (previous.owner(file).is_some() || next.owner(file).is_some())
+        })
+        .cloned()
+        .collect()
 }
 
 /// Recover backend errors by rescanning rather than ending the watch session.
@@ -256,6 +262,10 @@ fn add_event(event: Event, root: &Path, view: &View, paths: &mut BTreeSet<String
             let relative = relative.to_string_lossy().replace('\\', "/");
             // Policy changes must reload even when the old policy ignores itself.
             let policy = matches!(relative.as_str(), ".gitignore" | ".nxignore");
+            if policy {
+                // Source events in this batch may have been hidden by the old policy.
+                paths.insert(String::new());
+            }
             if !relative.is_empty() && (policy || !view.ignored(&relative)) {
                 paths.insert(relative);
             }
@@ -355,6 +365,8 @@ mod tests {
         std::fs::write(root.join(".nxignore"), ".nxignore\n").unwrap();
         let reloaded = View::load(root, &options).unwrap();
         assert!(reloaded.files.contains("app/ignored.txt"));
+        assert!(paths.contains(""));
+        assert!(changed_files(&view, &reloaded, &paths).contains("app/ignored.txt"));
         paths.clear();
         add_event(
             Event::new(EventKind::Any).add_path(root.join("app/ignored.txt")),
