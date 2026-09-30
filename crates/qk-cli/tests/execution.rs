@@ -71,6 +71,29 @@ fn process_helper() {
     let id = std::env::var("QK_TEST_ID").unwrap();
     let root = std::env::current_dir().unwrap();
     match mode.as_str() {
+        "diamond" => {
+            let dependencies: &[&str] = match id.as_str() {
+                "shared" => &[],
+                "a" | "b" => &["shared"],
+                "build" => &["a", "b"],
+                _ => panic!("unknown diamond task"),
+            };
+            for dependency in dependencies {
+                assert_eq!(
+                    fs::read_to_string(root.join(format!("{dependency}.done"))).unwrap(),
+                    format!("{dependency}\n")
+                );
+            }
+            // Each task owns its file; concurrent shell redirects to one file
+            // fail with a sharing violation on Windows.
+            use std::io::Write;
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(root.join(format!("{id}.done")))
+                .unwrap();
+            writeln!(file, "{id}").unwrap();
+        }
         "record" => {
             let values: std::collections::BTreeMap<_, _> = std::env::vars()
                 .filter(|(name, _)| name.starts_with("QK_TEST_"))
@@ -146,19 +169,24 @@ fn wait_for(path: &Path) {
 
 #[test]
 fn dependency_diamond_runs_once_before_dependents_and_streams_raw_output() {
-    let temp = fixture(json!({
-        "build":{"executor":"nx:noop", "dependsOn":["a", "b"]},
-        "a":{"command":"echo a>> order.txt", "dependsOn":["shared"]},
-        "b":{"command":"echo b>> order.txt", "dependsOn":["shared"]},
-        "shared":{"command":"echo shared>> order.txt"},
-        "output":{"command":"echo raw-output"}
-    }));
+    let mut targets = json!({"output":{"command":"echo raw-output"}});
+    for (id, dependencies) in [
+        ("shared", vec![]),
+        ("a", vec!["shared"]),
+        ("b", vec!["shared"]),
+        ("build", vec!["a", "b"]),
+    ] {
+        targets[id] = helper_target("diamond", id);
+        targets[id]["dependsOn"] = json!(dependencies);
+    }
+    let temp = fixture(targets);
     success(run(temp.path(), &["run", "app:build", "--parallel", "2"]));
-    let lines = fs::read_to_string(temp.path().join("order.txt")).unwrap();
-    let lines: Vec<_> = lines.lines().map(str::trim).collect();
-    assert_eq!(lines.len(), 3);
-    assert_eq!(lines[0], "shared");
-    assert!(lines.contains(&"a") && lines.contains(&"b"));
+    for id in ["shared", "a", "b", "build"] {
+        assert_eq!(
+            fs::read_to_string(temp.path().join(format!("{id}.done"))).unwrap(),
+            format!("{id}\n")
+        );
+    }
     let output = success(run(temp.path(), &["run", "app:output"]));
     assert_eq!(
         String::from_utf8(output.stdout).unwrap().trim(),
