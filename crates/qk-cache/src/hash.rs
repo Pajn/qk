@@ -922,6 +922,9 @@ pub fn resolve(
             resolver.selected.insert(path.into());
         }
     }
+    if let Some(extended) = &workspace.extended {
+        resolver.selected.insert(extended.clone());
+    }
     // Package scripts and dependency declarations remain inputs even when filesets exclude them.
     let mut packages = BTreeSet::from([task.project.clone()]);
     let mut pending = packages.clone();

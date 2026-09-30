@@ -79,11 +79,50 @@ enum Command {
         #[command(subcommand)]
         command: ShowCommand,
     },
+    /// Run the command after -- as Nx's exec does: inside a task, as it is;
+    /// from a package script, as that script's target; otherwise in each
+    /// selected project and the projects it depends on, dependencies first.
+    Exec {
+        #[arg(short = 'p', long, value_delimiter = ',', num_args = 1..)]
+        projects: Vec<String>,
+        #[arg(long, value_delimiter = ',', num_args = 1..)]
+        exclude: Vec<String>,
+        #[command(flatten)]
+        options: RunOptions,
+    },
+    /// Remove the cache and this worktree's state, as `nx reset` does. Run
+    /// history is kept.
+    #[command(alias = "clear-cache")]
+    Reset {
+        /// Only the cache, which the repository's worktrees share.
+        #[arg(long, alias = "onlyCache")]
+        only_cache: bool,
+        /// Only this worktree's file digests, output records and warm directories.
+        #[arg(long, alias = "onlyWorkspaceData")]
+        only_workspace_data: bool,
+        /// Nx's daemon and Nx Cloud client, which qk has neither of.
+        #[arg(long, alias = "onlyDaemon", hide = true)]
+        only_daemon: bool,
+        #[arg(long, alias = "onlyCloud", hide = true)]
+        only_cloud: bool,
+    },
     /// Export the workspace project graph as JSON.
     Graph {
-        /// Output file; use - for stdout. Paths are relative to the current directory.
+        /// Output file; use - or stdout for stdout. Paths are relative to the
+        /// current directory.
         #[arg(long, value_name = "PATH", default_value = "-")]
         file: PathBuf,
+        /// Write to stdout, as `--file -`.
+        #[arg(long, conflicts_with = "file")]
+        print: bool,
+        /// Only this project, the projects it depends on and the projects
+        /// depending on it, directly or not.
+        #[arg(long, value_name = "PROJECT")]
+        focus: Option<String>,
+        /// Leave out matching names, globs or tags. As in Nx, the edges of the
+        /// projects kept still name them.
+        #[arg(long, value_delimiter = ',', num_args = 1..)]
+        exclude: Vec<String>,
         /// Add the packages the pnpm lockfile installs as `externalNodes`, with
         /// edges from projects and between packages. `nx graph --file` leaves
         /// them out.
@@ -539,7 +578,6 @@ const NX_COMMANDS: &[&str] = &[
     "add",
     "connect",
     "daemon",
-    "exec",
     "format",
     "format:check",
     "format:write",
@@ -553,7 +591,6 @@ const NX_COMMANDS: &[&str] = &[
     "release",
     "repair",
     "report",
-    "reset",
     "sync",
     "sync:check",
     "view-logs",
@@ -687,6 +724,35 @@ fn run(cli: Cli) -> Result<i32> {
                 pruned.freed,
                 pruned.size
             )?;
+        }
+        Command::Exec {
+            projects,
+            exclude,
+            options,
+        } => return exec(&workspace, &projects, &exclude, options),
+        Command::Reset {
+            only_cache,
+            only_workspace_data,
+            only_daemon,
+            only_cloud,
+        } => {
+            // As in Nx, no `--only-*` option means everything.
+            let all = !(only_cache || only_workspace_data || only_daemon || only_cloud);
+            let mut stdout = io::stdout().lock();
+            if all || only_cache {
+                let cache = qk_cache::cache_location(&workspace);
+                match std::fs::remove_dir_all(&cache) {
+                    Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                        return Err(error)
+                            .with_context(|| format!("cannot remove {}", cache.display()));
+                    }
+                    _ => writeln!(stdout, "Removed the cache at {}.", cache.display())?,
+                }
+            }
+            if all || only_workspace_data {
+                qk_cache::clear_worktree_state(&workspace.root)?;
+                writeln!(stdout, "Removed this worktree's state.")?;
+            }
         }
         Command::Run { task, options } => {
             let task = if task.contains(':') {
@@ -915,15 +981,32 @@ fn run(cli: Cli) -> Result<i32> {
             };
             print_json(project)?;
         }
-        Command::Graph { file, external } => {
-            let graph = ProjectGraph::build(&workspace)?;
+        Command::Graph {
+            file,
+            print,
+            focus,
+            exclude,
+            external,
+        } => {
+            let mut graph = ProjectGraph::build(&workspace)?;
+            if focus.is_some() || !exclude.is_empty() {
+                let mut kept = select_projects(&workspace.projects, &[], &exclude)?;
+                if kept.len() == workspace.projects.len() && !exclude.is_empty() {
+                    eprintln!("qk: warning: --exclude matched no projects");
+                }
+                if let Some(focus) = &focus {
+                    kept = &kept & &graph.related_to(focus)?;
+                }
+                graph.retain(&kept);
+            }
             let mut report = serde_json::to_value(GraphReport { graph: &graph })?;
             if external {
                 external_nodes(&workspace, &mut report["graph"])?;
             }
             let mut bytes = serde_json::to_vec_pretty(&report)?;
             bytes.push(b'\n');
-            if file.as_os_str() == "-" {
+            // As in Nx, `stdout` names stdout rather than a file.
+            if print || file.as_os_str() == "-" || file.as_os_str() == "stdout" {
                 io::stdout().lock().write_all(&bytes)?;
             } else {
                 std::fs::write(&file, bytes)
@@ -1110,6 +1193,165 @@ fn execute_tasks(
     Ok(result.exit_code)
 }
 
+/// `nx exec`. Its command is the arguments, each in double quotes, run in the
+/// shell tasks use, with NX_PROJECT_NAME and NX_PROJECT_ROOT_PATH set.
+fn exec(
+    workspace: &Workspace,
+    projects: &[String],
+    exclude: &[String],
+    mut options: RunOptions,
+) -> Result<i32> {
+    if options.args.is_empty() {
+        bail!("exec needs a command after --");
+    }
+    let command: Vec<String> = options
+        .args
+        .iter()
+        .map(|arg| format!("\"{arg}\""))
+        .collect();
+    let command = command.join(" ");
+    let run = |project: &str, cwd: &std::path::Path| -> Result<i32> {
+        let root = workspace.projects.get(project).map(|project| &project.root);
+        let mut child = qk_executor::shell(&command);
+        child.current_dir(cwd).env("NX_PROJECT_NAME", project);
+        if let Some(root) = root {
+            child.env("NX_PROJECT_ROOT_PATH", root);
+        }
+        let status = child
+            .status()
+            .with_context(|| format!("cannot run {command}"))?;
+        // As in Nx, any failure exits with 1.
+        Ok(i32::from(!status.success()))
+    };
+    // Only a package script's target runs as a task; elsewhere the command
+    // runs as it is, so options that change how tasks run cannot apply.
+    let direct = |enclosed: bool| -> Result<()> {
+        if (options.sandbox.is_some() && !enclosed) || options.dry_run || options.graph.is_some() {
+            bail!(
+                "exec runs the command directly here, so --sandbox, --dry-run and --graph cannot apply; they apply when exec runs a package script's target"
+            );
+        }
+        Ok(())
+    };
+    // Inside a task, the command is the task's.
+    if let Some(project) = std::env::var("NX_TASK_TARGET_PROJECT")
+        .ok()
+        .filter(|project| !project.is_empty())
+    {
+        direct(std::env::var("QK_TASK_SANDBOX").as_deref() == Ok("1"))?;
+        return run(&project, &std::env::current_dir()?);
+    }
+    // From a package script, run that script's target, so it is cached. The
+    // script runs `exec` again, then inside the task.
+    if let Ok(target) = std::env::var("npm_lifecycle_event")
+        && let Ok(project) = current_project(workspace)
+        && let Some(script) = workspace
+            .packages
+            .get(&project)
+            .and_then(|package| package.scripts.get(&target))
+    {
+        if !workspace.projects[&project].targets.contains_key(&target) {
+            let root = &workspace.projects[&project].root;
+            bail!(
+                "{project} has no target {target:?}; is it missing from {root}/package.json's nx.includedScripts?"
+            );
+        }
+        // Arguments beyond those the script gives are the caller's.
+        let given = script
+            .split_whitespace()
+            .skip_while(|word| *word != "--")
+            .skip(1)
+            .count();
+        let args = if given == options.args.len() {
+            Vec::new()
+        } else {
+            options.args.split_off(given.min(options.args.len()))
+        };
+        let request = Request {
+            project,
+            target,
+            configuration: options.configuration(),
+            args,
+        };
+        return execute_tasks(workspace, vec![request], &options, true);
+    }
+    direct(false)?;
+    let selected = select_projects(&workspace.projects, projects, exclude)?;
+    for project in exec_order(workspace, selected, &options)? {
+        let code = run(
+            &project,
+            &workspace.root.join(&workspace.projects[&project].root),
+        )?;
+        if code != 0 {
+            return Ok(code);
+        }
+    }
+    Ok(0)
+}
+
+/// The projects `nx exec` runs in: the selected ones and, unless task
+/// dependencies are excluded, every project they depend on, in waves of
+/// projects whose dependencies have run.
+fn exec_order(
+    workspace: &Workspace,
+    selected: std::collections::BTreeSet<String>,
+    options: &RunOptions,
+) -> Result<Vec<String>> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let graph = ProjectGraph::build(workspace)?;
+    let mut included = selected.clone();
+    if !options.exclude_task_dependencies {
+        let mut pending: Vec<String> = selected.into_iter().collect();
+        while let Some(project) = pending.pop() {
+            for edge in &graph.dependencies[&project] {
+                if graph.nodes.contains_key(&edge.target) && included.insert(edge.target.clone()) {
+                    pending.push(edge.target.clone());
+                }
+            }
+        }
+    }
+    let mut waiting: BTreeMap<String, BTreeSet<String>> = included
+        .iter()
+        .map(|project| {
+            let dependencies = graph.dependencies[project]
+                .iter()
+                .map(|edge| edge.target.clone())
+                .filter(|target| included.contains(target) && target != project)
+                .collect();
+            (project.clone(), dependencies)
+        })
+        .collect();
+    let mut order = Vec::new();
+    while !waiting.is_empty() {
+        let ready: Vec<String> = waiting
+            .iter()
+            .filter(|(_, dependencies)| dependencies.is_empty())
+            .map(|(project, _)| project.clone())
+            .collect();
+        let ready = if ready.is_empty() {
+            if !(options.nx_ignore_cycles || env_flag("NX_IGNORE_CYCLES")) {
+                bail!("cannot run the command: the project graph has a cycle");
+            }
+            eprintln!(
+                "qk: warning: the project graph has a cycle; running the rest in graph order"
+            );
+            waiting.keys().cloned().collect()
+        } else {
+            ready
+        };
+        for project in &ready {
+            waiting.remove(project);
+        }
+        for dependencies in waiting.values_mut() {
+            for project in &ready {
+                dependencies.remove(project);
+            }
+        }
+        order.extend(graph_order(&workspace.projects, ready));
+    }
+    Ok(order)
+}
+
 fn warn_landed(range: Option<&qk_affected::Range>) {
     if let Some(warning) = range.and_then(explain::landed_warning) {
         eprintln!("qk: warning: {warning}");
@@ -1231,9 +1473,13 @@ fn external_nodes(workspace: &Workspace, graph: &mut serde_json::Value) -> Resul
         let Some(direct) = lockfile.direct_snapshots(&project.root) else {
             continue;
         };
-        let edges = graph["dependencies"][&project.name]
-            .as_array_mut()
-            .context("project dependencies must be an array")?;
+        // A project left out of the graph by --focus or --exclude.
+        let Some(edges) = graph["dependencies"]
+            .get_mut(&project.name)
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
         for key in direct {
             edges.push(json!({"source": project.name, "target": node(&key), "type": "static"}));
         }

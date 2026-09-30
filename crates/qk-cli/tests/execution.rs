@@ -28,6 +28,9 @@ fn command(root: &Path, args: &[&str]) -> Command {
         .args(args);
     command.env_remove("NX_PARALLEL");
     command.env_remove("NX_CACHE_DIRECTORY");
+    // What a task or package script running the tests would pass on to exec.
+    command.env_remove("NX_TASK_TARGET_PROJECT");
+    command.env_remove("npm_lifecycle_event");
     command
 }
 
@@ -68,6 +71,29 @@ fn process_helper() {
     let id = std::env::var("QK_TEST_ID").unwrap();
     let root = std::env::current_dir().unwrap();
     match mode.as_str() {
+        "diamond" => {
+            let dependencies: &[&str] = match id.as_str() {
+                "shared" => &[],
+                "a" | "b" => &["shared"],
+                "build" => &["a", "b"],
+                _ => panic!("unknown diamond task"),
+            };
+            for dependency in dependencies {
+                assert_eq!(
+                    fs::read_to_string(root.join(format!("{dependency}.done"))).unwrap(),
+                    format!("{dependency}\n")
+                );
+            }
+            // Each task owns its file; concurrent shell redirects to one file
+            // fail with a sharing violation on Windows.
+            use std::io::Write;
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(root.join(format!("{id}.done")))
+                .unwrap();
+            writeln!(file, "{id}").unwrap();
+        }
         "record" => {
             let values: std::collections::BTreeMap<_, _> = std::env::vars()
                 .filter(|(name, _)| name.starts_with("QK_TEST_"))
@@ -142,20 +168,26 @@ fn wait_for(path: &Path) {
 }
 
 #[test]
+/// Shared dependencies run once before both branches, and raw output stays intact.
 fn dependency_diamond_runs_once_before_dependents_and_streams_raw_output() {
-    let temp = fixture(json!({
-        "build":{"executor":"nx:noop", "dependsOn":["a", "b"]},
-        "a":{"command":"echo a>> order.txt", "dependsOn":["shared"]},
-        "b":{"command":"echo b>> order.txt", "dependsOn":["shared"]},
-        "shared":{"command":"echo shared>> order.txt"},
-        "output":{"command":"echo raw-output"}
-    }));
+    let mut targets = json!({"output":{"command":"echo raw-output"}});
+    for (id, dependencies) in [
+        ("shared", vec![]),
+        ("a", vec!["shared"]),
+        ("b", vec!["shared"]),
+        ("build", vec!["a", "b"]),
+    ] {
+        targets[id] = helper_target("diamond", id);
+        targets[id]["dependsOn"] = json!(dependencies);
+    }
+    let temp = fixture(targets);
     success(run(temp.path(), &["run", "app:build", "--parallel", "2"]));
-    let lines = fs::read_to_string(temp.path().join("order.txt")).unwrap();
-    let lines: Vec<_> = lines.lines().map(str::trim).collect();
-    assert_eq!(lines.len(), 3);
-    assert_eq!(lines[0], "shared");
-    assert!(lines.contains(&"a") && lines.contains(&"b"));
+    for id in ["shared", "a", "b", "build"] {
+        assert_eq!(
+            fs::read_to_string(temp.path().join(format!("{id}.done"))).unwrap(),
+            format!("{id}\n")
+        );
+    }
     let output = success(run(temp.path(), &["run", "app:output"]));
     assert_eq!(
         String::from_utf8(output.stdout).unwrap().trim(),
@@ -1451,4 +1483,129 @@ fn the_sandbox_refuses_what_a_task_does_not_declare_on_linux() {
     // Audit needs reports Landlock does not give.
     let audit = run(temp.path(), &["run", "app:build", "--sandbox"]);
     assert!(String::from_utf8_lossy(&audit.stderr).contains("use --sandbox=enforce"));
+}
+
+#[cfg(unix)]
+#[test]
+/// Nested exec uses existing confinement and rejects unconfined sandbox requests.
+fn exec_inherits_the_enclosing_task_sandbox() {
+    let executable = env!("CARGO_BIN_EXE_qk");
+    let temp = fixture(json!({
+        "build": {"command": format!("\"{executable}\" exec --sandbox=enforce -- echo built")}
+    }));
+    let output = success(run(temp.path(), &["run", "app:build", "--sandbox=enforce"]));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("built"));
+
+    // An unsandboxed task must not inherit a caller-supplied marker.
+    let output = command(temp.path(), &["run", "app:build"])
+        .env("QK_TASK_SANDBOX", "1")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot apply"));
+}
+
+#[cfg(unix)]
+#[test]
+/// Exec selects project order and switches behavior for tasks and package scripts.
+fn exec_runs_in_projects_dependencies_first_as_nx_does() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    fs::write(root.join("nx.json"), "{}").unwrap();
+    for (directory, project) in [
+        ("libs/core", json!({"name": "core"})),
+        (
+            "apps/web",
+            json!({"name": "web", "implicitDependencies": ["core"]}),
+        ),
+        ("tools/other", json!({"name": "other"})),
+    ] {
+        fs::create_dir_all(root.join(directory)).unwrap();
+        fs::write(
+            root.join(directory).join("project.json"),
+            project.to_string(),
+        )
+        .unwrap();
+    }
+    let text = |output: Output| String::from_utf8(success(output).stdout).unwrap();
+    // Each argument is quoted as Nx quotes it, so the shell expands variables.
+    let names = [
+        "exec",
+        "-p",
+        "web",
+        "--",
+        "echo",
+        "$NX_PROJECT_NAME",
+        "$NX_PROJECT_ROOT_PATH",
+    ];
+    assert_eq!(text(run(root, &names)), "core libs/core\nweb apps/web\n");
+    assert!(text(run(root, &["exec", "-p", "core", "--", "pwd"])).ends_with("libs/core\n"));
+    assert_eq!(
+        text(run(
+            root,
+            &[
+                "exec",
+                "-p",
+                "web",
+                "--exclude-task-dependencies",
+                "--",
+                "echo",
+                "$NX_PROJECT_NAME"
+            ]
+        )),
+        "web\n"
+    );
+
+    // The first failure stops the rest, and exits 1.
+    let failed = run(
+        root,
+        &[
+            "exec",
+            "-p",
+            "web",
+            "--",
+            "sh",
+            "-c",
+            "echo $NX_PROJECT_NAME; exit 3",
+        ],
+    );
+    assert_eq!(failed.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&failed.stdout), "core\n");
+
+    // Inside a task, the command runs as it is, for the task's project.
+    let inside = command(root, &["exec", "--", "echo", "$NX_PROJECT_NAME"])
+        .env("NX_TASK_TARGET_PROJECT", "web")
+        .output()
+        .unwrap();
+    assert_eq!(text(inside), "web\n");
+
+    // From a package script, the script's target runs instead.
+    fs::write(
+        root.join("apps/web/package.json"),
+        json!({"name": "web", "scripts": {"build": "qk exec -- echo script"}}).to_string(),
+    )
+    .unwrap();
+    fs::write(
+        root.join("apps/web/project.json"),
+        json!({"name": "web", "targets": {"build": {"command": "echo target"}}}).to_string(),
+    )
+    .unwrap();
+    let script = command(root, &["exec", "--", "echo", "script"])
+        .current_dir(root.join("apps/web"))
+        .env("npm_lifecycle_event", "build")
+        .output()
+        .unwrap();
+    assert!(text(script).contains("target\n"));
+
+    assert!(!run(root, &["exec", "-p", "web"]).status.success());
+
+    // Run directly, the command cannot be sandboxed or dry-run, so asking
+    // for either fails without running it.
+    for option in ["--dry-run", "--sandbox=enforce"] {
+        let refused = run(root, &["exec", option, "--", "touch", "ran"]);
+        assert!(!refused.status.success());
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("cannot apply"));
+    }
+    assert!(!root.join("ran").exists());
+    assert!(!root.join("tools/other/ran").exists());
 }

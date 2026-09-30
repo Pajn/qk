@@ -577,3 +577,156 @@ fn a_local_workspace_file_replaces_filtered_defaults() {
         (json!(1), json!(2))
     );
 }
+
+#[test]
+/// Resolve file and package presets, respecting export conditions and main fallbacks.
+fn nx_json_extends_a_file_or_package_export_one_level() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    write(
+        root,
+        "nx.json",
+        r#"{"extends": "./nx.base.json", "defaultBase": "develop"}"#,
+    );
+    write(
+        root,
+        "nx.base.json",
+        r#"{
+            "extends": "./ignored.json",
+            "defaultBase": "main",
+            "parallel": 5,
+            "namedInputs": {"production": ["default"]}
+        }"#,
+    );
+    write(root, "ignored.json", r#"{"parallel": 9}"#);
+    let workspace = Workspace::load(root).unwrap();
+    // nx.json's own settings win whole, and the base's `extends` is not followed.
+    assert_eq!(workspace.config.default_base.as_deref(), Some("develop"));
+    assert_eq!(workspace.config.extra["parallel"], 5);
+    assert_eq!(
+        workspace.config.named_inputs["production"],
+        [json!("default")]
+    );
+    assert_eq!(workspace.extended.as_deref(), Some("nx.base.json"));
+
+    // A package subpath resolves through the package's exports, as Nx's
+    // `nx/presets/npm.json` does.
+    write(
+        root,
+        "nx.json",
+        r#"{"extends": "@scope/config/presets/shared.json"}"#,
+    );
+    write(
+        root,
+        "node_modules/@scope/config/package.json",
+        r#"{"exports": {
+            "./presets/*": {"custom": "./src/*.json", "default": "./dist/*.json"},
+            "./presets/*.json": {"custom": "./src/*.json", "default": "./dist/*.json"}
+        }}"#,
+    );
+    write(
+        root,
+        "node_modules/@scope/config/dist/shared.json",
+        r#"{"parallel": 2}"#,
+    );
+    let workspace = Workspace::load(root).unwrap();
+    assert_eq!(workspace.config.extra["parallel"], 2);
+    assert_eq!(
+        workspace.extended.as_deref(),
+        Some("node_modules/@scope/config/dist/shared.json")
+    );
+
+    // Conditions apply in the order they are declared, as in Node.
+    write(
+        root,
+        "node_modules/@scope/config/package.json",
+        r#"{"exports": {"./presets/*.json": {"default": "./dist/*.json", "require": "./src/*.json"}}}"#,
+    );
+    write(
+        root,
+        "node_modules/@scope/config/src/shared.json",
+        r#"{"parallel": 7}"#,
+    );
+    assert_eq!(Workspace::load(root).unwrap().config.extra["parallel"], 2);
+
+    // Without exports, a bare package resolves to its `main`, else `index`.
+    write(
+        root,
+        "node_modules/plain/package.json",
+        r#"{"main": "preset.json"}"#,
+    );
+    write(root, "node_modules/plain/preset.json", r#"{"parallel": 4}"#);
+    write(root, "nx.json", r#"{"extends": "plain"}"#);
+    assert_eq!(Workspace::load(root).unwrap().config.extra["parallel"], 4);
+    write(root, "node_modules/plain/package.json", "{}");
+    write(root, "node_modules/plain/index.json", r#"{"parallel": 6}"#);
+    assert_eq!(Workspace::load(root).unwrap().config.extra["parallel"], 6);
+
+    write(
+        root,
+        "node_modules/plain/package.json",
+        r#"{"main": "./presets"}"#,
+    );
+    write(
+        root,
+        "node_modules/plain/presets/index.json",
+        r#"{"parallel": 8}"#,
+    );
+    assert_eq!(Workspace::load(root).unwrap().config.extra["parallel"], 8);
+    write(
+        root,
+        "node_modules/plain/package.json",
+        r#"{"main": "missing"}"#,
+    );
+    assert_eq!(Workspace::load(root).unwrap().config.extra["parallel"], 6);
+
+    for exports in [
+        r#"{".": {"require": null, "default": "./preset.json"}}"#,
+        r#"{".": {"node": {"require": null}, "default": "./preset.json"}}"#,
+    ] {
+        write(
+            root,
+            "node_modules/plain/package.json",
+            &format!(r#"{{"exports": {exports}}}"#),
+        );
+        assert!(format!("{:#}", Workspace::load(root).unwrap_err()).contains("does not export"));
+    }
+    // An unresolved nested condition allows the next active condition.
+    write(
+        root,
+        "node_modules/plain/package.json",
+        r#"{"exports": {".": {"node": {"import": null}, "default": "./preset.json"}}}"#,
+    );
+    assert_eq!(Workspace::load(root).unwrap().config.extra["parallel"], 4);
+
+    write(root, "nx.json", r#"{"extends": "missing/preset.json"}"#);
+    let error = Workspace::load(root).unwrap_err();
+    assert!(format!("{error:#}").contains("no node_modules contains missing"));
+}
+
+// A package manager such as pnpm links packages into node_modules; the
+// extended file is keyed by its real path, since keys read no input through a
+// link.
+#[cfg(unix)]
+#[test]
+fn nx_json_extends_a_linked_package_by_its_real_path() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    write(root, "nx.json", r#"{"extends": "linked/preset.json"}"#);
+    write(
+        root,
+        "node_modules/.pnpm/linked@1.0.0/node_modules/linked/preset.json",
+        r#"{"parallel": 2}"#,
+    );
+    std::os::unix::fs::symlink(
+        ".pnpm/linked@1.0.0/node_modules/linked",
+        root.join("node_modules/linked"),
+    )
+    .unwrap();
+    let workspace = Workspace::load(root).unwrap();
+    assert_eq!(workspace.config.extra["parallel"], 2);
+    assert_eq!(
+        workspace.extended.as_deref(),
+        Some("node_modules/.pnpm/linked@1.0.0/node_modules/linked/preset.json")
+    );
+}

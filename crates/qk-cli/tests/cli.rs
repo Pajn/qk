@@ -405,6 +405,52 @@ fn graph_can_include_the_packages_the_lockfile_installs() {
 }
 
 #[test]
+/// Graph filtering follows dependency closures and preserves Nx edge behavior.
+fn graph_focus_and_exclude_keep_what_nx_keeps() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/parity/fixture");
+    let graph = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_qk"))
+            .args(["--workspace", root.to_str().unwrap(), "graph"])
+            .args(args)
+            .output()
+            .unwrap();
+        successful_json(output)["graph"].clone()
+    };
+    let names =
+        |object: &Value| -> Vec<String> { object.as_object().unwrap().keys().cloned().collect() };
+    // What `nx graph --file=stdout --focus=ui` keeps: ui's dependencies and dependents.
+    let focused = graph(&["--focus", "ui"]);
+    assert_eq!(
+        names(&focused["nodes"]),
+        ["@fixture/utils", "tooling", "ui", "web", "web-e2e"]
+    );
+    assert_eq!(names(&focused["nodes"]), names(&focused["dependencies"]));
+    // Nx keeps web-e2e's edge to the excluded web.
+    let excluded = graph(&["--focus", "ui", "--exclude", "web", "--print"]);
+    assert_eq!(
+        names(&excluded["nodes"]),
+        ["@fixture/utils", "tooling", "ui", "web-e2e"]
+    );
+    assert_eq!(excluded["dependencies"]["web-e2e"][0]["target"], "web");
+    assert_eq!(graph(&["--file", "stdout"]), graph(&[]));
+    let external = graph(&["--focus", "web", "--external"]);
+    assert!(external["dependencies"].get("mobile").is_none());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_qk"))
+        .args([
+            "--workspace",
+            root.to_str().unwrap(),
+            "graph",
+            "--focus",
+            "missing",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
 fn show_projects_filters_by_type_and_target_like_nx() {
     let text = |args: &[&str]| {
         let output = qk(args);

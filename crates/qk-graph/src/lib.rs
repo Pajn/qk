@@ -195,6 +195,30 @@ impl ProjectGraph {
         }
         Ok(visited)
     }
+
+    /// The project, the projects it depends on and the projects depending on
+    /// it, transitively: the projects `nx graph --focus` keeps.
+    pub fn related_to(&self, project: &str) -> Result<BTreeSet<String>> {
+        let mut related = self.dependents_of(&BTreeSet::from([project.to_owned()]))?;
+        let mut visited = BTreeSet::from([project]);
+        let mut pending = vec![project];
+        while let Some(name) = pending.pop() {
+            for edge in self.dependencies.get(name).into_iter().flatten() {
+                if visited.insert(&edge.target) {
+                    related.insert(edge.target.clone());
+                    pending.push(&edge.target);
+                }
+            }
+        }
+        Ok(related)
+    }
+
+    /// Keeps only the named projects. As in Nx, the kept projects' edges stay
+    /// as they are, including those to projects left out.
+    pub fn retain(&mut self, projects: &BTreeSet<String>) {
+        self.nodes.retain(|name, _| projects.contains(name));
+        self.dependencies.retain(|name, _| projects.contains(name));
+    }
 }
 
 /// A node's `type`, as Nx's `getProjectType` derives it.

@@ -1,6 +1,7 @@
 //! Workspace discovery and normalization. Configuration is never executed.
 
 mod discovery;
+mod extends;
 mod normalize;
 
 use std::collections::BTreeMap;
@@ -138,6 +139,9 @@ pub struct Workspace {
     pub projects: BTreeMap<String, Project>,
     /// Package manifests indexed by normalized project name.
     pub packages: BTreeMap<String, Package>,
+    /// The file nx.json `extends`, workspace-relative, when it is inside the
+    /// workspace.
+    pub extended: Option<String>,
     /// The `nx.local.json` and `project.local.json` files merged in,
     /// workspace-relative.
     pub local_overrides: Vec<String>,
@@ -161,7 +165,24 @@ impl Workspace {
         if !root.is_dir() {
             bail!("workspace is not a directory: {}", root.display());
         }
-        let nx_json = read_optional_json(&root.join("nx.json"))?;
+        let mut nx_json = read_optional_json(&root.join("nx.json"))?;
+        // As in Nx, the extended file's settings are replaced, not merged, by
+        // nx.json's own, and its own `extends` is not followed.
+        let mut extended = None;
+        if let Some(Value::Object(own)) = &mut nx_json
+            && let Some(specifier) = own.get("extends")
+        {
+            let specifier = specifier
+                .as_str()
+                .context("nx.json: extends must be a string")?;
+            let path = extends::resolve(&root, specifier)?;
+            let Some(Value::Object(mut base)) = read_optional_json(&path)? else {
+                bail!("cannot read {}", path.display());
+            };
+            base.extend(std::mem::take(own));
+            *own = base;
+            extended = Some(path);
+        }
         let local = read_optional_json(&root.join(LOCAL_WORKSPACE))?;
         let has_local = local.is_some();
         let nx_json = match (nx_json, local) {
@@ -200,6 +221,13 @@ impl Workspace {
             config,
             projects: BTreeMap::new(),
             packages: BTreeMap::new(),
+            // Canonical, as a package manager may link the package in: keys
+            // read no input through a link.
+            extended: extended.and_then(|path| {
+                let path = path.canonicalize().ok().map(simplified)?;
+                let relative = path.strip_prefix(&root).ok()?.to_str()?;
+                Some(relative.replace('\\', "/"))
+            }),
             local_overrides: if has_local {
                 vec![LOCAL_WORKSPACE.to_owned()]
             } else {
