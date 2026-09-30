@@ -54,6 +54,20 @@ pub struct Warm {
     pub preserve_mtimes: bool,
     /// Whether another worktree's save, or the remote's, may be restored.
     pub portable: bool,
+    /// What decides whether a save suits this checkout, in order.
+    pub key: Vec<KeyPart>,
+    /// How many leading parts of the key a save must match when none matches
+    /// it whole, or `None` to restore only exact matches.
+    pub restore_keys: Option<usize>,
+}
+
+/// One part of a warm key.
+#[derive(Clone, Debug)]
+pub enum KeyPart {
+    /// A workspace-relative file, by its content.
+    File(String),
+    /// An environment variable, by its value.
+    Env(String),
 }
 
 /// The target's `qk:warm`, or `None` without one.
@@ -65,7 +79,15 @@ pub fn config(workspace: &Workspace, task: &Task) -> Result<Option<Warm>> {
     for key in object.keys() {
         if !matches!(
             key.as_str(),
-            "outputs" | "paths" | "env" | "maxSize" | "remote" | "mtimes" | "portable"
+            "outputs"
+                | "paths"
+                | "env"
+                | "maxSize"
+                | "remote"
+                | "mtimes"
+                | "portable"
+                | "key"
+                | "restoreKeys"
         ) {
             bail!("unknown qk:warm field {key:?}");
         }
@@ -132,6 +154,41 @@ pub fn config(workspace: &Workspace, task: &Task) -> Result<Option<Warm>> {
         Some(Some("preserve")) => true,
         Some(_) => bail!("qk:warm.mtimes must be \"epoch\" or \"preserve\""),
     };
+    const KEY_SHAPE: &str = "qk:warm.key must be an array of paths and {\"env\": name} objects";
+    let mut key = Vec::new();
+    for part in object
+        .get("key")
+        .map(|value| value.as_array().context(KEY_SHAPE))
+        .transpose()?
+        .into_iter()
+        .flatten()
+    {
+        key.push(match part {
+            Value::String(path) => {
+                let path = paths::expand(workspace, &task.project, path)?;
+                paths::validate_path(&path)?;
+                KeyPart::File(path)
+            }
+            Value::Object(object) if object.len() == 1 => KeyPart::Env(
+                object
+                    .get("env")
+                    .and_then(Value::as_str)
+                    .context(KEY_SHAPE)?
+                    .to_owned(),
+            ),
+            _ => bail!(KEY_SHAPE),
+        });
+    }
+    let restore_keys = object
+        .get("restoreKeys")
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|count| usize::try_from(count).ok())
+                .filter(|count| *count <= key.len())
+                .context("qk:warm.restoreKeys must be a count no larger than qk:warm.key")
+        })
+        .transpose()?;
     Ok(Some(Warm {
         outputs: flag("outputs", false)?,
         paths,
@@ -141,6 +198,8 @@ pub fn config(workspace: &Workspace, task: &Task) -> Result<Option<Warm>> {
         remote: flag("remote", true)?,
         preserve_mtimes,
         portable: flag("portable", true)?,
+        key,
+        restore_keys,
     }))
 }
 
@@ -214,6 +273,9 @@ pub(crate) struct Record {
     commit: Option<String>,
     /// When it was saved, in milliseconds since the Unix epoch.
     saved: u64,
+    /// A digest of each part of the target's warm key when it was saved.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    key: Vec<String>,
     groups: BTreeMap<String, Group>,
 }
 
@@ -379,6 +441,60 @@ fn current_commit(workspace: &Workspace) -> Option<String> {
     (output.status.success() && !commit.is_empty()).then_some(commit)
 }
 
+/// A digest of each part of the warm key, as this checkout has them.
+fn key_digests(workspace: &Workspace, warm: &Warm) -> Result<Vec<String>> {
+    warm.key
+        .iter()
+        .map(|part| {
+            Ok(match part {
+                KeyPart::File(path) => {
+                    paths::safe_parents(&workspace.root, path)?;
+                    let absolute = workspace.root.join(path);
+                    if absolute.is_file() {
+                        format!("file:{}", digest_file(&absolute)?)
+                    } else {
+                        "file:absent".to_owned()
+                    }
+                }
+                KeyPart::Env(name) => match std::env::var(name) {
+                    Ok(value) => format!("env:{}", hash32(&value)),
+                    Err(_) => "env:unset".to_owned(),
+                },
+            })
+        })
+        .collect()
+}
+
+/// How well a save's key suits this checkout: `Some(0)` when it matches
+/// whole, `Some(1)` when it matches only in the leading parts `restoreKeys`
+/// allows, `None` when it does not suit.
+fn key_match(warm: &Warm, current: &[String], saved: &[String]) -> Option<u8> {
+    if saved == current {
+        return Some(0);
+    }
+    let count = warm.restore_keys?;
+    (saved.len() == current.len() && saved[..count] == current[..count]).then_some(1)
+}
+
+/// How many commits `commit` is behind the checkout's `HEAD`, or `None` when
+/// it is not an ancestor of it.
+fn behind(workspace: &Workspace, commit: &str) -> Option<u64> {
+    let ancestor = paths::git(
+        &workspace.root,
+        &["merge-base", "--is-ancestor", commit, "HEAD"],
+    )
+    .ok()?;
+    if !ancestor.status.success() {
+        return None;
+    }
+    let output = paths::git(
+        &workspace.root,
+        &["rev-list", "--count", &format!("{commit}..HEAD")],
+    )
+    .ok()?;
+    String::from_utf8(output.stdout).ok()?.trim().parse().ok()
+}
+
 fn hash32(text: &str) -> String {
     blake3::hash(text.as_bytes()).to_hex()[..32].to_owned()
 }
@@ -424,7 +540,7 @@ impl Cache {
         self.root.join("warm").join(format!(
             "{}-{}.json",
             self.warm_prefix(task),
-            hash32(&record.worktree)
+            hash32(&format!("{}\0{}", record.worktree, record.key.join("\0")))
         ))
     }
 
@@ -452,27 +568,57 @@ impl Cache {
         records
     }
 
-    /// The save to restore from, and how to name where it came from: this
-    /// worktree's own, else, when the state is portable, the newest other.
+    /// The save to restore from, and how to name where it came from. A save
+    /// whose key matches whole comes before one that matches in part; then
+    /// this worktree's own before another's, which only a portable target
+    /// restores; then the one made at the commit nearest behind `HEAD`; then
+    /// the newest.
     fn choose_warm(
         &self,
         workspace: &Workspace,
         task: &Task,
         warm: &Warm,
+        current: &[String],
     ) -> Option<(Record, String)> {
         let own = worktree(workspace);
-        let mut records = self.warm_records(task);
-        if let Some(index) = records
+        let mut candidates: Vec<(u8, bool, Record)> = self
+            .warm_records(task)
+            .into_iter()
+            .filter_map(|(_, record)| {
+                let quality = key_match(warm, current, &record.key)?;
+                let other = record.worktree != own;
+                (!other || warm.portable).then_some((quality, other, record))
+            })
+            .collect();
+        // Newest first within each rank, as warm_records returned them.
+        candidates.sort_by_key(|(quality, other, _)| (*quality, *other));
+        let rank = candidates
+            .first()
+            .map(|(quality, other, _)| (*quality, *other))?;
+        let tied = candidates
             .iter()
-            .position(|(_, record)| record.worktree == own)
-        {
-            return Some((records.swap_remove(index).1, "local".to_owned()));
-        }
-        if !warm.portable {
-            return None;
-        }
-        let (_, record) = records.into_iter().next()?;
-        let source = format!("worktree {}", record.worktree);
+            .take_while(|(quality, other, _)| (*quality, *other) == rank)
+            .count();
+        let index = if tied > 1 {
+            (0..tied)
+                .min_by_key(|&index| {
+                    let behind = candidates[index]
+                        .2
+                        .commit
+                        .as_deref()
+                        .and_then(|commit| behind(workspace, commit));
+                    (behind.is_none(), behind, index)
+                })
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let (_, other, record) = candidates.swap_remove(index);
+        let source = if other {
+            format!("worktree {}", record.worktree)
+        } else {
+            "local".to_owned()
+        };
         Some((record, source))
     }
 
@@ -498,9 +644,10 @@ impl Cache {
         warm: &Warm,
     ) -> Result<Restored> {
         let mut restored = Restored::default();
-        let (record, source) = match self.choose_warm(workspace, task, warm) {
+        let current = key_digests(workspace, warm)?;
+        let (record, source) = match self.choose_warm(workspace, task, warm, &current) {
             Some(chosen) => chosen,
-            None => match self.remote_warm(workspace, task, warm) {
+            None => match self.remote_warm(workspace, task, warm, &current) {
                 Some((record, branch)) => (record, format!("remote {branch}")),
                 None => return Ok(restored),
             },
@@ -584,6 +731,7 @@ impl Cache {
         workspace: &Workspace,
         task: &Task,
         warm: &Warm,
+        current: &[String],
     ) -> Option<(Record, String)> {
         let remote = self
             .remote
@@ -598,6 +746,11 @@ impl Cache {
                             .filter(|record| {
                                 record.version == RECORD_VERSION && record.task == task.id
                             })?;
+                    // A branch's save that does not suit this checkout gives
+                    // way to the next branch's.
+                    if key_match(warm, current, &record.key).is_none() {
+                        continue;
+                    }
                     if self.store_warm(task, &record).is_err() {
                         return None;
                     }
@@ -621,10 +774,13 @@ impl Cache {
     /// restore keeps its blob unread.
     pub(crate) fn save_warm(&self, workspace: &Workspace, task: &Task, warm: &Warm) -> Result<()> {
         let own = worktree(workspace);
+        let key = key_digests(workspace, warm)?;
         let records = self.warm_records(task);
+        // This worktree's save under the same key, else under any.
         let previous = records
             .iter()
-            .find(|(_, record)| record.worktree == own)
+            .filter(|(_, record)| record.worktree == own)
+            .min_by_key(|(_, record)| record.key != key)
             .map(|(_, record)| record);
         let noted = read_restored_files(workspace, task);
         let mut record = Record {
@@ -633,6 +789,7 @@ impl Cache {
             worktree: own.clone(),
             commit: current_commit(workspace),
             saved: now_ms(),
+            key,
             groups: BTreeMap::new(),
         };
         for location in locations(workspace, task, warm)? {

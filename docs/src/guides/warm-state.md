@@ -47,7 +47,26 @@ its outputs, as Ninja does, need to skip unchanged work; another worktree's
 save is still dated to the epoch. State that records the checkout's absolute
 path, such as CMake build directories, is useless or harmful in another
 worktree: `portable: false` restores only the worktree's own save and keeps
-it out of the remote store. Groups over
+it out of the remote store.
+
+A `key` restricts restores to saves that suit the checkout, such as those
+built with the same toolchain:
+
+```jsonc
+"qk:warm": {
+  "paths": ["{projectRoot}/android/app/.cxx"],
+  "key": ["{workspaceRoot}/pnpm-lock.yaml", { "env": "ANDROID_NDK_VERSION" }],
+  "restoreKeys": 1
+}
+```
+
+Each part is a file, by its content, or an environment variable, by its
+value. A save is restored when its key matches whole, or, with `restoreKeys`,
+when it matches in that many leading parts; one that matches whole is
+preferred. Among saves that suit equally, the worktree's own comes first,
+then the one made at the commit nearest behind `HEAD` in Git history, then
+the newest, so a worktree cut from `main` starts from `main`'s state rather
+than the last feature branch's. Groups over
 their `maxSize` are not saved. Warm state counts toward the
 cache's size limit and is evicted with it. `--skip-cache` neither restores
 nor saves it, and leaves the variables unset. Two tasks in one run cannot

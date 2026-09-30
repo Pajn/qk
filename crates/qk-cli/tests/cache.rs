@@ -1201,6 +1201,94 @@ fn preserved_modification_times_come_back_only_to_their_worktree() {
 }
 
 #[cfg(unix)]
+fn said_with(fixture: &Fixture, root: &Path, env: &[(&str, &str)]) -> String {
+    let mut command = fixture.command(root, &["run", "app:build"]);
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    stdout(&success(command.output().unwrap()))
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+#[cfg(unix)]
+#[test]
+fn a_warm_key_restores_only_saves_that_match_it() {
+    let fixture = Fixture::new(scratch_target(json!({
+        "paths": ["{projectRoot}/scratch"],
+        "key": ["{projectRoot}/toolchain.txt"]
+    })));
+    fs::write(fixture.root.join("toolchain.txt"), "1\n").unwrap();
+    assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
+    fs::remove_dir_all(fixture.root.join("scratch")).unwrap();
+    fs::write(fixture.root.join("toolchain.txt"), "2\n").unwrap();
+    assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
+    // Back on the first toolchain, its save is still kept.
+    fs::remove_dir_all(fixture.root.join("scratch")).unwrap();
+    fs::write(fixture.root.join("toolchain.txt"), "1\n").unwrap();
+    assert_eq!(said(&fixture, &fixture.root, &[]), "repo");
+}
+
+#[cfg(unix)]
+#[test]
+fn restore_keys_accept_a_save_matching_the_leading_parts() {
+    let fixture = Fixture::new(scratch_target(json!({
+        "paths": ["{projectRoot}/scratch"],
+        "key": ["{projectRoot}/toolchain.txt", {"env": "DEPENDENCIES"}],
+        "restoreKeys": 1
+    })));
+    fs::write(fixture.root.join("toolchain.txt"), "1\n").unwrap();
+    let run =
+        |dependencies: &str| said_with(&fixture, &fixture.root, &[("DEPENDENCIES", dependencies)]);
+    assert_eq!(run("a"), "cold");
+    fs::remove_dir_all(fixture.root.join("scratch")).unwrap();
+    assert_eq!(run("b"), "repo");
+    fs::remove_dir_all(fixture.root.join("scratch")).unwrap();
+    fs::write(fixture.root.join("toolchain.txt"), "2\n").unwrap();
+    assert_eq!(run("b"), "cold");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_new_worktree_prefers_the_save_nearest_behind_its_head() {
+    let fixture = Fixture::new(scratch_target(json!({"paths": ["{projectRoot}/scratch"]})));
+    let base = fixture.root.parent().unwrap();
+    assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
+    // A newer save, made on a commit the next worktree does not have.
+    let linked = fixture.worktree();
+    fixture.git(
+        &linked,
+        &[
+            "-c",
+            "user.name=qk",
+            "-c",
+            "user.email=qk@example.invalid",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "ahead",
+        ],
+    );
+    assert_eq!(said(&fixture, &linked, &[]), "repo");
+    let third = base.join("third");
+    fixture.git(
+        &fixture.root,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            third.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    assert_eq!(said(&fixture, &third, &[]), "repo");
+}
+
+#[cfg(unix)]
 #[test]
 fn local_overrides_change_the_task_and_its_key() {
     let fixture = Fixture::new(json!({

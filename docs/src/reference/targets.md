@@ -141,6 +141,8 @@ An object describing reusable scratch state:
 | `remote` | boolean | `true`; permit sharing warm state remotely |
 | `portable` | boolean | `true`; restore another worktree's or the remote's save |
 | `mtimes` | `"epoch"` or `"preserve"` | `"epoch"`; `"preserve"` keeps a worktree's own save's modification times |
+| `key` | array of workspace paths and `{"env": name}` objects | Empty; a save is restored only where the key matches |
+| `restoreKeys` | count | None; how many leading `key` parts a save must match when none matches whole |
 
 Put it beside `inputs` and `outputs`, rather than in executor `options`.
 Warm state is restored on misses and uncached runs, saved after success,
