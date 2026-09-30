@@ -241,11 +241,22 @@ for (const policy of ["git", "nxignore"]) {
       if (sample >= 2) samples.push((Number(readFileSync(record, 'utf8')) - start) / 1000);
     }
   } finally {
-    if (child.pid) { try { process.kill(-child.pid, 'SIGINT'); } catch {} }
+    const signal = value => {
+      try { process.kill(-child.pid, value); }
+      catch { try { child.kill(value); } catch {} }
+    };
+    if (child.pid) signal('SIGINT');
     await Promise.race([closed, delay(3000)]);
     if (!ended && child.pid) {
-      try { process.kill(-child.pid, 'SIGKILL'); } catch {}
-      await closed;
+      signal('SIGKILL');
+      await Promise.race([closed, delay(3000)]);
+    }
+    if (!ended) {
+      // A failed termination must not keep Node alive through child handles.
+      child.unref();
+      child.stdout.destroy();
+      child.stderr.destroy();
+      throw new Error('watch benchmark could not stop its child process');
     }
   }
   const mean = samples.reduce((a, b) => a + b, 0) / samples.length;
