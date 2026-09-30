@@ -114,10 +114,12 @@ rounded down with a minimum of one task. `--skip-nx-cache` and
 | `--base <revision>` | Base: `NX_BASE`, then `defaultBase`, then `main` |
 | `--head <revision>` | Head: `NX_HEAD`, otherwise working tree |
 | `--files <paths>` | Replace Git comparison with named workspace-relative paths |
+| `--stdin` | Read changed workspace-relative paths from stdin, one per line; an empty list means no changes |
 | `--uncommitted` | Only uncommitted changes |
 | `--untracked` | Only untracked files |
 
-`show projects` change options imply `--affected`. For `show tasks`, use
+`show projects` change options imply `--affected`. `--stdin` preserves spaces
+in paths and conflicts with `--files`, `--uncommitted` and `--untracked`. For `show tasks`, use
 `--affected` to filter the planned tasks. `affected --granularity task`
 selects by task inputs; `project` is the default.
 See [Affected selection](../guides/affected.md) for merge-base behavior.

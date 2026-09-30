@@ -581,3 +581,70 @@ fn inspects_targets_inputs_and_outputs_without_running_commands() {
         .success()
     );
 }
+
+/// Stdin file selection preserves spaces and treats empty input as no changes.
+#[test]
+fn affected_reads_changed_paths_from_stdin() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    std::fs::write(root.join("nx.json"), "{}").unwrap();
+    std::fs::create_dir_all(root.join("app/src")).unwrap();
+    std::fs::write(
+        root.join("app/project.json"),
+        r#"{"name":"app","targets":{"build":{"executor":"nx:noop"}}}"#,
+    )
+    .unwrap();
+    std::fs::write(root.join("app/src/a file.ts"), "source").unwrap();
+    let run = |args: &[&str], input: &str| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_qk"))
+            .current_dir(root)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+    assert_eq!(
+        successful_json(run(
+            &["show", "projects", "--stdin", "--json"],
+            "app/src/a file.ts\r\n\n"
+        )),
+        json!(["app"])
+    );
+    assert_eq!(
+        successful_json(run(&["show", "projects", "--stdin", "--json"], "")),
+        json!([])
+    );
+    assert!(
+        run(
+            &["affected", "-t", "build", "--stdin"],
+            "app/src/a file.ts\n"
+        )
+        .status
+        .success()
+    );
+    assert!(
+        !run(
+            &[
+                "show",
+                "projects",
+                "--stdin",
+                "--files",
+                "app/src/a file.ts"
+            ],
+            ""
+        )
+        .status
+        .success()
+    );
+}

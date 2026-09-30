@@ -33,6 +33,8 @@ pub struct Options {
     pub base: Option<String>,
     pub head: Option<String>,
     pub files: Vec<String>,
+    /// An explicitly supplied list can be empty, such as empty stdin.
+    pub explicit_files: bool,
     pub uncommitted: bool,
     pub untracked: bool,
 }
@@ -367,8 +369,11 @@ impl<'a> Changes<'a> {
             .unwrap_or_else(|| default_base.clone());
         let head_revision = head.as_deref().unwrap_or("HEAD");
         let (merged, upstream) = merge_base(root, &requested, head_revision);
-        let range =
-            (options.files.is_empty() && !options.uncommitted && !options.untracked).then(|| {
+        let range = (options.files.is_empty()
+            && !options.explicit_files
+            && !options.uncommitted
+            && !options.untracked)
+            .then(|| {
                 let default_branch = upstream_of(root, &default_base).or_else(|| {
                     git_lines(root, &["rev-parse", "--verify", "--quiet", &default_base])
                         .ok()
@@ -385,7 +390,7 @@ impl<'a> Changes<'a> {
                 }
             });
         let base = Some(merged);
-        let files = if !options.files.is_empty() {
+        let files = if options.explicit_files || !options.files.is_empty() {
             options.files.clone()
         } else if options.uncommitted {
             uncommitted(root)?
