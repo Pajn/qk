@@ -190,6 +190,8 @@ impl Cache {
         cancelled: &AtomicBool,
     ) -> Result<TaskResult> {
         let cacheable = task.definition.cache == Some(true);
+        // Held until the task is done, whether it ran or came from the cache.
+        let _kept = warm::keep_across(workspace, graph, task);
         let warm = match warm::config(workspace, task) {
             Ok(warm) => warm,
             Err(error) => {

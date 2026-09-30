@@ -144,6 +144,7 @@ An object describing reusable scratch state:
 | `key` | array of workspace paths and `{"env": name}` objects | Empty; a save is restored only where the key matches |
 | `restoreKeys` | count | None; how many leading `key` parts a save must match when none matches whole |
 | `group` | string | None; share `{warm}` and its saves with every target naming the group |
+| `survive` | array of targets, `target` or `project:target` | Empty; keep `paths` across these dependencies |
 
 Put it beside `inputs` and `outputs`, rather than in executor `options`.
 Warm state is restored on misses and uncached runs, saved after success,

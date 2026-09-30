@@ -1357,6 +1357,92 @@ fn excluded_warm_paths_are_neither_saved_nor_inputs() {
     assert_eq!(said(&fixture, &fixture.root, &[]), "state");
 }
 
+/// A prebuild that recreates `native/`, and a build that keeps
+/// `native/build` in it and prints the year its state was written.
+#[cfg(unix)]
+fn survive_targets(prebuild: &str) -> Value {
+    json!({
+        "prebuild": {"command": prebuild},
+        "build": {
+            "command": "if [ -f native/build/state ]; then date -r native/build/state +%Y; else echo cold; fi; mkdir -p native/build; touch native/build/state",
+            "dependsOn": ["prebuild"],
+            "qk:warm": {"paths": ["{projectRoot}/native/build"], "survive": ["prebuild"]}
+        }
+    })
+}
+
+#[cfg(unix)]
+#[test]
+fn surviving_paths_outlast_a_dependency_that_deletes_them() {
+    let fixture = Fixture::with_targets(survive_targets(
+        "rm -rf native && mkdir -p native && echo generated > native/config",
+    ));
+    assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
+    // Kept as it was, not restored from the save, which would date it 1970.
+    let year = said(&fixture, &fixture.root, &[]);
+    assert_ne!(year, "1970");
+    assert_ne!(year, "cold");
+    // What the dependency generated beside them stays.
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("native/config")).unwrap(),
+        "generated\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn surviving_paths_come_back_when_the_dependency_fails() {
+    let fixture = Fixture::with_targets(survive_targets("mkdir -p native"));
+    assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
+    let failing = survive_targets("rm -rf native; exit 3");
+    fs::write(
+        fixture.root.join("project.json"),
+        json!({"name": "app", "targets": failing}).to_string(),
+    )
+    .unwrap();
+    let output = fixture.build(&fixture.root, &[]);
+    assert!(!output.status.success());
+    assert!(fixture.root.join("native/build/state").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn surviving_paths_left_aside_by_a_killed_run_come_back() {
+    let fixture = Fixture::with_targets(survive_targets("mkdir -p native"));
+    assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
+    let slow = survive_targets("sleep 3");
+    fs::write(
+        fixture.root.join("project.json"),
+        json!({"name": "app", "targets": slow}).to_string(),
+    )
+    .unwrap();
+    let mut running = fixture
+        .command(&fixture.root, &["run", "app:build"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    // Killed while the dependency runs, with the paths moved aside.
+    let moved = || !fixture.root.join("native/build/state").exists();
+    for _ in 0..100 {
+        if moved() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(moved());
+    running.kill().unwrap();
+    running.wait().unwrap();
+    fs::write(
+        fixture.root.join("project.json"),
+        json!({"name": "app", "targets": survive_targets("true")}).to_string(),
+    )
+    .unwrap();
+    let year = said(&fixture, &fixture.root, &[]);
+    assert_ne!(year, "1970");
+    assert_ne!(year, "cold");
+}
+
 #[cfg(unix)]
 #[test]
 fn local_overrides_change_the_task_and_its_key() {

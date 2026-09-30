@@ -61,6 +61,9 @@ pub struct Warm {
     /// How many leading parts of the key a save must match when none matches
     /// it whole, or `None` to restore only exact matches.
     pub restore_keys: Option<usize>,
+    /// Dependencies that delete the paths, which are moved aside while one
+    /// runs: `target` in the task's project, or `project:target`.
+    pub survive: Vec<String>,
 }
 
 /// One part of a warm key.
@@ -91,6 +94,7 @@ pub fn config(workspace: &Workspace, task: &Task) -> Result<Option<Warm>> {
                 | "key"
                 | "restoreKeys"
                 | "group"
+                | "survive"
         ) {
             bail!("unknown qk:warm field {key:?}");
         }
@@ -115,6 +119,25 @@ pub fn config(workspace: &Workspace, task: &Task) -> Result<Option<Warm>> {
         bail!("a qk:warm.group shares {{warm}} alone; outputs and paths belong to one task");
     }
     let identity = group.map_or_else(|| task.id.clone(), |group| format!("group {group}"));
+    const SURVIVE_SHAPE: &str = "qk:warm.survive must be an array of target names";
+    let survive = object
+        .get("survive")
+        .map(|value| {
+            value
+                .as_array()
+                .context(SURVIVE_SHAPE)?
+                .iter()
+                .map(|target| {
+                    target
+                        .as_str()
+                        .filter(|target| !target.is_empty())
+                        .map(str::to_owned)
+                        .context(SURVIVE_SHAPE)
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
     let directory = directory(workspace, &identity);
     let directory_text = directory.to_str().context("warm directory must be UTF-8")?;
     let expand = |text: &str| -> Result<String> {
@@ -221,6 +244,7 @@ pub fn config(workspace: &Workspace, task: &Task) -> Result<Option<Warm>> {
         portable: flag("portable", true)?,
         key,
         restore_keys,
+        survive,
     }))
 }
 
@@ -241,6 +265,182 @@ impl Warm {
             .cloned()
             .collect()
     }
+}
+
+/// Paths moved aside while a dependency that deletes them runs, and moved
+/// back, over whatever it left there, when this is dropped.
+#[derive(Default)]
+pub struct Kept {
+    stashes: Vec<Stash>,
+}
+
+/// One task's paths, moved into its directory in the worktree's state.
+#[derive(Default, Serialize, Deserialize)]
+struct Stash {
+    #[serde(skip)]
+    root: PathBuf,
+    #[serde(skip)]
+    workspace: PathBuf,
+    /// Each moved path, relative to the workspace, by the order it was moved.
+    moved: Vec<String>,
+}
+
+impl Stash {
+    fn manifest(root: &std::path::Path) -> PathBuf {
+        root.join("moved.json")
+    }
+
+    /// Moves the paths back, replacing what is there now, and removes the
+    /// stash.
+    fn put_back(&self) {
+        for (index, path) in self.moved.iter().enumerate().rev() {
+            let kept = self.root.join(index.to_string());
+            if fs::symlink_metadata(&kept).is_err() {
+                continue;
+            }
+            let original = self.workspace.join(path);
+            if let Err(error) = remove(&original).and_then(|()| {
+                if let Some(parent) = original.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::rename(&kept, &original)
+            }) {
+                qk_executor::status!("qk: could not put {path} back ({error})");
+            }
+        }
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+fn remove(path: &std::path::Path) -> std::io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path),
+        Ok(_) => fs::remove_file(path),
+    }
+}
+
+impl Drop for Kept {
+    fn drop(&mut self) {
+        for stash in self.stashes.iter().rev() {
+            stash.put_back();
+        }
+    }
+}
+
+/// Whether `entry`, from `owner`'s `survive`, names `task`.
+fn names(owner: &Task, entry: &str, task: &Task) -> bool {
+    match entry.split_once(':') {
+        Some((project, target)) => task.project == project && task.target == target,
+        None => task.project == owner.project && task.target == entry,
+    }
+}
+
+/// Whether `from` depends on `on`, directly or through other tasks.
+fn depends_on(graph: &TaskGraph, from: &str, on: &str) -> bool {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut next = vec![from];
+    while let Some(id) = next.pop() {
+        for dependency in graph
+            .tasks
+            .get(id)
+            .into_iter()
+            .flat_map(|task| &task.dependencies)
+        {
+            if dependency == on {
+                return true;
+            }
+            if seen.insert(dependency.as_str()) {
+                next.push(dependency);
+            }
+        }
+    }
+    false
+}
+
+/// Moves aside the warm paths of every task in the graph that depends on
+/// `task` and names it in `survive`, so that `task` cannot delete them.
+pub fn keep_across(workspace: &Workspace, graph: &TaskGraph, task: &Task) -> Kept {
+    let mut kept = Kept::default();
+    for owner in graph.tasks.values() {
+        let Ok(Some(warm)) = config(workspace, owner) else {
+            continue;
+        };
+        if !warm.survive.iter().any(|entry| names(owner, entry, task))
+            || !depends_on(graph, &owner.id, &task.id)
+        {
+            continue;
+        }
+        match stash(workspace, owner, &warm) {
+            Ok(stash) => kept.stashes.push(stash),
+            Err(error) => qk_executor::status!(
+                "qk: {}: warm paths not kept across {} ({error:#})",
+                owner.id,
+                task.id
+            ),
+        }
+    }
+    kept
+}
+
+fn stash(workspace: &Workspace, owner: &Task, warm: &Warm) -> Result<Stash> {
+    let root = paths::worktree_state(&workspace.root)
+        .join("warm-kept")
+        .join(hash32(&owner.id));
+    // A stash left by a run that was stopped goes back first.
+    if let Ok(bytes) = fs::read(Stash::manifest(&root)) {
+        let mut left: Stash = serde_json::from_slice(&bytes).unwrap_or_default();
+        left.root = root.clone();
+        left.workspace = workspace.root.clone();
+        for (index, path) in left.moved.clone().iter().enumerate() {
+            if fs::symlink_metadata(workspace.root.join(path)).is_ok() {
+                let _ = remove(&root.join(index.to_string()));
+            }
+        }
+        left.put_back();
+    }
+    let _ = fs::remove_dir_all(&root);
+    let kept = Outputs::from_paths(&warm.kept_paths())?.paths(&workspace.root)?;
+    // The topmost paths only: moving one moves what is below it.
+    let topmost: Vec<String> = kept
+        .iter()
+        .filter(|path| {
+            !std::path::Path::new(path.as_str())
+                .ancestors()
+                .skip(1)
+                .any(|ancestor| {
+                    ancestor
+                        .to_str()
+                        .is_some_and(|ancestor| kept.contains(ancestor))
+                })
+        })
+        .cloned()
+        .collect();
+    let mut stash = Stash {
+        root: root.clone(),
+        workspace: workspace.root.clone(),
+        moved: Vec::new(),
+    };
+    if topmost.is_empty() {
+        return Ok(stash);
+    }
+    fs::create_dir_all(&root)?;
+    for path in topmost {
+        paths::safe_parents(&workspace.root, &path)?;
+        stash.moved.push(path.clone());
+        fs::write(Stash::manifest(&root), serde_json::to_vec(&stash)?)?;
+        if let Err(error) = fs::rename(
+            workspace.root.join(&path),
+            root.join((stash.moved.len() - 1).to_string()),
+        ) {
+            stash.moved.pop();
+            fs::write(Stash::manifest(&root), serde_json::to_vec(&stash)?)?;
+            stash.put_back();
+            return Err(error.into());
+        }
+    }
+    Ok(stash)
 }
 
 /// Two tasks in a run cannot keep the same scratch path, since both would

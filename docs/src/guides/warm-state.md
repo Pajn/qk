@@ -52,6 +52,28 @@ path, such as CMake build directories, is useless or harmful in another
 worktree: `portable: false` restores only the worktree's own save and keeps
 it out of the remote store.
 
+A step that regenerates a directory can take build state with it, as
+`expo prebuild --clean` deletes an Android project together with Gradle's
+build directories. `survive` names such dependencies:
+
+```jsonc
+"android": {
+  "dependsOn": ["prebuild-android"],
+  "qk:warm": {
+    "paths": ["{projectRoot}/android/.gradle", "{projectRoot}/android/app/build"],
+    "survive": ["prebuild-android"]
+  }
+}
+```
+
+Before a named dependency runs, or is restored from the cache, qk moves the
+task's `paths` into the worktree's state, and after it finishes, whether it
+succeeded or not, moves them back over whatever it left there. They keep
+their files and modification times without being stored or copied, and a
+run that is stopped moves them back at the next one. An entry names a target
+in the task's project, or `project:target`, and applies to the dependency in
+any configuration. What the dependency writes beside the paths stays.
+
 A `key` restricts restores to saves that suit the checkout, such as those
 built with the same toolchain:
 
