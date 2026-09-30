@@ -241,6 +241,7 @@ for (const policy of ["git", "nxignore"]) {
       if (sample >= 2) samples.push((Number(readFileSync(record, 'utf8')) - start) / 1000);
     }
   } finally {
+    /** Stop the process group, falling back to the direct child where needed. */
     const signal = value => {
       try { process.kill(-child.pid, value); }
       catch { try { child.kill(value); } catch {} }

@@ -13,6 +13,7 @@ const packages = resolve(values.packages);
 const binary = resolve(values.binary);
 const scratch = mkdtempSync(join(tmpdir(), 'qk install smoke '));
 const env = { ...process.env, npm_config_cache: join(scratch, 'npm-cache'), npm_config_update_notifier: 'false' };
+/** Execute a bounded process and include its output when it fails. */
 function run(command, args, cwd) {
   const result = spawnSync(command, args, {
     cwd, env, encoding: 'utf8', timeout: 60_000,
@@ -23,6 +24,7 @@ function run(command, args, cwd) {
   if (result.status !== 0) throw new Error(`${command} ${args.join(' ')} failed: ${result.error ?? ''}\n${result.stdout}\n${result.stderr}`);
   return result.stdout;
 }
+/** Invoke npm through its platform entry point, preserving paths with spaces. */
 function npm(args, cwd) {
   // npm's Windows entry point is a cmd shim. Quote paths, including our
   // deliberate spaces, rather than relying on implicit shell interpolation.
@@ -30,6 +32,7 @@ function npm(args, cwd) {
     ? run('cmd.exe', ['/d', '/s', '/c', `npm ${args.map(arg => '"' + arg.replaceAll('"', '""') + '"').join(' ')}`], cwd)
     : run('npm', args, cwd);
 }
+/** Verify discovery, diagnostics, execution and cache behavior in a fresh workspace. */
 function check(label, invoke) {
   const root = join(scratch, label);
   mkdirSync(join(root, 'app/src'), { recursive: true });
