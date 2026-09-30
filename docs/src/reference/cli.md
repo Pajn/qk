@@ -71,7 +71,9 @@ wrapped in double quotes and the result runs in the shell tasks use, so
   first failure stops it. `--exclude-task-dependencies` runs only the
   selected projects.
 
-A failing command exits with `1`, as in Nx.
+A failing command exits with `1`, as in Nx. Only the package-script case
+runs a task, so the others refuse `--sandbox`, `--dry-run` and `--graph`
+rather than run the command without them.
 
 ## Shared run options
 

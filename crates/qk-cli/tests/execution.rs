@@ -1548,4 +1548,14 @@ fn exec_runs_in_projects_dependencies_first_as_nx_does() {
     assert!(text(script).contains("target\n"));
 
     assert!(!run(root, &["exec", "-p", "web"]).status.success());
+
+    // Run directly, the command cannot be sandboxed or dry-run, so asking
+    // for either fails without running it.
+    for option in ["--dry-run", "--sandbox=enforce"] {
+        let refused = run(root, &["exec", option, "--", "touch", "ran"]);
+        assert!(!refused.status.success());
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("cannot apply"));
+    }
+    assert!(!root.join("ran").exists());
+    assert!(!root.join("tools/other/ran").exists());
 }
