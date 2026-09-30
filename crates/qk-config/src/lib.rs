@@ -221,7 +221,10 @@ impl Workspace {
             config,
             projects: BTreeMap::new(),
             packages: BTreeMap::new(),
+            // Canonical, as a package manager may link the package in: keys
+            // read no input through a link.
             extended: extended.and_then(|path| {
+                let path = path.canonicalize().ok().map(simplified)?;
                 let relative = path.strip_prefix(&root).ok()?.to_str()?;
                 Some(relative.replace('\\', "/"))
             }),

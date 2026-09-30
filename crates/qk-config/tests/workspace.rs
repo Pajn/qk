@@ -635,7 +635,60 @@ fn nx_json_extends_a_file_or_package_export_one_level() {
         Some("node_modules/@scope/config/dist/shared.json")
     );
 
+    // Conditions apply in the order they are declared, as in Node.
+    write(
+        root,
+        "node_modules/@scope/config/package.json",
+        r#"{"exports": {"./presets/*.json": {"default": "./dist/*.json", "require": "./src/*.json"}}}"#,
+    );
+    write(
+        root,
+        "node_modules/@scope/config/src/shared.json",
+        r#"{"parallel": 7}"#,
+    );
+    assert_eq!(Workspace::load(root).unwrap().config.extra["parallel"], 2);
+
+    // Without exports, a bare package resolves to its `main`, else `index`.
+    write(
+        root,
+        "node_modules/plain/package.json",
+        r#"{"main": "preset.json"}"#,
+    );
+    write(root, "node_modules/plain/preset.json", r#"{"parallel": 4}"#);
+    write(root, "nx.json", r#"{"extends": "plain"}"#);
+    assert_eq!(Workspace::load(root).unwrap().config.extra["parallel"], 4);
+    write(root, "node_modules/plain/package.json", "{}");
+    write(root, "node_modules/plain/index.json", r#"{"parallel": 6}"#);
+    assert_eq!(Workspace::load(root).unwrap().config.extra["parallel"], 6);
+
     write(root, "nx.json", r#"{"extends": "missing/preset.json"}"#);
     let error = Workspace::load(root).unwrap_err();
     assert!(format!("{error:#}").contains("no node_modules contains missing"));
+}
+
+// A package manager such as pnpm links packages into node_modules; the
+// extended file is keyed by its real path, since keys read no input through a
+// link.
+#[cfg(unix)]
+#[test]
+fn nx_json_extends_a_linked_package_by_its_real_path() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    write(root, "nx.json", r#"{"extends": "linked/preset.json"}"#);
+    write(
+        root,
+        "node_modules/.pnpm/linked@1.0.0/node_modules/linked/preset.json",
+        r#"{"parallel": 2}"#,
+    );
+    std::os::unix::fs::symlink(
+        ".pnpm/linked@1.0.0/node_modules/linked",
+        root.join("node_modules/linked"),
+    )
+    .unwrap();
+    let workspace = Workspace::load(root).unwrap();
+    assert_eq!(workspace.config.extra["parallel"], 2);
+    assert_eq!(
+        workspace.extended.as_deref(),
+        Some("node_modules/.pnpm/linked@1.0.0/node_modules/linked/preset.json")
+    );
 }

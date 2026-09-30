@@ -4,7 +4,32 @@
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use serde_json::Value;
+use jsonc_parser::JsonValue;
+
+/// A package's `exports`, with objects in the order they are declared, since
+/// Node applies the first matching condition.
+enum Export {
+    Path(String),
+    List(Vec<Export>),
+    Map(Vec<(String, Export)>),
+    Other,
+}
+
+impl From<JsonValue<'_>> for Export {
+    fn from(value: JsonValue<'_>) -> Self {
+        match value {
+            JsonValue::String(path) => Self::Path(path.into_owned()),
+            JsonValue::Array(entries) => Self::List(entries.into_iter().map(Self::from).collect()),
+            JsonValue::Object(entries) => Self::Map(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key, Self::from(value)))
+                    .collect(),
+            ),
+            _ => Self::Other,
+        }
+    }
+}
 
 /// The file `specifier` names: a path relative to the workspace root, or a
 /// package subpath such as `nx/presets/npm.json`, found in the `node_modules`
@@ -26,18 +51,35 @@ pub fn resolve(root: &Path, specifier: &str) -> Result<PathBuf> {
         if !location.is_dir() {
             continue;
         }
-        let manifest = crate::read_optional_json(&location.join("package.json"))?;
-        let target = match manifest
-            .as_ref()
-            .and_then(|manifest| manifest.get("exports"))
+        let manifest_path = location.join("package.json");
+        let text = match std::fs::read_to_string(&manifest_path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("cannot read {}", manifest_path.display()));
+            }
+        };
+        let mut manifest = match jsonc_parser::parse_to_value(&text, &Default::default())
+            .with_context(|| format!("cannot parse {}", manifest_path.display()))?
         {
+            Some(JsonValue::Object(manifest)) => manifest,
+            _ => jsonc_parser::JsonObject::new(Default::default()),
+        };
+        let target = match manifest.take("exports") {
             Some(exports) => {
                 let key = subpath.map_or_else(|| ".".to_owned(), |subpath| format!("./{subpath}"));
-                exported(exports, &key).with_context(|| {
+                exported(&Export::from(exports), &key).with_context(|| {
                     format!("nx.json extends {specifier:?}, which {package} does not export")
                 })?
             }
-            None => subpath.unwrap_or("package.json").to_owned(),
+            // As Node loads a package directory: its `main`, else `index`.
+            None => match subpath {
+                Some(subpath) => subpath.to_owned(),
+                None => manifest
+                    .take_string("main")
+                    .map_or_else(|| "index".to_owned(), |main| main.into_owned()),
+            },
         };
         return file(&location.join(target))
             .with_context(|| format!("nx.json extends {specifier:?}, which does not exist"));
@@ -71,18 +113,18 @@ fn file(path: &Path) -> Option<PathBuf> {
 /// Where a package's `exports` send `key`: an exact entry, else the pattern
 /// with a single `*` whose prefix is longest, then the longest pattern, as
 /// Node orders them, with the match substituted.
-fn exported(exports: &Value, key: &str) -> Option<String> {
-    let Value::Object(map) = exports else {
+fn exported(exports: &Export, key: &str) -> Option<String> {
+    let Export::Map(entries) = exports else {
         return (key == ".").then(|| target(exports)).flatten();
     };
     // Conditions alone describe the package's root export.
-    if !map.keys().any(|name| name.starts_with('.')) {
+    if !entries.iter().any(|(name, _)| name.starts_with('.')) {
         return (key == ".").then(|| target(exports)).flatten();
     }
-    if let Some(value) = map.get(key) {
+    if let Some((_, value)) = entries.iter().find(|(name, _)| name == key) {
         return target(value);
     }
-    let (_, value, matched) = map
+    let (_, value, matched) = entries
         .iter()
         .filter_map(|(pattern, value)| {
             let (prefix, suffix) = pattern.split_once('*')?;
@@ -94,14 +136,16 @@ fn exported(exports: &Value, key: &str) -> Option<String> {
 }
 
 /// An export target: a path, the first usable entry of an array, or the
-/// entry for the conditions `require.resolve` applies.
-fn target(value: &Value) -> Option<String> {
+/// first declared of the conditions `require.resolve` applies.
+fn target(value: &Export) -> Option<String> {
     match value {
-        Value::String(path) => Some(path.clone()),
-        Value::Array(entries) => entries.iter().find_map(target),
-        Value::Object(conditions) => ["node", "require", "default"]
-            .iter()
-            .find_map(|condition| conditions.get(*condition).and_then(target)),
-        _ => None,
+        Export::Path(path) => Some(path.clone()),
+        Export::List(entries) => entries.iter().find_map(target),
+        Export::Map(conditions) => conditions.iter().find_map(|(condition, value)| {
+            matches!(condition.as_str(), "node" | "require" | "default")
+                .then(|| target(value))
+                .flatten()
+        }),
+        Export::Other => None,
     }
 }

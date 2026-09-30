@@ -22,7 +22,7 @@ libc = "0.2"
 shlex = "2"
 globset = "0.4"
 ignore = "0.4"
-jsonc-parser = { version = "0.32", features = ["serde"] }
+jsonc-parser = { version = "0.32", features = ["preserve_order", "serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_ng = "0.10"
