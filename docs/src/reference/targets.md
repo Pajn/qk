@@ -139,6 +139,8 @@ An object describing reusable scratch state:
 | `env` | object of strings | Empty; supports `{warm}`, `{workspaceRoot}`, `{projectRoot}` |
 | `maxSize` | bytes or size string | No per-group limit |
 | `remote` | boolean | `true`; permit sharing warm state remotely |
+| `portable` | boolean | `true`; restore another worktree's or the remote's save |
+| `mtimes` | `"epoch"` or `"preserve"` | `"epoch"`; `"preserve"` keeps a worktree's own save's modification times |
 
 Put it beside `inputs` and `outputs`, rather than in executor `options`.
 Warm state is restored on misses and uncached runs, saved after success,

@@ -1135,6 +1135,71 @@ fn warm_state_is_shared_through_the_remote_by_branch() {
     assert_eq!(on("feature"), "feature");
 }
 
+/// A task that prints what its warm `scratch/state` held, then records the
+/// worktree it ran in.
+#[cfg(unix)]
+fn scratch_target(warm: Value) -> Value {
+    json!({
+        "command": "if [ -f scratch/state ]; then cat scratch/state; else echo cold; fi; mkdir -p scratch; basename \"$PWD\" > scratch/state",
+        "qk:warm": warm
+    })
+}
+
+#[cfg(unix)]
+#[test]
+fn a_worktree_restores_its_own_save_before_a_newer_one() {
+    let fixture = Fixture::new(scratch_target(json!({"paths": ["{projectRoot}/scratch"]})));
+    assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
+    // A new worktree starts from the other worktree's save.
+    let linked = fixture.worktree();
+    assert_eq!(said(&fixture, &linked, &[]), "repo");
+    let text = stdout(&success(
+        fixture.qk(&linked, &["show", "task", "app:build"]),
+    ));
+    assert!(
+        text.contains("warm state restored from worktree "),
+        "{text}"
+    );
+    // Its save is newer, but the first worktree comes back to its own.
+    fs::remove_dir_all(fixture.root.join("scratch")).unwrap();
+    assert_eq!(said(&fixture, &fixture.root, &[]), "repo");
+    let text = stdout(&success(
+        fixture.qk(&fixture.root, &["show", "task", "app:build"]),
+    ));
+    assert!(text.contains("warm state restored from local:"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn state_that_does_not_relocate_stays_in_its_worktree() {
+    let fixture = Fixture::new(scratch_target(
+        json!({"paths": ["{projectRoot}/scratch"], "portable": false}),
+    ));
+    assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
+    let linked = fixture.worktree();
+    assert_eq!(said(&fixture, &linked, &[]), "cold");
+    // Its own save still comes back.
+    fs::remove_dir_all(fixture.root.join("scratch")).unwrap();
+    assert_eq!(said(&fixture, &fixture.root, &[]), "repo");
+}
+
+#[cfg(unix)]
+#[test]
+fn preserved_modification_times_come_back_only_to_their_worktree() {
+    let fixture = Fixture::new(json!({
+        "command": "if [ -f scratch/state ]; then date -r scratch/state +%Y; else echo cold; fi; mkdir -p scratch; touch scratch/state",
+        "qk:warm": {"paths": ["{projectRoot}/scratch"], "mtimes": "preserve"}
+    }));
+    assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
+    let year = said(&fixture, &fixture.root, &[]);
+    assert_ne!(year, "1970");
+    fs::remove_dir_all(fixture.root.join("scratch")).unwrap();
+    assert_eq!(said(&fixture, &fixture.root, &[]), year);
+    // Another worktree's timestamps say nothing about this one's sources.
+    let linked = fixture.worktree();
+    assert_eq!(said(&fixture, &linked, &[]), "1970");
+}
+
 #[cfg(unix)]
 #[test]
 fn local_overrides_change_the_task_and_its_key() {

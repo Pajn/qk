@@ -28,8 +28,10 @@ state ever being part of a result, with a `qk:warm` key at target level
 Warm state is restored before the task runs, on a cache miss and for
 targets that are not cacheable, and never on a hit. A group already present
 on disk is left alone, since it is the newest for that checkout; otherwise
-it comes from the task's most recent save, in the store linked worktrees
-share, and without one there from the remote store: the current branch's
+it comes from a save in the store linked worktrees share. Each worktree
+keeps its own save, and a restore takes the worktree's own before the most
+recent other worktree's; the eight most recent saves of a task are kept.
+Without one there it comes from the remote store: the current branch's
 save, else the default branch's (nx.json `defaultBase`, else `main`). The
 branch comes from `GITHUB_HEAD_REF` or `GITHUB_REF_NAME` in CI, else from
 git; a checkout with no branch reads the default branch's state but saves
@@ -38,7 +40,14 @@ saved after successful runs only; files unchanged since the last save or
 restore are recognised by their metadata and not read again.
 Restored files are dated to the Unix epoch, older than anything in the
 checkout, so a tool that compares timestamps, as `tsc --build` does, checks
-the sources against them rather than taking them as up to date. Groups over
+the sources against them rather than taking them as up to date.
+`mtimes: "preserve"` restores a worktree's own save with the modification
+times it was saved with, which tools that rebuild whatever looks newer than
+its outputs, as Ninja does, need to skip unchanged work; another worktree's
+save is still dated to the epoch. State that records the checkout's absolute
+path, such as CMake build directories, is useless or harmful in another
+worktree: `portable: false` restores only the worktree's own save and keeps
+it out of the remote store. Groups over
 their `maxSize` are not saved. Warm state counts toward the
 cache's size limit and is evicted with it. `--skip-cache` neither restores
 nor saves it, and leaves the variables unset. Two tasks in one run cannot

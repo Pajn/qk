@@ -9,11 +9,14 @@
 //!   keeps for the task outside the working tree.
 //!
 //! A group already present on disk is left alone. Otherwise it is restored
-//! from the most recent save for the task. It is saved after successful runs.
+//! from a save: this worktree's own if it has one, else another worktree's,
+//! the most recent first. It is saved after successful runs, one record per
+//! worktree.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use qk_config::Workspace;
@@ -31,6 +34,9 @@ use crate::{Cache, hash::digest_file};
 /// instead of taking a restored build for an up-to-date one.
 pub const RESTORED_AT: std::time::SystemTime = std::time::UNIX_EPOCH;
 
+/// How many saves are kept for a task, across worktrees and keys.
+const KEPT: usize = 8;
+
 /// A target's `qk:warm`.
 #[derive(Clone, Debug, Default)]
 pub struct Warm {
@@ -43,6 +49,11 @@ pub struct Warm {
     pub directory: bool,
     pub max_size: Option<u64>,
     pub remote: bool,
+    /// Whether a worktree's own save comes back with the modification times it
+    /// was saved with, rather than [`RESTORED_AT`].
+    pub preserve_mtimes: bool,
+    /// Whether another worktree's save, or the remote's, may be restored.
+    pub portable: bool,
 }
 
 /// The target's `qk:warm`, or `None` without one.
@@ -54,7 +65,7 @@ pub fn config(workspace: &Workspace, task: &Task) -> Result<Option<Warm>> {
     for key in object.keys() {
         if !matches!(
             key.as_str(),
-            "outputs" | "paths" | "env" | "maxSize" | "remote"
+            "outputs" | "paths" | "env" | "maxSize" | "remote" | "mtimes" | "portable"
         ) {
             bail!("unknown qk:warm field {key:?}");
         }
@@ -116,6 +127,11 @@ pub fn config(workspace: &Workspace, task: &Task) -> Result<Option<Warm>> {
         Some(Value::Number(number)) => number.as_u64(),
         Some(_) => bail!("qk:warm.maxSize must be a size such as \"2GB\""),
     };
+    let preserve_mtimes = match object.get("mtimes").map(|value| value.as_str()) {
+        None | Some(Some("epoch")) => false,
+        Some(Some("preserve")) => true,
+        Some(_) => bail!("qk:warm.mtimes must be \"epoch\" or \"preserve\""),
+    };
     Ok(Some(Warm {
         outputs: flag("outputs", false)?,
         paths,
@@ -123,6 +139,8 @@ pub fn config(workspace: &Workspace, task: &Task) -> Result<Option<Warm>> {
         directory: uses_directory,
         max_size,
         remote: flag("remote", true)?,
+        preserve_mtimes,
+        portable: flag("portable", true)?,
     }))
 }
 
@@ -159,9 +177,14 @@ pub fn check_overlaps(workspace: &Workspace, graph: &TaskGraph) -> Result<()> {
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub(crate) struct Group {
     artifacts: BTreeMap<String, Artifact>,
-    /// Metadata of each file when saved or restored, so an unchanged file is
-    /// not read again on the next save.
+    /// Metadata of each file when saved, so an unchanged file is not read
+    /// again on the next save.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     stamps: BTreeMap<String, Vec<i64>>,
+    /// Each file's modification time when saved, in nanoseconds since the
+    /// Unix epoch, for restores that keep it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    mtimes: BTreeMap<String, i64>,
 }
 
 impl Group {
@@ -179,17 +202,35 @@ impl Group {
     }
 }
 
-#[derive(Default, Serialize, Deserialize)]
+/// One save of a task's warm state.
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub(crate) struct Record {
     version: u32,
     task: String,
+    /// The root of the worktree that saved it.
+    worktree: String,
+    /// The commit that worktree had checked out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    commit: Option<String>,
+    /// When it was saved, in milliseconds since the Unix epoch.
+    saved: u64,
     groups: BTreeMap<String, Group>,
+}
+
+const RECORD_VERSION: u32 = 2;
+
+/// What this worktree last restored, per group: each file's metadata once
+/// restored and the artifact it came from, so a save need not read it again.
+#[derive(Default, Serialize, Deserialize)]
+struct RestoredFiles {
+    groups: BTreeMap<String, BTreeMap<String, (Vec<i64>, Artifact)>>,
 }
 
 /// What a restore brought back.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Restored {
-    /// `local`, or `remote <branch>`.
+    /// `local` for this worktree's own save, `worktree <root>` for another
+    /// worktree's, or `remote <branch>`.
     pub source: String,
     pub groups: Vec<String>,
     pub files: usize,
@@ -324,29 +365,119 @@ fn stamp(metadata: &fs::Metadata) -> Vec<i64> {
     stamp
 }
 
+/// This worktree's root, as records name it.
+fn worktree(workspace: &Workspace) -> String {
+    fs::canonicalize(&workspace.root)
+        .unwrap_or_else(|_| workspace.root.clone())
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn current_commit(workspace: &Workspace) -> Option<String> {
+    let output = paths::git(&workspace.root, &["rev-parse", "HEAD"]).ok()?;
+    let commit = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+    (output.status.success() && !commit.is_empty()).then_some(commit)
+}
+
+fn hash32(text: &str) -> String {
+    blake3::hash(text.as_bytes()).to_hex()[..32].to_owned()
+}
+
+fn nanos(time: SystemTime) -> Option<i64> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis() as u64)
+}
+
+/// Where a worktree notes what it last restored for a task.
+fn restored_files_path(workspace: &Workspace, task: &Task) -> PathBuf {
+    paths::worktree_state(&workspace.root)
+        .join("warm-restored")
+        .join(format!("{}.json", hash32(&task.id)))
+}
+
+fn read_restored_files(workspace: &Workspace, task: &Task) -> RestoredFiles {
+    fs::read(restored_files_path(workspace, task))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
 impl Cache {
-    fn warm_record(&self, task: &Task) -> PathBuf {
-        let identity = format!(
+    /// The file-name prefix every save of the task shares.
+    fn warm_prefix(&self, task: &Task) -> String {
+        hash32(&format!(
             "{}\0{}\0{}",
             task.id,
             std::env::consts::OS,
             std::env::consts::ARCH
-        );
-        self.root.join("warm").join(format!(
-            "{}.json",
-            &blake3::hash(identity.as_bytes()).to_hex()[..32]
         ))
     }
 
-    pub(crate) fn load_warm(&self, task: &Task) -> Option<Record> {
-        let bytes = fs::read(self.warm_record(task)).ok()?;
-        serde_json::from_slice::<Record>(&bytes)
-            .ok()
-            .filter(|record| record.version == 1 && record.task == task.id)
+    fn warm_record(&self, task: &Task, record: &Record) -> PathBuf {
+        self.root.join("warm").join(format!(
+            "{}-{}.json",
+            self.warm_prefix(task),
+            hash32(&record.worktree)
+        ))
+    }
+
+    /// Every save of the task, newest first.
+    fn warm_records(&self, task: &Task) -> Vec<(PathBuf, Record)> {
+        let prefix = format!("{}-", self.warm_prefix(task));
+        let mut records: Vec<(PathBuf, Record)> = fs::read_dir(self.root.join("warm"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".json"))
+            })
+            .filter_map(|entry| {
+                let record =
+                    serde_json::from_slice::<Record>(&fs::read(entry.path()).ok()?).ok()?;
+                (record.version == RECORD_VERSION && record.task == task.id)
+                    .then(|| (entry.path(), record))
+            })
+            .collect();
+        records.sort_by_key(|(_, record)| std::cmp::Reverse(record.saved));
+        records
+    }
+
+    /// The save to restore from, and how to name where it came from: this
+    /// worktree's own, else, when the state is portable, the newest other.
+    fn choose_warm(
+        &self,
+        workspace: &Workspace,
+        task: &Task,
+        warm: &Warm,
+    ) -> Option<(Record, String)> {
+        let own = worktree(workspace);
+        let mut records = self.warm_records(task);
+        if let Some(index) = records
+            .iter()
+            .position(|(_, record)| record.worktree == own)
+        {
+            return Some((records.swap_remove(index).1, "local".to_owned()));
+        }
+        if !warm.portable {
+            return None;
+        }
+        let (_, record) = records.into_iter().next()?;
+        let source = format!("worktree {}", record.worktree);
+        Some((record, source))
     }
 
     fn store_warm(&self, task: &Task, record: &Record) -> Result<()> {
-        let path = self.warm_record(task);
+        let path = self.warm_record(task, record);
         let directory = path.parent().context("warm records have a directory")?;
         fs::create_dir_all(directory)?;
         let mut file = tempfile::NamedTempFile::new_in(self.root.join("tmp"))?;
@@ -355,9 +486,11 @@ impl Cache {
         Ok(())
     }
 
-    /// Restores each warm group not already on disk from the task's last save,
-    /// and records what the restore left, so the next save can tell which
-    /// files are unchanged. Every file is dated [`RESTORED_AT`].
+    /// Restores each warm group not already on disk from the save
+    /// [`Cache::choose_warm`] picks, or the remote's, and notes what it
+    /// restored so the next save can tell which files are unchanged. Files are
+    /// dated [`RESTORED_AT`], unless the target keeps modification times and
+    /// the save is this worktree's own.
     pub(crate) fn restore_warm(
         &self,
         workspace: &Workspace,
@@ -365,16 +498,18 @@ impl Cache {
         warm: &Warm,
     ) -> Result<Restored> {
         let mut restored = Restored::default();
-        let (mut record, source) = match self.load_warm(task) {
-            Some(record) => (record, "local".to_owned()),
+        let (record, source) = match self.choose_warm(workspace, task, warm) {
+            Some(chosen) => chosen,
             None => match self.remote_warm(workspace, task, warm) {
                 Some((record, branch)) => (record, format!("remote {branch}")),
                 None => return Ok(restored),
             },
         };
+        let keep_mtimes = warm.preserve_mtimes && source == "local";
         restored.source = source;
+        let mut noted = read_restored_files(workspace, task);
         for location in locations(workspace, task, warm)? {
-            let Some(group) = record.groups.get_mut(location.name) else {
+            let Some(group) = record.groups.get(location.name) else {
                 continue;
             };
             // Local state wins: it is the newest for this checkout.
@@ -382,7 +517,7 @@ impl Cache {
                 continue;
             }
             fs::create_dir_all(&location.base)?;
-            let mut stamps = BTreeMap::new();
+            let mut files = BTreeMap::new();
             for (path, artifact) in &group.artifacts {
                 paths::safe_parents(&location.base, path)?;
                 if !location.matches(path) {
@@ -399,14 +534,27 @@ impl Cache {
                             bail!("warm state for {} has a corrupt blob", task.id);
                         }
                         fs::copy(&source, &destination)?;
+                        let modified = keep_mtimes
+                            .then(|| group.mtimes.get(path))
+                            .flatten()
+                            .and_then(|nanos| u64::try_from(*nanos).ok())
+                            .map_or(RESTORED_AT, |nanos| {
+                                UNIX_EPOCH + Duration::from_nanos(nanos)
+                            });
                         fs::File::options()
                             .write(true)
                             .open(&destination)?
-                            .set_modified(RESTORED_AT)?;
+                            .set_modified(modified)?;
                         set_mode(&destination, *mode)?;
                         restored.files += 1;
                         restored.bytes += fs::metadata(&destination)?.len();
-                        stamps.insert(path.clone(), stamp(&fs::symlink_metadata(&destination)?));
+                        files.insert(
+                            path.clone(),
+                            (
+                                stamp(&fs::symlink_metadata(&destination)?),
+                                artifact.clone(),
+                            ),
+                        );
                     }
                     Artifact::Directory { mode } => {
                         fs::create_dir_all(&destination)?;
@@ -418,11 +566,13 @@ impl Cache {
                     }
                 }
             }
-            group.stamps = stamps;
+            noted.groups.insert(location.name.to_owned(), files);
             restored.groups.push(location.name.to_owned());
         }
         if !restored.groups.is_empty() {
-            self.store_warm(task, &record)?;
+            let path = restored_files_path(workspace, task);
+            fs::create_dir_all(path.parent().context("restore notes have a directory")?)?;
+            fs::write(path, serde_json::to_vec(&noted)?)?;
         }
         Ok(restored)
     }
@@ -435,13 +585,19 @@ impl Cache {
         task: &Task,
         warm: &Warm,
     ) -> Option<(Record, String)> {
-        let remote = self.remote.as_ref().filter(|_| warm.remote)?;
+        let remote = self
+            .remote
+            .as_ref()
+            .filter(|_| warm.remote && warm.portable)?;
         for branch in branches(workspace) {
             match remote.fetch_warm(&self.root, &task.id, &branch) {
                 Ok(Some(bytes)) => {
-                    let record = serde_json::from_slice::<Record>(&bytes)
-                        .ok()
-                        .filter(|record| record.version == 1 && record.task == task.id)?;
+                    let record =
+                        serde_json::from_slice::<Record>(&bytes)
+                            .ok()
+                            .filter(|record| {
+                                record.version == RECORD_VERSION && record.task == task.id
+                            })?;
                     if self.store_warm(task, &record).is_err() {
                         return None;
                     }
@@ -460,20 +616,31 @@ impl Cache {
         None
     }
 
-    /// Saves the task's warm groups after a successful run. A file whose
-    /// metadata matches the last save or restore keeps its blob unread.
+    /// Saves the task's warm groups after a successful run, as this worktree's
+    /// save. A file whose metadata matches this worktree's last save or
+    /// restore keeps its blob unread.
     pub(crate) fn save_warm(&self, workspace: &Workspace, task: &Task, warm: &Warm) -> Result<()> {
-        let previous = self.load_warm(task).unwrap_or_default();
+        let own = worktree(workspace);
+        let records = self.warm_records(task);
+        let previous = records
+            .iter()
+            .find(|(_, record)| record.worktree == own)
+            .map(|(_, record)| record);
+        let noted = read_restored_files(workspace, task);
         let mut record = Record {
-            version: 1,
+            version: RECORD_VERSION,
             task: task.id.clone(),
+            worktree: own.clone(),
+            commit: current_commit(workspace),
+            saved: now_ms(),
             groups: BTreeMap::new(),
         };
         for location in locations(workspace, task, warm)? {
             if !location.base.exists() {
                 continue;
             }
-            let known = previous.groups.get(location.name);
+            let known = previous.and_then(|previous| previous.groups.get(location.name));
+            let restored_files = noted.groups.get(location.name);
             let mut group = Group::default();
             for path in location.paths()? {
                 paths::safe_parents(&location.base, &path)?;
@@ -491,21 +658,25 @@ impl Cache {
                     }
                 } else if metadata.is_file() {
                     let now = stamp(&metadata);
-                    let reused = known.and_then(|known| {
+                    let saved = known.and_then(|known| {
                         (known.stamps.get(&path) == Some(&now))
                             .then(|| known.artifacts.get(&path))
                             .flatten()
-                            .filter(|artifact| match artifact {
-                                Artifact::File { blob, .. } => {
-                                    self.root.join("blobs").join(blob).is_file()
-                                }
-                                _ => false,
-                            })
-                            .cloned()
+                    });
+                    let restored = restored_files
+                        .and_then(|files| files.get(&path))
+                        .filter(|(stamp, _)| *stamp == now)
+                        .map(|(_, artifact)| artifact);
+                    let reused = saved.or(restored).filter(|artifact| match artifact {
+                        Artifact::File { blob, .. } => self.root.join("blobs").join(blob).is_file(),
+                        _ => false,
                     });
                     group.stamps.insert(path.clone(), now);
+                    if let Some(modified) = metadata.modified().ok().and_then(nanos) {
+                        group.mtimes.insert(path.clone(), modified);
+                    }
                     match reused {
-                        Some(artifact) => artifact,
+                        Some(artifact) => artifact.clone(),
                         None => Artifact::File {
                             blob: self.put_blob(&absolute)?,
                             mode: mode(&metadata),
@@ -533,8 +704,20 @@ impl Cache {
             record.groups.insert(location.name.to_owned(), group);
         }
         self.store_warm(task, &record)?;
+        let _ = fs::remove_file(restored_files_path(workspace, task));
+        // The oldest saves beyond the kept number go; the blobs they alone
+        // cite are evicted with the cache.
+        let saved = self.warm_record(task, &record);
+        for (path, _) in records
+            .into_iter()
+            .filter(|(path, _)| *path != saved)
+            .skip(KEPT - 1)
+        {
+            let _ = fs::remove_file(path);
+        }
         // Stamps describe this machine's files; the remote record goes without.
         if warm.remote
+            && warm.portable
             && let Some(remote) = &self.remote
             && let Some(branch) = current_branch(workspace)
         {
