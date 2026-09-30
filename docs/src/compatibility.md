@@ -31,6 +31,8 @@ When a name occurs in multiple sections, precedence is `dependencies`,
 - A tracked upstream can adjust the affected base to avoid counting changes
   already landed upstream.
 - `readyWhen` accepts readiness text from either stdout or stderr.
+- `exec --exclude-task-dependencies` runs the command in the selected
+  projects; Nx's leaves every project out and runs nothing.
 - `project.local.json`, `nx.local.json`, `qk:threads` and `qk:warm` are qk
   extensions. Nx does not apply them.
 - Input negated-group exclusions apply to the pattern they came from in qk;

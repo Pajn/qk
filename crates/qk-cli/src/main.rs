@@ -79,6 +79,17 @@ enum Command {
         #[command(subcommand)]
         command: ShowCommand,
     },
+    /// Run the command after -- as Nx's exec does: inside a task, as it is;
+    /// from a package script, as that script's target; otherwise in each
+    /// selected project and the projects it depends on, dependencies first.
+    Exec {
+        #[arg(short = 'p', long, value_delimiter = ',', num_args = 1..)]
+        projects: Vec<String>,
+        #[arg(long, value_delimiter = ',', num_args = 1..)]
+        exclude: Vec<String>,
+        #[command(flatten)]
+        options: RunOptions,
+    },
     /// Remove the cache and this worktree's state, as `nx reset` does. Run
     /// history is kept.
     #[command(alias = "clear-cache")]
@@ -567,7 +578,6 @@ const NX_COMMANDS: &[&str] = &[
     "add",
     "connect",
     "daemon",
-    "exec",
     "format",
     "format:check",
     "format:write",
@@ -715,6 +725,11 @@ fn run(cli: Cli) -> Result<i32> {
                 pruned.size
             )?;
         }
+        Command::Exec {
+            projects,
+            exclude,
+            options,
+        } => return exec(&workspace, &projects, &exclude, options),
         Command::Reset {
             only_cache,
             only_workspace_data,
@@ -1176,6 +1191,153 @@ fn execute_tasks(
         }
     }
     Ok(result.exit_code)
+}
+
+/// `nx exec`. Its command is the arguments, each in double quotes, run in the
+/// shell tasks use, with NX_PROJECT_NAME and NX_PROJECT_ROOT_PATH set.
+fn exec(
+    workspace: &Workspace,
+    projects: &[String],
+    exclude: &[String],
+    mut options: RunOptions,
+) -> Result<i32> {
+    if options.args.is_empty() {
+        bail!("exec needs a command after --");
+    }
+    let command: Vec<String> = options
+        .args
+        .iter()
+        .map(|arg| format!("\"{arg}\""))
+        .collect();
+    let command = command.join(" ");
+    let run = |project: &str, cwd: &std::path::Path| -> Result<i32> {
+        let root = workspace.projects.get(project).map(|project| &project.root);
+        let mut child = qk_executor::shell(&command);
+        child.current_dir(cwd).env("NX_PROJECT_NAME", project);
+        if let Some(root) = root {
+            child.env("NX_PROJECT_ROOT_PATH", root);
+        }
+        let status = child
+            .status()
+            .with_context(|| format!("cannot run {command}"))?;
+        // As in Nx, any failure exits with 1.
+        Ok(i32::from(!status.success()))
+    };
+    // Inside a task, the command is the task's.
+    if let Some(project) = std::env::var("NX_TASK_TARGET_PROJECT")
+        .ok()
+        .filter(|project| !project.is_empty())
+    {
+        return run(&project, &std::env::current_dir()?);
+    }
+    // From a package script, run that script's target, so it is cached. The
+    // script runs `exec` again, then inside the task.
+    if let Ok(target) = std::env::var("npm_lifecycle_event")
+        && let Ok(project) = current_project(workspace)
+        && let Some(script) = workspace
+            .packages
+            .get(&project)
+            .and_then(|package| package.scripts.get(&target))
+    {
+        if !workspace.projects[&project].targets.contains_key(&target) {
+            let root = &workspace.projects[&project].root;
+            bail!(
+                "{project} has no target {target:?}; is it missing from {root}/package.json's nx.includedScripts?"
+            );
+        }
+        // Arguments beyond those the script gives are the caller's.
+        let given = script
+            .split_whitespace()
+            .skip_while(|word| *word != "--")
+            .skip(1)
+            .count();
+        let args = if given == options.args.len() {
+            Vec::new()
+        } else {
+            options.args.split_off(given.min(options.args.len()))
+        };
+        let request = Request {
+            project,
+            target,
+            configuration: options.configuration(),
+            args,
+        };
+        return execute_tasks(workspace, vec![request], &options, true);
+    }
+    let selected = select_projects(&workspace.projects, projects, exclude)?;
+    for project in exec_order(workspace, selected, &options)? {
+        let code = run(
+            &project,
+            &workspace.root.join(&workspace.projects[&project].root),
+        )?;
+        if code != 0 {
+            return Ok(code);
+        }
+    }
+    Ok(0)
+}
+
+/// The projects `nx exec` runs in: the selected ones and, unless task
+/// dependencies are excluded, every project they depend on, in waves of
+/// projects whose dependencies have run.
+fn exec_order(
+    workspace: &Workspace,
+    selected: std::collections::BTreeSet<String>,
+    options: &RunOptions,
+) -> Result<Vec<String>> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let graph = ProjectGraph::build(workspace)?;
+    let mut included = selected.clone();
+    if !options.exclude_task_dependencies {
+        let mut pending: Vec<String> = selected.into_iter().collect();
+        while let Some(project) = pending.pop() {
+            for edge in &graph.dependencies[&project] {
+                if graph.nodes.contains_key(&edge.target) && included.insert(edge.target.clone()) {
+                    pending.push(edge.target.clone());
+                }
+            }
+        }
+    }
+    let mut waiting: BTreeMap<String, BTreeSet<String>> = included
+        .iter()
+        .map(|project| {
+            let dependencies = graph.dependencies[project]
+                .iter()
+                .map(|edge| edge.target.clone())
+                .filter(|target| included.contains(target) && target != project)
+                .collect();
+            (project.clone(), dependencies)
+        })
+        .collect();
+    let mut order = Vec::new();
+    while !waiting.is_empty() {
+        let ready: Vec<String> = waiting
+            .iter()
+            .filter(|(_, dependencies)| dependencies.is_empty())
+            .map(|(project, _)| project.clone())
+            .collect();
+        let ready = if ready.is_empty() {
+            if !(options.nx_ignore_cycles || env_flag("NX_IGNORE_CYCLES")) {
+                bail!("cannot run the command: the project graph has a cycle");
+            }
+            eprintln!(
+                "qk: warning: the project graph has a cycle; running the rest in graph order"
+            );
+            waiting.keys().cloned().collect()
+        } else {
+            ready
+        };
+        for project in &ready {
+            waiting.remove(project);
+        }
+        for dependencies in waiting.values_mut() {
+            for project in &ready {
+                dependencies.remove(project);
+            }
+        }
+        order.extend(graph_order(&workspace.projects, ready));
+    }
+    Ok(order)
 }
 
 fn warn_landed(range: Option<&qk_affected::Range>) {

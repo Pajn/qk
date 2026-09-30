@@ -15,7 +15,7 @@ use qk_taskgraph::Task;
 use serde_json::Value;
 
 pub use capture::{Capture, Decoration, Display, OutputStyle, Shown, read_capture, replay};
-pub use process::{Outcome, execute, execute_captured};
+pub use process::{Outcome, execute, execute_captured, shell};
 
 /// Reports a `qk:` warning to the installed sink; by default it is written to
 /// stderr in one write, so task processes sharing stderr cannot split it.

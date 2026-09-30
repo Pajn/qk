@@ -28,6 +28,9 @@ fn command(root: &Path, args: &[&str]) -> Command {
         .args(args);
     command.env_remove("NX_PARALLEL");
     command.env_remove("NX_CACHE_DIRECTORY");
+    // What a task or package script running the tests would pass on to exec.
+    command.env_remove("NX_TASK_TARGET_PROJECT");
+    command.env_remove("npm_lifecycle_event");
     command
 }
 
@@ -1451,4 +1454,98 @@ fn the_sandbox_refuses_what_a_task_does_not_declare_on_linux() {
     // Audit needs reports Landlock does not give.
     let audit = run(temp.path(), &["run", "app:build", "--sandbox"]);
     assert!(String::from_utf8_lossy(&audit.stderr).contains("use --sandbox=enforce"));
+}
+
+#[cfg(unix)]
+#[test]
+fn exec_runs_in_projects_dependencies_first_as_nx_does() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    fs::write(root.join("nx.json"), "{}").unwrap();
+    for (directory, project) in [
+        ("libs/core", json!({"name": "core"})),
+        (
+            "apps/web",
+            json!({"name": "web", "implicitDependencies": ["core"]}),
+        ),
+        ("tools/other", json!({"name": "other"})),
+    ] {
+        fs::create_dir_all(root.join(directory)).unwrap();
+        fs::write(
+            root.join(directory).join("project.json"),
+            project.to_string(),
+        )
+        .unwrap();
+    }
+    let text = |output: Output| String::from_utf8(success(output).stdout).unwrap();
+    // Each argument is quoted as Nx quotes it, so the shell expands variables.
+    let names = [
+        "exec",
+        "-p",
+        "web",
+        "--",
+        "echo",
+        "$NX_PROJECT_NAME",
+        "$NX_PROJECT_ROOT_PATH",
+    ];
+    assert_eq!(text(run(root, &names)), "core libs/core\nweb apps/web\n");
+    assert!(text(run(root, &["exec", "-p", "core", "--", "pwd"])).ends_with("libs/core\n"));
+    assert_eq!(
+        text(run(
+            root,
+            &[
+                "exec",
+                "-p",
+                "web",
+                "--exclude-task-dependencies",
+                "--",
+                "echo",
+                "$NX_PROJECT_NAME"
+            ]
+        )),
+        "web\n"
+    );
+
+    // The first failure stops the rest, and exits 1.
+    let failed = run(
+        root,
+        &[
+            "exec",
+            "-p",
+            "web",
+            "--",
+            "sh",
+            "-c",
+            "echo $NX_PROJECT_NAME; exit 3",
+        ],
+    );
+    assert_eq!(failed.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&failed.stdout), "core\n");
+
+    // Inside a task, the command runs as it is, for the task's project.
+    let inside = command(root, &["exec", "--", "echo", "$NX_PROJECT_NAME"])
+        .env("NX_TASK_TARGET_PROJECT", "web")
+        .output()
+        .unwrap();
+    assert_eq!(text(inside), "web\n");
+
+    // From a package script, the script's target runs instead.
+    fs::write(
+        root.join("apps/web/package.json"),
+        json!({"name": "web", "scripts": {"build": "qk exec -- echo script"}}).to_string(),
+    )
+    .unwrap();
+    fs::write(
+        root.join("apps/web/project.json"),
+        json!({"name": "web", "targets": {"build": {"command": "echo target"}}}).to_string(),
+    )
+    .unwrap();
+    let script = command(root, &["exec", "--", "echo", "script"])
+        .current_dir(root.join("apps/web"))
+        .env("npm_lifecycle_event", "build")
+        .output()
+        .unwrap();
+    assert!(text(script).contains("target\n"));
+
+    assert!(!run(root, &["exec", "-p", "web"]).status.success());
 }

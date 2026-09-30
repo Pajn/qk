@@ -14,6 +14,7 @@
 | `qk run <project>:<target>[:<configuration>]` | Execute a task and its dependencies |
 | `qk <target> [project]`, `qk <project>:<target>` | Nx-style shorthand for `qk run` |
 | `qk run-many -t build,test -p 'web,core' --parallel 4` | Execute matching targets with bounded task concurrency |
+| `qk exec -p web -- <command>` | Run a command in projects, or as a package script's target, as `nx exec` does |
 | `qk run web:build --dry-run` | Prepare every planned task without running it, and print the task graph as JSON |
 | `qk show projects --affected [--base <rev>] [--head <rev>]` | Projects affected by the changes, in graph order |
 | `qk affected -t build,test [--base <rev>] [--head <rev>]` | Execute targets on the affected projects |
@@ -51,6 +52,26 @@ already exist. JSON output has no progress messages mixed into stdout.
 Errors go to stderr and return a nonzero exit code. Unknown commands and
 flags fail explicitly.
 
+
+## `exec`
+
+`qk exec -- <command>` runs a command as `nx exec` does. Each argument is
+wrapped in double quotes and the result runs in the shell tasks use, so
+`$NAME` expands; `NX_PROJECT_NAME` and `NX_PROJECT_ROOT_PATH` name the project.
+
+- Inside a task, where `NX_TASK_TARGET_PROJECT` is set, the command runs in
+  the current directory for that project.
+- From a package script, where the package manager sets
+  `npm_lifecycle_event`, the current directory's project runs the script's
+  target instead, with the run options and any arguments beyond the
+  script's own. That task runs the script again, which then takes the first
+  case, so a script such as `"build": "qk exec -- tsc"` is cached.
+- Otherwise it runs in each project `-p` and `--exclude` select, all by
+  default, and in every project they depend on, dependencies first. The
+  first failure stops it. `--exclude-task-dependencies` runs only the
+  selected projects.
+
+A failing command exits with `1`, as in Nx.
 
 ## Shared run options
 

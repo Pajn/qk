@@ -156,9 +156,11 @@ pub fn execute_captured(
     })
 }
 
-fn spawn(task: &PreparedTask, text: &str, capture: bool, interactive: bool) -> Result<GroupChild> {
+/// A command running `text` in the shell tasks run in: `/bin/sh` on Unix,
+/// `cmd.exe` on Windows.
+pub fn shell(text: &str) -> Command {
     #[cfg(windows)]
-    let mut command = {
+    {
         use std::os::windows::process::CommandExt;
         let mut command =
             Command::new(std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into()));
@@ -166,7 +168,18 @@ fn spawn(task: &PreparedTask, text: &str, capture: bool, interactive: bool) -> R
             .args(["/D", "/S", "/C"])
             .raw_arg(format!("\"{text}\""));
         command
-    };
+    }
+    #[cfg(not(windows))]
+    {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(text);
+        command
+    }
+}
+
+fn spawn(task: &PreparedTask, text: &str, capture: bool, interactive: bool) -> Result<GroupChild> {
+    #[cfg(windows)]
+    let mut command = shell(text);
     #[cfg(not(windows))]
     let mut command = match &task.sandbox {
         Some(crate::Confinement::Seatbelt(profile)) => {
@@ -174,11 +187,7 @@ fn spawn(task: &PreparedTask, text: &str, capture: bool, interactive: bool) -> R
             command.arg("-f").arg(profile).args(["/bin/sh", "-c", text]);
             command
         }
-        _ => {
-            let mut command = Command::new("/bin/sh");
-            command.arg("-c").arg(text);
-            command
-        }
+        _ => shell(text),
     };
     #[cfg(target_os = "linux")]
     if let Some(crate::Confinement::Landlock(ruleset)) = task.sandbox {
