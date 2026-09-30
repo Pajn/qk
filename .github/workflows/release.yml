@@ -28,7 +28,7 @@ jobs:
             os: windows-latest
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check the tag matches the workspace version
         shell: bash
         run: |
@@ -50,7 +50,7 @@ jobs:
           binary=qk
           if [ "${{ runner.os }}" = Windows ]; then binary=qk.exe; fi
           cp target/${{ matrix.target }}/release/$binary dist/${{ matrix.target }}/
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: qk-${{ matrix.target }}
           path: dist
@@ -59,7 +59,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -82,12 +82,12 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       - name: Install npm with trusted publishing support
@@ -122,3 +122,25 @@ jobs:
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org
         run: cargo npm publish -p qk-cli -- --access public
+
+  crates:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Verify crates before requesting the short-lived token
+        run: cargo publish --workspace --locked --dry-run
+      - name: Authenticate with crates.io through OIDC
+        id: crates-auth
+        uses: rust-lang/crates-io-auth-action@v1
+      - name: Publish the workspace in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}
+        run: cargo publish --workspace --locked

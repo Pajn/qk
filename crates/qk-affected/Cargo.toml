@@ -3,6 +3,8 @@ name = "qk-affected"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Affected project selection for the qk task runner"
 publish.workspace = true
 
 [dependencies]

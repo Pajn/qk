@@ -3,6 +3,8 @@ name = "qk-lockfile"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Lockfile parsing for the qk task runner"
 publish.workspace = true
 
 [dependencies]

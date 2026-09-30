@@ -18,7 +18,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install mdBook
         env:
           MDBOOK_VERSION: '0.5.4'
@@ -32,14 +32,14 @@ jobs:
       - name: Configure Pages
         if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         id: pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
       - name: Build documentation
         env:
           MDBOOK_OUTPUT__HTML__SITE_URL: ${{ steps.pages.outputs.base_path || '' }}/
           MDBOOK_OUTPUT__HTML__GIT_REPOSITORY_URL: ${{ github.server_url }}/${{ github.repository }}
         run: mdbook build docs
       - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v4
+        uses: actions/upload-pages-artifact@v5
         with:
           path: docs/book
 
@@ -59,4 +59,4 @@ jobs:
     steps:
       - name: Deploy documentation
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

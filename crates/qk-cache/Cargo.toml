@@ -3,6 +3,8 @@ name = "qk-cache"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Task input hashing and caching for the qk task runner"
 publish.workspace = true
 
 [dependencies]

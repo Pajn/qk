@@ -129,13 +129,32 @@ After verifying all five trust entries, set the GitHub repository variable
 `NPM_PUBLISH` to `true`. Push the release workflow before creating a matching
 version tag. See [npm's trusted publishing documentation](https://docs.npmjs.com/trusted-publishers/).
 
-### crates.io placeholder
+### crates.io releases
 
-`qk-cli` version `0.0.0` is a metadata-only placeholder on crates.io.
-Its isolated source lives in `tools/crates-io/qk-cli`, so reserving the name
-does not require publishing the internal workspace crates. It contains no
-CLI executable or public library API. A functional crates.io release will
-need publishable internal dependencies or a separate distribution design.
+The release workflow publishes all ten workspace crates to crates.io through
+OIDC, with `qk-cli` published after its internal dependencies. Install the CLI
+with `cargo install qk-cli --locked`. Internal crate dependencies use exact
+workspace versions so a release consistently uses the matching source.
+CI verifies the packaged distribution with `cargo publish --workspace --locked
+--dry-run`, including compiling the extracted crates without workspace paths.
+
+Trusted publishing must be configured for **every workspace crate**, since the
+short-lived token can only publish crates that trust this workflow. Each crate
+must trust GitHub owner `Pajn`, repository `qk`, and workflow `release.yml`, with
+no environment constraint. Configure these under each crate's Settings →
+Trusted Publishing on crates.io. See [crates.io's setup guide](https://crates.io/docs/trusted-publishing).
+
+crates.io requires an initial local publication before trust can be configured.
+`qk-cli` already has a metadata-only `0.0.0` reservation, whose isolated source
+is retained in `tools/crates-io/qk-cli`. The nine dependency crates also need an
+initial publication and trust configuration before the first workflow release.
+Generate their metadata-only `0.0.0` reservations with
+`python3 tools/crates-io/bootstrap.py --out /tmp/qk-cargo-bootstrap`, then publish
+each generated manifest locally with `cargo publish --manifest-path <manifest>`.
+These placeholders have no public API; functional releases use the workspace
+source and version.
+Subsequent releases need no long-lived Cargo token in GitHub secrets. The
+workflow verifies the packages before requesting its short-lived token.
 
 ### Benchmarks
 

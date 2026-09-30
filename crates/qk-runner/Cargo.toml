@@ -3,6 +3,8 @@ name = "qk-runner"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Task scheduling and sandboxing for the qk task runner"
 publish.workspace = true
 
 [dependencies]

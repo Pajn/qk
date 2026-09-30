@@ -3,6 +3,8 @@ name = "qk-graph"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Project dependency graphs for the qk task runner"
 publish.workspace = true
 
 [dependencies]

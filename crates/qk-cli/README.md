@@ -22,8 +22,13 @@ qk run-many -t build,test --parallel 4
 qk affected -t build,test --base main
 ```
 
-The `qk-cli` 0.0.0 package on crates.io is a metadata-only prerelease, not
-an installable CLI. npm installation becomes available with the first
-published `@runqk/cli` release.
+## Cargo installation
+
+```sh
+cargo install qk-cli --locked
+```
+
+The crates.io `0.0.0` version is a metadata-only name reservation.
+Functional Cargo releases start at `0.1.1` and install the `qk` executable.
 
 Licensed under either MIT or Apache-2.0, at your option.
