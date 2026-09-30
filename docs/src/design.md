@@ -193,9 +193,11 @@ run plugins, sync generators or a daemon. Declared outputs, warm paths and runne
 state are excluded to prevent feedback loops. Tests cover dependency selection,
 new project discovery, queued changes and cancellation.
 
-## Proposal: warm state for native builds
+## Warm state for native builds
 
-**Status: proposal.** Nothing in this section is implemented.
+**Status: implemented.** [Warm state](guides/warm-state.md) and the
+[`qk:warm` reference](reference/targets.md#qkwarm) describe the behavior;
+this section records why it takes this shape.
 
 Native build systems keep two kinds of state. Some is bound to the checkout's
 absolute path and trusts file timestamps, as Gradle's execution history,
@@ -264,10 +266,11 @@ today's behavior, including remote restores.
 ```
 
 A named group is one piece of warm state that several targets use, as one
-ccache serves every native build. Saves from concurrent tasks must not lose
-each other's entries: either the group is locked while a task uses it, or
-saves only add files. Combined with remote warm state, a new worktree or
-machine starts from the default branch's ccache.
+ccache serves every native build. Its targets share the live directory,
+which the tool itself keeps consistent, so only restoring and saving it are
+serialized, and each save holds everything the directory held. A group has
+no `outputs` or `paths`, which belong to one task. Combined with remote warm
+state, a new worktree or machine starts from the default branch's ccache.
 
 ### Choosing a save by key
 
@@ -287,26 +290,32 @@ chooses a save; it never makes warm state a result.
 
 ### Excluding and globbing paths
 
-`exclude` omits files no later build reads, such as packaged artifacts that
-are rebuilt on every run. Glob patterns in `paths` name directories whose
-location depends on package versions, as pnpm places a package's native build
-under a versioned directory.
+A path starting with `!` omits files no later build reads, such as packaged
+artifacts that are rebuilt on every run, as it does for outputs. Glob
+patterns in `paths` name directories whose location depends on package
+versions, as pnpm places a package's native build under a versioned
+directory. Excluded files stay out of task inputs, like the rest of a warm
+path.
 
 ### Saving in the background
 
 `save: "background"` saves after the task has reported success, so the next
-task starts without waiting. A background save that has not finished when
-the same group is next restored is completed or discarded first.
+task starts without waiting. Saves and restores of a group are serialized,
+and the run waits for background saves before it finishes its remote
+uploads, which a save may add to.
 
 ### Suggesting warm paths
 
 `qk warm suggest <task>` runs the task in the sandbox and lists what it wrote
-outside its declared outputs as candidate warm paths. Native builds write to
-places that are hard to guess, such as build directories that a build script
-moves to the workspace root.
+outside its declared outputs as candidate warm paths, each under its topmost
+directory that holds no source file. Native builds write to places that are
+hard to guess, such as build directories that a build script moves to the
+workspace root. It needs macOS, where the sandbox can report rather than
+refuse.
 
 ### Reporting warm state's effect
 
-Run records already hold where warm state came from, what was restored and
-how long saving took. Comparing a task's duration with and without warm
-state, per group, shows whether a group is worth its size.
+Run records hold where warm state came from, what was restored, which
+groups were on disk already and how long saving took. `qk show task`
+compares the task's duration from warm state with its duration without,
+which shows whether its warm state is worth its size.

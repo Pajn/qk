@@ -46,7 +46,7 @@ checkout, so a tool that compares timestamps, as `tsc --build` does, checks
 the sources against them rather than taking them as up to date.
 `mtimes: "preserve"` restores a worktree's own save with the modification
 times it was saved with, which tools that rebuild whatever looks newer than
-its outputs, as Ninja does, need to skip unchanged work; another worktree's
+their outputs, as Ninja does, need to skip unchanged work; another worktree's
 save is still dated to the epoch. State that records the checkout's absolute
 path, such as CMake build directories, is useless or harmful in another
 worktree: `portable: false` restores only the worktree's own save and keeps
@@ -115,12 +115,14 @@ that names it, as one compiler cache serves several builds:
 A group keeps no `outputs` or `paths`, which belong to one task. Its
 targets may run at once and use the directory together; restoring and
 saving it are serialized, and a save holds everything the directory held.
+
 `save: "background"` saves after the task has reported, so its dependents
 start without waiting for a large group to be stored; the run waits for the
 save before it ends. Other tasks may change the paths meanwhile, so the save
 can hold files from after the task ran, and files removed before it reads
-them are left out. Groups over
-their `maxSize` are not saved. Warm state counts toward the
+them are left out.
+
+Groups over their `maxSize` are not saved. Warm state counts toward the
 cache's size limit and is evicted with it. `--skip-cache` neither restores
 nor saves it, and leaves the variables unset. Two tasks in one run cannot
 keep the same path. A tool must validate its own cache, as Metro, `tsc` and
