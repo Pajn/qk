@@ -43,6 +43,17 @@ jobs:
           rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
           rustup default stable
       - run: cargo build --release --locked -p qk-cli --target ${{ matrix.target }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: cargo install cargo-npm --version 0.1.4 --locked
+      - run: cargo npm generate -p qk-cli --target ${{ matrix.target }}
+      - name: Test installed npm packages and binary archive
+        shell: bash
+        run: |
+          binary=qk
+          if [ "${{ runner.os }}" = Windows ]; then binary=qk.exe; fi
+          node tools/npm/smoke.mjs --packages npm --binary "target/${{ matrix.target }}/release/$binary"
       - name: Collect the binary
         shell: bash
         run: |
