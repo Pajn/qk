@@ -682,6 +682,12 @@ fn doctor_reports_unsupported_features_without_side_effects() {
             .unwrap()
             .contains(&json!("--batch"))
     );
+    assert!(
+        report["acceptedNoopOptions"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("--no-tui"))
+    );
     assert!(!root.join("ran").exists());
     std::fs::write(
         root.join("project.json"),
@@ -698,6 +704,24 @@ fn doctor_reports_unsupported_features_without_side_effects() {
     };
     assert!(run(false).status.success());
     assert_eq!(run(true).status.code(), Some(1));
+    std::fs::write(
+        root.join("nx.json"),
+        r#"{"sync":{"globalGenerators":["missing:sync"]}}"#,
+    )
+    .unwrap();
+    assert_eq!(run(true).status.code(), Some(1));
+    let output = Command::new(env!("CARGO_BIN_EXE_qk"))
+        .current_dir(root)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["warnings"], 1);
+    assert_eq!(
+        report["findings"][0]["location"],
+        "nx.json.sync.globalGenerators"
+    );
     std::fs::write(root.join("nx.json"), "{}").unwrap();
     assert!(run(true).status.success());
 }

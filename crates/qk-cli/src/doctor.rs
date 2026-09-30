@@ -15,6 +15,7 @@ const NOOP_OPTIONS: &[&str] = &[
     "--no-dte",
     "--agents",
     "--tui",
+    "--no-tui",
     "--tui-auto-exit",
 ];
 
@@ -37,6 +38,20 @@ pub fn show(workspace: &Workspace, json: bool, strict: bool) -> Result<i32> {
         findings.push(Finding {
             severity: "warning", code: "plugins-not-run", location: "nx.json.plugins".into(),
             message: "qk does not run Nx plugins or infer their targets; declare required targets explicitly.".into(),
+        });
+    }
+    if workspace
+        .config
+        .extra
+        .get("sync")
+        .and_then(|sync| sync.get("globalGenerators"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|generators| !generators.is_empty())
+    {
+        findings.push(Finding {
+            severity: "warning", code: "sync-generators-not-run",
+            location: "nx.json.sync.globalGenerators".into(),
+            message: "qk does not run workspace sync generators; perform required synchronization separately.".into(),
         });
     }
     for (project, definition) in &workspace.projects {

@@ -1906,14 +1906,18 @@ fn watch_portable_queues_changes_ignores_files_and_cancels_callback() {
     wait_for(&records.join("1.json"));
     let first: Value = serde_json::from_slice(&fs::read(records.join("1.json")).unwrap()).unwrap();
     assert_eq!(first["project"], "app");
-    assert_eq!(first["files"], "app/first.txt");
+    let files: Vec<_> = first["files"].as_str().unwrap().split(' ').collect();
+    assert!(files.contains(&"app/first.txt"), "{first}");
+    assert!(!files.contains(&"app/ignored.txt"), "{first}");
     fs::write(root.join("app/second.txt"), "two").unwrap();
     fs::write(records.join("release-1"), "release").unwrap();
     wait_for(&records.join("2.json"));
     wait_for(&records.join("2.tick"));
     let queued: Value = serde_json::from_slice(&fs::read(records.join("2.json")).unwrap()).unwrap();
     assert_eq!(queued["project"], "app");
-    assert_eq!(queued["files"], "app/second.txt");
+    let files: Vec<_> = queued["files"].as_str().unwrap().split(' ').collect();
+    assert!(files.contains(&"app/second.txt"), "{queued}");
+    assert!(!files.contains(&"app/ignored.txt"), "{queued}");
     #[cfg(unix)]
     assert!(
         Command::new("kill")

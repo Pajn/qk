@@ -418,7 +418,13 @@ impl SourceIgnore {
 
     /// Whether a workspace-relative file or its parent is ignored.
     pub fn matches(&self, path: &str) -> bool {
-        self.0.matched_path_or_any_parents(path, false).is_ignore()
+        // A file whitelist cannot reinclude it beneath an excluded directory.
+        Path::new(path)
+            .ancestors()
+            .skip(1)
+            .take_while(|parent| !parent.as_os_str().is_empty())
+            .any(|parent| self.0.matched(parent, true).is_ignore())
+            || self.0.matched(path, false).is_ignore()
     }
 }
 
@@ -460,7 +466,7 @@ pub fn source_files(root: &Path) -> Result<BTreeSet<String>> {
         (listed, deleted.join().expect("git listing thread panicked"))
     });
     let candidates = match (lines(listed), lines(deleted)) {
-        (Some(listed), Some(deleted)) => {
+        (Some(listed), Some(deleted)) if !root.join(".nxignore").is_file() => {
             let deleted = deleted?;
             let mut files = BTreeSet::new();
             for entry in listed? {
@@ -482,6 +488,8 @@ pub fn source_files(root: &Path) -> Result<BTreeSet<String>> {
                 .parents(false)
                 .git_global(false)
                 .require_git(false)
+                .ignore(false)
+                .add_custom_ignore_filename(".nxignore")
                 .follow_links(false)
                 .filter_entry(|entry| {
                     !matches!(

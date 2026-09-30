@@ -68,6 +68,24 @@
     "app"
   ],
   "stdin-empty": [],
+  "cache-excluded-parent": [
+    [
+      "consumer.ran"
+    ],
+    []
+  ],
+  "affected-excluded-parent": [],
+  "cache-git-negation": [
+    [
+      "consumer.ran"
+    ],
+    [
+      "consumer.ran"
+    ]
+  ],
+  "affected-git-negation": [
+    "app"
+  ],
   "watch": {
     "initial": {
       "project": "app",

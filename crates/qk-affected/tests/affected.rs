@@ -527,3 +527,35 @@ fn a_changed_json_input_affects_the_task() {
     let tasks = affected_tasks(&repo);
     assert_eq!(tasks.keys().collect::<Vec<_>>(), ["app:build"]);
 }
+
+/// Ignore matching consistently prunes excluded parents and honors Nx negations.
+#[test]
+fn nxignore_parent_and_untracked_negations_match_source_discovery() {
+    let repo = Repo::new(&[
+        (
+            ".nxignore",
+            "libs/lib/generated/\n!libs/lib/generated/keep.ts\n",
+        ),
+        ("libs/lib/generated/keep.ts", "tracked"),
+    ]);
+    assert_eq!(
+        repo.affected(Options {
+            files: vec!["libs/lib/generated/keep.ts".into()],
+            explicit_files: true,
+            ..Options::default()
+        }),
+        Vec::<String>::new()
+    );
+    let repo = Repo::new(&[
+        (".gitignore", "libs/lib/src/*.ts\n"),
+        (".nxignore", "!libs/lib/src/keep.ts\n"),
+    ]);
+    write(&repo.root, "libs/lib/src/keep.ts", "untracked");
+    assert_eq!(
+        repo.affected(Options {
+            untracked: true,
+            ..Options::default()
+        }),
+        names(&["app", "lib"])
+    );
+}

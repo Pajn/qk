@@ -109,6 +109,30 @@ try {
     result['stdin-spaces'] = JSON.parse(run(root, ['show', 'projects', '--affected', '--stdin', '--json'], { input: 'app/input with spaces.txt\r\n\r\n' }).trim().split('\n').pop()).sort();
     result['stdin-empty'] = JSON.parse(run(root, ['show', 'projects', '--affected', '--stdin', '--json'], { input: '' }).trim().split('\n').pop()).sort();
   }
+  for (const [name, ignoredParent] of [['excluded-parent', true], ['git-negation', false]]) {
+    const { root, records } = workspace();
+    const input = ignoredParent ? 'app/ignored/keep.txt' : 'app/keep.txt';
+    if (!ignoredParent) write(root, '.gitignore', '.nx/\n.qk/\nnode_modules/\n**/dist/\napp/*.txt\n');
+    write(root, '.nxignore', ignoredParent ? 'app/ignored/\n!app/ignored/keep.txt\n' : '!app/keep.txt\n');
+    write(root, input, 'one');
+    if (ignoredParent) {
+      const tracked = spawnSync('git', ['add', input], { cwd: root, encoding: 'utf8' });
+      if (tracked.status !== 0) throw new Error(tracked.stderr);
+    }
+    write(root, 'app/project.json', { name: 'app', targets: { build: { command: 'node record.mjs', cache: true, inputs: ['{projectRoot}/**/*'], outputs: ['{projectRoot}/dist'] } } });
+    write(root, 'record.mjs', `import {writeFileSync,mkdirSync} from 'node:fs';import {join} from 'node:path';writeFileSync(join(process.env.BEHAVIOR_RECORDS,'consumer.ran'),'ran');mkdirSync('app/dist',{recursive:true});writeFileSync('app/dist/out','result');`);
+    const phases = [];
+    for (const [phase, content] of ['one', 'two'].entries()) {
+      write(root, input, content);
+      const timestamp = new Date(Date.now() + (phase + 1) * 2000);
+      utimesSync(join(root, input), timestamp, timestamp);
+      clear(records);
+      run(root, ['run', 'app:build'], { env: { BEHAVIOR_RECORDS: records } });
+      phases.push(tasks(records));
+    }
+    result[`cache-${name}`] = phases;
+    result[`affected-${name}`] = JSON.parse(run(root, ['show', 'projects', '--affected', '--stdin', '--json'], { input: input + '\n' }).trim().split('\n').pop()).sort();
+  }
   {
     const { root, records } = workspace();
     write(root, 'app/project.json', { name: 'app' });
