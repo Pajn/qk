@@ -1866,6 +1866,9 @@ fn watch_portable_queues_changes_ignores_files_and_cancels_callback() {
     fs::write(root.join("app/project.json"), r#"{"name":"app"}"#).unwrap();
     fs::write(root.join("app/first.txt"), "one").unwrap();
     fs::write(root.join("app/second.txt"), "one").unwrap();
+    // Editing an existing ignored file isolates ignore filtering. Creating it
+    // can emit a directory event whose conservative batch includes siblings.
+    fs::write(root.join("app/ignored.txt"), "before watch").unwrap();
     let records = temp.path().join("records");
     fs::create_dir_all(&records).unwrap();
     // The libtest skip argument mentions the project variable for watch selection.

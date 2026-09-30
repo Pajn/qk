@@ -18,8 +18,9 @@
 //
 // Needs hyperfine and git on PATH.
 
-import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { setTimeout as delay } from "node:timers/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
@@ -30,6 +31,10 @@ const option = (name, fallback) => {
 };
 const qk = resolve(option("--qk", "target/release/qk"));
 const projects = Number(option("--projects", "300"));
+const runs = Number(option("--runs", "10"));
+if (!Number.isInteger(projects) || projects < 1 || !Number.isInteger(runs) || runs < 1) {
+  throw new Error('--projects and --runs must be positive integers');
+}
 const externals = projects * 10;
 const filesPerProject = 10;
 // Each build writes a JavaScript file, a declaration and a source map per
@@ -95,6 +100,13 @@ write(
 write("package.json", JSON.stringify({ name: "bench", private: true }));
 write("pnpm-workspace.yaml", "packages:\n  - packages/*\n");
 write(".gitignore", "node_modules/\ndist/\n.qk/\n");
+write("prepare.mjs", `import {writeFileSync,rmSync} from 'node:fs';
+if(process.argv.includes('nxignore'))writeFileSync('.nxignore','**/ignored/**\\n');
+else rmSync('.nxignore',{force:true});
+if(process.argv.includes('restore'))await import('./clean.mjs');\n`);
+write("callback.mjs", `import {writeFileSync} from 'node:fs';
+if((process.env.NX_FILE_CHANGES||'').split(' ').includes(process.env.BENCH_INPUT))
+writeFileSync(process.env.BENCH_RECORD,String(Date.now()));\n`);
 
 const lock = ["lockfileVersion: '9.0'", "", "importers:", "", "  .: {}", ""];
 for (let index = 0; index < projects; index++) {
@@ -113,6 +125,7 @@ for (let index = 0; index < projects; index++) {
     write(`packages/${name(index)}/src/file${file}.ts`, `export const value${file} = ${index * 100 + file};\n`);
   }
   write(`packages/${name(index)}/src/file0.test.ts`, "export {};\n");
+  write(`packages/${name(index)}/ignored/generated.txt`, "ignored by .nxignore\n");
   lock.push(`  packages/${name(index)}:`, "    dependencies:");
   for (const dependency of workspace) {
     lock.push(`      '@bench/${dependency}':`, "        specifier: workspace:*", `        version: link:../${dependency}`);
@@ -162,25 +175,99 @@ const commands = [
 ];
 // Commands measured with every output removed before each run.
 const restoring = [["run-many, restoring outputs", `${qk} run-many -t build --output-style static`]];
+const nxignore = [
+  ["run-many, .nxignore, all cached", "node prepare.mjs nxignore"],
+  ["run-many, .nxignore, restoring outputs", "node prepare.mjs nxignore restore"],
+];
+// Populate both input-policy cache keys before timed runs.
+write(".nxignore", "**/ignored/**\n");
+const ignoredWarm = spawnSync(qk, ["run-many", "-t", "build", "--output-style", "static"], { cwd: root, encoding: "utf8" });
+if (ignoredWarm.status !== 0) throw new Error(`.nxignore warm-up failed:\n${ignoredWarm.stderr}`);
+rmSync(join(root, ".nxignore"));
 const results = join(root, "hyperfine.json");
 const hyperfine = spawnSync(
   "hyperfine",
   [
     "--warmup", "2",
-    "--runs", "10",
+    "--runs", String(runs),
     "--export-json", results,
     "--output", "null",
-    ...commands.flatMap(([label, command]) => ["--prepare", "node -e 0", "--command-name", label, command]),
-    ...restoring.flatMap(([label, command]) => ["--prepare", "node clean.mjs", "--command-name", label, command]),
+    ...commands.flatMap(([label, command]) => ["--prepare", "node prepare.mjs", "--command-name", label, command]),
+    ...restoring.flatMap(([label, command]) => ["--prepare", "node prepare.mjs restore", "--command-name", label, command]),
+    ...nxignore.flatMap(([label, prepare]) => ["--prepare", prepare, "--command-name", label, `${qk} run-many -t build --output-style static`]),
   ],
   { cwd: root, stdio: ["ignore", "inherit", "inherit"] },
 );
 if (hyperfine.status !== 0) process.exit(hyperfine.status ?? 1);
 
 const { results: measured } = JSON.parse(readFileSync(results, "utf8"));
+// Callback timestamps exclude the polling delay used to collect each sample.
+// This includes native event delivery, debounce, graph reload and Node startup.
+for (const policy of ["git", "nxignore"]) {
+  if (policy === "nxignore") write(".nxignore", "**/ignored/**\n");
+  else rmSync(join(root, ".nxignore"), { force: true });
+  const record = join(root, `.qk/watch-${policy}.txt`);
+  mkdirSync(dirname(record), { recursive: true });
+  const input = `packages/${name(0)}/src/file0.ts`;
+  const child = spawn(qk, ["watch", "-p", `@bench/${name(0)}`, "--", "node callback.mjs"], {
+    cwd: root, detached: true, stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, BENCH_INPUT: input, BENCH_RECORD: record },
+  });
+  let output = '';
+  let ended = false;
+  let failure;
+  const closed = new Promise(resolve => child.once('close', resolve));
+  child.on('error', error => { failure = error; ended = true; });
+  child.on('exit', () => ended = true);
+  child.stdout.on('data', chunk => output += chunk);
+  child.stderr.on('data', chunk => output += chunk);
+  const wait = async predicate => {
+    const deadline = Date.now() + 30_000;
+    while (!predicate()) {
+      if (ended || Date.now() > deadline) throw new Error(`watch benchmark failed: ${failure ?? output}`);
+      await delay(10);
+    }
+  };
+  const samples = [];
+  try {
+    await wait(() => output.includes('qk: watching'));
+    for (let sample = 0; sample < runs + 2; sample++) {
+      // Allow the previous callback to exit before the next edit.
+      await delay(100);
+      rmSync(record, { force: true });
+      const start = Date.now();
+      write(input, `export const value0 = ${sample};\n`);
+      await wait(() => existsSync(record) && readFileSync(record, 'utf8').length > 0);
+      if (sample >= 2) samples.push((Number(readFileSync(record, 'utf8')) - start) / 1000);
+    }
+  } finally {
+    /** Stop the process group, falling back to the direct child where needed. */
+    const signal = value => {
+      try { process.kill(-child.pid, value); }
+      catch { try { child.kill(value); } catch {} }
+    };
+    if (child.pid) signal('SIGINT');
+    await Promise.race([closed, delay(3000)]);
+    if (!ended && child.pid) {
+      signal('SIGKILL');
+      await Promise.race([closed, delay(3000)]);
+    }
+    if (!ended) {
+      // A failed termination must not keep Node alive through child handles.
+      child.unref();
+      child.stdout.destroy();
+      child.stderr.destroy();
+      throw new Error('watch benchmark could not stop its child process');
+    }
+  }
+  const mean = samples.reduce((a, b) => a + b, 0) / samples.length;
+  measured.push({ command: `watch edit-to-callback, ${policy}`, mean,
+    stddev: Math.sqrt(samples.reduce((sum, value) => sum + (value - mean) ** 2, 0) / samples.length),
+    min: Math.min(...samples), max: Math.max(...samples) });
+}
 const summary = {
   projects,
-  files: projects * (filesPerProject + 1),
+  files: projects * (filesPerProject + 2),
   outputs: projects * outputsPerProject,
   externals,
   commands: Object.fromEntries(

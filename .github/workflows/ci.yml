@@ -91,3 +91,37 @@ jobs:
           rustup default stable
       - name: Verify the crates.io distribution
         run: cargo publish --workspace --locked --dry-run
+
+  install-smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Set up Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+          rustup default stable
+      - run: cargo build --release --locked -p qk-cli --target ${{ matrix.target }}
+      - run: cargo install cargo-npm --version 0.1.4 --locked
+      - run: cargo npm generate -p qk-cli --target ${{ matrix.target }}
+      - name: Test installed npm packages and binary archive
+        shell: bash
+        run: |
+          binary=qk
+          if [ "${{ runner.os }}" = Windows ]; then binary=qk.exe; fi
+          node tools/npm/smoke.mjs --packages npm --binary "target/${{ matrix.target }}/release/$binary"
