@@ -204,6 +204,22 @@ impl Cache {
         dependencies: &BTreeMap<String, Fingerprint>,
         cancelled: &AtomicBool,
     ) -> Result<TaskResult> {
+        let result = self.run_task(workspace, graph, task, prepared, dependencies, cancelled);
+        if let Some(Ok(snapshot)) = self.snapshot.get() {
+            snapshot.outputs_written(workspace, task);
+        }
+        result
+    }
+
+    fn run_task(
+        &self,
+        workspace: &Workspace,
+        graph: &TaskGraph,
+        task: &Task,
+        prepared: &PreparedTask,
+        dependencies: &BTreeMap<String, Fingerprint>,
+        cancelled: &AtomicBool,
+    ) -> Result<TaskResult> {
         let cacheable = task.definition.cache == Some(true);
         // Held until the task is done, whether it ran or came from the cache.
         let _kept = warm::keep_across(workspace, graph, task);

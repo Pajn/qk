@@ -94,6 +94,19 @@ pub struct Snapshot {
     runtime: Mutex<HashMap<String, Value>>,
     /// The parsed pnpm lockfile, replaced whenever its content changes.
     lockfile: Mutex<Option<Arc<Installed>>>,
+    /// Each dependency task's output files, listed when a task first asks and
+    /// dropped once a task whose outputs overlap them is done.
+    dependency_outputs: Mutex<HashMap<String, Arc<DependencyOutputs>>>,
+    /// Counts drops, so a listing taken while a task finished is not kept.
+    outputs_written: std::sync::atomic::AtomicU64,
+}
+
+/// One dependency task's output files, and the value of each one a pattern
+/// has selected so far.
+struct DependencyOutputs {
+    anchors: Vec<String>,
+    files: Vec<String>,
+    values: Mutex<HashMap<String, Value>>,
 }
 
 /// One revision of `pnpm-lock.yaml`, with digests of what it installs computed
@@ -186,6 +199,8 @@ impl Snapshot {
             directories: Mutex::default(),
             runtime: Mutex::default(),
             lockfile: Mutex::new(lockfile),
+            dependency_outputs: Mutex::default(),
+            outputs_written: Default::default(),
         })
     }
 
@@ -308,6 +323,65 @@ impl Snapshot {
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
         Ok(digest)
+    }
+
+    /// `task`'s output files that are not directories, as listed since the
+    /// last task that could have written them was done.
+    fn dependency_outputs(
+        &self,
+        workspace: &Workspace,
+        task: &Task,
+    ) -> Result<Arc<DependencyOutputs>> {
+        if let Some(outputs) = self.dependency_outputs.lock().unwrap().get(&task.id) {
+            return Ok(outputs.clone());
+        }
+        let written = self
+            .outputs_written
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let declared = Outputs::new(workspace, task)?;
+        let mut files = Vec::new();
+        for path in declared.paths(&workspace.root)? {
+            if !std::fs::symlink_metadata(workspace.root.join(&path))?.is_dir() {
+                files.push(path);
+            }
+        }
+        let outputs = Arc::new(DependencyOutputs {
+            anchors: declared.anchors().map(str::to_owned).collect(),
+            files,
+            values: Mutex::default(),
+        });
+        let mut listed = self.dependency_outputs.lock().unwrap();
+        if self
+            .outputs_written
+            .load(std::sync::atomic::Ordering::SeqCst)
+            != written
+        {
+            return Ok(outputs);
+        }
+        Ok(listed.entry(task.id.clone()).or_insert(outputs).clone())
+    }
+
+    /// Drops the listings `task` may have changed, once it is done. Without
+    /// its outputs, every listing goes.
+    pub(crate) fn outputs_written(&self, workspace: &Workspace, task: &Task) {
+        let anchors: Option<Vec<String>> = Outputs::new(workspace, task)
+            .ok()
+            .map(|outputs| outputs.anchors().map(str::to_owned).collect());
+        let overlap = |a: &str, b: &str| {
+            a == b
+                || b.strip_prefix(a).is_some_and(|rest| rest.starts_with('/'))
+                || a.strip_prefix(b).is_some_and(|rest| rest.starts_with('/'))
+        };
+        let mut listed = self.dependency_outputs.lock().unwrap();
+        self.outputs_written
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        listed.retain(|_, outputs| {
+            anchors.as_ref().is_some_and(|written| {
+                !written
+                    .iter()
+                    .any(|a| outputs.anchors.iter().any(|b| overlap(a, b)))
+            })
+        });
     }
 
     fn file_value(&self, root: &Path, path: &str) -> Result<Value> {
@@ -1184,14 +1258,23 @@ pub(crate) fn dependency_keys(
             }
         }
         for id in selected {
-            let outputs = Outputs::new(workspace, &graph.tasks[&id])?;
+            let outputs = snapshot.dependency_outputs(workspace, &graph.tasks[&id])?;
             let mut files = BTreeMap::new();
-            for path in outputs.paths(&workspace.root)? {
-                if matcher.is_match(&path)
-                    && !std::fs::symlink_metadata(workspace.root.join(&path))?.is_dir()
-                {
-                    files.insert(path.clone(), snapshot.file_value(&workspace.root, &path)?);
-                }
+            for path in outputs.files.iter().filter(|path| matcher.is_match(path)) {
+                let known = outputs.values.lock().unwrap().get(path).cloned();
+                let value = match known {
+                    Some(value) => value,
+                    None => {
+                        let value = snapshot.file_value(&workspace.root, path)?;
+                        outputs
+                            .values
+                            .lock()
+                            .unwrap()
+                            .insert(path.clone(), value.clone());
+                        value
+                    }
+                };
+                files.insert(path.clone(), value);
             }
             keys.insert(format!("{id}:{pattern}"), key(&json!(files))?);
         }

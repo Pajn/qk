@@ -2357,6 +2357,55 @@ fn dependency_output_inputs_hash_only_matching_artifacts() {
     }
 }
 
+/// A dependency's outputs are keyed as they are when the dependent is keyed,
+/// after any task that rewrites them has run.
+#[cfg(unix)]
+#[test]
+fn dependency_outputs_rewritten_by_a_later_task_change_the_key() {
+    let fixture = Fixture::with_targets(json!({
+        "gen": {
+            "command": "mkdir -p generated && cat src/input.txt > generated/value",
+            "cache": true,
+            "inputs": ["{projectRoot}/src/input.txt"],
+            "outputs": ["{projectRoot}/generated"]
+        },
+        "early": {
+            "command": "mkdir -p dist && cp generated/value dist/early",
+            "cache": true,
+            "dependsOn": ["gen"],
+            "inputs": [{"dependentTasksOutputFiles": "**/*"}],
+            "outputs": ["{projectRoot}/dist/early"]
+        },
+        "post": {
+            "command": "cat src/post.txt >> generated/value",
+            "cache": true,
+            "dependsOn": ["early"],
+            "inputs": ["{projectRoot}/src/post.txt"],
+            "outputs": ["{projectRoot}/generated"]
+        },
+        "step": {"executor": "nx:noop", "cache": true, "inputs": [], "outputs": [], "dependsOn": ["post"]},
+        "build": {
+            "command": "mkdir -p dist && cp generated/value dist/late",
+            "cache": true,
+            "dependsOn": ["gen", "step"],
+            "inputs": [{"dependentTasksOutputFiles": "**/*"}],
+            "outputs": ["{projectRoot}/dist/late"]
+        }
+    }));
+    fs::write(fixture.root.join("src/post.txt"), "two\n").unwrap();
+    success(fixture.build(&fixture.root, &[]));
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("dist/late")).unwrap(),
+        "one\ntwo\n"
+    );
+    fs::write(fixture.root.join("src/post.txt"), "three\n").unwrap();
+    success(fixture.build(&fixture.root, &[]));
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("dist/late")).unwrap(),
+        "one\nthree\n"
+    );
+}
+
 /// Broad artifact globs include directories, which must not disable caching.
 #[test]
 fn dependency_output_glob_skips_directories() {
