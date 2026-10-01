@@ -141,6 +141,30 @@ pub fn record(
     run
 }
 
+/// What each task is expected to take, from the runs recorded so far; none
+/// when there are none or they cannot be read.
+pub fn expected(workspace: &Workspace) -> std::collections::BTreeMap<String, qk_runner::Expected> {
+    let path = path(workspace);
+    if !path.exists() {
+        return Default::default();
+    }
+    History::open(&path)
+        .and_then(|history| history.expected())
+        .map(|expected| {
+            expected
+                .into_iter()
+                .map(|(id, expected)| {
+                    let expected = qk_runner::Expected {
+                        millis: expected.millis,
+                        threads: expected.threads,
+                    };
+                    (id, expected)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn open(workspace: &Workspace) -> Result<History> {
     let path = path(workspace);
     if !path.exists() {

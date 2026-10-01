@@ -168,6 +168,17 @@ pub struct Observation {
     pub log_available: bool,
 }
 
+/// How long a task can be expected to run, from the runs that executed it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Expected {
+    pub millis: u64,
+    /// The threads it ran with: one, unless its target has `qk:threads`.
+    pub threads: u64,
+}
+
+/// Executions an expectation is the median of.
+const EXPECTED_FROM: usize = 5;
+
 pub struct History {
     connection: Connection,
 }
@@ -508,6 +519,42 @@ impl History {
             "SELECT data, truncated FROM execution_logs WHERE run_id = ?1 AND task_id = ?2 AND data IS NOT NULL",
             params![run, task], |row| Ok(Log { data: row.get(0)?, truncated: row.get(1)? })
         ).optional()?)
+    }
+
+    /// Each task's expected execution: the median of its last few that ran
+    /// the task rather than replaying it from a cache, and were not cut short.
+    pub fn expected(&self) -> Result<BTreeMap<String, Expected>> {
+        let mut statement = self.connection.prepare(
+            "SELECT task_id, ended - started, threads FROM tasks
+             WHERE cache IN ('miss', 'uncached') AND status IN ('success', 'failure')
+               AND started IS NOT NULL AND ended IS NOT NULL
+             ORDER BY task_id, started DESC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        })?;
+        let mut recent: BTreeMap<String, Vec<Expected>> = BTreeMap::new();
+        for row in rows {
+            let (task, millis, threads) = row?;
+            let executions = recent.entry(task).or_default();
+            if executions.len() < EXPECTED_FROM {
+                executions.push(Expected {
+                    millis: millis.max(0) as u64,
+                    threads: threads.map_or(1, |threads| threads.max(1) as u64),
+                });
+            }
+        }
+        Ok(recent
+            .into_iter()
+            .map(|(task, mut executions)| {
+                executions.sort_by_key(|execution| execution.millis);
+                (task, executions[executions.len() / 2])
+            })
+            .collect())
     }
 
     /// Mixed outcomes for identical verified declared inputs, excluding cache replay.

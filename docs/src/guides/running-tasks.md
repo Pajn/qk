@@ -81,6 +81,12 @@ capacity to spare, it says how much sooner a higher `--parallel` could
 finish; when the machine was busy while they waited, it says more
 parallelism would not help.
 
+Of the tasks ready to start, those with the longest expected path to the end
+of the run start first: how long the task took in its recent runs that
+executed it, rather than restoring it from the cache, and the longest chain
+of tasks depending on it. A task without such runs is expected to take no
+time, so a workspace's first run starts tasks in the order of their ids.
+
 ## Dependencies and configurations
 
 The planner expands `dependsOn` before execution: local targets, `^target`

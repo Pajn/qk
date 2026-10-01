@@ -1248,6 +1248,7 @@ fn execute_tasks(
         },
         std::num::NonZeroUsize::get,
     );
+    let expected = history::expected(workspace);
     let started = std::time::SystemTime::now();
     let result = qk_runner::run(
         workspace,
@@ -1262,6 +1263,7 @@ fn execute_tasks(
                 SandboxMode::Audit => qk_runner::sandbox::Mode::Audit,
                 SandboxMode::Enforce => qk_runner::sandbox::Mode::Enforce,
             }),
+            expected: &expected,
         },
         cancelled,
     );

@@ -310,3 +310,38 @@ fn upgrades_schema_three_without_inventing_logs() {
     assert!(history.log("old", "app:test").unwrap().is_none());
     assert!(history.flaky(None, 20).unwrap().is_empty());
 }
+
+#[test]
+fn a_task_is_expected_to_take_the_median_of_its_recent_executions() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let mut history = History::open(&temp.path().join("history.db")).unwrap();
+    // Oldest first: the first two fall out of the last five executions.
+    for (index, millis) in [900, 900, 40, 10, 30, 50, 20].into_iter().enumerate() {
+        let started = 1_000 * (index as u64 + 1);
+        let mut test = task("app:test", Some("k"), started, started + millis, &[]);
+        test.threads = Some(4);
+        history
+            .record(
+                run(&format!("run{index}"), started, vec![test]),
+                &inputs(&[]),
+            )
+            .unwrap();
+    }
+    // Cache hits and cancelled tasks do not say how long the task takes.
+    let mut hit = task("app:test", Some("k"), 9_000, 9_001, &[]);
+    hit.cache = Some("local-hit".into());
+    let mut cancelled = task("app:lint", None, 9_000, 9_002, &[]);
+    cancelled.status = "cancelled".into();
+    history
+        .record(run("hit", 9_000, vec![hit, cancelled]), &inputs(&[]))
+        .unwrap();
+    let expected = history.expected().unwrap();
+    assert_eq!(
+        expected.get("app:test"),
+        Some(&qk_history::Expected {
+            millis: 30,
+            threads: 4
+        })
+    );
+    assert_eq!(expected.get("app:lint"), None);
+}
