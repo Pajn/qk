@@ -366,6 +366,7 @@ impl Snapshot {
     pub(crate) fn outputs_written(&self, workspace: &Workspace, task: &Task) {
         let anchors: Option<Vec<String>> = Outputs::new(workspace, task)
             .ok()
+            .filter(Outputs::is_explicit)
             .map(|outputs| outputs.anchors().map(str::to_owned).collect());
         let overlap = |a: &str, b: &str| {
             a == b
@@ -1266,11 +1267,14 @@ pub(crate) fn dependency_keys(
                     Some(value) => value,
                     None => {
                         let value = snapshot.file_value(&workspace.root, path)?;
-                        outputs
-                            .values
-                            .lock()
-                            .unwrap()
-                            .insert(path.clone(), value.clone());
+                        // Links depend on paths outside the declared output roots.
+                        if value.get("link").is_none() {
+                            outputs
+                                .values
+                                .lock()
+                                .unwrap()
+                                .insert(path.clone(), value.clone());
+                        }
                         value
                     }
                 };
@@ -1280,4 +1284,85 @@ pub(crate) fn dependency_keys(
         }
     }
     Ok(keys)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use qk_taskgraph::Request;
+
+    fn fixture(outputs: Option<Value>) -> (tempfile::TempDir, Workspace, TaskGraph) {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("nx.json"), "{}").unwrap();
+        let mut post = json!({"command": "true"});
+        if let Some(outputs) = outputs {
+            post["outputs"] = outputs;
+        }
+        std::fs::write(root.path().join("project.json"), json!({"name":"app", "targets": {
+            "gen": {"command":"true", "outputs":["generated"]},
+            "post": post,
+            "build": {"command":"true", "dependsOn":["gen", "post"], "inputs":[{"dependentTasksOutputFiles":"**/*"}]}
+        }}).to_string()).unwrap();
+        std::fs::create_dir(root.path().join("generated")).unwrap();
+        std::fs::write(root.path().join("generated/value"), "one").unwrap();
+        let workspace = Workspace::load(root.path()).unwrap();
+        let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
+        (root, workspace, graph)
+    }
+
+    #[test]
+    fn undeclared_writes_invalidate_dependency_values() {
+        for outputs in [None, Some(json!(["generated"]))] {
+            let (root, workspace, graph) = fixture(outputs);
+            let snapshot = Snapshot::new(&workspace, &graph, &root.path().join("cache")).unwrap();
+            let keys = || {
+                dependency_keys(
+                    &snapshot,
+                    &workspace,
+                    &graph,
+                    &graph.tasks["app:build"],
+                    &BTreeMap::new(),
+                    &AtomicBool::new(false),
+                )
+                .unwrap()
+            };
+            let before = keys();
+            std::fs::write(root.path().join("generated/value"), "different").unwrap();
+            snapshot.outputs_written(&workspace, &graph.tasks["app:post"]);
+            assert_ne!(before, keys());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dependency_symlinks_recheck_targets_outside_output_roots() {
+        let (root, mut workspace, _) = fixture(Some(json!(["generated"])));
+        workspace
+            .projects
+            .get_mut("app")
+            .unwrap()
+            .targets
+            .get_mut("gen")
+            .unwrap()
+            .outputs = Some(vec!["links".into()]);
+        std::fs::create_dir(root.path().join("links")).unwrap();
+        std::os::unix::fs::symlink("../generated/value", root.path().join("links/value")).unwrap();
+        let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
+        let snapshot = Snapshot::new(&workspace, &graph, &root.path().join("cache")).unwrap();
+        let keys = || {
+            dependency_keys(
+                &snapshot,
+                &workspace,
+                &graph,
+                &graph.tasks["app:build"],
+                &BTreeMap::new(),
+                &AtomicBool::new(false),
+            )
+            .unwrap()
+        };
+        let before = keys();
+        std::fs::write(root.path().join("generated/value"), "different").unwrap();
+        snapshot.outputs_written(&workspace, &graph.tasks["app:post"]);
+        assert_ne!(before["app:gen:**/*"], keys()["app:gen:**/*"]);
+    }
 }
