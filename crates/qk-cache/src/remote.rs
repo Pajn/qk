@@ -1,17 +1,19 @@
 //! A remote store on S3-compatible storage, configured by nx.json's `s3` key as
 //! `@nx/s3-cache` reads it.
 //!
-//! It mirrors the local layout under `<cacheKeyPrefix>qk/v1/`: `entries/<key>.json`
-//! manifests and `blobs/<hash>` contents, so a bucket shared with Nx never
-//! mixes the two. A local miss fetches the manifest, then only the blobs missing
-//! locally, verifying each against its hash; the restore then runs locally.
-//! Uploads run in the background after a task is saved, blobs first and the
-//! manifest last, so a reader never finds a manifest without its blobs.
+//! Objects live under `<cacheKeyPrefix>qk/v2/`, so a bucket shared with Nx never
+//! mixes the two: `entries/<key>` for results and `warm/<task>/<branch>` for
+//! warm records. Each object is a pack holding a manifest or record with every
+//! blob it cites, so that one request reads or writes it whole; the store's
+//! latency is per request, and an entry can cite thousands of blobs. A local
+//! miss fetches the pack and keeps the blobs missing locally, verifying each
+//! against its hash; the restore then runs locally. Uploads run in the
+//! background after a task is saved.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -26,6 +28,11 @@ use serde_json::Value;
 const SIGNED_FOR: Duration = Duration::from_secs(15 * 60);
 /// Uploads in flight at once.
 const UPLOADERS: usize = 8;
+/// The most a single upload may hold, as S3 allows.
+const LARGEST_UPLOAD: u64 = 5 << 30;
+/// The most a pack's manifest or record may hold, so a corrupt length is not
+/// taken for one to read into memory.
+const LARGEST_RECORD: u64 = 1 << 30;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -129,7 +136,7 @@ pub fn configure(
     Ok(Some(Remote {
         bucket,
         credentials,
-        prefix: format!("{}qk/v1/", setting("cacheKeyPrefix").unwrap_or_default()),
+        prefix: format!("{}qk/v2/", setting("cacheKeyPrefix").unwrap_or_default()),
         agent,
         mode,
         uploads: Mutex::new(None),
@@ -139,23 +146,6 @@ pub fn configure(
 impl Remote {
     fn object(&self, kind: &str, name: &str) -> String {
         format!("{}{kind}/{name}", self.prefix)
-    }
-
-    /// The object's body streamed into `sink`, or `false` when it is missing.
-    fn get(&self, object: &str, sink: &mut dyn Write) -> Result<bool> {
-        let url = self
-            .bucket
-            .get_object(Some(&self.credentials), object)
-            .sign(SIGNED_FOR);
-        let response = self.agent.get(url.as_str()).call()?;
-        match response.status().as_u16() {
-            200 => {
-                io::copy(&mut response.into_body().into_reader(), sink)?;
-                Ok(true)
-            }
-            404 => Ok(false),
-            status => bail!("GET {object} returned {status}"),
-        }
     }
 
     fn exists(&self, object: &str) -> Result<bool> {
@@ -178,30 +168,27 @@ impl Remote {
             .put_object(Some(&self.credentials), object)
             .sign(SIGNED_FOR);
         let response = self.agent.put(url.as_str()).send(body)?;
-        match response.status().as_u16() {
+        let status = response.status().as_u16();
+        io::copy(&mut response.into_body().into_reader(), &mut io::sink())?;
+        match status {
             200..=299 => Ok(()),
             status => bail!("PUT {object} returned {status}"),
         }
     }
 
     /// Copies the entry for `key` into the local store at `root`, returning
-    /// whether the remote had it. Blobs the local store already holds are not
-    /// fetched again; every fetched blob is verified before it is kept.
+    /// whether the remote had it. Every blob the local store lacks is verified
+    /// before it is kept.
     pub(crate) fn fetch(&self, root: &Path, key: &str) -> Result<bool> {
-        let mut manifest = Vec::new();
-        if !self.get(
-            &self.object("entries", &format!("{key}.json")),
-            &mut manifest,
-        )? {
+        let Some(manifest) = self.fetch_pack(root, &self.object("entries", key), |parsed| {
+            if parsed.get("key").and_then(Value::as_str) != Some(key) {
+                bail!("remote manifest is for another key");
+            }
+            Ok(())
+        })?
+        else {
             return Ok(false);
-        }
-        let parsed: Value = serde_json::from_slice(&manifest).context("invalid remote manifest")?;
-        if parsed.get("key").and_then(Value::as_str) != Some(key) {
-            bail!("remote manifest is for another key");
-        }
-        for blob in crate::evict::manifest_blobs(&parsed) {
-            self.fetch_blob(root, &blob)?;
-        }
+        };
         let mut file = tempfile::NamedTempFile::new_in(root.join("tmp"))?;
         file.write_all(&manifest)?;
         file.as_file().sync_all()?;
@@ -255,36 +242,71 @@ impl Remote {
         task: &str,
         branch: &str,
     ) -> Result<Option<Vec<u8>>> {
-        let mut record = Vec::new();
-        if !self.get(&self.warm_object(task, branch), &mut record)? {
-            return Ok(None);
-        }
-        let parsed: Value =
-            serde_json::from_slice(&record).context("invalid remote warm record")?;
-        for blob in crate::evict::manifest_blobs(&parsed) {
-            self.fetch_blob(root, &blob)?;
-        }
-        Ok(Some(record))
+        self.fetch_pack(root, &self.warm_object(task, branch), |_| Ok(()))
     }
 
-    fn fetch_blob(&self, root: &Path, blob: &str) -> Result<()> {
-        if !crate::store::valid_hash(blob) {
-            bail!("invalid blob name in remote record");
+    /// The record in the pack at `object`, once `check` accepts it and the
+    /// blobs it cites that the local store lacks are kept there, or `None`
+    /// when there is no such object.
+    fn fetch_pack(
+        &self,
+        root: &Path,
+        object: &str,
+        check: impl Fn(&Value) -> Result<()>,
+    ) -> Result<Option<Vec<u8>>> {
+        let url = self
+            .bucket
+            .get_object(Some(&self.credentials), object)
+            .sign(SIGNED_FOR);
+        let response = self.agent.get(url.as_str()).call()?;
+        let status = response.status().as_u16();
+        let mut body = io::BufReader::new(response.into_body().into_reader());
+        if status != 200 {
+            io::copy(&mut body, &mut io::sink())?;
+            match status {
+                404 => return Ok(None),
+                status => bail!("GET {object} returned {status}"),
+            }
         }
-        let target = root.join("blobs").join(blob);
-        if target.is_file() {
-            return Ok(());
+        let length = pack_length(&mut body)?;
+        if length > LARGEST_RECORD {
+            bail!("remote record in {object} is too large");
         }
-        let mut file = tempfile::NamedTempFile::new_in(root.join("tmp"))?;
-        if !self.get(&self.object("blobs", blob), file.as_file_mut())? {
-            bail!("remote record is missing blob {blob}");
+        let mut record = Vec::new();
+        if (&mut body).take(length).read_to_end(&mut record)? as u64 != length {
+            bail!("remote pack {object} ends early");
         }
-        file.as_file().sync_all()?;
-        if crate::hash::digest_file(file.path())? != blob {
-            bail!("remote blob {blob} does not match its hash");
+        let parsed: Value = serde_json::from_slice(&record).context("invalid remote record")?;
+        check(&parsed)?;
+        for blob in crate::evict::manifest_blobs(&parsed) {
+            if !crate::store::valid_hash(&blob) {
+                bail!("invalid blob name in remote record");
+            }
+            let length = pack_length(&mut body)?;
+            let mut part = (&mut body).take(length);
+            let target = root.join("blobs").join(&blob);
+            let copied = if target.is_file() {
+                io::copy(&mut part, &mut io::sink())?
+            } else {
+                let mut file = tempfile::NamedTempFile::new_in(root.join("tmp"))?;
+                let copied = io::copy(&mut part, file.as_file_mut())?;
+                file.as_file().sync_all()?;
+                if copied == length {
+                    if crate::hash::digest_file(file.path())? != blob {
+                        bail!("remote blob {blob} does not match its hash");
+                    }
+                    file.persist(&target)?;
+                }
+                copied
+            };
+            if copied != length {
+                bail!("remote pack {object} ends early");
+            }
         }
-        file.persist(&target)?;
-        Ok(())
+        if body.read(&mut [0])? != 0 {
+            bail!("remote pack {object} holds more than its record cites");
+        }
+        Ok(Some(record))
     }
 
     fn enqueue(self: &Arc<Self>, upload: Upload) {
@@ -326,30 +348,40 @@ impl Remote {
 
     fn send(&self, job: &Upload) -> Result<()> {
         if let Some((object, record)) = &job.warm {
-            let parsed: Value = serde_json::from_slice(record)?;
-            for blob in crate::evict::manifest_blobs(&parsed) {
-                let remote = self.object("blobs", &blob);
-                if !self.exists(&remote)? {
-                    self.put(&remote, File::open(job.local.join("blobs").join(&blob))?)?;
-                }
-            }
             // The newest save for the branch replaces the last one.
-            return self.put(object, record.as_slice());
+            return self.put_pack(&job.local, object, record);
         }
-        let manifest_path = job.local.join("entries").join(format!("{}.json", job.key));
-        let manifest = fs::read(&manifest_path)?;
-        let parsed: Value = serde_json::from_slice(&manifest)?;
-        let object = self.object("entries", &format!("{}.json", job.key));
+        let object = self.object("entries", &job.key);
         if self.exists(&object)? {
             return Ok(());
         }
+        let manifest = fs::read(job.local.join("entries").join(format!("{}.json", job.key)))?;
+        self.put_pack(&job.local, &object, &manifest)
+    }
+
+    /// Uploads `record` with the blobs it cites from the local store at
+    /// `root`, as one pack.
+    fn put_pack(&self, root: &Path, object: &str, record: &[u8]) -> Result<()> {
+        let parsed: Value = serde_json::from_slice(record)?;
+        let mut pack = tempfile::NamedTempFile::new_in(root.join("tmp"))?;
+        let mut writer = io::BufWriter::new(pack.as_file_mut());
+        writer.write_all(&(record.len() as u64).to_le_bytes())?;
+        writer.write_all(record)?;
         for blob in crate::evict::manifest_blobs(&parsed) {
-            let remote = self.object("blobs", &blob);
-            if !self.exists(&remote)? {
-                self.put(&remote, File::open(job.local.join("blobs").join(&blob))?)?;
+            let mut file = File::open(root.join("blobs").join(&blob))?;
+            let length = file.metadata()?.len();
+            writer.write_all(&length.to_le_bytes())?;
+            if io::copy(&mut (&mut file).take(length), &mut writer)? != length {
+                bail!("blob {blob} changed while it was uploaded");
             }
         }
-        self.put(&object, manifest.as_slice())
+        writer.flush()?;
+        drop(writer);
+        let file = pack.reopen()?;
+        if file.metadata()?.len() > LARGEST_UPLOAD {
+            bail!("too large to upload as one object");
+        }
+        self.put(object, file)
     }
 
     /// Waits for queued uploads, returning the ones that failed.
@@ -363,4 +395,13 @@ impl Remote {
         }
         std::mem::take(&mut *uploads.failures.lock().unwrap())
     }
+}
+
+/// The length that starts each part of a pack.
+fn pack_length(reader: &mut impl Read) -> Result<u64> {
+    let mut bytes = [0; 8];
+    reader
+        .read_exact(&mut bytes)
+        .context("remote pack ends early")?;
+    Ok(u64::from_le_bytes(bytes))
 }

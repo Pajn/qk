@@ -788,13 +788,21 @@ fn remote_cache_restores_what_another_machine_uploaded() {
         "{}",
         stderr(&first)
     );
-    assert_eq!(server.objects("/cache/qk/v1/entries/").len(), 1);
-    assert!(server.objects("/cache/qk/v1/blobs/").len() >= 2);
+    // The entry and its outputs are one object.
+    assert_eq!(server.objects("/cache/qk/v2/").len(), 1);
+    assert_eq!(server.objects("/cache/qk/v2/entries/").len(), 1);
 
-    // A machine with an empty local cache restores from the remote store.
+    // A machine with an empty local cache restores from the remote store, in
+    // one request.
     clear_local_cache(&fixture);
     fs::remove_dir_all(fixture.root.join("dist")).unwrap();
+    let before = server.state.lock().unwrap().requests.len();
     let second = success(remote_build(&fixture, &[]));
+    let entry = server.objects("/cache/qk/v2/entries/").remove(0);
+    assert_eq!(
+        server.state.lock().unwrap().requests[before..],
+        [format!("GET {entry}")]
+    );
     assert!(
         stderr(&second).contains("qk: remote cache hit app:build"),
         "{}",
@@ -854,7 +862,7 @@ fn remote_failures_mid_restore_are_misses() {
     with_remote(&fixture, &server, json!({}));
     success(remote_build(&fixture, &[]));
     clear_local_cache(&fixture);
-    server.state.lock().unwrap().fail_blob_reads = true;
+    server.state.lock().unwrap().cut_reads = true;
     let output = success(remote_build(&fixture, &[]));
     assert!(
         stderr(&output).contains("remote cache unavailable"),
@@ -864,6 +872,23 @@ fn remote_failures_mid_restore_are_misses() {
     assert!(stderr(&output).contains("qk: cache miss app:build"));
     assert_eq!(fixture.runs(), 2);
     assert_eq!(artifact(&fixture.root), "built:one\n");
+
+    // So is a pack whose outputs do not match their hashes.
+    clear_local_cache(&fixture);
+    {
+        let mut state = server.state.lock().unwrap();
+        state.cut_reads = false;
+        let pack = state.objects.values_mut().next().unwrap();
+        *pack.last_mut().unwrap() ^= 1;
+    }
+    let output = success(remote_build(&fixture, &[]));
+    assert!(
+        stderr(&output).contains("does not match its hash"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(stderr(&output).contains("qk: cache miss app:build"));
+    assert_eq!(fixture.runs(), 3);
 }
 
 #[test]
@@ -1212,25 +1237,31 @@ fn warm_state_is_shared_through_the_remote_by_branch() {
         let _ = fs::remove_dir_all(fixture.root.join(".git/qk/warm"));
     };
     assert_eq!(on("main"), "cold");
-    let main_key = server.objects("/cache/qk/v1/warm/").pop().unwrap();
-    assert_eq!(server.objects("/cache/qk/v1/warm/").len(), 1);
+    let main_key = server.objects("/cache/qk/v2/warm/").pop().unwrap();
+    assert_eq!(server.objects("/cache/qk/v2/warm/").len(), 1);
     // Another machine, on a branch without its own state, starts from main's.
     fresh();
     assert_eq!(on("feature"), "main");
     // Once the branch has saved state, it is preferred.
     fresh();
     assert_eq!(on("feature"), "feature");
-    let (branch_key, record) = {
+    let (branch_key, pack) = {
         let state = server.state.lock().unwrap();
         state
             .objects
             .iter()
-            .find_map(|(key, bytes)| {
-                let record: Value = serde_json::from_slice(bytes).ok()?;
-                (key.starts_with("/cache/qk/v1/warm/") && key != &main_key)
-                    .then(|| (key.clone(), record))
-            })
+            .find(|(key, _)| key.starts_with("/cache/qk/v2/warm/") && *key != &main_key)
+            .map(|(key, pack)| (key.clone(), pack.clone()))
             .unwrap()
+    };
+    // A pack starts with its record's length and the record, then the blobs.
+    let length = u64::from_le_bytes(pack[..8].try_into().unwrap()) as usize;
+    let record: Value = serde_json::from_slice(&pack[8..8 + length]).unwrap();
+    let repack = |record: &[u8]| {
+        let mut bytes = (record.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(record);
+        bytes.extend_from_slice(&pack[8 + length..]);
+        bytes
     };
     let mut legacy = record.clone();
     legacy["version"] = json!(1);
@@ -1246,7 +1277,7 @@ fn warm_state_is_shared_through_the_remote_by_branch() {
             .lock()
             .unwrap()
             .objects
-            .insert(branch_key.clone(), bytes);
+            .insert(branch_key.clone(), repack(&bytes));
         fresh();
         assert_eq!(
             on("feature"),

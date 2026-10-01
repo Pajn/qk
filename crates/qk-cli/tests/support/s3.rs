@@ -11,8 +11,8 @@ pub struct State {
     pub objects: BTreeMap<String, Vec<u8>>,
     /// Methods and paths, in order.
     pub requests: Vec<String>,
-    /// Answer blob reads with a server error.
-    pub fail_blob_reads: bool,
+    /// Close the connection halfway through each object read.
+    pub cut_reads: bool,
 }
 
 pub struct FakeS3 {
@@ -98,21 +98,20 @@ fn serve(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
         body.resize(length, 0);
         reader.read_exact(&mut body)?;
     }
-    let (status, response) = {
+    let (status, response, cut) = {
         let mut state = state.lock().unwrap();
         state.requests.push(format!("{method} {path}"));
         match method.as_str() {
-            "PUT" if chunked => (501, Vec::new()),
+            "PUT" if chunked => (501, Vec::new(), false),
             "PUT" => {
                 state.objects.insert(path, body);
-                (200, Vec::new())
+                (200, Vec::new(), false)
             }
-            "GET" if state.fail_blob_reads && path.contains("/blobs/") => (500, Vec::new()),
             "GET" | "HEAD" => match state.objects.get(&path) {
-                Some(object) => (200, object.clone()),
-                None => (404, Vec::new()),
+                Some(object) => (200, object.clone(), method == "GET" && state.cut_reads),
+                None => (404, Vec::new(), false),
             },
-            _ => (405, Vec::new()),
+            _ => (405, Vec::new(), false),
         }
     };
     let mut stream = stream;
@@ -121,7 +120,9 @@ fn serve(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
         "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         response.len()
     )?;
-    if method != "HEAD" {
+    if cut {
+        stream.write_all(&response[..response.len() / 2])?;
+    } else if method != "HEAD" {
         stream.write_all(&response)?;
     }
     stream.flush()

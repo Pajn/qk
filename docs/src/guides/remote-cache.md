@@ -11,13 +11,15 @@ default), `read` (also spelled `read-only`) or `no-cache`, and
 not supported; a store that cannot be used is reported and left out, and the
 local cache carries on.
 
-Entries are stored under `<cacheKeyPrefix>qk/v1/` in the local layout, so a
-bucket shared with Nx never mixes the two. A local miss fetches the manifest
-and only the outputs the local cache lacks, verifying each against its hash,
-and shows `[remote cache]`; any failure is a miss. After a task is saved it is
-uploaded in the background, outputs first and the manifest last, and a run
-waits for its uploads before it ends. Uploads report their failures without
-failing the run.
+Entries are stored under `<cacheKeyPrefix>qk/v2/`, so a bucket shared with Nx
+never mixes the two. Each entry is one object holding its manifest and
+outputs, so that a lookup or restore is one request however many files the
+task wrote. A local miss fetches it, keeps the outputs the local cache lacks,
+verifying each against its hash, and shows `[remote cache]`; any failure is a
+miss. After a task is saved it is uploaded in the background, and a run waits
+for its uploads before it ends. Uploads report their failures without failing
+the run; an entry larger than 5 GiB, the most one S3 upload may hold, is not
+uploaded.
 
 The cache stays under a size limit: `NX_MAX_CACHE_SIZE`, else nx.json
 `maxCacheSize`, else a tenth of the disk holding it, as in Nx. Sizes are a
