@@ -53,6 +53,12 @@ pub enum CacheStatus {
     Uncached,
 }
 
+/// One actual keyed execution, independent of reusable cache entries.
+pub struct Execution {
+    pub log: qk_executor::RecordedLog,
+    pub inputs_unchanged: bool,
+}
+
 pub struct TaskResult {
     pub outcome: Outcome,
     pub fingerprint: Fingerprint,
@@ -61,6 +67,7 @@ pub struct TaskResult {
     pub key: Option<(String, Value)>,
     /// What warm state did, for targets that keep it.
     pub warm: Option<warm::WarmReport>,
+    pub execution: Option<Execution>,
 }
 
 impl TaskResult {
@@ -71,6 +78,7 @@ impl TaskResult {
             cache: CacheStatus::Uncached,
             key: None,
             warm: None,
+            execution: None,
         }
     }
 }
@@ -346,6 +354,7 @@ impl Cache {
                 cache: CacheStatus::Uncached,
                 key: keyed,
                 warm: warm_report,
+                execution: None,
             });
         }
         if let Err(error) = self.initialize() {
@@ -397,6 +406,7 @@ impl Cache {
                     cache: CacheStatus::LocalHit,
                     key: keyed,
                     warm: None,
+                    execution: None,
                 });
             }
             Ok(None) => {}
@@ -431,6 +441,7 @@ impl Cache {
                         cache: CacheStatus::RemoteHit,
                         key: keyed,
                         warm: None,
+                        execution: None,
                     });
                 }
                 Ok(None) => {}
@@ -447,20 +458,25 @@ impl Cache {
             Ok(log) => log,
             Err(error) => return bypass(format!("cache log unavailable: {error}")),
         };
-        let capture = Capture::new(Some(log.as_file().try_clone()?), prepared.display.clone());
+        let capture =
+            Capture::new(Some(log.as_file().try_clone()?), prepared.display.clone()).retain_log();
         let restored = before(running);
         let outcome = execute_captured(running, cancelled, Some(&capture))?;
         let warm_report = after(outcome, restored, running);
-        let fingerprint = if !self.unchanged(
+        let inputs_unchanged = self.inputs_match(
             snapshot,
             workspace,
             task,
             prepared,
             &dependencies,
             &key,
-            outcome,
             cancelled,
-        ) {
+        );
+        let execution = capture.take_log().map(|log| Execution {
+            log,
+            inputs_unchanged,
+        });
+        let fingerprint = if outcome != Outcome::Success || !inputs_unchanged {
             Err(format!("{}: did not complete unchanged", task.id))
         } else if !capture.healthy() {
             outputs_fingerprint(task, &workspace.root, &outputs, &key)
@@ -486,6 +502,7 @@ impl Cache {
             cache: CacheStatus::Miss,
             key: keyed,
             warm: warm_report,
+            execution,
         })
     }
 
@@ -503,6 +520,32 @@ impl Cache {
         cancelled: &AtomicBool,
     ) -> bool {
         if outcome != Outcome::Success || cancelled.load(Ordering::SeqCst) {
+            return false;
+        }
+        self.inputs_match(
+            snapshot,
+            workspace,
+            task,
+            prepared,
+            dependencies,
+            before,
+            cancelled,
+        )
+    }
+
+    /// Rechecks declared inputs for successful and failed executions alike.
+    #[allow(clippy::too_many_arguments)]
+    fn inputs_match(
+        &self,
+        snapshot: &hash::Snapshot,
+        workspace: &Workspace,
+        task: &Task,
+        prepared: &PreparedTask,
+        dependencies: &BTreeMap<String, String>,
+        before: &str,
+        cancelled: &AtomicBool,
+    ) -> bool {
+        if cancelled.load(Ordering::SeqCst) {
             return false;
         }
         let after = hash::fingerprint(snapshot, workspace, task, prepared, dependencies, cancelled);

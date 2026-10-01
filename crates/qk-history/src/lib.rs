@@ -16,7 +16,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 /// Runs kept in the database.
 pub const KEPT_RUNS: usize = 200;
 
@@ -133,6 +133,41 @@ pub struct RunSummary {
     pub cache: BTreeMap<String, usize>,
 }
 
+/// Maximum retained framed log payload; run metadata survives log eviction.
+pub const MAX_LOG_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Output borrowed from a finished task when recording its run.
+pub struct Execution<'a> {
+    pub data: &'a [u8],
+    pub truncated: bool,
+    pub inputs_unchanged: bool,
+}
+
+/// A retained execution's stream-tagged output.
+pub struct Log {
+    pub data: Vec<u8>,
+    pub truncated: bool,
+}
+
+/// A task/key with both successful and failed actual executions.
+#[derive(Debug, Serialize)]
+pub struct Flaky {
+    pub task: String,
+    pub key: String,
+    pub successes: usize,
+    pub failures: usize,
+    pub executions: Vec<Observation>,
+}
+
+/// An actual execution contributing to mixed outcomes for a task key.
+#[derive(Debug, Serialize)]
+pub struct Observation {
+    pub run: String,
+    pub status: String,
+    pub started: u64,
+    pub log_available: bool,
+}
+
 pub struct History {
     connection: Connection,
 }
@@ -201,6 +236,7 @@ impl History {
                  ALTER TABLE tasks ADD COLUMN threads INTEGER;
                  UPDATE schema_version SET version = 3;",
             )?,
+            Some(3) => {}
             Some(2) => transaction.execute_batch(
                 "ALTER TABLE tasks ADD COLUMN threads INTEGER;
                  UPDATE schema_version SET version = 3;",
@@ -209,6 +245,18 @@ impl History {
                 bail!("run history has schema version {other}; this qk reads {SCHEMA_VERSION}")
             }
         }
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS execution_logs (
+                 run_id TEXT NOT NULL,
+                 task_id TEXT NOT NULL,
+                 data BLOB,
+                 truncated INTEGER NOT NULL,
+                 inputs_unchanged INTEGER NOT NULL,
+                 PRIMARY KEY (run_id, task_id),
+                 FOREIGN KEY (run_id, task_id) REFERENCES tasks(run_id, task_id) ON DELETE CASCADE
+             );
+             UPDATE schema_version SET version = 4;",
+        )?;
         transaction.commit()?;
         connection.execute_batch("PRAGMA foreign_keys = ON;")?;
         Ok(Self { connection })
@@ -219,8 +267,18 @@ impl History {
     /// each key was computed from.
     pub fn record(
         &mut self,
+        run: RunReport,
+        inputs: &BTreeMap<String, Value>,
+    ) -> Result<RunReport> {
+        self.record_with_executions(run, inputs, &BTreeMap::new())
+    }
+
+    /// Stores execution observations and bounded logs atomically with their run.
+    pub fn record_with_executions(
+        &mut self,
         mut run: RunReport,
         inputs: &BTreeMap<String, Value>,
+        executions: &BTreeMap<&str, Execution<'_>>,
     ) -> Result<RunReport> {
         run.critical_path = critical_path(&run.tasks);
         for task in &mut run.tasks {
@@ -267,6 +325,19 @@ impl History {
                 ],
             )?;
         }
+        for task in &run.tasks {
+            if let Some(execution) = executions.get(task.id.as_str()) {
+                // Enforce the limit at the storage boundary as well as capture.
+                if execution.data.len() > 4 * 1024 * 1024 {
+                    bail!("execution log exceeds 4 MiB");
+                }
+                transaction.execute(
+                    "INSERT INTO execution_logs (run_id, task_id, data, truncated, inputs_unchanged)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![run.id, task.id, execution.data, execution.truncated, execution.inputs_unchanged],
+                )?;
+            }
+        }
         for (key, value) in inputs {
             transaction.execute(
                 "INSERT OR IGNORE INTO inputs (key, inputs) VALUES (?1, ?2)",
@@ -280,6 +351,21 @@ impl History {
         transaction.execute(
             "DELETE FROM inputs WHERE key NOT IN (SELECT key FROM tasks WHERE key IS NOT NULL)",
             [],
+        )?;
+        // Keep newest payloads under the shared byte budget, but retain the
+        // observations so eviction cannot erase evidence of mixed outcomes.
+        transaction.execute(
+            "UPDATE execution_logs SET data = NULL WHERE (run_id, task_id) IN (
+                 SELECT run_id, task_id FROM (
+                     SELECT e.run_id, e.task_id,
+                         SUM(length(e.data)) OVER (
+                             ORDER BY r.started DESC, e.run_id DESC, e.task_id
+                         ) AS retained_bytes
+                     FROM execution_logs e JOIN runs r ON r.id = e.run_id
+                     WHERE e.data IS NOT NULL
+                 ) WHERE retained_bytes > ?1
+             )",
+            [MAX_LOG_BYTES],
         )?;
         transaction.commit()?;
         Ok(run)
@@ -413,6 +499,61 @@ impl History {
     /// The task's most recent records, newest first, with their runs.
     pub fn task(&self, task: &str, limit: usize) -> Result<Vec<(String, TaskReport)>> {
         self.tasks("task_id = ?1", task, limit)
+    }
+
+    /// Reads one execution's log; absent for old runs, cache hits or evicted logs.
+    pub fn log(&self, run: &str, task: &str) -> Result<Option<Log>> {
+        Ok(self.connection.query_row(
+            "SELECT data, truncated FROM execution_logs WHERE run_id = ?1 AND task_id = ?2 AND data IS NOT NULL",
+            params![run, task], |row| Ok(Log { data: row.get(0)?, truncated: row.get(1)? })
+        ).optional()?)
+    }
+
+    /// Mixed outcomes for identical verified declared inputs, excluding cache replay.
+    pub fn flaky(&self, task: Option<&str>, limit: usize) -> Result<Vec<Flaky>> {
+        let mut statement = self.connection.prepare(
+            "SELECT t.task_id, t.key FROM tasks t
+             JOIN execution_logs e ON e.run_id = t.run_id AND e.task_id = t.task_id
+             WHERE t.cache = 'miss' AND t.key IS NOT NULL AND e.inputs_unchanged = 1
+               AND t.status IN ('success', 'failure') AND (?1 IS NULL OR t.task_id = ?1)
+             GROUP BY t.task_id, t.key
+             HAVING SUM(t.status = 'success') > 0 AND SUM(t.status = 'failure') > 0
+             ORDER BY MAX(t.started) DESC, t.task_id, t.key LIMIT ?2",
+        )?;
+        let keys = statement
+            .query_map(
+                params![task, i64::try_from(limit).unwrap_or(i64::MAX)],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        keys.into_iter()
+            .map(|(task, key)| {
+                let mut statement = self.connection.prepare(
+                    "SELECT t.run_id, t.status, t.started, e.data IS NOT NULL FROM tasks t
+                 JOIN execution_logs e ON e.run_id = t.run_id AND e.task_id = t.task_id
+                 WHERE t.task_id = ?1 AND t.key = ?2 AND t.cache = 'miss'
+                   AND t.status IN ('success', 'failure') AND e.inputs_unchanged = 1
+                 ORDER BY t.started DESC, t.run_id DESC",
+                )?;
+                let executions = statement
+                    .query_map(params![task, key], |row| {
+                        Ok(Observation {
+                            run: row.get(0)?,
+                            status: row.get(1)?,
+                            started: row.get(2)?,
+                            log_available: row.get(3)?,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(Flaky {
+                    task,
+                    key,
+                    successes: executions.iter().filter(|e| e.status == "success").count(),
+                    failures: executions.iter().filter(|e| e.status == "failure").count(),
+                    executions,
+                })
+            })
+            .collect()
     }
 
     fn tasks(&self, filter: &str, value: &str, limit: usize) -> Result<Vec<(String, TaskReport)>> {

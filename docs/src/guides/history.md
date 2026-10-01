@@ -37,3 +37,39 @@ web:build, most recent first:
         changed packages/ui/src/index.ts
         dependency ui:build
 ```
+
+## Execution logs and mixed outcomes
+
+```sh
+qk show flaky
+qk show flaky web:test --json
+qk show log <run-id> web:test
+```
+
+Successful and failed cacheable executions retain stdout and stderr separately,
+with their observed chunk order preserved. `show log` replays each chunk to its
+original stream. Cache hits replay a previous success and do not create another
+execution log. Uncached tasks, tasks run with `--skip-cache`, and tasks bypassed
+before execution do not retain logs. Failed executions never publish reusable
+cache entries.
+
+`show flaky [task]` lists task keys with both successful and failed executions
+in retained history. `--limit` defaults to 20 groups; `--json` includes the exact
+run IDs, outcomes and whether each log is still available. It excludes cache
+hits, cancelled executions and executions whose declared inputs changed while
+running. These are **mixed outcomes for identical declared inputs**, which can
+also indicate undeclared inputs, network dependencies or changing external
+state. To collect another actual execution after a cached success, `qk reset
+--only-cache` clears result entries while keeping history.
+
+Each log retains at most its first 4 MiB of framed output and reports truncation
+when replayed. History keeps at most 64 MiB of log payload across linked
+worktrees, evicting older payloads while keeping their outcome observations.
+The normal 200-run retention also removes those runs' logs and observations.
+These limits apply to retained payload, not SQLite metadata, free pages or
+result-cache logs. Logs stay local in `history.db`; remote result caching is
+unchanged. Logs can contain anything the command prints, including credentials.
+
+Schema version 4 adds execution observations and logs. Older histories upgrade
+in place; existing runs remain readable but have no execution logs and are not
+included in mixed-outcome detection.

@@ -32,6 +32,14 @@ fn process_helper() {
     fs::write("dist/nested/out.txt", format!("built:{input}")).unwrap();
     println!("building from {}", input.trim());
     eprintln!("build diagnostics");
+    if mode == "flaky-mutating" && runs == 0 {
+        fs::write("src/input.txt", "changed while running\n").unwrap();
+        std::process::exit(4);
+    }
+    if mode == "flaky" && runs % 2 == 0 {
+        eprintln!("flaky failure {}", runs + 1);
+        std::process::exit(4);
+    }
     if mode == "fail" {
         std::process::exit(4);
     }
@@ -2488,4 +2496,75 @@ fn warm_environment_keys_use_the_final_execution_environment() {
         fs::remove_dir_all(fixture.root.join("scratch")).unwrap();
         assert_eq!(said(&fixture, &fixture.root, &[]), "repo");
     }
+}
+
+/// Failed executions retain logs, never become cache hits, and pair with real successes.
+#[test]
+fn flaky_history_keeps_failed_logs_and_excludes_cache_replays() {
+    let fixture = Fixture::new(target(
+        "flaky",
+        json!({"inputs": ["{projectRoot}/src/**/*"]}),
+    ));
+    let first = fixture.build(&fixture.root, &[]);
+    assert_eq!(first.status.code(), Some(4));
+    let latest = || -> Value {
+        serde_json::from_slice(
+            &success(fixture.qk(&fixture.root, &["show", "run", "--json"])).stdout,
+        )
+        .unwrap()
+    };
+    let failed = latest();
+    assert_eq!(failed["tasks"][0]["cache"], "miss");
+    success(fixture.build(&fixture.root, &[]));
+    let passed = latest();
+    assert_eq!(failed["tasks"][0]["key"], passed["tasks"][0]["key"]);
+    assert_eq!(passed["tasks"][0]["cache"], "miss");
+    success(fixture.build(&fixture.root, &[]));
+    let cached = latest();
+    assert_eq!(cached["tasks"][0]["cache"], "local-hit");
+    let groups: Value = serde_json::from_slice(
+        &success(fixture.qk(&fixture.root, &["show", "flaky", "--json"])).stdout,
+    )
+    .unwrap();
+    assert_eq!(groups.as_array().unwrap().len(), 1);
+    assert_eq!(groups[0]["successes"], 1);
+    assert_eq!(groups[0]["failures"], 1);
+    assert_eq!(groups[0]["executions"].as_array().unwrap().len(), 2);
+    let log = success(fixture.qk(
+        &fixture.root,
+        &["show", "log", failed["id"].as_str().unwrap(), "app:build"],
+    ));
+    assert!(stdout(&log).contains("building from one"));
+    assert!(stderr(&log).contains("flaky failure 1"));
+    assert!(!stdout(&log).contains("flaky failure"));
+    let missing = fixture.qk(
+        &fixture.root,
+        &["show", "log", cached["id"].as_str().unwrap(), "app:build"],
+    );
+    assert!(!missing.status.success());
+    assert!(stderr(&missing).contains("no retained execution log"));
+    let linked = fixture.worktree();
+    let shared = success(fixture.qk(
+        &linked,
+        &["show", "log", failed["id"].as_str().unwrap(), "app:build"],
+    ));
+    assert_eq!(log.stdout, shared.stdout);
+    assert_eq!(log.stderr, shared.stderr);
+}
+
+/// A failure that changes declared inputs is inspectable but not a same-input observation.
+#[test]
+fn input_changes_during_failure_do_not_report_flakiness() {
+    let fixture = Fixture::new(target(
+        "flaky-mutating",
+        json!({"inputs": ["{projectRoot}/src/**/*"]}),
+    ));
+    assert_eq!(fixture.build(&fixture.root, &[]).status.code(), Some(4));
+    fs::write(fixture.root.join("src/input.txt"), "one\n").unwrap();
+    success(fixture.build(&fixture.root, &[]));
+    let groups: Value = serde_json::from_slice(
+        &success(fixture.qk(&fixture.root, &["show", "flaky", "--json"])).stdout,
+    )
+    .unwrap();
+    assert!(groups.as_array().unwrap().is_empty());
 }
