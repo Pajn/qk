@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -374,6 +374,62 @@ impl Outputs {
     }
 
     pub fn paths(&self, root: &Path) -> Result<BTreeSet<String>> {
+        if let Some(segments) = self.simple_segments()? {
+            for anchor in &self.anchors {
+                safe_parents(root, anchor)?;
+                match std::fs::symlink_metadata(root.join(anchor)) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return self.walk_paths(root);
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            let mut traversal = Traversal::default();
+            let mut candidates = BTreeSet::new();
+            for pattern in &segments {
+                traversal.expand(root, root, pattern, &mut candidates)?;
+            }
+            return candidates
+                .into_iter()
+                .filter(|path| self.matches(path))
+                .map(|path| {
+                    validate_path(&path)?;
+                    Ok(path)
+                })
+                .collect();
+        }
+        self.walk_paths(root)
+    }
+
+    fn simple_segments(&self) -> Result<Option<Vec<Vec<Segment>>>> {
+        if self.globs.iter().any(|glob| {
+            glob.contains("**")
+                || glob.contains(['!', '@', '+', '|', ',', '{', '}', '[', ']', '(', ')'])
+        }) {
+            return Ok(None);
+        }
+        let mut matchers = BTreeMap::new();
+        let mut patterns = Vec::new();
+        for glob in &self.globs {
+            let mut segments = Vec::new();
+            for part in glob.split('/') {
+                segments.push(if crate::glob::is_literal(part) {
+                    Segment::Literal(part.to_owned())
+                } else {
+                    let matcher = matchers
+                        .entry(part.to_owned())
+                        .or_insert(Pattern::new(part, false)?);
+                    Segment::Glob(matcher.clone())
+                });
+            }
+            patterns.push(segments);
+        }
+        Ok(Some(patterns))
+    }
+
+    fn walk_paths(&self, root: &Path) -> Result<BTreeSet<String>> {
         let mut paths = BTreeSet::new();
         for anchor in &self.anchors {
             safe_parents(root, anchor)?;
@@ -405,6 +461,65 @@ impl Outputs {
             }
         }
         Ok(paths)
+    }
+}
+
+#[derive(Clone)]
+enum Segment {
+    Literal(String),
+    Glob(Pattern),
+}
+
+#[derive(Default)]
+struct Traversal {
+    directories: BTreeMap<PathBuf, Vec<PathBuf>>,
+}
+
+impl Traversal {
+    fn expand(
+        &mut self,
+        root: &Path,
+        path: &Path,
+        segments: &[Segment],
+        paths: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let Some((segment, rest)) = segments.split_first() else {
+            for entry in walkdir::WalkDir::new(path)
+                .follow_links(false)
+                .follow_root_links(false)
+            {
+                paths.insert(relative(root, entry?.path())?);
+            }
+            return Ok(());
+        };
+        if !metadata.is_dir() {
+            return Ok(());
+        }
+        match segment {
+            Segment::Literal(name) => self.expand(root, &path.join(name), rest, paths),
+            Segment::Glob(matcher) => {
+                if !self.directories.contains_key(path) {
+                    let children = std::fs::read_dir(path)?
+                        .map(|entry| entry.map(|entry| entry.path()))
+                        .collect::<std::io::Result<Vec<_>>>()?;
+                    self.directories.insert(path.to_owned(), children);
+                }
+                let children: Vec<_> = self.directories[path]
+                    .iter()
+                    .filter(|child| matcher.is_match(child.file_name().unwrap()))
+                    .cloned()
+                    .collect();
+                for child in children {
+                    self.expand(root, &child, rest, paths)?;
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -610,6 +725,79 @@ mod tests {
                 "apps/b/graphql/nested/output.txt",
             ]
         );
+    }
+
+    #[test]
+    fn segment_traversal_preserves_output_sets() {
+        let workspace = tempfile::tempdir().unwrap();
+        for file in [
+            "apps/a/graphql/manifest.json",
+            "apps/a/graphql/nested/out.ts",
+            "apps/a/src/other.ts",
+            "apps/b/src/graphql/manifest.json",
+            "apps/.hidden/graphql/manifest.json",
+            "apps/a/file",
+            "dist/a.ts",
+            "dist/deep/b.ts",
+        ] {
+            let path = workspace.path().join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "value").unwrap();
+        }
+        for patterns in [
+            vec![
+                "apps/*/graphql/manifest.json",
+                "apps/*/*/graphql/manifest.json",
+            ],
+            vec!["apps/?/graphql", "!apps/a/graphql/nested"],
+            vec!["apps/a/graphql", "apps/*/graphql/*"],
+            vec!["apps/a/file/nested", "missing/*/file", "dist/*.ts"],
+            vec!["dist"],
+            vec!["apps/**/manifest.json"],
+            vec!["apps/[a/b]/graphql"],
+        ] {
+            let outputs =
+                Outputs::from_paths(&patterns.iter().map(|p| (*p).to_owned()).collect::<Vec<_>>())
+                    .unwrap();
+            match (
+                outputs.paths(workspace.path()),
+                outputs.walk_paths(workspace.path()),
+            ) {
+                (Ok(actual), Ok(expected)) => assert_eq!(actual, expected, "{patterns:?}"),
+                (Err(actual), Err(expected)) => {
+                    assert_eq!(actual.to_string(), expected.to_string())
+                }
+                results => panic!("different results for {patterns:?}: {results:?}"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn segment_traversal_preserves_symlink_boundaries() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        std::fs::create_dir_all(root.join("apps/a/graphql")).unwrap();
+        std::fs::write(root.join("apps/a/graphql/manifest.json"), "value").unwrap();
+        std::os::unix::fs::symlink("a", root.join("apps/link")).unwrap();
+        std::os::unix::fs::symlink("absent", root.join("apps/dangling")).unwrap();
+        for patterns in [
+            vec!["apps/*/graphql/manifest.json"],
+            vec!["apps/*"],
+            vec!["apps/link"],
+            vec!["apps/dangling"],
+        ] {
+            let outputs =
+                Outputs::from_paths(&patterns.iter().map(|p| (*p).to_owned()).collect::<Vec<_>>())
+                    .unwrap();
+            match (outputs.paths(root), outputs.walk_paths(root)) {
+                (Ok(actual), Ok(expected)) => assert_eq!(actual, expected, "{patterns:?}"),
+                (Err(actual), Err(expected)) => {
+                    assert_eq!(actual.to_string(), expected.to_string())
+                }
+                results => panic!("different results for {patterns:?}: {results:?}"),
+            }
+        }
     }
 
     /// Only unconditional literal output roots may move as complete trees.
