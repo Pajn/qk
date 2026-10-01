@@ -22,6 +22,8 @@
 | `qk affected -t build --granularity task` | Execute only the tasks whose inputs changed |
 | `qk show tasks -t build,test --affected [--json]` | The affected tasks and why |
 | `qk show runs`, `qk show run [id]` | Recent runs; one run's tasks, cache results and critical path |
+| `qk show flaky [task]` | Mixed successful/failed executions for identical declared inputs |
+| `qk show log <run> <task>` | Replay retained stdout/stderr from an actual cacheable execution |
 | `qk show task <project:target>` | A task's recent runs and why its cache key changed |
 | `qk cache path` | Print the local cache directory without creating it |
 | `qk cache prune [--max-size 1GB]` | Evict least recently used entries until the cache fits |
@@ -135,6 +137,9 @@ Quote name/tag globs so the shell does not expand them.
 
 `show runs --limit` defaults to `20`, and `show task <id> --limit` to `10`.
 `show run` without an ID uses the most recent run. All support `--json`.
+`show flaky [task] --limit` defaults to 20 task/key groups and supports `--json`.
+`show log <run> <task>` replays output to its original stdout/stderr streams.
+See [Run history](../guides/history.md) for retention limits and interpretation.
 
 ## Cache administration
 

@@ -184,3 +184,129 @@ fn upgrades_a_history_from_before_warm_state() {
     drop(history);
     History::open(&path).unwrap();
 }
+
+/// Different keys, replays, cancellations and unstable inputs cannot imply flakiness.
+#[test]
+fn mixed_outcomes_require_verified_executions_of_the_same_task_key() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut history = History::open(&temp.path().join("history.db")).unwrap();
+    for (index, (id, key, status, cache, stable)) in [
+        ("app:test", "same", "failure", "miss", true),
+        ("app:test", "different", "success", "miss", true),
+        ("other:test", "same", "success", "miss", true),
+        ("app:test", "same", "success", "local-hit", true),
+        ("app:test", "same", "success", "miss", false),
+        ("app:test", "same", "cancelled", "miss", true),
+        ("app:test", "same", "success", "miss", true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut record = task(id, Some(key), index as u64, index as u64 + 1, &[]);
+        record.status = status.into();
+        record.cache = Some(cache.into());
+        history
+            .record_with_executions(
+                run(&index.to_string(), index as u64, vec![record]),
+                &BTreeMap::new(),
+                &BTreeMap::from([(
+                    id,
+                    qk_history::Execution {
+                        data: b"",
+                        truncated: false,
+                        inputs_unchanged: stable,
+                    },
+                )]),
+            )
+            .unwrap();
+        let groups = history.flaky(None, 20).unwrap();
+        if index < 6 {
+            assert!(groups.is_empty());
+        } else {
+            assert_eq!(groups.len(), 1);
+            assert_eq!(groups[0].successes, 1);
+            assert_eq!(groups[0].failures, 1);
+        }
+    }
+    assert!(history.flaky(Some("other:test"), 20).unwrap().is_empty());
+    assert!(history.flaky(None, 0).unwrap().is_empty());
+}
+
+/// Payload eviction leaves observations intact; run pruning removes their logs.
+#[test]
+fn log_retention_is_bounded_without_erasing_mixed_outcomes() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut history = History::open(&temp.path().join("history.db")).unwrap();
+    let data = vec![0; 4 * 1024 * 1024];
+    for index in 0..18 {
+        let mut record = task("app:test", Some("same"), index, index + 1, &[]);
+        if index == 0 {
+            record.status = "failure".into();
+        }
+        history
+            .record_with_executions(
+                run(&index.to_string(), index, vec![record]),
+                &BTreeMap::new(),
+                &BTreeMap::from([(
+                    "app:test",
+                    qk_history::Execution {
+                        data: &data,
+                        truncated: true,
+                        inputs_unchanged: true,
+                    },
+                )]),
+            )
+            .unwrap();
+    }
+    assert!(history.log("0", "app:test").unwrap().is_none());
+    let newest = history.log("17", "app:test").unwrap().unwrap();
+    assert!(newest.truncated);
+    assert_eq!(newest.data.len(), data.len());
+    let groups = history.flaky(None, 20).unwrap();
+    assert_eq!(groups[0].failures, 1);
+    assert_eq!(
+        groups[0]
+            .executions
+            .iter()
+            .filter(|e| e.log_available)
+            .count(),
+        16
+    );
+    for index in 18..220 {
+        history
+            .record(
+                run(
+                    &index.to_string(),
+                    index,
+                    vec![task("app:test", Some("same"), index, index + 1, &[])],
+                ),
+                &BTreeMap::new(),
+            )
+            .unwrap();
+    }
+    assert!(history.log("17", "app:test").unwrap().is_none());
+    assert!(history.flaky(None, 20).unwrap().is_empty());
+}
+
+/// Existing schema-3 runs remain readable but do not invent execution observations.
+#[test]
+fn upgrades_schema_three_without_inventing_logs() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("history.db");
+    let mut history = History::open(&path).unwrap();
+    history
+        .record(
+            run("old", 1, vec![task("app:test", Some("same"), 1, 2, &[])]),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+    drop(history);
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("DROP TABLE execution_logs; UPDATE schema_version SET version = 3;")
+        .unwrap();
+    let history = History::open(&path).unwrap();
+    assert!(history.run(Some("old")).unwrap().is_some());
+    assert!(history.log("old", "app:test").unwrap().is_none());
+    assert!(history.flaky(None, 20).unwrap().is_empty());
+}

@@ -97,8 +97,23 @@ pub fn record(
         tasks,
         critical_path: Default::default(),
     };
+    let executions = result
+        .tasks
+        .iter()
+        .filter_map(|(id, record)| {
+            let execution = record.execution.as_ref()?;
+            Some((
+                id.as_str(),
+                qk_history::Execution {
+                    data: &execution.log.data,
+                    truncated: execution.log.truncated,
+                    inputs_unchanged: execution.inputs_unchanged,
+                },
+            ))
+        })
+        .collect();
     let run = match History::open(&path(workspace))
-        .and_then(|mut history| history.record(run.clone(), &inputs))
+        .and_then(|mut history| history.record_with_executions(run.clone(), &inputs, &executions))
     {
         Ok(run) => run,
         Err(error) => {
@@ -420,4 +435,67 @@ fn ago(millis: u64) -> String {
         3600..86400 => format!("{} h ago", seconds / 3600),
         _ => format!("{} days ago", seconds / 86400),
     }
+}
+
+/// Lists mixed outcomes and the exact executions whose logs can be inspected.
+pub fn show_flaky(
+    workspace: &Workspace,
+    task: Option<&str>,
+    limit: usize,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<()> {
+    let groups = open(workspace)?.flaky(task, limit)?;
+    if json {
+        serde_json::to_writer_pretty(&mut *out, &groups)?;
+        writeln!(out)?;
+        return Ok(());
+    }
+    if groups.is_empty() {
+        writeln!(
+            out,
+            "No mixed outcomes for identical declared inputs in retained history."
+        )?;
+    }
+    for group in groups {
+        writeln!(
+            out,
+            "{}  key {}  {} passed, {} failed (identical declared inputs)",
+            group.task, group.key, group.successes, group.failures
+        )?;
+        for execution in group.executions {
+            writeln!(
+                out,
+                "  {}  {}  {}",
+                execution.run,
+                execution.status,
+                if execution.log_available {
+                    "log retained"
+                } else {
+                    "log unavailable"
+                }
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Replays one execution in recorded chunk order, preserving stdout and stderr.
+pub fn show_log(workspace: &Workspace, run: &str, task: &str) -> Result<()> {
+    let Some(log) = open(workspace)?.log(run, task)? else {
+        bail!(
+            "no retained execution log for {task} in run {run} (cache hit, older run or log evicted)"
+        );
+    };
+    qk_executor::read_capture(log.data.as_slice(), |stderr, bytes| {
+        if stderr {
+            std::io::stderr().lock().write_all(bytes)
+        } else {
+            std::io::stdout().lock().write_all(bytes)
+        }
+    })?;
+    if log.truncated {
+        eprintln!("qk: execution log truncated at 4 MiB");
+    }
+    Ok(())
 }

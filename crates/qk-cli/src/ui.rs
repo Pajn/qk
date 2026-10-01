@@ -705,6 +705,7 @@ mod tests {
             key: None,
             warm: None,
             threads: None,
+            execution: None,
         };
         let report = |id: &str, started: u64, ended: u64, dependencies: &[&str]| TaskReport {
             id: id.into(),

@@ -281,9 +281,38 @@ fn write_to(stderr: bool, bytes: &[u8]) -> io::Result<()> {
 /// task's log, and shown as the task's display asks.
 pub struct Capture {
     file: Option<Mutex<File>>,
+    retained: Mutex<Option<RecordedLog>>,
     printer: Printer,
     healthy: AtomicBool,
     readiness: Option<Readiness>,
+}
+
+/// Maximum framed bytes retained for an execution, independent of result caching.
+pub const MAX_LOG_BYTES: usize = 4 * 1024 * 1024;
+
+/// Ordered, stream-tagged frames retained for run history.
+#[derive(Default)]
+pub struct RecordedLog {
+    pub data: Vec<u8>,
+    /// Further output was displayed but omitted from this bounded record.
+    pub truncated: bool,
+}
+
+impl RecordedLog {
+    /// Keeps a prefix of complete frames, stopping at the payload limit.
+    fn append(&mut self, stderr: bool, bytes: &[u8]) {
+        if self.truncated {
+            return;
+        }
+        let remaining = MAX_LOG_BYTES.saturating_sub(self.data.len());
+        let count = bytes.len().min(remaining.saturating_sub(5));
+        if count > 0 {
+            self.data.push(u8::from(stderr));
+            self.data.extend_from_slice(&(count as u32).to_le_bytes());
+            self.data.extend_from_slice(&bytes[..count]);
+        }
+        self.truncated = count != bytes.len();
+    }
 }
 
 /// Watches output for `readyWhen` text, on either stream and across reads.
@@ -318,13 +347,26 @@ impl Readiness {
 }
 
 impl Capture {
+    /// Streams output through its display, optionally recording cache frames on disk.
     pub fn new(file: Option<File>, display: Display) -> Self {
         Self {
             file: file.map(Mutex::new),
+            retained: Mutex::new(None),
             printer: Printer::new(display),
             healthy: AtomicBool::new(true),
             readiness: None,
         }
+    }
+
+    /// Retains a bounded execution log alongside any result-cache capture.
+    pub fn retain_log(self) -> Self {
+        *self.retained.lock().unwrap() = Some(RecordedLog::default());
+        self
+    }
+
+    /// Takes the retained log after the command's output readers have finished.
+    pub fn take_log(&self) -> Option<RecordedLog> {
+        self.retained.lock().unwrap().take()
     }
 
     /// Sets `ready` once every one of `patterns` has appeared in the output.
@@ -387,6 +429,14 @@ impl Capture {
     /// Records, shows and watches output, in frames the log reader accepts.
     fn emit(&self, stderr: bool, bytes: &[u8]) -> io::Result<()> {
         for frame in bytes.chunks(16 * 1024) {
+            // One order for retained frames, cache frames and displayed chunks.
+            let mut retained = self
+                .retained
+                .lock()
+                .map_err(|_| io::Error::other("retained log lock poisoned"))?;
+            if let Some(log) = retained.as_mut() {
+                log.append(stderr, frame);
+            }
             if let Some(file) = &self.file {
                 let mut file = file
                     .lock()
@@ -449,6 +499,34 @@ pub fn replay(reader: impl Read, display: &Display, shown: Shown) -> io::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Retention preserves binary streams and valid framing at the byte limit.
+    #[test]
+    fn retained_logs_are_ordered_and_bounded() {
+        let capture = Capture::new(None, Display::Hidden).retain_log();
+        capture.emit(false, b"stdout\0\xff").unwrap();
+        capture.emit(true, b"stderr").unwrap();
+        let data = vec![b'x'; MAX_LOG_BYTES];
+        capture.emit(false, &data).unwrap();
+        capture.emit(true, b"omitted").unwrap();
+        let log = capture.take_log().unwrap();
+        assert!(log.truncated);
+        assert!(log.data.len() <= MAX_LOG_BYTES);
+        let mut frames = Vec::new();
+        read_capture(log.data.as_slice(), |stderr, bytes| {
+            frames.push((stderr, bytes.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(frames[0], (false, b"stdout\0\xff".to_vec()));
+        assert_eq!(frames[1], (true, b"stderr".to_vec()));
+        assert!(
+            frames[2..]
+                .iter()
+                .all(|(stderr, bytes)| !stderr && bytes.iter().all(|b| *b == b'x'))
+        );
+        assert!(capture.take_log().is_none());
+    }
 
     #[test]
     fn prefixes_non_empty_lines_like_nx() {

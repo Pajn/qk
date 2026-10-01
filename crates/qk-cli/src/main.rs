@@ -595,6 +595,17 @@ enum ShowCommand {
         #[arg(long)]
         json: bool,
     },
+    /// List task keys with successful and failed executions of identical declared inputs.
+    Flaky {
+        /// Restrict results to a task id.
+        task: Option<String>,
+        #[arg(long, default_value = "20")]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Replay retained stdout and stderr from one actual cacheable execution.
+    Log { run: String, task: String },
     /// Show a project's normalized configuration.
     Project {
         name: String,
@@ -1077,6 +1088,18 @@ fn run(mut cli: Cli) -> Result<i32> {
         Command::Show {
             command: ShowCommand::Task { id, limit, json },
         } => history::show_task(&workspace, &id, limit, json, &mut io::stdout().lock())?,
+        Command::Show {
+            command: ShowCommand::Flaky { task, limit, json },
+        } => history::show_flaky(
+            &workspace,
+            task.as_deref(),
+            limit,
+            json,
+            &mut io::stdout().lock(),
+        )?,
+        Command::Show {
+            command: ShowCommand::Log { run, task },
+        } => history::show_log(&workspace, &run, &task)?,
         Command::Show {
             command: ShowCommand::Project { name, .. },
         } => {

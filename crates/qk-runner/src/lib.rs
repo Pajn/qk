@@ -57,6 +57,8 @@ pub struct TaskRecord {
     pub warm: Option<qk_cache::warm::WarmReport>,
     /// The threads it was given, for targets with `qk:threads`.
     pub threads: Option<usize>,
+    /// Bounded output and input verification for an actual cacheable execution.
+    pub execution: Option<qk_cache::Execution>,
 }
 
 /// How a run is carried out.
@@ -439,12 +441,18 @@ pub fn run(
                         active.remove(&id);
                         stops.remove(&id);
                         held.remove(&id);
-                        let (outcome, cache, key, warm) = match result {
+                        let (outcome, cache, key, warm, execution) = match result {
                             Ok(result) => {
                                 if !serving.contains(&id) {
                                     fingerprints.insert(id.clone(), result.fingerprint);
                                 }
-                                (result.outcome, result.cache, result.key, result.warm)
+                                (
+                                    result.outcome,
+                                    result.cache,
+                                    result.key,
+                                    result.warm,
+                                    result.execution,
+                                )
                             }
                             Err(error) => {
                                 fingerprints.insert(id.clone(), Err(format!("{id}: {error:#}")));
@@ -452,6 +460,7 @@ pub fn run(
                                 (
                                     Outcome::Failed(1),
                                     qk_cache::CacheStatus::Uncached,
+                                    None,
                                     None,
                                     None,
                                 )
@@ -489,6 +498,7 @@ pub fn run(
                                 key,
                                 warm,
                                 threads: given.remove(&id),
+                                execution,
                             },
                         );
                         outcomes.insert(id, outcome);
