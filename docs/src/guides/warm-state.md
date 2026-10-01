@@ -83,7 +83,8 @@ Dependencies named this way that run at once share the move: the first
 moves the paths, the last moves them back. A path is only moved back where
 its parents are directories inside the workspace; when the dependency put a
 link or a file in their place, the path stays aside, and the next run moves
-it back after that run's dependency. A run that is stopped leaves its paths
+it back after that run's dependency, keeping the task's other paths across
+that dependency as usual. A run that is stopped leaves its paths
 aside the same way. An entry names a target in the task's project, or
 `project:target`, and applies to the dependency in any configuration. What
 the dependency writes beside the paths stays.

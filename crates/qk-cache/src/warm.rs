@@ -462,19 +462,18 @@ fn acquire(workspace: &Workspace, owner: &Task, warm: &Warm) -> Result<PathBuf> 
     fs2::FileExt::lock_exclusive(&lock)?;
     // Under the lock, a stash on disk is one no run holds: one an earlier run
     // could not put back, or left when it was stopped. It goes back first.
-    // What cannot go back yet, as when its parent is not a directory, is the
-    // stash this dependency holds: nothing is moved over it, and it is put
-    // back after the dependency, which may well recreate the parent.
+    // What cannot go back yet, as when its parent is not a directory, stays
+    // in the stash this dependency holds, beside the paths that did go back,
+    // and is put back after the dependency, which may well recreate the
+    // parent.
     let left = fs::read(Stash::manifest(&root)).ok().map(|bytes| {
         let mut left: Stash = serde_json::from_slice(&bytes).unwrap_or_default();
         left.root = root.clone();
         left.workspace = workspace.root.clone();
         left
     });
-    let stash = match left {
-        Some(left) if !left.put_back() => left,
-        _ => stash(workspace, &root, warm)?,
-    };
+    let retained = left.filter(|left| !left.put_back());
+    let stash = stash(workspace, &root, warm, retained)?;
     active.insert(
         root.clone(),
         Active {
@@ -486,9 +485,50 @@ fn acquire(workspace: &Workspace, owner: &Task, warm: &Warm) -> Result<PathBuf> 
     Ok(root)
 }
 
-fn stash(workspace: &Workspace, root: &std::path::Path, warm: &Warm) -> Result<Stash> {
-    let _ = fs::remove_dir_all(root);
-    let kept = Outputs::from_paths(&warm.kept_paths())?.paths(&workspace.root)?;
+/// Moves the warm paths into a stash at `root`: a new one, or `retained`,
+/// what an earlier run could not put back, which keeps its entries. A path
+/// that is one of those, or inside or around one, stays where it is.
+fn stash(
+    workspace: &Workspace,
+    root: &std::path::Path,
+    warm: &Warm,
+    retained: Option<Stash>,
+) -> Result<Stash> {
+    let mut stash = match retained {
+        Some(retained) => retained,
+        None => {
+            let _ = fs::remove_dir_all(root);
+            Stash {
+                root: root.to_owned(),
+                workspace: workspace.root.clone(),
+                moved: Vec::new(),
+            }
+        }
+    };
+    let held: Vec<String> = stash
+        .moved
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| fs::symlink_metadata(root.join(index.to_string())).is_ok())
+        .map(|(_, path)| path.clone())
+        .collect();
+    let overlaps = |path: &str| {
+        held.iter().any(|held| {
+            held == path
+                || path.starts_with(&format!("{held}/"))
+                || held.starts_with(&format!("{path}/"))
+        })
+    };
+    // Each path on its own: one whose parents are not usable now, as one
+    // retained above may have, has nothing live there to move.
+    let mut kept = std::collections::BTreeSet::new();
+    for path in warm.kept_paths() {
+        if let Ok(found) = Outputs::from_paths(std::slice::from_ref(&path))
+            .and_then(|outputs| outputs.paths(&workspace.root))
+        {
+            kept.extend(found);
+        }
+    }
     // The topmost paths only: moving one moves what is below it.
     let topmost: Vec<String> = kept
         .iter()
@@ -502,13 +542,9 @@ fn stash(workspace: &Workspace, root: &std::path::Path, warm: &Warm) -> Result<S
                         .is_some_and(|ancestor| kept.contains(ancestor))
                 })
         })
+        .filter(|path| !overlaps(path))
         .cloned()
         .collect();
-    let mut stash = Stash {
-        root: root.to_owned(),
-        workspace: workspace.root.clone(),
-        moved: Vec::new(),
-    };
     if topmost.is_empty() {
         return Ok(stash);
     }
@@ -517,6 +553,8 @@ fn stash(workspace: &Workspace, root: &std::path::Path, warm: &Warm) -> Result<S
         let moved = paths::safe_parents(&workspace.root, &path).and_then(|()| {
             stash.moved.push(path.clone());
             fs::write(Stash::manifest(root), serde_json::to_vec(&stash)?)?;
+            // An entry put back earlier left its slot empty, and a retained
+            // one's slot is taken; a new one goes at the end either way.
             fs::rename(
                 workspace.root.join(&path),
                 root.join((stash.moved.len() - 1).to_string()),

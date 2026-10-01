@@ -1550,6 +1550,49 @@ fn surviving_paths_put_back_later_when_their_parent_is_not_a_directory() {
 
 #[cfg(unix)]
 #[test]
+fn paths_put_back_beside_one_that_could_not_be_survive_the_next_dependency() {
+    let targets = |prebuild: &str| {
+        json!({
+            "prebuild": {"command": prebuild},
+            "build": {
+                "command": "for d in one two; do if [ -f $d/build/state ]; then date -r $d/build/state +%Y; else echo cold; fi; done; mkdir -p one/build two/build; touch one/build/state two/build/state",
+                "dependsOn": ["prebuild"],
+                "qk:warm": {
+                    "paths": ["{projectRoot}/one/build", "{projectRoot}/two/build"],
+                    "survive": ["prebuild"]
+                }
+            }
+        })
+    };
+    let fixture = Fixture::with_targets(targets("mkdir -p one two"));
+    let mut ignore = fs::read_to_string(fixture.root.join(".gitignore")).unwrap();
+    ignore.push_str("one\ntwo\n");
+    fs::write(fixture.root.join(".gitignore"), ignore).unwrap();
+    let years = |fixture: &Fixture| {
+        stdout(&success(fixture.build(&fixture.root, &[])))
+            .lines()
+            .take(2)
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(years(&fixture), ["cold", "cold"]);
+    // one/build cannot go back, its parent now a file; two/build can.
+    set_targets(
+        &fixture,
+        targets("rm -rf one two && echo file > one && mkdir two"),
+    );
+    let _ = fixture.build(&fixture.root, &[]);
+    assert!(fixture.root.join("two/build/state").is_file());
+    // The next dependency deletes both; both are kept across it.
+    set_targets(&fixture, targets("rm -rf one two; mkdir one two"));
+    for year in years(&fixture) {
+        assert_ne!(year, "cold");
+        assert_ne!(year, "1970");
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn surviving_paths_outlast_dependencies_that_run_at_once() {
     let fixture = native_fixture(json!({
         "prepare-a": {"command": "rm -rf native; mkdir -p native; sleep 1"},
