@@ -173,6 +173,7 @@ pub struct History {
 }
 
 impl History {
+    /// Opens shared local history and atomically upgrades older supported schemas.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;

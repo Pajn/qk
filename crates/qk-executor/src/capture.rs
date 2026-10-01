@@ -347,6 +347,7 @@ impl Readiness {
 }
 
 impl Capture {
+    /// Streams output through its display, optionally recording cache frames on disk.
     pub fn new(file: Option<File>, display: Display) -> Self {
         Self {
             file: file.map(Mutex::new),
