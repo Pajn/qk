@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Component, Path};
@@ -290,14 +290,14 @@ impl Cache {
         let stage = tempfile::Builder::new()
             .prefix("restore-")
             .tempdir_in(stage_parent)?;
+        let mut staging = StagingDirectories::new(stage.path());
         for (path, artifact) in &manifest.artifacts {
             paths::safe_parents(root, path)?;
-            paths::safe_parents(stage.path(), path)?;
+            staging.parents(path)?;
             if !outputs.matches(path) {
                 bail!("cached artifact is outside declared outputs");
             }
             let destination = stage.path().join(path);
-            fs::create_dir_all(destination.parent().context("output has no parent")?)?;
             match artifact {
                 Artifact::File { blob, mode } => {
                     if !valid_hash(blob) {
@@ -313,15 +313,16 @@ impl Cache {
                     set_modified(&destination, started)?;
                     set_mode(&destination, *mode)?;
                 }
-                Artifact::Directory { .. } => {
-                    fs::create_dir_all(destination)?;
-                }
+                Artifact::Directory { .. } => staging.directory(path)?,
                 Artifact::Symlink { target, directory } => {
                     validate_link(path, target)?;
                     symlink(target, &destination, *directory)?;
                 }
             }
         }
+        // Eligibility is determined before cleanup: replacing an existing output
+        // tree keeps the established per-artifact behavior, even if cleanup empties it.
+        let complete = absent_directories(root, outputs, &manifest.artifacts)?;
         let current = outputs.paths(root)?;
         // Validate the complete cleanup set before deleting any output.
         for path in &current {
@@ -349,7 +350,24 @@ impl Cache {
                 fs::remove_file(absolute)?;
             }
         }
+        let mut promoted = BTreeSet::new();
+        for path in complete {
+            paths::safe_parents(root, &path)?;
+            let destination = root.join(&path);
+            fs::create_dir_all(destination.parent().context("output has no parent")?)?;
+            if promote_directory(&stage.path().join(&path), &destination)? {
+                promoted.insert(path);
+            }
+        }
         for (path, artifact) in &manifest.artifacts {
+            if promoted.iter().any(|parent| {
+                path == parent
+                    || path
+                        .strip_prefix(parent)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+            }) {
+                continue;
+            }
             paths::safe_parents(root, path)?;
             let destination = root.join(path);
             fs::create_dir_all(destination.parent().context("output has no parent")?)?;
@@ -368,6 +386,110 @@ impl Cache {
         qk_executor::replay(File::open(log)?, display, shown)?;
         crate::evict::touch(&self.root.join("entries").join(format!("{key}.json")));
         manifest.output_fingerprint(outputs.declared()).map(Some)
+    }
+}
+
+/// Directory creation is deduplicated only inside this restore's private
+/// temporary stage. Staging never replaces directories with files or links;
+/// such conflicting manifests fail. Destination validation is never cached.
+struct StagingDirectories<'a> {
+    root: &'a Path,
+    directories: BTreeSet<String>,
+}
+
+impl<'a> StagingDirectories<'a> {
+    fn new(root: &'a Path) -> Self {
+        Self {
+            root,
+            directories: BTreeSet::new(),
+        }
+    }
+
+    fn parents(&mut self, path: &str) -> Result<()> {
+        paths::validate_path(path)?;
+        if let Some((parent, _)) = path.rsplit_once('/') {
+            self.directory(parent)?;
+        }
+        Ok(())
+    }
+
+    fn directory(&mut self, path: &str) -> Result<()> {
+        paths::validate_path(path)?;
+        let mut prefix = String::new();
+        for part in path.split('/') {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(part);
+            if self.directories.contains(&prefix) {
+                continue;
+            }
+            let absolute = self.root.join(&prefix);
+            match fs::create_dir(&absolute) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let metadata = fs::symlink_metadata(&absolute)?;
+                    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                        bail!(
+                            "cache staging parent is not a real directory: {}",
+                            absolute.display()
+                        );
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+            self.directories.insert(prefix.clone());
+        }
+        Ok(())
+    }
+}
+
+/// Complete staged directories whose destinations were absent before cleanup.
+fn absent_directories(
+    root: &Path,
+    outputs: &Outputs,
+    artifacts: &BTreeMap<String, Artifact>,
+) -> Result<Vec<String>> {
+    let mut roots = Vec::new();
+    for path in outputs.complete_roots() {
+        if !matches!(artifacts.get(path), Some(Artifact::Directory { .. })) {
+            continue;
+        }
+        paths::safe_parents(root, path)?;
+        match fs::symlink_metadata(root.join(path)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                roots.push(path.to_owned())
+            }
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
+        }
+    }
+    Ok(roots)
+}
+
+/// Move a complete verified directory without replacing a destination that
+/// appeared during staging. Unsupported or cross-device renames retain the
+/// per-artifact path; unexpected I/O errors still fail restoration.
+fn promote_directory(staged: &Path, destination: &Path) -> Result<bool> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use rustix::fs::{CWD, RenameFlags, renameat_with};
+        match renameat_with(CWD, staged, CWD, destination, RenameFlags::NOREPLACE) {
+            Ok(()) => Ok(true),
+            Err(
+                rustix::io::Errno::EXIST
+                | rustix::io::Errno::XDEV
+                | rustix::io::Errno::NOSYS
+                | rustix::io::Errno::INVAL
+                | rustix::io::Errno::OPNOTSUPP,
+            ) => Ok(false),
+            Err(error) => Err(std::io::Error::from(error).into()),
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (staged, destination);
+        Ok(false)
     }
 }
 
@@ -499,4 +621,143 @@ fn outputs_unchanged(root: &Path, task: &str, key: &str, outputs: &Outputs) -> b
         return false;
     };
     serde_json::to_value(current).ok().as_ref() == record.get("outputs")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Private staging rejects unsafe paths and file/link ancestors rather
+    /// than following them, while shared ordinary parents can be reused.
+    #[test]
+    fn staging_directory_reuse_rejects_conflicting_manifest_parents() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut staging = StagingDirectories::new(temp.path());
+        staging.parents("dist/nested/a").unwrap();
+        staging.parents("dist/nested/b").unwrap();
+        staging.directory("dist/nested/empty").unwrap();
+        assert!(temp.path().join("dist/nested/empty").is_dir());
+        fs::write(temp.path().join("file"), "keep").unwrap();
+        assert!(staging.parents("file/child").is_err());
+        assert!(staging.parents("../escape").is_err());
+        assert!(staging.parents("dist/../escape").is_err());
+        assert_eq!(
+            fs::read_to_string(temp.path().join("file")).unwrap(),
+            "keep"
+        );
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(outside.path(), temp.path().join("link")).unwrap();
+            assert!(staging.parents("link/child").is_err());
+            assert!(!outside.path().join("child").exists());
+        }
+    }
+
+    /// A no-replace move must leave every kind of existing destination intact.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn directory_promotion_never_replaces_a_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("staged");
+        let destination = temp.path().join("dist");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("output"), "cached").unwrap();
+        fs::create_dir(&destination).unwrap();
+        assert!(!promote_directory(&source, &destination).unwrap());
+        assert!(destination.is_dir());
+        assert!(fs::read_dir(&destination).unwrap().next().is_none());
+        fs::write(destination.join("keep"), "unrelated").unwrap();
+        assert!(!promote_directory(&source, &destination).unwrap());
+        assert_eq!(
+            fs::read_to_string(destination.join("keep")).unwrap(),
+            "unrelated"
+        );
+        fs::remove_dir_all(&destination).unwrap();
+        fs::write(&destination, "file").unwrap();
+        assert!(!promote_directory(&source, &destination).unwrap());
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "file");
+        fs::remove_file(&destination).unwrap();
+        std::os::unix::fs::symlink("absent", &destination).unwrap();
+        assert!(!promote_directory(&source, &destination).unwrap());
+        assert_eq!(fs::read_link(&destination).unwrap(), Path::new("absent"));
+        fs::remove_file(&destination).unwrap();
+        assert!(promote_directory(&source, &destination).unwrap());
+        assert_eq!(
+            fs::read_to_string(destination.join("output")).unwrap(),
+            "cached"
+        );
+        assert!(!source.exists());
+    }
+
+    /// Complete roots require a cached directory and an absent destination.
+    #[test]
+    fn directory_candidates_require_absent_manifest_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let outputs = Outputs::from_paths(&[
+            "a".into(),
+            "ab".into(),
+            "file".into(),
+            "partial/*.txt".into(),
+        ])
+        .unwrap();
+        let artifacts = BTreeMap::from([
+            ("a".into(), Artifact::Directory { mode: 0o755 }),
+            ("ab".into(), Artifact::Directory { mode: 0o755 }),
+            (
+                "file".into(),
+                Artifact::File {
+                    blob: "0".repeat(64),
+                    mode: 0o644,
+                },
+            ),
+            ("partial".into(), Artifact::Directory { mode: 0o755 }),
+        ]);
+        assert_eq!(
+            absent_directories(temp.path(), &outputs, &artifacts).unwrap(),
+            ["a", "ab"]
+        );
+        fs::create_dir(temp.path().join("a")).unwrap();
+        assert_eq!(
+            absent_directories(temp.path(), &outputs, &artifacts).unwrap(),
+            ["ab"]
+        );
+    }
+
+    /// Every blob is verified before any output is cleaned or promoted.
+    #[test]
+    fn corrupt_late_blob_leaves_existing_and_absent_roots_untouched() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir(root.join("a")).unwrap();
+        fs::create_dir(root.join("z")).unwrap();
+        fs::write(root.join("a/value"), "first").unwrap();
+        fs::write(root.join("z/value"), "last").unwrap();
+        let log = root.join("log");
+        fs::write(&log, "").unwrap();
+        let cache = Cache::new(root.join(".qk/cache"));
+        cache.initialize().unwrap();
+        let outputs = Outputs::from_patterns(&["a", "z"]);
+        let key = "0".repeat(64);
+        cache.publish(root, &key, &outputs, &log).unwrap();
+        fs::write(root.join("a/value"), "keep me").unwrap();
+        fs::remove_dir_all(root.join("z")).unwrap();
+        let blob = blake3::hash(b"last").to_hex().to_string();
+        fs::write(cache.root.join("blobs").join(blob), "corrupt").unwrap();
+        assert!(
+            cache
+                .restore(
+                    root,
+                    "build",
+                    &Default::default(),
+                    &key,
+                    &outputs,
+                    &qk_executor::Display::Hidden,
+                    qk_executor::Shown::LocalCache
+                )
+                .is_err()
+        );
+        assert_eq!(fs::read_to_string(root.join("a/value")).unwrap(), "keep me");
+        assert!(!root.join("z").exists());
+    }
 }
