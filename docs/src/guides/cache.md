@@ -18,7 +18,9 @@ records of the outputs it holds, restores in progress) lives in its own git
 directory, `$(git rev-parse --git-dir)/qk`, so nothing of qk's appears in the
 working tree. Outside Git both live in `.qk` at the workspace root, the cache
 in `.qk/cache/v1`. `qk cache path` prints the cache's location. `--skip-cache` (also
-`--skip-nx-cache` and `--skipNxCache`) bypasses all cache reads and writes.
+`--skip-nx-cache` and `--skipNxCache`) bypasses result-cache reads and writes.
+Otherwise cacheable executions still record their keys and bounded stdout/stderr
+in [run history](history.md), so repeated forced runs can reveal flaky outcomes.
 
 ## What changes the key
 

@@ -205,13 +205,15 @@ pub fn run(
     if warm && !skip_cache {
         qk_cache::warm::check_overlaps(workspace, graph)?;
     }
-    let cache = (!skip_cache
-        && (warm
-            || graph
-                .tasks
-                .values()
-                .any(|task| task.definition.cache == Some(true))))
-    .then(|| qk_cache::Cache::for_workspace(workspace, &environment));
+    let cacheable = graph
+        .tasks
+        .values()
+        .any(|task| task.definition.cache == Some(true));
+    let cache = if skip_cache {
+        (sandbox.is_none() && cacheable).then(|| qk_cache::Cache::for_observation(workspace))
+    } else {
+        (warm || cacheable).then(|| qk_cache::Cache::for_workspace(workspace, &environment))
+    };
     let mut skipped = BTreeSet::new();
     let mut exit_code = 0;
     let mut started = BTreeMap::new();

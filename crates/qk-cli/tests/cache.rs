@@ -448,6 +448,155 @@ fn skip_cache_neither_reads_nor_writes() {
 }
 
 #[test]
+fn skipped_cache_runs_record_flakes_without_using_local_or_remote_entries() {
+    let server = s3::FakeS3::start();
+    let fixture = Fixture::new(target(
+        "flaky",
+        json!({"inputs": ["{projectRoot}/src/**/*"]}),
+    ));
+    with_remote(&fixture, &server, json!({}));
+    let forced = |flag: &str| {
+        fixture
+            .command(&fixture.root, &["run", "app:build", flag])
+            .env("AWS_ACCESS_KEY_ID", "key")
+            .env("AWS_SECRET_ACCESS_KEY", "secret")
+            .output()
+            .unwrap()
+    };
+    assert_eq!(forced("--skip-nx-cache").status.code(), Some(4));
+    let latest = || -> Value {
+        serde_json::from_slice(
+            &success(fixture.qk(&fixture.root, &["show", "run", "--json"])).stdout,
+        )
+        .unwrap()
+    };
+    let failed = latest();
+    success(forced("--skip-cache"));
+    let passed = latest();
+    let environment_run = fixture
+        .command(&fixture.root, &["run", "app:build"])
+        .env("NX_SKIP_NX_CACHE", "true")
+        .env("AWS_ACCESS_KEY_ID", "key")
+        .env("AWS_SECRET_ACCESS_KEY", "secret")
+        .output()
+        .unwrap();
+    assert_eq!(environment_run.status.code(), Some(4));
+    let environment_failed = latest();
+    assert_eq!(failed["tasks"][0]["cache"], "uncached");
+    assert_eq!(passed["tasks"][0]["cache"], "uncached");
+    assert!(failed["tasks"][0]["key"].is_string());
+    assert_eq!(failed["tasks"][0]["key"], passed["tasks"][0]["key"]);
+    assert_eq!(
+        failed["tasks"][0]["key"],
+        environment_failed["tasks"][0]["key"]
+    );
+    assert_eq!(environment_failed["tasks"][0]["cache"], "uncached");
+    assert!(server.state.lock().unwrap().requests.is_empty());
+    let cache = stdout(&success(fixture.qk(&fixture.root, &["cache", "path"])));
+    assert!(!Path::new(cache.trim()).exists());
+    let groups: Value = serde_json::from_slice(
+        &success(fixture.qk(&fixture.root, &["show", "flaky", "--json"])).stdout,
+    )
+    .unwrap();
+    assert_eq!(groups.as_array().unwrap().len(), 1);
+    assert_eq!(groups[0]["successes"], 1);
+    assert_eq!(groups[0]["failures"], 2);
+    let log = success(fixture.qk(
+        &fixture.root,
+        &["show", "log", failed["id"].as_str().unwrap(), "app:build"],
+    ));
+    assert!(stdout(&log).contains("building from one"));
+    assert!(stderr(&log).contains("flaky failure 1"));
+    assert!(!stdout(&log).contains("flaky failure"));
+}
+
+#[test]
+fn forced_failure_pairs_with_a_real_success_and_preserves_its_cache_entry() {
+    let fixture = Fixture::new(target(
+        "flaky",
+        json!({"inputs": ["{projectRoot}/src/**/*"]}),
+    ));
+    assert_eq!(fixture.build(&fixture.root, &[]).status.code(), Some(4));
+    success(fixture.build(&fixture.root, &[]));
+    let manifests = || {
+        let cache = stdout(&success(fixture.qk(&fixture.root, &["cache", "path"])));
+        fs::read_dir(Path::new(cache.trim()).join("entries"))
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.file_name(), fs::read(entry.path()).unwrap())
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let entry = manifests();
+    assert_eq!(
+        fixture
+            .build(&fixture.root, &["--skip-nx-cache"])
+            .status
+            .code(),
+        Some(4)
+    );
+    assert_eq!(manifests(), entry);
+    let hit = success(fixture.build(&fixture.root, &[]));
+    assert!(stderr(&hit).contains("qk: cache hit app:build"));
+    assert_eq!(fixture.runs(), 3);
+    let groups: Value = serde_json::from_slice(
+        &success(fixture.qk(&fixture.root, &["show", "flaky", "--json"])).stdout,
+    )
+    .unwrap();
+    assert_eq!(groups.as_array().unwrap().len(), 1);
+    assert_eq!(groups[0]["successes"], 1);
+    assert_eq!(groups[0]["failures"], 2);
+    assert_eq!(groups[0]["executions"].as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn forced_runs_fingerprint_uncacheable_dependencies_without_retaining_their_logs() {
+    let fixture = Fixture::with_targets(json!({
+        "generate": target("generate", json!({"cache": false, "outputs": ["{projectRoot}/generated"], "inputs": ["{projectRoot}/src/**/*"]})),
+        "build": target("build", json!({"dependsOn": ["generate"], "inputs": []}))
+    }));
+    let latest = || -> Value {
+        serde_json::from_slice(
+            &success(fixture.qk(&fixture.root, &["show", "run", "--json"])).stdout,
+        )
+        .unwrap()
+    };
+    let build_key = |run: &Value| {
+        run["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["id"] == "app:build")
+            .unwrap()["key"]
+            .clone()
+    };
+    success(fixture.build(&fixture.root, &["--skip-nx-cache"]));
+    let first = latest();
+    assert!(build_key(&first).is_string());
+    fs::write(fixture.root.join("src/input.txt"), "two\n").unwrap();
+    success(fixture.build(&fixture.root, &["--skip-nx-cache"]));
+    let second = latest();
+    assert_ne!(build_key(&first), build_key(&second));
+    let build_log = fixture.qk(
+        &fixture.root,
+        &["show", "log", second["id"].as_str().unwrap(), "app:build"],
+    );
+    success(build_log);
+    let dependency_log = fixture.qk(
+        &fixture.root,
+        &[
+            "show",
+            "log",
+            second["id"].as_str().unwrap(),
+            "app:generate",
+        ],
+    );
+    assert!(!dependency_log.status.success());
+    assert!(stderr(&dependency_log).contains("no retained execution log"));
+}
+
+#[test]
 fn failures_are_not_cached() {
     let fixture = Fixture::new(target("fail", json!({})));
     assert_eq!(fixture.build(&fixture.root, &[]).status.code(), Some(4));
@@ -2644,16 +2793,18 @@ fn flaky_history_keeps_failed_logs_and_excludes_cache_replays() {
 /// A failure that changes declared inputs is inspectable but not a same-input observation.
 #[test]
 fn input_changes_during_failure_do_not_report_flakiness() {
-    let fixture = Fixture::new(target(
-        "flaky-mutating",
-        json!({"inputs": ["{projectRoot}/src/**/*"]}),
-    ));
-    assert_eq!(fixture.build(&fixture.root, &[]).status.code(), Some(4));
-    fs::write(fixture.root.join("src/input.txt"), "one\n").unwrap();
-    success(fixture.build(&fixture.root, &[]));
-    let groups: Value = serde_json::from_slice(
-        &success(fixture.qk(&fixture.root, &["show", "flaky", "--json"])).stdout,
-    )
-    .unwrap();
-    assert!(groups.as_array().unwrap().is_empty());
+    for flags in [&[][..], &["--skip-nx-cache"][..]] {
+        let fixture = Fixture::new(target(
+            "flaky-mutating",
+            json!({"inputs": ["{projectRoot}/src/**/*"]}),
+        ));
+        assert_eq!(fixture.build(&fixture.root, flags).status.code(), Some(4));
+        fs::write(fixture.root.join("src/input.txt"), "one\n").unwrap();
+        success(fixture.build(&fixture.root, flags));
+        let groups: Value = serde_json::from_slice(
+            &success(fixture.qk(&fixture.root, &["show", "flaky", "--json"])).stdout,
+        )
+        .unwrap();
+        assert!(groups.as_array().unwrap().is_empty());
+    }
 }

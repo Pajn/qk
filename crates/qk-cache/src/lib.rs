@@ -32,6 +32,8 @@ pub struct Cache {
     pub root: PathBuf,
     snapshot: OnceLock<std::result::Result<hash::Snapshot, String>>,
     remote: Option<std::sync::Arc<remote::Remote>>,
+    /// Whether results and warm state may be restored or published.
+    reuse: bool,
     /// The tasks whose outputs this run left exactly as they were.
     kept: std::sync::Mutex<std::collections::BTreeSet<String>>,
     /// Warm state being saved in the background.
@@ -137,8 +139,17 @@ impl Cache {
             root,
             snapshot: OnceLock::new(),
             remote: None,
+            reuse: true,
             kept: Default::default(),
             saves: Default::default(),
+        }
+    }
+
+    /// Records verified executions without configuring or using result stores.
+    pub fn for_observation(workspace: &Workspace) -> Self {
+        Self {
+            reuse: false,
+            ..Self::new(paths::cache_location(workspace))
         }
     }
 
@@ -166,6 +177,9 @@ impl Cache {
     /// Saves what later runs reuse and waits for background uploads to the
     /// remote store, reporting failures.
     pub fn finish(&self, workspace: &Workspace) {
+        if !self.reuse {
+            return;
+        }
         if let Some(Ok(snapshot)) = self.snapshot.get() {
             snapshot.save_digests(&workspace.root);
         }
@@ -222,13 +236,19 @@ impl Cache {
     ) -> Result<TaskResult> {
         let cacheable = task.definition.cache == Some(true);
         // Held until the task is done, whether it ran or came from the cache.
-        let _kept = warm::keep_across(workspace, graph, task);
-        let warm = match warm::config(workspace, task) {
-            Ok(warm) => warm,
-            Err(error) => {
-                qk_executor::status!("qk: {}: warm state ignored ({error:#})", task.id);
-                None
+        let _kept = self
+            .reuse
+            .then(|| warm::keep_across(workspace, graph, task));
+        let warm = if self.reuse {
+            match warm::config(workspace, task) {
+                Ok(warm) => warm,
+                Err(error) => {
+                    qk_executor::status!("qk: {}: warm state ignored ({error:#})", task.id);
+                    None
+                }
             }
+        } else {
+            None
         };
         // The warm variables point tools at their state; they are not inputs,
         // so the key is computed from the task without them.
@@ -371,6 +391,35 @@ impl Cache {
                 key: keyed,
                 warm: warm_report,
                 execution: None,
+            });
+        }
+        if !self.reuse {
+            let capture = Capture::new(None, prepared.display.clone()).retain_log();
+            let outcome = execute_captured(running, cancelled, Some(&capture))?;
+            let inputs_unchanged = self.inputs_match(
+                snapshot,
+                workspace,
+                task,
+                prepared,
+                &dependencies,
+                &key,
+                cancelled,
+            );
+            let fingerprint = if outcome == Outcome::Success && inputs_unchanged {
+                outputs_fingerprint(task, &workspace.root, &outputs, &key)
+            } else {
+                Err(format!("{}: did not complete unchanged", task.id))
+            };
+            return Ok(TaskResult {
+                outcome,
+                fingerprint,
+                cache: CacheStatus::Uncached,
+                key: keyed,
+                warm: None,
+                execution: capture.take_log().map(|log| Execution {
+                    log,
+                    inputs_unchanged,
+                }),
             });
         }
         if let Err(error) = self.initialize() {
@@ -567,10 +616,17 @@ impl Cache {
         let after = hash::fingerprint(snapshot, workspace, task, prepared, dependencies, cancelled);
         if after.as_deref().ok() != Some(before) {
             if task.definition.cache == Some(true) {
-                qk_executor::status!(
-                    "qk: {}: not caching because inputs changed during execution",
-                    task.id
-                );
+                if self.reuse {
+                    qk_executor::status!(
+                        "qk: {}: not caching because inputs changed during execution",
+                        task.id
+                    );
+                } else {
+                    qk_executor::status!(
+                        "qk: {}: excluding execution from flaky results because inputs changed during execution",
+                        task.id
+                    );
+                }
             }
             return false;
         }
