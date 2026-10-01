@@ -208,6 +208,23 @@ fn artifact(root: &Path) -> String {
 }
 
 #[test]
+fn simple_output_globs_restore_nested_artifacts() {
+    let fixture = Fixture::new(target(
+        "generate-graphql",
+        json!({"inputs": [], "outputs": ["apps/*/graphql/nested/output.txt"]}),
+    ));
+    success(fixture.build(&fixture.root, &[]));
+    fs::remove_dir_all(fixture.root.join("apps")).unwrap();
+    let restored = success(fixture.build(&fixture.root, &[]));
+    assert!(stderr(&restored).contains("qk: cache hit app:build"));
+    assert_eq!(fixture.runs(), 1);
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("apps/a/graphql/nested/output.txt")).unwrap(),
+        "one\n"
+    );
+}
+
+#[test]
 fn character_class_output_globs_restore_nested_artifacts() {
     let fixture = Fixture::new(target(
         "generate-graphql",

@@ -374,12 +374,31 @@ impl Outputs {
     }
 
     pub fn paths(&self, root: &Path) -> Result<BTreeSet<String>> {
+        self.listing(root).map(|(paths, _)| paths)
+    }
+
+    pub(crate) fn entries(&self, root: &Path) -> Result<BTreeMap<String, std::fs::Metadata>> {
+        let (paths, mut traversal) = self.listing(root)?;
+        paths
+            .into_iter()
+            .map(|path| {
+                let metadata = traversal
+                    .metadata(&root.join(&path))?
+                    .ok_or_else(|| anyhow::anyhow!("output disappeared while listing: {path}"))?;
+                Ok((path, metadata))
+            })
+            .collect()
+    }
+
+    fn listing(&self, root: &Path) -> Result<(BTreeSet<String>, Traversal)> {
         if let Some(segments) = self.simple_segments()? {
             for anchor in &self.anchors {
                 safe_parents(root, anchor)?;
                 match std::fs::symlink_metadata(root.join(anchor)) {
                     Ok(metadata) if metadata.file_type().is_symlink() => {
-                        return self.walk_paths(root);
+                        return self
+                            .walk_paths(root)
+                            .map(|paths| (paths, Traversal::default()));
                     }
                     Ok(_) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -388,8 +407,13 @@ impl Outputs {
             }
             let mut traversal = Traversal::default();
             let mut candidates = BTreeSet::new();
-            for pattern in &segments {
-                traversal.expand(root, root, pattern, &mut candidates)?;
+            for (glob, pattern) in self.globs.iter().zip(&segments) {
+                let fixed = pattern
+                    .iter()
+                    .take_while(|segment| matches!(segment, Segment::Literal(_)))
+                    .count();
+                let anchor = glob.split('/').take(fixed).collect::<Vec<_>>().join("/");
+                traversal.expand(root, &root.join(anchor), &pattern[fixed..], &mut candidates)?;
             }
             return candidates
                 .into_iter()
@@ -398,9 +422,11 @@ impl Outputs {
                     validate_path(&path)?;
                     Ok(path)
                 })
-                .collect();
+                .collect::<Result<_>>()
+                .map(|paths| (paths, traversal));
         }
         self.walk_paths(root)
+            .map(|paths| (paths, Traversal::default()))
     }
 
     fn simple_segments(&self) -> Result<Option<Vec<Vec<Segment>>>> {
@@ -410,7 +436,7 @@ impl Outputs {
         }) {
             return Ok(None);
         }
-        let mut matchers = BTreeMap::new();
+        let mut matchers: BTreeMap<String, Pattern> = BTreeMap::new();
         let mut patterns = Vec::new();
         for glob in &self.globs {
             let mut segments = Vec::new();
@@ -418,10 +444,13 @@ impl Outputs {
                 segments.push(if crate::glob::is_literal(part) {
                     Segment::Literal(part.to_owned())
                 } else {
-                    let matcher = matchers
-                        .entry(part.to_owned())
-                        .or_insert(Pattern::new(part, false)?);
-                    Segment::Glob(matcher.clone())
+                    let matcher = match matchers.entry(part.to_owned()) {
+                        std::collections::btree_map::Entry::Occupied(entry) => entry.get().clone(),
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(Pattern::new(part, false)?).clone()
+                        }
+                    };
+                    Segment::Glob(matcher)
                 });
             }
             patterns.push(segments);
@@ -472,10 +501,35 @@ enum Segment {
 
 #[derive(Default)]
 struct Traversal {
+    metadata: BTreeMap<PathBuf, std::fs::Metadata>,
     directories: BTreeMap<PathBuf, Vec<PathBuf>>,
 }
 
 impl Traversal {
+    fn metadata(&mut self, path: &Path) -> Result<Option<std::fs::Metadata>> {
+        if let Some(metadata) = self.metadata.get(path) {
+            return Ok(Some(metadata.clone()));
+        }
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                self.metadata.insert(path.to_owned(), metadata.clone());
+                Ok(Some(metadata))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn children(&mut self, path: &Path) -> Result<&Vec<PathBuf>> {
+        if !self.directories.contains_key(path) {
+            let children = std::fs::read_dir(path)?
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<std::io::Result<Vec<_>>>()?;
+            self.directories.insert(path.to_owned(), children);
+        }
+        Ok(&self.directories[path])
+    }
+
     fn expand(
         &mut self,
         root: &Path,
@@ -483,10 +537,8 @@ impl Traversal {
         segments: &[Segment],
         paths: &mut BTreeSet<String>,
     ) -> Result<()> {
-        let metadata = match std::fs::symlink_metadata(path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error.into()),
+        let Some(metadata) = self.metadata(path)? else {
+            return Ok(());
         };
         let Some((segment, rest)) = segments.split_first() else {
             for entry in walkdir::WalkDir::new(path)
@@ -501,15 +553,25 @@ impl Traversal {
             return Ok(());
         }
         match segment {
-            Segment::Literal(name) => self.expand(root, &path.join(name), rest, paths),
-            Segment::Glob(matcher) => {
-                if !self.directories.contains_key(path) {
-                    let children = std::fs::read_dir(path)?
-                        .map(|entry| entry.map(|entry| entry.path()))
-                        .collect::<std::io::Result<Vec<_>>>()?;
-                    self.directories.insert(path.to_owned(), children);
+            Segment::Literal(name) => {
+                let candidate = path.join(name);
+                if self.metadata(&candidate)?.is_none() {
+                    return Ok(());
                 }
-                let children: Vec<_> = self.directories[path]
+                // A successful lookup may differ in case on the host filesystem.
+                let child = self
+                    .children(path)?
+                    .iter()
+                    .find(|child| child.file_name() == Some(std::ffi::OsStr::new(name)))
+                    .cloned();
+                if let Some(child) = child {
+                    self.expand(root, &child, rest, paths)?;
+                }
+                Ok(())
+            }
+            Segment::Glob(matcher) => {
+                let children: Vec<_> = self
+                    .children(path)?
                     .iter()
                     .filter(|child| matcher.is_match(child.file_name().unwrap()))
                     .cloned()
@@ -797,6 +859,48 @@ mod tests {
                 }
                 results => panic!("different results for {patterns:?}: {results:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn listings_recheck_metadata_and_directory_contents() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        std::fs::create_dir_all(root.join("apps/a/graphql")).unwrap();
+        std::fs::write(root.join("apps/a/graphql/manifest.json"), "one").unwrap();
+        let outputs = Outputs::from_paths(&["apps/*/graphql/manifest.json".into()]).unwrap();
+        assert_eq!(
+            outputs.entries(root).unwrap()["apps/a/graphql/manifest.json"].len(),
+            3
+        );
+        std::fs::write(root.join("apps/a/graphql/manifest.json"), "different").unwrap();
+        std::fs::create_dir_all(root.join("apps/b/graphql")).unwrap();
+        std::fs::write(root.join("apps/b/graphql/manifest.json"), "two").unwrap();
+        let entries = outputs.entries(root).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries["apps/a/graphql/manifest.json"].len(), 9);
+        std::fs::remove_dir_all(root.join("apps/a")).unwrap();
+        assert_eq!(outputs.entries(root).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn literal_segments_after_wildcards_remain_case_sensitive() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        std::fs::create_dir_all(root.join("apps/a/GraphQL")).unwrap();
+        std::fs::write(root.join("apps/a/GraphQL/Manifest.json"), "one").unwrap();
+        for glob in [
+            "apps/*/graphql/Manifest.json",
+            "apps/*/GraphQL/manifest.json",
+            "apps/*/GraphQL/Manifest.json",
+            "apps/a/GraphQL",
+        ] {
+            let outputs = Outputs::from_paths(&[glob.into()]).unwrap();
+            assert_eq!(
+                outputs.paths(root).unwrap(),
+                outputs.walk_paths(root).unwrap(),
+                "{glob}"
+            );
         }
     }
 
