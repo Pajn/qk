@@ -150,6 +150,7 @@ impl Cache {
         workspace: &Workspace,
         environment: &BTreeMap<std::ffi::OsString, std::ffi::OsString>,
     ) -> Self {
+        let root = paths::cache_location(workspace);
         let remote = match remote::configure(workspace.config.extra.get("s3"), environment) {
             Ok(remote) => remote.map(std::sync::Arc::new),
             Err(error) => {
@@ -157,9 +158,12 @@ impl Cache {
                 None
             }
         };
+        if let Some(remote) = &remote {
+            remote.read_index(&root);
+        }
         Self {
             remote,
-            ..Self::new(paths::cache_location(workspace))
+            ..Self::new(root)
         }
     }
 
@@ -412,6 +416,9 @@ impl Cache {
             qk_executor::Shown::LocalCache,
         ) {
             Ok(Some(fingerprint)) => {
+                if let Some(remote) = &self.remote {
+                    remote.held(&key);
+                }
                 qk_executor::report::event(qk_executor::report::Event::Cache {
                     id: task.id.clone(),
                     cached: qk_executor::report::Cached::Hit,

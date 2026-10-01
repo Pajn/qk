@@ -8,19 +8,23 @@
 //! latency is per request, and an entry can cite thousands of blobs. A local
 //! miss fetches the pack and keeps the blobs missing locally, verifying each
 //! against its hash; the restore then runs locally. Uploads run in the
-//! background after a task is saved.
+//! background after a task is saved. An [`index`] of the entries the store
+//! holds spares the lookups it would answer with a miss.
 
-use std::collections::BTreeMap;
+mod index;
+
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use rusty_s3::actions::ListObjectsV2;
 use rusty_s3::{Bucket, Credentials, S3Action, UrlStyle};
 use serde_json::Value;
 
@@ -30,6 +34,8 @@ const SIGNED_FOR: Duration = Duration::from_secs(15 * 60);
 const UPLOADERS: usize = 8;
 /// The most a single upload may hold, as S3 allows.
 const LARGEST_UPLOAD: u64 = 5 << 30;
+/// Listings fetched at once.
+const LISTING_READERS: usize = 16;
 /// The most a pack's manifest or record may hold, so a corrupt length is not
 /// taken for one to read into memory.
 const LARGEST_RECORD: u64 = 1 << 30;
@@ -47,6 +53,16 @@ pub struct Remote {
     agent: ureq::Agent,
     pub mode: Mode,
     uploads: Mutex<Option<Uploads>>,
+    /// What the store's index says it holds, once read: `None` when it could
+    /// not be read, and every lookup then goes to the store.
+    known: OnceLock<Option<index::Known>>,
+    /// The index being read in the background.
+    reading: Mutex<Option<JoinHandle<Option<index::Known>>>>,
+    /// Entries this run found in the store or put there, for its listing.
+    confirmed: Mutex<BTreeSet<String>>,
+    /// Entries this run found in the local cache, which its listing names
+    /// too when the index already does.
+    held: Mutex<BTreeSet<String>>,
 }
 
 struct Uploads {
@@ -140,12 +156,151 @@ pub fn configure(
         agent,
         mode,
         uploads: Mutex::new(None),
+        known: OnceLock::new(),
+        reading: Mutex::new(None),
+        confirmed: Mutex::default(),
+        held: Mutex::default(),
     }))
 }
 
 impl Remote {
     fn object(&self, kind: &str, name: &str) -> String {
         format!("{}{kind}/{name}", self.prefix)
+    }
+
+    /// Starts reading the store's index in the background, keeping a copy in
+    /// the local cache at `root` so that later runs fetch only what is new.
+    pub(crate) fn read_index(self: &Arc<Self>, root: &Path) {
+        let store = self
+            .bucket
+            .object_url(&self.prefix)
+            .map_or_else(|_| self.prefix.clone(), |url| url.to_string());
+        let path = root
+            .join("remote")
+            .join(&blake3::hash(store.as_bytes()).to_hex()[..32]);
+        let remote = self.clone();
+        let reading = std::thread::spawn(move || match remote.sync_index(&path) {
+            Ok(known) => Some(known),
+            Err(error) => {
+                qk_executor::status!(
+                    "qk: remote cache index unavailable, looking up each entry ({error:#})"
+                );
+                None
+            }
+        });
+        *self.reading.lock().unwrap() = Some(reading);
+    }
+
+    /// The store's index, waiting for it to be read.
+    fn known(&self) -> Option<&index::Known> {
+        self.known
+            .get_or_init(|| {
+                let reading = self.reading.lock().unwrap().take()?;
+                reading.join().ok().flatten()
+            })
+            .as_ref()
+    }
+
+    /// The local copy at `path` brought up to date with the listings the store
+    /// holds now.
+    fn sync_index(&self, path: &Path) -> Result<index::Known> {
+        let mut known = index::Known::load(path);
+        let names = self.list(&self.object("index", ""))?;
+        let new: Vec<&String> = names
+            .iter()
+            .filter(|name| !known.listings.contains(*name))
+            .collect();
+        let fetched: Vec<Result<Option<Vec<u8>>>> = std::thread::scope(|scope| {
+            new.chunks(new.len().div_ceil(LISTING_READERS).max(1))
+                .map(|names| {
+                    scope.spawn(move || {
+                        names
+                            .iter()
+                            .map(|name| self.get(&self.object("index", name)))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .flat_map(|reader| reader.join().unwrap())
+                .collect()
+        });
+        // A listing merged away since the store was listed is in the listing
+        // it was merged into, which a later run reads.
+        for listing in fetched {
+            if let Some(listing) = listing? {
+                known.add(&String::from_utf8_lossy(&listing));
+            }
+        }
+        known.listings = names.into_iter().collect();
+        known.expire(index::now());
+        if let Err(error) = known.save(path) {
+            qk_executor::status!("qk: could not save the remote cache index ({error:#})");
+        }
+        Ok(known)
+    }
+
+    /// The names of the objects under `prefix`, without it.
+    fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        let mut names = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut action = self.bucket.list_objects_v2(Some(&self.credentials));
+            action.with_prefix(prefix);
+            if let Some(token) = &token {
+                action.with_continuation_token(token.as_str());
+            }
+            let url = action.sign(SIGNED_FOR);
+            let response = self.agent.get(url.as_str()).call()?;
+            let status = response.status().as_u16();
+            let body = response.into_body().read_to_string()?;
+            if status != 200 {
+                bail!("listing {prefix} returned {status}");
+            }
+            let parsed = ListObjectsV2::parse_response(&body)
+                .map_err(|error| anyhow::anyhow!("invalid listing of {prefix}: {error:?}"))?;
+            names.extend(
+                parsed
+                    .contents
+                    .into_iter()
+                    .filter_map(|object| object.key.strip_prefix(prefix).map(str::to_owned)),
+            );
+            match parsed.next_continuation_token {
+                Some(next) => token = Some(next),
+                None => return Ok(names),
+            }
+        }
+    }
+
+    /// The object's body, or `None` when it is missing.
+    fn get(&self, object: &str) -> Result<Option<Vec<u8>>> {
+        let url = self
+            .bucket
+            .get_object(Some(&self.credentials), object)
+            .sign(SIGNED_FOR);
+        let response = self.agent.get(url.as_str()).call()?;
+        let status = response.status().as_u16();
+        let mut body = Vec::new();
+        response.into_body().into_reader().read_to_end(&mut body)?;
+        match status {
+            200 => Ok(Some(body)),
+            404 => Ok(None),
+            status => bail!("GET {object} returned {status}"),
+        }
+    }
+
+    fn delete(&self, object: &str) -> Result<()> {
+        let url = self
+            .bucket
+            .delete_object(Some(&self.credentials), object)
+            .sign(SIGNED_FOR);
+        let response = self.agent.delete(url.as_str()).call()?;
+        let status = response.status().as_u16();
+        io::copy(&mut response.into_body().into_reader(), &mut io::sink())?;
+        match status {
+            200..=299 | 404 => Ok(()),
+            status => bail!("DELETE {object} returned {status}"),
+        }
     }
 
     fn exists(&self, object: &str) -> Result<bool> {
@@ -180,6 +335,12 @@ impl Remote {
     /// whether the remote had it. Every blob the local store lacks is verified
     /// before it is kept.
     pub(crate) fn fetch(&self, root: &Path, key: &str) -> Result<bool> {
+        if self
+            .known()
+            .is_some_and(|known| !known.keys.contains_key(key))
+        {
+            return Ok(false);
+        }
         let Some(manifest) = self.fetch_pack(root, &self.object("entries", key), |parsed| {
             if parsed.get("key").and_then(Value::as_str) != Some(key) {
                 bail!("remote manifest is for another key");
@@ -193,7 +354,13 @@ impl Remote {
         file.write_all(&manifest)?;
         file.as_file().sync_all()?;
         file.persist(root.join("entries").join(format!("{key}.json")))?;
+        self.confirmed.lock().unwrap().insert(key.to_owned());
         Ok(true)
+    }
+
+    /// Notes that the local cache held the entry for `key`.
+    pub(crate) fn held(&self, key: &str) {
+        self.held.lock().unwrap().insert(key.to_owned());
     }
 
     /// Queues the local entry for `key` for upload.
@@ -352,11 +519,12 @@ impl Remote {
             return self.put_pack(&job.local, object, record);
         }
         let object = self.object("entries", &job.key);
-        if self.exists(&object)? {
-            return Ok(());
+        if !self.exists(&object)? {
+            let manifest = fs::read(job.local.join("entries").join(format!("{}.json", job.key)))?;
+            self.put_pack(&job.local, &object, &manifest)?;
         }
-        let manifest = fs::read(job.local.join("entries").join(format!("{}.json", job.key)))?;
-        self.put_pack(&job.local, &object, &manifest)
+        self.confirmed.lock().unwrap().insert(job.key.clone());
+        Ok(())
     }
 
     /// Uploads `record` with the blobs it cites from the local store at
@@ -384,16 +552,55 @@ impl Remote {
         self.put(object, file)
     }
 
-    /// Waits for queued uploads, returning the ones that failed.
+    /// Waits for queued uploads, then adds this run's listing to the index,
+    /// returning what failed.
     pub(crate) fn finish(&self) -> Vec<String> {
-        let Some(uploads) = self.uploads.lock().unwrap().take() else {
-            return Vec::new();
-        };
-        drop(uploads.sender);
-        for worker in uploads.workers {
-            let _ = worker.join();
+        let mut failures = Vec::new();
+        if let Some(uploads) = self.uploads.lock().unwrap().take() {
+            drop(uploads.sender);
+            for worker in uploads.workers {
+                let _ = worker.join();
+            }
+            failures = std::mem::take(&mut *uploads.failures.lock().unwrap());
         }
-        std::mem::take(&mut *uploads.failures.lock().unwrap())
+        if self.mode == Mode::ReadWrite
+            && let Err(error) = self.add_listing()
+        {
+            failures.push(format!("the index: {error:#}"));
+        }
+        failures
+    }
+
+    /// Lists the entries this run found in the store or put there. With many
+    /// listings already, merges them into this one and deletes them.
+    fn add_listing(&self) -> Result<()> {
+        let mut confirmed = std::mem::take(&mut *self.confirmed.lock().unwrap());
+        // A run that only used the local cache neither waits for the index nor
+        // writes to it.
+        if confirmed.is_empty() {
+            return Ok(());
+        }
+        let now = index::now();
+        let known = self.known();
+        if let Some(known) = known {
+            let held = std::mem::take(&mut *self.held.lock().unwrap());
+            confirmed.extend(held.into_iter().filter(|key| known.keys.contains_key(key)));
+        }
+        let mut listing = index::Known::default();
+        let merged = known.filter(|known| known.listings.len() >= index::MERGE_AFTER);
+        if let Some(known) = merged {
+            listing.keys = known.keys.clone();
+        }
+        listing
+            .keys
+            .extend(confirmed.into_iter().map(|key| (key, now)));
+        listing.expire(now);
+        let text = index::format(listing.keys.iter().map(|(key, time)| (key.as_str(), *time)));
+        self.put(&self.object("index", &index::name(now)), text.as_bytes())?;
+        for name in merged.iter().flat_map(|known| &known.listings) {
+            self.delete(&self.object("index", name))?;
+        }
+        Ok(())
     }
 }
 
