@@ -377,17 +377,19 @@ impl Outputs {
         self.listing(root).map(|(paths, _)| paths)
     }
 
-    pub(crate) fn entries(&self, root: &Path) -> Result<BTreeMap<String, std::fs::Metadata>> {
+    pub(crate) fn entries<'a>(
+        &self,
+        root: &'a Path,
+    ) -> Result<impl Iterator<Item = Result<(String, std::fs::Metadata)>> + 'a> {
         let (paths, mut traversal) = self.listing(root)?;
-        paths
-            .into_iter()
-            .map(|path| {
-                let metadata = traversal
-                    .metadata(&root.join(&path))?
-                    .ok_or_else(|| anyhow::anyhow!("output disappeared while listing: {path}"))?;
-                Ok((path, metadata))
-            })
-            .collect()
+        Ok(paths.into_iter().map(move |path| {
+            let absolute = root.join(&path);
+            let metadata = match traversal.metadata.remove(&absolute) {
+                Some(metadata) => metadata,
+                None => std::fs::symlink_metadata(&absolute)?,
+            };
+            Ok((path, metadata))
+        }))
     }
 
     fn listing(&self, root: &Path) -> Result<(BTreeSet<String>, Traversal)> {
@@ -870,17 +872,34 @@ mod tests {
         std::fs::write(root.join("apps/a/graphql/manifest.json"), "one").unwrap();
         let outputs = Outputs::from_paths(&["apps/*/graphql/manifest.json".into()]).unwrap();
         assert_eq!(
-            outputs.entries(root).unwrap()["apps/a/graphql/manifest.json"].len(),
+            outputs
+                .entries(root)
+                .unwrap()
+                .collect::<anyhow::Result<std::collections::BTreeMap<_, _>>>()
+                .unwrap()["apps/a/graphql/manifest.json"]
+                .len(),
             3
         );
         std::fs::write(root.join("apps/a/graphql/manifest.json"), "different").unwrap();
         std::fs::create_dir_all(root.join("apps/b/graphql")).unwrap();
         std::fs::write(root.join("apps/b/graphql/manifest.json"), "two").unwrap();
-        let entries = outputs.entries(root).unwrap();
+        let entries = outputs
+            .entries(root)
+            .unwrap()
+            .collect::<anyhow::Result<std::collections::BTreeMap<_, _>>>()
+            .unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries["apps/a/graphql/manifest.json"].len(), 9);
         std::fs::remove_dir_all(root.join("apps/a")).unwrap();
-        assert_eq!(outputs.entries(root).unwrap().len(), 1);
+        assert_eq!(
+            outputs
+                .entries(root)
+                .unwrap()
+                .collect::<anyhow::Result<std::collections::BTreeMap<_, _>>>()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -901,6 +920,35 @@ mod tests {
                 outputs.walk_paths(root).unwrap(),
                 "{glob}"
             );
+        }
+    }
+
+    #[test]
+    fn simple_glob_combinations_match_the_walker() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        for project in ["a", "aa", "Ab", ".hidden", "café"] {
+            for directory in ["graphql", "GraphQL", "src"] {
+                let path = root.join(format!("apps/{project}/{directory}/nested"));
+                std::fs::create_dir_all(&path).unwrap();
+                std::fs::write(path.join("manifest.json"), "value").unwrap();
+                std::fs::write(path.parent().unwrap().join("manifest.json"), "value").unwrap();
+            }
+        }
+        for project in ["*", "?", "a*", "*a", "*?", "A*"] {
+            for directory in ["graphql", "GraphQL", "src", "missing"] {
+                for suffix in ["", "/manifest.json", "/*.json", "/?anifest.json", "/*"] {
+                    let glob = format!("apps/{project}/{directory}{suffix}");
+                    let outputs =
+                        Outputs::from_paths(&[glob.clone(), "!apps/aa/graphql/nested".into()])
+                            .unwrap();
+                    assert_eq!(
+                        outputs.paths(root).unwrap(),
+                        outputs.walk_paths(root).unwrap(),
+                        "{glob}"
+                    );
+                }
+            }
         }
     }
 

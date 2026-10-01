@@ -620,7 +620,8 @@ fn outputs_fingerprint(
 
 fn output_fingerprint(root: &Path, outputs: &paths::Outputs, input: &str) -> Result<String> {
     let mut files = BTreeMap::new();
-    for (path, metadata) in outputs.entries(root)? {
+    for entry in outputs.entries(root)? {
+        let (path, metadata) = entry?;
         paths::safe_parents(root, &path)?;
         let absolute = root.join(&path);
         let value = if metadata.file_type().is_symlink() {

@@ -340,7 +340,8 @@ impl Snapshot {
             .load(std::sync::atomic::Ordering::SeqCst);
         let declared = Outputs::new(workspace, task)?;
         let mut files = Vec::new();
-        for (path, metadata) in declared.entries(&workspace.root)? {
+        for entry in declared.entries(&workspace.root)? {
+            let (path, metadata) = entry?;
             if !metadata.is_dir() {
                 files.push(path);
             }

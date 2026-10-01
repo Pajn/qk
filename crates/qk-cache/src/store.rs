@@ -195,7 +195,8 @@ impl Cache {
         log: &Path,
     ) -> Result<String> {
         let mut artifacts = BTreeMap::new();
-        for (path, metadata) in outputs.entries(root)? {
+        for entry in outputs.entries(root)? {
+            let (path, metadata) = entry?;
             paths::safe_parents(root, &path)?;
             let absolute = root.join(&path);
             let artifact = if metadata.file_type().is_symlink() {
@@ -565,7 +566,8 @@ fn move_staged(staged: &Path, destination: &Path) -> Result<()> {
 /// replaced, removed or recreated.
 fn output_stamps(root: &Path, outputs: &Outputs) -> Result<BTreeMap<String, Vec<i64>>> {
     let mut stamps = BTreeMap::new();
-    for (path, metadata) in outputs.entries(root)? {
+    for entry in outputs.entries(root)? {
+        let (path, metadata) = entry?;
         let kind = if metadata.file_type().is_symlink() {
             2
         } else if metadata.is_dir() {
