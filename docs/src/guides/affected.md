@@ -17,6 +17,10 @@ lists as untracked and not ignored, so an `.nxignore` negation does not bring
 back one `.gitignore` excludes, though it does for a file named with
 `--files`.
 
+Unlike Nx, a changed or untracked file whose name is outside ASCII counts:
+Nx reads the names Git quotes, such as `"caf\303\251.ts"` for `café.ts`,
+and finds no project for them.
+
 Unlike Nx, when the base is a branch with an upstream, such as `main`
 following `origin/main`, and the head left the upstream later than the local
 branch, the base is that later point. Otherwise a local `main` that has not

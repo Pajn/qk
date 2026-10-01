@@ -397,7 +397,7 @@ impl<'a> Changes<'a> {
         } else if options.untracked {
             untracked(root)?
         } else if let (Some(base), Some(head)) = (&base, &head) {
-            git_lines(
+            git_paths(
                 root,
                 &[
                     "diff",
@@ -410,7 +410,7 @@ impl<'a> Changes<'a> {
             )?
         } else {
             let base = base.as_deref().expect("base defaults to main");
-            let mut files: BTreeSet<String> = git_lines(
+            let mut files: BTreeSet<String> = git_paths(
                 root,
                 &[
                     "diff",
@@ -580,7 +580,7 @@ fn landed(root: &Path, base: &str, head: &str, branch: &str) -> usize {
 }
 
 fn uncommitted(root: &Path) -> Result<Vec<String>> {
-    git_lines(
+    git_paths(
         root,
         &[
             "diff",
@@ -597,7 +597,34 @@ fn uncommitted(root: &Path) -> Result<Vec<String>> {
 /// ignore. An `.nxignore` negation cannot bring back a file `.gitignore`
 /// excludes, since it filters this list and does not add to it.
 fn untracked(root: &Path) -> Result<Vec<String>> {
-    git_lines(root, &["ls-files", "--others", "--exclude-standard"])
+    git_paths(root, &["ls-files", "--others", "--exclude-standard"])
+}
+
+/// The paths a Git command lists, read NUL-separated so that Git does not
+/// quote names outside ASCII. Nx reads them line by line, quoted, and so
+/// misses a change to such a file.
+fn git_paths(root: &Path, args: &[&str]) -> Result<Vec<String>> {
+    let (command, rest) = args.split_first().context("a git command")?;
+    let mut arguments = vec![*command, "-z"];
+    arguments.extend(rest);
+    let output = Command::new("git")
+        .current_dir(root)
+        .args(&arguments)
+        .output()
+        .context("could not run git")?;
+    if !output.status.success() {
+        bail!(
+            "git {} failed: {}",
+            arguments.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| String::from_utf8(path.to_vec()).context("git paths must be UTF-8"))
+        .collect()
 }
 
 fn git_lines(root: &Path, args: &[&str]) -> Result<Vec<String>> {

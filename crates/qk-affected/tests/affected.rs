@@ -570,3 +570,28 @@ fn nxignore_parent_and_untracked_negations_match_source_discovery() {
         Vec::<String>::new()
     );
 }
+
+/// Names outside ASCII are read as Git stores them, not as it quotes them in
+/// line output, so a change to one is found wherever it comes from.
+#[test]
+fn changes_to_files_named_outside_ascii_are_found() {
+    let repo = Repo::new(&[("libs/lib/src/café.ts", "lib")]);
+    write(&repo.root, "libs/lib/src/café.ts", "edited");
+    assert_eq!(
+        repo.affected(Options {
+            uncommitted: true,
+            ..Options::default()
+        }),
+        names(&["app", "lib"])
+    );
+    let repo = Repo::new(&[]);
+    write(&repo.root, "libs/lib/src/naïve.ts", "untracked");
+    assert_eq!(
+        repo.affected(Options {
+            untracked: true,
+            ..Options::default()
+        }),
+        names(&["app", "lib"])
+    );
+    assert_eq!(repo.committed(), names(&["app", "lib"]));
+}
