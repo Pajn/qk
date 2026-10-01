@@ -776,8 +776,13 @@ fn current_commit(workspace: &Workspace) -> Option<String> {
     (output.status.success() && !commit.is_empty()).then_some(commit)
 }
 
-/// A digest of each part of the warm key, as this checkout has them.
-fn key_digests(workspace: &Workspace, warm: &Warm) -> Result<Vec<String>> {
+/// A digest of each part of the warm key, as this checkout and the task's
+/// environment have them.
+fn key_digests(
+    workspace: &Workspace,
+    warm: &Warm,
+    prepared: &qk_executor::PreparedTask,
+) -> Result<Vec<String>> {
     warm.key
         .iter()
         .map(|part| {
@@ -791,9 +796,18 @@ fn key_digests(workspace: &Workspace, warm: &Warm) -> Result<Vec<String>> {
                         "file:absent".to_owned()
                     }
                 }
-                KeyPart::Env(name) => match std::env::var(name) {
-                    Ok(value) => format!("env:{}", hash32(&value)),
-                    Err(_) => "env:unset".to_owned(),
+                // As the task's process gets them: its execution variables
+                // over its environment, and nothing else.
+                KeyPart::Env(name) => match prepared
+                    .execution
+                    .get(std::ffi::OsStr::new(name))
+                    .or_else(|| prepared.env.get(std::ffi::OsStr::new(name)))
+                {
+                    Some(value) => format!(
+                        "env:{}",
+                        blake3::hash(value.as_encoded_bytes()).to_hex()[..32].to_owned()
+                    ),
+                    None => "env:unset".to_owned(),
                 },
             })
         })
@@ -990,6 +1004,7 @@ impl Cache {
         workspace: &Workspace,
         task: &Task,
         warm: &Warm,
+        prepared: &qk_executor::PreparedTask,
     ) -> Result<(Restored, Vec<String>)> {
         let mut restored = Restored::default();
         let _lock = self.lock_warm(warm)?;
@@ -1006,7 +1021,7 @@ impl Cache {
         if missing.is_empty() {
             return Ok((restored, present));
         }
-        let current = key_digests(workspace, warm)?;
+        let current = key_digests(workspace, warm, prepared)?;
         let (record, source) = match self.choose_warm(workspace, warm, &current) {
             Some(chosen) => chosen,
             None => match self.remote_warm(workspace, task, warm, &current) {
@@ -1129,8 +1144,14 @@ impl Cache {
 
     /// Saves the task's warm groups after a successful run, as this worktree's
     /// save.
-    pub(crate) fn save_warm(&self, workspace: &Workspace, task: &Task, warm: &Warm) -> Result<()> {
-        self.save_prepared(&Save::prepare(workspace, task, warm)?)
+    pub(crate) fn save_warm(
+        &self,
+        workspace: &Workspace,
+        task: &Task,
+        warm: &Warm,
+        prepared: &qk_executor::PreparedTask,
+    ) -> Result<()> {
+        self.save_prepared(&Save::prepare(workspace, task, warm, prepared)?)
     }
 
     /// Saves the task's warm groups on a thread of its own, which
@@ -1140,8 +1161,9 @@ impl Cache {
         workspace: &Workspace,
         task: &Task,
         warm: &Warm,
+        prepared: &qk_executor::PreparedTask,
     ) -> Result<()> {
-        let save = Save::prepare(workspace, task, warm)?;
+        let save = Save::prepare(workspace, task, warm, prepared)?;
         let cache = Cache {
             remote: self.remote.clone(),
             ..Cache::new(self.root.clone())
@@ -1313,7 +1335,12 @@ struct Save {
 }
 
 impl Save {
-    fn prepare(workspace: &Workspace, task: &Task, warm: &Warm) -> Result<Self> {
+    fn prepare(
+        workspace: &Workspace,
+        task: &Task,
+        warm: &Warm,
+        prepared: &qk_executor::PreparedTask,
+    ) -> Result<Self> {
         Ok(Self {
             task: task.id.clone(),
             warm: warm.clone(),
@@ -1321,7 +1348,7 @@ impl Save {
             worktree: worktree(workspace),
             commit: current_commit(workspace),
             branch: current_branch(workspace),
-            key: key_digests(workspace, warm)?,
+            key: key_digests(workspace, warm, prepared)?,
             notes: restored_files_path(workspace, warm),
         })
     }

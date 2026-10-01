@@ -221,7 +221,7 @@ impl Cache {
             };
             match self
                 .initialize()
-                .and_then(|()| self.restore_warm(workspace, task, warm))
+                .and_then(|()| self.restore_warm(workspace, task, warm, prepared))
             {
                 Ok((restored, present)) => {
                     ((!restored.groups.is_empty()).then_some(restored), present)
@@ -241,7 +241,7 @@ impl Cache {
             let save_ms = if outcome != Outcome::Success {
                 None
             } else if warm.background {
-                match self.save_warm_in_background(workspace, task, warm) {
+                match self.save_warm_in_background(workspace, task, warm, prepared) {
                     Ok(()) => background = true,
                     Err(error) => {
                         qk_executor::status!("qk: {}: warm state not saved ({error:#})", task.id);
@@ -249,7 +249,7 @@ impl Cache {
                 }
                 None
             } else {
-                match self.save_warm(workspace, task, warm) {
+                match self.save_warm(workspace, task, warm, prepared) {
                     Ok(()) => Some(started.elapsed().as_millis() as u64),
                     Err(error) => {
                         qk_executor::status!("qk: {}: warm state not saved ({error:#})", task.id);

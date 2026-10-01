@@ -1590,6 +1590,24 @@ fn surviving_paths_outlast_dependencies_that_run_at_once() {
 
 #[cfg(unix)]
 #[test]
+fn an_environment_key_reads_the_task_s_own_environment() {
+    let keyed = |value: &str| {
+        let mut target = scratch_target(json!({
+            "paths": ["{projectRoot}/scratch"],
+            "key": [{"env": "TOOLCHAIN"}]
+        }));
+        target["options"] = json!({"env": {"TOOLCHAIN": value}});
+        target
+    };
+    let fixture = Fixture::new(keyed("1"));
+    assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
+    fs::remove_dir_all(fixture.root.join("scratch")).unwrap();
+    set_targets(&fixture, json!({"build": keyed("2")}));
+    assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
+}
+
+#[cfg(unix)]
+#[test]
 fn local_overrides_change_the_task_and_its_key() {
     let fixture = Fixture::new(json!({
         "command": "cat src/input.txt",

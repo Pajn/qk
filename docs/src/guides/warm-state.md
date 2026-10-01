@@ -100,7 +100,7 @@ built with the same toolchain:
 ```
 
 Each part is a file, by its content, or an environment variable, by its
-value. A save is restored when its key matches whole, or, with `restoreKeys`,
+value as the task receives it, including the target's `options.env`. A save is restored when its key matches whole, or, with `restoreKeys`,
 when it matches in that many leading parts; one that matches whole is
 preferred. Among saves that suit equally, the worktree's own comes first,
 then the one made at the commit nearest behind `HEAD` in Git history, then
