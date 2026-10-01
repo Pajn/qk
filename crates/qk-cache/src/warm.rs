@@ -281,7 +281,16 @@ impl Warm {
 /// back, over whatever it left there, when this is dropped.
 #[derive(Default)]
 pub struct Kept {
-    stashes: Vec<Stash>,
+    /// The stashes this dependency holds a share of.
+    roots: Vec<PathBuf>,
+}
+
+impl Drop for Kept {
+    fn drop(&mut self) {
+        for root in self.roots.iter().rev() {
+            release(root);
+        }
+    }
 }
 
 /// One task's paths, moved into its directory in the worktree's state.
@@ -295,30 +304,55 @@ struct Stash {
     moved: Vec<String>,
 }
 
+/// A stash in use, and how many of the running dependencies share it. The
+/// lock keeps another qk process from taking it for abandoned.
+struct Active {
+    users: usize,
+    stash: Stash,
+    _lock: fs::File,
+}
+
+/// The stashes this process holds, by root. Dependencies that run at once
+/// share one: the first moves the paths, the last puts them back.
+static ACTIVE: std::sync::Mutex<BTreeMap<PathBuf, Active>> = std::sync::Mutex::new(BTreeMap::new());
+
 impl Stash {
     fn manifest(root: &std::path::Path) -> PathBuf {
         root.join("moved.json")
     }
 
     /// Moves the paths back, replacing what is there now, and removes the
-    /// stash.
-    fn put_back(&self) {
+    /// stash once every path is back. A path whose parents are not plain
+    /// directories inside the workspace, as when a dependency put a link or a
+    /// file in their place, is not touched and stays in the stash for the
+    /// next run. Whether every path went back.
+    fn put_back(&self) -> bool {
+        let mut complete = true;
         for (index, path) in self.moved.iter().enumerate().rev() {
             let kept = self.root.join(index.to_string());
             if fs::symlink_metadata(&kept).is_err() {
                 continue;
             }
             let original = self.workspace.join(path);
-            if let Err(error) = remove(&original).and_then(|()| {
+            let result = paths::safe_parents(&self.workspace, path).and_then(|()| {
+                remove(&original)?;
                 if let Some(parent) = original.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                fs::rename(&kept, &original)
-            }) {
-                qk_executor::status!("qk: could not put {path} back ({error})");
+                fs::rename(&kept, &original)?;
+                Ok(())
+            });
+            if let Err(error) = result {
+                complete = false;
+                qk_executor::status!(
+                    "qk: could not put {path} back, kept for the next run ({error:#})"
+                );
             }
         }
-        let _ = fs::remove_dir_all(&self.root);
+        if complete {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+        complete
     }
 }
 
@@ -331,12 +365,24 @@ fn remove(path: &std::path::Path) -> std::io::Result<()> {
     }
 }
 
-impl Drop for Kept {
-    fn drop(&mut self) {
-        for stash in self.stashes.iter().rev() {
-            stash.put_back();
-        }
+/// Gives up one dependency's share of a stash, putting the paths back when
+/// it was the last.
+fn release(root: &std::path::Path) {
+    let mut active = ACTIVE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(entry) = active.get_mut(root) else {
+        return;
+    };
+    entry.users -= 1;
+    if entry.users > 0 {
+        return;
     }
+    let entry = active.remove(root).expect("present above");
+    // Another dependency taking the stash again waits on the lock, not on
+    // every other task's stash.
+    drop(active);
+    entry.stash.put_back();
 }
 
 /// Whether `entry`, from `owner`'s `survive`, names `task`.
@@ -382,8 +428,8 @@ pub fn keep_across(workspace: &Workspace, graph: &TaskGraph, task: &Task) -> Kep
         {
             continue;
         }
-        match stash(workspace, owner, &warm) {
-            Ok(stash) => kept.stashes.push(stash),
+        match acquire(workspace, owner, &warm) {
+            Ok(root) => kept.roots.push(root),
             Err(error) => qk_executor::status!(
                 "qk: {}: warm paths not kept across {} ({error:#})",
                 owner.id,
@@ -394,23 +440,54 @@ pub fn keep_across(workspace: &Workspace, graph: &TaskGraph, task: &Task) -> Kep
     kept
 }
 
-fn stash(workspace: &Workspace, owner: &Task, warm: &Warm) -> Result<Stash> {
-    let root = paths::worktree_state(&workspace.root)
-        .join("warm-kept")
-        .join(hash32(&owner.id));
-    // A stash left by a run that was stopped goes back first.
-    if let Ok(bytes) = fs::read(Stash::manifest(&root)) {
+/// Takes a share of `owner`'s stash, moving its paths aside if no running
+/// dependency has yet.
+fn acquire(workspace: &Workspace, owner: &Task, warm: &Warm) -> Result<PathBuf> {
+    let state = paths::worktree_state(&workspace.root).join("warm-kept");
+    let root = state.join(hash32(&owner.id));
+    let mut active = ACTIVE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(entry) = active.get_mut(&root) {
+        entry.users += 1;
+        return Ok(root);
+    }
+    fs::create_dir_all(&state)?;
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(state.join(format!("{}.lock", hash32(&owner.id))))?;
+    fs2::FileExt::lock_exclusive(&lock)?;
+    // Under the lock, a stash on disk is one no run holds: one an earlier run
+    // could not put back, or left when it was stopped. It goes back first.
+    // What cannot go back yet, as when its parent is not a directory, is the
+    // stash this dependency holds: nothing is moved over it, and it is put
+    // back after the dependency, which may well recreate the parent.
+    let left = fs::read(Stash::manifest(&root)).ok().map(|bytes| {
         let mut left: Stash = serde_json::from_slice(&bytes).unwrap_or_default();
         left.root = root.clone();
         left.workspace = workspace.root.clone();
-        for (index, path) in left.moved.clone().iter().enumerate() {
-            if fs::symlink_metadata(workspace.root.join(path)).is_ok() {
-                let _ = remove(&root.join(index.to_string()));
-            }
-        }
-        left.put_back();
-    }
-    let _ = fs::remove_dir_all(&root);
+        left
+    });
+    let stash = match left {
+        Some(left) if !left.put_back() => left,
+        _ => stash(workspace, &root, warm)?,
+    };
+    active.insert(
+        root.clone(),
+        Active {
+            users: 1,
+            stash,
+            _lock: lock,
+        },
+    );
+    Ok(root)
+}
+
+fn stash(workspace: &Workspace, root: &std::path::Path, warm: &Warm) -> Result<Stash> {
+    let _ = fs::remove_dir_all(root);
     let kept = Outputs::from_paths(&warm.kept_paths())?.paths(&workspace.root)?;
     // The topmost paths only: moving one moves what is below it.
     let topmost: Vec<String> = kept
@@ -428,26 +505,33 @@ fn stash(workspace: &Workspace, owner: &Task, warm: &Warm) -> Result<Stash> {
         .cloned()
         .collect();
     let mut stash = Stash {
-        root: root.clone(),
+        root: root.to_owned(),
         workspace: workspace.root.clone(),
         moved: Vec::new(),
     };
     if topmost.is_empty() {
         return Ok(stash);
     }
-    fs::create_dir_all(&root)?;
+    fs::create_dir_all(root)?;
     for path in topmost {
-        paths::safe_parents(&workspace.root, &path)?;
-        stash.moved.push(path.clone());
-        fs::write(Stash::manifest(&root), serde_json::to_vec(&stash)?)?;
-        if let Err(error) = fs::rename(
-            workspace.root.join(&path),
-            root.join((stash.moved.len() - 1).to_string()),
-        ) {
-            stash.moved.pop();
-            fs::write(Stash::manifest(&root), serde_json::to_vec(&stash)?)?;
+        let moved = paths::safe_parents(&workspace.root, &path).and_then(|()| {
+            stash.moved.push(path.clone());
+            fs::write(Stash::manifest(root), serde_json::to_vec(&stash)?)?;
+            fs::rename(
+                workspace.root.join(&path),
+                root.join((stash.moved.len() - 1).to_string()),
+            )
+            .inspect_err(|_| {
+                stash.moved.pop();
+            })?;
+            Ok(())
+        });
+        if let Err(error) = moved {
+            // What was moved before goes back, rather than waiting on a run
+            // that holds no share of it.
+            fs::write(Stash::manifest(root), serde_json::to_vec(&stash)?)?;
             stash.put_back();
-            return Err(error.into());
+            return Err(error);
         }
     }
     Ok(stash)

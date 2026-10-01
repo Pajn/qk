@@ -1357,6 +1357,17 @@ fn excluded_warm_paths_are_neither_saved_nor_inputs() {
     assert_eq!(said(&fixture, &fixture.root, &[]), "state");
 }
 
+/// A fixture whose `native/` is generated, and so ignored, as a native
+/// project is.
+#[cfg(unix)]
+fn native_fixture(targets: Value) -> Fixture {
+    let fixture = Fixture::with_targets(targets);
+    let mut ignore = fs::read_to_string(fixture.root.join(".gitignore")).unwrap();
+    ignore.push_str("native\n");
+    fs::write(fixture.root.join(".gitignore"), ignore).unwrap();
+    fixture
+}
+
 /// A prebuild that recreates `native/`, and a build that keeps
 /// `native/build` in it and prints the year its state was written.
 #[cfg(unix)]
@@ -1374,7 +1385,7 @@ fn survive_targets(prebuild: &str) -> Value {
 #[cfg(unix)]
 #[test]
 fn surviving_paths_outlast_a_dependency_that_deletes_them() {
-    let fixture = Fixture::with_targets(survive_targets(
+    let fixture = native_fixture(survive_targets(
         "rm -rf native && mkdir -p native && echo generated > native/config",
     ));
     assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
@@ -1392,7 +1403,7 @@ fn surviving_paths_outlast_a_dependency_that_deletes_them() {
 #[cfg(unix)]
 #[test]
 fn surviving_paths_come_back_when_the_dependency_fails() {
-    let fixture = Fixture::with_targets(survive_targets("mkdir -p native"));
+    let fixture = native_fixture(survive_targets("mkdir -p native"));
     assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
     let failing = survive_targets("rm -rf native; exit 3");
     fs::write(
@@ -1408,7 +1419,7 @@ fn surviving_paths_come_back_when_the_dependency_fails() {
 #[cfg(unix)]
 #[test]
 fn surviving_paths_left_aside_by_a_killed_run_come_back() {
-    let fixture = Fixture::with_targets(survive_targets("mkdir -p native"));
+    let fixture = native_fixture(survive_targets("mkdir -p native"));
     assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
     let slow = survive_targets("sleep 3");
     fs::write(
@@ -1479,6 +1490,102 @@ fn show_task_compares_runs_from_warm_state_with_runs_without() {
         text.contains("From warm state it took ") && text.contains(" over 1 run; without, "),
         "{text}"
     );
+}
+
+/// Rewrites the fixture's project with these targets.
+#[cfg(unix)]
+fn set_targets(fixture: &Fixture, targets: Value) {
+    fs::write(
+        fixture.root.join("project.json"),
+        json!({"name": "app", "targets": targets}).to_string(),
+    )
+    .unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn surviving_paths_are_not_put_back_through_a_symlink() {
+    let fixture = native_fixture(survive_targets("mkdir -p native"));
+    assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
+    // Outside the workspace, where native/build would lead through the link.
+    let outside = fixture.root.parent().unwrap().join("outside");
+    fs::create_dir_all(outside.join("build")).unwrap();
+    fs::write(outside.join("build/unrelated"), "keep\n").unwrap();
+    set_targets(
+        &fixture,
+        // Failing, so that only qk could write through the link.
+        survive_targets(&format!(
+            "rm -rf native && ln -s {} native && exit 3",
+            outside.display()
+        )),
+    );
+    let _ = fixture.build(&fixture.root, &[]);
+    assert_eq!(
+        fs::read_to_string(outside.join("build/unrelated")).unwrap(),
+        "keep\n"
+    );
+    assert!(!outside.join("build/state").exists());
+    // Once native is a directory again, the kept state comes back.
+    set_targets(&fixture, survive_targets("rm -f native; mkdir -p native"));
+    let year = said(&fixture, &fixture.root, &[]);
+    assert_ne!(year, "1970");
+    assert_ne!(year, "cold");
+}
+
+#[cfg(unix)]
+#[test]
+fn surviving_paths_put_back_later_when_their_parent_is_not_a_directory() {
+    let fixture = native_fixture(survive_targets("mkdir -p native"));
+    assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
+    set_targets(
+        &fixture,
+        survive_targets("rm -rf native && echo file > native"),
+    );
+    let _ = fixture.build(&fixture.root, &[]);
+    set_targets(&fixture, survive_targets("rm -f native; mkdir -p native"));
+    let year = said(&fixture, &fixture.root, &[]);
+    assert_ne!(year, "1970");
+    assert_ne!(year, "cold");
+}
+
+#[cfg(unix)]
+#[test]
+fn surviving_paths_outlast_dependencies_that_run_at_once() {
+    let fixture = native_fixture(json!({
+        "prepare-a": {"command": "rm -rf native; mkdir -p native; sleep 1"},
+        "prepare-b": {"command": "rm -rf native/build; sleep 1"},
+        "build": {
+            "command": "if [ -f native/build/state ]; then date -r native/build/state +%Y; else echo cold; fi; mkdir -p native/build; touch native/build/state",
+            "dependsOn": ["prepare-a", "prepare-b"],
+            "qk:warm": {"paths": ["{projectRoot}/native/build"], "survive": ["prepare-a", "prepare-b"]}
+        }
+    }));
+    let run = || {
+        let output = success(fixture.qk(
+            &fixture.root,
+            &[
+                "run",
+                "app:build",
+                "--parallel",
+                "2",
+                "--output-style",
+                "static",
+            ],
+        ));
+        stdout(&output)
+            .lines()
+            .find(|line| {
+                *line == "cold" || (!line.is_empty() && line.chars().all(|c| c.is_ascii_digit()))
+            })
+            .unwrap_or_default()
+            .to_owned()
+    };
+    assert_eq!(run(), "cold");
+    for _ in 0..3 {
+        let year = run();
+        assert_ne!(year, "1970");
+        assert_ne!(year, "cold");
+    }
 }
 
 #[cfg(unix)]

@@ -78,10 +78,15 @@ build directories. `survive` names such dependencies:
 Before a named dependency runs, or is restored from the cache, qk moves the
 task's `paths` into the worktree's state, and after it finishes, whether it
 succeeded or not, moves them back over whatever it left there. They keep
-their files and modification times without being stored or copied, and a
-run that is stopped moves them back at the next one. An entry names a target
-in the task's project, or `project:target`, and applies to the dependency in
-any configuration. What the dependency writes beside the paths stays.
+their files and modification times without being stored or copied.
+Dependencies named this way that run at once share the move: the first
+moves the paths, the last moves them back. A path is only moved back where
+its parents are directories inside the workspace; when the dependency put a
+link or a file in their place, the path stays aside, and the next run moves
+it back after that run's dependency. A run that is stopped leaves its paths
+aside the same way. An entry names a target in the task's project, or
+`project:target`, and applies to the dependency in any configuration. What
+the dependency writes beside the paths stays.
 
 A `key` restricts restores to saves that suit the checkout, such as those
 built with the same toolchain:
