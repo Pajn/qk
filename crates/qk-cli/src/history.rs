@@ -246,7 +246,7 @@ pub fn show_task(
         return Ok(());
     }
     writeln!(out, "{task}, most recent first:")?;
-    for (run, record) in records {
+    for (run, record) in &records {
         writeln!(
             out,
             "  run {run}  {}  {}  {}  {}",
@@ -271,7 +271,50 @@ pub fn show_task(
             )?;
         }
     }
+    if let Some(effect) = warm_effect(&records) {
+        writeln!(out, "{effect}")?;
+    }
     Ok(())
+}
+
+/// How long the task took when it ran from warm state and when it ran
+/// without, over its successful runs that executed rather than hit the cache.
+fn warm_effect(records: &[(String, qk_history::TaskReport)]) -> Option<String> {
+    let (mut warm, mut cold) = (Vec::new(), Vec::new());
+    for (_, record) in records {
+        let Some(state) = &record.warm else {
+            continue;
+        };
+        if record.status != "success"
+            || !matches!(record.cache.as_deref(), Some("miss" | "uncached"))
+        {
+            continue;
+        }
+        let restored = state.get("restored").is_some_and(|value| !value.is_null());
+        let present = state
+            .get("present")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|groups| !groups.is_empty());
+        if restored || present {
+            warm.push(record.duration());
+        } else {
+            cold.push(record.duration());
+        }
+    }
+    if warm.is_empty() || cold.is_empty() {
+        return None;
+    }
+    let average = |durations: &[u64]| durations.iter().sum::<u64>() / durations.len() as u64;
+    let runs = |count: usize| if count == 1 { "run" } else { "runs" };
+    Some(format!(
+        "From warm state it took {} on average over {} {}; without, {} over {} {}.",
+        seconds(average(&warm)),
+        warm.len(),
+        runs(warm.len()),
+        seconds(average(&cold)),
+        cold.len(),
+        runs(cold.len())
+    ))
 }
 
 /// What warm state did for a run, in words.
@@ -294,6 +337,8 @@ pub fn warm_line(warm: &serde_json::Value) -> Option<String> {
     }
     if let Some(saved) = saved {
         parts.push(format!("warm state saved in {}", seconds(saved)));
+    } else if warm.get("background").and_then(serde_json::Value::as_bool) == Some(true) {
+        parts.push("warm state saved in the background".to_owned());
     }
     (!parts.is_empty()).then(|| parts.join("; "))
 }

@@ -500,7 +500,7 @@ fn plan(
     }
     let mut write_trees: BTreeSet<PathBuf> = anchors(task).into_iter().collect();
     if let Ok(Some(warm)) = qk_cache::warm::config(workspace, task)
-        && let Ok(paths) = qk_cache::Outputs::from_paths(&warm.paths)
+        && let Ok(paths) = qk_cache::Outputs::from_paths(&warm.kept_paths())
     {
         write_trees.extend(paths.anchors().map(path));
     }

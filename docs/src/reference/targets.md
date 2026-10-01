@@ -135,10 +135,17 @@ An object describing reusable scratch state:
 | Field | Type | Default |
 | --- | --- | --- |
 | `outputs` | boolean | `false`; restore previous outputs before execution |
-| `paths` | array of workspace paths | Empty; `{warm}` is not allowed here |
+| `paths` | array of workspace paths and globs | Empty; `!` excludes; `{warm}` is not allowed here |
 | `env` | object of strings | Empty; supports `{warm}`, `{workspaceRoot}`, `{projectRoot}` |
 | `maxSize` | bytes or size string | No per-group limit |
 | `remote` | boolean | `true`; permit sharing warm state remotely |
+| `portable` | boolean | `true`; restore another worktree's or the remote's save |
+| `mtimes` | `"epoch"` or `"preserve"` | `"epoch"`; `"preserve"` keeps a worktree's own save's modification times |
+| `key` | array of workspace paths and `{"env": name}` objects | Empty; a save is restored only where the key matches |
+| `restoreKeys` | count | None; how many leading `key` parts a save must match when none matches whole |
+| `group` | string | None; share `{warm}` and its saves with every target naming the group |
+| `survive` | array of targets, `target` or `project:target` | Empty; keep `paths` across these dependencies |
+| `save` | `"wait"` or `"background"` | `"wait"`; `"background"` saves after the task has reported |
 
 Put it beside `inputs` and `outputs`, rather than in executor `options`.
 Warm state is restored on misses and uncached runs, saved after success,

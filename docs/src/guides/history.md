@@ -16,9 +16,12 @@ the paths added, removed and changed), `env`, `runtime`, `dependencies` (with
 the dependency tasks), `lockfile` (with the importers and packages),
 `inputs`, `definition`, `args` and `tooling`, or `first`, `unchanged` and
 `unknown` when the previous inputs are no longer kept. For targets with warm
-state it also holds where that state came from (`local` or `remote <branch>`),
-how many files and bytes were restored, and how long saving it took; the run
-summary names the tasks that started from warm state. The newest 200 runs are
+state it also holds where that state came from (`local`, `worktree <root>`
+or `remote <branch>`), how many files and bytes were restored, which groups
+were on disk already, and how long saving it took, or that it was saved in
+the background; the run summary names the tasks that started from warm
+state, and `qk show task` compares how long the task took from warm state
+with how long it took without, over its successful runs that executed. The newest 200 runs are
 kept. The schema is versioned in `schema_version`.
 
 `--report <path>` (or `NX_RUN_REPORT`) on `run`, `run-many` and `affected`

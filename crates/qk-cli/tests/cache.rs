@@ -148,7 +148,10 @@ impl Fixture {
             .env("GIT_CONFIG_GLOBAL", &self.git_config)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env_remove("NX_PARALLEL")
-            .env_remove("NX_CACHE_DIRECTORY");
+            .env_remove("NX_CACHE_DIRECTORY")
+            // Fixture branches must not inherit the enclosing CI checkout.
+            .env_remove("GITHUB_HEAD_REF")
+            .env_remove("GITHUB_REF_NAME");
         command
     }
 
@@ -1161,6 +1164,7 @@ fn warm_state_is_shared_through_the_remote_by_branch() {
         let _ = fs::remove_dir_all(fixture.root.join(".git/qk/warm"));
     };
     assert_eq!(on("main"), "cold");
+    let main_key = server.objects("/cache/qk/v1/warm/").pop().unwrap();
     assert_eq!(server.objects("/cache/qk/v1/warm/").len(), 1);
     // Another machine, on a branch without its own state, starts from main's.
     fresh();
@@ -1168,6 +1172,554 @@ fn warm_state_is_shared_through_the_remote_by_branch() {
     // Once the branch has saved state, it is preferred.
     fresh();
     assert_eq!(on("feature"), "feature");
+    let (branch_key, record) = {
+        let state = server.state.lock().unwrap();
+        state
+            .objects
+            .iter()
+            .find_map(|(key, bytes)| {
+                let record: Value = serde_json::from_slice(bytes).ok()?;
+                (key.starts_with("/cache/qk/v1/warm/") && key != &main_key)
+                    .then(|| (key.clone(), record))
+            })
+            .unwrap()
+    };
+    let mut legacy = record.clone();
+    legacy["version"] = json!(1);
+    let mut wrong_task = record;
+    wrong_task["task"] = json!("another-task");
+    for bytes in [
+        b"{".to_vec(),
+        serde_json::to_vec(&legacy).unwrap(),
+        serde_json::to_vec(&wrong_task).unwrap(),
+    ] {
+        server
+            .state
+            .lock()
+            .unwrap()
+            .objects
+            .insert(branch_key.clone(), bytes);
+        fresh();
+        assert_eq!(
+            on("feature"),
+            "main",
+            "invalid branch records must allow default-branch fallback"
+        );
+    }
+}
+
+/// A task that prints what its warm `scratch/state` held, then records the
+/// worktree it ran in.
+#[cfg(unix)]
+fn scratch_target(warm: Value) -> Value {
+    json!({
+        "command": "if [ -f scratch/state ]; then cat scratch/state; else echo cold; fi; mkdir -p scratch; basename \"$PWD\" > scratch/state",
+        "qk:warm": warm
+    })
+}
+
+#[cfg(unix)]
+#[test]
+fn a_worktree_restores_its_own_save_before_a_newer_one() {
+    let fixture = Fixture::new(scratch_target(json!({"paths": ["{projectRoot}/scratch"]})));
+    assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
+    // A new worktree starts from the other worktree's save.
+    let linked = fixture.worktree();
+    assert_eq!(said(&fixture, &linked, &[]), "repo");
+    let text = stdout(&success(
+        fixture.qk(&linked, &["show", "task", "app:build"]),
+    ));
+    assert!(
+        text.contains("warm state restored from worktree "),
+        "{text}"
+    );
+    // Its save is newer, but the first worktree comes back to its own.
+    fs::remove_dir_all(fixture.root.join("scratch")).unwrap();
+    assert_eq!(said(&fixture, &fixture.root, &[]), "repo");
+    let text = stdout(&success(
+        fixture.qk(&fixture.root, &["show", "task", "app:build"]),
+    ));
+    assert!(text.contains("warm state restored from local:"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn state_that_does_not_relocate_stays_in_its_worktree() {
+    let fixture = Fixture::new(scratch_target(
+        json!({"paths": ["{projectRoot}/scratch"], "portable": false}),
+    ));
+    assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
+    let linked = fixture.worktree();
+    assert_eq!(said(&fixture, &linked, &[]), "cold");
+    // Its own save still comes back.
+    fs::remove_dir_all(fixture.root.join("scratch")).unwrap();
+    assert_eq!(said(&fixture, &fixture.root, &[]), "repo");
+}
+
+#[cfg(unix)]
+#[test]
+fn preserved_modification_times_come_back_only_to_their_worktree() {
+    let fixture = Fixture::new(json!({
+        "command": "if [ -f scratch/state ]; then date -r scratch/state +%Y; else echo cold; fi; mkdir -p scratch; touch scratch/state",
+        "qk:warm": {"paths": ["{projectRoot}/scratch"], "mtimes": "preserve"}
+    }));
+    assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
+    let year = said(&fixture, &fixture.root, &[]);
+    assert_ne!(year, "1970");
+    fs::remove_dir_all(fixture.root.join("scratch")).unwrap();
+    assert_eq!(said(&fixture, &fixture.root, &[]), year);
+    // Another worktree's timestamps say nothing about this one's sources.
+    let linked = fixture.worktree();
+    assert_eq!(said(&fixture, &linked, &[]), "1970");
+}
+
+#[cfg(unix)]
+fn said_with(fixture: &Fixture, root: &Path, env: &[(&str, &str)]) -> String {
+    let mut command = fixture.command(root, &["run", "app:build"]);
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    stdout(&success(command.output().unwrap()))
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+#[cfg(unix)]
+#[test]
+fn a_warm_key_restores_only_saves_that_match_it() {
+    let fixture = Fixture::new(scratch_target(json!({
+        "paths": ["{projectRoot}/scratch"],
+        "key": ["{projectRoot}/toolchain.txt"]
+    })));
+    fs::write(fixture.root.join("toolchain.txt"), "1\n").unwrap();
+    assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
+    fs::remove_dir_all(fixture.root.join("scratch")).unwrap();
+    fs::write(fixture.root.join("toolchain.txt"), "2\n").unwrap();
+    assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
+    // Back on the first toolchain, its save is still kept.
+    fs::remove_dir_all(fixture.root.join("scratch")).unwrap();
+    fs::write(fixture.root.join("toolchain.txt"), "1\n").unwrap();
+    assert_eq!(said(&fixture, &fixture.root, &[]), "repo");
+}
+
+#[cfg(unix)]
+#[test]
+fn restore_keys_accept_a_save_matching_the_leading_parts() {
+    let fixture = Fixture::new(scratch_target(json!({
+        "paths": ["{projectRoot}/scratch"],
+        "key": ["{projectRoot}/toolchain.txt", {"env": "DEPENDENCIES"}],
+        "restoreKeys": 1
+    })));
+    fs::write(fixture.root.join("toolchain.txt"), "1\n").unwrap();
+    let run =
+        |dependencies: &str| said_with(&fixture, &fixture.root, &[("DEPENDENCIES", dependencies)]);
+    assert_eq!(run("a"), "cold");
+    fs::remove_dir_all(fixture.root.join("scratch")).unwrap();
+    assert_eq!(run("b"), "repo");
+    fs::remove_dir_all(fixture.root.join("scratch")).unwrap();
+    fs::write(fixture.root.join("toolchain.txt"), "2\n").unwrap();
+    assert_eq!(run("b"), "cold");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_new_worktree_prefers_the_save_nearest_behind_its_head() {
+    let fixture = Fixture::new(scratch_target(json!({"paths": ["{projectRoot}/scratch"]})));
+    let base = fixture.root.parent().unwrap();
+    assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
+    // A newer save, made on a commit the next worktree does not have.
+    let linked = fixture.worktree();
+    fixture.git(
+        &linked,
+        &[
+            "-c",
+            "user.name=qk",
+            "-c",
+            "user.email=qk@example.invalid",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "ahead",
+        ],
+    );
+    assert_eq!(said(&fixture, &linked, &[]), "repo");
+    let third = base.join("third");
+    fixture.git(
+        &fixture.root,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            third.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    assert_eq!(said(&fixture, &third, &[]), "repo");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_warm_group_is_shared_by_the_targets_that_name_it() {
+    let tool = |name: &str| {
+        json!({
+            "command": format!("if [ -f \"$TOOL_CACHE/seen\" ]; then cat \"$TOOL_CACHE/seen\"; else echo cold; fi; mkdir -p \"$TOOL_CACHE\" && echo {name} > \"$TOOL_CACHE/seen\""),
+            "qk:warm": {"group": "tool", "env": {"TOOL_CACHE": "{warm}/tool"}}
+        })
+    };
+    let fixture = Fixture::with_targets(json!({"build": tool("build"), "test": tool("test")}));
+    let run = |root: &Path, target: &str| {
+        stdout(&success(
+            fixture.qk(root, &["run", &format!("app:{target}")]),
+        ))
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+    };
+    assert_eq!(run(&fixture.root, "build"), "cold");
+    assert_eq!(run(&fixture.root, "test"), "build");
+    // Gone from the worktree, one target restores what the other saved.
+    fs::remove_dir_all(fixture.root.join(".git/qk/warm")).unwrap();
+    assert_eq!(run(&fixture.root, "build"), "test");
+    let linked = fixture.worktree();
+    assert_eq!(run(&linked, "test"), "build");
+    // Both restoring it at once is serialized.
+    fs::remove_dir_all(fixture.root.join(".git/qk/warm")).unwrap();
+    success(fixture.qk(
+        &fixture.root,
+        &["run-many", "-t", "build,test", "--parallel", "2"],
+    ));
+    assert!(fixture.root.join(".git/qk/warm").is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_warm_group_cannot_keep_one_task_s_paths() {
+    let fixture = Fixture::new(json!({
+        "command": "echo ran",
+        "qk:warm": {"group": "tool", "paths": ["{projectRoot}/scratch"]}
+    }));
+    let output = fixture.build(&fixture.root, &[]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("a qk:warm.group shares {warm} alone"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn excluded_warm_paths_are_neither_saved_nor_inputs() {
+    let fixture = Fixture::new(json!({
+        "command": "echo $(ls scratch 2>/dev/null); mkdir -p scratch/big; echo kept > scratch/state; echo large > scratch/big/blob",
+        "cache": true,
+        "outputs": ["{projectRoot}/dist"],
+        "qk:warm": {"paths": ["{projectRoot}/scratch", "!{projectRoot}/scratch/big"]}
+    }));
+    assert_eq!(said(&fixture, &fixture.root, &[]), "");
+    // Changing what is excluded changes no key.
+    fs::write(fixture.root.join("scratch/big/blob"), "changed\n").unwrap();
+    assert!(stderr(&success(fixture.build(&fixture.root, &[]))).contains("cache hit"));
+    fs::remove_dir_all(fixture.root.join("scratch")).unwrap();
+    fs::write(fixture.root.join("src/input.txt"), "two\n").unwrap();
+    assert_eq!(said(&fixture, &fixture.root, &[]), "state");
+}
+
+/// A fixture whose `native/` is generated, and so ignored, as a native
+/// project is.
+#[cfg(unix)]
+fn native_fixture(targets: Value) -> Fixture {
+    let fixture = Fixture::with_targets(targets);
+    let mut ignore = fs::read_to_string(fixture.root.join(".gitignore")).unwrap();
+    ignore.push_str("native\n");
+    fs::write(fixture.root.join(".gitignore"), ignore).unwrap();
+    fixture
+}
+
+/// A prebuild that recreates `native/`, and a build that keeps
+/// `native/build` in it and prints the year its state was written.
+#[cfg(unix)]
+fn survive_targets(prebuild: &str) -> Value {
+    json!({
+        "prebuild": {"command": prebuild},
+        "build": {
+            "command": "if [ -f native/build/state ]; then date -r native/build/state +%Y; else echo cold; fi; mkdir -p native/build; touch native/build/state",
+            "dependsOn": ["prebuild"],
+            "qk:warm": {"paths": ["{projectRoot}/native/build"], "survive": ["prebuild"]}
+        }
+    })
+}
+
+#[cfg(unix)]
+#[test]
+fn surviving_paths_outlast_a_dependency_that_deletes_them() {
+    let fixture = native_fixture(survive_targets(
+        "rm -rf native && mkdir -p native && echo generated > native/config",
+    ));
+    assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
+    // Kept as it was, not restored from the save, which would date it 1970.
+    let year = said(&fixture, &fixture.root, &[]);
+    assert_ne!(year, "1970");
+    assert_ne!(year, "cold");
+    // What the dependency generated beside them stays.
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("native/config")).unwrap(),
+        "generated\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn surviving_paths_come_back_when_the_dependency_fails() {
+    let fixture = native_fixture(survive_targets("mkdir -p native"));
+    assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
+    let failing = survive_targets("rm -rf native; exit 3");
+    fs::write(
+        fixture.root.join("project.json"),
+        json!({"name": "app", "targets": failing}).to_string(),
+    )
+    .unwrap();
+    let output = fixture.build(&fixture.root, &[]);
+    assert!(!output.status.success());
+    assert!(fixture.root.join("native/build/state").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn surviving_paths_left_aside_by_a_killed_run_come_back() {
+    let fixture = native_fixture(survive_targets("mkdir -p native"));
+    assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
+    let slow = survive_targets("sleep 3");
+    fs::write(
+        fixture.root.join("project.json"),
+        json!({"name": "app", "targets": slow}).to_string(),
+    )
+    .unwrap();
+    let mut running = fixture
+        .command(&fixture.root, &["run", "app:build"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    // Killed while the dependency runs, with the paths moved aside.
+    let moved = || !fixture.root.join("native/build/state").exists();
+    for _ in 0..100 {
+        if moved() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(moved());
+    running.kill().unwrap();
+    running.wait().unwrap();
+    fs::write(
+        fixture.root.join("project.json"),
+        json!({"name": "app", "targets": survive_targets("true")}).to_string(),
+    )
+    .unwrap();
+    let year = said(&fixture, &fixture.root, &[]);
+    assert_ne!(year, "1970");
+    assert_ne!(year, "cold");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_background_save_finishes_before_the_run_does() {
+    let fixture = Fixture::new(scratch_target(
+        json!({"paths": ["{projectRoot}/scratch"], "save": "background"}),
+    ));
+    assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
+    let text = stdout(&success(
+        fixture.qk(&fixture.root, &["show", "task", "app:build"]),
+    ));
+    assert!(
+        text.contains("warm state saved in the background"),
+        "{text}"
+    );
+    fs::remove_dir_all(fixture.root.join("scratch")).unwrap();
+    assert_eq!(said(&fixture, &fixture.root, &[]), "repo");
+}
+
+#[cfg(unix)]
+#[test]
+fn show_task_compares_runs_from_warm_state_with_runs_without() {
+    let fixture = Fixture::new(scratch_target(json!({"paths": ["{projectRoot}/scratch"]})));
+    assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
+    let text = stdout(&success(
+        fixture.qk(&fixture.root, &["show", "task", "app:build"]),
+    ));
+    assert!(!text.contains("From warm state"), "{text}");
+    // On disk already, which counts as warm as much as a restore does.
+    assert_eq!(said(&fixture, &fixture.root, &[]), "repo");
+    let text = stdout(&success(
+        fixture.qk(&fixture.root, &["show", "task", "app:build"]),
+    ));
+    assert!(
+        text.contains("From warm state it took ") && text.contains(" over 1 run; without, "),
+        "{text}"
+    );
+}
+
+/// Rewrites the fixture's project with these targets.
+#[cfg(unix)]
+fn set_targets(fixture: &Fixture, targets: Value) {
+    fs::write(
+        fixture.root.join("project.json"),
+        json!({"name": "app", "targets": targets}).to_string(),
+    )
+    .unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn surviving_paths_are_not_put_back_through_a_symlink() {
+    let fixture = native_fixture(survive_targets("mkdir -p native"));
+    assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
+    // Outside the workspace, where native/build would lead through the link.
+    let outside = fixture.root.parent().unwrap().join("outside");
+    fs::create_dir_all(outside.join("build")).unwrap();
+    fs::write(outside.join("build/unrelated"), "keep\n").unwrap();
+    set_targets(
+        &fixture,
+        // Failing, so that only qk could write through the link.
+        survive_targets(&format!(
+            "rm -rf native && ln -s {} native && exit 3",
+            outside.display()
+        )),
+    );
+    let _ = fixture.build(&fixture.root, &[]);
+    assert_eq!(
+        fs::read_to_string(outside.join("build/unrelated")).unwrap(),
+        "keep\n"
+    );
+    assert!(!outside.join("build/state").exists());
+    // Once native is a directory again, the kept state comes back.
+    set_targets(&fixture, survive_targets("rm -f native; mkdir -p native"));
+    let year = said(&fixture, &fixture.root, &[]);
+    assert_ne!(year, "1970");
+    assert_ne!(year, "cold");
+}
+
+#[cfg(unix)]
+#[test]
+fn surviving_paths_put_back_later_when_their_parent_is_not_a_directory() {
+    let fixture = native_fixture(survive_targets("mkdir -p native"));
+    assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
+    set_targets(
+        &fixture,
+        survive_targets("rm -rf native && echo file > native"),
+    );
+    let _ = fixture.build(&fixture.root, &[]);
+    set_targets(&fixture, survive_targets("rm -f native; mkdir -p native"));
+    let year = said(&fixture, &fixture.root, &[]);
+    assert_ne!(year, "1970");
+    assert_ne!(year, "cold");
+}
+
+#[cfg(unix)]
+#[test]
+fn paths_put_back_beside_one_that_could_not_be_survive_the_next_dependency() {
+    let targets = |prebuild: &str| {
+        json!({
+            "prebuild": {"command": prebuild},
+            "build": {
+                "command": "for d in one two; do if [ -f $d/build/state ]; then date -r $d/build/state +%Y; else echo cold; fi; done; mkdir -p one/build two/build; touch one/build/state two/build/state",
+                "dependsOn": ["prebuild"],
+                "qk:warm": {
+                    "paths": ["{projectRoot}/one/build", "{projectRoot}/two/build"],
+                    "survive": ["prebuild"]
+                }
+            }
+        })
+    };
+    let fixture = Fixture::with_targets(targets("mkdir -p one two"));
+    let mut ignore = fs::read_to_string(fixture.root.join(".gitignore")).unwrap();
+    ignore.push_str("one\ntwo\n");
+    fs::write(fixture.root.join(".gitignore"), ignore).unwrap();
+    let years = |fixture: &Fixture| {
+        stdout(&success(fixture.build(&fixture.root, &[])))
+            .lines()
+            .take(2)
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(years(&fixture), ["cold", "cold"]);
+    // one/build cannot go back, its parent now a file; two/build can.
+    set_targets(
+        &fixture,
+        targets("rm -rf one two && echo file > one && mkdir two"),
+    );
+    let _ = fixture.build(&fixture.root, &[]);
+    assert!(fixture.root.join("two/build/state").is_file());
+    // The next dependency deletes both; both are kept across it.
+    set_targets(&fixture, targets("rm -rf one two; mkdir one two"));
+    for year in years(&fixture) {
+        assert_ne!(year, "cold");
+        assert_ne!(year, "1970");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn surviving_paths_outlast_dependencies_that_run_at_once() {
+    let fixture = native_fixture(json!({
+        "prepare-a": {"command": "rm -rf native; mkdir -p native; sleep 1"},
+        "prepare-b": {"command": "rm -rf native/build; sleep 1"},
+        "build": {
+            "command": "if [ -f native/build/state ]; then date -r native/build/state +%Y; else echo cold; fi; mkdir -p native/build; touch native/build/state",
+            "dependsOn": ["prepare-a", "prepare-b"],
+            "qk:warm": {"paths": ["{projectRoot}/native/build"], "survive": ["prepare-a", "prepare-b"]}
+        }
+    }));
+    let run = || {
+        let output = success(fixture.qk(
+            &fixture.root,
+            &[
+                "run",
+                "app:build",
+                "--parallel",
+                "2",
+                "--output-style",
+                "static",
+            ],
+        ));
+        stdout(&output)
+            .lines()
+            .find(|line| {
+                *line == "cold" || (!line.is_empty() && line.chars().all(|c| c.is_ascii_digit()))
+            })
+            .unwrap_or_default()
+            .to_owned()
+    };
+    assert_eq!(run(), "cold");
+    for _ in 0..3 {
+        let year = run();
+        assert_ne!(year, "1970");
+        assert_ne!(year, "cold");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn an_environment_key_reads_the_task_s_own_environment() {
+    let keyed = |value: &str| {
+        let mut target = scratch_target(json!({
+            "paths": ["{projectRoot}/scratch"],
+            "key": [{"env": "TOOLCHAIN"}]
+        }));
+        target["options"] = json!({"env": {"TOOLCHAIN": value}});
+        target
+    };
+    let fixture = Fixture::new(keyed("1"));
+    assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
+    fs::remove_dir_all(fixture.root.join("scratch")).unwrap();
+    set_targets(&fixture, json!({"build": keyed("2")}));
+    assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
 }
 
 #[cfg(unix)]
@@ -1912,4 +2464,28 @@ fn nxignore_can_reinclude_untracked_gitignored_files() {
         "{}",
         stderr(&output)
     );
+}
+
+/// Warm environment overrides participate in keys for both save modes.
+#[cfg(unix)]
+#[test]
+fn warm_environment_keys_use_the_final_execution_environment() {
+    for save in ["wait", "background"] {
+        let keyed = |value: &str| {
+            let mut target = scratch_target(json!({
+                "paths": ["{projectRoot}/scratch"],
+                "key": [{"env": "TOOLCHAIN"}],
+                "env": {"TOOLCHAIN": value}, "save": save
+            }));
+            target["options"] = json!({"env": {"TOOLCHAIN": "base"}});
+            target
+        };
+        let fixture = Fixture::new(keyed("1"));
+        assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
+        fs::remove_dir_all(fixture.root.join("scratch")).unwrap();
+        set_targets(&fixture, json!({"build": keyed("2")}));
+        assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
+        fs::remove_dir_all(fixture.root.join("scratch")).unwrap();
+        assert_eq!(said(&fixture, &fixture.root, &[]), "repo");
+    }
 }

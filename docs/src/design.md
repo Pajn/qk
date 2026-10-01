@@ -192,3 +192,130 @@ variables. Cancellation uses the executor's process-group cleanup. It does not
 run plugins, sync generators or a daemon. Declared outputs, warm paths and runner
 state are excluded to prevent feedback loops. Tests cover dependency selection,
 new project discovery, queued changes and cancellation.
+
+## Warm state for native builds
+
+**Status: implemented.** [Warm state](guides/warm-state.md) and the
+[`qk:warm` reference](reference/targets.md#qkwarm) describe the behavior;
+this section records why it takes this shape.
+
+Native build systems keep two kinds of state. Some is bound to the checkout's
+absolute path and trusts file timestamps, as Gradle's execution history,
+CMake's build directories and Ninja do. Some is content-addressed and
+path-independent, as ccache is when its base directory is the workspace root.
+The first kind makes rebuilds fast inside the worktree that produced it and is
+worth little elsewhere, where CMake refuses a cache created in another
+directory. The second kind carries across worktrees and machines. The
+portability and timestamp controls distinguish these two kinds of state.
+
+A React Native Android debug build, whose prebuild step recreates the native
+project on every run, measured once on one machine:
+
+| Situation | Build |
+| --- | --- |
+| Same worktree, build state deleted by the prebuild | 35–40 s |
+| Same worktree, build state moved aside and back | 7–10 s |
+| Same worktree, build state restored with Unix-epoch timestamps | 24 s |
+| New worktree, cold | 182 s |
+| New worktree, Gradle state copied from another worktree | 167 s |
+| New worktree, CMake state copied from another worktree | Fails |
+| New worktree, ccache filled by another worktree | 98 s |
+
+### Keeping state across a destructive dependency
+
+```jsonc
+"android": { "qk:warm": { "paths": ["…"], "survive": ["prebuild-android"] } }
+```
+
+`survive` names dependency targets that delete the warm paths. qk moves the
+paths aside before such a dependency runs and back after it succeeds, so the
+state keeps its files and timestamps without being stored or copied. If the
+dependency fails, the paths return unchanged. A path the dependency itself
+recreates is replaced by the kept one, so `survive` suits generated trees
+that hold build state, not a dependency's own outputs.
+
+### Timestamps
+
+`mtimes: "preserve"` restores files with the modification times they were
+saved with, instead of the Unix epoch. Epoch times make `tsc --build` check
+sources against restored state; they also make Ninja rebuild every restored
+object and Gradle rehash every restored file. Preserved times are only
+meaningful against the worktree that saved them, so they apply to a
+worktree's own save and fall back to the epoch for any other.
+
+### Preferring the worktree's own save
+
+A restore chooses the worktree's own most recent save before any other
+worktree's. Before this, the most recent save of the task won, whichever
+worktree made it.
+
+### Groups that do not relocate
+
+`portable: false` restores a group only from the worktree that saved it. State
+that records absolute paths, such as CMake build directories, then never
+reaches a checkout it would break or merely occupy. Portable groups can
+restore from other worktrees and the remote store.
+
+### Named groups shared between targets
+
+```jsonc
+"qk:warm": {
+  "group": "ccache",
+  "env": { "CCACHE_DIR": "{warm}", "CCACHE_BASEDIR": "{workspaceRoot}" }
+}
+```
+
+A named group is one piece of warm state that several targets use, as one
+ccache serves every native build. Its targets share the live directory,
+which the tool itself keeps consistent, so only restoring and saving it are
+serialized, and each save holds everything the directory held. A group has
+no `outputs` or `paths`, which belong to one task. Combined with remote warm
+state, a new worktree or machine starts from the default branch's ccache.
+
+### Choosing a save by key
+
+```jsonc
+"qk:warm": {
+  "key": ["{workspaceRoot}/pnpm-lock.yaml", { "env": "ANDROID_NDK_VERSION" }],
+  "restoreKeys": 1
+}
+```
+
+A group keeps several saves, each labeled with a hash of the declared `key`
+inputs. A restore takes the save with an exact key, else one matching the
+first `restoreKeys` entries, else none. Among equal candidates, the save
+made at the commit nearest the checkout's `HEAD` in Git history wins over the
+newest, so a worktree cut from `main` starts from `main`'s state. The key only
+chooses a save; it never makes warm state a result.
+
+### Excluding and globbing paths
+
+A path starting with `!` omits files no later build reads, such as packaged
+artifacts that are rebuilt on every run, as it does for outputs. Glob
+patterns in `paths` name directories whose location depends on package
+versions, as pnpm places a package's native build under a versioned
+directory. Excluded files stay out of task inputs, like the rest of a warm
+path.
+
+### Saving in the background
+
+`save: "background"` saves after the task has reported success, so the next
+task starts without waiting. Saves and restores of a group are serialized,
+and the run waits for background saves before it finishes its remote
+uploads, which a save may add to.
+
+### Suggesting warm paths
+
+`qk warm suggest <task>` runs the task in the sandbox and lists what it wrote
+outside its declared outputs as candidate warm paths, each under its topmost
+directory that holds no source file. Native builds write to places that are
+hard to guess, such as build directories that a build script moves to the
+workspace root. It needs macOS, where the sandbox can report rather than
+refuse.
+
+### Reporting warm state's effect
+
+Run records hold where warm state came from, what was restored, which
+groups were on disk already and how long saving took. `qk show task`
+compares the task's duration from warm state with its duration without,
+which shows whether its warm state is worth its size.
