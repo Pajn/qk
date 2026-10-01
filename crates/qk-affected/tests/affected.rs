@@ -551,11 +551,22 @@ fn nxignore_parent_and_untracked_negations_match_source_discovery() {
         (".nxignore", "!libs/lib/src/keep.ts\n"),
     ]);
     write(&repo.root, "libs/lib/src/keep.ts", "untracked");
+    // Named, the negation includes it.
+    assert_eq!(
+        repo.affected(Options {
+            files: vec!["libs/lib/src/keep.ts".into()],
+            explicit_files: true,
+            ..Options::default()
+        }),
+        names(&["app", "lib"])
+    );
+    // Untracked files are what Git lists, as in Nx, which leaves out what
+    // .gitignore excludes whatever .nxignore says.
     assert_eq!(
         repo.affected(Options {
             untracked: true,
             ..Options::default()
         }),
-        names(&["app", "lib"])
+        Vec::<String>::new()
     );
 }

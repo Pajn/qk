@@ -12,7 +12,10 @@ As in Nx 23, changed files are those between the merge base of `--base` and
 including uncommitted and untracked files. The base defaults to `NX_BASE`,
 then nx.json `defaultBase`, then `main`; the head to `NX_HEAD`. `--files`,
 `--uncommitted` and `--untracked` replace the comparison. Files matching the
-root `.gitignore` or `.nxignore` are left out.
+root `.gitignore` or `.nxignore` are left out. Untracked files are those Git
+lists as untracked and not ignored, so an `.nxignore` negation does not bring
+back one `.gitignore` excludes, though it does for a file named with
+`--files`.
 
 Unlike Nx, when the base is a branch with an upstream, such as `main`
 following `origin/main`, and the head left the upstream later than the local

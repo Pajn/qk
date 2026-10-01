@@ -593,16 +593,10 @@ fn uncommitted(root: &Path) -> Result<Vec<String>> {
     )
 }
 
+/// Untracked files as Nx's `getUntrackedFiles` lists them: what Git does not
+/// ignore. An `.nxignore` negation cannot bring back a file `.gitignore`
+/// excludes, since it filters this list and does not add to it.
 fn untracked(root: &Path) -> Result<Vec<String>> {
-    if root.join(".nxignore").is_file() {
-        let tracked: BTreeSet<_> = git_lines(root, &["ls-files", "--cached"])?
-            .into_iter()
-            .collect();
-        return Ok(qk_cache::source_files(root)?
-            .difference(&tracked)
-            .cloned()
-            .collect());
-    }
     git_lines(root, &["ls-files", "--others", "--exclude-standard"])
 }
 
