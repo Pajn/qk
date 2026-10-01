@@ -1,7 +1,7 @@
 // A restoration matrix sharing the main benchmark's graph and source fixture.
 // Preparation and content/cache-hit verification run outside every timing window.
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 export function measureRestoration({ root, qk, projects, runs, filesPerProject }) {
@@ -11,7 +11,12 @@ export function measureRestoration({ root, qk, projects, runs, filesPerProject }
   writeFileSync(join(root, 'restore-bench.mjs'), `
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
-const [mode, content, state, selection] = process.argv.slice(2);
+import {spawnSync} from 'node:child_process';
+let [mode, content, state, selection] = process.argv.slice(2);
+if(mode === 'verify-previous') {
+  [content,state,selection] = JSON.parse(readFileSync('.qk/restore-pending.json','utf8'));
+  mode = 'verify';
+}
 const root = mode === 'build' ? resolve('../..') : process.cwd();
 const selected = mode === 'build' ? state : selection;
 const count = ${filesPerProject};
@@ -28,6 +33,10 @@ if (mode === 'build') {
   writeFileSync('dist/tsconfig.tsbuildinfo', info(project));
   if(selected === 'excluded') { mkdirSync('dist/keep', {recursive:true}); writeFileSync('dist/keep/sentinel', 'unselected'); }
 } else if (mode === 'prepare') {
+  if(existsSync('.qk/restore-counts.json') && existsSync('.qk/restore-pending.json')) {
+    const verified = spawnSync(process.execPath,['restore-bench.mjs','verify-previous'],{stdio:'inherit'});
+    if(verified.error || verified.status !== 0) throw new Error('previous restoration verification failed');
+  }
   const config = JSON.parse(readFileSync('.qk/restore-base.json','utf8'));
   config.targetDefaults.build.command = 'node ../../restore-bench.mjs build '+content+' '+selection;
   config.targetDefaults.build.outputs = selection === 'excluded' ? ['{projectRoot}/dist','!{projectRoot}/dist/keep'] : ['{projectRoot}/dist'];
@@ -45,6 +54,7 @@ if (mode === 'build') {
       for(const entry of readdirSync(dist)) if(entry !== 'keep') rmSync(join(dist,entry),{recursive:true,force:true});
     }
   }
+  writeFileSync('.qk/restore-pending.json',JSON.stringify([content,state,selection]));
 } else if (mode === 'verify') {
   const counts = JSON.parse(readFileSync('.qk/restore-counts.json','utf8'));
   for(const project of projects()) {
@@ -70,6 +80,9 @@ if (mode === 'build') {
     { content, state: 'partial', selection: 'excluded' },
   ]);
   try {
+    // Verification starts only after all variants are warmed and counters frozen.
+    rmSync(join(root,'.qk/restore-counts.json'), {force:true});
+    rmSync(join(root,'.qk/restore-pending.json'), {force:true});
     for (const content of ['repeated', 'distinct']) for (const selection of ['complete', 'excluded']) {
       run(process.execPath, ['restore-bench.mjs', 'prepare', content, selection === 'complete' ? 'absent' : 'partial', selection]);
       run(qk, ['run-many', '-t', 'build', '--output-style', 'static']);
@@ -82,17 +95,21 @@ if (mode === 'build') {
     const results = join(root, 'restore-hyperfine.json');
     // Quote the absolute binary path for the POSIX shell used by hyperfine.
     const quoted = `'${qk.replaceAll("'", "'\\''")}'`;
-    const measured = spawnSync('hyperfine', [
-      '--warmup', '2', '--runs', String(runs), '--export-json', results, '--output', 'null',
-      ...matrix.flatMap(({content,state,selection}) => [
+    const measured = [];
+    for (const {content,state,selection} of matrix) {
+      const benchmark = spawnSync('hyperfine', [
+        '--warmup', '2', '--runs', String(runs), '--export-json', results, '--output', 'null',
+        // Preparation checks the previous sample before mutating its outputs.
+        // This also supports Hyperfine releases without --conclude.
         '--prepare', `node restore-bench.mjs prepare ${content} ${state} ${selection}`,
-        '--conclude', `node restore-bench.mjs verify ${content} ${state} ${selection}`,
         '--command-name', `restore, ${content} blobs, ${state} outputs, ${selection}`,
         `${quoted} run-many -t build --output-style static`,
-      ]),
-    ], { cwd: root, stdio: ['ignore','inherit','inherit'] });
-    if (measured.error || measured.status !== 0) throw new Error(`restoration benchmark failed: ${measured.error ?? measured.status}`);
-    return JSON.parse(readFileSync(results, 'utf8')).results;
+      ], { cwd: root, stdio: ['ignore','inherit','inherit'] });
+      if (benchmark.error || benchmark.status !== 0) throw new Error(`restoration benchmark failed: ${benchmark.error ?? benchmark.status}`);
+      run(process.execPath, ['restore-bench.mjs','verify-previous']);
+      measured.push(...JSON.parse(readFileSync(results, 'utf8')).results);
+    }
+    return measured;
   } finally {
     writeFileSync(join(root, 'nx.json'), base);
   }
