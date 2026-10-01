@@ -515,7 +515,7 @@ impl History {
         let mut statement = self.connection.prepare(
             "SELECT t.task_id, t.key FROM tasks t
              JOIN execution_logs e ON e.run_id = t.run_id AND e.task_id = t.task_id
-             WHERE t.cache = 'miss' AND t.key IS NOT NULL AND e.inputs_unchanged = 1
+             WHERE t.cache IN ('miss', 'uncached') AND t.key IS NOT NULL AND e.inputs_unchanged = 1
                AND t.status IN ('success', 'failure') AND (?1 IS NULL OR t.task_id = ?1)
              GROUP BY t.task_id, t.key
              HAVING SUM(t.status = 'success') > 0 AND SUM(t.status = 'failure') > 0
@@ -532,7 +532,7 @@ impl History {
                 let mut statement = self.connection.prepare(
                     "SELECT t.run_id, t.status, t.started, e.data IS NOT NULL FROM tasks t
                  JOIN execution_logs e ON e.run_id = t.run_id AND e.task_id = t.task_id
-                 WHERE t.task_id = ?1 AND t.key = ?2 AND t.cache = 'miss'
+                 WHERE t.task_id = ?1 AND t.key = ?2 AND t.cache IN ('miss', 'uncached')
                    AND t.status IN ('success', 'failure') AND e.inputs_unchanged = 1
                  ORDER BY t.started DESC, t.run_id DESC",
                 )?;

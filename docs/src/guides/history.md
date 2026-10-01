@@ -49,8 +49,11 @@ qk show log <run-id> web:test
 Successful and failed cacheable executions retain stdout and stderr separately,
 with their observed chunk order preserved. `show log` replays each chunk to its
 original stream. Cache hits replay a previous success and do not create another
-execution log. Uncached tasks, tasks run with `--skip-cache`, and tasks bypassed
-before execution do not retain logs. Failed executions never publish reusable
+execution log. Otherwise cacheable tasks run with `--skip-nx-cache` (or its
+aliases or `NX_SKIP_NX_CACHE=true`) retain their keys and execution logs while
+always executing, without restoring or publishing results or warm state.
+Uncacheable tasks, sandboxed tasks, and tasks whose inputs cannot be keyed do
+not retain execution logs. Failed executions never publish reusable
 cache entries.
 
 `show flaky [task]` lists task keys with both successful and failed executions
@@ -59,8 +62,10 @@ run IDs, outcomes and whether each log is still available. It excludes cache
 hits, cancelled executions and executions whose declared inputs changed while
 running. These are **mixed outcomes for identical declared inputs**, which can
 also indicate undeclared inputs, network dependencies or changing external
-state. To collect another actual execution after a cached success, `qk reset
---only-cache` clears result entries while keeping history.
+state. To collect more actual executions while keeping existing results, run
+the task repeatedly with `--skip-nx-cache`, then use `qk show flaky` and
+`qk show log` to inspect the outcomes. `qk reset --only-cache` also clears
+result entries while keeping history.
 
 Each log retains at most its first 4 MiB of framed output and reports truncation
 when replayed. History keeps at most 64 MiB of log payload across linked
