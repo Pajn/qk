@@ -2033,3 +2033,17 @@ fn signal_windows_watch(pid: u32) {
         FreeConsole();
     }
 }
+
+/// Suggestions require an actual audited execution, not a planning command.
+#[test]
+fn warm_suggest_rejects_options_that_skip_execution() {
+    let temp = fixture(json!({"build": {"command": "echo unused"}}));
+    for options in [vec!["--dry-run"], vec!["--graph", "graph.json"]] {
+        let mut args = vec!["warm", "suggest", "app:build"];
+        args.extend(options);
+        let output = run(temp.path(), &args);
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("requires task execution"));
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("wrote nothing"));
+    }
+}

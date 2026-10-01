@@ -55,6 +55,7 @@ pub fn candidates(writes: &BTreeSet<String>, sources: &BTreeSet<String>) -> Vec<
 pub fn size(path: &Path) -> u64 {
     walkdir::WalkDir::new(path)
         .follow_links(false)
+        .follow_root_links(false)
         .into_iter()
         .flatten()
         .filter_map(|entry| entry.metadata().ok())
@@ -67,6 +68,7 @@ pub fn size(path: &Path) -> u64 {
 mod tests {
     use super::*;
 
+    /// Paths as the audit collector presents them.
     fn set(paths: &[&str]) -> BTreeSet<String> {
         paths.iter().map(|path| (*path).to_owned()).collect()
     }
@@ -103,5 +105,18 @@ mod tests {
     fn writes_beside_sources_are_left_out() {
         let sources = set(&["src/index.ts"]);
         assert!(candidates(&set(&["src/generated.ts"]), &sources).is_empty());
+    }
+    /// Neither root nor nested symlinks contribute their targets' bytes.
+    #[cfg(unix)]
+    #[test]
+    fn size_does_not_follow_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("large"), [0; 100]).unwrap();
+        let root_link = temp.path().join("link");
+        std::os::unix::fs::symlink(outside.path(), &root_link).unwrap();
+        assert_eq!(size(&root_link), 0);
+        std::fs::write(temp.path().join("local"), [0; 3]).unwrap();
+        assert_eq!(size(temp.path()), 3);
     }
 }

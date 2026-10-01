@@ -205,8 +205,8 @@ CMake's build directories and Ninja do. Some is content-addressed and
 path-independent, as ccache is when its base directory is the workspace root.
 The first kind makes rebuilds fast inside the worktree that produced it and is
 worth little elsewhere, where CMake refuses a cache created in another
-directory. The second kind carries across worktrees and machines. `qk:warm`
-treats both alike today.
+directory. The second kind carries across worktrees and machines. The
+portability and timestamp controls distinguish these two kinds of state.
 
 A React Native Android debug build, whose prebuild step recreates the native
 project on every run, measured once on one machine:
@@ -246,15 +246,15 @@ worktree's own save and fall back to the epoch for any other.
 ### Preferring the worktree's own save
 
 A restore chooses the worktree's own most recent save before any other
-worktree's. Today the most recent save of the task wins, whichever worktree
-made it.
+worktree's. Before this, the most recent save of the task won, whichever
+worktree made it.
 
 ### Groups that do not relocate
 
 `portable: false` restores a group only from the worktree that saved it. State
 that records absolute paths, such as CMake build directories, then never
-reaches a checkout it would break or merely occupy. Portable groups keep
-today's behavior, including remote restores.
+reaches a checkout it would break or merely occupy. Portable groups can
+restore from other worktrees and the remote store.
 
 ### Named groups shared between targets
 

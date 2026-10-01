@@ -89,6 +89,11 @@ aside the same way. An entry names a target in the task's project, or
 `project:target`, and applies to the dependency in any configuration. What
 the dependency writes beside the paths stays.
 
+Stash ownership records are replaced atomically after syncing the new file.
+Unreadable, invalid or missing metadata leaves saved contents in place and
+reports a recovery warning. This protects stopped-process recovery; it does
+not promise durability across power loss.
+
 A `key` restricts restores to saves that suit the checkout, such as those
 built with the same toolchain:
 

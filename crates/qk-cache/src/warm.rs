@@ -317,8 +317,20 @@ struct Active {
 static ACTIVE: std::sync::Mutex<BTreeMap<PathBuf, Active>> = std::sync::Mutex::new(BTreeMap::new());
 
 impl Stash {
+    /// The ownership record for the numbered paths in a stash.
     fn manifest(root: &std::path::Path) -> PathBuf {
         root.join("moved.json")
+    }
+
+    /// Publishes ownership before moving a path, without truncating the last
+    /// valid record. Sync the file before the atomic replacement.
+    fn save_manifest(&self) -> Result<()> {
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new_in(&self.root)?;
+        file.write_all(&serde_json::to_vec(self)?)?;
+        file.as_file().sync_all()?;
+        file.persist(Self::manifest(&self.root))?;
+        Ok(())
     }
 
     /// Moves the paths back, replacing what is there now, and removes the
@@ -356,6 +368,7 @@ impl Stash {
     }
 }
 
+/// Removes a path itself, including a symlink, without following it.
 fn remove(path: &std::path::Path) -> std::io::Result<()> {
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -445,13 +458,6 @@ pub fn keep_across(workspace: &Workspace, graph: &TaskGraph, task: &Task) -> Kep
 fn acquire(workspace: &Workspace, owner: &Task, warm: &Warm) -> Result<PathBuf> {
     let state = paths::worktree_state(&workspace.root).join("warm-kept");
     let root = state.join(hash32(&owner.id));
-    let mut active = ACTIVE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(entry) = active.get_mut(&root) {
-        entry.users += 1;
-        return Ok(root);
-    }
     fs::create_dir_all(&state)?;
     let lock = fs::OpenOptions::new()
         .create(true)
@@ -459,19 +465,47 @@ fn acquire(workspace: &Workspace, owner: &Task, warm: &Warm) -> Result<PathBuf> 
         .read(true)
         .write(true)
         .open(state.join(format!("{}.lock", hash32(&owner.id))))?;
-    fs2::FileExt::lock_exclusive(&lock)?;
+    // Only the nonblocking attempt holds ACTIVE. Waiting for another process
+    // must leave this process's other stashes free to acquire and release.
+    let mut active = loop {
+        let mut active = ACTIVE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = active.get_mut(&root) {
+            entry.users += 1;
+            return Ok(root);
+        }
+        match fs2::FileExt::try_lock_exclusive(&lock) {
+            Ok(()) => break active,
+            Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+                drop(active);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
     // Under the lock, a stash on disk is one no run holds: one an earlier run
     // could not put back, or left when it was stopped. It goes back first.
     // What cannot go back yet, as when its parent is not a directory, stays
     // in the stash this dependency holds, beside the paths that did go back,
     // and is put back after the dependency, which may well recreate the
     // parent.
-    let left = fs::read(Stash::manifest(&root)).ok().map(|bytes| {
-        let mut left: Stash = serde_json::from_slice(&bytes).unwrap_or_default();
-        left.root = root.clone();
-        left.workspace = workspace.root.clone();
-        left
-    });
+    let left = match fs::read(Stash::manifest(&root)) {
+        Ok(bytes) => {
+            let mut left: Stash = serde_json::from_slice(&bytes)
+                .context("invalid warm stash manifest; saved paths retained for recovery")?;
+            left.root = root.clone();
+            left.workspace = workspace.root.clone();
+            Some(left)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if root.is_dir() && fs::read_dir(&root)?.next().is_some() {
+                bail!("missing warm stash manifest; saved paths retained for recovery");
+            }
+            None
+        }
+        Err(error) => return Err(error).context("cannot read warm stash; saved paths retained"),
+    };
     let retained = left.filter(|left| !left.put_back());
     let stash = stash(workspace, &root, warm, retained)?;
     active.insert(
@@ -552,7 +586,7 @@ fn stash(
     for path in topmost {
         let moved = paths::safe_parents(&workspace.root, &path).and_then(|()| {
             stash.moved.push(path.clone());
-            fs::write(Stash::manifest(root), serde_json::to_vec(&stash)?)?;
+            stash.save_manifest()?;
             // An entry put back earlier left its slot empty, and a retained
             // one's slot is taken; a new one goes at the end either way.
             fs::rename(
@@ -567,7 +601,7 @@ fn stash(
         if let Err(error) = moved {
             // What was moved before goes back, rather than waiting on a run
             // that holds no share of it.
-            fs::write(Stash::manifest(root), serde_json::to_vec(&stash)?)?;
+            stash.save_manifest()?;
             stash.put_back();
             return Err(error);
         }
@@ -612,6 +646,7 @@ pub(crate) struct Group {
 }
 
 impl Group {
+    /// Total saved file bytes, excluding directories and links.
     fn size(&self, cache: &Cache) -> u64 {
         self.artifacts
             .values()
@@ -713,6 +748,7 @@ impl Location {
         }
     }
 
+    /// Whether a relative path belongs to this configured group.
     fn matches(&self, path: &str) -> bool {
         self.outputs
             .as_ref()
@@ -720,6 +756,7 @@ impl Location {
     }
 }
 
+/// Resolves output, scratch and external environment groups for this task.
 fn locations(workspace: &Workspace, task: &Task, warm: &Warm) -> Result<Vec<Location>> {
     let mut locations = Vec::new();
     if warm.outputs {
@@ -780,6 +817,7 @@ fn branches(workspace: &Workspace) -> Vec<String> {
     branches
 }
 
+/// Metadata used to detect files unchanged since their save or restore.
 fn stamp(metadata: &fs::Metadata) -> Vec<i64> {
     let modified = metadata
         .modified()
@@ -808,6 +846,7 @@ fn worktree(workspace: &Workspace) -> String {
         .into_owned()
 }
 
+/// The checkout commit, absent outside Git workspaces.
 fn current_commit(workspace: &Workspace) -> Option<String> {
     let output = paths::git(&workspace.root, &["rev-parse", "HEAD"]).ok()?;
     let commit = String::from_utf8(output.stdout).ok()?.trim().to_owned();
@@ -882,16 +921,19 @@ fn behind(workspace: &Workspace, commit: &str) -> Option<u64> {
     String::from_utf8(output.stdout).ok()?.trim().parse().ok()
 }
 
+/// A compact stable filename component for task and group identities.
 fn hash32(text: &str) -> String {
     blake3::hash(text.as_bytes()).to_hex()[..32].to_owned()
 }
 
+/// A representable timestamp for restoring saved modification times.
 fn nanos(time: SystemTime) -> Option<i64> {
     time.duration_since(UNIX_EPOCH)
         .ok()
         .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
 }
 
+/// The save time used to order records across worktrees.
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -905,6 +947,7 @@ fn restored_files_path(workspace: &Workspace, warm: &Warm) -> PathBuf {
         .join(format!("{}.json", hash32(&warm.identity)))
 }
 
+/// Reads optional restore metadata; a missing note forces fresh file reads.
 fn read_restored_files(workspace: &Workspace, warm: &Warm) -> RestoredFiles {
     fs::read(restored_files_path(workspace, warm))
         .ok()
@@ -1151,12 +1194,15 @@ impl Cache {
         for branch in branches(workspace) {
             match remote.fetch_warm(&self.root, &warm.identity, &branch) {
                 Ok(Some(bytes)) => {
-                    let record =
+                    let Some(record) =
                         serde_json::from_slice::<Record>(&bytes)
                             .ok()
                             .filter(|record| {
                                 record.version == RECORD_VERSION && record.task == warm.identity
-                            })?;
+                            })
+                    else {
+                        continue;
+                    };
                     // A branch's save that does not suit this checkout gives
                     // way to the next branch's.
                     if key_match(warm, current, &record.key).is_none() {
@@ -1173,7 +1219,9 @@ impl Cache {
                         "qk: {}: remote warm state unavailable ({error:#})",
                         task.id
                     );
-                    return None;
+                    // An invalid record or unavailable blob on this branch
+                    // does not rule out a usable default-branch save.
+                    continue;
                 }
             }
         }
@@ -1373,6 +1421,7 @@ struct Save {
 }
 
 impl Save {
+    /// Captures the effective key and locations before a background save.
     fn prepare(
         workspace: &Workspace,
         task: &Task,
@@ -1389,5 +1438,102 @@ impl Save {
             key: key_digests(workspace, warm, prepared)?,
             notes: restored_files_path(workspace, warm),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use qk_taskgraph::Request;
+    use serde_json::json;
+
+    /// Two independent owners let a blocked file lock contend with a release.
+    fn fixture() -> (tempfile::TempDir, Workspace, TaskGraph) {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("nx.json"), "{}").unwrap();
+        fs::write(
+            temp.path().join("project.json"),
+            json!({
+                "name": "app", "targets": {
+                    "one": {"command": "true", "qk:warm": {"paths": ["scratch-one"]}},
+                    "two": {"command": "true", "qk:warm": {"paths": ["scratch-two"]}}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        for path in ["scratch-one", "scratch-two"] {
+            fs::create_dir(temp.path().join(path)).unwrap();
+            fs::write(temp.path().join(path).join("state"), "saved").unwrap();
+        }
+        let workspace = Workspace::load(temp.path()).unwrap();
+        let graph = TaskGraph::build(
+            &workspace,
+            &[
+                Request::parse("app:one").unwrap(),
+                Request::parse("app:two").unwrap(),
+            ],
+        )
+        .unwrap();
+        (temp, workspace, graph)
+    }
+
+    /// An external owner lock must not prevent another stash's final release.
+    #[test]
+    fn waiting_for_an_owner_does_not_block_other_releases() {
+        let (_temp, workspace, graph) = fixture();
+        let one = &graph.tasks["app:one"];
+        let two = &graph.tasks["app:two"];
+        let first = acquire(&workspace, one, &config(&workspace, one).unwrap().unwrap()).unwrap();
+        let state = paths::worktree_state(&workspace.root).join("warm-kept");
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(state.join(format!("{}.lock", hash32(&two.id))))
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&lock).unwrap();
+        let (released, received) = std::sync::mpsc::channel();
+        let completed = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let second =
+                    acquire(&workspace, two, &config(&workspace, two).unwrap().unwrap()).unwrap();
+                release(&second);
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            scope.spawn(|| {
+                release(&first);
+                released.send(()).unwrap();
+            });
+            let completed = received.recv_timeout(Duration::from_secs(2)).is_ok();
+            fs2::FileExt::unlock(&lock).unwrap();
+            completed
+        });
+        assert!(
+            completed,
+            "a blocked owner lock prevented an unrelated release"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.root.join("scratch-one/state")).unwrap(),
+            "saved"
+        );
+    }
+
+    /// Damaged or absent ownership metadata never makes saved contents disposable.
+    #[test]
+    fn unreadable_ownership_preserves_saved_paths() {
+        let (_temp, workspace, graph) = fixture();
+        let owner = &graph.tasks["app:one"];
+        let warm = config(&workspace, owner).unwrap().unwrap();
+        let root = acquire(&workspace, owner, &warm).unwrap();
+        let entry = ACTIVE.lock().unwrap().remove(&root).unwrap();
+        drop(entry); // Simulate a stopped process, without returning its paths.
+        fs::write(Stash::manifest(&root), "{").unwrap();
+        assert!(acquire(&workspace, owner, &warm).is_err());
+        assert_eq!(fs::read_to_string(root.join("0/state")).unwrap(), "saved");
+        fs::remove_file(Stash::manifest(&root)).unwrap();
+        assert!(acquire(&workspace, owner, &warm).is_err());
+        assert_eq!(fs::read_to_string(root.join("0/state")).unwrap(), "saved");
     }
 }

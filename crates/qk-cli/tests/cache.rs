@@ -1161,6 +1161,7 @@ fn warm_state_is_shared_through_the_remote_by_branch() {
         let _ = fs::remove_dir_all(fixture.root.join(".git/qk/warm"));
     };
     assert_eq!(on("main"), "cold");
+    let main_key = server.objects("/cache/qk/v1/warm/").pop().unwrap();
     assert_eq!(server.objects("/cache/qk/v1/warm/").len(), 1);
     // Another machine, on a branch without its own state, starts from main's.
     fresh();
@@ -1168,6 +1169,40 @@ fn warm_state_is_shared_through_the_remote_by_branch() {
     // Once the branch has saved state, it is preferred.
     fresh();
     assert_eq!(on("feature"), "feature");
+    let (branch_key, record) = {
+        let state = server.state.lock().unwrap();
+        state
+            .objects
+            .iter()
+            .find_map(|(key, bytes)| {
+                let record: Value = serde_json::from_slice(bytes).ok()?;
+                (key.starts_with("/cache/qk/v1/warm/") && key != &main_key)
+                    .then(|| (key.clone(), record))
+            })
+            .unwrap()
+    };
+    let mut legacy = record.clone();
+    legacy["version"] = json!(1);
+    let mut wrong_task = record;
+    wrong_task["task"] = json!("another-task");
+    for bytes in [
+        b"{".to_vec(),
+        serde_json::to_vec(&legacy).unwrap(),
+        serde_json::to_vec(&wrong_task).unwrap(),
+    ] {
+        server
+            .state
+            .lock()
+            .unwrap()
+            .objects
+            .insert(branch_key.clone(), bytes);
+        fresh();
+        assert_eq!(
+            on("feature"),
+            "main",
+            "invalid branch records must allow default-branch fallback"
+        );
+    }
 }
 
 /// A task that prints what its warm `scratch/state` held, then records the
@@ -2426,4 +2461,28 @@ fn nxignore_can_reinclude_untracked_gitignored_files() {
         "{}",
         stderr(&output)
     );
+}
+
+/// Warm environment overrides participate in keys for both save modes.
+#[cfg(unix)]
+#[test]
+fn warm_environment_keys_use_the_final_execution_environment() {
+    for save in ["wait", "background"] {
+        let keyed = |value: &str| {
+            let mut target = scratch_target(json!({
+                "paths": ["{projectRoot}/scratch"],
+                "key": [{"env": "TOOLCHAIN"}],
+                "env": {"TOOLCHAIN": value}, "save": save
+            }));
+            target["options"] = json!({"env": {"TOOLCHAIN": "base"}});
+            target
+        };
+        let fixture = Fixture::new(keyed("1"));
+        assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
+        fs::remove_dir_all(fixture.root.join("scratch")).unwrap();
+        set_targets(&fixture, json!({"build": keyed("2")}));
+        assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
+        fs::remove_dir_all(fixture.root.join("scratch")).unwrap();
+        assert_eq!(said(&fixture, &fixture.root, &[]), "repo");
+    }
 }

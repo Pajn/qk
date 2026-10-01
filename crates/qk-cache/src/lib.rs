@@ -215,13 +215,13 @@ impl Cache {
             }
         }
         // What was restored, and which groups were on disk already.
-        let before = || -> (Option<warm::Restored>, Vec<String>) {
+        let before = |running: &PreparedTask| -> (Option<warm::Restored>, Vec<String>) {
             let Some(warm) = warm.as_ref() else {
                 return (None, Vec::new());
             };
             match self
                 .initialize()
-                .and_then(|()| self.restore_warm(workspace, task, warm, prepared))
+                .and_then(|()| self.restore_warm(workspace, task, warm, running))
             {
                 Ok((restored, present)) => {
                     ((!restored.groups.is_empty()).then_some(restored), present)
@@ -233,7 +233,8 @@ impl Cache {
             }
         };
         let after = |outcome: Outcome,
-                     (restored, present): (Option<warm::Restored>, Vec<String>)|
+                     (restored, present): (Option<warm::Restored>, Vec<String>),
+                     running: &PreparedTask|
          -> Option<warm::WarmReport> {
             let warm = warm.as_ref()?;
             let started = std::time::Instant::now();
@@ -241,7 +242,7 @@ impl Cache {
             let save_ms = if outcome != Outcome::Success {
                 None
             } else if warm.background {
-                match self.save_warm_in_background(workspace, task, warm, prepared) {
+                match self.save_warm_in_background(workspace, task, warm, running) {
                     Ok(()) => background = true,
                     Err(error) => {
                         qk_executor::status!("qk: {}: warm state not saved ({error:#})", task.id);
@@ -249,7 +250,7 @@ impl Cache {
                 }
                 None
             } else {
-                match self.save_warm(workspace, task, warm, prepared) {
+                match self.save_warm(workspace, task, warm, running) {
                     Ok(()) => Some(started.elapsed().as_millis() as u64),
                     Err(error) => {
                         qk_executor::status!("qk: {}: warm state not saved ({error:#})", task.id);
@@ -322,9 +323,9 @@ impl Cache {
             Err(error) => return bypass(format!("{error:#}")),
         };
         if !cacheable {
-            let restored = before();
+            let restored = before(running);
             let outcome = execute(running, cancelled)?;
-            let warm_report = after(outcome, restored);
+            let warm_report = after(outcome, restored, running);
             let fingerprint = if self.unchanged(
                 snapshot,
                 workspace,
@@ -447,9 +448,9 @@ impl Cache {
             Err(error) => return bypass(format!("cache log unavailable: {error}")),
         };
         let capture = Capture::new(Some(log.as_file().try_clone()?), prepared.display.clone());
-        let restored = before();
+        let restored = before(running);
         let outcome = execute_captured(running, cancelled, Some(&capture))?;
-        let warm_report = after(outcome, restored);
+        let warm_report = after(outcome, restored, running);
         let fingerprint = if !self.unchanged(
             snapshot,
             workspace,

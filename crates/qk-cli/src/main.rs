@@ -822,26 +822,43 @@ fn run(mut cli: Cli) -> Result<i32> {
         Command::Warm {
             command: WarmCommand::Suggest { task, mut options },
         } => {
+            if options.dry_run || options.graph.is_some() {
+                bail!(
+                    "warm suggest requires task execution; --dry-run and --graph are not supported"
+                );
+            }
             let task = if task.contains(':') {
                 task
             } else {
                 format!("{}:{task}", current_project(&workspace)?)
             };
-            let report =
-                std::env::temp_dir().join(format!("qk-warm-suggest-{}.json", std::process::id()));
+            let report_dir = tempfile::tempdir()?;
+            let report = report_dir.path().join("report.json");
             options.sandbox = Some(options.sandbox.unwrap_or(SandboxMode::Audit));
             options.sandbox_report = Some(report.clone());
             let code = run_task(&workspace, task.clone(), &options)?;
-            let findings: serde_json::Value = std::fs::read(&report)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-                .unwrap_or_default();
-            let _ = std::fs::remove_file(&report);
-            let writes: std::collections::BTreeSet<String> = findings["tasks"]
+            if code != 0 {
+                return Ok(code);
+            }
+            let findings: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(&report).context("warm suggest could not read its audit report")?,
+            )
+            .context("warm suggest received an invalid audit report")?;
+            let matches_task = |id: &str| id == task || id.starts_with(&format!("{task}:"));
+            if let Some((id, reason)) = findings["unsandboxed"]
                 .as_object()
                 .into_iter()
                 .flatten()
-                .filter(|(id, _)| *id == &task || id.starts_with(&format!("{task}:")))
+                .find(|(id, _)| matches_task(id))
+            {
+                bail!("cannot suggest warm paths for {id}: task ran without auditing ({reason})");
+            }
+            let tasks = findings["tasks"]
+                .as_object()
+                .context("warm suggest audit report has no task findings")?;
+            let writes: std::collections::BTreeSet<String> = tasks
+                .iter()
+                .filter(|(id, _)| matches_task(id))
                 .flat_map(|(_, found)| found["strayWrites"].as_array().into_iter().flatten())
                 .filter_map(|path| path.as_str().map(str::to_owned))
                 .collect();

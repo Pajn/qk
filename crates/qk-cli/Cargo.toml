@@ -30,7 +30,6 @@ serde.workspace = true
 serde_json.workspace = true
 walkdir.workspace = true
 
-[dev-dependencies]
 tempfile.workspace = true
 
 [package.metadata.npm]
