@@ -199,6 +199,8 @@ fn normalize(path: &str) -> Result<String> {
 #[derive(Clone)]
 pub struct Outputs {
     patterns: Vec<Pattern>,
+    /// The patterns as written, for skipping directories none can match.
+    globs: Vec<String>,
     /// Negated patterns: what they match is never an output.
     negations: Vec<Pattern>,
     anchors: BTreeSet<String>,
@@ -215,6 +217,7 @@ impl Outputs {
     /// excludes what it matches.
     pub fn from_paths(patterns: &[String]) -> Result<Self> {
         let mut compiled = Vec::new();
+        let mut globs = Vec::new();
         let mut negations = Vec::new();
         let mut anchors = BTreeSet::new();
         let mut complete = BTreeSet::new();
@@ -237,10 +240,12 @@ impl Outputs {
                 complete.insert(pattern.clone());
             }
             compiled.push(Pattern::new(pattern, false)?);
+            globs.push(pattern.clone());
             anchors.insert(anchor);
         }
         Ok(Self {
             patterns: compiled,
+            globs,
             negations,
             anchors,
             complete,
@@ -255,6 +260,10 @@ impl Outputs {
             patterns: patterns
                 .iter()
                 .map(|pattern| Pattern::new(pattern, false).unwrap())
+                .collect(),
+            globs: patterns
+                .iter()
+                .map(|pattern| (*pattern).to_owned())
                 .collect(),
             anchors: patterns
                 .iter()
@@ -274,6 +283,7 @@ impl Outputs {
     pub fn new(workspace: &Workspace, task: &Task) -> Result<Self> {
         let (resolved, explicit) = resolved_outputs(workspace, task)?;
         let mut patterns = Vec::new();
+        let mut globs = Vec::new();
         let mut negations = Vec::new();
         let mut anchors = BTreeSet::new();
         let mut complete = BTreeSet::new();
@@ -306,10 +316,12 @@ impl Outputs {
                 complete.insert(pattern.clone());
             }
             patterns.push(Pattern::new(&pattern, false)?);
+            globs.push(pattern);
             anchors.insert(anchor);
         }
         Ok(Self {
             patterns,
+            globs,
             negations,
             anchors,
             complete,
@@ -371,7 +383,19 @@ impl Outputs {
                 Err(error) => return Err(error.into()),
                 Ok(_) => {}
             }
-            for entry in walkdir::WalkDir::new(path).follow_links(false) {
+            let walk = walkdir::WalkDir::new(path)
+                .follow_links(false)
+                .into_iter()
+                .filter_entry(|entry| {
+                    entry.depth() == 0
+                        || !entry.file_type().is_dir()
+                        || relative(root, entry.path()).map_or(true, |directory| {
+                            self.globs
+                                .iter()
+                                .any(|glob| may_match_below(glob, &directory))
+                        })
+                });
+            for entry in walk {
                 let entry = entry?;
                 let path = relative(root, entry.path())?;
                 if self.matches(&path) {
@@ -382,6 +406,24 @@ impl Outputs {
         }
         Ok(paths)
     }
+}
+
+/// Whether `glob` can match `directory` or a path below it. A path matches
+/// when it or an ancestor does, so a directory deeper than the glob counts.
+/// Groups can span segments, so a glob with one is not ruled out.
+fn may_match_below(glob: &str, directory: &str) -> bool {
+    if glob.contains(['{', '}', '(', ')']) {
+        return true;
+    }
+    for (part, name) in glob.split('/').zip(directory.split('/')) {
+        if part == "**" {
+            return true;
+        }
+        if crate::glob::is_literal(part) && part != name {
+            return false;
+        }
+    }
+    true
 }
 
 /// A task's outputs as Nx lists them: workspace-relative paths and globs,
@@ -498,6 +540,49 @@ fn resolve_output(
 #[cfg(test)]
 mod tests {
     use super::{Outputs, Pattern, normalize};
+
+    /// Directories no glob can match are skipped without losing a match.
+    #[test]
+    fn listing_skips_only_directories_no_glob_reaches() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        for file in [
+            "apps/web/graphql/manifest.json",
+            "apps/web/src/graphql/manifest.json",
+            "apps/web/node_modules/pkg/graphql/manifest.json",
+            "apps/mobile/app/graphql/manifest.json",
+            "apps/mobile/app/graphql/nested/extra.json",
+            "packages/a/deep/x/gen/out.ts",
+            "packages/b/types/index.d.ts",
+            "packages/c/lib/one.js",
+        ] {
+            let path = root.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+        let outputs = Outputs::from_paths(&[
+            "apps/*/graphql/manifest.json".into(),
+            "apps/*/app/graphql".into(),
+            "packages/a/**/gen/*.ts".into(),
+            "packages/b/types".into(),
+            "packages/{c,d}/lib/*.js".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            outputs.paths(root).unwrap().into_iter().collect::<Vec<_>>(),
+            [
+                "apps/mobile/app/graphql",
+                "apps/mobile/app/graphql/manifest.json",
+                "apps/mobile/app/graphql/nested",
+                "apps/mobile/app/graphql/nested/extra.json",
+                "apps/web/graphql/manifest.json",
+                "packages/a/deep/x/gen/out.ts",
+                "packages/b/types",
+                "packages/b/types/index.d.ts",
+                "packages/c/lib/one.js",
+            ]
+        );
+    }
 
     /// Only unconditional literal output roots may move as complete trees.
     #[test]
