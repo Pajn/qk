@@ -410,9 +410,10 @@ impl Outputs {
 
 /// Whether `glob` can match `directory` or a path below it. A path matches
 /// when it or an ancestor does, so a directory deeper than the glob counts.
-/// Groups can span segments, so a glob with one is not ruled out.
+/// Groups and character classes can contain slashes, so a glob with one is
+/// not ruled out by comparing slash-separated segments.
 fn may_match_below(glob: &str, directory: &str) -> bool {
-    if glob.contains(['{', '}', '(', ')']) {
+    if glob.contains(['{', '}', '(', ')', '[', ']']) {
         return true;
     }
     for (part, name) in glob.split('/').zip(directory.split('/')) {
@@ -580,6 +581,33 @@ mod tests {
                 "packages/b/types",
                 "packages/b/types/index.d.ts",
                 "packages/c/lib/one.js",
+            ]
+        );
+    }
+
+    /// A slash inside a character class does not separate path segments.
+    #[test]
+    fn character_classes_with_slashes_keep_nested_artifacts() {
+        let workspace = tempfile::tempdir().unwrap();
+        for name in ["a", "b", "c"] {
+            let directory = workspace.path().join(format!("apps/{name}/graphql/nested"));
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("output.txt"), "value").unwrap();
+        }
+        let outputs = Outputs::from_paths(&["apps/[a/b]/graphql".into()]).unwrap();
+        assert_eq!(
+            outputs
+                .paths(workspace.path())
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            [
+                "apps/a/graphql",
+                "apps/a/graphql/nested",
+                "apps/a/graphql/nested/output.txt",
+                "apps/b/graphql",
+                "apps/b/graphql/nested",
+                "apps/b/graphql/nested/output.txt",
             ]
         );
     }

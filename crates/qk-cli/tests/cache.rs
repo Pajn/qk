@@ -28,6 +28,11 @@ fn process_helper() {
         fs::write("generated/value.txt", format!("generated:{input}")).unwrap();
         return;
     }
+    if mode == "generate-graphql" {
+        fs::create_dir_all("apps/a/graphql/nested").unwrap();
+        fs::write("apps/a/graphql/nested/output.txt", input).unwrap();
+        return;
+    }
     fs::create_dir_all("dist/nested").unwrap();
     fs::write("dist/nested/out.txt", format!("built:{input}")).unwrap();
     println!("building from {}", input.trim());
@@ -200,6 +205,24 @@ fn stdout(output: &Output) -> String {
 
 fn artifact(root: &Path) -> String {
     fs::read_to_string(root.join("dist/nested/out.txt")).unwrap()
+}
+
+#[test]
+fn character_class_output_globs_restore_nested_artifacts() {
+    let fixture = Fixture::new(target(
+        "generate-graphql",
+        json!({"inputs": [], "outputs": ["apps/[a/b]/graphql"]}),
+    ));
+    let first = success(fixture.build(&fixture.root, &[]));
+    assert!(stderr(&first).contains("qk: cache miss app:build"));
+    let output = fixture.root.join("apps/a/graphql/nested/output.txt");
+    assert_eq!(fs::read_to_string(&output).unwrap(), "one\n");
+
+    fs::remove_dir_all(fixture.root.join("apps")).unwrap();
+    let restored = success(fixture.build(&fixture.root, &[]));
+    assert!(stderr(&restored).contains("qk: cache hit app:build"));
+    assert_eq!(fixture.runs(), 1);
+    assert_eq!(fs::read_to_string(output).unwrap(), "one\n");
 }
 
 #[test]
