@@ -17,6 +17,10 @@ pub struct State {
     pub fail_lists: bool,
     /// The most objects one listing response names; all when zero.
     pub list_page: usize,
+    /// Fail this numbered index PUT, including earlier successful PUTs.
+    pub fail_index_put: Option<usize>,
+    /// Replace the next index object between LIST and GET.
+    pub compact_index_read: bool,
 }
 
 pub struct FakeS3 {
@@ -167,11 +171,32 @@ fn serve(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
                     (200, xml.into_bytes(), false)
                 }
             }
+            "GET" if state.compact_index_read && path.contains("/qk/v2/index/") => {
+                let bytes = state.objects.remove(&path).unwrap();
+                state.objects.insert(format!("{path}-merged"), bytes);
+                state.compact_index_read = false;
+                (404, Vec::new(), false)
+            }
             "DELETE" => {
                 state.objects.remove(&path);
                 (204, Vec::new(), false)
             }
             "PUT" if chunked => (501, Vec::new(), false),
+            "PUT"
+                if path.contains("/qk/v2/index/")
+                    && state.fail_index_put
+                        == Some(
+                            state
+                                .requests
+                                .iter()
+                                .filter(|request| {
+                                    request.starts_with("PUT ") && request.contains("/qk/v2/index/")
+                                })
+                                .count(),
+                        ) =>
+            {
+                (500, Vec::new(), false)
+            }
             "PUT" => {
                 state.objects.insert(path, body);
                 (200, Vec::new(), false)

@@ -225,12 +225,13 @@ impl Remote {
                 .flat_map(|reader| reader.join().unwrap())
                 .collect()
         });
-        // A listing merged away since the store was listed is in the listing
-        // it was merged into, which a later run reads.
         for listing in fetched {
-            if let Some(listing) = listing? {
-                known.add(&String::from_utf8_lossy(&listing));
-            }
+            // Compaction may replace a listing after LIST. This snapshot is
+            // then incomplete and cannot safely rule out any entry.
+            let Some(listing) = listing? else {
+                bail!("remote index changed while it was read");
+            };
+            known.add(&String::from_utf8_lossy(&listing));
         }
         known.listings = names.into_iter().collect();
         known.expire(index::now());
@@ -519,7 +520,14 @@ impl Remote {
             return self.put_pack(&job.local, object, record);
         }
         let object = self.object("entries", &job.key);
-        if !self.exists(&object)? {
+        let exists = self.exists(&object)?;
+        // Announce the key before publishing its entry. If the run stops or
+        // the final listing fails, readers can still discover the entry. An
+        // announcement whose upload fails merely causes a normal GET miss.
+        let now = index::now();
+        let listing = index::format(std::iter::once((job.key.as_str(), now)));
+        self.put(&self.object("index", &index::name(now)), listing.as_bytes())?;
+        if !exists {
             let manifest = fs::read(job.local.join("entries").join(format!("{}.json", job.key)))?;
             self.put_pack(&job.local, &object, &manifest)?;
         }

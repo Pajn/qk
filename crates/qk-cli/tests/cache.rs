@@ -788,10 +788,11 @@ fn remote_cache_restores_what_another_machine_uploaded() {
         "{}",
         stderr(&first)
     );
-    // The entry and its outputs are one object, and the index lists it.
+    // The entry and its outputs are one object. A write-ahead listing and the
+    // final run listing both name it.
     assert_eq!(server.objects("/cache/qk/v2/entries/").len(), 1);
-    assert_eq!(server.objects("/cache/qk/v2/index/").len(), 1);
-    assert_eq!(server.objects("/cache/qk/v2/").len(), 2);
+    assert_eq!(server.objects("/cache/qk/v2/index/").len(), 2);
+    assert_eq!(server.objects("/cache/qk/v2/").len(), 3);
 
     // A machine with an empty local cache restores from the remote store, in
     // one request.
@@ -929,7 +930,7 @@ fn the_remote_index_spares_lookups_the_store_would_miss() {
     success(remote_build(&fixture, &[]));
     assert_eq!(
         reads_since(&server, "/cache/qk/v2/index/", listings).len(),
-        1
+        2
     );
 
     // What the index lists is restored.
@@ -957,6 +958,118 @@ fn the_remote_index_spares_lookups_the_store_would_miss() {
     assert_eq!(
         reads_since(&server, "/cache/qk/v2/entries/", entries).len(),
         1
+    );
+}
+
+#[test]
+fn remote_entries_remain_discoverable_when_the_final_index_write_fails() {
+    let server = s3::FakeS3::start();
+    server.state.lock().unwrap().fail_index_put = Some(2);
+    let fixture = Fixture::new(target("build", json!({})));
+    with_remote(&fixture, &server, json!({}));
+    let output = success(remote_build(&fixture, &[]));
+    assert!(stderr(&output).contains("remote cache upload failed for the index"));
+    assert_eq!(server.objects("/cache/qk/v2/entries/").len(), 1);
+    assert_eq!(server.objects("/cache/qk/v2/index/").len(), 1);
+    let requests = server.requests("/cache/qk/v2/");
+    let announcement = requests
+        .iter()
+        .position(|r| r.starts_with("PUT /cache/qk/v2/index/"))
+        .unwrap();
+    let entry = requests
+        .iter()
+        .position(|r| r.starts_with("PUT /cache/qk/v2/entries/"))
+        .unwrap();
+    assert!(announcement < entry);
+
+    clear_local_cache(&fixture);
+    fs::remove_dir_all(fixture.root.join("dist")).unwrap();
+    let writes = server.writes();
+    let output = success(remote_build(
+        &fixture,
+        &[("NX_POWERPACK_CACHE_MODE", "read-only")],
+    ));
+    assert!(
+        stderr(&output).contains("qk: remote cache hit app:build"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(fixture.runs(), 1);
+    assert_eq!(artifact(&fixture.root), "built:one\n");
+    assert_eq!(server.writes(), writes);
+}
+
+#[test]
+fn a_failed_index_announcement_does_not_publish_an_unlisted_entry() {
+    let server = s3::FakeS3::start();
+    server.state.lock().unwrap().fail_index_put = Some(1);
+    let fixture = Fixture::new(target("build", json!({})));
+    with_remote(&fixture, &server, json!({}));
+    let output = success(remote_build(&fixture, &[]));
+    assert!(
+        stderr(&output).contains("remote cache upload failed"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(server.objects("/cache/qk/v2/entries/").is_empty());
+    assert!(server.objects("/cache/qk/v2/index/").is_empty());
+
+    // Retry from a fresh local cache once the store is available again.
+    clear_local_cache(&fixture);
+    success(remote_build(&fixture, &[]));
+    clear_local_cache(&fixture);
+    let output = success(remote_build(
+        &fixture,
+        &[("NX_POWERPACK_CACHE_MODE", "read-only")],
+    ));
+    assert!(
+        stderr(&output).contains("qk: remote cache hit app:build"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(fixture.runs(), 2);
+}
+
+#[test]
+fn remote_index_compaction_during_read_falls_back_to_entry_lookups() {
+    let server = s3::FakeS3::start();
+    let fixture = Fixture::new(target("build", json!({})));
+    with_remote(&fixture, &server, json!({}));
+    success(remote_build(&fixture, &[]));
+    clear_local_cache(&fixture);
+    fs::remove_dir_all(fixture.root.join("dist")).unwrap();
+    server.state.lock().unwrap().compact_index_read = true;
+    let output = success(remote_build(
+        &fixture,
+        &[("NX_POWERPACK_CACHE_MODE", "read-only")],
+    ));
+    assert!(
+        stderr(&output).contains("remote cache index unavailable"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        stderr(&output).contains("qk: remote cache hit app:build"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(fixture.runs(), 1);
+
+    // A later reader can consume the replacement listing normally.
+    clear_local_cache(&fixture);
+    let output = success(remote_build(
+        &fixture,
+        &[("NX_POWERPACK_CACHE_MODE", "read-only")],
+    ));
+    assert!(
+        !stderr(&output).contains("remote cache index unavailable"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        stderr(&output).contains("qk: remote cache hit app:build"),
+        "{}",
+        stderr(&output)
     );
 }
 

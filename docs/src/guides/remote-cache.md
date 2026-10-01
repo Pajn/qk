@@ -22,14 +22,19 @@ the run; an entry larger than 5 GiB, the most one S3 upload may hold, is not
 uploaded.
 
 Every request to the store waits a round trip, so qk keeps an index of the
-entries it holds and does not ask for one the index leaves out. Each run that
-writes to the store adds a listing under `index/` of the entries it found or
-put there. A run lists `index/` as it starts, reads the listings it has not
-seen and keeps them in the local cache; if that fails, it looks up each entry
-as it needs it. An entry uploaded after a run started is not found by that
-run. Once there are more than 16 listings, a writing run merges them into its
-own and deletes them, so the store's credentials need permission to delete
-objects. An entry no run has found for 30 days drops out of the index.
+entries it holds and does not ask for one the index leaves out. Each run
+that writes to the store adds a listing under `index/` of the entries it
+found or put there. Each entry upload also writes a listing before
+publishing the entry, so an interrupted run or a failed final listing cannot
+leave a stored entry undiscoverable. If that first listing fails, the entry
+is not uploaded; if the entry upload fails, its listed key simply returns a
+miss. A run lists `index/` as it starts, reads the listings it has not seen
+and keeps them in the local cache; if that fails, including a listing
+removed by concurrent compaction, it looks up each entry as it needs it. An
+entry uploaded after a run started is not found by that run. Once there are
+more than 16 listings, a writing run merges them into its own and deletes
+them, so the store's credentials need permission to delete objects. An entry
+no run has found for 30 days drops out of the index.
 
 The cache stays under a size limit: `NX_MAX_CACHE_SIZE`, else nx.json
 `maxCacheSize`, else a tenth of the disk holding it, as in Nx. Sizes are a
