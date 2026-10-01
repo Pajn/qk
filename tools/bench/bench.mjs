@@ -18,6 +18,8 @@
 //
 // Needs hyperfine and git on PATH.
 
+import { measureRestoration } from "./restoration.mjs";
+
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
@@ -201,6 +203,7 @@ const hyperfine = spawnSync(
 if (hyperfine.status !== 0) process.exit(hyperfine.status ?? 1);
 
 const { results: measured } = JSON.parse(readFileSync(results, "utf8"));
+measured.push(...measureRestoration({ root, qk, projects, runs, filesPerProject }));
 // Callback timestamps exclude the polling delay used to collect each sample.
 // This includes native event delivery, debounce, graph reload and Node startup.
 for (const policy of ["git", "nxignore"]) {

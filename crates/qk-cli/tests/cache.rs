@@ -221,6 +221,41 @@ fn restore_replaces_stale_outputs() {
     assert!(!fixture.root.join("dist/stale.txt").exists());
 }
 
+/// Partial and negated outputs restore selected artifacts without touching
+/// files outside the selection, including files beside a missing artifact.
+#[test]
+fn partial_and_excluded_outputs_preserve_unselected_files() {
+    for outputs in [
+        json!(["{projectRoot}/dist/nested/*.txt"]),
+        json!(["{projectRoot}/dist", "!{projectRoot}/dist/keep"]),
+    ] {
+        let fixture = Fixture::new(target("build", json!({"outputs": outputs})));
+        success(fixture.build(&fixture.root, &[]));
+        fs::create_dir_all(fixture.root.join("dist/keep")).unwrap();
+        fs::write(fixture.root.join("dist/keep/unrelated"), "keep").unwrap();
+        fs::write(fixture.root.join("dist/nested/unrelated.bin"), "beside").unwrap();
+        fs::remove_file(fixture.root.join("dist/nested/out.txt")).unwrap();
+        let restored = success(fixture.build(&fixture.root, &[]));
+        assert!(stderr(&restored).contains("qk: cache hit app:build"));
+        assert_eq!(fixture.runs(), 1);
+        assert_eq!(artifact(&fixture.root), "built:one\n");
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("dist/keep/unrelated")).unwrap(),
+            "keep"
+        );
+        // The literal directory selection owns unrelated.bin; the partial
+        // selection does not, and must preserve it.
+        if outputs.as_array().unwrap().len() == 1 {
+            assert_eq!(
+                fs::read_to_string(fixture.root.join("dist/nested/unrelated.bin")).unwrap(),
+                "beside"
+            );
+        } else {
+            assert!(!fixture.root.join("dist/nested/unrelated.bin").exists());
+        }
+    }
+}
+
 #[test]
 fn input_changes_invalidate_and_old_entries_remain() {
     let fixture = Fixture::new(target("build", json!({})));

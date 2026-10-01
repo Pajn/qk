@@ -27,3 +27,6 @@ rusty-s3.workspace = true
 ureq.workspace = true
 url.workspace = true
 walkdir.workspace = true
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+rustix.workspace = true
