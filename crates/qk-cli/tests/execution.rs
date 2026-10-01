@@ -1413,8 +1413,9 @@ fn a_target_without_a_project_finds_one_like_nx() {
     assert_eq!(hello(temp.path(), None), "lib\n");
 }
 
-/// Audits read the system log, and two at once can each miss the other's
-/// reports, so the tests that audit take turns.
+/// Every audit ends its watch of the system log on the same probe message,
+/// so one audit's probe could end another's watch early; the tests that
+/// audit take turns.
 #[cfg(target_os = "macos")]
 static AUDIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
