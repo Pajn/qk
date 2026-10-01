@@ -24,7 +24,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use rusty_s3::actions::ListObjectsV2;
+use rusty_s3::actions::{DeleteObjectsResponse, ListObjectsV2, ObjectIdentifier};
 use rusty_s3::{Bucket, Credentials, S3Action, UrlStyle};
 use serde_json::Value;
 
@@ -60,6 +60,9 @@ pub struct Remote {
     reading: Mutex<Option<JoinHandle<Option<index::Known>>>>,
     /// Entries this run found in the store or put there, for its listing.
     confirmed: Mutex<BTreeSet<String>>,
+    /// Write-ahead listings whose entries this run confirmed. They can be
+    /// removed only after a final listing has safely replaced them.
+    announcements: Mutex<BTreeSet<String>>,
     /// Entries this run found in the local cache, which its listing names
     /// too when the index already does.
     held: Mutex<BTreeSet<String>>,
@@ -159,6 +162,7 @@ pub fn configure(
         known: OnceLock::new(),
         reading: Mutex::new(None),
         confirmed: Mutex::default(),
+        announcements: Mutex::default(),
         held: Mutex::default(),
     }))
 }
@@ -290,18 +294,36 @@ impl Remote {
         }
     }
 
-    fn delete(&self, object: &str) -> Result<()> {
-        let url = self
-            .bucket
-            .delete_object(Some(&self.credentials), object)
-            .sign(SIGNED_FOR);
-        let response = self.agent.delete(url.as_str()).call()?;
-        let status = response.status().as_u16();
-        io::copy(&mut response.into_body().into_reader(), &mut io::sink())?;
-        match status {
-            200..=299 | 404 => Ok(()),
-            status => bail!("DELETE {object} returned {status}"),
+    /// Delete listings in batches, keeping cleanup latency per batch rather
+    /// than per uploaded entry. S3 accepts at most 1,000 keys per request.
+    fn delete_listings(&self, names: BTreeSet<String>) -> Result<()> {
+        let objects: Vec<_> = names
+            .into_iter()
+            .map(|name| ObjectIdentifier::new(self.object("index", &name)))
+            .collect();
+        for objects in objects.chunks(1_000) {
+            let mut action = self
+                .bucket
+                .delete_objects(Some(&self.credentials), objects.iter());
+            action.set_quiet(true);
+            let url = action.sign(SIGNED_FOR);
+            let (body, content_md5) = action.body_with_md5();
+            let response = self
+                .agent
+                .post(url.as_str())
+                .header("Content-MD5", content_md5)
+                .send(body)?;
+            let status = response.status().as_u16();
+            let body = response.into_body().read_to_string()?;
+            if !(200..=299).contains(&status) {
+                bail!("deleting index listings returned {status}");
+            }
+            let response = DeleteObjectsResponse::parse(&body)?;
+            if !response.errors.is_empty() {
+                bail!("deleting index listings failed: {:?}", response.errors);
+            }
         }
+        Ok(())
     }
 
     fn exists(&self, object: &str) -> Result<bool> {
@@ -526,12 +548,14 @@ impl Remote {
         // announcement whose upload fails merely causes a normal GET miss.
         let now = index::now();
         let listing = index::format(std::iter::once((job.key.as_str(), now)));
-        self.put(&self.object("index", &index::name(now)), listing.as_bytes())?;
+        let announcement = index::name(now);
+        self.put(&self.object("index", &announcement), listing.as_bytes())?;
         if !exists {
             let manifest = fs::read(job.local.join("entries").join(format!("{}.json", job.key)))?;
             self.put_pack(&job.local, &object, &manifest)?;
         }
         self.confirmed.lock().unwrap().insert(job.key.clone());
+        self.announcements.lock().unwrap().insert(announcement);
         Ok(())
     }
 
@@ -605,10 +629,16 @@ impl Remote {
         listing.expire(now);
         let text = index::format(listing.keys.iter().map(|(key, time)| (key.as_str(), *time)));
         self.put(&self.object("index", &index::name(now)), text.as_bytes())?;
-        for name in merged.iter().flat_map(|known| &known.listings) {
-            self.delete(&self.object("index", name))?;
-        }
-        Ok(())
+        // The final listing now covers every confirmed announcement. Leave
+        // announcements in place on any earlier failure, including uploads
+        // whose outcome was uncertain, so entries remain discoverable.
+        let mut obsolete = std::mem::take(&mut *self.announcements.lock().unwrap());
+        obsolete.extend(
+            merged
+                .iter()
+                .flat_map(|known| known.listings.iter().cloned()),
+        );
+        self.delete_listings(obsolete)
     }
 }
 

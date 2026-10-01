@@ -788,11 +788,11 @@ fn remote_cache_restores_what_another_machine_uploaded() {
         "{}",
         stderr(&first)
     );
-    // The entry and its outputs are one object. A write-ahead listing and the
-    // final run listing both name it.
+    // The entry and its outputs are one object. The final run listing
+    // replaces its write-ahead announcement.
     assert_eq!(server.objects("/cache/qk/v2/entries/").len(), 1);
-    assert_eq!(server.objects("/cache/qk/v2/index/").len(), 2);
-    assert_eq!(server.objects("/cache/qk/v2/").len(), 3);
+    assert_eq!(server.objects("/cache/qk/v2/index/").len(), 1);
+    assert_eq!(server.objects("/cache/qk/v2/").len(), 2);
 
     // A machine with an empty local cache restores from the remote store, in
     // one request.
@@ -930,7 +930,7 @@ fn the_remote_index_spares_lookups_the_store_would_miss() {
     success(remote_build(&fixture, &[]));
     assert_eq!(
         reads_since(&server, "/cache/qk/v2/index/", listings).len(),
-        2
+        1
     );
 
     // What the index lists is restored.
@@ -981,6 +981,7 @@ fn remote_entries_remain_discoverable_when_the_final_index_write_fails() {
         .position(|r| r.starts_with("PUT /cache/qk/v2/entries/"))
         .unwrap();
     assert!(announcement < entry);
+    assert!(!requests.iter().any(|r| r.starts_with("POST ")));
 
     clear_local_cache(&fixture);
     fs::remove_dir_all(fixture.root.join("dist")).unwrap();
@@ -997,6 +998,66 @@ fn remote_entries_remain_discoverable_when_the_final_index_write_fails() {
     assert_eq!(fixture.runs(), 1);
     assert_eq!(artifact(&fixture.root), "built:one\n");
     assert_eq!(server.writes(), writes);
+}
+
+#[test]
+fn a_run_replaces_its_entry_announcements_with_one_listing_and_one_cleanup() {
+    let server = s3::FakeS3::start();
+    let fixture = Fixture::with_targets(json!({
+        "a": target("build", json!({})),
+        "b": target("build", json!({})),
+        "c": target("build", json!({}))
+    }));
+    with_remote(&fixture, &server, json!({}));
+    let output = fixture
+        .command(
+            &fixture.root,
+            &["run-many", "-t", "a,b,c", "--parallel", "1"],
+        )
+        .env("AWS_ACCESS_KEY_ID", "key")
+        .env("AWS_SECRET_ACCESS_KEY", "secret")
+        .env_remove("CI")
+        .env_remove("NX_POWERPACK_CACHE_MODE")
+        .output()
+        .unwrap();
+    success(output);
+    assert_eq!(server.objects("/cache/qk/v2/entries/").len(), 3);
+    assert_eq!(server.objects("/cache/qk/v2/index/").len(), 1);
+    let requests = server.state.lock().unwrap().requests.clone();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.starts_with("POST /cache"))
+            .count(),
+        1
+    );
+    let cleanup = requests
+        .iter()
+        .position(|r| r.starts_with("POST /cache"))
+        .unwrap();
+    let final_listing = requests
+        .iter()
+        .rposition(|r| r.starts_with("PUT /cache/qk/v2/index/"))
+        .unwrap();
+    assert!(cleanup > final_listing);
+}
+
+#[test]
+fn index_cleanup_errors_leave_published_entries_discoverable() {
+    let server = s3::FakeS3::start();
+    server.state.lock().unwrap().fail_listing_delete = true;
+    let fixture = Fixture::new(target("build", json!({})));
+    with_remote(&fixture, &server, json!({}));
+    let output = success(remote_build(&fixture, &[]));
+    assert!(stderr(&output).contains("deleting index listings failed"));
+    assert_eq!(server.objects("/cache/qk/v2/index/").len(), 2);
+    clear_local_cache(&fixture);
+    let output = success(remote_build(
+        &fixture,
+        &[("NX_POWERPACK_CACHE_MODE", "read-only")],
+    ));
+    assert!(stderr(&output).contains("qk: remote cache hit app:build"));
+    assert_eq!(fixture.runs(), 1);
 }
 
 #[test]

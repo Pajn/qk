@@ -19,6 +19,7 @@ pub struct State {
     pub list_page: usize,
     /// Fail this numbered index PUT, including earlier successful PUTs.
     pub fail_index_put: Option<usize>,
+    pub fail_listing_delete: bool,
     /// Replace the next index object between LIST and GET.
     pub compact_index_read: bool,
 }
@@ -176,6 +177,28 @@ fn serve(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
                 state.objects.insert(format!("{path}-merged"), bytes);
                 state.compact_index_read = false;
                 (404, Vec::new(), false)
+            }
+            "POST"
+                if query
+                    .split('&')
+                    .any(|part| part.split('=').next() == Some("delete")) =>
+            {
+                let mut xml = String::from(
+                    "<DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
+                );
+                let body = String::from_utf8(body).unwrap();
+                for part in body.split("<Key>").skip(1) {
+                    let key = part.split("</Key>").next().unwrap();
+                    if state.fail_listing_delete {
+                        xml.push_str(&format!("<Error><Key>{key}</Key><Code>AccessDenied</Code><Message>denied</Message></Error>"));
+                    } else {
+                        state
+                            .objects
+                            .remove(&format!("{}/{key}", path.trim_end_matches('/')));
+                    }
+                }
+                xml.push_str("</DeleteResult>");
+                (200, xml.into_bytes(), false)
             }
             "DELETE" => {
                 state.objects.remove(&path);
