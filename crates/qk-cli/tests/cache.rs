@@ -148,7 +148,10 @@ impl Fixture {
             .env("GIT_CONFIG_GLOBAL", &self.git_config)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env_remove("NX_PARALLEL")
-            .env_remove("NX_CACHE_DIRECTORY");
+            .env_remove("NX_CACHE_DIRECTORY")
+            // Fixture branches must not inherit the enclosing CI checkout.
+            .env_remove("GITHUB_HEAD_REF")
+            .env_remove("GITHUB_REF_NAME");
         command
     }
 

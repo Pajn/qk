@@ -342,8 +342,16 @@ impl Stash {
         let mut complete = true;
         for (index, path) in self.moved.iter().enumerate().rev() {
             let kept = self.root.join(index.to_string());
-            if fs::symlink_metadata(&kept).is_err() {
-                continue;
+            match fs::symlink_metadata(&kept) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    complete = false;
+                    qk_executor::status!(
+                        "qk: could not inspect saved {path}, kept for the next run ({error})"
+                    );
+                    continue;
+                }
             }
             let original = self.workspace.join(path);
             let result = paths::safe_parents(&self.workspace, path).and_then(|()| {
@@ -543,9 +551,14 @@ fn stash(
         .moved
         .iter()
         .enumerate()
-        .filter(|(index, _)| fs::symlink_metadata(root.join(index.to_string())).is_ok())
-        .map(|(_, path)| path.clone())
-        .collect();
+        .filter_map(
+            |(index, path)| match fs::symlink_metadata(root.join(index.to_string())) {
+                Ok(_) => Some(Ok(path.clone())),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => Some(Err(error).context("cannot inspect retained warm path")),
+            },
+        )
+        .collect::<Result<_>>()?;
     let overlaps = |path: &str| {
         held.iter().any(|held| {
             held == path
@@ -1535,5 +1548,31 @@ mod tests {
         fs::remove_file(Stash::manifest(&root)).unwrap();
         assert!(acquire(&workspace, owner, &warm).is_err());
         assert_eq!(fs::read_to_string(root.join("0/state")).unwrap(), "saved");
+        fs::create_dir(Stash::manifest(&root)).unwrap();
+        assert!(acquire(&workspace, owner, &warm).is_err());
+        assert_eq!(fs::read_to_string(root.join("0/state")).unwrap(), "saved");
+    }
+
+    /// Inspection errors are incomplete recovery, not evidence of an empty slot.
+    #[cfg(unix)]
+    #[test]
+    fn inspection_errors_keep_recovery_incomplete() {
+        let (_temp, workspace, graph) = fixture();
+        let owner = &graph.tasks["app:one"];
+        let warm = config(&workspace, owner).unwrap().unwrap();
+        let root = acquire(&workspace, owner, &warm).unwrap();
+        let entry = ACTIVE.lock().unwrap().remove(&root).unwrap();
+        let saved = root.with_extension("saved");
+        fs::rename(&root, &saved).unwrap();
+        fs::write(&root, "blocked").unwrap(); // Numbered slot inspection returns ENOTDIR.
+        assert!(!entry.stash.put_back());
+        let retained = Stash {
+            root: root.clone(),
+            workspace: workspace.root.clone(),
+            moved: entry.stash.moved.clone(),
+        };
+        assert!(stash(&workspace, &root, &warm, Some(retained)).is_err());
+        assert_eq!(fs::read_to_string(saved.join("0/state")).unwrap(), "saved");
+        assert_eq!(fs::read_to_string(&root).unwrap(), "blocked");
     }
 }
