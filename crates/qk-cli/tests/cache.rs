@@ -28,6 +28,11 @@ fn process_helper() {
         fs::write("generated/value.txt", format!("generated:{input}")).unwrap();
         return;
     }
+    if mode == "generate-graphql" {
+        fs::create_dir_all("apps/a/graphql/nested").unwrap();
+        fs::write("apps/a/graphql/nested/output.txt", input).unwrap();
+        return;
+    }
     fs::create_dir_all("dist/nested").unwrap();
     fs::write("dist/nested/out.txt", format!("built:{input}")).unwrap();
     println!("building from {}", input.trim());
@@ -200,6 +205,24 @@ fn stdout(output: &Output) -> String {
 
 fn artifact(root: &Path) -> String {
     fs::read_to_string(root.join("dist/nested/out.txt")).unwrap()
+}
+
+#[test]
+fn character_class_output_globs_restore_nested_artifacts() {
+    let fixture = Fixture::new(target(
+        "generate-graphql",
+        json!({"inputs": [], "outputs": ["apps/[a/b]/graphql"]}),
+    ));
+    let first = success(fixture.build(&fixture.root, &[]));
+    assert!(stderr(&first).contains("qk: cache miss app:build"));
+    let output = fixture.root.join("apps/a/graphql/nested/output.txt");
+    assert_eq!(fs::read_to_string(&output).unwrap(), "one\n");
+
+    fs::remove_dir_all(fixture.root.join("apps")).unwrap();
+    let restored = success(fixture.build(&fixture.root, &[]));
+    assert!(stderr(&restored).contains("qk: cache hit app:build"));
+    assert_eq!(fixture.runs(), 1);
+    assert_eq!(fs::read_to_string(output).unwrap(), "one\n");
 }
 
 #[test]
@@ -2355,6 +2378,55 @@ fn dependency_output_inputs_hash_only_matching_artifacts() {
         };
         assert!(stderr(&output).contains(expected), "{}", stderr(&output));
     }
+}
+
+/// A dependency's outputs are keyed as they are when the dependent is keyed,
+/// after any task that rewrites them has run.
+#[cfg(unix)]
+#[test]
+fn dependency_outputs_rewritten_by_a_later_task_change_the_key() {
+    let fixture = Fixture::with_targets(json!({
+        "gen": {
+            "command": "mkdir -p generated && cat src/input.txt > generated/value",
+            "cache": true,
+            "inputs": ["{projectRoot}/src/input.txt"],
+            "outputs": ["{projectRoot}/generated"]
+        },
+        "early": {
+            "command": "mkdir -p dist && cp generated/value dist/early",
+            "cache": true,
+            "dependsOn": ["gen"],
+            "inputs": [{"dependentTasksOutputFiles": "**/*"}],
+            "outputs": ["{projectRoot}/dist/early"]
+        },
+        "post": {
+            "command": "cat src/post.txt >> generated/value",
+            "cache": true,
+            "dependsOn": ["early"],
+            "inputs": ["{projectRoot}/src/post.txt"],
+            "outputs": ["{projectRoot}/generated"]
+        },
+        "step": {"executor": "nx:noop", "cache": true, "inputs": [], "outputs": [], "dependsOn": ["post"]},
+        "build": {
+            "command": "mkdir -p dist && cp generated/value dist/late",
+            "cache": true,
+            "dependsOn": ["gen", "step"],
+            "inputs": [{"dependentTasksOutputFiles": "**/*"}],
+            "outputs": ["{projectRoot}/dist/late"]
+        }
+    }));
+    fs::write(fixture.root.join("src/post.txt"), "two\n").unwrap();
+    success(fixture.build(&fixture.root, &[]));
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("dist/late")).unwrap(),
+        "one\ntwo\n"
+    );
+    fs::write(fixture.root.join("src/post.txt"), "three\n").unwrap();
+    success(fixture.build(&fixture.root, &[]));
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("dist/late")).unwrap(),
+        "one\nthree\n"
+    );
 }
 
 /// Broad artifact globs include directories, which must not disable caching.

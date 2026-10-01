@@ -204,6 +204,22 @@ impl Cache {
         dependencies: &BTreeMap<String, Fingerprint>,
         cancelled: &AtomicBool,
     ) -> Result<TaskResult> {
+        let result = self.run_task(workspace, graph, task, prepared, dependencies, cancelled);
+        if let Some(Ok(snapshot)) = self.snapshot.get() {
+            snapshot.outputs_written(workspace, task);
+        }
+        result
+    }
+
+    fn run_task(
+        &self,
+        workspace: &Workspace,
+        graph: &TaskGraph,
+        task: &Task,
+        prepared: &PreparedTask,
+        dependencies: &BTreeMap<String, Fingerprint>,
+        cancelled: &AtomicBool,
+    ) -> Result<TaskResult> {
         let cacheable = task.definition.cache == Some(true);
         // Held until the task is done, whether it ran or came from the cache.
         let _kept = warm::keep_across(workspace, graph, task);
@@ -627,6 +643,42 @@ fn output_fingerprint(root: &Path, outputs: &paths::Outputs, input: &str) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Content the store holds already is reused, not copied over again.
+    #[cfg(unix)]
+    #[test]
+    fn a_blob_the_store_holds_is_not_written_again() {
+        use std::os::unix::fs::MetadataExt;
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        let cache = Cache::new(root.join(".qk/cache"));
+        cache.initialize().unwrap();
+        std::fs::write(root.join("first"), "same").unwrap();
+        std::fs::write(root.join("second"), "same").unwrap();
+        std::fs::write(root.join("other"), "different").unwrap();
+        let first = cache.put_blob(&root.join("first")).unwrap();
+        let blob = cache.root.join("blobs").join(&first);
+        let stored = std::fs::metadata(&blob).unwrap().ino();
+        assert_eq!(cache.put_blob(&root.join("second")).unwrap(), first);
+        assert_eq!(std::fs::metadata(&blob).unwrap().ino(), stored);
+        // A stored blob whose content no longer matches is stored anew.
+        std::fs::write(&blob, "corrupt").unwrap();
+        assert_eq!(cache.put_blob(&root.join("second")).unwrap(), first);
+        assert_eq!(std::fs::read(&blob).unwrap(), b"same");
+        // So is one that cannot be read.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        assert_eq!(cache.put_blob(&root.join("second")).unwrap(), first);
+        assert_eq!(std::fs::read(&blob).unwrap(), b"same");
+        let other = cache.put_blob(&root.join("other")).unwrap();
+        assert_ne!(other, first);
+        assert_eq!(
+            std::fs::read(cache.root.join("blobs").join(other)).unwrap(),
+            b"different"
+        );
+    }
 
     /// Complete-directory restore preserves contents, links, modes, timestamps
     /// and fingerprints, and the subsequent hit keeps restored files in place.

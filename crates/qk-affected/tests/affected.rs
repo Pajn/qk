@@ -551,6 +551,41 @@ fn nxignore_parent_and_untracked_negations_match_source_discovery() {
         (".nxignore", "!libs/lib/src/keep.ts\n"),
     ]);
     write(&repo.root, "libs/lib/src/keep.ts", "untracked");
+    // Named, the negation includes it.
+    assert_eq!(
+        repo.affected(Options {
+            files: vec!["libs/lib/src/keep.ts".into()],
+            explicit_files: true,
+            ..Options::default()
+        }),
+        names(&["app", "lib"])
+    );
+    // Untracked files are what Git lists, as in Nx, which leaves out what
+    // .gitignore excludes whatever .nxignore says.
+    assert_eq!(
+        repo.affected(Options {
+            untracked: true,
+            ..Options::default()
+        }),
+        Vec::<String>::new()
+    );
+}
+
+/// Names outside ASCII are read as Git stores them, not as it quotes them in
+/// line output, so a change to one is found wherever it comes from.
+#[test]
+fn changes_to_files_named_outside_ascii_are_found() {
+    let repo = Repo::new(&[("libs/lib/src/café.ts", "lib")]);
+    write(&repo.root, "libs/lib/src/café.ts", "edited");
+    assert_eq!(
+        repo.affected(Options {
+            uncommitted: true,
+            ..Options::default()
+        }),
+        names(&["app", "lib"])
+    );
+    let repo = Repo::new(&[]);
+    write(&repo.root, "libs/lib/src/naïve.ts", "untracked");
     assert_eq!(
         repo.affected(Options {
             untracked: true,
@@ -558,4 +593,5 @@ fn nxignore_parent_and_untracked_negations_match_source_discovery() {
         }),
         names(&["app", "lib"])
     );
+    assert_eq!(repo.committed(), names(&["app", "lib"]));
 }
