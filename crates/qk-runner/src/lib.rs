@@ -79,6 +79,13 @@ impl Expected {
     fn work(&self) -> u64 {
         self.millis.saturating_mul(self.threads)
     }
+
+    /// Historical work less what the current allocation has already done.
+    fn remaining(&self, elapsed: Duration, threads: usize) -> u64 {
+        let elapsed = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        self.work()
+            .saturating_sub(elapsed.saturating_mul(threads as u64))
+    }
 }
 
 /// How a run is carried out.
@@ -305,11 +312,7 @@ pub fn run(
                     .map(Expected::work)
                     .chain(held.iter().filter_map(|(id, cores)| {
                         let elapsed = now.duration_since(started[id]).unwrap_or_default();
-                        let left = expected
-                            .get(id)?
-                            .millis
-                            .saturating_sub(elapsed.as_millis() as u64);
-                        Some(left.saturating_mul(*cores as u64))
+                        Some(expected.get(id)?.remaining(elapsed, *cores))
                     }))
                     .sum();
                 // After a failure under --nx-bail, what has not started is skipped
@@ -367,7 +370,7 @@ pub fn run(
                     if !is_continuous {
                         let free = cores.saturating_sub(held.values().sum());
                         let cores_for = match threads.get(&id) {
-                            Some(threads) => {
+                            Some(config) => {
                                 // Alone, nothing else can take a share. A task
                                 // expected to do much of what is left gets as
                                 // much of the cores, so that it is not left
@@ -377,10 +380,42 @@ pub fn run(
                                 let even = if alone.contains(&id) {
                                     cores
                                 } else {
+                                    // Keep other slots usable, including tasks
+                                    // with no history. Ready threaded tasks need
+                                    // their minimum; future tasks reserve a core.
+                                    let slots = parallel.saturating_sub(finite_active + 1);
+                                    let dependencies_done = |id: &String| {
+                                        graph.tasks[id].dependencies.iter().all(|dependency| {
+                                            outcomes.get(dependency) == Some(&Outcome::Success)
+                                                || (active.contains(dependency)
+                                                    && is_up(dependency))
+                                        })
+                                    };
+                                    let others = || {
+                                        order.iter().filter(|other| {
+                                            *other != &id
+                                                && pending.contains(*other)
+                                                && !continuous.contains(*other)
+                                        })
+                                    };
+                                    let reserved = others()
+                                        .filter(|other| dependencies_done(other))
+                                        .map(|other| {
+                                            threads
+                                                .get(other)
+                                                .map_or(1, |threads| threads.min.min(cores))
+                                        })
+                                        .chain(
+                                            others()
+                                                .filter(|other| !dependencies_done(other))
+                                                .map(|_| 1),
+                                        )
+                                        .take(slots)
+                                        .fold(0usize, usize::saturating_add);
                                     even.max(proportion(expected.get(&id), remaining_work, cores))
-                                        .min(free)
+                                        .min(free.saturating_sub(reserved))
                                 };
-                                threads.share(cores, even, free, held.is_empty())
+                                config.share(cores, even, free, held.is_empty())
                             }
                             None => (free > 0 || held.is_empty()).then_some(1),
                         };
@@ -640,5 +675,25 @@ fn proportion(expected: Option<&Expected>, remaining: u64, cores: usize) -> usiz
             (expected.work() as u128 * cores as u128).div_ceil(remaining as u128) as usize
         }
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Expected;
+    use std::time::Duration;
+
+    #[test]
+    fn remaining_work_accounts_for_the_current_allocation() {
+        let expected = Expected {
+            millis: 1_000,
+            threads: 4,
+        };
+        assert_eq!(expected.remaining(Duration::ZERO, 8), 4_000);
+        assert_eq!(expected.remaining(Duration::from_millis(250), 8), 2_000);
+        assert_eq!(expected.remaining(Duration::from_millis(500), 8), 0);
+        assert_eq!(expected.remaining(Duration::from_millis(500), 2), 3_000);
+        assert_eq!(expected.remaining(Duration::from_secs(10), 8), 0);
+        assert_eq!(expected.remaining(Duration::MAX, 8), 0);
     }
 }
