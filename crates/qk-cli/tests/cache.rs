@@ -2083,6 +2083,98 @@ fn a_threaded_task_waits_for_its_minimum() {
     assert_eq!((threads("a"), threads("b")), ("3\n".into(), "4\n".into()));
 }
 
+#[cfg(unix)]
+#[test]
+fn tasks_with_the_longest_expected_path_start_first() {
+    // Each notes when it starts; the chain through b-gen takes longest.
+    let task = |name: &str, seconds: &str| json!({"command": format!("echo {name} >> started; sleep {seconds}")});
+    let mut slow = task("c-slow", "0.6");
+    slow["dependsOn"] = json!(["b-gen"]);
+    let fixture = Fixture::with_targets(json!({
+        "a-mid": task("a-mid", "0.3"), "b-gen": task("b-gen", "0.05"), "c-slow": slow
+    }));
+    let order = || {
+        let _ = fs::remove_file(fixture.root.join("started"));
+        success(fixture.qk(
+            &fixture.root,
+            &["run-many", "-t", "a-mid,c-slow", "--parallel", "1"],
+        ));
+        fs::read_to_string(fixture.root.join("started")).unwrap()
+    };
+    // Without earlier runs, in the order of their ids.
+    assert_eq!(order(), "a-mid\nb-gen\nc-slow\n");
+    assert_eq!(order(), "b-gen\nc-slow\na-mid\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_task_expected_to_do_most_of_the_work_gets_most_of_the_cores() {
+    let fixture = Fixture::with_targets(json!({
+        "big": threaded("echo $QK_THREADS > dist/big; sleep 1.5", json!(true)),
+        "small1": threaded("echo $QK_THREADS > dist/small1; sleep 0.05", json!(true)),
+        "small2": threaded("echo $QK_THREADS > dist/small2; sleep 0.05", json!(true))
+    }));
+    let big = || {
+        success(fixture.qk(
+            &fixture.root,
+            &[
+                "run-many",
+                "-t",
+                "big,small1,small2",
+                "--parallel",
+                "3",
+                "--cores",
+                "12",
+            ],
+        ));
+        let threads = fs::read_to_string(fixture.root.join("dist/big")).unwrap();
+        threads.trim().parse::<usize>().unwrap()
+    };
+    // Without earlier runs the three split the cores evenly.
+    assert_eq!(big(), 4);
+    let threads = big();
+    assert!(threads > 4 && threads <= 10, "{threads}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_known_long_task_leaves_cores_for_tasks_without_history() {
+    for minimum in [None, Some(3)] {
+        let mut small = json!({"command": "touch small-ran"});
+        if let Some(minimum) = minimum {
+            small["qk:threads"] = json!({"min": minimum});
+        }
+        let fixture = Fixture::with_targets(json!({
+            "big": threaded(
+                "echo $QK_THREADS > dist/big; if test -f require-small; then i=0; while ! test -f small-ran; do i=$((i+1)); if test $i -ge 100; then exit 7; fi; sleep 0.02; done; else sleep 0.05; fi",
+                json!(true)
+            ),
+            "small": small
+        }));
+        // Only big has an expectation. On the next run it needs small to
+        // start beside it, even though small contributes no expected work.
+        success(fixture.qk(&fixture.root, &["run", "app:big", "--cores", "8"]));
+        fs::write(fixture.root.join("require-small"), "").unwrap();
+        success(fixture.qk(
+            &fixture.root,
+            &[
+                "run-many",
+                "-t",
+                "big,small",
+                "--parallel",
+                "2",
+                "--cores",
+                "8",
+            ],
+        ));
+        let count = fs::read_to_string(fixture.root.join("dist/big")).unwrap();
+        assert_eq!(
+            count.trim().parse::<usize>().unwrap(),
+            8 - minimum.unwrap_or(1)
+        );
+    }
+}
+
 #[test]
 fn the_thread_count_is_not_part_of_the_key() {
     let fixture = Fixture::new(json!({

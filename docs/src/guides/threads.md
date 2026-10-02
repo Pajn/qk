@@ -28,7 +28,14 @@ A share is fixed when the task starts, since a tool cannot give up workers
 it has started. Threaded tasks starting together split the free cores
 evenly, after a core for each task slot other pending tasks could take, so
 two get half each and three a third, and one starting alone leaves room for
-what follows. Cores come back as tasks finish and go to the next to start. A
+what follows. A task expected to do a larger part of the work left in the
+run, from its recent runs and the threads it had in them, gets that part of
+the cores instead, so that it does not keep running once the rest is done.
+This larger share leaves capacity for other task slots, including tasks without
+history, and respects the minimum of other ready threaded tasks when the budget
+can accommodate them. Remaining work subtracts the work already done with each
+running task's current thread allocation from its historical core-milliseconds.
+Cores come back as tasks finish and go to the next to start. A
 share stays within `min` (default 1) and `max` (default the budget); a task
 waits until `min` cores are free, unless nothing else runs. The thread count
 is not part of the cache key, and neither is `qk:threads`. The summary lists

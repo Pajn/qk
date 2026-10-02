@@ -3,6 +3,11 @@
 //! A continuous task satisfies its dependents once it has started. It does not count
 //! towards the parallel limit, since it holds its slot indefinitely. Unless it was
 //! requested directly, it is stopped once every task depending on it has finished.
+//!
+//! Of the tasks ready to start, those with the longest expected path to the end
+//! of the run start first: the task's own expected time and that of the
+//! longest chain of tasks depending on it. A task expected to take long thus
+//! does not start last and keep the run waiting for it alone.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
@@ -61,8 +66,30 @@ pub struct TaskRecord {
     pub execution: Option<qk_cache::Execution>,
 }
 
+/// How long a task can be expected to run, from earlier runs that executed it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Expected {
+    pub millis: u64,
+    /// The threads it ran with: one, unless its target has `qk:threads`.
+    pub threads: u64,
+}
+
+impl Expected {
+    /// Core-milliseconds: the time it takes on the threads it ran with.
+    fn work(&self) -> u64 {
+        self.millis.saturating_mul(self.threads)
+    }
+
+    /// Historical work less what the current allocation has already done.
+    fn remaining(&self, elapsed: Duration, threads: usize) -> u64 {
+        let elapsed = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        self.work()
+            .saturating_sub(elapsed.saturating_mul(threads as u64))
+    }
+}
+
 /// How a run is carried out.
-pub struct Settings {
+pub struct Settings<'a> {
     /// Tasks running at once, continuous ones aside.
     pub parallel: usize,
     /// Cores the tasks share.
@@ -73,6 +100,9 @@ pub struct Settings {
     pub style: OutputStyle,
     /// Run each task in macOS's sandbox, auditing or enforcing what it declares.
     pub sandbox: Option<sandbox::Mode>,
+    /// What each task is expected to take; a task without one is expected to
+    /// take no time.
+    pub expected: &'a BTreeMap<String, Expected>,
 }
 
 pub fn run(
@@ -88,6 +118,7 @@ pub fn run(
         bail: bails,
         style,
         sandbox: sandbox_mode,
+        expected,
     } = *settings;
     if parallel == 0 || cores == 0 {
         bail!("parallel and cores must be at least 1");
@@ -191,6 +222,7 @@ pub fn run(
             dependents.entry(dependency).or_default().push(id);
         }
     }
+    let order = by_path(graph, &dependents, expected);
     let mut pending: BTreeSet<_> = graph.tasks.keys().cloned().collect();
     let mut active = BTreeSet::new();
     // Stop signals for running continuous tasks, and those already asked to stop.
@@ -273,6 +305,18 @@ pub fn run(
                         (finite_pending - ready_threaded).min(slots.saturating_sub(sharing));
                     Threads::even(cores.saturating_sub(held.values().sum()), sharing, reserved)
                 };
+                // The core-milliseconds the run has left: what pending tasks are
+                // expected to take, and what running ones have still to go.
+                let now = SystemTime::now();
+                let remaining_work: u64 = pending
+                    .iter()
+                    .filter_map(|id| expected.get(id))
+                    .map(Expected::work)
+                    .chain(held.iter().filter_map(|(id, cores)| {
+                        let elapsed = now.duration_since(started[id]).unwrap_or_default();
+                        Some(expected.get(id)?.remaining(elapsed, *cores))
+                    }))
+                    .sum();
                 // After a failure under --nx-bail, what has not started is skipped
                 // and what runs finishes.
                 if bailed && !pending.is_empty() {
@@ -288,7 +332,12 @@ pub fn run(
                         stop.store(true, Ordering::SeqCst);
                     }
                 }
-                for id in pending.clone() {
+                for id in order
+                    .iter()
+                    .filter(|id| pending.contains(*id))
+                    .cloned()
+                    .collect::<Vec<_>>()
+                {
                     let dependencies = &graph.tasks[&id].dependencies;
                     if dependencies.iter().any(|dependency| {
                         skipped.contains(dependency)
@@ -323,10 +372,52 @@ pub fn run(
                     if !is_continuous {
                         let free = cores.saturating_sub(held.values().sum());
                         let cores_for = match threads.get(&id) {
-                            Some(threads) => {
-                                // Alone, nothing else can take a share.
-                                let even = if alone.contains(&id) { cores } else { even };
-                                threads.share(cores, even, free, held.is_empty())
+                            Some(config) => {
+                                // Alone, nothing else can take a share. A task
+                                // expected to do much of what is left gets as
+                                // much of the cores, so that it is not left
+                                // running once the rest is done.
+                                // The even split was made before this pass
+                                // started tasks; it cannot exceed what they left.
+                                let even = if alone.contains(&id) {
+                                    cores
+                                } else {
+                                    // Keep other slots usable, including tasks
+                                    // with no history. Ready threaded tasks need
+                                    // their minimum; future tasks reserve a core.
+                                    let slots = parallel.saturating_sub(finite_active + 1);
+                                    let dependencies_done = |id: &String| {
+                                        graph.tasks[id].dependencies.iter().all(|dependency| {
+                                            outcomes.get(dependency) == Some(&Outcome::Success)
+                                                || (active.contains(dependency)
+                                                    && is_up(dependency))
+                                        })
+                                    };
+                                    let others = || {
+                                        order.iter().filter(|other| {
+                                            *other != &id
+                                                && pending.contains(*other)
+                                                && !continuous.contains(*other)
+                                        })
+                                    };
+                                    let reserved = others()
+                                        .filter(|other| dependencies_done(other))
+                                        .map(|other| {
+                                            threads
+                                                .get(other)
+                                                .map_or(1, |threads| threads.min.min(cores))
+                                        })
+                                        .chain(
+                                            others()
+                                                .filter(|other| !dependencies_done(other))
+                                                .map(|_| 1),
+                                        )
+                                        .take(slots)
+                                        .fold(0usize, usize::saturating_add);
+                                    even.max(proportion(expected.get(&id), remaining_work, cores))
+                                        .min(free.saturating_sub(reserved))
+                                };
+                                config.share(cores, even, free, held.is_empty())
                             }
                             None => (free > 0 || held.is_empty()).then_some(1),
                         };
@@ -539,4 +630,72 @@ pub fn run(
         load: load.into_inner().unwrap(),
         sandbox,
     })
+}
+
+/// The tasks, those with the longest expected path to the end of the run
+/// first: a task's own expected time and the longest of its dependents'
+/// paths. Ties keep the order of task ids.
+fn by_path(
+    graph: &TaskGraph,
+    dependents: &BTreeMap<&str, Vec<&str>>,
+    expected: &BTreeMap<String, Expected>,
+) -> Vec<String> {
+    fn path<'a>(
+        id: &'a str,
+        dependents: &BTreeMap<&str, Vec<&'a str>>,
+        expected: &BTreeMap<String, Expected>,
+        paths: &mut BTreeMap<&'a str, u64>,
+    ) -> u64 {
+        if let Some(path) = paths.get(id) {
+            return *path;
+        }
+        let after = dependents
+            .get(id)
+            .into_iter()
+            .flatten()
+            .map(|dependent| path(dependent, dependents, expected, paths))
+            .max()
+            .unwrap_or(0);
+        let path = expected.get(id).map_or(0, |expected| expected.millis) + after;
+        paths.insert(id, path);
+        path
+    }
+    let mut paths = BTreeMap::new();
+    for id in graph.tasks.keys() {
+        path(id, dependents, expected, &mut paths);
+    }
+    let mut order: Vec<String> = graph.tasks.keys().cloned().collect();
+    order.sort_by_key(|id| std::cmp::Reverse(paths[id.as_str()]));
+    order
+}
+
+/// The share of `cores` matching the share of `remaining` work a task is
+/// expected to do, or none for a task without an expectation.
+fn proportion(expected: Option<&Expected>, remaining: u64, cores: usize) -> usize {
+    match expected {
+        Some(expected) if remaining > 0 => {
+            (expected.work() as u128 * cores as u128).div_ceil(remaining as u128) as usize
+        }
+        _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Expected;
+    use std::time::Duration;
+
+    #[test]
+    fn remaining_work_accounts_for_the_current_allocation() {
+        let expected = Expected {
+            millis: 1_000,
+            threads: 4,
+        };
+        assert_eq!(expected.remaining(Duration::ZERO, 8), 4_000);
+        assert_eq!(expected.remaining(Duration::from_millis(250), 8), 2_000);
+        assert_eq!(expected.remaining(Duration::from_millis(500), 8), 0);
+        assert_eq!(expected.remaining(Duration::from_millis(500), 2), 3_000);
+        assert_eq!(expected.remaining(Duration::from_secs(10), 8), 0);
+        assert_eq!(expected.remaining(Duration::MAX, 8), 0);
+    }
 }
