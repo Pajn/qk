@@ -222,12 +222,12 @@ fn decode(process: u32, call: &str, cwd: &Path) -> Option<Decoded> {
         "getdents64" => emit(descriptor(args.first()?)?, Operation::ListDirectory),
         "readlink" => emit(path(0, None)?, Operation::ReadLink),
         "readlinkat" => emit(path(1, Some(0))?, Operation::ReadLink),
-        "stat" | "lstat" | "stat64" | "lstat64" | "access" | "statfs" | "statfs64" => {
-            emit(path(0, None)?, Operation::Metadata)
-        }
-        "newfstatat" | "fstatat64" | "statx" | "faccessat" | "faccessat2" => {
+        "stat" | "lstat" | "stat64" | "lstat64" | "access" | "statfs" | "statfs64" | "getxattr"
+        | "lgetxattr" | "listxattr" | "llistxattr" => emit(path(0, None)?, Operation::Metadata),
+        "newfstatat" | "fstatat64" | "statx" | "faccessat" | "faccessat2" | "name_to_handle_at" => {
             emit(path(1, Some(0))?, Operation::Metadata)
         }
+        "inotify_add_watch" => emit(path(1, None)?, Operation::Metadata),
         "unlink" | "rmdir" => emit(path(0, None)?, Operation::Delete),
         "unlinkat" => emit(path(1, Some(0))?, Operation::Delete),
         "rename" => {
@@ -238,12 +238,12 @@ fn decode(process: u32, call: &str, cwd: &Path) -> Option<Decoded> {
             emit(path(1, Some(0))?, Operation::Delete);
             emit(path(3, Some(2))?, Operation::Rename);
         }
-        "mkdir" | "truncate" | "chmod" | "chown" | "lchown" | "utime" | "utimes" | "mknod" => {
+        "mkdir" | "truncate" | "chmod" | "chown" | "lchown" | "utime" | "utimes" | "mknod"
+        | "setxattr" | "lsetxattr" | "removexattr" | "lremovexattr" => {
             emit(path(0, None)?, Operation::Write)
         }
-        "mkdirat" | "fchmodat" | "fchmodat2" | "fchownat" | "utimensat" | "mknodat" => {
-            emit(path(1, Some(0))?, Operation::Write)
-        }
+        "mkdirat" | "fchmodat" | "fchmodat2" | "fchownat" | "utimensat" | "mknodat"
+        | "futimesat" => emit(path(1, Some(0))?, Operation::Write),
         "symlink" => emit(path(1, None)?, Operation::Write),
         "symlinkat" => emit(path(2, Some(1))?, Operation::Write),
         "link" => {
@@ -255,7 +255,8 @@ fn decode(process: u32, call: &str, cwd: &Path) -> Option<Decoded> {
             emit(path(3, Some(2))?, Operation::Write);
         }
         "execve" | "execveat" | "exit" | "exit_group" | "wait4" | "waitid" | "close" | "dup"
-        | "dup2" | "dup3" => {}
+        | "dup2" | "dup3" | "kill" | "tkill" | "tgkill" | "rt_sigqueueinfo"
+        | "rt_tgsigqueueinfo" | "pidfd_send_signal" | "pidfd_open" => {}
         _ => return None,
     }
     Some((events, change, child))
@@ -344,7 +345,7 @@ fn quoted(text: &str) -> Option<String> {
     None
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -398,5 +399,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(events[0].path, "/repo/sub/file");
+    }
+
+    #[test]
+    fn signals_and_path_metadata_do_not_disable_successful_collection() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("command-0.123"), concat!(
+            "1.000 tgkill(123, 124, SIGURG) = 0\n",
+            "1.001 kill(125, SIGTERM) = 0\n",
+            "1.002 lgetxattr(\"f\", \"security.selinux\", 0x0, 0) = -1 ENODATA (No data available)\n",
+            "1.003 inotify_add_watch(3, \"src\", IN_MODIFY) = 1\n",
+            "1.004 setxattr(\"f\", \"user.test\", 0x123, 1, 0) = 0\n",
+            "1.005 futimesat(AT_FDCWD, \"f\", NULL) = 0\n",
+            "1.006 name_to_handle_at(AT_FDCWD, \"f\", 0x123, 0x124, 0) = 0\n",
+        )).unwrap();
+        let (events, diagnostics) = collect(directory.path(), Path::new("/repo")).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(events.len(), 5);
+        assert_eq!(events[0].path, "/repo/f");
+        assert_eq!(events[0].operation, Operation::Metadata);
+        assert_eq!(events[0].result, "ENODATA");
+        assert_eq!(events[1].path, "/repo/src");
+        assert_eq!(events[1].operation, Operation::Metadata);
+        assert_eq!(events[2].operation, Operation::Write);
+        assert_eq!(events[3].operation, Operation::Write);
+        assert_eq!(events[4].operation, Operation::Metadata);
+        assert!(decode(123, "chroot(\"/other\") = 0", Path::new("/repo")).is_none());
     }
 }
