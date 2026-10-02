@@ -671,14 +671,21 @@ fn read_bounded(
             bail!("remote index listing exceeds its {limit}-byte limit");
         }
         if let Some(budget) = budget {
-            budget
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-                    used.checked_add(count)
-                        .filter(|total| *total <= LARGEST_INDEX)
-                })
-                .map_err(|_| {
-                    anyhow::anyhow!("remote index exceeds its {LARGEST_INDEX}-byte read budget")
-                })?;
+            let mut used = budget.load(Ordering::Relaxed);
+            loop {
+                if count > LARGEST_INDEX.saturating_sub(used) {
+                    bail!("remote index exceeds its {LARGEST_INDEX}-byte read budget");
+                }
+                match budget.compare_exchange_weak(
+                    used,
+                    used + count,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(current) => used = current,
+                }
+            }
         }
         body.extend_from_slice(&chunk[..count]);
     }
