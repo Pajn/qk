@@ -29,13 +29,19 @@ publishing the entry, so an interrupted run or a failed final listing cannot
 leave a stored entry undiscoverable. After the final listing succeeds, the
 run removes its replaced announcements in batches. If that first listing
 fails, the entry is not uploaded; if the entry upload fails, its listed key
-simply returns a miss. A run lists `index/` as it starts, reads the listings it has not seen
-and keeps them in the local cache; if that fails, including a listing
-removed by concurrent compaction, it looks up each entry as it needs it. An
-entry uploaded after a run started is not found by that run. Once there are
+simply returns a miss. A run lists `index/` as it starts, reads the listings it
+has not seen and keeps them in the local cache. If that fails, including a
+listing removed by concurrent compaction, it looks up each entry as it needs
+it. Paginated indexes also use direct lookups because pages cannot establish
+a complete snapshot during concurrent compaction. Listing payloads are bounded
+at 4 MiB each and 32 MiB across a synchronization; exceeding either limit also
+uses direct lookups without retaining an incomplete index. An entry uploaded
+after a run started is not found by that run. Once there are
 16 or more listings, a writing run merges them into its own and deletes
-them, so the store's credentials need permission to delete objects. An entry
-no run has found for 30 days drops out of the index.
+them, so the store's credentials need permission to delete objects. Entries
+whose timestamps have not been renewed for 30 days drop out of the index.
+Read-write local cache hits renew entries an available remote index already
+lists; unuploaded local results are not advertised.
 
 The cache stays under a size limit: `NX_MAX_CACHE_SIZE`, else nx.json
 `maxCacheSize`, else a tenth of the disk holding it, as in Nx. Sizes are a

@@ -46,7 +46,11 @@ impl Known {
     /// The local copy at `path`, empty when there is none or it cannot be read.
     pub fn load(path: &Path) -> Self {
         let mut known = Self::default();
-        let Ok(text) = std::fs::read_to_string(path) else {
+        let text = std::fs::File::open(path)
+            .ok()
+            .and_then(|file| super::read_bounded(file, super::LARGEST_INDEX, None).ok())
+            .and_then(|bytes| String::from_utf8(bytes).ok());
+        let Some(text) = text else {
             return known;
         };
         for line in text.lines() {

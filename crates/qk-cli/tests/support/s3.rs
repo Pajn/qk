@@ -22,6 +22,8 @@ pub struct State {
     pub fail_listing_delete: bool,
     /// Replace the next index object between LIST and GET.
     pub compact_index_read: bool,
+    /// While returning a first page, replace unseen listings before its cursor.
+    pub compact_index_page: bool,
 }
 
 pub struct FakeS3 {
@@ -169,6 +171,23 @@ fn serve(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
                         ));
                     }
                     xml.push_str("</ListBucketResult>");
+                    if more && state.compact_index_page && prefix.contains("/qk/v2/index/") {
+                        let cursor = format!("{bucket}{}", listed.last().unwrap());
+                        let unseen: Vec<_> = state
+                            .objects
+                            .keys()
+                            .filter(|key| key.starts_with(&prefix) && **key > cursor)
+                            .cloned()
+                            .collect();
+                        let mut merged = Vec::new();
+                        for key in unseen {
+                            merged.extend(state.objects.remove(&key).unwrap());
+                        }
+                        state
+                            .objects
+                            .insert(format!("{prefix}0000000000000-page-merge"), merged);
+                        state.compact_index_page = false;
+                    }
                     (200, xml.into_bytes(), false)
                 }
             }

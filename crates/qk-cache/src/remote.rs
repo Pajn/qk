@@ -18,6 +18,7 @@ use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -36,6 +37,10 @@ const UPLOADERS: usize = 8;
 const LARGEST_UPLOAD: u64 = 5 << 30;
 /// Listings fetched at once.
 const LISTING_READERS: usize = 16;
+/// Limits on index payloads, which are optional hints rather than task results.
+const LARGEST_LISTING: usize = 4 << 20;
+const LARGEST_INDEX: usize = 32 << 20;
+const LARGEST_LIST_RESPONSE: usize = 1 << 20;
 /// The most a pack's manifest or record may hold, so a corrupt length is not
 /// taken for one to read into memory.
 const LARGEST_RECORD: u64 = 1 << 30;
@@ -214,13 +219,15 @@ impl Remote {
             .iter()
             .filter(|name| !known.listings.contains(*name))
             .collect();
+        let budget = AtomicUsize::new(0);
         let fetched: Vec<Result<Option<Vec<u8>>>> = std::thread::scope(|scope| {
+            let budget = &budget;
             new.chunks(new.len().div_ceil(LISTING_READERS).max(1))
                 .map(|names| {
                     scope.spawn(move || {
                         names
                             .iter()
-                            .map(|name| self.get(&self.object("index", name)))
+                            .map(|name| self.get(&self.object("index", name), budget))
                             .collect::<Vec<_>>()
                     })
                 })
@@ -245,50 +252,50 @@ impl Remote {
         Ok(known)
     }
 
-    /// The names of the objects under `prefix`, without it.
+    /// Names from a single complete LIST response. Pagination has no snapshot
+    /// semantics: a replacement can sort before the continuation position while
+    /// compaction removes an unseen old listing. Such an index cannot rule out
+    /// entries, so use the direct-lookup fallback instead.
     fn list(&self, prefix: &str) -> Result<Vec<String>> {
-        let mut names = Vec::new();
-        let mut token: Option<String> = None;
-        loop {
-            let mut action = self.bucket.list_objects_v2(Some(&self.credentials));
-            action.with_prefix(prefix);
-            if let Some(token) = &token {
-                action.with_continuation_token(token.as_str());
-            }
-            let url = action.sign(SIGNED_FOR);
-            let response = self.agent.get(url.as_str()).call()?;
-            let status = response.status().as_u16();
-            let body = response.into_body().read_to_string()?;
-            if status != 200 {
-                bail!("listing {prefix} returned {status}");
-            }
-            let parsed = ListObjectsV2::parse_response(&body)
-                .map_err(|error| anyhow::anyhow!("invalid listing of {prefix}: {error:?}"))?;
-            names.extend(
-                parsed
-                    .contents
-                    .into_iter()
-                    .filter_map(|object| object.key.strip_prefix(prefix).map(str::to_owned)),
-            );
-            match parsed.next_continuation_token {
-                Some(next) => token = Some(next),
-                None => return Ok(names),
-            }
+        let mut action = self.bucket.list_objects_v2(Some(&self.credentials));
+        action.with_prefix(prefix);
+        let url = action.sign(SIGNED_FOR);
+        let response = self.agent.get(url.as_str()).call()?;
+        let status = response.status().as_u16();
+        if status != 200 {
+            bail!("listing {prefix} returned {status}");
         }
+        let body = read_bounded(
+            response.into_body().into_reader(),
+            LARGEST_LIST_RESPONSE,
+            None,
+        )?;
+        let body = String::from_utf8(body).context("invalid index listing response")?;
+        let parsed = ListObjectsV2::parse_response(&body)
+            .map_err(|error| anyhow::anyhow!("invalid listing of {prefix}: {error:?}"))?;
+        if parsed.next_continuation_token.is_some() {
+            bail!("paginated remote index cannot provide a complete snapshot");
+        }
+        Ok(parsed
+            .contents
+            .into_iter()
+            .filter_map(|object| object.key.strip_prefix(prefix).map(str::to_owned))
+            .collect())
     }
 
-    /// The object's body, or `None` when it is missing.
-    fn get(&self, object: &str) -> Result<Option<Vec<u8>>> {
+    /// A bounded listing body, or `None` when concurrent compaction removed it.
+    fn get(&self, object: &str, budget: &AtomicUsize) -> Result<Option<Vec<u8>>> {
         let url = self
             .bucket
             .get_object(Some(&self.credentials), object)
             .sign(SIGNED_FOR);
         let response = self.agent.get(url.as_str()).call()?;
-        let status = response.status().as_u16();
-        let mut body = Vec::new();
-        response.into_body().into_reader().read_to_end(&mut body)?;
-        match status {
-            200 => Ok(Some(body)),
+        match response.status().as_u16() {
+            200 => Ok(Some(read_bounded(
+                response.into_body().into_reader(),
+                LARGEST_LISTING,
+                Some(budget),
+            )?)),
             404 => Ok(None),
             status => bail!("GET {object} returned {status}"),
         }
@@ -607,16 +614,19 @@ impl Remote {
     /// listings already, merges them into this one and deletes them.
     fn add_listing(&self) -> Result<()> {
         let mut confirmed = std::mem::take(&mut *self.confirmed.lock().unwrap());
-        // A run that only used the local cache neither waits for the index nor
-        // writes to it.
-        if confirmed.is_empty() {
+        let held = std::mem::take(&mut *self.held.lock().unwrap());
+        if confirmed.is_empty() && held.is_empty() {
             return Ok(());
         }
         let now = index::now();
         let known = self.known();
         if let Some(known) = known {
-            let held = std::mem::take(&mut *self.held.lock().unwrap());
             confirmed.extend(held.into_iter().filter(|key| known.keys.contains_key(key)));
+        }
+        // Local-only runs renew entries the store already lists, but never
+        // advertise a local result that has not been confirmed remotely.
+        if confirmed.is_empty() {
+            return Ok(());
         }
         let mut listing = index::Known::default();
         let merged = known.filter(|known| known.listings.len() >= index::MERGE_AFTER);
@@ -642,6 +652,38 @@ impl Remote {
     }
 }
 
+/// Read bounded index payloads without trusting Content-Length. Each reader
+/// charges the shared budget before retaining bytes; failed reads remain
+/// charged so parallel failures cannot exceed the synchronization budget.
+fn read_bounded(
+    mut reader: impl Read,
+    limit: usize,
+    budget: Option<&AtomicUsize>,
+) -> Result<Vec<u8>> {
+    let mut body = Vec::new();
+    let mut chunk = [0u8; 8_192];
+    loop {
+        let count = reader.read(&mut chunk)?;
+        if count == 0 {
+            return Ok(body);
+        }
+        if count > limit.saturating_sub(body.len()) {
+            bail!("remote index listing exceeds its {limit}-byte limit");
+        }
+        if let Some(budget) = budget {
+            budget
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                    used.checked_add(count)
+                        .filter(|total| *total <= LARGEST_INDEX)
+                })
+                .map_err(|_| {
+                    anyhow::anyhow!("remote index exceeds its {LARGEST_INDEX}-byte read budget")
+                })?;
+        }
+        body.extend_from_slice(&chunk[..count]);
+    }
+}
+
 /// The length that starts each part of a pack.
 fn pack_length(reader: &mut impl Read) -> Result<u64> {
     let mut bytes = [0; 8];
@@ -649,4 +691,30 @@ fn pack_length(reader: &mut impl Read) -> Result<u64> {
         .read_exact(&mut bytes)
         .context("remote pack ends early")?;
     Ok(u64::from_le_bytes(bytes))
+}
+
+#[cfg(test)]
+mod index_read_tests {
+    use super::{LARGEST_INDEX, read_bounded};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn listing_limits_apply_without_length_headers() {
+        assert_eq!(read_bounded(&b"abcd"[..], 4, None).unwrap(), b"abcd");
+        assert!(read_bounded(&b"abcde"[..], 4, None).is_err());
+    }
+
+    #[test]
+    fn listing_readers_share_one_payload_budget() {
+        let used = AtomicUsize::new(LARGEST_INDEX - 4);
+        std::thread::scope(|scope| {
+            let used = &used;
+            let a = scope.spawn(|| read_bounded(&b"abcd"[..], 4, Some(used)));
+            let b = scope.spawn(|| read_bounded(&b"abcd"[..], 4, Some(used)));
+            let results = [a.join().unwrap(), b.join().unwrap()];
+            assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+            assert_eq!(results.iter().filter(|r| r.is_err()).count(), 1);
+        });
+        assert_eq!(used.load(Ordering::Relaxed), LARGEST_INDEX);
+    }
 }
