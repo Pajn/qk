@@ -11,8 +11,19 @@ pub struct State {
     pub objects: BTreeMap<String, Vec<u8>>,
     /// Methods and paths, in order.
     pub requests: Vec<String>,
-    /// Answer blob reads with a server error.
-    pub fail_blob_reads: bool,
+    /// Close the connection halfway through each object read.
+    pub cut_reads: bool,
+    /// Answer listings with a server error.
+    pub fail_lists: bool,
+    /// The most objects one listing response names; all when zero.
+    pub list_page: usize,
+    /// Fail this numbered index PUT, including earlier successful PUTs.
+    pub fail_index_put: Option<usize>,
+    pub fail_listing_delete: bool,
+    /// Replace the next index object between LIST and GET.
+    pub compact_index_read: bool,
+    /// While returning a first page, replace unseen listings before its cursor.
+    pub compact_index_page: bool,
 }
 
 pub struct FakeS3 {
@@ -47,6 +58,21 @@ impl FakeS3 {
             .collect()
     }
 
+    /// The requests made so far whose path starts with `prefix`.
+    pub fn requests(&self, prefix: &str) -> Vec<String> {
+        let state = self.state.lock().unwrap();
+        state
+            .requests
+            .iter()
+            .filter(|request| {
+                request
+                    .split_once(' ')
+                    .is_some_and(|(_, path)| path.starts_with(prefix))
+            })
+            .cloned()
+            .collect()
+    }
+
     pub fn writes(&self) -> usize {
         let state = self.state.lock().unwrap();
         state
@@ -64,7 +90,14 @@ fn serve(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
     let mut parts = line.split_whitespace();
     let method = parts.next().unwrap_or_default().to_owned();
     let target = parts.next().unwrap_or_default();
-    let path = target.split('?').next().unwrap_or_default().to_owned();
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let path = path.to_owned();
+    let parameter = |name: &str| {
+        query.split('&').find_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            (key == name).then(|| decode(value))
+        })
+    };
     let mut length = 0;
     let mut chunked = false;
     loop {
@@ -98,21 +131,123 @@ fn serve(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
         body.resize(length, 0);
         reader.read_exact(&mut body)?;
     }
-    let (status, response) = {
+    let (status, response, cut) = {
         let mut state = state.lock().unwrap();
         state.requests.push(format!("{method} {path}"));
         match method.as_str() {
-            "PUT" if chunked => (501, Vec::new()),
+            "GET" if parameter("list-type").is_some() => {
+                if state.fail_lists {
+                    (500, Vec::new(), false)
+                } else {
+                    let bucket = format!("{}/", path.trim_end_matches('/'));
+                    let prefix = format!("{bucket}{}", parameter("prefix").unwrap_or_default());
+                    let after =
+                        parameter("continuation-token").map(|token| format!("{bucket}{token}"));
+                    let page = if state.list_page == 0 {
+                        usize::MAX
+                    } else {
+                        state.list_page
+                    };
+                    let mut names = state
+                        .objects
+                        .keys()
+                        .filter(|key| key.starts_with(&prefix))
+                        .filter(|key| after.as_ref().is_none_or(|after| *key > after))
+                        .map(|key| key[bucket.len()..].to_owned());
+                    let listed: Vec<String> = names.by_ref().take(page).collect();
+                    let more = names.next().is_some();
+                    let mut xml = String::from(
+                        "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
+                    );
+                    for name in &listed {
+                        xml.push_str(&format!(
+                            "<Contents><Key>{name}</Key><LastModified>2026-01-01T00:00:00.000Z</LastModified><ETag>\"x\"</ETag><Size>0</Size></Contents>"
+                        ));
+                    }
+                    if more {
+                        xml.push_str(&format!(
+                            "<NextContinuationToken>{}</NextContinuationToken>",
+                            listed.last().unwrap()
+                        ));
+                    }
+                    xml.push_str("</ListBucketResult>");
+                    if more && state.compact_index_page && prefix.contains("/qk/v2/index/") {
+                        let cursor = format!("{bucket}{}", listed.last().unwrap());
+                        let unseen: Vec<_> = state
+                            .objects
+                            .keys()
+                            .filter(|key| key.starts_with(&prefix) && **key > cursor)
+                            .cloned()
+                            .collect();
+                        let mut merged = Vec::new();
+                        for key in unseen {
+                            merged.extend(state.objects.remove(&key).unwrap());
+                        }
+                        state
+                            .objects
+                            .insert(format!("{prefix}0000000000000-page-merge"), merged);
+                        state.compact_index_page = false;
+                    }
+                    (200, xml.into_bytes(), false)
+                }
+            }
+            "GET" if state.compact_index_read && path.contains("/qk/v2/index/") => {
+                let bytes = state.objects.remove(&path).unwrap();
+                state.objects.insert(format!("{path}-merged"), bytes);
+                state.compact_index_read = false;
+                (404, Vec::new(), false)
+            }
+            "POST"
+                if query
+                    .split('&')
+                    .any(|part| part.split('=').next() == Some("delete")) =>
+            {
+                let mut xml = String::from(
+                    "<DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
+                );
+                let body = String::from_utf8(body).unwrap();
+                for part in body.split("<Key>").skip(1) {
+                    let key = part.split("</Key>").next().unwrap();
+                    if state.fail_listing_delete {
+                        xml.push_str(&format!("<Error><Key>{key}</Key><Code>AccessDenied</Code><Message>denied</Message></Error>"));
+                    } else {
+                        state
+                            .objects
+                            .remove(&format!("{}/{key}", path.trim_end_matches('/')));
+                    }
+                }
+                xml.push_str("</DeleteResult>");
+                (200, xml.into_bytes(), false)
+            }
+            "DELETE" => {
+                state.objects.remove(&path);
+                (204, Vec::new(), false)
+            }
+            "PUT" if chunked => (501, Vec::new(), false),
+            "PUT"
+                if path.contains("/qk/v2/index/")
+                    && state.fail_index_put
+                        == Some(
+                            state
+                                .requests
+                                .iter()
+                                .filter(|request| {
+                                    request.starts_with("PUT ") && request.contains("/qk/v2/index/")
+                                })
+                                .count(),
+                        ) =>
+            {
+                (500, Vec::new(), false)
+            }
             "PUT" => {
                 state.objects.insert(path, body);
-                (200, Vec::new())
+                (200, Vec::new(), false)
             }
-            "GET" if state.fail_blob_reads && path.contains("/blobs/") => (500, Vec::new()),
             "GET" | "HEAD" => match state.objects.get(&path) {
-                Some(object) => (200, object.clone()),
-                None => (404, Vec::new()),
+                Some(object) => (200, object.clone(), method == "GET" && state.cut_reads),
+                None => (404, Vec::new(), false),
             },
-            _ => (405, Vec::new()),
+            _ => (405, Vec::new(), false),
         }
     };
     let mut stream = stream;
@@ -121,8 +256,34 @@ fn serve(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
         "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         response.len()
     )?;
-    if method != "HEAD" {
+    if cut {
+        stream.write_all(&response[..response.len() / 2])?;
+    } else if method != "HEAD" {
         stream.write_all(&response)?;
     }
     stream.flush()
+}
+
+/// A query value with its percent-escapes decoded.
+fn decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        let escape = bytes
+            .get(index + 1..index + 3)
+            .filter(|_| bytes[index] == b'%')
+            .and_then(|hex| u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok());
+        match escape {
+            Some(byte) => {
+                decoded.push(byte);
+                index += 3;
+            }
+            None => {
+                decoded.push(bytes[index]);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
 }

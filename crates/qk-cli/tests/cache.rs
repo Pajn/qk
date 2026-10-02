@@ -937,13 +937,23 @@ fn remote_cache_restores_what_another_machine_uploaded() {
         "{}",
         stderr(&first)
     );
-    assert_eq!(server.objects("/cache/qk/v1/entries/").len(), 1);
-    assert!(server.objects("/cache/qk/v1/blobs/").len() >= 2);
+    // The entry and its outputs are one object. The final run listing
+    // replaces its write-ahead announcement.
+    assert_eq!(server.objects("/cache/qk/v2/entries/").len(), 1);
+    assert_eq!(server.objects("/cache/qk/v2/index/").len(), 1);
+    assert_eq!(server.objects("/cache/qk/v2/").len(), 2);
 
-    // A machine with an empty local cache restores from the remote store.
+    // A machine with an empty local cache restores from the remote store, in
+    // one request.
     clear_local_cache(&fixture);
     fs::remove_dir_all(fixture.root.join("dist")).unwrap();
+    let before_entries = server.requests("/cache/qk/v2/entries/").len();
     let second = success(remote_build(&fixture, &[]));
+    let entry = server.objects("/cache/qk/v2/entries/").remove(0);
+    assert_eq!(
+        server.requests("/cache/qk/v2/entries/")[before_entries..],
+        [format!("GET {entry}")]
+    );
     assert!(
         stderr(&second).contains("qk: remote cache hit app:build"),
         "{}",
@@ -1003,7 +1013,7 @@ fn remote_failures_mid_restore_are_misses() {
     with_remote(&fixture, &server, json!({}));
     success(remote_build(&fixture, &[]));
     clear_local_cache(&fixture);
-    server.state.lock().unwrap().fail_blob_reads = true;
+    server.state.lock().unwrap().cut_reads = true;
     let output = success(remote_build(&fixture, &[]));
     assert!(
         stderr(&output).contains("remote cache unavailable"),
@@ -1013,6 +1023,419 @@ fn remote_failures_mid_restore_are_misses() {
     assert!(stderr(&output).contains("qk: cache miss app:build"));
     assert_eq!(fixture.runs(), 2);
     assert_eq!(artifact(&fixture.root), "built:one\n");
+
+    // So is a pack whose outputs do not match their hashes.
+    clear_local_cache(&fixture);
+    {
+        let mut state = server.state.lock().unwrap();
+        state.cut_reads = false;
+        let (_, pack) = state
+            .objects
+            .iter_mut()
+            .find(|(name, _)| name.starts_with("/cache/qk/v2/entries/"))
+            .unwrap();
+        *pack.last_mut().unwrap() ^= 1;
+    }
+    let output = success(remote_build(&fixture, &[]));
+    assert!(
+        stderr(&output).contains("does not match its hash"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(stderr(&output).contains("qk: cache miss app:build"));
+    assert_eq!(fixture.runs(), 3);
+}
+
+/// GETs since `before` of objects under `prefix`.
+fn reads_since(server: &s3::FakeS3, prefix: &str, before: usize) -> Vec<String> {
+    server.requests(prefix)[before..]
+        .iter()
+        .filter(|request| request.starts_with("GET "))
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn the_remote_index_spares_lookups_the_store_would_miss() {
+    let server = s3::FakeS3::start();
+    let fixture = Fixture::new(target("build", json!({})));
+    with_remote(&fixture, &server, json!({}));
+    success(remote_build(&fixture, &[]));
+
+    // Inputs no run has uploaded are not looked up.
+    clear_local_cache(&fixture);
+    fs::write(fixture.root.join("src/input.txt"), "two\n").unwrap();
+    let entries = server.requests("/cache/qk/v2/entries/").len();
+    let output = success(remote_build(&fixture, &[]));
+    assert!(stderr(&output).contains("qk: cache miss app:build"));
+    assert_eq!(
+        reads_since(&server, "/cache/qk/v2/entries/", entries),
+        Vec::<String>::new()
+    );
+
+    // Listings already read are not read again.
+    fs::write(fixture.root.join("src/input.txt"), "three\n").unwrap();
+    let listings = server.requests("/cache/qk/v2/index/").len();
+    success(remote_build(&fixture, &[]));
+    assert_eq!(
+        reads_since(&server, "/cache/qk/v2/index/", listings).len(),
+        1
+    );
+
+    // What the index lists is restored.
+    clear_local_cache(&fixture);
+    fs::remove_dir_all(fixture.root.join("dist")).unwrap();
+    fs::write(fixture.root.join("src/input.txt"), "one\n").unwrap();
+    let output = success(remote_build(&fixture, &[]));
+    assert!(
+        stderr(&output).contains("qk: remote cache hit app:build"),
+        "{}",
+        stderr(&output)
+    );
+
+    // Without the index, each entry is looked up.
+    clear_local_cache(&fixture);
+    server.state.lock().unwrap().fail_lists = true;
+    fs::write(fixture.root.join("src/input.txt"), "four\n").unwrap();
+    let entries = server.requests("/cache/qk/v2/entries/").len();
+    let output = success(remote_build(&fixture, &[]));
+    assert!(
+        stderr(&output).contains("remote cache index unavailable"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(
+        reads_since(&server, "/cache/qk/v2/entries/", entries).len(),
+        1
+    );
+}
+
+#[test]
+fn remote_entries_remain_discoverable_when_the_final_index_write_fails() {
+    let server = s3::FakeS3::start();
+    server.state.lock().unwrap().fail_index_put = Some(2);
+    let fixture = Fixture::new(target("build", json!({})));
+    with_remote(&fixture, &server, json!({}));
+    let output = success(remote_build(&fixture, &[]));
+    assert!(stderr(&output).contains("remote cache upload failed for the index"));
+    assert_eq!(server.objects("/cache/qk/v2/entries/").len(), 1);
+    assert_eq!(server.objects("/cache/qk/v2/index/").len(), 1);
+    let requests = server.requests("/cache/qk/v2/");
+    let announcement = requests
+        .iter()
+        .position(|r| r.starts_with("PUT /cache/qk/v2/index/"))
+        .unwrap();
+    let entry = requests
+        .iter()
+        .position(|r| r.starts_with("PUT /cache/qk/v2/entries/"))
+        .unwrap();
+    assert!(announcement < entry);
+    assert!(!requests.iter().any(|r| r.starts_with("POST ")));
+
+    clear_local_cache(&fixture);
+    fs::remove_dir_all(fixture.root.join("dist")).unwrap();
+    let writes = server.writes();
+    let output = success(remote_build(
+        &fixture,
+        &[("NX_POWERPACK_CACHE_MODE", "read-only")],
+    ));
+    assert!(
+        stderr(&output).contains("qk: remote cache hit app:build"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(fixture.runs(), 1);
+    assert_eq!(artifact(&fixture.root), "built:one\n");
+    assert_eq!(server.writes(), writes);
+}
+
+#[test]
+fn a_run_replaces_its_entry_announcements_with_one_listing_and_one_cleanup() {
+    let server = s3::FakeS3::start();
+    let fixture = Fixture::with_targets(json!({
+        "a": target("build", json!({})),
+        "b": target("build", json!({})),
+        "c": target("build", json!({}))
+    }));
+    with_remote(&fixture, &server, json!({}));
+    let output = fixture
+        .command(
+            &fixture.root,
+            &["run-many", "-t", "a,b,c", "--parallel", "1"],
+        )
+        .env("AWS_ACCESS_KEY_ID", "key")
+        .env("AWS_SECRET_ACCESS_KEY", "secret")
+        .env_remove("CI")
+        .env_remove("NX_POWERPACK_CACHE_MODE")
+        .output()
+        .unwrap();
+    success(output);
+    assert_eq!(server.objects("/cache/qk/v2/entries/").len(), 3);
+    assert_eq!(server.objects("/cache/qk/v2/index/").len(), 1);
+    let requests = server.state.lock().unwrap().requests.clone();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.starts_with("POST /cache"))
+            .count(),
+        1
+    );
+    let cleanup = requests
+        .iter()
+        .position(|r| r.starts_with("POST /cache"))
+        .unwrap();
+    let final_listing = requests
+        .iter()
+        .rposition(|r| r.starts_with("PUT /cache/qk/v2/index/"))
+        .unwrap();
+    assert!(cleanup > final_listing);
+}
+
+#[test]
+fn index_cleanup_errors_leave_published_entries_discoverable() {
+    let server = s3::FakeS3::start();
+    server.state.lock().unwrap().fail_listing_delete = true;
+    let fixture = Fixture::new(target("build", json!({})));
+    with_remote(&fixture, &server, json!({}));
+    let output = success(remote_build(&fixture, &[]));
+    assert!(stderr(&output).contains("deleting index listings failed"));
+    assert_eq!(server.objects("/cache/qk/v2/index/").len(), 2);
+    clear_local_cache(&fixture);
+    let output = success(remote_build(
+        &fixture,
+        &[("NX_POWERPACK_CACHE_MODE", "read-only")],
+    ));
+    assert!(stderr(&output).contains("qk: remote cache hit app:build"));
+    assert_eq!(fixture.runs(), 1);
+}
+
+#[test]
+fn a_failed_index_announcement_does_not_publish_an_unlisted_entry() {
+    let server = s3::FakeS3::start();
+    server.state.lock().unwrap().fail_index_put = Some(1);
+    let fixture = Fixture::new(target("build", json!({})));
+    with_remote(&fixture, &server, json!({}));
+    let output = success(remote_build(&fixture, &[]));
+    assert!(
+        stderr(&output).contains("remote cache upload failed"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(server.objects("/cache/qk/v2/entries/").is_empty());
+    assert!(server.objects("/cache/qk/v2/index/").is_empty());
+
+    // Retry from a fresh local cache once the store is available again.
+    clear_local_cache(&fixture);
+    success(remote_build(&fixture, &[]));
+    clear_local_cache(&fixture);
+    let output = success(remote_build(
+        &fixture,
+        &[("NX_POWERPACK_CACHE_MODE", "read-only")],
+    ));
+    assert!(
+        stderr(&output).contains("qk: remote cache hit app:build"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(fixture.runs(), 2);
+}
+
+#[test]
+fn remote_index_compaction_during_read_falls_back_to_entry_lookups() {
+    let server = s3::FakeS3::start();
+    let fixture = Fixture::new(target("build", json!({})));
+    with_remote(&fixture, &server, json!({}));
+    success(remote_build(&fixture, &[]));
+    clear_local_cache(&fixture);
+    fs::remove_dir_all(fixture.root.join("dist")).unwrap();
+    server.state.lock().unwrap().compact_index_read = true;
+    let output = success(remote_build(
+        &fixture,
+        &[("NX_POWERPACK_CACHE_MODE", "read-only")],
+    ));
+    assert!(
+        stderr(&output).contains("remote cache index unavailable"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        stderr(&output).contains("qk: remote cache hit app:build"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(fixture.runs(), 1);
+
+    // A later reader can consume the replacement listing normally.
+    clear_local_cache(&fixture);
+    let output = success(remote_build(
+        &fixture,
+        &[("NX_POWERPACK_CACHE_MODE", "read-only")],
+    ));
+    assert!(
+        !stderr(&output).contains("remote cache index unavailable"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        stderr(&output).contains("qk: remote cache hit app:build"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn local_hits_renew_remote_index_entries_without_advertising_unuploaded_results() {
+    let server = s3::FakeS3::start();
+    let fixture = Fixture::new(target("build", json!({})));
+    with_remote(&fixture, &server, json!({}));
+    success(remote_build(&fixture, &[]));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let day = 24 * 60 * 60 * 1_000;
+    let original = server.objects("/cache/qk/v2/index/").remove(0);
+    {
+        let mut state = server.state.lock().unwrap();
+        let text = String::from_utf8(state.objects[&original].clone()).unwrap();
+        let aged: String = text
+            .lines()
+            .map(|line| {
+                let (key, _) = line.split_once(' ').unwrap();
+                format!("{key} {}\n", now - 29 * day)
+            })
+            .collect();
+        state.objects.insert(original.clone(), aged.into_bytes());
+    }
+    let entries = server.requests("/cache/qk/v2/entries/").len();
+    let output = success(remote_build(&fixture, &[]));
+    assert!(stderr(&output).contains("qk: cache hit app:build"));
+    assert_eq!(server.requests("/cache/qk/v2/entries/").len(), entries);
+    assert_eq!(server.objects("/cache/qk/v2/index/").len(), 2);
+    // Advance both listings' ages by two days: the original now expires,
+    // while the local hit's renewed timestamp remains discoverable.
+    {
+        let mut state = server.state.lock().unwrap();
+        for (name, bytes) in &mut state.objects {
+            if name.contains("/qk/v2/index/") {
+                let text = String::from_utf8(bytes.clone()).unwrap();
+                let aged: String = text
+                    .lines()
+                    .map(|line| {
+                        let (key, time) = line.split_once(' ').unwrap();
+                        format!("{key} {}\n", time.parse::<u64>().unwrap() - 2 * day)
+                    })
+                    .collect();
+                *bytes = aged.into_bytes();
+            }
+        }
+    }
+    clear_local_cache(&fixture);
+    let output = success(remote_build(
+        &fixture,
+        &[("NX_POWERPACK_CACHE_MODE", "read-only")],
+    ));
+    assert!(stderr(&output).contains("qk: remote cache hit app:build"));
+    assert_eq!(fixture.runs(), 1);
+
+    // A purely local entry was never in the store, so a local hit must not
+    // create a false remote advertisement for its key.
+    fs::write(fixture.root.join("src/input.txt"), "two\n").unwrap();
+    success(remote_build(&fixture, &[("NX_SKIP_REMOTE_CACHE", "true")]));
+    let writes = server.writes();
+    let output = success(remote_build(&fixture, &[]));
+    assert!(stderr(&output).contains("qk: cache hit app:build"));
+    assert_eq!(server.writes(), writes);
+}
+
+#[test]
+fn paginated_remote_index_compaction_falls_back_without_saving_an_incomplete_snapshot() {
+    let server = s3::FakeS3::start();
+    let fixture = Fixture::new(target("build", json!({})));
+    with_remote(&fixture, &server, json!({}));
+    success(remote_build(&fixture, &[]));
+    fs::write(fixture.root.join("src/input.txt"), "two\n").unwrap();
+    success(remote_build(&fixture, &[]));
+    clear_local_cache(&fixture);
+    {
+        let mut state = server.state.lock().unwrap();
+        state.list_page = 1;
+        state.compact_index_page = true;
+    }
+    let output = success(remote_build(
+        &fixture,
+        &[("NX_POWERPACK_CACHE_MODE", "read-only")],
+    ));
+    assert!(stderr(&output).contains("paginated remote index cannot provide a complete snapshot"));
+    assert!(stderr(&output).contains("qk: remote cache hit app:build"));
+    assert_eq!(artifact(&fixture.root), "built:two\n");
+    assert_eq!(fixture.runs(), 2);
+    assert!(!server.state.lock().unwrap().compact_index_page);
+    let cache = stdout(&success(fixture.qk(&fixture.root, &["cache", "path"])));
+    assert!(!Path::new(cache.trim()).join("remote").exists());
+}
+
+#[test]
+fn oversized_remote_index_payloads_fall_back_to_entry_lookups() {
+    for aggregate in [false, true] {
+        let server = s3::FakeS3::start();
+        let fixture = Fixture::new(target("build", json!({})));
+        with_remote(&fixture, &server, json!({}));
+        success(remote_build(&fixture, &[]));
+        clear_local_cache(&fixture);
+        {
+            let mut state = server.state.lock().unwrap();
+            let (count, bytes) = if aggregate {
+                (9, 4 << 20)
+            } else {
+                (1, (4 << 20) + 1)
+            };
+            for index in 0..count {
+                state.objects.insert(
+                    format!("/cache/qk/v2/index/extra-{index}"),
+                    vec![b'x'; bytes],
+                );
+            }
+        }
+        let output = success(remote_build(
+            &fixture,
+            &[("NX_POWERPACK_CACHE_MODE", "read-only")],
+        ));
+        assert!(stderr(&output).contains("remote cache index unavailable"));
+        let expected = if aggregate {
+            "read budget"
+        } else {
+            "byte limit"
+        };
+        assert!(stderr(&output).contains(expected), "{}", stderr(&output));
+        assert!(stderr(&output).contains("qk: remote cache hit app:build"));
+        assert_eq!(fixture.runs(), 1);
+        let cache = stdout(&success(fixture.qk(&fixture.root, &["cache", "path"])));
+        assert!(!Path::new(cache.trim()).join("remote").exists());
+    }
+}
+
+#[test]
+fn the_remote_index_merges_its_listings() {
+    let server = s3::FakeS3::start();
+    let fixture = Fixture::new(target("build", json!({})));
+    with_remote(&fixture, &server, json!({}));
+    for run in 0..20 {
+        fs::write(fixture.root.join("src/input.txt"), format!("{run}\n")).unwrap();
+        success(remote_build(&fixture, &[]));
+    }
+    let listings = server.objects("/cache/qk/v2/index/").len();
+    assert!((1..=16).contains(&listings), "{listings} listings");
+
+    // The first run's entry is still listed.
+    clear_local_cache(&fixture);
+    fs::write(fixture.root.join("src/input.txt"), "0\n").unwrap();
+    let output = success(remote_build(&fixture, &[]));
+    assert!(
+        stderr(&output).contains("qk: remote cache hit app:build"),
+        "{}",
+        stderr(&output)
+    );
 }
 
 #[test]
@@ -1361,25 +1784,31 @@ fn warm_state_is_shared_through_the_remote_by_branch() {
         let _ = fs::remove_dir_all(fixture.root.join(".git/qk/warm"));
     };
     assert_eq!(on("main"), "cold");
-    let main_key = server.objects("/cache/qk/v1/warm/").pop().unwrap();
-    assert_eq!(server.objects("/cache/qk/v1/warm/").len(), 1);
+    let main_key = server.objects("/cache/qk/v2/warm/").pop().unwrap();
+    assert_eq!(server.objects("/cache/qk/v2/warm/").len(), 1);
     // Another machine, on a branch without its own state, starts from main's.
     fresh();
     assert_eq!(on("feature"), "main");
     // Once the branch has saved state, it is preferred.
     fresh();
     assert_eq!(on("feature"), "feature");
-    let (branch_key, record) = {
+    let (branch_key, pack) = {
         let state = server.state.lock().unwrap();
         state
             .objects
             .iter()
-            .find_map(|(key, bytes)| {
-                let record: Value = serde_json::from_slice(bytes).ok()?;
-                (key.starts_with("/cache/qk/v1/warm/") && key != &main_key)
-                    .then(|| (key.clone(), record))
-            })
+            .find(|(key, _)| key.starts_with("/cache/qk/v2/warm/") && *key != &main_key)
+            .map(|(key, pack)| (key.clone(), pack.clone()))
             .unwrap()
+    };
+    // A pack starts with its record's length and the record, then the blobs.
+    let length = u64::from_le_bytes(pack[..8].try_into().unwrap()) as usize;
+    let record: Value = serde_json::from_slice(&pack[8..8 + length]).unwrap();
+    let repack = |record: &[u8]| {
+        let mut bytes = (record.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(record);
+        bytes.extend_from_slice(&pack[8 + length..]);
+        bytes
     };
     let mut legacy = record.clone();
     legacy["version"] = json!(1);
@@ -1395,7 +1824,7 @@ fn warm_state_is_shared_through_the_remote_by_branch() {
             .lock()
             .unwrap()
             .objects
-            .insert(branch_key.clone(), bytes);
+            .insert(branch_key.clone(), repack(&bytes));
         fresh();
         assert_eq!(
             on("feature"),

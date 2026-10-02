@@ -141,7 +141,7 @@ dotenv files rather than checked-in configuration.
 | `region` | string | Required |
 | `endpoint` | URL string | `https://s3.<region>.amazonaws.com` |
 | `forcePathStyle` | boolean | `false`; use `true` for path-style storage |
-| `cacheKeyPrefix` | string | Empty; qk appends `qk/v1/` |
+| `cacheKeyPrefix` | string | Empty; qk appends `qk/v2/` |
 | `accessKeyId` | string | Falls back to `AWS_ACCESS_KEY_ID` |
 | `secretAccessKey` | string | Falls back to `AWS_SECRET_ACCESS_KEY` |
 | `localMode` | string | `read-write` outside CI |
