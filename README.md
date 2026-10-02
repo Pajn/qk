@@ -13,6 +13,7 @@ The [documentation](docs/src/index.md) contains guides and reference pages:
 - [Getting started](docs/src/getting-started.md)
 - [Running tasks](docs/src/guides/running-tasks.md) and [affected selection](docs/src/guides/affected.md)
 - [Local caching](docs/src/guides/cache.md), [remote caching](docs/src/guides/remote-cache.md) and [warm state](docs/src/guides/warm-state.md)
+- [Recording task inputs](docs/src/guides/input-analysis.md)
 - [CLI reference](docs/src/reference/cli.md)
 - [Workspace configuration](docs/src/reference/workspace.md), [project configuration](docs/src/reference/projects.md) and [target configuration](docs/src/reference/targets.md)
 - [Nx compatibility](docs/src/compatibility.md)

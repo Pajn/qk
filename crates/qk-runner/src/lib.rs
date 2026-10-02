@@ -23,6 +23,7 @@ use qk_executor::report::{self, Event};
 use qk_executor::{Display, Outcome, OutputStyle, environment, execute, prepare};
 use qk_taskgraph::TaskGraph;
 
+mod recorder;
 pub mod sandbox;
 pub mod threads;
 use threads::Threads;
@@ -39,6 +40,7 @@ pub struct RunResult {
     /// Under `--sandbox`, what each task did beyond its declarations, and
     /// the tasks that ran unsandboxed with why.
     pub sandbox: Option<SandboxResult>,
+    pub input_analysis: Option<qk_input_analysis::Report>,
 }
 
 pub struct SandboxResult {
@@ -100,6 +102,8 @@ pub struct Settings<'a> {
     pub style: OutputStyle,
     /// Run each task in macOS's sandbox, auditing or enforcing what it declares.
     pub sandbox: Option<sandbox::Mode>,
+    /// Execute finite tasks under an advisory file-access recorder.
+    pub analyze_inputs: bool,
     /// What each task is expected to take; a task without one is expected to
     /// take no time.
     pub expected: &'a BTreeMap<String, Expected>,
@@ -118,8 +122,13 @@ pub fn run(
         bail: bails,
         style,
         sandbox: sandbox_mode,
+        analyze_inputs,
         expected,
     } = *settings;
+    if analyze_inputs && sandbox_mode.is_some() {
+        bail!("input analysis and sandbox enforcement/audit cannot be combined");
+    }
+    let skip_cache = skip_cache || analyze_inputs;
     if parallel == 0 || cores == 0 {
         bail!("parallel and cores must be at least 1");
     }
@@ -154,6 +163,9 @@ pub fn run(
     }
     let sandbox = sandbox_mode
         .map(|mode| sandbox::Sandbox::start(workspace, graph, mode))
+        .transpose()?;
+    let recorder = analyze_inputs
+        .then(|| recorder::Recorder::start(workspace, graph, &mut prepared))
         .transpose()?;
     let prepared = prepared;
     let threads: BTreeMap<String, Threads> = graph
@@ -242,7 +254,8 @@ pub fn run(
         .values()
         .any(|task| task.definition.cache == Some(true));
     let cache = if skip_cache {
-        (sandbox.is_none() && cacheable).then(|| qk_cache::Cache::for_observation(workspace))
+        (sandbox.is_none() && !analyze_inputs && cacheable)
+            .then(|| qk_cache::Cache::for_observation(workspace))
     } else {
         (warm || cacheable).then(|| qk_cache::Cache::for_workspace(workspace, &environment))
     };
@@ -622,6 +635,9 @@ pub fn run(
             })
         })
         .transpose()?;
+    let input_analysis = recorder
+        .map(|recorder| recorder.finish(workspace, graph, &prepared, &outcomes))
+        .transpose()?;
     Ok(RunResult {
         outcomes,
         skipped,
@@ -629,6 +645,7 @@ pub fn run(
         tasks: records,
         load: load.into_inner().unwrap(),
         sandbox,
+        input_analysis,
     })
 }
 

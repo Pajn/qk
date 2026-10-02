@@ -415,6 +415,7 @@ fn callbacks(
                 decorations: Vec::new(),
                 interactive: false,
                 sandbox: None,
+                recording: None,
                 display: Display::Stream,
             };
             if options.verbose {

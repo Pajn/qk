@@ -11,6 +11,7 @@
 - [Warm state](guides/warm-state.md)
 - [Sharing cores](guides/threads.md)
 - [Checking inputs in a sandbox](guides/sandbox.md)
+- [Recording task inputs](guides/input-analysis.md)
 - [Run history and reports](guides/history.md)
 
 # Reference

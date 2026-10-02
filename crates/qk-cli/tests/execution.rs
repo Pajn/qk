@@ -1413,9 +1413,7 @@ fn a_target_without_a_project_finds_one_like_nx() {
     assert_eq!(hello(temp.path(), None), "lib\n");
 }
 
-/// Every audit ends its watch of the system log on the same probe message,
-/// so one audit's probe could end another's watch early; the tests that
-/// audit take turns.
+/// Keep system-log tests serial to reduce pressure on the lossy log stream.
 #[cfg(target_os = "macos")]
 static AUDIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -2032,6 +2030,341 @@ fn signal_windows_watch(pid: u32) {
     unsafe {
         FreeConsole();
     }
+}
+
+#[test]
+fn input_analysis_rejects_nonexecuting_options_and_invalid_previous_reports() {
+    let temp = fixture(json!({"build": {"command": "echo executed > marker"}}));
+    for flag in ["--dry-run", "--graph", "--sandbox"] {
+        let output = run(temp.path(), &["inputs", "analyze", "app:build", flag]);
+        assert!(!output.status.success());
+        assert!(!temp.path().join("marker").exists());
+    }
+    fs::write(
+        temp.path().join("previous.json"),
+        r#"{"schemaVersion": 999}"#,
+    )
+    .unwrap();
+    let output = run(
+        temp.path(),
+        &[
+            "inputs",
+            "analyze",
+            "app:build",
+            "--previous",
+            "previous.json",
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(!temp.path().join("marker").exists());
+    let temp = fixture(json!({
+        "seed": {"command": "echo executed > marker"},
+        "serve": {"command": "echo executed > marker", "continuous": true, "dependsOn": ["seed"]},
+        "ready": {"executor": "nx:run-commands", "options": {"command": "echo executed > marker", "readyWhen": "ready"}}
+    }));
+    for task in ["app:serve", "app:ready"] {
+        let output = run(temp.path(), &["inputs", "analyze", task]);
+        assert!(!output.status.success());
+        assert!(!temp.path().join("marker").exists());
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn input_analysis_cancellation_stops_descendants_and_saves_an_advisory_report() {
+    #[cfg(target_os = "macos")]
+    let _audit = AUDIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    #[cfg(target_os = "linux")]
+    if Command::new("strace").arg("-V").output().is_err() {
+        return;
+    }
+    let temp = fixture(json!({"long": helper_target("tree", "tree")}));
+    let mut child = WatchChild(
+        command(
+            temp.path(),
+            &[
+                "inputs",
+                "analyze",
+                "app:long",
+                "--report",
+                "cancelled.json",
+            ],
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap(),
+    );
+    // Also permits macOS CI machines without exposed Seatbelt logs to skip.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !temp.path().join("heartbeat.started").exists() {
+        if child.try_wait().unwrap().is_some() {
+            use std::io::Read;
+            let mut stderr = String::new();
+            child
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .unwrap();
+            #[cfg(target_os = "macos")]
+            if stderr.contains("did not reach the system log") {
+                return;
+            }
+            panic!("recorder did not start: {stderr}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "recorder did not launch its task"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        Command::new("/bin/kill")
+            .arg("-INT")
+            .arg(child.id().to_string())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "recorder did not stop");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(status.code(), Some(130));
+    assert_stopped(&temp.path().join("heartbeat"));
+    let report: Value =
+        serde_json::from_slice(&fs::read(temp.path().join("cancelled.json")).unwrap()).unwrap();
+    assert_eq!(report["tasks"]["app:long"]["outcome"], "cancelled");
+    assert!(
+        report["tasks"]["app:long"]["successfulRuns"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn input_analysis_records_descendants_outputs_and_uncovered_inputs_without_cache_reuse() {
+    #[cfg(target_os = "macos")]
+    let _audit = AUDIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    #[cfg(target_os = "linux")]
+    if Command::new("strace").arg("-V").output().is_err() {
+        eprintln!("strace is not installed; recorder integration not checked");
+        return;
+    }
+    let temp = fixture(json!({
+        "seed": {"command": "mkdir -p dependency-dist; echo seed > dependency-dist/value", "outputs": ["{projectRoot}/dependency-dist"], "cache": true},
+        "build": {
+            "command": "cat src/a.txt src/alias.txt other/hidden.txt settings.json dependency-dist/value; test -e missing.json || :; ls templates; printf generated > generated.tmp; cat generated.tmp; mkdir -p dist; echo out > dist/out.txt; echo run >> dist/runs.txt",
+            "inputs": ["{projectRoot}/src/**/*", {"json": "{projectRoot}/settings.json", "fields": ["value"]}],
+            "outputs": ["{projectRoot}/dist"], "dependsOn": ["seed"], "cache": true,
+            "options": {"env": {"QK_FIXTURE_SECRET": "do-not-store-this-secret"}}
+        },
+        "fail": {"command": "cat src/a.txt; exit 7", "inputs": ["{projectRoot}/src/**/*"]}
+    }));
+    for path in ["src", "other", "templates"] {
+        fs::create_dir(temp.path().join(path)).unwrap();
+    }
+    fs::write(temp.path().join("src/a.txt"), "input").unwrap();
+    fs::write(temp.path().join("src/unused.txt"), "unused").unwrap();
+    fs::write(temp.path().join("other/hidden.txt"), "hidden").unwrap();
+    fs::write(temp.path().join("settings.json"), r#"{"value": 1}"#).unwrap();
+    fs::write(temp.path().join("linked.txt"), "linked").unwrap();
+    std::os::unix::fs::symlink("../linked.txt", temp.path().join("src/alias.txt")).unwrap();
+    let output = run(
+        temp.path(),
+        &[
+            "inputs",
+            "analyze",
+            "app:build",
+            "--report",
+            "first.json",
+            "--suggestions",
+            "draft.json",
+        ],
+    );
+    #[cfg(target_os = "macos")]
+    if String::from_utf8_lossy(&output.stderr).contains("did not reach the system log") {
+        eprintln!("Seatbelt logs unavailable; recorder integration not checked");
+        return;
+    }
+    success(output);
+    let draft: Value =
+        serde_json::from_slice(&fs::read(temp.path().join("draft.json")).unwrap()).unwrap();
+    assert_eq!(draft["reviewRequired"], true);
+    let fragment = &draft["tasks"]["app:build"];
+    if !fragment.is_null() {
+        assert!(
+            fragment["targets"]["build"]["inputs"]
+                .as_array()
+                .unwrap()
+                .contains(&json!({"json": "{projectRoot}/settings.json", "fields": ["value"]}))
+        );
+    }
+    let project: Value =
+        serde_json::from_slice(&fs::read(temp.path().join("project.json")).unwrap()).unwrap();
+    assert_eq!(
+        project["targets"]["build"]["inputs"][0],
+        "{projectRoot}/src/**/*"
+    );
+    let bytes = fs::read(temp.path().join("first.json")).unwrap();
+    assert!(!String::from_utf8_lossy(&bytes).contains("do-not-store-this-secret"));
+    let report: Value = serde_json::from_slice(&bytes).unwrap();
+    let task = &report["tasks"]["app:build"];
+    assert_eq!(task["outcome"], "success");
+    assert_eq!(task["coverage"]["partial"], true);
+    assert!(task["configurationFragment"].is_null()); // Existing specific inputs stay intact.
+    assert!(
+        draft["reviews"]["app:build"]["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|note| note.as_str().unwrap().contains("retained"))
+    );
+    assert!(
+        task["accessReview"]["contentReads"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("other/hidden.txt"))
+    );
+    #[cfg(target_os = "linux")]
+    assert!(
+        task["observedInputs"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("src/a.txt")),
+        "{report}"
+    );
+    // Seatbelt logs can omit individual accesses, so macOS asserts observed
+    // coverage and classification rather than completeness of the trace.
+    assert!(
+        !task["observedInputs"].as_array().unwrap().is_empty(),
+        "{report}"
+    );
+    if task["accesses"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["path"] == "linked.txt" || event["path"] == "src/alias.txt")
+    {
+        assert!(
+            task["observedInputs"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("src/alias.txt")),
+            "{report}"
+        );
+    }
+    assert!(
+        !task["uncoveredAccesses"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("linked.txt"))
+    );
+    assert!(
+        task["unobservedInputs"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("src/unused.txt")),
+        "{report}"
+    );
+    assert!(
+        !task["unobservedInputs"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("nx.json"))
+    );
+    assert!(
+        task["uncoveredAccesses"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("other/hidden.txt")),
+        "{report}"
+    );
+    assert!(
+        !task["uncoveredAccesses"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("settings.json"))
+    );
+    let events = task["accesses"].as_array().unwrap();
+    for (path, category) in [
+        ("dependency-dist/value", "dependencyOutput"),
+        ("dist/out.txt", "ownOutput"),
+        ("generated.tmp", "generated"),
+    ] {
+        assert!(
+            events
+                .iter()
+                .any(|event| event["path"] == path && event["category"] == category),
+            "{path}: {report}"
+        );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        assert!(
+            events
+                .iter()
+                .any(|event| event["path"] == "src/alias.txt"
+                    && event["resolvedPath"] == "linked.txt"),
+            "{report}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event["path"] == "missing.json" && event["result"] == "missing"),
+            "{report}"
+        );
+    }
+    success(run(
+        temp.path(),
+        &[
+            "inputs",
+            "analyze",
+            "app:build",
+            "--report",
+            "second.json",
+            "--previous",
+            "first.json",
+        ],
+    ));
+    assert_eq!(
+        fs::read_to_string(temp.path().join("dist/runs.txt")).unwrap(),
+        "run\nrun\n"
+    );
+    let second: Value =
+        serde_json::from_slice(&fs::read(temp.path().join("second.json")).unwrap()).unwrap();
+    assert_eq!(
+        second["tasks"]["app:build"]["successfulRuns"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let failed = run(
+        temp.path(),
+        &["inputs", "analyze", "app:fail", "--report", "failed.json"],
+    );
+    assert_eq!(failed.status.code(), Some(7));
+    let failed: Value =
+        serde_json::from_slice(&fs::read(temp.path().join("failed.json")).unwrap()).unwrap();
+    assert_eq!(failed["tasks"]["app:fail"]["outcome"], "failed:7");
+    assert!(
+        failed["tasks"]["app:fail"]["candidateFilesets"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// Suggestions require an actual audited execution, not a planning command.

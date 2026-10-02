@@ -988,6 +988,8 @@ impl Resolver<'_> {
 pub struct Resolved {
     /// Workspace-relative files whose content is part of the key.
     pub files: BTreeSet<String>,
+    /// Always-on workspace and package configuration, also useful to input analysis.
+    pub mandatory: BTreeSet<String>,
     /// Env, runtime and other named values; env and runtime are evaluated only
     /// with a prepared task.
     pub values: BTreeMap<String, Value>,
@@ -1034,6 +1036,7 @@ pub fn resolve(
     let tsconfig = ["tsconfig.base.json", "tsconfig.json"]
         .into_iter()
         .find(|name| workspace.root.join(name).is_file());
+    let mut mandatory = BTreeSet::new();
     for path in tsconfig.into_iter().chain([
         "nx.json",
         qk_config::LOCAL_WORKSPACE,
@@ -1046,10 +1049,12 @@ pub fn resolve(
     ]) {
         if workspace.root.join(path).is_file() && !(path == "pnpm-lock.yaml" && readable) {
             resolver.selected.insert(path.into());
+            mandatory.insert(path.into());
         }
     }
     if let Some(extended) = &workspace.extended {
         resolver.selected.insert(extended.clone());
+        mandatory.insert(extended.clone());
     }
     // Package scripts and dependency declarations remain inputs even when filesets exclude them.
     let mut packages = BTreeSet::from([task.project.clone()]);
@@ -1066,17 +1071,21 @@ pub fn resolve(
             let path = Path::new(&workspace.projects[project].root).join(name);
             let path = path.strip_prefix(".").unwrap_or(&path).to_owned();
             if workspace.root.join(&path).is_file() {
-                resolver.selected.insert(
-                    path.to_str()
-                        .context("project path must be UTF-8")?
-                        .replace('\\', "/"),
-                );
+                let path = path
+                    .to_str()
+                    .context("project path must be UTF-8")?
+                    .replace('\\', "/");
+                resolver.selected.insert(path.clone());
+                mandatory.insert(path);
             }
         }
     }
     // However it was selected, the workspace file's resolution keys reach the
     // task through the lockfile when qk can read it.
     let workspace_file = readable && resolver.selected.remove("pnpm-workspace.yaml");
+    if workspace_file {
+        mandatory.remove("pnpm-workspace.yaml");
+    }
     let lockfile = readable.then(|| {
         // The root importer's packages resolve from every package in the
         // workspace, so they count for every task.
@@ -1091,6 +1100,7 @@ pub fn resolve(
     });
     Ok(Resolved {
         files: resolver.selected,
+        mandatory,
         values: resolver.values,
         lockfile,
         workspace_file,
