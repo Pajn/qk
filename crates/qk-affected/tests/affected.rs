@@ -595,3 +595,26 @@ fn changes_to_files_named_outside_ascii_are_found() {
     );
     assert_eq!(repo.committed(), names(&["app", "lib"]));
 }
+
+#[test]
+fn unreadable_lockfile_and_root_dependency_changes_affect_every_project() {
+    for head_lockfile in [Some("not a lockfile"), None] {
+        let repo = Repo::new(&[
+            (
+                "package.json",
+                r#"{"name":"root","devDependencies":{"react":"^19.0.0"}}"#,
+            ),
+            ("pnpm-lock.yaml", &lockfile("19.0.0", "19.0.0")),
+        ]);
+        write(
+            &repo.root,
+            "package.json",
+            r#"{"name":"root","devDependencies":{"react":"^19.1.0"}}"#,
+        );
+        match head_lockfile {
+            Some(text) => write(&repo.root, "pnpm-lock.yaml", text),
+            None => std::fs::remove_file(repo.root.join("pnpm-lock.yaml")).unwrap(),
+        }
+        assert_eq!(repo.committed(), names(&["app", "lib", "tool"]));
+    }
+}

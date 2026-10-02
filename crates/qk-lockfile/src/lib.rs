@@ -7,6 +7,7 @@
 //! and the integrity of the package behind it.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::OnceLock;
 
 /// Keys of `pnpm-workspace.yaml` that configure how pnpm resolves
 /// dependencies. Their effect lands in the lockfile, so a change confined to
@@ -52,6 +53,7 @@ pub struct Lockfile {
     /// Importer path (`.` for the workspace root) to dependency name and reference.
     importers: BTreeMap<String, BTreeMap<String, String>>,
     snapshots: BTreeMap<String, BTreeMap<String, String>>,
+    fingerprints: BTreeMap<String, OnceLock<String>>,
     /// Package key (a snapshot key without peers or patch) to its resolution.
     resolutions: BTreeMap<String, Value>,
     global: Value,
@@ -156,7 +158,7 @@ impl Lockfile {
                 (path, dependencies)
             })
             .collect();
-        let snapshots = document
+        let snapshots: BTreeMap<String, BTreeMap<String, String>> = document
             .snapshots
             .into_iter()
             .map(|(key, snapshot)| {
@@ -172,6 +174,10 @@ impl Lockfile {
             .collect();
         Ok(Self {
             importers,
+            fingerprints: snapshots
+                .keys()
+                .map(|key| (key.clone(), OnceLock::new()))
+                .collect(),
             snapshots,
             resolutions,
             global: json!({
@@ -321,6 +327,13 @@ impl Lockfile {
     /// with the references they resolve to. A key the lockfile does not list is
     /// fingerprinted as such, so it still changes when the lockfile does.
     fn fingerprint(&self, key: &str) -> String {
+        match self.fingerprints.get(key) {
+            Some(cell) => cell.get_or_init(|| self.snapshot_fingerprint(key)).clone(),
+            None => self.snapshot_fingerprint(key),
+        }
+    }
+
+    fn snapshot_fingerprint(&self, key: &str) -> String {
         let Some(dependencies) = self.snapshots.get(key) else {
             return json!({"key": key, "missing": true}).to_string();
         };
