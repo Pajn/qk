@@ -13,6 +13,7 @@ mod tasks;
 
 pub use tasks::{TaskAnalysis, TaskCause, TaskReason, affected_tasks};
 
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::process::Command;
@@ -326,6 +327,8 @@ pub struct Range {
 /// The changed files, and each one's content at the two revisions.
 struct Changes<'a> {
     workspace: &'a Workspace,
+    before_lockfile: OnceCell<std::result::Result<Lockfile, String>>,
+    after_lockfile: OnceCell<std::result::Result<Lockfile, String>>,
     files: Vec<String>,
     base: Option<String>,
     /// `None` reads the working tree.
@@ -434,6 +437,8 @@ impl<'a> Changes<'a> {
             .collect();
         Ok(Self {
             workspace,
+            before_lockfile: OnceCell::new(),
+            after_lockfile: OnceCell::new(),
             files,
             base,
             head,
@@ -484,6 +489,22 @@ impl<'a> Changes<'a> {
             Some((before, after)) => FileChange::Json(json_diff::diff(&before, &after)),
             None => FileChange::Whole,
         }
+    }
+
+    fn lockfile(&self, before: bool) -> std::result::Result<&Lockfile, &str> {
+        let (cell, revision) = if before {
+            (&self.before_lockfile, self.base.as_deref())
+        } else {
+            (&self.after_lockfile, self.head.as_deref())
+        };
+        cell.get_or_init(|| {
+            let text = self
+                .read("pnpm-lock.yaml", revision)
+                .ok_or_else(|| "a revision could not be read".to_owned())?;
+            Lockfile::parse(&text).map_err(|error| format!("{error:#}"))
+        })
+        .as_ref()
+        .map_err(String::as_str)
     }
 
     fn read(&self, file: &str, revision: Option<&str>) -> Option<String> {
@@ -830,18 +851,22 @@ fn touched_by_lockfile(
         file: file.clone(),
         detail: detail.to_owned(),
     };
-    let FileChange::Lockfile { before, after } = changes.change(file) else {
-        touches.all(workspace, unreadable("a revision could not be read"));
-        return Ok(());
-    };
     if file != "pnpm-lock.yaml" {
-        touches.all(workspace, unreadable("qk reads pnpm lockfiles only"));
+        let detail = match changes.change(file) {
+            FileChange::Lockfile { .. } => "qk reads pnpm lockfiles only",
+            _ => "a revision could not be read",
+        };
+        touches.all(workspace, unreadable(detail));
         return Ok(());
     }
-    let (before, after) = match (Lockfile::parse(&before), Lockfile::parse(&after)) {
+    if !workspace.root.join(file).exists() {
+        touches.all(workspace, unreadable("a revision could not be read"));
+        return Ok(());
+    }
+    let (before, after) = match (changes.lockfile(true), changes.lockfile(false)) {
         (Ok(before), Ok(after)) => (before, after),
         (Err(error), _) | (_, Err(error)) => {
-            touches.all(workspace, unreadable(&format!("{error:#}")));
+            touches.all(workspace, unreadable(error));
             return Ok(());
         }
     };
@@ -1037,8 +1062,7 @@ fn installed_packages(
     workspace: &Workspace,
     changes: &Changes,
 ) -> Option<BTreeMap<String, BTreeSet<String>>> {
-    let text = changes.read("pnpm-lock.yaml", changes.head.as_deref())?;
-    let lockfile = Lockfile::parse(&text).ok()?;
+    let lockfile = changes.lockfile(false).ok()?;
     Some(
         workspace
             .projects

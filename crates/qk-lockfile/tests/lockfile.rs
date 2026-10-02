@@ -335,3 +335,31 @@ fn finds_every_installation_of_a_package_by_name() {
     );
     assert!(lockfile.package("missing").is_empty());
 }
+
+#[test]
+fn shared_snapshot_fingerprints_stay_local_to_each_lockfile() {
+    let text = lockfile(
+        &[
+            ("app-a", &[("shared", "1.0.0")]),
+            ("app-b", &[("shared", "1.0.0")]),
+        ],
+        &[("shared@1.0.0", &[("missing", "1.0.0")])],
+    );
+    let before = Lockfile::parse(&text).unwrap();
+    let after = Lockfile::parse(&text.replace("sha512-shared@1.0.0", "sha512-changed")).unwrap();
+    let original = before.installation("apps/app-a").unwrap();
+    let changed = after.installation("apps/app-b").unwrap();
+    assert_ne!(original, changed);
+    assert_eq!(before.installation("apps/app-b").unwrap(), original);
+    assert_eq!(after.installation("apps/app-a").unwrap(), changed);
+    assert_eq!(before.installation("apps/app-a").unwrap(), original);
+    assert_eq!(after.installation("apps/app-b").unwrap(), changed);
+    assert_eq!(
+        original.snapshots["missing@1.0.0"],
+        changed.snapshots["missing@1.0.0"]
+    );
+    assert_eq!(
+        before.package("shared"),
+        original.snapshots.into_values().collect()
+    );
+}
