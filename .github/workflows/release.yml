@@ -40,8 +40,8 @@ jobs:
       - name: Set up Rust
         shell: bash
         run: |
-          rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
-          rustup default stable
+          rustup show
+          rustup target add ${{ matrix.target }}
       - run: cargo build --release --locked -p qk-cli --target ${{ matrix.target }}
       - uses: actions/setup-node@v7
         with:
@@ -105,8 +105,7 @@ jobs:
         run: npm install --global npm@11.19.0
       - name: Set up Rust
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup show
       - name: Install cargo-npm
         run: cargo install cargo-npm --version 0.1.4 --locked
       - name: Arrange binaries for cargo-npm
@@ -144,8 +143,7 @@ jobs:
       - uses: actions/checkout@v7
       - name: Set up Rust
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup show
       - name: Verify crates before requesting the short-lived token
         run: cargo publish --workspace --locked --dry-run
       - name: Authenticate with crates.io through OIDC
