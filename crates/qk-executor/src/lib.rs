@@ -39,6 +39,38 @@ pub enum Confinement {
     Landlock(i32),
 }
 
+/// An external syscall recorder wrapping each command, with separate trace files.
+#[derive(Clone, Debug)]
+pub struct Recording {
+    pub program: PathBuf,
+    pub directory: PathBuf,
+}
+
+impl Recording {
+    /// The same invocation is used by preflight and actual task commands.
+    pub fn command(&self, index: usize, text: &str) -> std::process::Command {
+        let mut command = std::process::Command::new(&self.program);
+        // No read/write buffers or exec argument/environment arrays.
+        command
+            .args([
+                "-ff",
+                "-ttt",
+                "-yy",
+                "-qq",
+                "-s",
+                "4096",
+                "-e",
+                "trace=%file,%process,getdents64,fchdir,close,dup,dup2,dup3,getcwd",
+                "-e",
+                "raw=execve,execveat",
+                "-o",
+            ])
+            .arg(self.directory.join(format!("command-{index}")))
+            .args(["--", "/bin/sh", "-c", text]);
+        command
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PreparedTask {
     pub id: String,
@@ -62,6 +94,7 @@ pub struct PreparedTask {
     pub interactive: bool,
     /// What the commands run under, for `--sandbox`.
     pub sandbox: Option<Confinement>,
+    pub recording: Option<Recording>,
     /// How the task's output is shown; the runner sets it per output style.
     pub display: Display,
 }
@@ -503,6 +536,7 @@ pub fn prepare(
         decorations,
         interactive: false,
         sandbox: None,
+        recording: None,
         display: Display::default(),
     })
 }

@@ -18,6 +18,11 @@ exporting graphs reads configuration without running executor commands.
 8. `qk-history` records runs and key changes. `qk-cli` presents results and
    optional JSON reports.
 
+`inputs analyze` attaches a per-task recorder at command launch. The runner
+collects macOS Seatbelt reports or Linux strace output and classifies observations
+using the cache's input resolver. `qk-input-analysis` owns the report model and
+observation unions. Analysis never substitutes observations into cache keys.
+
 `--dry-run` ends after planning. It does not load dotenv, validate executor
 support or execute runtime inputs, so a valid dry run does not guarantee a
 successful execution preflight.

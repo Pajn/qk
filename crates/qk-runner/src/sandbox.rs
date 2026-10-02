@@ -258,7 +258,13 @@ impl Sandbox {
     /// returns each task's findings, and the tasks that ran unsandboxed.
     pub fn finish(mut self) -> Result<(BTreeMap<String, Findings>, BTreeMap<String, String>)> {
         let reports = match self.watcher.take() {
-            Some(watcher) => watcher.finish(&self.directory)?,
+            Some(watcher) => {
+                let (reports, dropped) = watcher.finish(&self.directory)?;
+                if dropped > 0 {
+                    bail!("sandbox log exceeded 100000 reports; {dropped} reports omitted");
+                }
+                reports
+            }
             None => Vec::new(),
         };
         let _ = std::fs::remove_dir_all(&self.directory);
@@ -592,22 +598,25 @@ fn profile(plan: &Plan, id: &str, root: &Path, state: &Path, mode: Mode) -> Resu
 }
 
 /// A report from the kernel's log.
-struct Report {
-    task: String,
-    operation: String,
-    path: String,
+pub(crate) struct Report {
+    pub task: String,
+    pub process: u32,
+    pub operation: String,
+    pub path: String,
 }
 
 /// `log stream`, reading the sandbox's reports while the run lasts.
-struct Watcher {
+pub(crate) struct Watcher {
     child: Child,
     reports: Arc<Mutex<Vec<Report>>>,
     sentinel: Arc<Mutex<bool>>,
+    marker: String,
+    dropped: Arc<std::sync::atomic::AtomicUsize>,
     reader: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Watcher {
-    fn start(directory: &Path) -> Result<Self> {
+    pub(crate) fn start(directory: &Path) -> Result<Self> {
         let mut child = Command::new("log")
             .args([
                 "stream",
@@ -625,10 +634,14 @@ impl Watcher {
         let stdout = child.stdout.take().context("log stream has no output")?;
         let reports = Arc::new(Mutex::new(Vec::new()));
         let sentinel = Arc::new(Mutex::new(false));
+        let marker = format!("{SENTINEL}:{}", directory.canonicalize()?.display());
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (ready, started) = std::sync::mpsc::channel();
         let reader = {
             let reports = reports.clone();
             let sentinel = sentinel.clone();
+            let marker = marker.clone();
+            let dropped = dropped.clone();
             std::thread::spawn(move || {
                 for line in BufReader::new(stdout).lines() {
                     let Ok(line) = line else { break };
@@ -639,12 +652,17 @@ impl Watcher {
                     let Some(message) = event["eventMessage"].as_str() else {
                         continue;
                     };
-                    if message.contains(SENTINEL) {
+                    if message.contains(&marker) {
                         *sentinel.lock().unwrap() = true;
                         continue;
                     }
                     if let Some(report) = parse(message) {
-                        reports.lock().unwrap().push(report);
+                        let mut reports = reports.lock().unwrap();
+                        if reports.len() < 100_000 {
+                            reports.push(report);
+                        } else {
+                            dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                 }
             })
@@ -653,6 +671,8 @@ impl Watcher {
             child,
             reports,
             sentinel,
+            marker,
+            dropped,
             reader: Some(reader),
         };
         // The stream's first line says it has started filtering.
@@ -675,7 +695,7 @@ impl Watcher {
             format!(
                 "(version 1)\n(allow default)\n(allow file-read-data (literal {}) (with report) (with message {}))\n",
                 quote(marker.to_str().context("marker path must be UTF-8")?),
-                quote(SENTINEL)
+                quote(&self.marker)
             ),
         )?;
         *self.sentinel.lock().unwrap() = false;
@@ -697,7 +717,7 @@ impl Watcher {
         Ok(())
     }
 
-    fn finish(mut self, directory: &Path) -> Result<Vec<Report>> {
+    pub(crate) fn finish(mut self, directory: &Path) -> Result<(Vec<Report>, usize)> {
         let probed = self.probe(directory, "finish");
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -705,7 +725,20 @@ impl Watcher {
             let _ = reader.join();
         }
         probed?;
-        Ok(std::mem::take(&mut *self.reports.lock().unwrap()))
+        Ok((
+            std::mem::take(&mut *self.reports.lock().unwrap()),
+            self.dropped.load(std::sync::atomic::Ordering::Relaxed),
+        ))
+    }
+}
+
+impl Drop for Watcher {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
     }
 }
 
@@ -713,12 +746,15 @@ impl Watcher {
 /// with `deny(1)`.
 fn parse(message: &str) -> Option<Report> {
     let (line, task) = message.split_once(&format!("\n{TAG}"))?;
-    let rest = line.strip_prefix("Sandbox: ")?;
-    let (_, rest) = rest.split_once(") ")?;
+    // The system log may prefix a coalesced event with a duplicate count.
+    let rest = line.split_once("Sandbox: ")?.1;
+    let (process, rest) = rest.split_once(") ")?;
+    let process = process.rsplit_once('(')?.1.parse().ok()?;
     let (_, rest) = rest.split_once(' ')?;
     let (operation, path) = rest.split_once(' ')?;
     Some(Report {
         task: task.trim().to_owned(),
+        process,
         operation: operation.to_owned(),
         path: path.to_owned(),
     })

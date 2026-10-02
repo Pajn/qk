@@ -1,6 +1,7 @@
 mod doctor;
 mod explain;
 mod history;
+mod inputs;
 mod inspect;
 mod ui;
 mod warm_suggest;
@@ -37,6 +38,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Record task file accesses and review input declarations.
+    Inputs {
+        #[command(subcommand)]
+        command: InputsCommand,
+    },
     /// Report compatibility issues without running commands or plugins.
     Doctor {
         #[arg(long)]
@@ -155,6 +161,8 @@ enum Command {
 
 #[derive(Args)]
 struct RunOptions {
+    #[arg(skip)]
+    input_analysis: Option<inputs::Options>,
     /// Bypass all cache reads and writes; also NX_SKIP_NX_CACHE=true.
     #[arg(long, aliases = ["skip-nx-cache", "skipNxCache", "disable-nx-cache", "disableNxCache"])]
     skip_cache: bool,
@@ -487,6 +495,23 @@ fn default_output_style(single: bool) -> Rendered {
 }
 
 #[derive(Subcommand)]
+enum InputsCommand {
+    /// Execute finite tasks and report observed accesses. --report saves the
+    /// input-analysis report instead of a run report. Never changes inputs.
+    Analyze {
+        task: String,
+        /// Union successful observations from earlier compatible reports.
+        #[arg(long, value_name = "PATH")]
+        previous: Vec<PathBuf>,
+        /// Export review-only project.json fragments, grouped by task.
+        #[arg(long, value_name = "PATH")]
+        suggestions: Option<PathBuf>,
+        #[command(flatten)]
+        options: RunOptions,
+    },
+}
+
+#[derive(Subcommand)]
 enum WarmCommand {
     /// Run a task in the sandbox and list the directories it wrote outside its
     /// outputs, as candidates for its qk:warm paths. Needs macOS.
@@ -767,6 +792,27 @@ fn run(mut cli: Cli) -> Result<i32> {
     };
     let workspace = Workspace::load(&root)?;
     match cli.command {
+        Command::Inputs {
+            command:
+                InputsCommand::Analyze {
+                    task,
+                    previous,
+                    suggestions,
+                    mut options,
+                },
+        } => {
+            if options.dry_run || options.graph.is_some() || options.sandbox.is_some() {
+                bail!(
+                    "inputs analyze requires execution and cannot combine with --dry-run, --graph or --sandbox"
+                );
+            }
+            options.input_analysis = Some(inputs::Options {
+                report: options.report.take(),
+                suggestions,
+                previous: inputs::load_previous(&previous)?,
+            });
+            return run_task(&workspace, task, &options);
+        }
         Command::Doctor { json, strict } => return doctor::show(&workspace, json, strict),
         Command::Cache {
             command: CacheCommand::Path,
@@ -1193,7 +1239,8 @@ fn execute_tasks(
     })
     .context("cannot register cancellation handler")?;
     // A sandboxed task has to run to be observed.
-    let skip_cache = options.skips_cache() || options.sandbox.is_some();
+    let skip_cache =
+        options.skips_cache() || options.sandbox.is_some() || options.input_analysis.is_some();
     let rendered = options
         .output_style
         .map_or_else(|| default_output_style(single), OutputStyle::rendered);
@@ -1264,6 +1311,7 @@ fn execute_tasks(
                 SandboxMode::Enforce => qk_runner::sandbox::Mode::Enforce,
             }),
             expected: &expected,
+            analyze_inputs: options.input_analysis.is_some(),
         },
         cancelled,
     );
@@ -1318,6 +1366,12 @@ fn execute_tasks(
                 format!("cannot write the sandbox report to {}", path.display())
             })?;
         }
+    }
+    if let (Some(analysis), Some(options)) = (
+        result.input_analysis.as_ref(),
+        options.input_analysis.as_ref(),
+    ) {
+        inputs::present(analysis.clone(), options)?;
     }
     Ok(result.exit_code)
 }

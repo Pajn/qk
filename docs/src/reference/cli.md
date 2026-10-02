@@ -3,6 +3,7 @@
 
 | Command | Result |
 | --- | --- |
+| `qk inputs analyze <task> [--report <path>] [--previous <path>] [--suggestions <path>]` | Execute tasks without caching, record file accesses and review input coverage; macOS or Linux with strace. See [Recording task inputs](../guides/input-analysis.md) |
 | `qk show projects [--json]` | Project names in Nx graph order, one per line or as a compact JSON array |
 | `qk show projects -p 'web,tag:library' --exclude 'experimental-*'` | Union of matching names, globs and tags, minus exclusions |
 | `qk show projects --with-target e2e --type app [--sep ,]` | Projects with one of the targets, of a type (`app`, `lib` or `e2e`, as Nx types them), joined by a separator |

@@ -1119,6 +1119,7 @@ dependencies = [
  "qk-executor",
  "qk-graph",
  "qk-history",
+ "qk-input-analysis",
  "qk-lockfile",
  "qk-runner",
  "qk-taskgraph",
@@ -1181,6 +1182,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "qk-input-analysis"
+version = "0.1.1"
+dependencies = [
+ "globset",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "qk-lockfile"
 version = "0.1.1"
 dependencies = [
@@ -1195,14 +1205,17 @@ name = "qk-runner"
 version = "0.1.1"
 dependencies = [
  "anyhow",
+ "blake3",
  "libc",
  "qk-cache",
  "qk-config",
  "qk-executor",
+ "qk-input-analysis",
  "qk-taskgraph",
  "serde",
  "serde_json",
  "sysinfo",
+ "tempfile",
 ]
 
 [[package]]

@@ -724,6 +724,7 @@ mod tests {
         };
         let result = RunResult {
             sandbox: None,
+            input_analysis: None,
             outcomes: BTreeMap::new(),
             skipped: BTreeSet::new(),
             exit_code: 0,

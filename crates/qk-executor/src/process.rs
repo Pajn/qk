@@ -88,7 +88,7 @@ pub fn execute_captured(
                 if children.0.is_empty() || task.parallel {
                     for (index, command) in pending.by_ref() {
                         let interactive = task.interactive && task.commands.len() == 1;
-                        let mut child = spawn(task, command, capture.is_some(), interactive)
+                        let mut child = spawn(task, command, index, capture.is_some(), interactive)
                             .with_context(|| format!("cannot start command for {}", task.id))?;
                         if let Some(capture) = capture {
                             let stdout =
@@ -178,7 +178,13 @@ pub fn shell(text: &str) -> Command {
 }
 
 /// Launch a task command with its environment, confinement and output streams.
-fn spawn(task: &PreparedTask, text: &str, capture: bool, interactive: bool) -> Result<GroupChild> {
+fn spawn(
+    task: &PreparedTask,
+    text: &str,
+    index: usize,
+    capture: bool,
+    interactive: bool,
+) -> Result<GroupChild> {
     #[cfg(windows)]
     let mut command = shell(text);
     #[cfg(not(windows))]
@@ -190,6 +196,9 @@ fn spawn(task: &PreparedTask, text: &str, capture: bool, interactive: bool) -> R
         }
         _ => shell(text),
     };
+    if let Some(recording) = &task.recording {
+        command = recording.command(index, text);
+    }
     #[cfg(target_os = "linux")]
     if let Some(crate::Confinement::Landlock(ruleset)) = task.sandbox {
         use std::os::unix::process::CommandExt;
