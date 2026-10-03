@@ -118,6 +118,7 @@ pub fn affected_tasks(
     let mut tasks = BTreeMap::new();
     let canonical_root = workspace.root.canonicalize()?;
     let mut links = BTreeMap::new();
+    let mut directory_links = BTreeMap::new();
     for (id, inputs) in &resolved {
         let mut reasons = Vec::new();
         if let Some(file) = deleted_manifest {
@@ -135,7 +136,10 @@ pub fn affected_tasks(
                 continue;
             }
             if !links.contains_key(file) {
-                links.insert(file.to_owned(), symlink_targets(&canonical_root, file)?);
+                links.insert(
+                    file.to_owned(),
+                    symlink_targets(&canonical_root, file, &mut directory_links)?,
+                );
             }
             for target in &links[file] {
                 touched.extend(
@@ -229,7 +233,11 @@ pub fn affected_tasks(
 }
 
 /// Paths a selected symlink reads, including a target that has been deleted.
-fn symlink_targets(root: &Path, path: &str) -> Result<Vec<String>> {
+fn symlink_targets(
+    root: &Path,
+    path: &str,
+    directory_links: &mut BTreeMap<PathBuf, Vec<PathBuf>>,
+) -> Result<Vec<String>> {
     let mut pending = vec![root.join(path)];
     let mut visited = BTreeSet::new();
     let mut targets = BTreeSet::new();
@@ -275,12 +283,17 @@ fn symlink_targets(root: &Path, path: &str) -> Result<Vec<String>> {
             && resolved.starts_with(root)
             && resolved.is_dir()
         {
-            for entry in walkdir::WalkDir::new(resolved).follow_links(false) {
-                let entry = entry?;
-                if entry.file_type().is_symlink() {
-                    pending.push(entry.path().to_owned());
+            if !directory_links.contains_key(resolved) {
+                let mut links = Vec::new();
+                for entry in walkdir::WalkDir::new(resolved).follow_links(false) {
+                    let entry = entry?;
+                    if entry.file_type().is_symlink() {
+                        links.push(entry.into_path());
+                    }
                 }
+                directory_links.insert(resolved.clone(), links);
             }
+            pending.extend(directory_links[resolved].iter().cloned());
         }
         for target in std::iter::once(normalized).chain(resolved) {
             if let Ok(relative) = target.strip_prefix(root)

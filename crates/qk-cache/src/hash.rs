@@ -438,8 +438,11 @@ impl Snapshot {
             };
             if resolved.is_file() {
                 let metadata = std::fs::metadata(&resolved)?;
-                return Ok(json!({"link":target, "content":digest_file(&resolved)?,
-                    "mode":crate::store::mode(&metadata) & 0o111 != 0}));
+                let key = paths::relative(Path::new(""), relative)?;
+                return Ok(
+                    json!({"link":target, "content":self.digest(&key, &resolved, &metadata)?,
+                    "mode":crate::store::mode(&metadata) & 0o111 != 0}),
+                );
             }
             let relative = paths::relative(Path::new(""), relative)?;
             if relative.is_empty() {
