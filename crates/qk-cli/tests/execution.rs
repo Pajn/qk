@@ -1575,6 +1575,89 @@ fn the_sandbox_refuses_what_a_task_does_not_declare_on_linux() {
     assert!(String::from_utf8_lossy(&audit.stderr).contains("use --sandbox=enforce"));
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn sandbox_allows_linked_input_trees_without_granting_unrelated_access() {
+    let temp = fixture(json!({
+        "build": {
+            "command": "mkdir -p dist && cat alias/value.txt alias/ignored/value.txt alias/file.txt alias/nested/value.txt selected.txt > dist/out.txt",
+            "inputs": ["{projectRoot}/alias", "{projectRoot}/selected.txt"],
+            "outputs": ["{projectRoot}/dist"]
+        },
+        "peek": {
+            "command": "cat other/value.txt",
+            "inputs": ["{projectRoot}/alias"]
+        },
+        "write": {
+            "command": "echo changed > alias/value.txt",
+            "inputs": ["{projectRoot}/alias"]
+        }
+    }));
+    for directory in ["shared/ignored", "nested", "other"] {
+        fs::create_dir_all(temp.path().join(directory)).unwrap();
+    }
+    for (path, content) in [
+        ("shared/value.txt", "direct\n"),
+        ("shared/ignored/value.txt", "ignored\n"),
+        ("file.txt", "file\n"),
+        ("nested/value.txt", "nested\n"),
+        ("other/value.txt", "unselected\n"),
+    ] {
+        fs::write(temp.path().join(path), content).unwrap();
+    }
+    fs::write(temp.path().join(".gitignore"), "shared/ignored/\ndist/\n").unwrap();
+    for (target, alias) in [
+        ("shared", "alias"),
+        ("../file.txt", "shared/file.txt"),
+        ("../nested", "shared/nested"),
+        ("file.txt", "selected.txt"),
+    ] {
+        std::os::unix::fs::symlink(target, temp.path().join(alias)).unwrap();
+    }
+    let enforced = |target: &str| run(temp.path(), &["run", target, "--sandbox=enforce"]);
+    success(enforced("app:build"));
+    assert_eq!(
+        fs::read_to_string(temp.path().join("dist/out.txt")).unwrap(),
+        "direct\nignored\nfile\nnested\nfile\n"
+    );
+    assert!(!enforced("app:peek").status.success());
+    assert!(!enforced("app:write").status.success());
+    assert_eq!(
+        fs::read_to_string(temp.path().join("shared/value.txt")).unwrap(),
+        "direct\n"
+    );
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn sandbox_allows_structured_json_inputs_and_their_linked_targets() {
+    let temp = fixture(json!({
+        "build": {
+            "command": "mkdir -p dist && cat settings.json selected.json > dist/out.txt",
+            "inputs": [
+                {"json": "{projectRoot}/settings.json", "fields": ["selected"]},
+                {"json": "{projectRoot}/selected.json", "excludeFields": ["comment"]}
+            ],
+            "outputs": ["{projectRoot}/dist"]
+        },
+        "peek": {
+            "command": "cat other.json",
+            "inputs": [{"json": "{projectRoot}/settings.json", "fields": ["selected"]}]
+        }
+    }));
+    for path in ["settings.json", "linked.json", "other.json"] {
+        fs::write(temp.path().join(path), "{\"selected\":1}").unwrap();
+    }
+    std::os::unix::fs::symlink("linked.json", temp.path().join("selected.json")).unwrap();
+    let enforced = |target: &str| run(temp.path(), &["run", target, "--sandbox=enforce"]);
+    success(enforced("app:build"));
+    assert_eq!(
+        fs::read_to_string(temp.path().join("dist/out.txt")).unwrap(),
+        "{\"selected\":1}{\"selected\":1}"
+    );
+    assert!(!enforced("app:peek").status.success());
+}
+
 #[cfg(unix)]
 #[test]
 /// Nested exec uses existing confinement and rejects unconfined sandbox requests.
@@ -2076,6 +2159,110 @@ fn input_analysis_rejects_nonexecuting_options_and_invalid_previous_reports() {
         assert!(!output.status.success());
         assert!(!temp.path().join("marker").exists());
     }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn input_analysis_recognizes_nested_links_and_structured_link_targets() {
+    #[cfg(target_os = "macos")]
+    let _audit = AUDIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    #[cfg(target_os = "linux")]
+    if Command::new("strace").arg("-V").output().is_err() {
+        return;
+    }
+    let temp = fixture(json!({
+        "build": {
+            "command": "cat selected/file.txt selected/nested/value.txt settings.json other/value.txt",
+            "inputs": [
+                "{projectRoot}/selected",
+                {"json": "{projectRoot}/settings.json", "fields": ["value"]}
+            ]
+        }
+    }));
+    for directory in ["shared", "nested", "other"] {
+        fs::create_dir(temp.path().join(directory)).unwrap();
+    }
+    for (path, content) in [
+        ("file.txt", "linked file"),
+        ("nested/value.txt", "linked directory"),
+        ("data.json", "{\"value\":1}"),
+        ("other/value.txt", "uncovered"),
+    ] {
+        fs::write(temp.path().join(path), content).unwrap();
+    }
+    for (target, alias) in [
+        ("shared", "selected"),
+        ("../file.txt", "shared/file.txt"),
+        ("../nested", "shared/nested"),
+        ("data.json", "settings.json"),
+    ] {
+        std::os::unix::fs::symlink(target, temp.path().join(alias)).unwrap();
+    }
+    let output = run(
+        temp.path(),
+        &[
+            "inputs",
+            "analyze",
+            "app:build",
+            "--report",
+            "analysis.json",
+        ],
+    );
+    #[cfg(target_os = "macos")]
+    if String::from_utf8_lossy(&output.stderr).contains("did not reach the system log") {
+        return;
+    }
+    success(output);
+    let report: Value =
+        serde_json::from_slice(&fs::read(temp.path().join("analysis.json")).unwrap()).unwrap();
+    let task = &report["tasks"]["app:build"];
+    for (path, requested, category, alias) in [
+        ("file.txt", "selected/file.txt", "input", "selected"),
+        (
+            "nested/value.txt",
+            "selected/nested/value.txt",
+            "input",
+            "selected",
+        ),
+        (
+            "data.json",
+            "settings.json",
+            "structuredInput",
+            "settings.json",
+        ),
+    ] {
+        assert!(
+            !task["uncoveredAccesses"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(path)),
+            "{report}"
+        );
+        let reads: Vec<_> = task["accesses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|access| {
+                (access["path"] == path || access["path"] == requested)
+                    && (access["operation"] == "readData" || access["operation"] == "openRead")
+            })
+            .collect();
+        #[cfg(target_os = "linux")]
+        assert!(!reads.is_empty(), "{report}");
+        for read in reads {
+            assert_eq!(read["category"], category, "{report}");
+            assert_eq!(read["keyedPath"], alias, "{report}");
+        }
+    }
+    assert!(
+        task["uncoveredAccesses"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("other/value.txt")),
+        "{report}"
+    );
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]

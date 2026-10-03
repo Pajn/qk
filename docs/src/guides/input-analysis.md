@@ -24,7 +24,8 @@ Each task retains its arguments, configuration, outcome, backend and coverage
 limitations. Events contain a process ID, operation, path, result and category.
 Workspace paths are relative; recorded external paths are absolute. Accesses
 retain descriptor targets as `resolvedPath` when available. Declared
-symlinks captured before execution can identify a covering input as `keyedPath`.
+symlinks captured before execution can identify a covering input as `keyedPath`,
+including nested links in declared directory inputs and structured JSON links.
 Target definitions are represented by a digest, not their environment values. Reports
 contain filenames and forwarded arguments, so review them before sharing.
 
