@@ -136,6 +136,11 @@ fn dotenv_files(project_root: &str, target: &str, configuration: Option<&str>) -
     let mut files = Vec::new();
     for root in [project_root, ""] {
         for identifier in &identifiers {
+            // Colons in target names cannot name regular dotenv files on Windows.
+            #[cfg(windows)]
+            if identifier.contains(':') {
+                continue;
+            }
             for file in variants(identifier, root) {
                 if !files.contains(&file) {
                     files.push(file);
@@ -702,4 +707,17 @@ fn package_manager(workspace: &Workspace) -> Result<&'static str> {
         }
     }
     Ok("npm")
+}
+
+#[cfg(all(test, windows))]
+mod dotenv_tests {
+    #[test]
+    fn colon_targets_keep_configuration_and_generic_dotenv_files() {
+        let files = super::dotenv_files("app", "test:unit:watch", Some("ci"));
+        assert!(files.iter().all(|file| !file.contains(':')));
+        assert!(files.contains(&"app/.env.ci".to_owned()));
+        assert!(files.contains(&"app/.env".to_owned()));
+        assert!(files.contains(&".env.ci".to_owned()));
+        assert!(files.contains(&".env".to_owned()));
+    }
 }
