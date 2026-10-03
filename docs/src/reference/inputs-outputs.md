@@ -95,7 +95,7 @@ qk was invoked from in the key.
 
 `{"json": "path", "fields": ["compilerOptions"], "excludeFields": ["scripts"]}`
 selects dotted fields of a JSON file. Affected selection conservatively
-counts any change to the file.
+counts any change to the file, even when source ignore rules exclude its path.
 
 ## `outputs`
 
@@ -129,6 +129,8 @@ caching, with a reported reason.
 
 Root `.gitignore` and `.nxignore` rules exclude files from source input discovery,
 including tracked files. Negations use Git ignore semantics. Watch uses the same
-rules, and affected selection also applies the root ignore files. qk still hashes
+rules, and project affected selection also applies the root ignore files. qk still hashes
 mandatory workspace/project configuration independently of source filesets,
 including the root `.gitignore` and `.nxignore` files themselves.
+Task-level affected selection follows these cache inputs, including explicitly
+declared JSON inputs and mandatory configuration hidden by source ignore rules.

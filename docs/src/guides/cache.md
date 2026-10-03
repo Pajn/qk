@@ -89,7 +89,7 @@ Every input declaration of Nx 23 is supported:
   from;
 - `{"json": "path", "fields": […], "excludeFields": […]}`, only the selected
   dotted fields of a JSON file. Affected selection counts any change to the
-  file.
+  file, even when source ignore rules exclude its path.
 
 As in Nx, a named input cannot use `dependencies` or `projects`. With a
 package manager other than pnpm, lockfiles are always keyed by content.
