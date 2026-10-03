@@ -12,6 +12,7 @@
 // - show projects: configuration and graph loading
 // - graph: the full project graph as JSON
 // - affected, no changes: change detection with a base equal to the head
+// - affected tasks, no changes: task selection with a base equal to the head
 // - run-many, all cached: hashing every task, with every output kept in place
 // - run-many, restoring outputs: the same with every output restored from the
 //   cache, as after a checkout or a clean
@@ -173,6 +174,7 @@ const commands = [
   ["show projects", `${qk} show projects --json`],
   ["graph", `${qk} graph --file -`],
   ["affected, no changes", `${qk} show projects --affected --base HEAD --head HEAD`],
+  ["affected tasks, no changes", `${qk} show tasks -t build --affected --base HEAD --head HEAD --json`],
   ["run-many, all cached", `${qk} run-many -t build --output-style static`],
 ];
 // Commands measured with every output removed before each run.
