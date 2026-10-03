@@ -437,6 +437,73 @@ fn a_task_is_affected_when_its_inputs_change() {
     assert!(matches!(&tasks["app:build"], TaskCause::Touched { .. }));
 }
 
+/// Empty change lists preserve revision metadata without reading task inputs.
+#[test]
+fn empty_task_changes_skip_input_resolution() {
+    use qk_taskgraph::{Request, TaskGraph};
+    let repo = Repo::new(&[
+        ("nx.json", "{}"),
+        (
+            "apps/app/project.json",
+            r#"{"name":"app","targets":{"build":{"command":"echo build",
+                "inputs":[{"json":"{projectRoot}/meta.json"}]}}}"#,
+        ),
+        ("apps/app/meta.json", "invalid JSON"),
+    ]);
+    let workspace = Workspace::load(&repo.root).unwrap();
+    let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
+    for options in [
+        Options {
+            base: Some(repo.base.clone()),
+            head: Some(repo.base.clone()),
+            ..Options::default()
+        },
+        Options {
+            base: Some(repo.base.clone()),
+            explicit_files: true,
+            ..Options::default()
+        },
+        Options {
+            base: Some(repo.base.clone()),
+            uncommitted: true,
+            ..Options::default()
+        },
+        Options {
+            base: Some(repo.base.clone()),
+            untracked: true,
+            ..Options::default()
+        },
+    ] {
+        let projects = qk_affected::analyse(
+            &workspace,
+            &ProjectGraph::build(&workspace).unwrap(),
+            &options,
+        )
+        .unwrap();
+        let tasks = qk_affected::affected_tasks(&workspace, &graph, &options).unwrap();
+        assert!(tasks.files.is_empty());
+        assert!(tasks.tasks.is_empty());
+        assert_eq!(tasks.base, projects.base);
+        assert_eq!(tasks.head, projects.head);
+        assert_eq!(
+            serde_json::to_value(tasks.range).unwrap(),
+            serde_json::to_value(projects.range).unwrap()
+        );
+    }
+    // A nonempty list still resolves inputs, including their validation.
+    assert!(
+        qk_affected::affected_tasks(
+            &workspace,
+            &graph,
+            &Options {
+                files: vec!["apps/app/src/main.ts".into()],
+                ..Options::default()
+            }
+        )
+        .is_err()
+    );
+}
+
 /// A branch taken from `origin/main` after it moved on, while the local `main`
 /// stayed behind: `tool` changed on `origin/main`, `lib` on the branch.
 /// Returns the stale local `main`.

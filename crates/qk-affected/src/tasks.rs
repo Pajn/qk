@@ -74,6 +74,15 @@ pub fn affected_tasks(
     options: &Options,
 ) -> Result<TaskAnalysis> {
     let changes = Changes::unfiltered(workspace, options)?;
+    if changes.files.is_empty() {
+        return Ok(TaskAnalysis {
+            base: changes.base,
+            head: changes.head,
+            range: changes.range,
+            files: changes.files,
+            tasks: BTreeMap::new(),
+        });
+    }
     let ignore = qk_cache::SourceIgnore::new(&workspace.root)?;
     let changed: BTreeSet<&str> = changes.files.iter().map(String::as_str).collect();
     let deleted_manifest = changes.files.iter().find(|file| {
