@@ -1764,13 +1764,16 @@ fn watch_runs_callbacks_for_project_changes_and_cancels() {
     assert_eq!(fs::read_to_string(&callbacks).unwrap(), "app|\n");
     fs::write(root.join("lib/input.txt"), "two").unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !fs::read_to_string(&callbacks)
-        .unwrap()
-        .contains("lib|lib/input.txt")
-    {
+    // Native events may batch the dependency edit with other source paths.
+    // NX_FILE_CHANGES contains the whole batch for each changed project.
+    while !fs::read_to_string(&callbacks).unwrap().lines().any(|line| {
+        line.strip_prefix("lib|")
+            .is_some_and(|files| files.split_whitespace().any(|file| file == "lib/input.txt"))
+    }) {
         assert!(
             Instant::now() < deadline,
-            "watch did not observe dependency edit"
+            "watch did not observe dependency edit; callbacks: {:?}",
+            fs::read_to_string(&callbacks).unwrap()
         );
         std::thread::sleep(Duration::from_millis(20));
     }
