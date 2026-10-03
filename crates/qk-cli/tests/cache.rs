@@ -16,7 +16,13 @@ fn process_helper() {
         .map(|text| text.trim().parse::<u32>().unwrap())
         .unwrap_or(0);
     fs::write(&counter, (runs + 1).to_string()).unwrap();
-    let input = fs::read_to_string("src/input.txt").unwrap();
+    let input_path =
+        std::env::var("QK_CACHE_TEST_INPUT").unwrap_or_else(|_| "src/input.txt".into());
+    let input = fs::read_to_string(input_path).unwrap();
+    if mode == "generate-source" {
+        fs::write("src/generated.txt", input).unwrap();
+        return;
+    }
     if mode == "generate-types" {
         fs::create_dir_all("types/nested/empty.d.ts").unwrap();
         fs::write("types/value.d.ts", input.lines().next().unwrap_or_default()).unwrap();
@@ -2357,7 +2363,8 @@ fn local_overrides_change_the_task_and_its_key() {
         "inputs": ["{projectRoot}/src/**/*"]
     }));
     assert_eq!(said(&fixture, &fixture.root, &[]), "one");
-    let mut ignore = fs::read_to_string(fixture.root.join(".gitignore")).unwrap();
+    let original_ignore = fs::read_to_string(fixture.root.join(".gitignore")).unwrap();
+    let mut ignore = original_ignore.clone();
     ignore.push_str("project.local.json\n");
     fs::write(fixture.root.join(".gitignore"), ignore).unwrap();
     fs::write(
@@ -2373,6 +2380,7 @@ fn local_overrides_change_the_task_and_its_key() {
         "{stderr}"
     );
     // Without it, the checked-in definition's entry still applies.
+    fs::write(fixture.root.join(".gitignore"), original_ignore).unwrap();
     fs::remove_file(fixture.root.join("project.local.json")).unwrap();
     let output = success(fixture.build(&fixture.root, &["--output-style", "static"]));
     assert!(stdout(&output).contains("one"));
@@ -3328,4 +3336,123 @@ fn input_changes_during_failure_do_not_report_flakiness() {
         .unwrap();
         assert!(groups.as_array().unwrap().is_empty());
     }
+}
+
+#[test]
+fn workspace_inputs_survive_dependency_project_exclusions() {
+    for reverse in [false, true] {
+        let mut build = target("build", json!({}));
+        build["options"]["env"]["QK_CACHE_TEST_INPUT"] = json!("libs/lib/src/value.test.txt");
+        let fixture = Fixture::new(build);
+        fs::create_dir_all(fixture.root.join("libs/lib/src")).unwrap();
+        fs::write(fixture.root.join("libs/lib/src/value.test.txt"), "one\n").unwrap();
+        fs::write(
+            fixture.root.join("libs/lib/project.json"),
+            json!({"name":"lib"}).to_string(),
+        )
+        .unwrap();
+        fs::write(fixture.root.join("nx.json"), json!({"namedInputs":{"production":["{projectRoot}/src/**/*","!{projectRoot}/src/**/*.test.txt"]}}).to_string()).unwrap();
+        let mut inputs = vec![
+            json!("{workspaceRoot}/libs/lib/src/**/*"),
+            json!("^production"),
+        ];
+        if reverse {
+            inputs.reverse();
+        }
+        let mut project: Value =
+            serde_json::from_slice(&fs::read(fixture.root.join("project.json")).unwrap()).unwrap();
+        project["implicitDependencies"] = json!(["lib"]);
+        project["targets"]["build"]["inputs"] = json!(inputs);
+        fs::write(fixture.root.join("project.json"), project.to_string()).unwrap();
+        success(fixture.build(&fixture.root, &[]));
+        fs::write(fixture.root.join("libs/lib/src/value.test.txt"), "two\n").unwrap();
+        let changed = success(fixture.build(&fixture.root, &[]));
+        assert!(stderr(&changed).contains("cache miss app:build"));
+        assert_eq!(artifact(&fixture.root), "built:two\n");
+        assert_eq!(fixture.runs(), 2);
+        success(fixture.build(&fixture.root, &[]));
+        assert_eq!(fixture.runs(), 2);
+    }
+}
+
+#[test]
+fn exclusions_apply_to_their_whole_input_scope_in_any_order() {
+    for reverse in [false, true] {
+        let mut inputs = vec![
+            json!("{projectRoot}/src/**/*"),
+            json!("!{projectRoot}/src/**/*.test.txt"),
+        ];
+        if reverse {
+            inputs.reverse();
+        }
+        let fixture = Fixture::new(target("build", json!({"inputs":inputs})));
+        fs::write(fixture.root.join("src/unused.test.txt"), "one").unwrap();
+        success(fixture.build(&fixture.root, &[]));
+        fs::write(fixture.root.join("src/unused.test.txt"), "two").unwrap();
+        success(fixture.build(&fixture.root, &[]));
+        assert_eq!(fixture.runs(), 1);
+    }
+}
+
+#[test]
+fn generated_source_is_keyed_alongside_selective_dependency_outputs() {
+    for ignore_file in [None, Some(".gitignore"), Some(".nxignore")] {
+        let mut generate = target(
+            "generate-source",
+            json!({"inputs":["{workspaceRoot}/seed.txt"],"outputs":["{projectRoot}/src/generated.txt"]}),
+        );
+        generate["options"]["env"]["QK_CACHE_TEST_INPUT"] = json!("seed.txt");
+        let mut build = target(
+            "build",
+            json!({"dependsOn":["generate"],"inputs":["{projectRoot}/src/**/*",{"dependentTasksOutputFiles":"**/manifest.json"}]}),
+        );
+        build["options"]["env"]["QK_CACHE_TEST_INPUT"] = json!("src/generated.txt");
+        let fixture = Fixture::with_targets(json!({"generate":generate,"build":build}));
+        if let Some(file) = ignore_file {
+            let path = fixture.root.join(file);
+            let mut rules = fs::read_to_string(&path).unwrap_or_default();
+            rules.push_str("src/generated.txt/\n");
+            fs::write(path, rules).unwrap();
+        }
+        fs::write(fixture.root.join("seed.txt"), "one\n").unwrap();
+        success(fixture.build(&fixture.root, &[]));
+        assert_eq!(artifact(&fixture.root), "built:one\n");
+        fs::write(fixture.root.join("seed.txt"), "two\n").unwrap();
+        let changed = success(fixture.build(&fixture.root, &[]));
+        assert!(stderr(&changed).contains("cache miss app:build"));
+        assert_eq!(artifact(&fixture.root), "built:two\n");
+        assert_eq!(fixture.runs(), 4);
+        fs::remove_file(fixture.root.join("src/generated.txt")).unwrap();
+        fs::remove_dir_all(fixture.root.join("dist")).unwrap();
+        let restored = success(fixture.build(&fixture.root, &[]));
+        assert!(stderr(&restored).contains("cache hit app:generate"));
+        assert!(stderr(&restored).contains("cache hit app:build"));
+        assert_eq!(artifact(&fixture.root), "built:two\n");
+        assert_eq!(fixture.runs(), 4);
+    }
+}
+
+#[test]
+fn root_ignore_files_are_keyed_with_narrow_inputs() {
+    let fixture = Fixture::new(target(
+        "build",
+        json!({"inputs":["{projectRoot}/src/**/*"]}),
+    ));
+    success(fixture.build(&fixture.root, &[]));
+    let ignore = fixture.root.join(".gitignore");
+    let original = fs::read_to_string(&ignore).unwrap();
+    fs::write(&ignore, format!("{original}# changed\n")).unwrap();
+    success(fixture.build(&fixture.root, &[]));
+    assert_eq!(fixture.runs(), 2);
+    let nxignore = fixture.root.join(".nxignore");
+    fs::write(&nxignore, "# first\n").unwrap();
+    success(fixture.build(&fixture.root, &[]));
+    assert_eq!(fixture.runs(), 3);
+    fs::write(&nxignore, "# second\n").unwrap();
+    success(fixture.build(&fixture.root, &[]));
+    assert_eq!(fixture.runs(), 4);
+    fs::remove_file(nxignore).unwrap();
+    let restored = success(fixture.build(&fixture.root, &[]));
+    assert!(stderr(&restored).contains("cache hit app:build"));
+    assert_eq!(fixture.runs(), 4);
 }

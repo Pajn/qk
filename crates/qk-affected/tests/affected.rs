@@ -528,6 +528,61 @@ fn a_changed_json_input_affects_the_task() {
     assert_eq!(tasks.keys().collect::<Vec<_>>(), ["app:build"]);
 }
 
+/// Ignore rules prune source filesets, but explicit JSON inputs still affect keys.
+#[test]
+fn ignored_json_inputs_affect_tasks_without_reincluding_ignored_sources() {
+    let repo = Repo::new(&[
+        (
+            "nx.json",
+            r#"{"targetDefaults": {"build": {"command": "echo build", "inputs": [{"json": "{projectRoot}/meta.json", "fields": ["version"]}]},
+                                   "test": {"command": "echo test", "inputs": ["{projectRoot}/src/**/*"]}}}"#,
+        ),
+        (".nxignore", "apps/app/meta.json\napps/app/src/ignored.ts\n"),
+        (
+            "apps/app/project.json",
+            r#"{"name": "app", "targets": {"build": {}, "test": {}}}"#,
+        ),
+        ("apps/app/meta.json", r#"{"version": 1}"#),
+        ("apps/app/src/ignored.ts", "before"),
+        (
+            "libs/lib/project.json",
+            r#"{"name": "lib", "targets": {"build": {}, "test": {}}}"#,
+        ),
+    ]);
+    write(&repo.root, "apps/app/src/ignored.ts", "after");
+    assert!(affected_tasks(&repo).is_empty());
+    write(&repo.root, "apps/app/meta.json", r#"{"version": 2}"#);
+    let tasks = affected_tasks(&repo);
+    assert_eq!(tasks.keys().collect::<Vec<_>>(), ["app:build"]);
+}
+
+/// Changed output candidates remain inputs of consumers, never of their producer.
+#[test]
+fn changed_declared_outputs_only_affect_tasks_that_consume_them() {
+    let repo = Repo::new(&[
+        (
+            "nx.json",
+            r#"{"targetDefaults": {"build": {"command": "echo build", "inputs": ["{projectRoot}/src/**/*"], "outputs": ["{projectRoot}/src/generated.txt"]},
+                                   "test": {"command": "echo test", "inputs": ["{projectRoot}/src/**/*"]}}}"#,
+        ),
+        (
+            "apps/app/project.json",
+            r#"{"name": "app", "targets": {"build": {}, "test": {}}}"#,
+        ),
+        ("apps/app/src/generated.txt", "before"),
+        (
+            "libs/lib/project.json",
+            r#"{"name": "lib", "targets": {"build": {}, "test": {}}}"#,
+        ),
+    ]);
+    write(&repo.root, "apps/app/src/generated.txt", "after");
+    let tasks = affected_tasks(&repo);
+    assert_eq!(tasks.keys().collect::<Vec<_>>(), ["app:test"]);
+    std::fs::remove_file(repo.root.join("apps/app/src/generated.txt")).unwrap();
+    let tasks = affected_tasks(&repo);
+    assert_eq!(tasks.keys().collect::<Vec<_>>(), ["app:test"]);
+}
+
 /// Ignore matching consistently prunes excluded parents and honors Nx negations.
 #[test]
 fn nxignore_parent_and_untracked_negations_match_source_discovery() {
@@ -616,5 +671,82 @@ fn unreadable_lockfile_and_root_dependency_changes_affect_every_project() {
             None => std::fs::remove_file(repo.root.join("pnpm-lock.yaml")).unwrap(),
         }
         assert_eq!(repo.committed(), names(&["app", "lib", "tool"]));
+    }
+}
+
+#[test]
+fn deleted_mandatory_workspace_files_affect_tasks_with_narrow_inputs() {
+    for file in [
+        ".gitignore",
+        ".nxignore",
+        "tsconfig.base.json",
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "pnpm-workspace.yaml",
+    ] {
+        let repo = Repo::new(&[
+            (
+                "nx.json",
+                r#"{"targetDefaults":{"build":{"command":"echo build","inputs":["{projectRoot}/src/**/*"]},"test":{"command":"echo test","inputs":["{projectRoot}/src/**/*"]}}}"#,
+            ),
+            (
+                "apps/app/project.json",
+                r#"{"name":"app","targets":{"build":{},"test":{}}}"#,
+            ),
+            (
+                "libs/lib/project.json",
+                r#"{"name":"lib","targets":{"build":{},"test":{}}}"#,
+            ),
+            (file, "{}"),
+        ]);
+        std::fs::remove_file(repo.root.join(file)).unwrap();
+        let tasks = affected_tasks(&repo);
+        assert_eq!(
+            tasks.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["app:build", "app:test", "lib:build", "lib:test"],
+            "{file}"
+        );
+        assert!(tasks.values().all(|cause| matches!(cause, qk_affected::TaskCause::Touched {reasons} if reasons.iter().any(|reason| matches!(reason,qk_affected::TaskReason::Input {file:changed} if changed==file)))));
+    }
+}
+
+/// Ignored deleted artifacts do not invalidate every task; explicit JSON reads still count.
+#[test]
+fn ignored_deleted_manifests_only_affect_explicit_consumers() {
+    for name in ["package.json", "project.json"] {
+        for explicit in [false, true] {
+            let file = format!("apps/app/artifacts/{name}");
+            let inputs = if explicit {
+                serde_json::json!([{"json":format!("{{projectRoot}}/artifacts/{name}")}])
+            } else {
+                serde_json::json!(["{projectRoot}/src/**/*"])
+            };
+            let config = serde_json::json!({"targetDefaults":{
+                "build":{"command":"echo build","inputs":inputs},
+                "test":{"command":"echo test","inputs":["{projectRoot}/src/**/*"]}
+            }})
+            .to_string();
+            let repo = Repo::new(&[
+                ("nx.json", &config),
+                (".nxignore", "apps/app/artifacts/\n"),
+                (
+                    "apps/app/project.json",
+                    r#"{"name":"app","targets":{"build":{},"test":{}}}"#,
+                ),
+                (
+                    "libs/lib/project.json",
+                    r#"{"name":"lib","targets":{"build":{},"test":{}}}"#,
+                ),
+                (&file, r#"{"version":1}"#),
+            ]);
+            std::fs::remove_file(repo.root.join(&file)).unwrap();
+            let tasks = affected_tasks(&repo);
+            let expected = if explicit { vec!["app:build"] } else { vec![] };
+            assert_eq!(
+                tasks.keys().map(String::as_str).collect::<Vec<_>>(),
+                expected,
+                "{file}, explicit={explicit}"
+            );
+        }
     }
 }

@@ -73,11 +73,14 @@ pub fn affected_tasks(
     graph: &TaskGraph,
     options: &Options,
 ) -> Result<TaskAnalysis> {
-    let changes = Changes::new(workspace, options)?;
+    let changes = Changes::unfiltered(workspace, options)?;
+    let ignore = qk_cache::SourceIgnore::new(&workspace.root)?;
     let changed: BTreeSet<&str> = changes.files.iter().map(String::as_str).collect();
     let deleted_manifest = changes.files.iter().find(|file| {
         let name = file.rsplit('/').next().unwrap_or(file);
-        matches!(name, "project.json" | "package.json") && !workspace.root.join(file).exists()
+        matches!(name, "project.json" | "package.json")
+            && !ignore.matches(file)
+            && !workspace.root.join(file).exists()
     });
     let resolved = qk_cache::resolve_tasks(workspace, graph, &changes.files)?;
     // The lockfile at both revisions, when it changed and both can be read.

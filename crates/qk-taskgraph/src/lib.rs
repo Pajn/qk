@@ -32,6 +32,37 @@ impl Request {
             args: Vec::new(),
         })
     }
+
+    /// Resolve a literal target name before treating its final segment as a configuration.
+    pub fn parse_in(workspace: &Workspace, value: &str) -> Result<Self> {
+        let Some((project, identifier)) = value.split_once(':') else {
+            return Self::parse(value);
+        };
+        if let Some(project_config) = workspace.projects.get(project) {
+            if project_config.targets.contains_key(identifier) {
+                return Ok(Self {
+                    project: project.into(),
+                    target: identifier.into(),
+                    configuration: None,
+                    requested_configuration: None,
+                    args: Vec::new(),
+                });
+            }
+            if let Some((target, configuration)) = identifier.rsplit_once(':')
+                && project_config.targets.contains_key(target)
+                && !configuration.is_empty()
+            {
+                return Ok(Self {
+                    project: project.into(),
+                    target: target.into(),
+                    configuration: Some(configuration.into()),
+                    requested_configuration: Some(configuration.into()),
+                    args: Vec::new(),
+                });
+            }
+        }
+        Self::parse(value)
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]

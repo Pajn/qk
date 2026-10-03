@@ -81,7 +81,10 @@ fn digests_path(root: &Path) -> PathBuf {
 /// their metadata changes, so edits during the run are detected.
 pub struct Snapshot {
     pub(crate) files: BTreeSet<String>,
+    extra_candidates: BTreeSet<String>,
     projects: ProjectGraph,
+    generated_tasks: Vec<(Task, Outputs)>,
+    source_ignore: SourceIgnore,
     canonical_root: PathBuf,
     workspace_prefix: Option<PathBuf>,
     patterns: Mutex<HashMap<(String, bool), Arc<Pattern>>>,
@@ -190,7 +193,17 @@ impl Snapshot {
             .and_then(|root| canonical_root.strip_prefix(root).ok().map(PathBuf::from));
         Ok(Self {
             files,
+            extra_candidates: BTreeSet::new(),
             projects: ProjectGraph::build(workspace)?,
+            source_ignore: SourceIgnore::new(&workspace.root)?,
+            generated_tasks: graph
+                .tasks
+                .values()
+                .filter_map(|task| {
+                    let outputs = Outputs::new(workspace, task).ok()?;
+                    outputs.is_explicit().then(|| (task.clone(), outputs))
+                })
+                .collect(),
             canonical_root,
             workspace_prefix,
             patterns: Mutex::default(),
@@ -290,7 +303,13 @@ impl Snapshot {
     /// Adds paths to the candidate files, such as files deleted since a base
     /// revision.
     pub fn with_candidates(mut self, paths: &[String]) -> Self {
-        self.files.extend(paths.iter().cloned());
+        self.files.extend(
+            paths
+                .iter()
+                .filter(|path| !self.source_ignore.matches(path))
+                .cloned(),
+        );
+        self.extra_candidates.extend(paths.iter().cloned());
         self
     }
 
@@ -492,6 +511,10 @@ impl SourceIgnore {
         Ok(Self(builder.build()?))
     }
 
+    fn matches_directory(&self, path: &str) -> bool {
+        self.matches(path) || self.0.matched(path, true).is_ignore()
+    }
+
     /// Whether a workspace-relative file or its parent is ignored.
     pub fn matches(&self, path: &str) -> bool {
         // A file whitelist cannot reinclude it beneath an excluded directory.
@@ -641,10 +664,30 @@ fn remove_json_path(target: &mut Value, path: &str) {
     }
 }
 
+struct FilePattern {
+    matcher: Arc<Pattern>,
+    prefix: String,
+    excluded: bool,
+}
+
+#[derive(Default)]
+struct FileSelection {
+    patterns: Vec<FilePattern>,
+    included: BTreeSet<String>,
+    excluded: BTreeSet<String>,
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum FileScope {
+    Workspace,
+    Project(String),
+}
+
 struct Resolver<'a> {
     workspace: &'a Workspace,
     snapshot: &'a Snapshot,
     selected: BTreeSet<String>,
+    scopes: BTreeMap<FileScope, FileSelection>,
     values: BTreeMap<String, Value>,
     named_stack: Vec<(String, String)>,
     /// Dependency named inputs already expanded for `^` inputs.
@@ -864,9 +907,14 @@ impl Resolver<'_> {
             .strip_prefix('!')
             .map(|pattern| (true, pattern))
             .unwrap_or((false, pattern));
+        // Nx hashes workspace files and each project's files in separate scopes.
+        let scope = if pattern.contains("{workspaceRoot}") {
+            FileScope::Workspace
+        } else {
+            FileScope::Project(project.to_owned())
+        };
         let pattern = paths::expand(self.workspace, project, pattern)?;
         let matcher = self.snapshot.pattern(&pattern, exclude)?;
-        // Only files below the pattern's literal directory prefix can match.
         let prefix = pattern
             .split('/')
             .take_while(|part| is_literal(part))
@@ -877,13 +925,18 @@ impl Resolver<'_> {
         } else {
             Box::new(under(&self.snapshot.files, &prefix))
         };
-        for file in candidates.filter(|file| matcher.is_match(file)) {
-            if exclude {
-                self.selected.remove(file);
-            } else {
-                self.selected.insert(file.clone());
-            }
-        }
+        let selection = self.scopes.entry(scope).or_default();
+        let selected = if exclude {
+            &mut selection.excluded
+        } else {
+            &mut selection.included
+        };
+        selected.extend(candidates.filter(|file| matcher.is_match(file)).cloned());
+        selection.patterns.push(FilePattern {
+            matcher,
+            prefix,
+            excluded: exclude,
+        });
         Ok(())
     }
 
@@ -1014,6 +1067,7 @@ pub fn resolve(
         workspace,
         snapshot,
         selected: BTreeSet::new(),
+        scopes: BTreeMap::new(),
         values: BTreeMap::new(),
         named_stack: Vec::new(),
         expanded: BTreeSet::new(),
@@ -1025,6 +1079,65 @@ pub fn resolve(
     for input in task.definition.inputs.as_ref().unwrap_or(&default) {
         resolver.input(&task.project, input)?;
     }
+    // Declared source files can also be outputs of other tasks. List them when
+    // resolving the consumer, after its dependencies have run or been restored.
+    let own_outputs = Outputs::new(workspace, task)
+        .ok()
+        .filter(Outputs::is_explicit);
+    for (producer, declared) in &snapshot.generated_tasks {
+        if producer.id == task.id {
+            continue;
+        }
+        let overlaps = |a: &str, b: &str| {
+            a.is_empty()
+                || a == b
+                || a.strip_prefix(b).is_some_and(|rest| rest.starts_with('/'))
+                || b.strip_prefix(a).is_some_and(|rest| rest.starts_with('/'))
+        };
+        let relevant = resolver
+            .scopes
+            .values()
+            .flat_map(|scope| &scope.patterns)
+            .filter(|pattern| !pattern.excluded)
+            .any(|pattern| {
+                declared.anchors().any(|anchor| {
+                    overlaps(&pattern.prefix, anchor)
+                        && (!snapshot.source_ignore.matches_directory(anchor)
+                            || !workspace.root.join(anchor).is_dir())
+                })
+            });
+        if !relevant {
+            continue;
+        }
+        let outputs = snapshot.dependency_outputs(workspace, producer)?;
+        for path in &outputs.files {
+            if snapshot.source_ignore.matches(path)
+                || own_outputs.as_ref().is_some_and(|own| own.matches(path))
+            {
+                continue;
+            }
+            for selection in resolver.scopes.values_mut() {
+                for pattern in &selection.patterns {
+                    if pattern.matcher.is_match(path) {
+                        if pattern.excluded {
+                            selection.excluded.insert(path.clone());
+                        } else {
+                            selection.included.insert(path.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for selection in resolver.scopes.values() {
+        resolver.selected.extend(
+            selection
+                .included
+                .difference(&selection.excluded)
+                .filter(|path| own_outputs.as_ref().is_none_or(|own| !own.matches(path)))
+                .cloned(),
+        );
+    }
     let readable = snapshot
         .installed(&workspace.root)?
         .is_some_and(|installed| installed.lockfile.is_some());
@@ -1035,10 +1148,14 @@ pub fn resolve(
     // The root tsconfig, as Nx hashes it into every task.
     let tsconfig = ["tsconfig.base.json", "tsconfig.json"]
         .into_iter()
-        .find(|name| workspace.root.join(name).is_file());
+        .find(|name| {
+            workspace.root.join(name).is_file() || snapshot.extra_candidates.contains(*name)
+        });
     let mut mandatory = BTreeSet::new();
     for path in tsconfig.into_iter().chain([
         "nx.json",
+        ".gitignore",
+        ".nxignore",
         qk_config::LOCAL_WORKSPACE,
         "package.json",
         "pnpm-workspace.yaml",
@@ -1047,7 +1164,9 @@ pub fn resolve(
         "yarn.lock",
         "bun.lock",
     ]) {
-        if workspace.root.join(path).is_file() && !(path == "pnpm-lock.yaml" && readable) {
+        if (workspace.root.join(path).is_file() || snapshot.extra_candidates.contains(path))
+            && !(path == "pnpm-lock.yaml" && readable)
+        {
             resolver.selected.insert(path.into());
             mandatory.insert(path.into());
         }

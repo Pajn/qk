@@ -1764,13 +1764,16 @@ fn watch_runs_callbacks_for_project_changes_and_cancels() {
     assert_eq!(fs::read_to_string(&callbacks).unwrap(), "app|\n");
     fs::write(root.join("lib/input.txt"), "two").unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !fs::read_to_string(&callbacks)
-        .unwrap()
-        .contains("lib|lib/input.txt")
-    {
+    // Native events may batch the dependency edit with other source paths.
+    // NX_FILE_CHANGES contains the whole batch for each changed project.
+    while !fs::read_to_string(&callbacks).unwrap().lines().any(|line| {
+        line.strip_prefix("lib|")
+            .is_some_and(|files| files.split_whitespace().any(|file| file == "lib/input.txt"))
+    }) {
         assert!(
             Instant::now() < deadline,
-            "watch did not observe dependency edit"
+            "watch did not observe dependency edit; callbacks: {:?}",
+            fs::read_to_string(&callbacks).unwrap()
         );
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -2385,4 +2388,52 @@ fn warm_suggest_rejects_options_that_skip_execution() {
         assert!(String::from_utf8_lossy(&output.stderr).contains("requires task execution"));
         assert!(!String::from_utf8_lossy(&output.stdout).contains("wrote nothing"));
     }
+}
+
+#[test]
+fn colon_target_inspection_uses_the_execution_identifier() {
+    let temp = fixture(json!({
+        "install": {"executor":"nx:noop", "configurations":{"ios":{}}},
+        "install:ios": {"executor":"nx:noop", "inputs":[], "outputs":[], "configurations":{"ci":{}}},
+        "test:unit:watch": {"executor":"nx:noop", "inputs":[], "outputs":[]}
+    }));
+    for (identifier, target, configuration) in [
+        ("app:install:ios", "install:ios", None),
+        ("app:install:ios:ci", "install:ios", Some("ci")),
+        ("app:test:unit:watch", "test:unit:watch", None),
+    ] {
+        let plan: Value = serde_json::from_slice(
+            &success(run(temp.path(), &["run", identifier, "--dry-run"])).stdout,
+        )
+        .unwrap();
+        let root = plan["roots"][0].as_str().unwrap();
+        assert_eq!(plan["tasks"][root]["target"], target);
+        assert_eq!(plan["tasks"][root]["configuration"], json!(configuration));
+        let inspected: Value = serde_json::from_slice(
+            &success(run(temp.path(), &["show", "target", identifier, "--json"])).stdout,
+        )
+        .unwrap();
+        assert_eq!(inspected["target"], target);
+        for category in ["inputs", "outputs"] {
+            let inspected: Value = serde_json::from_slice(
+                &success(run(
+                    temp.path(),
+                    &["show", "target", category, identifier, "--json"],
+                ))
+                .stdout,
+            )
+            .unwrap();
+            assert_eq!(inspected["target"], target);
+        }
+    }
+    let configured: Value = serde_json::from_slice(
+        &success(run(
+            temp.path(),
+            &["show", "target", "app:install:ios", "-c", "ci", "--json"],
+        ))
+        .stdout,
+    )
+    .unwrap();
+    assert_eq!(configured["target"], "install:ios");
+    assert_eq!(configured["configuration"], "ci");
 }

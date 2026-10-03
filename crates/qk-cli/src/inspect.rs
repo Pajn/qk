@@ -59,7 +59,7 @@ pub fn show(workspace: &Workspace, options: Options) -> Result<i32> {
     } else {
         format!("{}:{name}", crate::current_project(workspace)?)
     };
-    let mut request = Request::parse(&name)?;
+    let mut request = Request::parse_in(workspace, &name)?;
     if options.configuration.is_some() {
         request.requested_configuration = options.configuration.clone();
         request.configuration = options.configuration;

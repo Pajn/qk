@@ -50,6 +50,13 @@ paths are resolved within the workspace. A symlinked input is keyed by its
 target text and the content it resolves to, including the files below a
 linked directory; links that resolve outside the workspace are not supported.
 
+File exclusions apply to every inclusion in the same input scope, regardless of
+declaration order. Workspace filesets and each project's filesets have separate
+scopes: an exclusion in `^production` cannot remove a file selected explicitly
+by a `{workspaceRoot}` fileset. Generated files selected by source filesets are
+keyed after dependencies complete, independently of `dependentTasksOutputFiles`;
+a task's own declared outputs stay out of its source inputs.
+
 Extended globs (`?(…)`, `*(…)`, `+(…)`, `@(…)`, `!(…)`, `(a|b)` and `{,…}`) are expanded
 exactly as Nx 23 expands them, including its approximations: `+(a|b)` matches
 one occurrence, and an omitted group in a directory segment widens that
@@ -88,7 +95,7 @@ qk was invoked from in the key.
 
 `{"json": "path", "fields": ["compilerOptions"], "excludeFields": ["scripts"]}`
 selects dotted fields of a JSON file. Affected selection conservatively
-counts any change to the file.
+counts any change to the file, even when source ignore rules exclude its path.
 
 ## `outputs`
 
@@ -122,5 +129,8 @@ caching, with a reported reason.
 
 Root `.gitignore` and `.nxignore` rules exclude files from source input discovery,
 including tracked files. Negations use Git ignore semantics. Watch uses the same
-rules, and affected selection also applies the root ignore files. qk still hashes
-mandatory workspace/project configuration independently of source filesets.
+rules, and project affected selection also applies the root ignore files. qk still hashes
+mandatory workspace/project configuration independently of source filesets,
+including the root `.gitignore` and `.nxignore` files themselves.
+Task-level affected selection follows these cache inputs, including explicitly
+declared JSON inputs and mandatory configuration hidden by source ignore rules.

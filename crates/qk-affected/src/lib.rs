@@ -349,6 +349,15 @@ enum FileChange {
 
 impl<'a> Changes<'a> {
     fn new(workspace: &'a Workspace, options: &Options) -> Result<Self> {
+        let mut changes = Self::unfiltered(workspace, options)?;
+        let ignore = qk_cache::SourceIgnore::new(&workspace.root)?;
+        changes.files.retain(|file| !ignore.matches(file));
+        Ok(changes)
+    }
+
+    /// Task inputs can explicitly read ignored JSON and mandatory metadata.
+    /// Let the cache resolver decide which changed paths are inputs.
+    fn unfiltered(workspace: &'a Workspace, options: &Options) -> Result<Self> {
         let root = &workspace.root;
         let head = options.head.clone().or_else(|| non_empty_env("NX_HEAD"));
         let default_base = workspace
@@ -430,11 +439,6 @@ impl<'a> Changes<'a> {
             files.extend(untracked(root)?);
             files.into_iter().collect()
         };
-        let ignore = qk_cache::SourceIgnore::new(root)?;
-        let files = files
-            .into_iter()
-            .filter(|file| !ignore.matches(file))
-            .collect();
         Ok(Self {
             workspace,
             before_lockfile: OnceCell::new(),

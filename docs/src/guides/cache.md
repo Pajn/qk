@@ -33,7 +33,7 @@ one without declared outputs is fingerprinted by its key. Files are keyed
 by workspace-relative path, content and mode. Branch names and checkout
 locations are not part of the key, so identical sources in two worktrees
 share entries. Root workspace files (the root `tsconfig.base.json` or
-`tsconfig.json`, `nx.json`, `package.json`, `pnpm-workspace.yaml`,
+`tsconfig.json`, `nx.json`, `.gitignore`, `.nxignore`, `package.json`, `pnpm-workspace.yaml`,
 lockfiles) and the manifests of
 the task's project and its transitive project dependencies are always
 included. Dotenv files are not, as in Nx: they hold per-machine values and
@@ -60,9 +60,12 @@ same rule affected selection applies.
 ## Inputs
 
 Candidate input files are tracked and untracked-but-not-ignored files, minus
-any task's declared outputs. The list is taken once per run, as Nx does, so a
-file that a task creates without declaring it as an output is seen from the
-next run. File contents are re-read whenever their metadata changes; their
+planned tasks' declared outputs. Source filesets also select other tasks' declared
+outputs after dependencies complete, including newly generated files, while
+respecting source ignore rules and excluding the consumer's own outputs. These
+files are keyed independently of selective `dependentTasksOutputFiles` inputs.
+The source list is taken once per run, so a file that a task creates without
+declaring it as an output is seen from the next run. File contents are re-read whenever their metadata changes; their
 digests persist between runs in the worktree's state, keyed by
 path, size, modification time and, on Unix, change time, inode and mode, so a
 warm run reads only files whose metadata changed. Without
@@ -86,7 +89,7 @@ Every input declaration of Nx 23 is supported:
   from;
 - `{"json": "path", "fields": […], "excludeFields": […]}`, only the selected
   dotted fields of a JSON file. Affected selection counts any change to the
-  file.
+  file, even when source ignore rules exclude its path.
 
 As in Nx, a named input cannot use `dependencies` or `projects`. With a
 package manager other than pnpm, lockfiles are always keyed by content.
