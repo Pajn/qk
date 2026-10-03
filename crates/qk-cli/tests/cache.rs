@@ -3575,3 +3575,86 @@ fn root_ignore_files_are_keyed_with_narrow_inputs() {
     assert!(stderr(&restored).contains("cache hit app:build"));
     assert_eq!(fixture.runs(), 4);
 }
+
+#[test]
+fn downstream_artifacts_do_not_invalidate_upstream_source_inputs() {
+    for transitive in [false, true] {
+        let mut targets = json!({
+            "prepare": {"executor": "nx:noop", "cache": true, "outputs": [], "inputs": ["{projectRoot}/**/*"]},
+            "build": target("build", json!({"dependsOn": ["prepare"], "inputs": ["{projectRoot}/src/**/*"]}))
+        });
+        if transitive {
+            targets["middle"] = json!({"executor": "nx:noop", "cache": true, "outputs": [], "inputs": ["{projectRoot}/src/**/*"], "dependsOn": ["prepare"]});
+            targets["build"]["dependsOn"] = json!(["middle"]);
+        }
+        let fixture = Fixture::with_targets(targets);
+        fs::write(fixture.root.join(".gitignore"), ".qk/\n").unwrap();
+        success(fixture.build(&fixture.root, &[]));
+        let warm = success(fixture.build(&fixture.root, &[]));
+        assert!(
+            stderr(&warm).contains("cache hit app:prepare"),
+            "{}",
+            stderr(&warm)
+        );
+        assert!(
+            stderr(&warm).contains("cache hit app:build"),
+            "{}",
+            stderr(&warm)
+        );
+        assert_eq!(fixture.runs(), 1);
+        fs::remove_dir_all(fixture.root.join("dist")).unwrap();
+        let restored = success(fixture.build(&fixture.root, &[]));
+        assert!(stderr(&restored).contains("cache hit app:prepare"));
+        assert!(stderr(&restored).contains("cache hit app:build"));
+        assert_eq!(artifact(&fixture.root), "built:one\n");
+        assert_eq!(fixture.runs(), 1);
+    }
+}
+
+#[test]
+fn runtime_color_helper() {
+    if std::env::var_os("QK_CACHE_RUNTIME_HELPER").is_none() {
+        return;
+    }
+    let color = std::env::var("FORCE_COLOR").ok();
+    println!("stable runtime value: {color:?}");
+    if color.as_deref() == Some("true") {
+        eprintln!("color diagnostic from {}", std::process::id());
+    }
+    std::process::exit(0);
+}
+
+#[test]
+fn runtime_inputs_do_not_inherit_runner_color_defaults() {
+    for color in [false, true] {
+        let command = format!(
+            "\"{}\" --exact runtime_color_helper --nocapture",
+            std::env::current_exe().unwrap().display()
+        );
+        let mut build = target("build", json!({"inputs": [{"runtime": command}]}));
+        build["options"]["env"]["QK_CACHE_RUNTIME_HELPER"] = json!("1");
+        build["options"]["color"] = json!(color);
+        let fixture = Fixture::new(build);
+        let run = |force_color: Option<&str>| {
+            let mut command = fixture.command(&fixture.root, &["run", "app:build"]);
+            command.env_remove("FORCE_COLOR");
+            if let Some(value) = force_color {
+                command.env("FORCE_COLOR", value);
+            }
+            command.output().unwrap()
+        };
+        success(run(None));
+        let warm = success(run(None));
+        assert!(
+            stderr(&warm).contains("cache hit app:build"),
+            "{}",
+            stderr(&warm)
+        );
+        assert_eq!(fixture.runs(), 1);
+        let configured = success(run(Some("0")));
+        assert!(stderr(&configured).contains("cache miss app:build"));
+        let warm = success(run(Some("0")));
+        assert!(stderr(&warm).contains("cache hit app:build"));
+        assert_eq!(fixture.runs(), 2);
+    }
+}
