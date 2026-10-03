@@ -618,3 +618,39 @@ fn unreadable_lockfile_and_root_dependency_changes_affect_every_project() {
         assert_eq!(repo.committed(), names(&["app", "lib", "tool"]));
     }
 }
+
+#[test]
+fn deleted_mandatory_workspace_files_affect_tasks_with_narrow_inputs() {
+    for file in [
+        ".gitignore",
+        ".nxignore",
+        "tsconfig.base.json",
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "pnpm-workspace.yaml",
+    ] {
+        let repo = Repo::new(&[
+            (
+                "nx.json",
+                r#"{"targetDefaults":{"build":{"command":"echo build","inputs":["{projectRoot}/src/**/*"]},"test":{"command":"echo test","inputs":["{projectRoot}/src/**/*"]}}}"#,
+            ),
+            (
+                "apps/app/project.json",
+                r#"{"name":"app","targets":{"build":{},"test":{}}}"#,
+            ),
+            (
+                "libs/lib/project.json",
+                r#"{"name":"lib","targets":{"build":{},"test":{}}}"#,
+            ),
+            (file, "{}"),
+        ]);
+        std::fs::remove_file(repo.root.join(file)).unwrap();
+        let tasks = affected_tasks(&repo);
+        assert_eq!(
+            tasks.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["app:build", "app:test", "lib:build", "lib:test"],
+            "{file}"
+        );
+        assert!(tasks.values().all(|cause| matches!(cause, qk_affected::TaskCause::Touched {reasons} if reasons.iter().any(|reason| matches!(reason,qk_affected::TaskReason::Input {file:changed} if changed==file)))));
+    }
+}

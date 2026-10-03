@@ -81,6 +81,7 @@ fn digests_path(root: &Path) -> PathBuf {
 /// their metadata changes, so edits during the run are detected.
 pub struct Snapshot {
     pub(crate) files: BTreeSet<String>,
+    extra_candidates: BTreeSet<String>,
     projects: ProjectGraph,
     generated_tasks: Vec<(Task, Outputs)>,
     source_ignore: SourceIgnore,
@@ -192,6 +193,7 @@ impl Snapshot {
             .and_then(|root| canonical_root.strip_prefix(root).ok().map(PathBuf::from));
         Ok(Self {
             files,
+            extra_candidates: BTreeSet::new(),
             projects: ProjectGraph::build(workspace)?,
             source_ignore: SourceIgnore::new(&workspace.root)?,
             generated_tasks: graph
@@ -302,6 +304,7 @@ impl Snapshot {
     /// revision.
     pub fn with_candidates(mut self, paths: &[String]) -> Self {
         self.files.extend(paths.iter().cloned());
+        self.extra_candidates.extend(paths.iter().cloned());
         self
     }
 
@@ -1130,7 +1133,9 @@ pub fn resolve(
     // The root tsconfig, as Nx hashes it into every task.
     let tsconfig = ["tsconfig.base.json", "tsconfig.json"]
         .into_iter()
-        .find(|name| workspace.root.join(name).is_file());
+        .find(|name| {
+            workspace.root.join(name).is_file() || snapshot.extra_candidates.contains(*name)
+        });
     let mut mandatory = BTreeSet::new();
     for path in tsconfig.into_iter().chain([
         "nx.json",
@@ -1144,7 +1149,9 @@ pub fn resolve(
         "yarn.lock",
         "bun.lock",
     ]) {
-        if workspace.root.join(path).is_file() && !(path == "pnpm-lock.yaml" && readable) {
+        if (workspace.root.join(path).is_file() || snapshot.extra_candidates.contains(path))
+            && !(path == "pnpm-lock.yaml" && readable)
+        {
             resolver.selected.insert(path.into());
             mandatory.insert(path.into());
         }
