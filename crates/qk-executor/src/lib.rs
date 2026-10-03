@@ -171,14 +171,9 @@ fn task_environment(
             env.entry(name).or_insert(value);
         }
     }
-    let force_color = env
-        .get(std::ffi::OsStr::new("FORCE_COLOR"))
-        .cloned()
-        .unwrap_or_else(|| "true".into());
     let mut set = |name: &str, value: OsString| {
         env.insert(name.into(), value);
     };
-    set("FORCE_COLOR", force_color);
     set("NX_WORKSPACE_ROOT", workspace.root.clone().into_os_string());
     set("NX_TASK_TARGET_PROJECT", task.project.clone().into());
     set("NX_TASK_TARGET_TARGET", task.target.clone().into());
@@ -344,8 +339,15 @@ pub fn prepare(
             env.insert(name.into(), interpolation.text(value)?.into());
         }
     }
+    let mut execution = BTreeMap::new();
+    execution.insert(
+        "FORCE_COLOR".into(),
+        env.get(std::ffi::OsStr::new("FORCE_COLOR"))
+            .cloned()
+            .unwrap_or_else(|| "true".into()),
+    );
     if executor == "nx:run-commands" && boolean(options.get("color"), false, "color")? {
-        env.insert("FORCE_COLOR".into(), "true".into());
+        execution.insert("FORCE_COLOR".into(), "true".into());
     }
     for key in options.keys() {
         let allowed = match executor {
@@ -535,7 +537,7 @@ pub fn prepare(
         parallel,
         cwd,
         env,
-        execution: BTreeMap::new(),
+        execution,
         ready_when,
         ready: Default::default(),
         decorations,

@@ -84,6 +84,7 @@ pub struct Snapshot {
     extra_candidates: BTreeSet<String>,
     projects: ProjectGraph,
     generated_tasks: Vec<(Task, Outputs)>,
+    task_dependencies: BTreeMap<String, BTreeSet<String>>,
     source_ignore: SourceIgnore,
     canonical_root: PathBuf,
     workspace_prefix: Option<PathBuf>,
@@ -203,6 +204,11 @@ impl Snapshot {
                     let outputs = Outputs::new(workspace, task).ok()?;
                     outputs.is_explicit().then(|| (task.clone(), outputs))
                 })
+                .collect(),
+            task_dependencies: graph
+                .tasks
+                .iter()
+                .map(|(id, task)| (id.clone(), task.dependencies.clone()))
                 .collect(),
             canonical_root,
             workspace_prefix,
@@ -862,6 +868,9 @@ impl Resolver<'_> {
                     return Ok(());
                 }
                 let mut prepared = prepared.clone();
+                prepared
+                    .execution
+                    .remove(std::ffi::OsStr::new("FORCE_COLOR"));
                 prepared.commands = vec![command.into()];
                 prepared.cwd = self.workspace.root.clone();
                 prepared.parallel = false;
@@ -1108,13 +1117,22 @@ pub fn resolve(
     for input in task.definition.inputs.as_ref().unwrap_or(&default) {
         resolver.input(&task.project, input)?;
     }
-    // Declared source files can also be outputs of other tasks. List them when
-    // resolving the consumer, after its dependencies have run or been restored.
+    // Dependency outputs may also be declared sources. Downstream and unrelated
+    // outputs remain artifacts, so producing them cannot invalidate an upstream task.
+    let mut upstream = BTreeSet::new();
+    let mut pending: Vec<_> = task.dependencies.iter().cloned().collect();
+    while let Some(id) = pending.pop() {
+        if upstream.insert(id.clone())
+            && let Some(dependencies) = snapshot.task_dependencies.get(&id)
+        {
+            pending.extend(dependencies.iter().cloned());
+        }
+    }
     let own_outputs = Outputs::new(workspace, task)
         .ok()
         .filter(Outputs::is_explicit);
     for (producer, declared) in &snapshot.generated_tasks {
-        if producer.id == task.id {
+        if producer.id == task.id || !upstream.contains(&producer.id) {
             continue;
         }
         let overlaps = |a: &str, b: &str| {
