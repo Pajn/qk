@@ -506,6 +506,10 @@ impl SourceIgnore {
         Ok(Self(builder.build()?))
     }
 
+    fn matches_directory(&self, path: &str) -> bool {
+        self.matches(path) || self.0.matched(path, true).is_ignore()
+    }
+
     /// Whether a workspace-relative file or its parent is ignored.
     pub fn matches(&self, path: &str) -> bool {
         // A file whitelist cannot reinclude it beneath an excluded directory.
@@ -1091,9 +1095,10 @@ pub fn resolve(
             .flat_map(|scope| &scope.patterns)
             .filter(|pattern| !pattern.excluded)
             .any(|pattern| {
-                declared
-                    .anchors()
-                    .any(|anchor| overlaps(&pattern.prefix, anchor))
+                declared.anchors().any(|anchor| {
+                    !snapshot.source_ignore.matches_directory(anchor)
+                        && overlaps(&pattern.prefix, anchor)
+                })
             });
         if !relevant {
             continue;
