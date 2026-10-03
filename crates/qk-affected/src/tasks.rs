@@ -147,7 +147,8 @@ pub fn affected_tasks(
                         .files
                         .iter()
                         .filter(|changed| {
-                            **changed == *target
+                            target.is_empty()
+                                || **changed == *target
                                 || changed
                                     .strip_prefix(target)
                                     .is_some_and(|suffix| suffix.starts_with('/'))

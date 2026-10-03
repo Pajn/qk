@@ -509,7 +509,7 @@ fn empty_task_changes_skip_input_resolution() {
 #[test]
 fn symlink_targets_affect_tasks_that_read_the_link() {
     use qk_taskgraph::{Request, TaskGraph};
-    for mode in ["file", "directory", "json", "nested"] {
+    for mode in ["file", "directory", "json", "nested", "root"] {
         let inputs = if mode == "json" {
             serde_json::json!([{"json":"{projectRoot}/selected/link"}])
         } else {
@@ -536,7 +536,9 @@ fn symlink_targets_affect_tasks_that_read_the_link() {
         } else {
             "data/value.json"
         };
-        let target = if mode == "directory" || mode == "nested" {
+        let target = if mode == "root" {
+            "../../.."
+        } else if mode == "directory" || mode == "nested" {
             "../../../data"
         } else {
             "../../../data/value.json"
