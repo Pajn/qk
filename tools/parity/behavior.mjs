@@ -62,6 +62,33 @@ if (task === 'producer') {
   writeFileSync('app/dist/result', readFileSync('producer/dist/value.d.ts'));
 }`;
 try {
+  {
+    const { root, records } = workspace();
+    write(root, 'record.mjs', `import {writeFileSync} from 'node:fs';import {join} from 'node:path';writeFileSync(join(process.env.BEHAVIOR_RECORDS,process.argv[2]+'.json'),JSON.stringify({configuration:process.env.NX_TASK_TARGET_CONFIGURATION??null,base:process.env.QK_PARITY_BASE,both:process.env.QK_PARITY_BOTH,configured:process.env.QK_PARITY_CONFIG}));`);
+    const target = (name, extra = {}) => ({ command: `node record.mjs ${name}`, cache: false, ...extra });
+    write(root, 'app/project.json', { name: 'app', targets: { build: target('app', {
+      defaultConfiguration: 'prod', dependsOn: ['lib:build', 'tool:build'],
+      options: { env: { QK_PARITY_BASE: 'base', QK_PARITY_BOTH: 'base' } },
+      configurations: { prod: { env: { QK_PARITY_CONFIG: 'prod', QK_PARITY_BOTH: 'prod' } }, empty: { env: {} } },
+    }) } });
+    write(root, 'lib/project.json', { name: 'lib', targets: { build: target('lib', { configurations: { prod: {} } }) } });
+    write(root, 'tool/project.json', { name: 'tool', targets: { build: target('tool', {
+      defaultConfiguration: 'dev', dependsOn: ['leaf:build'], configurations: { dev: {} },
+    }) } });
+    write(root, 'leaf/project.json', { name: 'leaf', targets: { build: target('leaf', { configurations: { prod: {}, dev: {} } }) } });
+    for (const [name, args] of [
+      ['default', []], ['explicit', ['-c', 'prod']], ['empty-env', ['-c', 'empty']],
+    ]) {
+      clear(records);
+      run(root, ['run-many', '-t', 'build', '-p', 'app', ...args], { env: {
+        BEHAVIOR_RECORDS: records, QK_PARITY_BASE: 'inherited-base',
+        QK_PARITY_BOTH: 'inherited-both', QK_PARITY_CONFIG: 'inherited-config',
+      } });
+      result[`configuration-${name}`] = Object.fromEntries(readdirSync(records).sort().map(file => [
+        file.replace(/\.json$/, ''), JSON.parse(readFileSync(join(records, file), 'utf8')),
+      ]));
+    }
+  }
   for (const [name, indirect, transitive, pattern] of [
     ['direct', false, false, '**/*.d.ts'], ['indirect', true, false, '**/*.d.ts'],
     ['transitive', true, true, '**/*.d.ts'], ['broad-glob', false, false, '**/*'],
@@ -183,5 +210,5 @@ try {
   const text = JSON.stringify(result, null, 2) + '\n';
   if (mode === 'capture') writeFileSync(goldenArg, text);
   else if (text !== readFileSync(goldenArg, 'utf8')) throw new Error(`behavior differs from Nx golden:\n${text}`);
-  console.log(`ok   behavioral ${mode}: cache, ignore rules, stdin and watch`);
+  console.log(`ok   behavioral ${mode}: configurations, cache, ignore rules, stdin and watch`);
 } finally { rmSync(scratch, { recursive: true, force: true }); }

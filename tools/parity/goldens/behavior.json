@@ -1,4 +1,82 @@
 {
+  "configuration-default": {
+    "app": {
+      "configuration": "prod",
+      "base": "inherited-base",
+      "both": "prod",
+      "configured": "prod"
+    },
+    "leaf": {
+      "configuration": null,
+      "base": "inherited-base",
+      "both": "inherited-both",
+      "configured": "inherited-config"
+    },
+    "lib": {
+      "configuration": null,
+      "base": "inherited-base",
+      "both": "inherited-both",
+      "configured": "inherited-config"
+    },
+    "tool": {
+      "configuration": "dev",
+      "base": "inherited-base",
+      "both": "inherited-both",
+      "configured": "inherited-config"
+    }
+  },
+  "configuration-explicit": {
+    "app": {
+      "configuration": "prod",
+      "base": "inherited-base",
+      "both": "prod",
+      "configured": "prod"
+    },
+    "leaf": {
+      "configuration": "prod",
+      "base": "inherited-base",
+      "both": "inherited-both",
+      "configured": "inherited-config"
+    },
+    "lib": {
+      "configuration": "prod",
+      "base": "inherited-base",
+      "both": "inherited-both",
+      "configured": "inherited-config"
+    },
+    "tool": {
+      "configuration": "dev",
+      "base": "inherited-base",
+      "both": "inherited-both",
+      "configured": "inherited-config"
+    }
+  },
+  "configuration-empty-env": {
+    "app": {
+      "configuration": "empty",
+      "base": "inherited-base",
+      "both": "inherited-both",
+      "configured": "inherited-config"
+    },
+    "leaf": {
+      "configuration": null,
+      "base": "inherited-base",
+      "both": "inherited-both",
+      "configured": "inherited-config"
+    },
+    "lib": {
+      "configuration": null,
+      "base": "inherited-base",
+      "both": "inherited-both",
+      "configured": "inherited-config"
+    },
+    "tool": {
+      "configuration": "dev",
+      "base": "inherited-base",
+      "both": "inherited-both",
+      "configured": "inherited-config"
+    }
+  },
   "cache-direct": [
     [
       "consumer.ran",

@@ -36,22 +36,57 @@ fn expands_diamond_once_and_prunes_missing_dependency_targets() {
 }
 
 #[test]
-fn propagates_configurations_and_falls_back_to_dependency_default() {
+fn preserves_requested_configuration_across_dependency_defaults() {
     let (_temp, workspace) = workspace(json!({
-        "app": {"targets":{"build":{"defaultConfiguration":"prod", "dependsOn":["lib:build", "tool:build"], "options":{"command":"base", "env":{"A":"base"}}, "configurations":{"prod":{"command":"prod", "env":{"B":"prod"}, "outputs":["out"]}}}}},
-        "lib": {"targets":{"build":{"configurations":{"prod":{"command":"lib prod"}}}}},
-        "tool": {"targets":{"build":{"defaultConfiguration":"dev", "configurations":{"dev":{"command":"tool dev"}}}}}
+        "app": {"targets":{"build":{"defaultConfiguration":"prod", "dependsOn":["lib:build", "tool:build"], "configurations":{"prod":{}}}}},
+        "lib": {"targets":{"build":{"configurations":{"prod":{}}}}},
+        "tool": {"targets":{"build":{"defaultConfiguration":"dev", "dependsOn":["leaf:build"], "configurations":{"dev":{}}}}},
+        "leaf": {"targets":{"build":{"configurations":{"prod":{}, "dev":{}}}}}
     }));
-    let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
-    let app = &graph.tasks["app:build:prod"];
-    assert!(app.dependencies.contains("lib:build:prod"));
-    assert!(app.dependencies.contains("tool:build:dev"));
-    assert_eq!(app.definition.options["command"], "prod");
-    assert_eq!(
-        app.definition.options["env"],
-        json!({"A":"base", "B":"prod"})
-    );
-    assert_eq!(app.definition.outputs, Some(vec!["out".into()]));
+    for (request, lib, leaf) in [
+        ("app:build", "lib:build", "leaf:build"),
+        ("app:build:prod", "lib:build:prod", "leaf:build:prod"),
+    ] {
+        let graph = TaskGraph::build(&workspace, &[Request::parse(request).unwrap()]).unwrap();
+        assert_eq!(graph.tasks.len(), 4);
+        assert_eq!(
+            graph.tasks["app:build:prod"].dependencies,
+            [lib.to_owned(), "tool:build:dev".to_owned()].into()
+        );
+        assert_eq!(
+            graph.tasks["tool:build:dev"].dependencies,
+            [leaf.to_owned()].into()
+        );
+    }
+}
+
+#[test]
+fn configuration_environment_replaces_base_environment() {
+    let (_temp, workspace) = workspace(json!({
+        "app": {"targets":{"build":{
+            "defaultConfiguration":"prod",
+            "options":{"command":"base", "env":{"BASE":"base", "BOTH":"base"}},
+            "configurations":{
+                "prod":{"command":"prod", "env":{"CONFIG":"prod", "BOTH":"prod"}, "outputs":["out"]},
+                "empty":{"env":{}},
+                "unchanged":{}
+            }
+        }}}
+    }));
+    for (request, expected) in [
+        ("app:build", json!({"CONFIG":"prod", "BOTH":"prod"})),
+        ("app:build:prod", json!({"CONFIG":"prod", "BOTH":"prod"})),
+        ("app:build:empty", json!({})),
+        ("app:build:unchanged", json!({"BASE":"base", "BOTH":"base"})),
+    ] {
+        let graph = TaskGraph::build(&workspace, &[Request::parse(request).unwrap()]).unwrap();
+        let task = graph.tasks.values().next().unwrap();
+        assert_eq!(task.definition.options["env"], expected);
+        if task.configuration.as_deref() == Some("prod") {
+            assert_eq!(task.definition.options["command"], "prod");
+            assert_eq!(task.definition.outputs, Some(vec!["out".into()]));
+        }
+    }
 }
 
 #[test]

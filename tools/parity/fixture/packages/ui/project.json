@@ -5,7 +5,11 @@
     "type:ui"
   ],
   "targets": {
-    "build": {},
+    "build": {
+      "configurations": {
+        "production": {}
+      }
+    },
     "test": {},
     "lint": {},
     "check": {},

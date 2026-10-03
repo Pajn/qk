@@ -34,18 +34,23 @@ explicit executor with `options.commands` for multiple commands.
 
 An object, empty by default, of executor-specific options. Selected
 configuration values merge over these by key, followed by task argument
-overrides. Nested objects are replaced rather than recursively merged.
+overrides. Nested objects, including `env`, are replaced rather than recursively
+merged. A configuration with `env: {}` removes the base option's overrides;
+process and dotenv values still apply.
 
 ## `configurations`
 
 An object mapping configuration names to option objects, empty by default.
 Select with `-c release` or `project:target:release`. `--prod` selects
-`production`. Configuration names propagate to dependencies that define
-that name; otherwise each dependency uses its default configuration.
+`production`. Requested configuration names propagate through dependencies.
+A dependency without that configuration uses its own default, while its
+dependencies still receive the requested name.
 
 ## `defaultConfiguration`
 
 An optional string selecting a configuration when none is requested.
+Without a requested configuration, each task chooses its own default;
+a parent's default does not propagate to its dependencies.
 
 ## `dependsOn`
 

@@ -169,6 +169,7 @@ impl Builder<'_> {
             }
             return Ok(None);
         };
+        let requested_configuration = request.configuration.clone();
         let configuration = match request.configuration {
             Some(name) if target.configurations.contains_key(&name) => Some(name),
             Some(name) if required => bail!(
@@ -215,18 +216,12 @@ impl Builder<'_> {
                         Some(serde_json::from_value(value.clone()).with_context(|| {
                             format!("{id}: configuration outputs must be an array of paths")
                         })?);
-                } else if key == "env" {
-                    let overlay = value
-                        .as_object()
-                        .with_context(|| format!("{id}: configuration env must be an object"))?;
-                    let base = definition
-                        .options
-                        .entry("env")
-                        .or_insert_with(|| serde_json::json!({}));
-                    base.as_object_mut()
-                        .with_context(|| format!("{id}: options.env must be an object"))?
-                        .extend(overlay.clone());
                 } else {
+                    if key == "env" {
+                        value.as_object().with_context(|| {
+                            format!("{id}: configuration env must be an object")
+                        })?;
+                    }
                     definition.options.insert(key.clone(), value.clone());
                 }
             }
@@ -245,6 +240,7 @@ impl Builder<'_> {
         self.collect(
             &task,
             &task.project,
+            requested_configuration.as_deref(),
             &mut dependencies,
             &mut BTreeSet::new(),
         )?;
@@ -267,6 +263,7 @@ impl Builder<'_> {
         &mut self,
         task: &Task,
         derive_from: &str,
+        requested_configuration: Option<&str>,
         dependencies: &mut BTreeSet<String>,
         seen: &mut BTreeSet<String>,
     ) -> Result<()> {
@@ -275,7 +272,7 @@ impl Builder<'_> {
         }
         for dependency in task.definition.depends_on.as_deref().unwrap_or_default() {
             let (requests, derived) = self
-                .dependencies(task, derive_from, dependency)
+                .dependencies(task, derive_from, requested_configuration, dependency)
                 .with_context(|| format!("dependsOn of {}", task.id))?;
             for request in requests {
                 let has_target = self.workspace.projects[&request.project]
@@ -283,7 +280,7 @@ impl Builder<'_> {
                     .contains_key(&request.target);
                 if derived && !has_target {
                     let project = request.project;
-                    self.collect(task, &project, dependencies, seen)?;
+                    self.collect(task, &project, requested_configuration, dependencies, seen)?;
                 } else if request.project == task.project && request.target == task.target {
                     // Reached back to itself through a dependency cycle.
                     continue;
@@ -301,6 +298,7 @@ impl Builder<'_> {
         &self,
         task: &Task,
         derive_from: &str,
+        requested_configuration: Option<&str>,
         value: &Value,
     ) -> Result<(Vec<Request>, bool)> {
         let mut forward_options = false;
@@ -417,7 +415,7 @@ impl Builder<'_> {
                 projects.iter().map(|project| Request {
                     project: project.clone(),
                     target: target.clone(),
-                    configuration: task.configuration.clone(),
+                    configuration: requested_configuration.map(str::to_owned),
                     args: args.clone(),
                 })
             })
