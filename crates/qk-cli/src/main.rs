@@ -338,6 +338,10 @@ impl RunOptions {
             .or_else(|| self.prod.then(|| "production".to_owned()))
     }
 
+    fn graph_target(&self) -> Option<&str> {
+        self.graph.as_deref().filter(|target| *target != "false")
+    }
+
     fn skips_cache(&self) -> bool {
         self.skip_cache || env_flag("NX_SKIP_NX_CACHE")
     }
@@ -973,16 +977,17 @@ fn run(mut cli: Cli) -> Result<i32> {
             options,
         } => {
             let selected = select_projects(&workspace.projects, &projects, &exclude)?;
-            let graph = TaskGraph::build(
+            let candidates = requests(
                 &workspace,
-                &requests(
-                    &workspace,
-                    selected,
-                    &targets,
-                    options.configuration().as_ref(),
-                    &options.args,
-                ),
-            )?;
+                selected,
+                &targets,
+                options.configuration().as_ref(),
+                &options.args,
+            );
+            if candidates.is_empty() && options.graph_target().is_some() {
+                return execute_tasks(&workspace, candidates, &options, false);
+            }
+            let graph = TaskGraph::build(&workspace, &candidates)?;
             let analysis = qk_affected::affected_tasks(&workspace, &graph, &changes.options())?;
             warn_landed(analysis.range.as_ref());
             let requests: Vec<Request> = graph
@@ -1000,7 +1005,7 @@ fn run(mut cli: Cli) -> Result<i32> {
                     }
                 })
                 .collect();
-            if requests.is_empty() {
+            if requests.is_empty() && options.graph_target().is_none() {
                 eprintln!("qk: no affected tasks");
                 return Ok(0);
             }
@@ -1025,7 +1030,7 @@ fn run(mut cli: Cli) -> Result<i32> {
                 options.configuration().as_ref(),
                 &options.args,
             );
-            if requests.is_empty() {
+            if requests.is_empty() && options.graph_target().is_none() {
                 eprintln!("qk: no affected tasks");
                 return Ok(0);
             }
@@ -1198,21 +1203,29 @@ fn execute_tasks(
     single: bool,
 ) -> Result<i32> {
     options.export();
-    let graph = TaskGraph::build_with(
-        workspace,
-        &requests,
-        qk_taskgraph::BuildOptions {
-            exclude_task_dependencies: options.exclude_task_dependencies,
-            ignore_cycles: options.nx_ignore_cycles || env_flag("NX_IGNORE_CYCLES"),
-        },
-    )?;
+    let graph = if requests.is_empty() && options.graph_target().is_some() {
+        TaskGraph {
+            roots: Default::default(),
+            tasks: Default::default(),
+            cycles: Default::default(),
+        }
+    } else {
+        TaskGraph::build_with(
+            workspace,
+            &requests,
+            qk_taskgraph::BuildOptions {
+                exclude_task_dependencies: options.exclude_task_dependencies,
+                ignore_cycles: options.nx_ignore_cycles || env_flag("NX_IGNORE_CYCLES"),
+            },
+        )?
+    };
     for cycle in &graph.cycles {
         qk_executor::status!(
             "qk: the task graph has a cycle, broken as Nx does: {}",
             cycle.join(" -> ")
         );
     }
-    if let Some(target) = options.graph.as_deref().filter(|target| *target != "false") {
+    if let Some(target) = options.graph_target() {
         let mut bytes = serde_json::to_vec_pretty(&nx_task_graph(workspace, &graph)?)?;
         bytes.push(b'\n');
         if target == "stdout" || target == "true" {
