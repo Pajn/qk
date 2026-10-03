@@ -251,6 +251,69 @@ fn run_many_configuration_applies_only_where_defined_like_nx() {
 }
 
 #[test]
+fn root_configuration_fallback_preserves_the_requested_name_for_dependencies() {
+    let temp = TempDir::new().unwrap();
+    std::fs::write(temp.path().join("nx.json"), "{}").unwrap();
+    for (name, mut target) in [
+        (
+            "app",
+            json!({"dependsOn":["tool:build"], "configurations":{"prod":{}}}),
+        ),
+        (
+            "tool",
+            json!({"defaultConfiguration":"dev", "dependsOn":["leaf:build"], "configurations":{"dev":{}}}),
+        ),
+        ("leaf", json!({"configurations":{"prod":{}}})),
+    ] {
+        target["executor"] = json!("nx:noop");
+        std::fs::create_dir(temp.path().join(name)).unwrap();
+        std::fs::write(
+            temp.path().join(name).join("project.json"),
+            json!({"name":name, "targets":{"build":target}}).to_string(),
+        )
+        .unwrap();
+    }
+    for args in [
+        vec!["run-many"],
+        vec![
+            "affected",
+            "--files=tool/project.json",
+            "--granularity=task",
+        ],
+    ] {
+        let graph = successful_json(
+            Command::new(env!("CARGO_BIN_EXE_qk"))
+                .arg("--workspace")
+                .arg(temp.path())
+                .args(args)
+                .args(["-t", "build", "-p", "tool", "-c", "prod", "--dry-run"])
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(graph["roots"], json!(["tool:build:dev"]));
+        assert_eq!(
+            graph["tasks"]["tool:build:dev"]["dependencies"],
+            json!(["leaf:build:prod"])
+        );
+        assert!(graph["tasks"]["leaf:build:prod"].is_object());
+    }
+    let inspect = |args: &[&str]| {
+        successful_json(
+            Command::new(env!("CARGO_BIN_EXE_qk"))
+                .arg("--workspace")
+                .arg(temp.path())
+                .args(args)
+                .output()
+                .unwrap(),
+        )
+    };
+    assert_eq!(
+        inspect(&["show", "target", "app:build", "-c", "prod", "--json"]),
+        inspect(&["show", "target", "app:build:prod", "--json"])
+    );
+}
+
+#[test]
 fn affected_selects_touched_projects_and_their_dependents() {
     let output = qk(&[
         "show",

@@ -76,11 +76,12 @@ try {
       defaultConfiguration: 'dev', dependsOn: ['leaf:build'], configurations: { dev: {} },
     }) } });
     write(root, 'leaf/project.json', { name: 'leaf', targets: { build: target('leaf', { configurations: { prod: {}, dev: {} } }) } });
-    for (const [name, args] of [
-      ['default', []], ['explicit', ['-c', 'prod']], ['empty-env', ['-c', 'empty']],
+    for (const [name, project, args] of [
+      ['default', 'app', []], ['explicit', 'app', ['-c', 'prod']],
+      ['empty-env', 'app', ['-c', 'empty']], ['root-fallback', 'tool', ['-c', 'prod']],
     ]) {
       clear(records);
-      run(root, ['run-many', '-t', 'build', '-p', 'app', ...args], { env: {
+      run(root, ['run-many', '-t', 'build', '-p', project, ...args], { env: {
         BEHAVIOR_RECORDS: records, QK_PARITY_BASE: 'inherited-base',
         QK_PARITY_BOTH: 'inherited-both', QK_PARITY_CONFIG: 'inherited-config',
       } });

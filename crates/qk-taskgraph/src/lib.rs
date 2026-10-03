@@ -13,6 +13,8 @@ pub struct Request {
     pub project: String,
     pub target: String,
     pub configuration: Option<String>,
+    /// Configuration name propagated to dependencies, before root fallback.
+    pub requested_configuration: Option<String>,
     pub args: Vec<String>,
 }
 
@@ -26,6 +28,7 @@ impl Request {
             project: parts[0].into(),
             target: parts[1].into(),
             configuration: parts.get(2).map(|part| (*part).into()),
+            requested_configuration: parts.get(2).map(|part| (*part).into()),
             args: Vec::new(),
         })
     }
@@ -81,6 +84,7 @@ impl TaskGraph {
             projects,
             tasks: BTreeMap::new(),
             visiting: Vec::new(),
+            visited: BTreeSet::new(),
             ignore_cycles: options.ignore_cycles,
             cycles: Vec::new(),
         };
@@ -148,6 +152,7 @@ struct Builder<'a> {
     projects: ProjectGraph,
     tasks: BTreeMap<String, Task>,
     visiting: Vec<String>,
+    visited: BTreeSet<(String, Option<String>)>,
     ignore_cycles: bool,
     cycles: Vec<Vec<String>>,
 }
@@ -169,7 +174,7 @@ impl Builder<'_> {
             }
             return Ok(None);
         };
-        let requested_configuration = request.configuration.clone();
+        let requested_configuration = request.requested_configuration.clone();
         let configuration = match request.configuration {
             Some(name) if target.configurations.contains_key(&name) => Some(name),
             Some(name) if required => bail!(
@@ -202,7 +207,12 @@ impl Builder<'_> {
             if existing.args != request.args {
                 bail!("task {id} requested with conflicting forwarded arguments");
             }
-            return Ok(Some(id));
+            if self
+                .visited
+                .contains(&(id.clone(), requested_configuration.clone()))
+            {
+                return Ok(Some(id));
+            }
         }
         let mut definition = target.clone();
         if let Some(name) = &configuration {
@@ -236,7 +246,11 @@ impl Builder<'_> {
             dependencies: BTreeSet::new(),
         };
         self.visiting.push(id.clone());
-        let mut dependencies = BTreeSet::new();
+        let mut dependencies = self
+            .tasks
+            .get(&id)
+            .map(|task| task.dependencies.clone())
+            .unwrap_or_default();
         self.collect(
             &task,
             &task.project,
@@ -245,6 +259,7 @@ impl Builder<'_> {
             &mut BTreeSet::new(),
         )?;
         self.visiting.pop();
+        self.visited.insert((id.clone(), requested_configuration));
         self.tasks.insert(
             id.clone(),
             Task {
@@ -416,6 +431,7 @@ impl Builder<'_> {
                     project: project.clone(),
                     target: target.clone(),
                     configuration: requested_configuration.map(str::to_owned),
+                    requested_configuration: requested_configuration.map(str::to_owned),
                     args: args.clone(),
                 })
             })

@@ -77,6 +77,20 @@
       "configured": "inherited-config"
     }
   },
+  "configuration-root-fallback": {
+    "leaf": {
+      "configuration": "prod",
+      "base": "inherited-base",
+      "both": "inherited-both",
+      "configured": "inherited-config"
+    },
+    "tool": {
+      "configuration": "dev",
+      "base": "inherited-base",
+      "both": "inherited-both",
+      "configured": "inherited-config"
+    }
+  },
   "cache-direct": [
     [
       "consumer.ran",

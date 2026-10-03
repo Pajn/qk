@@ -995,6 +995,7 @@ fn run(mut cli: Cli) -> Result<i32> {
                         project: task.project.clone(),
                         target: task.target.clone(),
                         configuration: task.configuration.clone(),
+                        requested_configuration: options.configuration(),
                         args: task.args.clone(),
                     }
                 })
@@ -1396,6 +1397,7 @@ fn run_task(workspace: &Workspace, task: String, options: &RunOptions) -> Result
         {
             request.target = combined;
             request.configuration = None;
+            request.requested_configuration = None;
         }
     }
     if let Some(configuration) = &options.configuration() {
@@ -1407,6 +1409,7 @@ fn run_task(workspace: &Workspace, task: String, options: &RunOptions) -> Result
             bail!("configuration in task identifier conflicts with --configuration");
         }
         request.configuration = Some(configuration.clone());
+        request.requested_configuration = Some(configuration.clone());
     }
     request.args = options.args.clone();
     execute_tasks(workspace, vec![request], options, true)
@@ -1490,6 +1493,7 @@ fn exec(
             project,
             target,
             configuration: options.configuration(),
+            requested_configuration: options.configuration(),
             args,
         };
         return execute_tasks(workspace, vec![request], &options, true);
@@ -1650,13 +1654,15 @@ fn requests(
         for target in targets {
             if let Some(definition) = workspace.projects[&project].targets.get(target) {
                 // Like Nx, a target without the configuration runs its default.
-                let configuration = configuration
-                    .cloned()
+                let requested_configuration = configuration.cloned();
+                let configuration = requested_configuration
+                    .clone()
                     .filter(|name| definition.configurations.contains_key(name));
                 requests.push(Request {
                     project: project.clone(),
                     target: target.clone(),
                     configuration,
+                    requested_configuration,
                     args: args.to_vec(),
                 });
             }

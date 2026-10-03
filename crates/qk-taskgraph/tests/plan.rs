@@ -61,6 +61,30 @@ fn preserves_requested_configuration_across_dependency_defaults() {
 }
 
 #[test]
+fn shared_tasks_collect_dependencies_from_each_requested_configuration() {
+    let (_temp, workspace) = workspace(json!({
+        "app": {"targets":{"build":{"dependsOn":["tool:build"], "configurations":{"prod":{}}}}},
+        "tool": {"targets":{"build":{"defaultConfiguration":"dev", "dependsOn":["leaf:build"], "configurations":{"dev":{}}}}},
+        "leaf": {"targets":{"build":{"configurations":{"prod":{}}}}}
+    }));
+    let mut plans = Vec::new();
+    for requests in [
+        ["app:build:prod", "tool:build"],
+        ["tool:build", "app:build:prod"],
+    ] {
+        let requests = requests.map(|request| Request::parse(request).unwrap());
+        let graph = TaskGraph::build(&workspace, &requests).unwrap();
+        assert_eq!(graph.tasks.len(), 4);
+        assert_eq!(
+            graph.tasks["tool:build:dev"].dependencies,
+            ["leaf:build".to_owned(), "leaf:build:prod".to_owned()].into()
+        );
+        plans.push(serde_json::to_value(graph).unwrap());
+    }
+    assert_eq!(plans[0], plans[1]);
+}
+
+#[test]
 fn configuration_environment_replaces_base_environment() {
     let (_temp, workspace) = workspace(json!({
         "app": {"targets":{"build":{
