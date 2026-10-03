@@ -1385,21 +1385,7 @@ fn run_task(workspace: &Workspace, task: String, options: &RunOptions) -> Result
     } else {
         format!("{}:{task}", current_project(workspace)?)
     };
-    let mut request = Request::parse(&task)?;
-    // As in Nx, `project:a:b` is the target `a:b` when the project has
-    // one, and the target `a` in configuration `b` otherwise.
-    if let Some(configuration) = &request.configuration {
-        let combined = format!("{}:{configuration}", request.target);
-        if workspace
-            .projects
-            .get(&request.project)
-            .is_some_and(|project| project.targets.contains_key(&combined))
-        {
-            request.target = combined;
-            request.configuration = None;
-            request.requested_configuration = None;
-        }
-    }
+    let mut request = Request::parse_in(workspace, &task)?;
     if let Some(configuration) = &options.configuration() {
         if request
             .configuration

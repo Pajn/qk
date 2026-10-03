@@ -1,4 +1,56 @@
 {
+  "cache-workspace-scope": [
+    {
+      "tasks": [
+        "consumer.ran"
+      ],
+      "output": "one"
+    },
+    {
+      "tasks": [
+        "consumer.ran"
+      ],
+      "output": "two"
+    },
+    {
+      "tasks": [],
+      "output": "two"
+    }
+  ],
+  "cache-generated-source": [
+    {
+      "tasks": [
+        "consumer.ran",
+        "producer.ran"
+      ],
+      "output": "one"
+    },
+    {
+      "tasks": [
+        "consumer.ran",
+        "producer.ran"
+      ],
+      "output": "two"
+    }
+  ],
+  "cache-root-ignore": [
+    {
+      "tasks": [
+        "consumer.ran"
+      ],
+      "output": ".nx/\n.qk/\nnode_modules/\n**/dist/\n"
+    },
+    {
+      "tasks": [
+        "consumer.ran"
+      ],
+      "output": ".nx/\n.qk/\nnode_modules/\n**/dist/\n# changed\n"
+    },
+    {
+      "tasks": [],
+      "output": ".nx/\n.qk/\nnode_modules/\n**/dist/\n# changed\n"
+    }
+  ],
   "configuration-default": {
     "app": {
       "configuration": "prod",

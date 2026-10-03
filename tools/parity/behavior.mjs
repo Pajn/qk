@@ -62,6 +62,53 @@ if (task === 'producer') {
   writeFileSync('app/dist/result', readFileSync('producer/dist/value.d.ts'));
 }`;
 try {
+  for (const kind of ['workspace-scope', 'generated-source', 'root-ignore']) {
+    const { root, records } = workspace();
+    write(root, 'record.mjs', `import {readFileSync,writeFileSync,mkdirSync} from 'node:fs';
+import {join} from 'node:path';
+const producer=process.argv[2]==='producer';
+writeFileSync(join(process.env.BEHAVIOR_RECORDS,(producer?'producer':'consumer')+'.ran'),'ran');
+if(producer){writeFileSync('app/src/generated.txt',readFileSync('seed.txt'));}
+else {mkdirSync('app/dist',{recursive:true});writeFileSync('app/dist/result',readFileSync(process.env.SOURCE));}`);
+    write(root, 'app/src/input.txt', 'constant');
+    let inputs, dependencies=[];
+    let source;
+    if (kind === 'workspace-scope') {
+      write(root, 'nx.json', {namedInputs:{production:['{projectRoot}/src/**/*','!{projectRoot}/src/**/*.test.txt']}});
+      write(root, 'lib/project.json', {name:'lib'});
+      write(root, 'lib/src/value.test.txt', 'one');
+      inputs=['{workspaceRoot}/lib/src/**/*','^production'];
+      source='lib/src/value.test.txt';
+    } else if (kind === 'generated-source') {
+      write(root, 'seed.txt', 'one');
+      inputs=['{projectRoot}/src/**/*',{dependentTasksOutputFiles:'**/manifest.json'}];
+      dependencies=['generate'];
+      source='app/src/generated.txt';
+    } else {
+      inputs=['{projectRoot}/src/**/*'];
+      source='.gitignore';
+    }
+    write(root, 'app/project.json', {name:'app', implicitDependencies:kind==='workspace-scope'?['lib']:[], targets:{
+      generate:{command:'node record.mjs producer',cache:true,inputs:['{workspaceRoot}/seed.txt'],outputs:['{projectRoot}/src/generated.txt']},
+      build:{command:'node record.mjs consumer',cache:true,inputs,outputs:['{projectRoot}/dist'],dependsOn:dependencies}
+    }});
+    const phases=[];
+    // Nx can miss again after it snapshots generated source before the producer.
+    // Compare the changed result here; Rust tests cover qk's subsequent reuse.
+    for (let phase=0;phase<(kind==='generated-source'?2:3);phase++) {
+      if (phase===1) {
+        const path=kind==='generated-source'?'seed.txt':source;
+        write(root,path,kind==='root-ignore'?readFileSync(join(root,path),'utf8')+'# changed\n':'two');
+        const timestamp=new Date(Date.now()+2000);
+        utimesSync(join(root,path),timestamp,timestamp);
+      }
+      clear(records);
+      run(root,['run','app:build'],{env:{BEHAVIOR_RECORDS:records,SOURCE:source}});
+      phases.push({tasks:tasks(records),output:readFileSync(join(root,'app/dist/result'),'utf8')});
+    }
+    result[`cache-${kind}`]=phases;
+  }
+
   {
     const { root, records } = workspace();
     write(root, 'record.mjs', `import {writeFileSync} from 'node:fs';import {join} from 'node:path';writeFileSync(join(process.env.BEHAVIOR_RECORDS,process.argv[2]+'.json'),JSON.stringify({configuration:process.env.NX_TASK_TARGET_CONFIGURATION??null,base:process.env.QK_PARITY_BASE,both:process.env.QK_PARITY_BOTH,configured:process.env.QK_PARITY_CONFIG}));`);
