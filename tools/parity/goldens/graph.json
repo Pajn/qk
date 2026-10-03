@@ -325,7 +325,9 @@
               "options": {
                 "command": "node scripts/task.mjs ui:build packages/ui"
               },
-              "configurations": {},
+              "configurations": {
+                "production": {}
+              },
               "parallelism": true
             },
             "test": {

@@ -289,8 +289,10 @@ fn configuration_cwd_tokens_and_environment_precedence() {
     target["options"]["cwd"] = json!("{workspaceRoot}/working directory");
     target["env"] = json!({"QK_TEST_TARGET":"top", "QK_TEST_OVERRIDE":"top"});
     target["options"]["env"]["QK_TEST_OVERRIDE"] = json!("options");
-    target["options"]["env"]["QK_TEST_PROJECT"] = json!("{projectName}:{projectRoot}");
-    target["configurations"] = json!({"prod":{"env":{"QK_TEST_OVERRIDE":"configuration"}}});
+    target["options"]["env"]["QK_TEST_BASE_ONLY"] = json!("base");
+    target["configurations"] = json!({"prod":{"env":{
+        "QK_TEST_OVERRIDE":"configuration", "QK_TEST_PROJECT":"{projectName}:{projectRoot}"
+    }}});
     let temp = fixture(json!({"build":target}));
     fs::create_dir(temp.path().join("working directory")).unwrap();
     fs::write(
@@ -305,6 +307,9 @@ fn configuration_cwd_tokens_and_environment_precedence() {
     .unwrap();
     success(
         command(temp.path(), &["run", "app:build", "-c", "prod"])
+            .env("QK_TEST_MODE", "record")
+            .env("QK_TEST_ID", "result")
+            .env_remove("QK_TEST_BASE_ONLY")
             .env("QK_TEST_PARENT", "parent")
             .output()
             .unwrap(),
@@ -332,6 +337,7 @@ fn configuration_cwd_tokens_and_environment_precedence() {
     ] {
         assert_eq!(result["env"][key], expected, "{key}");
     }
+    assert!(result["env"].get("QK_TEST_BASE_ONLY").is_none());
 }
 
 #[test]

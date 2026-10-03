@@ -13,6 +13,8 @@ pub struct Request {
     pub project: String,
     pub target: String,
     pub configuration: Option<String>,
+    /// Configuration name propagated to dependencies, before root fallback.
+    pub requested_configuration: Option<String>,
     pub args: Vec<String>,
 }
 
@@ -26,6 +28,7 @@ impl Request {
             project: parts[0].into(),
             target: parts[1].into(),
             configuration: parts.get(2).map(|part| (*part).into()),
+            requested_configuration: parts.get(2).map(|part| (*part).into()),
             args: Vec::new(),
         })
     }
@@ -81,6 +84,7 @@ impl TaskGraph {
             projects,
             tasks: BTreeMap::new(),
             visiting: Vec::new(),
+            visited: BTreeSet::new(),
             ignore_cycles: options.ignore_cycles,
             cycles: Vec::new(),
         };
@@ -148,6 +152,7 @@ struct Builder<'a> {
     projects: ProjectGraph,
     tasks: BTreeMap<String, Task>,
     visiting: Vec<String>,
+    visited: BTreeSet<(String, Option<String>)>,
     ignore_cycles: bool,
     cycles: Vec<Vec<String>>,
 }
@@ -169,6 +174,7 @@ impl Builder<'_> {
             }
             return Ok(None);
         };
+        let requested_configuration = request.requested_configuration.clone();
         let configuration = match request.configuration {
             Some(name) if target.configurations.contains_key(&name) => Some(name),
             Some(name) if required => bail!(
@@ -201,7 +207,12 @@ impl Builder<'_> {
             if existing.args != request.args {
                 bail!("task {id} requested with conflicting forwarded arguments");
             }
-            return Ok(Some(id));
+            if self
+                .visited
+                .contains(&(id.clone(), requested_configuration.clone()))
+            {
+                return Ok(Some(id));
+            }
         }
         let mut definition = target.clone();
         if let Some(name) = &configuration {
@@ -215,18 +226,12 @@ impl Builder<'_> {
                         Some(serde_json::from_value(value.clone()).with_context(|| {
                             format!("{id}: configuration outputs must be an array of paths")
                         })?);
-                } else if key == "env" {
-                    let overlay = value
-                        .as_object()
-                        .with_context(|| format!("{id}: configuration env must be an object"))?;
-                    let base = definition
-                        .options
-                        .entry("env")
-                        .or_insert_with(|| serde_json::json!({}));
-                    base.as_object_mut()
-                        .with_context(|| format!("{id}: options.env must be an object"))?
-                        .extend(overlay.clone());
                 } else {
+                    if key == "env" {
+                        value.as_object().with_context(|| {
+                            format!("{id}: configuration env must be an object")
+                        })?;
+                    }
                     definition.options.insert(key.clone(), value.clone());
                 }
             }
@@ -241,14 +246,20 @@ impl Builder<'_> {
             dependencies: BTreeSet::new(),
         };
         self.visiting.push(id.clone());
-        let mut dependencies = BTreeSet::new();
+        let mut dependencies = self
+            .tasks
+            .get(&id)
+            .map(|task| task.dependencies.clone())
+            .unwrap_or_default();
         self.collect(
             &task,
             &task.project,
+            requested_configuration.as_deref(),
             &mut dependencies,
             &mut BTreeSet::new(),
         )?;
         self.visiting.pop();
+        self.visited.insert((id.clone(), requested_configuration));
         self.tasks.insert(
             id.clone(),
             Task {
@@ -267,6 +278,7 @@ impl Builder<'_> {
         &mut self,
         task: &Task,
         derive_from: &str,
+        requested_configuration: Option<&str>,
         dependencies: &mut BTreeSet<String>,
         seen: &mut BTreeSet<String>,
     ) -> Result<()> {
@@ -275,7 +287,7 @@ impl Builder<'_> {
         }
         for dependency in task.definition.depends_on.as_deref().unwrap_or_default() {
             let (requests, derived) = self
-                .dependencies(task, derive_from, dependency)
+                .dependencies(task, derive_from, requested_configuration, dependency)
                 .with_context(|| format!("dependsOn of {}", task.id))?;
             for request in requests {
                 let has_target = self.workspace.projects[&request.project]
@@ -283,7 +295,7 @@ impl Builder<'_> {
                     .contains_key(&request.target);
                 if derived && !has_target {
                     let project = request.project;
-                    self.collect(task, &project, dependencies, seen)?;
+                    self.collect(task, &project, requested_configuration, dependencies, seen)?;
                 } else if request.project == task.project && request.target == task.target {
                     // Reached back to itself through a dependency cycle.
                     continue;
@@ -301,6 +313,7 @@ impl Builder<'_> {
         &self,
         task: &Task,
         derive_from: &str,
+        requested_configuration: Option<&str>,
         value: &Value,
     ) -> Result<(Vec<Request>, bool)> {
         let mut forward_options = false;
@@ -417,7 +430,8 @@ impl Builder<'_> {
                 projects.iter().map(|project| Request {
                     project: project.clone(),
                     target: target.clone(),
-                    configuration: task.configuration.clone(),
+                    configuration: requested_configuration.map(str::to_owned),
+                    requested_configuration: requested_configuration.map(str::to_owned),
                     args: args.clone(),
                 })
             })

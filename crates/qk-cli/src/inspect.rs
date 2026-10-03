@@ -61,6 +61,7 @@ pub fn show(workspace: &Workspace, options: Options) -> Result<i32> {
     };
     let mut request = Request::parse(&name)?;
     if options.configuration.is_some() {
+        request.requested_configuration = options.configuration.clone();
         request.configuration = options.configuration;
     }
     let graph = TaskGraph::build(workspace, &[request])?;
