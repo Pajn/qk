@@ -1101,8 +1101,9 @@ pub fn resolve(
             .filter(|pattern| !pattern.excluded)
             .any(|pattern| {
                 declared.anchors().any(|anchor| {
-                    !snapshot.source_ignore.matches_directory(anchor)
-                        && overlaps(&pattern.prefix, anchor)
+                    overlaps(&pattern.prefix, anchor)
+                        && (!snapshot.source_ignore.matches_directory(anchor)
+                            || !workspace.root.join(anchor).is_dir())
                 })
             });
         if !relevant {

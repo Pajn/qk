@@ -709,3 +709,44 @@ fn deleted_mandatory_workspace_files_affect_tasks_with_narrow_inputs() {
         assert!(tasks.values().all(|cause| matches!(cause, qk_affected::TaskCause::Touched {reasons} if reasons.iter().any(|reason| matches!(reason,qk_affected::TaskReason::Input {file:changed} if changed==file)))));
     }
 }
+
+/// Ignored deleted artifacts do not invalidate every task; explicit JSON reads still count.
+#[test]
+fn ignored_deleted_manifests_only_affect_explicit_consumers() {
+    for name in ["package.json", "project.json"] {
+        for explicit in [false, true] {
+            let file = format!("apps/app/artifacts/{name}");
+            let inputs = if explicit {
+                serde_json::json!([{"json":format!("{{projectRoot}}/artifacts/{name}")}])
+            } else {
+                serde_json::json!(["{projectRoot}/src/**/*"])
+            };
+            let config = serde_json::json!({"targetDefaults":{
+                "build":{"command":"echo build","inputs":inputs},
+                "test":{"command":"echo test","inputs":["{projectRoot}/src/**/*"]}
+            }})
+            .to_string();
+            let repo = Repo::new(&[
+                ("nx.json", &config),
+                (".nxignore", "apps/app/artifacts/\n"),
+                (
+                    "apps/app/project.json",
+                    r#"{"name":"app","targets":{"build":{},"test":{}}}"#,
+                ),
+                (
+                    "libs/lib/project.json",
+                    r#"{"name":"lib","targets":{"build":{},"test":{}}}"#,
+                ),
+                (&file, r#"{"version":1}"#),
+            ]);
+            std::fs::remove_file(repo.root.join(&file)).unwrap();
+            let tasks = affected_tasks(&repo);
+            let expected = if explicit { vec!["app:build"] } else { vec![] };
+            assert_eq!(
+                tasks.keys().map(String::as_str).collect::<Vec<_>>(),
+                expected,
+                "{file}, explicit={explicit}"
+            );
+        }
+    }
+}
