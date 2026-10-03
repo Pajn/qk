@@ -303,7 +303,12 @@ impl Snapshot {
     /// Adds paths to the candidate files, such as files deleted since a base
     /// revision.
     pub fn with_candidates(mut self, paths: &[String]) -> Self {
-        self.files.extend(paths.iter().cloned());
+        self.files.extend(
+            paths
+                .iter()
+                .filter(|path| !self.source_ignore.matches(path))
+                .cloned(),
+        );
         self.extra_candidates.extend(paths.iter().cloned());
         self
     }
@@ -1124,9 +1129,13 @@ pub fn resolve(
         }
     }
     for selection in resolver.scopes.values() {
-        resolver
-            .selected
-            .extend(selection.included.difference(&selection.excluded).cloned());
+        resolver.selected.extend(
+            selection
+                .included
+                .difference(&selection.excluded)
+                .filter(|path| own_outputs.as_ref().is_none_or(|own| !own.matches(path)))
+                .cloned(),
+        );
     }
     let readable = snapshot
         .installed(&workspace.root)?
