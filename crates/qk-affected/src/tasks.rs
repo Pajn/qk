@@ -5,6 +5,7 @@
 //! count as unchanged, since the base revision's environment is unknowable.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::Result;
 use qk_config::Workspace;
@@ -115,26 +116,43 @@ pub fn affected_tasks(
         }
     };
     let mut tasks = BTreeMap::new();
+    let canonical_root = workspace.root.canonicalize()?;
+    let mut links = BTreeMap::new();
     for (id, inputs) in &resolved {
         let mut reasons = Vec::new();
         if let Some(file) = deleted_manifest {
             reasons.push(TaskReason::DeletedManifest { file: file.clone() });
         }
-        for file in inputs
-            .files
-            .iter()
-            .filter(|file| changed.contains(file.as_str()))
-        {
-            reasons.push(TaskReason::Input { file: file.clone() });
+        let mut touched = BTreeSet::new();
+        for file in inputs.files.iter().map(String::as_str).chain(
+            inputs
+                .values
+                .keys()
+                .filter_map(|key| key.strip_prefix("json:")),
+        ) {
+            if changed.contains(file) {
+                touched.insert(file);
+                continue;
+            }
+            if !links.contains_key(file) {
+                links.insert(file.to_owned(), symlink_targets(&canonical_root, file)?);
+            }
+            for target in &links[file] {
+                touched.extend(
+                    changes
+                        .files
+                        .iter()
+                        .filter(|changed| {
+                            **changed == *target
+                                || changed
+                                    .strip_prefix(target)
+                                    .is_some_and(|suffix| suffix.starts_with('/'))
+                        })
+                        .map(String::as_str),
+                );
+            }
         }
-        // A JSON input's file, by any change: coarser than the key, which only
-        // follows the fields it selects.
-        for file in inputs
-            .values
-            .keys()
-            .filter_map(|key| key.strip_prefix("json:"))
-            .filter(|file| changed.contains(file))
-        {
+        for file in touched {
             reasons.push(TaskReason::Input {
                 file: file.to_owned(),
             });
@@ -208,4 +226,69 @@ pub fn affected_tasks(
         files: changes.files,
         tasks,
     })
+}
+
+/// Paths a selected symlink reads, including a target that has been deleted.
+fn symlink_targets(root: &Path, path: &str) -> Result<Vec<String>> {
+    let mut pending = vec![root.join(path)];
+    let mut visited = BTreeSet::new();
+    let mut targets = BTreeSet::new();
+    while let Some(absolute) = pending.pop() {
+        if !visited.insert(absolute.clone()) {
+            continue;
+        }
+        let metadata = match std::fs::symlink_metadata(&absolute) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.file_type().is_symlink() {
+            continue;
+        }
+        let target = absolute
+            .parent()
+            .expect("input has a parent")
+            .join(std::fs::read_link(&absolute)?);
+        let mut normalized = PathBuf::new();
+        for component in target.components() {
+            match component {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    normalized.pop();
+                }
+                component => normalized.push(component.as_os_str()),
+            }
+        }
+        let resolved = target.canonicalize().ok().or_else(|| {
+            Some(
+                target
+                    .parent()?
+                    .canonicalize()
+                    .ok()?
+                    .join(target.file_name()?),
+            )
+        });
+        if normalized.starts_with(root) {
+            pending.push(normalized.clone());
+        }
+        if let Some(resolved) = &resolved
+            && resolved.starts_with(root)
+            && resolved.is_dir()
+        {
+            for entry in walkdir::WalkDir::new(resolved).follow_links(false) {
+                let entry = entry?;
+                if entry.file_type().is_symlink() {
+                    pending.push(entry.path().to_owned());
+                }
+            }
+        }
+        for target in std::iter::once(normalized).chain(resolved) {
+            if let Ok(relative) = target.strip_prefix(root)
+                && let Some(relative) = relative.to_str()
+            {
+                targets.insert(relative.replace('\\', "/"));
+            }
+        }
+    }
+    Ok(targets.into_iter().collect())
 }

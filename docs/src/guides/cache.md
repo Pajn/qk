@@ -94,11 +94,15 @@ Every input declaration of Nx 23 is supported:
 As in Nx, a named input cannot use `dependencies` or `projects`. With a
 package manager other than pnpm, lockfiles are always keyed by content.
 `runtime` commands run once per run for each environment.
-`dependentTasksOutputFiles` needs no file access: every dependency's
-fingerprint already covers its declared outputs. `.` and `..` segments in
+`dependentTasksOutputFiles` keys the selected artifacts directly; qk checks
+their listings and contents again after execution before saving a result.
+`.` and `..` segments in
 paths are resolved within the workspace. A symlinked input is keyed by its
 target text and the content it resolves to, including the files below a
-linked directory; links that resolve outside the workspace are not supported.
+linked directory, even when source ignore rules exclude the target. Nested links
+are followed; directory cycles and links outside the workspace run uncached.
+Task-level affected selection follows changes to symlink targets, including
+deletions, even when the target lies outside the source glob that selected the link.
 
 Extended globs (`?(…)`, `*(…)`, `+(…)`, `@(…)`, `!(…)`, `(a|b)` and `{,…}`) are expanded
 exactly as Nx 23 expands them, including its approximations: `+(a|b)` matches
@@ -134,6 +138,8 @@ they depend on.
 On a miss, the task runs with stdout and stderr streamed through a pipe while
 they are recorded, so child processes do not see a terminal. The entry is
 saved only when the task succeeds and its inputs are unchanged afterwards.
+Declared dependency outputs are rechecked too. Cache keys use a new schema so
+entries saved before these artifact checks are not reused.
 On a hit, qk removes existing files matching the declared outputs, copies the
 cached outputs into place and replays the recorded stdout and stderr. As in
 Nx, outputs a worktree already holds for the key are left as they are: after

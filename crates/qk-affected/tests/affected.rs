@@ -504,6 +504,72 @@ fn empty_task_changes_skip_input_resolution() {
     );
 }
 
+/// Symlink target edits and deletions affect consumers with narrow source globs.
+#[cfg(unix)]
+#[test]
+fn symlink_targets_affect_tasks_that_read_the_link() {
+    use qk_taskgraph::{Request, TaskGraph};
+    for mode in ["file", "directory", "json", "nested"] {
+        let inputs = if mode == "json" {
+            serde_json::json!([{"json":"{projectRoot}/selected/link"}])
+        } else {
+            serde_json::json!(["{projectRoot}/selected/**/*"])
+        };
+        let project = serde_json::json!({"name":"app","targets":{"build":{
+            "command":"echo build", "inputs":inputs,
+        }}})
+        .to_string();
+        let repo = Repo::new(&[
+            ("nx.json", "{}"),
+            ("apps/app/project.json", &project),
+            ("data/value.json", r#"{"value":1}"#),
+        ]);
+        std::fs::create_dir(repo.root.join("apps/app/selected")).unwrap();
+        if mode == "nested" {
+            write(&repo.root, "other/value.json", r#"{"value":1}"#);
+            std::fs::remove_file(repo.root.join("data/value.json")).unwrap();
+            std::os::unix::fs::symlink("../other/value.json", repo.root.join("data/value.json"))
+                .unwrap();
+        }
+        let actual = if mode == "nested" {
+            "other/value.json"
+        } else {
+            "data/value.json"
+        };
+        let target = if mode == "directory" || mode == "nested" {
+            "../../../data"
+        } else {
+            "../../../data/value.json"
+        };
+        std::os::unix::fs::symlink(target, repo.root.join("apps/app/selected/link")).unwrap();
+        commit(&repo.root);
+        let workspace = Workspace::load(&repo.root).unwrap();
+        let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
+        for deleted in [false, true] {
+            if deleted {
+                std::fs::remove_file(repo.root.join(actual)).unwrap();
+            } else {
+                write(&repo.root, actual, r#"{"value":2}"#);
+            }
+            let tasks = qk_affected::affected_tasks(
+                &workspace,
+                &graph,
+                &Options {
+                    files: vec![actual.into()],
+                    ..Options::default()
+                },
+            )
+            .unwrap()
+            .tasks;
+            assert_eq!(
+                tasks.keys().map(String::as_str).collect::<Vec<_>>(),
+                ["app:build"],
+                "{mode}"
+            );
+        }
+    }
+}
+
 /// A branch taken from `origin/main` after it moved on, while the local `main`
 /// stayed behind: `tool` changed on `origin/main`, `lib` on the branch.
 /// Returns the stale local `main`.

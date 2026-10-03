@@ -18,6 +18,9 @@ fn process_helper() {
     fs::write(&counter, (runs + 1).to_string()).unwrap();
     let input_path =
         std::env::var("QK_CACHE_TEST_INPUT").unwrap_or_else(|_| "src/input.txt".into());
+    if mode == "mutate-dependency" && runs == 1 {
+        fs::write(&input_path, "changed during consumer execution\n").unwrap();
+    }
     let input = fs::read_to_string(input_path).unwrap();
     if mode == "generate-source" {
         fs::write("src/generated.txt", input).unwrap();
@@ -748,6 +751,122 @@ fn directory_symlink_inputs_track_their_target() {
     fs::write(fixture.root.join("shared/value.txt"), "b").unwrap();
     success(fixture.build(&fixture.root, &[]));
     assert_eq!(fixture.runs(), 2);
+}
+
+/// Selected directory links read ignored files and the contents of nested links.
+#[cfg(unix)]
+#[test]
+fn directory_symlink_inputs_include_ignored_and_linked_targets() {
+    for nested in [false, true] {
+        let mut build = target("build", json!({"inputs": ["{projectRoot}/src/**/*"]}));
+        build["options"]["env"]["QK_CACHE_TEST_INPUT"] = json!("src/linked/value.txt");
+        let fixture = Fixture::new(build);
+        fs::create_dir(fixture.root.join("shared")).unwrap();
+        fs::create_dir(fixture.root.join("outside")).unwrap();
+        let actual = if nested {
+            "outside/value.txt"
+        } else {
+            "shared/value.txt"
+        };
+        fs::write(fixture.root.join(actual), "one").unwrap();
+        if nested {
+            std::os::unix::fs::symlink(
+                "../outside/value.txt",
+                fixture.root.join("shared/value.txt"),
+            )
+            .unwrap();
+        }
+        fs::write(fixture.root.join(".nxignore"), "shared/\noutside/\n").unwrap();
+        std::os::unix::fs::symlink("../shared", fixture.root.join("src/linked")).unwrap();
+        success(fixture.build(&fixture.root, &[]));
+        success(fixture.build(&fixture.root, &[]));
+        assert_eq!(fixture.runs(), 1);
+        fs::write(fixture.root.join(actual), "two").unwrap();
+        success(fixture.build(&fixture.root, &[]));
+        assert_eq!(fixture.runs(), 2, "nested={nested}");
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("dist/nested/out.txt")).unwrap(),
+            "built:two"
+        );
+    }
+}
+
+/// A cyclic linked directory falls back to execution instead of caching partial data.
+#[cfg(unix)]
+#[test]
+fn directory_symlink_cycles_bypass_the_cache() {
+    let mut build = target("build", json!({"inputs": ["{projectRoot}/src/**/*"]}));
+    build["options"]["env"]["QK_CACHE_TEST_INPUT"] = json!("src/linked/value.txt");
+    let fixture = Fixture::new(build);
+    fs::create_dir(fixture.root.join("shared")).unwrap();
+    fs::write(fixture.root.join("shared/value.txt"), "one").unwrap();
+    std::os::unix::fs::symlink("../shared", fixture.root.join("shared/cycle")).unwrap();
+    std::os::unix::fs::symlink("../shared", fixture.root.join("src/linked")).unwrap();
+    for _ in 0..2 {
+        let output = success(fixture.build(&fixture.root, &[]));
+        assert!(stderr(&output).contains("directory input symlink cycle"));
+    }
+    assert_eq!(fixture.runs(), 2);
+}
+
+/// Removing a linked command's executable bit must not replay an earlier success.
+#[cfg(unix)]
+#[test]
+fn symlink_inputs_track_target_executable_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut build = target(
+        "build",
+        json!({"inputs": ["{projectRoot}/src/link"], "outputs": []}),
+    );
+    build["options"]["command"] = json!("src/link");
+    let fixture = Fixture::new(build);
+    fs::write(fixture.root.join("script"), "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(
+        fixture.root.join("script"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("../script", fixture.root.join("src/link")).unwrap();
+    success(fixture.build(&fixture.root, &[]));
+    fs::set_permissions(
+        fixture.root.join("script"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    let output = fixture.build(&fixture.root, &[]);
+    assert!(!output.status.success());
+    assert!(!stderr(&output).contains("cache hit app:build"));
+}
+
+/// Changed dependency artifacts must not be published under their earlier key.
+#[test]
+fn dependency_artifacts_are_rechecked_after_execution() {
+    for inputs in [
+        json!([]),
+        json!([{"dependentTasksOutputFiles": "**/*.txt"}]),
+    ] {
+        let mut build = target(
+            "mutate-dependency",
+            json!({
+                "dependsOn": ["generate"], "inputs": inputs,
+            }),
+        );
+        build["options"]["env"]["QK_CACHE_TEST_INPUT"] = json!("generated/value.txt");
+        let fixture = Fixture::with_targets(json!({
+            "generate": target("generate", json!({"outputs": ["{projectRoot}/generated"]})),
+            "build": build,
+        }));
+        let first = success(fixture.build(&fixture.root, &[]));
+        assert!(stderr(&first).contains("not caching because inputs changed during execution"));
+        let second = success(fixture.build(&fixture.root, &[]));
+        assert!(!stderr(&second).contains("cache hit app:build"));
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("dist/nested/out.txt")).unwrap(),
+            "built:generated:one\n"
+        );
+        let third = success(fixture.build(&fixture.root, &[]));
+        assert!(stderr(&third).contains("cache hit app:build"));
+    }
 }
 
 /// A lockfile where the root installs `lib` and another importer installs `tool`.

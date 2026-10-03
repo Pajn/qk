@@ -377,6 +377,7 @@ impl Cache {
             let fingerprint = if self.unchanged(
                 snapshot,
                 workspace,
+                graph,
                 task,
                 prepared,
                 &dependencies,
@@ -403,6 +404,7 @@ impl Cache {
             let inputs_unchanged = self.inputs_match(
                 snapshot,
                 workspace,
+                graph,
                 task,
                 prepared,
                 &dependencies,
@@ -441,14 +443,24 @@ impl Cache {
         };
         // Inputs may have changed while another worktree held this key's lock.
         if waited
-            && hash::fingerprint(
+            && hash::recheck_dependency_keys(
                 snapshot,
                 workspace,
+                graph,
                 task,
-                prepared,
                 &dependencies,
                 cancelled,
             )
+            .and_then(|dependencies| {
+                hash::fingerprint(
+                    snapshot,
+                    workspace,
+                    task,
+                    prepared,
+                    &dependencies,
+                    cancelled,
+                )
+            })
             .ok()
             .as_ref()
                 != Some(&key)
@@ -538,6 +550,7 @@ impl Cache {
         let inputs_unchanged = self.inputs_match(
             snapshot,
             workspace,
+            graph,
             task,
             prepared,
             &dependencies,
@@ -584,6 +597,7 @@ impl Cache {
         &self,
         snapshot: &hash::Snapshot,
         workspace: &Workspace,
+        graph: &TaskGraph,
         task: &Task,
         prepared: &PreparedTask,
         dependencies: &BTreeMap<String, String>,
@@ -597,6 +611,7 @@ impl Cache {
         self.inputs_match(
             snapshot,
             workspace,
+            graph,
             task,
             prepared,
             dependencies,
@@ -611,6 +626,7 @@ impl Cache {
         &self,
         snapshot: &hash::Snapshot,
         workspace: &Workspace,
+        graph: &TaskGraph,
         task: &Task,
         prepared: &PreparedTask,
         dependencies: &BTreeMap<String, String>,
@@ -620,7 +636,24 @@ impl Cache {
         if cancelled.load(Ordering::SeqCst) {
             return false;
         }
-        let after = hash::fingerprint(snapshot, workspace, task, prepared, dependencies, cancelled);
+        let after = hash::recheck_dependency_keys(
+            snapshot,
+            workspace,
+            graph,
+            task,
+            dependencies,
+            cancelled,
+        )
+        .and_then(|dependencies| {
+            hash::fingerprint(
+                snapshot,
+                workspace,
+                task,
+                prepared,
+                &dependencies,
+                cancelled,
+            )
+        });
         if after.as_deref().ok() != Some(before) {
             if task.definition.cache == Some(true) {
                 if self.reuse {

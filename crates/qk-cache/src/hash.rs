@@ -357,19 +357,7 @@ impl Snapshot {
         let written = self
             .outputs_written
             .load(std::sync::atomic::Ordering::SeqCst);
-        let declared = Outputs::new(workspace, task)?;
-        let mut files = Vec::new();
-        for entry in declared.entries(&workspace.root)? {
-            let (path, metadata) = entry?;
-            if !metadata.is_dir() {
-                files.push(path);
-            }
-        }
-        let outputs = Arc::new(DependencyOutputs {
-            anchors: declared.anchors().map(str::to_owned).collect(),
-            files,
-            values: Mutex::default(),
-        });
+        let outputs = Arc::new(self.fresh_dependency_outputs(workspace, task)?);
         let mut listed = self.dependency_outputs.lock().unwrap();
         if self
             .outputs_written
@@ -379,6 +367,27 @@ impl Snapshot {
             return Ok(outputs);
         }
         Ok(listed.entry(task.id.clone()).or_insert(outputs).clone())
+    }
+
+    /// Re-list artifacts for verification, without reusing earlier content values.
+    fn fresh_dependency_outputs(
+        &self,
+        workspace: &Workspace,
+        task: &Task,
+    ) -> Result<DependencyOutputs> {
+        let declared = Outputs::new(workspace, task)?;
+        let mut files = Vec::new();
+        for entry in declared.entries(&workspace.root)? {
+            let (path, metadata) = entry?;
+            if !metadata.is_dir() {
+                files.push(path);
+            }
+        }
+        Ok(DependencyOutputs {
+            anchors: declared.anchors().map(str::to_owned).collect(),
+            files,
+            values: Mutex::default(),
+        })
     }
 
     /// Drops the listings `task` may have changed, once it is done. Without
@@ -406,6 +415,15 @@ impl Snapshot {
     }
 
     fn file_value(&self, root: &Path, path: &str) -> Result<Value> {
+        self.file_value_with_links(root, path, &mut BTreeSet::new())
+    }
+
+    fn file_value_with_links(
+        &self,
+        root: &Path,
+        path: &str,
+        visiting: &mut BTreeSet<PathBuf>,
+    ) -> Result<Value> {
         self.safe_parents(root, path)?;
         let absolute = root.join(path);
         let metadata = std::fs::symlink_metadata(&absolute)?;
@@ -419,25 +437,33 @@ impl Snapshot {
                 bail!("input symlink resolves outside the workspace: {path}");
             };
             if resolved.is_file() {
-                return Ok(json!({"link":target, "content":digest_file(&resolved)?}));
+                let metadata = std::fs::metadata(&resolved)?;
+                return Ok(json!({"link":target, "content":digest_file(&resolved)?,
+                    "mode":crate::store::mode(&metadata) & 0o111 != 0}));
             }
-            // A directory link is keyed by the files below its target. Links found
-            // there are keyed by their text only, which rules out cycles.
             let relative = paths::relative(Path::new(""), relative)?;
             if relative.is_empty() {
                 bail!("input symlink resolves to the workspace root: {path}");
             }
-            let mut contents = BTreeMap::new();
-            for file in under(&self.files, &relative) {
-                let absolute = self.canonical_root.join(file);
-                let metadata = std::fs::symlink_metadata(&absolute)?;
-                let value = if metadata.file_type().is_symlink() {
-                    json!({"link": std::fs::read_link(&absolute)?})
-                } else {
-                    json!(self.digest(file, &absolute, &metadata)?)
-                };
-                contents.insert(file.strip_prefix(&relative).unwrap_or(file), value);
+            if !visiting.insert(resolved.clone()) {
+                bail!("directory input symlink cycle: {path}");
             }
+            let mut contents = BTreeMap::new();
+            // Selecting the link explicitly reads its target, even when source
+            // discovery ignores that target or another link is nested inside it.
+            for entry in walkdir::WalkDir::new(&resolved).follow_links(false) {
+                let entry = entry?;
+                if entry.file_type().is_dir() {
+                    continue;
+                }
+                let file = paths::relative(&self.canonical_root, entry.path())?;
+                let value = self.file_value_with_links(&self.canonical_root, &file, visiting)?;
+                contents.insert(
+                    file.strip_prefix(&relative).unwrap_or(&file).to_owned(),
+                    value,
+                );
+            }
+            visiting.remove(&resolved);
             return Ok(json!({"link":target, "directory":contents}));
         }
         if !metadata.is_file() {
@@ -1302,7 +1328,7 @@ pub fn inputs(
     definition.extra.remove("qk:warm");
     definition.extra.remove("qk:threads");
     let hash = json!({
-        "schema":"qk-local-v1", "qk":env!("CARGO_PKG_VERSION"),
+        "schema":"qk-local-v2", "qk":env!("CARGO_PKG_VERSION"),
         "platform":[std::env::consts::OS, std::env::consts::ARCH], "workspace":snapshot.workspace_prefix,
         "id":task.id, "args":task.args, "definition":definition, "packageManager":workspace.package_manager,
         "files":files, "values":values, "dependencies":dependencies,
@@ -1362,6 +1388,46 @@ pub(crate) fn dependency_keys(
     dependencies: &BTreeMap<String, String>,
     cancelled: &AtomicBool,
 ) -> Result<BTreeMap<String, String>> {
+    dependency_keys_impl(
+        snapshot,
+        workspace,
+        graph,
+        task,
+        dependencies,
+        cancelled,
+        false,
+    )
+}
+
+/// Read dependency artifacts again before accepting an execution as unchanged.
+pub(crate) fn recheck_dependency_keys(
+    snapshot: &Snapshot,
+    workspace: &Workspace,
+    graph: &TaskGraph,
+    task: &Task,
+    dependencies: &BTreeMap<String, String>,
+    cancelled: &AtomicBool,
+) -> Result<BTreeMap<String, String>> {
+    dependency_keys_impl(
+        snapshot,
+        workspace,
+        graph,
+        task,
+        dependencies,
+        cancelled,
+        true,
+    )
+}
+
+fn dependency_keys_impl(
+    snapshot: &Snapshot,
+    workspace: &Workspace,
+    graph: &TaskGraph,
+    task: &Task,
+    dependencies: &BTreeMap<String, String>,
+    cancelled: &AtomicBool,
+    fresh: bool,
+) -> Result<BTreeMap<String, String>> {
     let resolved = resolve(snapshot, workspace, task, None, cancelled)?;
     let selections: Vec<_> = resolved
         .values
@@ -1372,9 +1438,24 @@ pub(crate) fn dependency_keys(
         })
         .collect();
     if selections.is_empty() {
+        if fresh {
+            return dependencies
+                .iter()
+                .map(|(id, key)| {
+                    let outputs = Outputs::new(workspace, &graph.tasks[id])?;
+                    let key = if outputs.declared() {
+                        crate::output_fingerprint(&workspace.root, &outputs, "")?
+                    } else {
+                        key.clone()
+                    };
+                    Ok((id.clone(), key))
+                })
+                .collect();
+        }
         return Ok(dependencies.clone());
     }
     let mut keys = BTreeMap::new();
+    let mut fresh_outputs = HashMap::new();
     for (pattern, transitive) in selections {
         let matcher = snapshot.pattern(pattern, false)?;
         let mut selected = task.dependencies.clone();
@@ -1389,7 +1470,17 @@ pub(crate) fn dependency_keys(
             }
         }
         for id in selected {
-            let outputs = snapshot.dependency_outputs(workspace, &graph.tasks[&id])?;
+            let outputs = if fresh {
+                if !fresh_outputs.contains_key(&id) {
+                    fresh_outputs.insert(
+                        id.clone(),
+                        Arc::new(snapshot.fresh_dependency_outputs(workspace, &graph.tasks[&id])?),
+                    );
+                }
+                fresh_outputs[&id].clone()
+            } else {
+                snapshot.dependency_outputs(workspace, &graph.tasks[&id])?
+            };
             let mut files = BTreeMap::new();
             for path in outputs.files.iter().filter(|path| matcher.is_match(path)) {
                 let known = outputs.values.lock().unwrap().get(path).cloned();
