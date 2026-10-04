@@ -72,7 +72,7 @@ artifact has a fresh timestamp.
 
 The following guidance comes from local restoration and relocation checks
 with TypeScript 6.0, Make 3.81, Ninja 1.10, CMake 4.4, Xcode 27, Cargo 1.98,
-Metro 0.84 and Gradle 9.3. Tool versions, plugins, generated rules and compiler
+Metro 0.84, Gradle 9.3, Jest 30.5 with babel-jest, and Vitest 5.0.2. Tool versions, plugins, generated rules and compiler
 flags can change whether state relocates. The configurations are starting
 points to verify on your project.
 
@@ -85,7 +85,79 @@ points to verify on your project.
 | Xcode build intermediates | Explicit intermediate/DerivedData paths, `mtimes: "preserve"`, `portable: false` | A relative-source project rebuilt correctly but compiled again. CMake-generated projects also retained CMake's absolute paths. |
 | Cargo target directory | Actual target directory, `mtimes: "preserve"`, `portable: false` | A simple crate rebuilt correctly, but was `Dirty` rather than `Fresh`. Build scripts and generated absolute paths need separate checks. |
 | Metro transform cache | Default epoch times; configure the tool's cache store | Reused transforms at a different project root with the same transformer/configuration. Its file-map cache is separate. |
+| Jest transform cache | Configure `cacheDirectory`; default epoch times worked; `portable: false` | babel-jest transformed modules again because the configuration/cache identity included checkout paths. |
+| Vitest filesystem module cache | Enable `fsModuleCache`, configure `fsModuleCachePath`; default epoch times worked; `portable: false` | Module-cache keys included absolute module IDs and the Vite root; transforms ran again. |
 | Gradle project history and build outputs | Complete local state, `mtimes: "preserve"`, `portable: false` | A Java project rebuilt correctly; copied history alone did not make compilation up to date. Native/CMake state can impose stricter path requirements. |
+
+### Jest and Vitest
+
+Warm transform caches avoid repeating compilation while the test runner still
+executes tests. In controlled two-module fixtures, Jest/babel-jest and Vitest
+with filesystem module caching each performed two transforms on a cold run,
+zero after restoring the same checkout's cache, and one after changing a
+source module. Both epoch and preserved timestamps worked; preserving times
+provided no extra transform hits. Every run executed the test and asserted
+the current source value.
+
+Linked-worktree and remote restores at a different checkout path each
+performed both transforms again. These caches therefore use
+`portable: false` in the recipes below. Remote checks used an isolated local
+S3-protocol store on the same platform with empty local cache directories;
+they do not establish portability across machines or operating systems.
+
+For Jest, configure its [cache directory](https://jestjs.io/docs/configuration#cachedirectory-string)
+explicitly rather than trying to capture the operating system's temporary
+directory:
+
+```js
+// jest.config.cjs
+module.exports = {
+  cacheDirectory: '<rootDir>/.cache/jest',
+};
+```
+
+```jsonc
+"test": {
+  "qk:warm": {
+    "paths": ["{projectRoot}/.cache/jest"],
+    "portable": false
+  }
+}
+```
+
+For Vitest, a Vite cache directory alone did not persist source transforms
+between processes in the tested installation. Enable the
+[filesystem module cache](https://vitest.dev/config/fsmodulecache)
+explicitly; defaults and option locations vary by version. Vitest 5 uses
+`test.fsModuleCache` and `test.fsModuleCachePath`; versions that expose them
+under `test.experimental` need that nesting instead.
+
+```js
+// vitest.config.mjs
+export default {
+  test: {
+    fsModuleCache: true,
+    fsModuleCachePath: '.cache/vitest-modules',
+  },
+};
+```
+
+```jsonc
+"test": {
+  "qk:warm": {
+    "paths": ["{projectRoot}/.cache/vitest-modules"],
+    "portable": false
+  }
+}
+```
+
+Ignore these scratch directories in Git. In multi-project configurations,
+use the actual Jest root or Vitest cache root when declaring the warm path.
+Vitest plugins that read external files or options may need a
+[cache key generator](https://vitest.dev/config/fsmodulecache#known-issues)
+or an opt-out to invalidate transforms correctly. Include those inputs in
+qk's task inputs too: task-result invalidation and transform-cache
+invalidation each need to cover them.
 
 For example, keep Cargo's local target directory with the worktree:
 
@@ -240,7 +312,12 @@ build directories. `survive` names such dependencies:
 "android": {
   "dependsOn": ["prebuild-android"],
   "qk:warm": {
-    "paths": ["{projectRoot}/android/.gradle", "{projectRoot}/android/app/build"],
+    "paths": [
+      "{projectRoot}/android/.gradle",
+      "{projectRoot}/android/build",
+      "{projectRoot}/android/app/.cxx",
+      "{projectRoot}/android/app/build"
+    ],
     "survive": ["prebuild-android"],
     "mtimes": "preserve",
     "portable": false

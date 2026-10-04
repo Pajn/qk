@@ -123,18 +123,19 @@ fn warm_environment_paths_are_absolute_in_each_worktree() {
         let values: Value =
             serde_json::from_str(text.lines().find(|line| line.starts_with('{')).unwrap()).unwrap();
         let canonical = root.canonicalize().unwrap();
+        let workspace_path = Path::new(values["WORKSPACE_PATH"].as_str().unwrap());
+        let project_path = Path::new(values["PROJECT_PATH"].as_str().unwrap());
+        assert!(workspace_path.is_absolute());
+        assert!(project_path.is_absolute());
+        assert_eq!(workspace_path.canonicalize().unwrap(), canonical);
         assert_eq!(
-            Path::new(values["WORKSPACE_PATH"].as_str().unwrap()),
-            canonical
-        );
-        assert_eq!(
-            Path::new(values["PROJECT_PATH"].as_str().unwrap()),
+            project_path.canonicalize().unwrap(),
             canonical.join("packages/app")
         );
         assert!(Path::new(values["TOOL_CACHE"].as_str().unwrap()).is_absolute());
         assert_eq!(
             values["TEXT"],
-            format!("before:{}:after", canonical.display())
+            format!("before:{}:after", workspace_path.display())
         );
         assert_eq!(values["LITERAL"], "a/../b");
     }
