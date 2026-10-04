@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -242,10 +242,11 @@ impl Snapshot {
             let directory = path.parent().context("digests have a directory")?;
             std::fs::create_dir_all(directory)?;
             let mut file = tempfile::NamedTempFile::new_in(directory)?;
-            serde_json::to_writer(
-                std::io::BufWriter::new(file.as_file_mut()),
-                &json!({"version": 1, "entries": entries}),
-            )?;
+            {
+                let mut writer = std::io::BufWriter::new(file.as_file_mut());
+                serde_json::to_writer(&mut writer, &json!({"version": 1, "entries": entries}))?;
+                writer.flush()?;
+            }
             file.persist(&path)?;
             Ok(())
         })();

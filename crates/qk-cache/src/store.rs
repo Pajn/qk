@@ -252,8 +252,11 @@ impl Cache {
             artifacts,
         };
         let mut file = NamedTempFile::new_in(self.root.join("tmp"))?;
-        serde_json::to_writer(file.as_file_mut(), &manifest)?;
-        file.flush()?;
+        {
+            let mut writer = std::io::BufWriter::new(file.as_file_mut());
+            serde_json::to_writer(&mut writer, &manifest)?;
+            writer.flush()?;
+        }
         file.persist(self.root.join("entries").join(format!("{key}.json")))?;
         manifest.output_fingerprint(outputs.declared())
     }
