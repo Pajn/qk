@@ -38,7 +38,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    #[command(hide = true)]
+    #[command(name = "__upload-worker", hide = true)]
     UploadWorker,
     /// Record task file accesses and review input declarations.
     Inputs {

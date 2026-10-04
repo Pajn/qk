@@ -180,7 +180,7 @@ pub(super) fn launch(
     let log = log.persist(&log_path)?;
     let mut command = Command::new(std::env::current_exe()?);
     command
-        .arg("upload-worker")
+        .arg("__upload-worker")
         .current_dir(snapshot.path().parent().unwrap())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
