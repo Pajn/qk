@@ -647,7 +647,9 @@ enum ShowCommand {
 }
 
 fn main() {
-    match run(Cli::parse_from(shorthand(std::env::args_os().collect()))) {
+    match run(Cli::parse_from(shorthand(kebab_flags(
+        std::env::args_os().collect(),
+    )))) {
         Ok(0) => {}
         Ok(code) => std::process::exit(code),
         Err(error) => {
@@ -686,6 +688,43 @@ const NX_COMMANDS: &[&str] = &[
     "sync:check",
     "view-logs",
 ];
+
+/// Spells camelCase long flags in kebab-case, since Nx accepts both and qk
+/// defines only the kebab-case one: `--outputStyle=static` becomes
+/// `--output-style=static`. Arguments after `--` are forwarded untouched.
+fn kebab_flags(args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    let mut forwarded = false;
+    args.into_iter()
+        .map(|arg| {
+            forwarded |= arg == "--";
+            let Some(text) = arg.to_str().filter(|_| !forwarded) else {
+                return arg;
+            };
+            let Some(flag) = text.strip_prefix("--") else {
+                return arg;
+            };
+            let (name, value) = match flag.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (flag, None),
+            };
+            if !name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+                return arg;
+            }
+            let mut kebab = String::from("--");
+            for character in name.chars() {
+                if character.is_ascii_uppercase() {
+                    kebab.push('-');
+                }
+                kebab.push(character.to_ascii_lowercase());
+            }
+            if let Some(value) = value {
+                kebab.push('=');
+                kebab.push_str(value);
+            }
+            kebab.into()
+        })
+        .collect()
+}
 
 /// Rewrites Nx's shorthand into `run`: `<target> <project>` and `<project>:<target>`
 /// become `run <project>:<target>`, and a bare `<target>` becomes `run <target>`.

@@ -233,6 +233,31 @@ fn run_many_accepts_space_separated_lists_like_nx() {
 }
 
 #[test]
+fn camel_case_flags_mean_their_kebab_case_spelling_like_nx() {
+    let kebab = planned(qk(&[
+        "run-many",
+        "-t",
+        "build",
+        "--output-style=static",
+        "--exclude-task-dependencies",
+        "--dry-run",
+    ]));
+    let camel = planned(qk(&[
+        "run-many",
+        "-t",
+        "build",
+        "--outputStyle=static",
+        "--excludeTaskDependencies",
+        "--dryRun",
+    ]));
+    assert_eq!(camel, kebab);
+    // Flags after `--` belong to the task.
+    let forwarded = qk(&["run", "web:build", "--dry-run", "--", "--outputStyle"]);
+    let plan = String::from_utf8(forwarded.stdout).unwrap();
+    assert!(plan.contains("\"--outputStyle\""), "{plan}");
+}
+
+#[test]
 fn run_many_configuration_applies_only_where_defined_like_nx() {
     let tasks = planned(qk(&[
         "run-many",

@@ -50,6 +50,10 @@ left out. `--print` and `--file stdout` write to stdout. qk has no browser
 view, so `nx graph`'s `--affected`, `--view` and server options do not apply;
 for a task graph, use `qk run-many -t <targets> --graph`.
 
+Flags may be spelled in camelCase as well as kebab-case, so Nx's
+`--outputStyle` works as `--output-style`. Arguments after `--` are forwarded
+unchanged.
+
 `--workspace <path>` works before or after the subcommand. Graph output paths
 are relative to the invocation directory; their parent directories must
 already exist. JSON output has no progress messages mixed into stdout.
