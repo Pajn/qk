@@ -125,15 +125,15 @@ enum Command {
     #[command(alias = "clear-cache")]
     Reset {
         /// Only the cache, which the repository's worktrees share.
-        #[arg(long, alias = "onlyCache")]
+        #[arg(long)]
         only_cache: bool,
         /// Only this worktree's file digests, output records and warm directories.
-        #[arg(long, alias = "onlyWorkspaceData")]
+        #[arg(long)]
         only_workspace_data: bool,
         /// Nx's daemon and Nx Cloud client, which qk has neither of.
-        #[arg(long, alias = "onlyDaemon", hide = true)]
+        #[arg(long, hide = true)]
         only_daemon: bool,
-        #[arg(long, alias = "onlyCloud", hide = true)]
+        #[arg(long, hide = true)]
         only_cloud: bool,
     },
     /// Export the workspace project graph as JSON.
@@ -166,10 +166,10 @@ struct RunOptions {
     #[arg(skip)]
     input_analysis: Option<inputs::Options>,
     /// Bypass all cache reads and writes; also NX_SKIP_NX_CACHE=true.
-    #[arg(long, aliases = ["skip-nx-cache", "skipNxCache", "disable-nx-cache", "disableNxCache"])]
+    #[arg(long, aliases = ["skip-nx-cache", "disable-nx-cache"])]
     skip_cache: bool,
     /// Use the local cache only; also NX_SKIP_REMOTE_CACHE=true.
-    #[arg(long, aliases = ["skipRemoteCache", "disable-remote-cache", "disableRemoteCache"])]
+    #[arg(long, alias = "disable-remote-cache")]
     skip_remote_cache: bool,
     #[arg(short = 'c', long)]
     configuration: Option<String>,
@@ -181,16 +181,16 @@ struct RunOptions {
     /// nx.json `parallel`, then 3; `--parallel` alone means NX_PARALLEL, else 3.
     #[arg(long, env = "NX_PARALLEL", num_args = 0..=1, default_missing_value = "true")]
     parallel: Option<String>,
-    #[arg(long, alias = "maxParallel", hide = true)]
+    #[arg(long, hide = true)]
     max_parallel: Option<String>,
     /// Stop starting tasks after the first failure; also NX_BAIL=true.
-    #[arg(long, alias = "nxBail")]
+    #[arg(long)]
     nx_bail: bool,
     /// Break task dependency cycles instead of failing; also NX_IGNORE_CYCLES=true.
-    #[arg(long, alias = "nxIgnoreCycles")]
+    #[arg(long)]
     nx_ignore_cycles: bool,
     /// Run only the requested tasks, not the tasks they depend on.
-    #[arg(long, alias = "excludeTaskDependencies")]
+    #[arg(long)]
     exclude_task_dependencies: bool,
     /// Write the task graph as Nx does, to a file or to stdout (`--graph` or
     /// `--graph=stdout`), without running anything.
@@ -312,7 +312,7 @@ struct IgnoredOptions {
     runner: Option<String>,
     #[arg(long, hide = true, num_args = 0..=1, default_missing_value = "true")]
     batch: Option<String>,
-    #[arg(long, alias = "skipSync", hide = true)]
+    #[arg(long, hide = true)]
     skip_sync: bool,
     #[arg(long, hide = true, num_args = 0..=1, default_missing_value = "true")]
     cloud: Option<String>,
@@ -322,13 +322,13 @@ struct IgnoredOptions {
     dte: Option<String>,
     #[arg(long, hide = true)]
     no_dte: bool,
-    #[arg(long, aliases = ["useAgents", "use-agents"], hide = true, num_args = 0..=1, default_missing_value = "true")]
+    #[arg(long, alias = "use-agents", hide = true, num_args = 0..=1, default_missing_value = "true")]
     agents: Option<String>,
     #[arg(long, hide = true, num_args = 0..=1, default_missing_value = "true")]
     tui: Option<String>,
     #[arg(long, hide = true)]
     no_tui: bool,
-    #[arg(long, alias = "tuiAutoExit", hide = true)]
+    #[arg(long, hide = true)]
     tui_auto_exit: Option<String>,
 }
 
@@ -563,7 +563,7 @@ enum ShowCommand {
         #[arg(long, value_delimiter = ',', action = clap::ArgAction::Append)]
         exclude: Vec<String>,
         /// Only projects with one of these targets.
-        #[arg(long, short = 't', alias = "withTarget", value_delimiter = ',', action = clap::ArgAction::Append)]
+        #[arg(long, short = 't', value_delimiter = ',', action = clap::ArgAction::Append)]
         with_target: Vec<String>,
         /// Only projects of this type.
         #[arg(long = "type", value_enum)]
