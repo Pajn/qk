@@ -11,9 +11,10 @@ default), `read` (also spelled `read-only`) or `no-cache`, and
 not supported; a store that cannot be used is reported and left out, and the
 local cache carries on.
 
-Entries are stored under `<cacheKeyPrefix>qk/v2/`, so a bucket shared with Nx
-never mixes the two. Each entry is one object holding its manifest and
-outputs, so that a lookup or restore is one request however many files the
+Entries are stored under `<cacheKeyPrefix>qk/v3/`, so a bucket shared with Nx
+never mixes the two. Result entries and portable warm state use streaming
+Zstandard level 3 compression with a frame checksum. Each entry is one object
+holding its manifest and outputs, so that a lookup or restore is one request however many files the
 task wrote. A local miss fetches it, keeps the outputs the local cache lacks,
 verifying each against its hash, and shows `[remote cache]`; any failure is a
 miss. After a task is saved it is uploaded in the background, and a run waits
@@ -55,6 +56,13 @@ can interrupt it. Later background runs reclaim snapshots older than one
 day when no worker holds their lease, and logs older than one day. Pending
 snapshots can retain disk space outside the cache size limit until cleanup.
 
+The remote format uses a clean cutover from `qk/v2`: new clients neither fetch
+nor overwrite older remote objects. Upgrading may cause one-time remote
+misses while the compressed cache fills. Existing local entries are unchanged,
+and older clients can continue using their own remote namespace. There is no
+legacy lookup after a miss. Downloads limit the decoder window to 128 MiB and
+the expanded pack to 5 GiB; malformed, truncated or oversized packs are misses.
+The local content-addressed blob store remains uncompressed.
 
 Every request to the store waits a round trip, so qk keeps an index of the
 entries it holds and does not ask for one the index leaves out. Each run

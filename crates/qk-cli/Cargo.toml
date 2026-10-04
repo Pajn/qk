@@ -44,3 +44,6 @@ targets = [
   "x86_64-pc-windows-msvc",
 ]
 custom = { publishConfig = { access = "public" } }
+
+[dev-dependencies]
+zstd.workspace = true
