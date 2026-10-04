@@ -1147,7 +1147,10 @@ fn wait_for_detached_uploads(log: &Path) -> String {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         let text = fs::read_to_string(log).unwrap();
-        if text.contains("background uploads completed") {
+        // Formatted stderr writes can become visible one fragment at a time.
+        if text.lines().any(|line| {
+            line.starts_with("qk: background uploads completed; ") && line.ends_with(" failure(s)")
+        }) {
             return text;
         }
         assert!(

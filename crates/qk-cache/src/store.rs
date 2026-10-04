@@ -351,6 +351,7 @@ impl Cache {
             .prefix("restore-")
             .tempdir_in(stage_parent)?;
         let mut staging = StagingDirectories::new(stage.path());
+        let mut files = Vec::new();
         for (path, artifact) in &manifest.artifacts {
             paths::safe_parents(root, path)?;
             staging.parents(path)?;
@@ -363,15 +364,7 @@ impl Cache {
                     if !valid_hash(blob) {
                         bail!("invalid blob identifier");
                     }
-                    let source = self.root.join("blobs").join(blob);
-                    if digest_file(&source)? != *blob {
-                        bail!("corrupt cached artifact");
-                    }
-                    // A clone where supported: edits to the restored file never reach the blob.
-                    fs::copy(source, &destination)?;
-                    // Before its mode, which may not let it be opened.
-                    set_modified(&destination, started)?;
-                    set_mode(&destination, *mode)?;
+                    files.push((blob.as_str(), *mode, destination));
                 }
                 Artifact::Directory { .. } => staging.directory(path)?,
                 Artifact::Symlink { target, directory } => {
@@ -380,6 +373,7 @@ impl Cache {
                 }
             }
         }
+        self.stage_files(&files, started)?;
         // Eligibility is determined before cleanup: replacing an existing output
         // tree keeps the established per-artifact behavior, even if cleanup empties it.
         let complete = absent_directories(root, outputs, &manifest.artifacts)?;
@@ -446,6 +440,43 @@ impl Cache {
         qk_executor::replay(File::open(log)?, display, shown)?;
         crate::evict::touch(&self.root.join("entries").join(format!("{key}.json")));
         manifest.output_fingerprint(outputs.declared()).map(Some)
+    }
+    /// Fills an already validated private stage before output cleanup begins.
+    fn stage_files(&self, files: &[(&str, u32, PathBuf)], time: SystemTime) -> Result<()> {
+        let stage = |files: &[(&str, u32, PathBuf)]| -> Result<()> {
+            for (blob, mode, destination) in files {
+                let source = self.root.join("blobs").join(blob);
+                if digest_file(&source)? != *blob {
+                    bail!("corrupt cached artifact");
+                }
+                // A clone where supported: edits never reach the cached blob.
+                fs::copy(source, destination)?;
+                // Before its mode, which may prevent opening the file.
+                set_modified(destination, time)?;
+                set_mode(destination, *mode)?;
+            }
+            Ok(())
+        };
+        let workers = files.len().div_ceil(64).clamp(1, 4);
+        if workers == 1 {
+            return stage(files);
+        }
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = files
+                .chunks(files.len().div_ceil(workers))
+                .map(|chunk| scope.spawn(move || stage(chunk)))
+                .collect();
+            // Join every worker, including after an error, before the private
+            // stage can be removed or any destination output can be changed.
+            let results: Vec<_> = handles
+                .into_iter()
+                .map(|handle| handle.join().expect("cache staging worker panicked"))
+                .collect();
+            for result in results {
+                result?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -784,6 +815,186 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parallel_staging_preserves_contents_modes_links_and_shared_restore_time() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("out/empty")).unwrap();
+        for index in 0..130 {
+            let path = root.join(format!("out/file-{index:03}"));
+            fs::write(&path, format!("content-{}", index % 65)).unwrap();
+            #[cfg(unix)]
+            set_mode(&path, if index % 2 == 0 { 0o755 } else { 0o640 }).unwrap();
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("file-000", root.join("out/link")).unwrap();
+        let log = root.join("log");
+        fs::write(&log, "").unwrap();
+        let cache = Cache::new(root.join("cache"));
+        cache.initialize().unwrap();
+        let outputs = Outputs::from_patterns(&["out"]);
+        let key = "a".repeat(64);
+        let expected = cache.publish(root, &key, &outputs, &log).unwrap();
+        fs::remove_dir_all(root.join("out")).unwrap();
+        let before = SystemTime::now();
+        assert_eq!(
+            cache
+                .restore(
+                    root,
+                    "build",
+                    &Default::default(),
+                    &key,
+                    &outputs,
+                    &qk_executor::Display::Hidden,
+                    qk_executor::Shown::LocalCache
+                )
+                .unwrap(),
+            Some(expected)
+        );
+        let mut common_time = None;
+        for index in 0..130 {
+            let path = root.join(format!("out/file-{index:03}"));
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                format!("content-{}", index % 65)
+            );
+            let metadata = fs::metadata(&path).unwrap();
+            let modified = metadata.modified().unwrap();
+            assert!(modified >= before);
+            assert_eq!(*common_time.get_or_insert(modified), modified);
+            #[cfg(unix)]
+            assert_eq!(mode(&metadata), if index % 2 == 0 { 0o755 } else { 0o640 });
+        }
+        assert!(root.join("out/empty").is_dir());
+        #[cfg(unix)]
+        assert_eq!(
+            fs::read_link(root.join("out/link")).unwrap(),
+            Path::new("file-000")
+        );
+    }
+
+    #[test]
+    fn a_corrupt_parallel_blob_leaves_all_existing_and_absent_outputs_untouched() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir(root.join("a")).unwrap();
+        fs::create_dir(root.join("z")).unwrap();
+        for index in 0..130 {
+            fs::write(
+                root.join(format!("a/file-{index:03}")),
+                format!("content-{index}"),
+            )
+            .unwrap();
+        }
+        fs::write(root.join("z/value"), "last").unwrap();
+        let log = root.join("log");
+        fs::write(&log, "").unwrap();
+        let cache = Cache::new(root.join("cache"));
+        cache.initialize().unwrap();
+        let outputs = Outputs::from_patterns(&["a", "z"]);
+        let key = "b".repeat(64);
+        cache.publish(root, &key, &outputs, &log).unwrap();
+        for index in 0..130 {
+            fs::write(
+                root.join(format!("a/file-{index:03}")),
+                format!("keep-{index}"),
+            )
+            .unwrap();
+        }
+        fs::remove_dir_all(root.join("z")).unwrap();
+        fs::write(
+            cache
+                .root
+                .join("blobs")
+                .join(blake3::hash(b"last").to_hex().to_string()),
+            "corrupt",
+        )
+        .unwrap();
+        assert!(
+            cache
+                .restore(
+                    root,
+                    "build",
+                    &Default::default(),
+                    &key,
+                    &outputs,
+                    &qk_executor::Display::Hidden,
+                    qk_executor::Shown::LocalCache
+                )
+                .is_err()
+        );
+        for index in 0..130 {
+            assert_eq!(
+                fs::read_to_string(root.join(format!("a/file-{index:03}"))).unwrap(),
+                format!("keep-{index}")
+            );
+        }
+        assert!(!root.join("z").exists());
+        assert_eq!(
+            fs::read_dir(paths::worktree_state(root).join("restore"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn delayed_file_staging_rejects_file_parent_conflicts_without_cleaning_outputs() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir(root.join("out")).unwrap();
+        fs::write(root.join("out/keep"), "existing").unwrap();
+        let source = root.join("source");
+        fs::write(&source, "cached").unwrap();
+        let log = root.join("log");
+        fs::write(&log, "").unwrap();
+        let cache = Cache::new(root.join("cache"));
+        cache.initialize().unwrap();
+        let blob = cache.put_blob(&source).unwrap();
+        let key = "c".repeat(64);
+        let manifest = Manifest {
+            version: 1,
+            key: key.clone(),
+            log: cache.put_blob(&log).unwrap(),
+            artifacts: BTreeMap::from([
+                (
+                    "out/file".to_owned(),
+                    Artifact::File {
+                        blob: blob.clone(),
+                        mode: 0o644,
+                    },
+                ),
+                (
+                    "out/file/child".to_owned(),
+                    Artifact::File { blob, mode: 0o644 },
+                ),
+            ]),
+        };
+        fs::write(
+            cache.root.join("entries").join(format!("{key}.json")),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let outputs = Outputs::from_patterns(&["out"]);
+        assert!(
+            cache
+                .restore(
+                    root,
+                    "build",
+                    &Default::default(),
+                    &key,
+                    &outputs,
+                    &qk_executor::Display::Hidden,
+                    qk_executor::Shown::LocalCache
+                )
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("out/keep")).unwrap(),
+            "existing"
+        );
+        assert!(!root.join("out/file").exists());
+    }
     /// Every blob is verified before any output is cleaned or promoted.
     #[test]
     fn corrupt_late_blob_leaves_existing_and_absent_roots_untouched() {
