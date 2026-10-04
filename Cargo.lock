@@ -1090,6 +1090,7 @@ dependencies = [
  "globset",
  "ignore",
  "jsonc-parser",
+ "libc",
  "qk-config",
  "qk-executor",
  "qk-graph",

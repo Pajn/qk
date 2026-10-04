@@ -736,6 +736,12 @@ fn output_fingerprint(root: &Path, outputs: &paths::Outputs, input: &str) -> Res
     combine_outputs(input, &files, outputs.declared())
 }
 
+/// Runs the private detached-upload protocol used by the qk executable.
+#[doc(hidden)]
+pub fn run_upload_worker() -> anyhow::Result<()> {
+    remote::background::run()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

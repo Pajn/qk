@@ -11,6 +11,7 @@
 //! background after a task is saved. An [`index`] of the entries the store
 //! holds spares the lookups it would answer with a miss.
 
+pub(crate) mod background;
 mod index;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -58,6 +59,8 @@ pub struct Remote {
     agent: ureq::Agent,
     pub mode: Mode,
     uploads: Mutex<Option<Uploads>>,
+    background: Option<background::Configuration>,
+    pending: Mutex<Vec<Upload>>,
     /// What the store's index says it holds, once read: `None` when it could
     /// not be read, and every lookup then goes to the store.
     known: OnceLock<Option<index::Known>>,
@@ -79,6 +82,7 @@ struct Uploads {
     failures: Arc<Mutex<Vec<String>>>,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Upload {
     /// The entry's key, or the warm record's task, for reporting failures.
     key: String,
@@ -147,7 +151,25 @@ pub fn configure(
     let (Some(key), Some(secret)) = (key, secret) else {
         bail!("no credentials: set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY");
     };
-    let credentials = match variable("AWS_SESSION_TOKEN") {
+    let token = variable("AWS_SESSION_TOKEN");
+    let upload_mode = variable("QK_REMOTE_UPLOAD_MODE")
+        .or_else(|| setting("uploadMode"))
+        .unwrap_or_else(|| "wait".into());
+    let background = match upload_mode.as_str() {
+        "wait" => None,
+        "background" => {
+            let mut config = config.clone();
+            config["accessKeyId"] = key.clone().into();
+            config["secretAccessKey"] = secret.clone().into();
+            config["uploadMode"] = "wait".into();
+            Some(background::Configuration {
+                config,
+                token: token.clone(),
+            })
+        }
+        other => bail!("unknown s3 upload mode {other:?}; use wait or background"),
+    };
+    let credentials = match token {
         Some(token) => Credentials::new_with_token(key, secret, token),
         None => Credentials::new(key, secret),
     };
@@ -164,6 +186,8 @@ pub fn configure(
         agent,
         mode,
         uploads: Mutex::new(None),
+        background,
+        pending: Mutex::new(Vec::new()),
         known: OnceLock::new(),
         reading: Mutex::new(None),
         confirmed: Mutex::default(),
@@ -508,6 +532,10 @@ impl Remote {
         if self.mode != Mode::ReadWrite {
             return;
         }
+        if self.background.is_some() {
+            self.pending.lock().unwrap().push(upload);
+            return;
+        }
         let mut uploads = self.uploads.lock().unwrap();
         let uploads = uploads.get_or_insert_with(|| {
             let (sender, receiver) = channel::<Upload>();
@@ -592,6 +620,40 @@ impl Remote {
     /// Waits for queued uploads, then adds this run's listing to the index,
     /// returning what failed.
     pub(crate) fn finish(&self) -> Vec<String> {
+        if let Some(configuration) = &self.background {
+            let pending = std::mem::take(&mut *self.pending.lock().unwrap());
+            if !pending.is_empty() {
+                match background::launch(
+                    configuration,
+                    &pending,
+                    self.held.lock().unwrap().iter().cloned().collect(),
+                    self.confirmed.lock().unwrap().iter().cloned().collect(),
+                ) {
+                    Ok(log) => {
+                        qk_executor::status!(
+                            "qk: remote uploads continuing in background; log: {}",
+                            log.display()
+                        );
+                        return Vec::new();
+                    }
+                    Err(error) => {
+                        qk_executor::status!(
+                            "qk: could not detach remote uploads; waiting instead ({error:#})"
+                        );
+                        let mut failures = Vec::new();
+                        for job in pending {
+                            if let Err(error) = self.send(&job) {
+                                failures.push(format!("{}: {error:#}", job.key));
+                            }
+                        }
+                        if let Err(error) = self.add_listing() {
+                            failures.push(format!("the index: {error:#}"));
+                        }
+                        return failures;
+                    }
+                }
+            }
+        }
         let mut failures = Vec::new();
         if let Some(uploads) = self.uploads.lock().unwrap().take() {
             drop(uploads.sender);

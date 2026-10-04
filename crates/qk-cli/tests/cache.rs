@@ -1133,6 +1133,106 @@ fn clear_local_cache(fixture: &Fixture) {
     fs::remove_dir_all(path.trim()).unwrap();
 }
 
+fn detached_log(output: &Output) -> PathBuf {
+    stderr(output)
+        .lines()
+        .find_map(|line| {
+            line.split_once("background; log: ")
+                .map(|(_, path)| PathBuf::from(path))
+        })
+        .unwrap()
+}
+
+fn wait_for_detached_uploads(log: &Path) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let text = fs::read_to_string(log).unwrap();
+        if text.contains("background uploads completed") {
+            return text;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "worker did not finish: {text}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn detached_upload_failures_remain_observable_after_parent_exit() {
+    let server = s3::FakeS3::start();
+    server.state.lock().unwrap().fail_index_put = Some(1);
+    let fixture = Fixture::new(target("build", json!({})));
+    with_remote(&fixture, &server, json!({"uploadMode": "background"}));
+    let output = success(remote_build(&fixture, &[]));
+    let text = wait_for_detached_uploads(&detached_log(&output));
+    assert!(text.contains("remote cache upload failed for"), "{text}");
+    assert!(text.contains("1 failure(s)"), "{text}");
+    assert!(server.objects("/cache/qk/v2/entries/").is_empty());
+}
+
+#[test]
+fn detached_uploads_survive_parent_exit_and_local_cache_removal() {
+    let server = s3::FakeS3::start();
+    server.state.lock().unwrap().block_puts = true;
+    let fixture = Fixture::new(target(
+        "build",
+        json!({"qk:warm": {"outputs": true, "portable": true}}),
+    ));
+    with_remote(&fixture, &server, json!({"uploadMode": "background"}));
+    let output = std::thread::scope(|scope| {
+        let (send, receive) = std::sync::mpsc::channel();
+        let fixture = &fixture;
+        scope.spawn(move || {
+            send.send(remote_build(fixture, &[])).unwrap();
+        });
+        let result = receive.recv_timeout(std::time::Duration::from_secs(10));
+        if result.is_err() {
+            server.state.lock().unwrap().block_puts = false;
+        }
+        result.expect("qk must exit while remote PUTs remain blocked")
+    });
+    let output = success(output);
+    assert!(
+        stderr(&output).contains("remote uploads continuing in background"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(server.objects("/cache/qk/v2/entries/").is_empty());
+    let log = detached_log(&output);
+    clear_local_cache(&fixture);
+    server.state.lock().unwrap().block_puts = false;
+    let text = wait_for_detached_uploads(&log);
+    assert!(text.contains("0 failure(s)"), "{text}");
+    assert_eq!(server.objects("/cache/qk/v2/entries/").len(), 1);
+    assert_eq!(server.objects("/cache/qk/v2/warm/").len(), 1);
+    assert!(
+        !fs::read_dir(log.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.path().is_dir()
+                && entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("qk-upload-"))
+    );
+    // A new run, with detached uploads overridden, consumes the uploaded result.
+    fs::remove_dir_all(fixture.root.join("dist")).unwrap();
+    let restored = success(remote_build(&fixture, &[("QK_REMOTE_UPLOAD_MODE", "wait")]));
+    assert!(
+        stderr(&restored).contains("remote cache hit app:build"),
+        "{}",
+        stderr(&restored)
+    );
+    assert_eq!(fixture.runs(), 1);
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("dist/nested/out.txt")).unwrap(),
+        "built:one\n"
+    );
+    let text = fs::read_to_string(log).unwrap();
+    assert!(!text.contains("secret"));
+}
+
 #[test]
 fn remote_cache_restores_what_another_machine_uploaded() {
     let server = s3::FakeS3::start();

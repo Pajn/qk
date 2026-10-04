@@ -21,6 +21,41 @@ for its uploads before it ends. Uploads report their failures without failing
 the run; an entry larger than 5 GiB, the most one S3 upload may hold, is not
 uploaded.
 
+For local runs, qk can hand queued uploads to a detached process after local
+cache saves finish. Set `s3.uploadMode` to `"background"` to opt in:
+
+```jsonc
+{
+  "s3": {
+    "bucket": "task-cache",
+    "region": "us-east-1",
+    "uploadMode": "background"
+  }
+}
+```
+
+`"wait"` is the default. `QK_REMOTE_UPLOAD_MODE=wait` overrides the setting
+for a run; use it in CI so uploads finish before the runner is torn down.
+It waits for that run's uploads, not workers started by earlier runs.
+Background mode starts uploads at the end of the run, whereas the default
+mode overlaps uploads with task execution and waits for them at the end.
+
+The detached process receives a private snapshot of result manifests and
+warm records, with hard links to immutable cache blobs (copies when hard
+links are unavailable). It can finish after qk exits, even if the local
+cache is pruned or reset. Snapshots and private failure logs live beside the
+cache directory; qk prints the log path on handoff. Credentials go through
+a pipe, not command arguments or a request file. If handoff fails, qk waits
+for the uploads instead.
+
+The worker removes its snapshot when it finishes and writes a completion
+line with a failure count to the log. This is best-effort background work,
+not a durable retry queue: shutdown, worker termination, or CI job cleanup
+can interrupt it. Later background runs reclaim snapshots older than one
+day when no worker holds their lease, and logs older than one day. Pending
+snapshots can retain disk space outside the cache size limit until cleanup.
+
+
 Every request to the store waits a round trip, so qk keeps an index of the
 entries it holds and does not ask for one the index leaves out. Each run
 that writes to the store adds a listing under `index/` of the entries it
