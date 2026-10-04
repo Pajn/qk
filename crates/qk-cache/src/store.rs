@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
@@ -119,6 +119,46 @@ pub(crate) fn valid_hash(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+// Keep each worker's snapshot bounded, including when a source grows during a save.
+const SMALL_BLOB_LIMIT: usize = 64 * 1024;
+
+fn small_blob_snapshot(reader: impl Read) -> Result<Option<Vec<u8>>> {
+    let mut bytes = Vec::new();
+    reader
+        .take(SMALL_BLOB_LIMIT as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    Ok((bytes.len() <= SMALL_BLOB_LIMIT).then_some(bytes))
+}
+
+fn copy_blob(source: &Path, destination: &Path) -> Result<String> {
+    let bytes = if fs::metadata(source)?.len() <= SMALL_BLOB_LIMIT as u64 {
+        small_blob_snapshot(File::open(source)?)?
+    } else {
+        None
+    };
+    let hash = if let Some(bytes) = bytes {
+        // Small files cost more to clone and re-read than to copy from a bounded
+        // snapshot. Hash exactly the bytes written, even if the source changes.
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination)?;
+        file.write_all(&bytes)?;
+        Some(blake3::hash(&bytes).to_hex().to_string())
+    } else {
+        // Larger files retain copy-on-write cloning where the filesystem supports it.
+        fs::copy(source, destination)?;
+        None
+    };
+    // Blobs carry no meaningful mode; restores apply the manifest's mode.
+    set_mode(destination, if cfg!(unix) { 0o644 } else { 0 })?;
+    // Disk flushing stays with the OS. Hash the large-file copy, never its source.
+    match hash {
+        Some(hash) => Ok(hash),
+        None => digest_file(destination),
+    }
+}
+
 impl Cache {
     pub(crate) fn initialize(&self) -> Result<()> {
         for directory in ["entries", "blobs", "locks", "tmp"] {
@@ -170,21 +210,15 @@ impl Cache {
         if existing.is_file() && digest_file(&existing).is_ok_and(|held| held == digest) {
             return Ok(digest);
         }
-        // fs::copy clones on copy-on-write filesystems when source and cache share
-        // a volume, and falls back to a byte copy otherwise. Cloning needs a fresh
-        // destination path, so copy into a private directory rather than a temp file.
+        // Stage each snapshot privately before atomic publication. Both cloning
+        // and small-file creation need a fresh destination path.
         if staging.is_none() {
             *staging = Some(tempfile::tempdir_in(self.root.join("tmp"))?);
         }
         // A worker keeps one private directory, but every clone needs a fresh
         // destination even when an earlier copy or rename failed.
         let temporary = staging.as_ref().unwrap().path().join(index.to_string());
-        fs::copy(source, &temporary)?;
-        // Blobs keep no meaningful mode of their own; restores apply the manifest's.
-        set_mode(&temporary, if cfg!(unix) { 0o644 } else { 0 })?;
-        // Cache content is rebuildable, so leave disk flushing to the OS.
-        // Hash the copy, not the source, so a concurrent write cannot mislabel the blob.
-        let hash = digest_file(&temporary)?;
+        let hash = copy_blob(source, &temporary)?;
         let target = self.root.join("blobs").join(&hash);
         // Replacing is atomic and cheaper than re-reading an existing blob. Where an
         // open blob cannot be replaced, keep it: restores verify it before use.
@@ -686,6 +720,84 @@ fn outputs_unchanged(root: &Path, task: &str, key: &str, outputs: &Outputs) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn small_snapshot_rejects_growth_without_reading_the_entire_stream() {
+        let mut reader = std::io::Cursor::new(vec![42; SMALL_BLOB_LIMIT * 4]);
+        assert!(small_blob_snapshot(&mut reader).unwrap().is_none());
+        assert_eq!(reader.position(), SMALL_BLOB_LIMIT as u64 + 1);
+    }
+
+    #[test]
+    fn both_blob_copy_paths_preserve_content_and_normalize_permissions() {
+        let scratch = tempfile::tempdir().unwrap();
+        for length in [
+            0,
+            1,
+            SMALL_BLOB_LIMIT - 1,
+            SMALL_BLOB_LIMIT,
+            SMALL_BLOB_LIMIT + 1,
+            SMALL_BLOB_LIMIT * 4,
+        ] {
+            let source = scratch.path().join(format!("source-{length}"));
+            let destination = scratch.path().join(format!("copy-{length}"));
+            let bytes: Vec<_> = (0..length).map(|index| (index % 251) as u8).collect();
+            fs::write(&source, &bytes).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&source, fs::Permissions::from_mode(0o754)).unwrap();
+            }
+            #[cfg(windows)]
+            {
+                let mut permissions = fs::metadata(&source).unwrap().permissions();
+                permissions.set_readonly(true);
+                fs::set_permissions(&source, permissions).unwrap();
+            }
+            let digest = copy_blob(&source, &destination).unwrap();
+            assert_eq!(fs::read(&destination).unwrap(), bytes);
+            assert_eq!(digest_file(&destination).unwrap(), digest);
+            assert_eq!(
+                mode(&fs::metadata(&destination).unwrap()),
+                if cfg!(unix) { 0o644 } else { 0 }
+            );
+            // Subsequent source writes cannot change the stored snapshot.
+            #[cfg(windows)]
+            fs::set_permissions(&source, fs::metadata(&destination).unwrap().permissions())
+                .unwrap();
+            fs::write(&source, b"changed after save").unwrap();
+            assert_eq!(fs::read(&destination).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn changing_small_sources_never_mislabels_a_published_blob() {
+        let scratch = tempfile::tempdir().unwrap();
+        let source = scratch.path().join("source");
+        fs::write(&source, vec![1; 8192]).unwrap();
+        let cache = Cache::new(scratch.path().join("cache"));
+        cache.initialize().unwrap();
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                let mut value = 2;
+                while !stop.load(Ordering::Relaxed) {
+                    fs::write(&source, vec![value; 8192]).unwrap();
+                    value = if value == 2 { 3 } else { 2 };
+                }
+            });
+            let results: Vec<_> = (0..64).map(|_| cache.put_blob(&source)).collect();
+            stop.store(true, Ordering::Relaxed);
+            writer.join().unwrap();
+            for result in results {
+                let digest = result.unwrap();
+                assert_eq!(
+                    digest_file(&cache.root.join("blobs").join(&digest)).unwrap(),
+                    digest
+                );
+            }
+        });
+    }
 
     /// Private staging rejects unsafe paths and file/link ancestors rather
     /// than following them, while shared ordinary parents can be reused.
