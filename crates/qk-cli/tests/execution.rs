@@ -1345,6 +1345,88 @@ fn nx_run_flags_work_as_in_nx() {
     );
 }
 
+#[test]
+fn empty_selections_write_machine_readable_task_graphs() {
+    let temp = fixture(json!({"build": {"command": "echo executed > marker"}}));
+    for args in [
+        vec!["init", "--quiet"],
+        vec!["add", "."],
+        vec![
+            "-c",
+            "user.name=qk",
+            "-c",
+            "user.email=qk@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+    ] {
+        success(
+            Command::new("git")
+                .current_dir(temp.path())
+                .args(args)
+                .output()
+                .unwrap(),
+        );
+    }
+    for mut args in [
+        vec!["run-many", "-t", "missing"],
+        vec!["run-many", "-t", "build", "--exclude=app"],
+        vec!["affected", "-t", "build", "--base=HEAD", "--head=HEAD"],
+        vec![
+            "affected",
+            "-t",
+            "build",
+            "--base=HEAD",
+            "--head=HEAD",
+            "--granularity=project",
+        ],
+        vec!["affected", "-t", "missing", "--base=HEAD", "--head=HEAD"],
+        vec![
+            "affected",
+            "-t",
+            "missing",
+            "--base=HEAD",
+            "--head=HEAD",
+            "--granularity=task",
+        ],
+    ] {
+        args.push("--graph=stdout");
+        let output = success(run(temp.path(), &args));
+        let graph: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(graph["graph"]["nodes"]["app"].is_object());
+        assert_eq!(graph["tasks"]["roots"], json!([]));
+        for name in ["tasks", "dependencies", "continuousDependencies"] {
+            assert_eq!(graph["tasks"][name], json!({}));
+        }
+        let file = temp.path().join("empty.json");
+        fs::write(&file, "previous graph").unwrap();
+        args.pop();
+        let flag = format!("--graph={}", file.display());
+        args.push(&flag);
+        success(run(temp.path(), &args));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(file).unwrap()).unwrap(),
+            graph
+        );
+        assert!(!temp.path().join("marker").exists());
+    }
+    let disabled = success(run(
+        temp.path(),
+        &[
+            "affected",
+            "-t",
+            "build",
+            "--base=HEAD",
+            "--head=HEAD",
+            "--graph=false",
+        ],
+    ));
+    assert!(disabled.stdout.is_empty());
+}
+
 #[cfg(unix)]
 #[test]
 fn the_task_graph_is_written_as_nx_writes_it() {
