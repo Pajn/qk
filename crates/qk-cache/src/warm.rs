@@ -1329,6 +1329,7 @@ impl Cache {
             let known = previous.and_then(|previous| previous.groups.get(location.name));
             let restored_files = noted.groups.get(location.name);
             let mut group = Group::default();
+            let mut pending = Vec::new();
             for path in location.paths()? {
                 paths::safe_parents(&location.base, &path)?;
                 let absolute = location.base.join(&path);
@@ -1365,20 +1366,9 @@ impl Cache {
                         Artifact::File { blob, .. } => self.root.join("blobs").join(blob).is_file(),
                         _ => false,
                     });
-                    let artifact = match reused {
-                        Some(artifact) => artifact.clone(),
-                        None => match self.put_blob(&absolute) {
-                            Ok(blob) => Artifact::File {
-                                blob,
-                                mode: mode(&metadata),
-                            },
-                            Err(error)
-                                if error.downcast_ref::<std::io::Error>().is_some_and(gone) =>
-                            {
-                                continue;
-                            }
-                            Err(error) => return Err(error),
-                        },
+                    let Some(artifact) = reused.cloned() else {
+                        pending.push((path, absolute, metadata));
+                        continue;
                     };
                     group.stamps.insert(path.clone(), now);
                     if let Some(modified) = metadata.modified().ok().and_then(nanos) {
@@ -1393,6 +1383,32 @@ impl Cache {
                     continue;
                 };
                 group.artifacts.insert(path, artifact);
+            }
+            let sources: Vec<_> = pending
+                .iter()
+                .map(|(_, absolute, _)| absolute.clone())
+                .collect();
+            for ((path, _, metadata), result) in
+                pending.into_iter().zip(self.put_warm_blobs(&sources))
+            {
+                let blob = match result {
+                    Ok(blob) => blob,
+                    Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(gone) => {
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                group.stamps.insert(path.clone(), stamp(&metadata));
+                if let Some(modified) = metadata.modified().ok().and_then(nanos) {
+                    group.mtimes.insert(path.clone(), modified);
+                }
+                group.artifacts.insert(
+                    path,
+                    Artifact::File {
+                        blob,
+                        mode: mode(&metadata),
+                    },
+                );
             }
             if let Some(limit) = warm.max_size
                 && group.size(self) > limit

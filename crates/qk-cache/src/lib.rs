@@ -740,6 +740,45 @@ fn output_fingerprint(root: &Path, outputs: &paths::Outputs, input: &str) -> Res
 mod tests {
     use super::*;
 
+    #[test]
+    fn concurrent_blob_writes_keep_results_ordered_and_repair_corruption() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        let cache = Cache::new(root.join("cache"));
+        cache.initialize().unwrap();
+        let mut sources = Vec::new();
+        for index in 0..130 {
+            let source = root.join(format!("source-{index}"));
+            std::fs::write(&source, format!("content-{}", index % 65)).unwrap();
+            sources.push(source);
+        }
+        let digest = cache.put_blob(&sources[0]).unwrap();
+        std::fs::write(cache.root.join("blobs").join(&digest), "corrupt").unwrap();
+        std::fs::remove_file(&sources[31]).unwrap();
+        let results = cache.put_warm_blobs(&sources);
+        assert_eq!(results.len(), sources.len());
+        for (index, result) in results.into_iter().enumerate() {
+            if index == 31 {
+                assert_eq!(
+                    result
+                        .unwrap_err()
+                        .downcast_ref::<std::io::Error>()
+                        .unwrap()
+                        .kind(),
+                    std::io::ErrorKind::NotFound
+                );
+                continue;
+            }
+            let digest = result.unwrap();
+            let held = cache.root.join("blobs").join(&digest);
+            assert_eq!(
+                std::fs::read(&held).unwrap(),
+                format!("content-{}", index % 65).as_bytes()
+            );
+            assert_eq!(hash::digest_file(&held).unwrap(), digest);
+        }
+    }
+
     /// Content the store holds already is reused, not copied over again.
     #[cfg(unix)]
     #[test]
