@@ -15,6 +15,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1101,7 +1102,11 @@ impl Cache {
         let directory = path.parent().context("warm records have a directory")?;
         fs::create_dir_all(directory)?;
         let mut file = tempfile::NamedTempFile::new_in(self.root.join("tmp"))?;
-        serde_json::to_writer(std::io::BufWriter::new(file.as_file_mut()), record)?;
+        {
+            let mut writer = std::io::BufWriter::new(file.as_file_mut());
+            serde_json::to_writer(&mut writer, record)?;
+            writer.flush()?;
+        }
         file.persist(path)?;
         Ok(())
     }
