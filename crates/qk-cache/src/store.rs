@@ -184,7 +184,7 @@ impl Cache {
     }
 
     /// Stores independent blobs with bounded I/O concurrency, retaining input order.
-    pub(crate) fn put_warm_blobs(&self, sources: &[PathBuf]) -> Vec<Result<String>> {
+    pub(crate) fn put_blobs(&self, sources: &[PathBuf]) -> Vec<Result<String>> {
         // Bound parallel copies and avoid threads for small saves.
         let workers = sources.len().div_ceil(64).clamp(1, 8);
         if workers == 1 {
@@ -217,6 +217,7 @@ impl Cache {
         log: &Path,
     ) -> Result<String> {
         let mut artifacts = BTreeMap::new();
+        let mut pending = Vec::new();
         for entry in outputs.entries(root)? {
             let (path, metadata) = entry?;
             paths::safe_parents(root, &path)?;
@@ -232,10 +233,8 @@ impl Cache {
                     directory: absolute.is_dir(),
                 }
             } else if metadata.is_file() {
-                Artifact::File {
-                    blob: self.put_blob(&absolute)?,
-                    mode: mode(&metadata),
-                }
+                pending.push((path, absolute, mode(&metadata)));
+                continue;
             } else if metadata.is_dir() {
                 Artifact::Directory {
                     mode: mode(&metadata),
@@ -245,10 +244,26 @@ impl Cache {
             };
             artifacts.insert(path, artifact);
         }
+        let mut sources: Vec<_> = pending
+            .iter()
+            .map(|(_, source, _)| source.clone())
+            .collect();
+        sources.push(log.to_owned());
+        // Every worker finishes before any manifest is published.
+        let mut blobs = self.put_blobs(&sources).into_iter();
+        for (path, _, mode) in pending {
+            artifacts.insert(
+                path,
+                Artifact::File {
+                    blob: blobs.next().expect("output blob result")?,
+                    mode,
+                },
+            );
+        }
         let manifest = Manifest {
             version: 1,
             key: key.into(),
-            log: self.put_blob(log)?,
+            log: blobs.next().expect("log blob result")?,
             artifacts,
         };
         let mut file = NamedTempFile::new_in(self.root.join("tmp"))?;
@@ -789,5 +804,119 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(root.join("a/value")).unwrap(), "keep me");
         assert!(!root.join("z").exists());
+    }
+
+    #[test]
+    fn parallel_publication_keeps_artifacts_log_and_fingerprints_deterministic() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("dist/empty")).unwrap();
+        for index in 0..130 {
+            let path = root.join(format!("dist/file-{index:03}"));
+            fs::write(&path, format!("content-{}", index % 65)).unwrap();
+            #[cfg(unix)]
+            set_mode(&path, if index % 2 == 0 { 0o755 } else { 0o640 }).unwrap();
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("file-000", root.join("dist/link")).unwrap();
+        let log = root.join("task.log");
+        let payload = b"saved task output\n";
+        let mut capture = vec![0];
+        capture.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        capture.extend_from_slice(payload);
+        fs::write(&log, &capture).unwrap();
+        let cache = Cache::new(root.join("cache"));
+        cache.initialize().unwrap();
+        let outputs = Outputs::from_patterns(&["dist"]);
+        let key = "a".repeat(64);
+        let first = cache.publish(root, &key, &outputs, &log).unwrap();
+        let entry = cache.root.join("entries").join(format!("{key}.json"));
+        let manifest = fs::read(&entry).unwrap();
+        assert_eq!(cache.publish(root, &key, &outputs, &log).unwrap(), first);
+        assert_eq!(fs::read(&entry).unwrap(), manifest);
+        // Concurrent publishers share duplicate blobs but keep independent entries.
+        std::thread::scope(|scope| {
+            for digit in ['b', 'c'] {
+                let (cache, outputs, log) = (&cache, &outputs, &log);
+                scope.spawn(move || {
+                    cache
+                        .publish(root, &digit.to_string().repeat(64), outputs, log)
+                        .unwrap()
+                });
+            }
+        });
+        fs::remove_dir_all(root.join("dist")).unwrap();
+        assert_eq!(
+            cache
+                .restore(
+                    root,
+                    "build",
+                    &Default::default(),
+                    &key,
+                    &outputs,
+                    &qk_executor::Display::Hidden,
+                    qk_executor::Shown::LocalCache
+                )
+                .unwrap(),
+            Some(first)
+        );
+        for index in 0..130 {
+            let path = root.join(format!("dist/file-{index:03}"));
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                format!("content-{}", index % 65)
+            );
+            #[cfg(unix)]
+            assert_eq!(
+                mode(&fs::metadata(&path).unwrap()),
+                if index % 2 == 0 { 0o755 } else { 0o640 }
+            );
+        }
+        assert!(root.join("dist/empty").is_dir());
+        #[cfg(unix)]
+        assert_eq!(
+            fs::read_link(root.join("dist/link")).unwrap(),
+            Path::new("file-000")
+        );
+        let parsed: Manifest = serde_json::from_slice(&manifest).unwrap();
+        assert_eq!(
+            fs::read(cache.root.join("blobs").join(parsed.log)).unwrap(),
+            capture
+        );
+    }
+
+    #[test]
+    fn failed_blob_batch_never_publishes_or_replaces_a_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir(root.join("dist")).unwrap();
+        for index in 0..130 {
+            fs::write(
+                root.join(format!("dist/file-{index}")),
+                format!("value-{index}"),
+            )
+            .unwrap();
+        }
+        let cache = Cache::new(root.join("cache"));
+        cache.initialize().unwrap();
+        let outputs = Outputs::from_patterns(&["dist"]);
+        let log = root.join("task.log");
+        let key = "d".repeat(64);
+        assert!(cache.publish(root, &key, &outputs, &log).is_err());
+        assert!(
+            !cache
+                .root
+                .join("entries")
+                .join(format!("{key}.json"))
+                .exists()
+        );
+        fs::write(&log, "complete\n").unwrap();
+        cache.publish(root, &key, &outputs, &log).unwrap();
+        let entry = cache.root.join("entries").join(format!("{key}.json"));
+        let original = fs::read(&entry).unwrap();
+        fs::remove_file(&log).unwrap();
+        fs::write(root.join("dist/file-0"), "changed").unwrap();
+        assert!(cache.publish(root, &key, &outputs, &log).is_err());
+        assert_eq!(fs::read(&entry).unwrap(), original);
     }
 }

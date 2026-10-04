@@ -1388,9 +1388,7 @@ impl Cache {
                 .iter()
                 .map(|(_, absolute, _)| absolute.clone())
                 .collect();
-            for ((path, _, metadata), result) in
-                pending.into_iter().zip(self.put_warm_blobs(&sources))
-            {
+            for ((path, _, metadata), result) in pending.into_iter().zip(self.put_blobs(&sources)) {
                 let blob = match result {
                     Ok(blob) => blob,
                     Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(gone) => {

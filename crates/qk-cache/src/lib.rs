@@ -761,7 +761,7 @@ mod tests {
         let digest = cache.put_blob(&sources[0]).unwrap();
         std::fs::write(cache.root.join("blobs").join(&digest), "corrupt").unwrap();
         std::fs::remove_file(&sources[31]).unwrap();
-        let results = cache.put_warm_blobs(&sources);
+        let results = cache.put_blobs(&sources);
         assert_eq!(results.len(), sources.len());
         for (index, result) in results.into_iter().enumerate() {
             if index == 31 {
