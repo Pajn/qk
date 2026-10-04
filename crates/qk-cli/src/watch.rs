@@ -23,9 +23,9 @@ pub struct Options {
     projects: Vec<String>,
     #[arg(long)]
     all: bool,
-    #[arg(short = 'd', long, alias = "includeDependencies")]
+    #[arg(short = 'd', long)]
     include_dependencies: bool,
-    #[arg(short = 'i', long, alias = "initialRun")]
+    #[arg(short = 'i', long)]
     initial_run: bool,
     #[arg(long)]
     verbose: bool,
