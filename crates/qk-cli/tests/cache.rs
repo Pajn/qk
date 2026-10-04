@@ -59,6 +59,88 @@ fn process_helper() {
     }
 }
 
+#[test]
+fn warm_environment_helper() {
+    if std::env::var_os("QK_WARM_ENV_HELPER").is_none() {
+        return;
+    }
+    let values: std::collections::BTreeMap<_, _> = [
+        "WORKSPACE_PATH",
+        "PROJECT_PATH",
+        "TOOL_CACHE",
+        "TEXT",
+        "LITERAL",
+    ]
+    .into_iter()
+    .map(|name| (name, std::env::var(name).unwrap()))
+    .collect();
+    println!("{}", serde_json::to_string(&values).unwrap());
+    std::process::exit(0);
+}
+
+#[test]
+fn warm_environment_paths_are_absolute_in_each_worktree() {
+    let fixture = Fixture::new(json!({
+        "executor": "nx:run-commands",
+        "options": {
+            "command": format!("\"{}\" --exact warm_environment_helper --nocapture", std::env::current_exe().unwrap().display()),
+            "cwd": "{projectRoot}",
+            "env": {"QK_WARM_ENV_HELPER": "1"}
+        },
+        "qk:warm": {"env": {
+            "WORKSPACE_PATH": "{workspaceRoot}",
+            "PROJECT_PATH": "{projectRoot}",
+            "TOOL_CACHE": "{warm}/tool",
+            "TEXT": "before:{workspaceRoot}:after",
+            "LITERAL": "a/../b"
+        }}
+    }));
+    let project = fixture.root.join("packages/app");
+    fs::create_dir_all(&project).unwrap();
+    fs::rename(
+        fixture.root.join("project.json"),
+        project.join("project.json"),
+    )
+    .unwrap();
+    fixture.git(&fixture.root, &["add", "--all"]);
+    fixture.git(
+        &fixture.root,
+        &[
+            "-c",
+            "user.name=qk",
+            "-c",
+            "user.email=qk@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "nested project",
+        ],
+    );
+    let linked = fixture.worktree();
+    for root in [&fixture.root, &linked] {
+        let output = success(fixture.build(root, &[]));
+        let text = stdout(&output);
+        let values: Value =
+            serde_json::from_str(text.lines().find(|line| line.starts_with('{')).unwrap()).unwrap();
+        let canonical = root.canonicalize().unwrap();
+        let workspace_path = Path::new(values["WORKSPACE_PATH"].as_str().unwrap());
+        let project_path = Path::new(values["PROJECT_PATH"].as_str().unwrap());
+        assert!(workspace_path.is_absolute());
+        assert!(project_path.is_absolute());
+        assert_eq!(workspace_path.canonicalize().unwrap(), canonical);
+        assert_eq!(
+            project_path.canonicalize().unwrap(),
+            canonical.join("packages/app")
+        );
+        assert!(Path::new(values["TOOL_CACHE"].as_str().unwrap()).is_absolute());
+        assert_eq!(
+            values["TEXT"],
+            format!("before:{}:after", workspace_path.display())
+        );
+        assert_eq!(values["LITERAL"], "a/../b");
+    }
+}
+
 fn target(mode: &str, extra: Value) -> Value {
     let mut target = json!({
         "executor": "nx:run-commands",
@@ -1872,7 +1954,7 @@ fn warm_outputs_start_a_miss_from_the_previous_build() {
 fn warm_directories_follow_the_task_across_worktrees() {
     let fixture = Fixture::new(json!({
         "command": "if [ -f \"${TOOL_CACHE:-/nonexistent}/seen\" ]; then echo warm; else echo cold; fi; if [ -n \"$TOOL_CACHE\" ]; then mkdir -p \"$TOOL_CACHE\" && touch \"$TOOL_CACHE/seen\"; fi",
-        "qk:warm": {"env": {"TOOL_CACHE": "{warm}/tool"}}
+        "qk:warm": {"portable": true, "env": {"TOOL_CACHE": "{warm}/tool"}}
     }));
     assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
     assert_eq!(said(&fixture, &fixture.root, &[]), "warm");
@@ -1893,7 +1975,7 @@ fn warm_state_is_shared_through_the_remote_by_branch() {
     let server = s3::FakeS3::start();
     let fixture = Fixture::new(json!({
         "command": "if [ -f \"$TOOL_CACHE/seen\" ]; then cat \"$TOOL_CACHE/seen\"; else echo cold; fi; mkdir -p \"$TOOL_CACHE\" && echo \"$GITHUB_REF_NAME\" > \"$TOOL_CACHE/seen\"",
-        "qk:warm": {"env": {"TOOL_CACHE": "{warm}/tool"}}
+        "qk:warm": {"portable": true, "env": {"TOOL_CACHE": "{warm}/tool"}}
     }));
     with_remote(&fixture, &server, json!({}));
     let on = |branch: &str| {
@@ -1959,6 +2041,41 @@ fn warm_state_is_shared_through_the_remote_by_branch() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn nonportable_warm_state_neither_reads_nor_writes_remote_saves() {
+    let server = s3::FakeS3::start();
+    let target = json!({
+        "command": "if [ -f \"$TOOL_CACHE/seen\" ]; then cat \"$TOOL_CACHE/seen\"; else echo cold; fi; mkdir -p \"$TOOL_CACHE\" && echo saved > \"$TOOL_CACHE/seen\"",
+        "qk:warm": {"portable": true, "env": {"TOOL_CACHE": "{warm}/tool"}}
+    });
+    let fixture = Fixture::new(target.clone());
+    with_remote(&fixture, &server, json!({}));
+    success(remote_build(&fixture, &[("GITHUB_REF_NAME", "main")]));
+    assert_eq!(server.objects("/cache/qk/v2/warm/").len(), 1);
+    for portable in [None, Some(false)] {
+        clear_local_cache(&fixture);
+        fs::remove_dir_all(fixture.root.join(".git/qk/warm")).unwrap();
+        let mut local_target = target.clone();
+        local_target["qk:warm"]
+            .as_object_mut()
+            .unwrap()
+            .remove("portable");
+        if let Some(value) = portable {
+            local_target["qk:warm"]["portable"] = json!(value);
+        }
+        fs::write(
+            fixture.root.join("project.json"),
+            json!({"name": "app", "targets": {"build": local_target}}).to_string(),
+        )
+        .unwrap();
+        let requests = server.requests("/cache/qk/v2/warm/");
+        let output = success(remote_build(&fixture, &[("GITHUB_REF_NAME", "main")]));
+        assert_eq!(stdout(&output).lines().next(), Some("cold"));
+        assert_eq!(server.requests("/cache/qk/v2/warm/"), requests);
+    }
+}
+
 /// A task that prints what its warm `scratch/state` held, then records the
 /// worktree it ran in.
 #[cfg(unix)]
@@ -1972,7 +2089,9 @@ fn scratch_target(warm: Value) -> Value {
 #[cfg(unix)]
 #[test]
 fn a_worktree_restores_its_own_save_before_a_newer_one() {
-    let fixture = Fixture::new(scratch_target(json!({"paths": ["{projectRoot}/scratch"]})));
+    let fixture = Fixture::new(scratch_target(
+        json!({"portable": true, "paths": ["{projectRoot}/scratch"]}),
+    ));
     assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
     // A new worktree starts from the other worktree's save.
     let linked = fixture.worktree();
@@ -1996,15 +2115,18 @@ fn a_worktree_restores_its_own_save_before_a_newer_one() {
 #[cfg(unix)]
 #[test]
 fn state_that_does_not_relocate_stays_in_its_worktree() {
-    let fixture = Fixture::new(scratch_target(
+    for warm in [
+        json!({"paths": ["{projectRoot}/scratch"]}),
         json!({"paths": ["{projectRoot}/scratch"], "portable": false}),
-    ));
-    assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
-    let linked = fixture.worktree();
-    assert_eq!(said(&fixture, &linked, &[]), "cold");
-    // Its own save still comes back.
-    fs::remove_dir_all(fixture.root.join("scratch")).unwrap();
-    assert_eq!(said(&fixture, &fixture.root, &[]), "repo");
+    ] {
+        let fixture = Fixture::new(scratch_target(warm));
+        assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
+        let linked = fixture.worktree();
+        assert_eq!(said(&fixture, &linked, &[]), "cold");
+        // Its own save still comes back with sharing disabled or omitted.
+        fs::remove_dir_all(fixture.root.join("scratch")).unwrap();
+        assert_eq!(said(&fixture, &fixture.root, &[]), "repo");
+    }
 }
 
 #[cfg(unix)]
@@ -2012,7 +2134,7 @@ fn state_that_does_not_relocate_stays_in_its_worktree() {
 fn preserved_modification_times_come_back_only_to_their_worktree() {
     let fixture = Fixture::new(json!({
         "command": "if [ -f scratch/state ]; then date -r scratch/state +%Y; else echo cold; fi; mkdir -p scratch; touch scratch/state",
-        "qk:warm": {"paths": ["{projectRoot}/scratch"], "mtimes": "preserve"}
+        "qk:warm": {"portable": true, "paths": ["{projectRoot}/scratch"], "mtimes": "preserve"}
     }));
     assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
     let year = said(&fixture, &fixture.root, &[]);
@@ -2077,7 +2199,9 @@ fn restore_keys_accept_a_save_matching_the_leading_parts() {
 #[cfg(unix)]
 #[test]
 fn a_new_worktree_prefers_the_save_nearest_behind_its_head() {
-    let fixture = Fixture::new(scratch_target(json!({"paths": ["{projectRoot}/scratch"]})));
+    let fixture = Fixture::new(scratch_target(
+        json!({"portable": true, "paths": ["{projectRoot}/scratch"]}),
+    ));
     let base = fixture.root.parent().unwrap();
     assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
     // A newer save, made on a commit the next worktree does not have.
@@ -2118,7 +2242,7 @@ fn a_warm_group_is_shared_by_the_targets_that_name_it() {
     let tool = |name: &str| {
         json!({
             "command": format!("if [ -f \"$TOOL_CACHE/seen\" ]; then cat \"$TOOL_CACHE/seen\"; else echo cold; fi; mkdir -p \"$TOOL_CACHE\" && echo {name} > \"$TOOL_CACHE/seen\""),
-            "qk:warm": {"group": "tool", "env": {"TOOL_CACHE": "{warm}/tool"}}
+            "qk:warm": {"portable": true, "group": "tool", "env": {"TOOL_CACHE": "{warm}/tool"}}
         })
     };
     let fixture = Fixture::with_targets(json!({"build": tool("build"), "test": tool("test")}));

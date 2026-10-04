@@ -141,10 +141,10 @@ An object describing reusable scratch state:
 | --- | --- | --- |
 | `outputs` | boolean | `false`; restore previous outputs before execution |
 | `paths` | array of workspace paths and globs | Empty; `!` excludes; `{warm}` is not allowed here |
-| `env` | object of strings | Empty; supports `{warm}`, `{workspaceRoot}`, `{projectRoot}` |
+| `env` | object of strings | Empty; `{warm}`, `{workspaceRoot}`, `{projectRoot}` expand to absolute directories |
 | `maxSize` | bytes or size string | No per-group limit |
-| `remote` | boolean | `true`; permit sharing warm state remotely |
-| `portable` | boolean | `true`; restore another worktree's or the remote's save |
+| `remote` | boolean | `true`; permit remote exchange when `portable` is also `true` |
+| `portable` | boolean | `false`; `true` permits another worktree's save and remote exchange |
 | `mtimes` | `"epoch"` or `"preserve"` | `"epoch"`; `"preserve"` keeps a worktree's own save's modification times |
 | `key` | array of workspace paths and `{"env": name}` objects | Empty; a save is restored only where the key matches |
 | `restoreKeys` | count | None; how many leading `key` parts a save must match when none matches whole |
@@ -153,6 +153,9 @@ An object describing reusable scratch state:
 | `save` | `"wait"` or `"background"` | `"wait"`; `"background"` saves after the task has reported |
 
 Put it beside `inputs` and `outputs`, rather than in executor `options`.
+Environment values retain their other text unchanged; their directory tokens
+are absolute even when the task runs from a project subdirectory.
 Warm state is restored on misses and uncached runs, saved after success,
 and never changes a key or a hit. `--skip-cache` disables it.
-See [Warm state](../guides/warm-state.md) for examples and lifecycle details.
+See [Warm state](../guides/warm-state.md) for tool configurations, portability checks
+and lifecycle details.
