@@ -42,10 +42,11 @@ git; a checkout with no branch reads the default branch's state but saves
 none remotely. `remote: false` keeps a target's warm state local. It is
 saved after successful runs only; files unchanged since the last save or
 restore are recognised by their metadata and not read again.
-New warm files are copied with bounded concurrency and left to the operating
-system to flush to disk. Warm state is rebuildable: a power loss may discard
-a save. Blobs are still verified before restoration, and a failed warm
-restore does not prevent the target from running.
+New warm files are copied with bounded concurrency. Cache writes are left
+to the operating system to flush to disk, for both warm state and result
+entries. A power loss may discard or damage a cache entry; blobs are
+verified before restoration, invalid result entries are misses, and a failed
+warm restore does not prevent the target from running.
 The timestamp and path policies below distinguish reusable tool state from
 verified result outputs.
 
