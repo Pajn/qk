@@ -1,10 +1,11 @@
 //! A remote store on S3-compatible storage, configured by nx.json's `s3` key as
 //! `@nx/s3-cache` reads it.
 //!
-//! Objects live under `<cacheKeyPrefix>qk/v2/`, so a bucket shared with Nx never
+//! Objects live under `<cacheKeyPrefix>qk/v3/`, so a bucket shared with Nx never
 //! mixes the two: `entries/<key>` for results and `warm/<task>/<branch>` for
-//! warm records. Each object is a pack holding a manifest or record with every
-//! blob it cites, so that one request reads or writes it whole; the store's
+//! warm records. Each object is a Zstandard level 3 pack holding a manifest or
+//! record with every blob it cites, so one request reads or writes it whole;
+//! the store's
 //! latency is per request, and an entry can cite thousands of blobs. A local
 //! miss fetches the pack and keeps the blobs missing locally, verifying each
 //! against its hash; the restore then runs locally. Uploads run in the
@@ -13,10 +14,11 @@
 
 pub(crate) mod background;
 mod index;
+mod pack;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
-use std::fs::{self, File};
+use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -42,9 +44,6 @@ const LISTING_READERS: usize = 16;
 const LARGEST_LISTING: usize = 4 << 20;
 const LARGEST_INDEX: usize = 32 << 20;
 const LARGEST_LIST_RESPONSE: usize = 1 << 20;
-/// The most a pack's manifest or record may hold, so a corrupt length is not
-/// taken for one to read into memory.
-const LARGEST_RECORD: u64 = 1 << 30;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -182,7 +181,7 @@ pub fn configure(
     Ok(Some(Remote {
         bucket,
         credentials,
-        prefix: format!("{}qk/v2/", setting("cacheKeyPrefix").unwrap_or_default()),
+        prefix: format!("{}qk/v3/", setting("cacheKeyPrefix").unwrap_or_default()),
         agent,
         mode,
         uploads: Mutex::new(None),
@@ -488,44 +487,7 @@ impl Remote {
                 status => bail!("GET {object} returned {status}"),
             }
         }
-        let length = pack_length(&mut body)?;
-        if length > LARGEST_RECORD {
-            bail!("remote record in {object} is too large");
-        }
-        let mut record = Vec::new();
-        if (&mut body).take(length).read_to_end(&mut record)? as u64 != length {
-            bail!("remote pack {object} ends early");
-        }
-        let parsed: Value = serde_json::from_slice(&record).context("invalid remote record")?;
-        check(&parsed)?;
-        for blob in crate::evict::manifest_blobs(&parsed) {
-            if !crate::store::valid_hash(&blob) {
-                bail!("invalid blob name in remote record");
-            }
-            let length = pack_length(&mut body)?;
-            let mut part = (&mut body).take(length);
-            let target = root.join("blobs").join(&blob);
-            let copied = if target.is_file() {
-                io::copy(&mut part, &mut io::sink())?
-            } else {
-                let mut file = tempfile::NamedTempFile::new_in(root.join("tmp"))?;
-                let copied = io::copy(&mut part, file.as_file_mut())?;
-                if copied == length {
-                    if crate::hash::digest_file(file.path())? != blob {
-                        bail!("remote blob {blob} does not match its hash");
-                    }
-                    file.persist(&target)?;
-                }
-                copied
-            };
-            if copied != length {
-                bail!("remote pack {object} ends early");
-            }
-        }
-        if body.read(&mut [0])? != 0 {
-            bail!("remote pack {object} holds more than its record cites");
-        }
-        Ok(Some(record))
+        pack::read(root, body, check).map(Some)
     }
 
     fn enqueue(self: &Arc<Self>, upload: Upload) {
@@ -595,21 +557,8 @@ impl Remote {
     /// Uploads `record` with the blobs it cites from the local store at
     /// `root`, as one pack.
     fn put_pack(&self, root: &Path, object: &str, record: &[u8]) -> Result<()> {
-        let parsed: Value = serde_json::from_slice(record)?;
         let mut pack = tempfile::NamedTempFile::new_in(root.join("tmp"))?;
-        let mut writer = io::BufWriter::new(pack.as_file_mut());
-        writer.write_all(&(record.len() as u64).to_le_bytes())?;
-        writer.write_all(record)?;
-        for blob in crate::evict::manifest_blobs(&parsed) {
-            let mut file = File::open(root.join("blobs").join(&blob))?;
-            let length = file.metadata()?.len();
-            writer.write_all(&length.to_le_bytes())?;
-            if io::copy(&mut (&mut file).take(length), &mut writer)? != length {
-                bail!("blob {blob} changed while it was uploaded");
-            }
-        }
-        writer.flush()?;
-        drop(writer);
+        pack::write(root, record, pack.as_file_mut())?;
         let file = pack.reopen()?;
         if file.metadata()?.len() > LARGEST_UPLOAD {
             bail!("too large to upload as one object");
@@ -749,15 +698,6 @@ fn read_bounded(
         }
         body.extend_from_slice(&chunk[..count]);
     }
-}
-
-/// The length that starts each part of a pack.
-fn pack_length(reader: &mut impl Read) -> Result<u64> {
-    let mut bytes = [0; 8];
-    reader
-        .read_exact(&mut bytes)
-        .context("remote pack ends early")?;
-    Ok(u64::from_le_bytes(bytes))
 }
 
 #[cfg(test)]

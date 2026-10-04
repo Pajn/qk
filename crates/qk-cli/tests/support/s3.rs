@@ -176,7 +176,7 @@ fn serve(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
                         ));
                     }
                     xml.push_str("</ListBucketResult>");
-                    if more && state.compact_index_page && prefix.contains("/qk/v2/index/") {
+                    if more && state.compact_index_page && prefix.contains("/qk/v3/index/") {
                         let cursor = format!("{bucket}{}", listed.last().unwrap());
                         let unseen: Vec<_> = state
                             .objects
@@ -196,7 +196,7 @@ fn serve(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
                     (200, xml.into_bytes(), false)
                 }
             }
-            "GET" if state.compact_index_read && path.contains("/qk/v2/index/") => {
+            "GET" if state.compact_index_read && path.contains("/qk/v3/index/") => {
                 let bytes = state.objects.remove(&path).unwrap();
                 state.objects.insert(format!("{path}-merged"), bytes);
                 state.compact_index_read = false;
@@ -230,14 +230,14 @@ fn serve(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
             }
             "PUT" if chunked => (501, Vec::new(), false),
             "PUT"
-                if path.contains("/qk/v2/index/")
+                if path.contains("/qk/v3/index/")
                     && state.fail_index_put
                         == Some(
                             state
                                 .requests
                                 .iter()
                                 .filter(|request| {
-                                    request.starts_with("PUT ") && request.contains("/qk/v2/index/")
+                                    request.starts_with("PUT ") && request.contains("/qk/v3/index/")
                                 })
                                 .count(),
                         ) =>
