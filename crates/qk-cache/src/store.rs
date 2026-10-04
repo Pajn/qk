@@ -152,6 +152,15 @@ impl Cache {
     }
 
     pub(crate) fn put_blob(&self, source: &Path) -> Result<String> {
+        self.put_blob_in(source, &mut None, 0)
+    }
+
+    fn put_blob_in(
+        &self,
+        source: &Path,
+        staging: &mut Option<tempfile::TempDir>,
+        index: usize,
+    ) -> Result<String> {
         // Content the store already holds is not copied again: a
         // rebuild rewrites most outputs with what they held before. A stored
         // blob that no longer holds its digest's content, or cannot be read, is
@@ -164,8 +173,12 @@ impl Cache {
         // fs::copy clones on copy-on-write filesystems when source and cache share
         // a volume, and falls back to a byte copy otherwise. Cloning needs a fresh
         // destination path, so copy into a private directory rather than a temp file.
-        let staging = tempfile::tempdir_in(self.root.join("tmp"))?;
-        let temporary = staging.path().join("blob");
+        if staging.is_none() {
+            *staging = Some(tempfile::tempdir_in(self.root.join("tmp"))?);
+        }
+        // A worker keeps one private directory, but every clone needs a fresh
+        // destination even when an earlier copy or rename failed.
+        let temporary = staging.as_ref().unwrap().path().join(index.to_string());
         fs::copy(source, &temporary)?;
         // Blobs keep no meaningful mode of their own; restores apply the manifest's.
         set_mode(&temporary, if cfg!(unix) { 0o644 } else { 0 })?;
@@ -195,9 +208,11 @@ impl Cache {
                 .chunks(sources.len().div_ceil(workers))
                 .map(|chunk| {
                     scope.spawn(move || {
+                        let mut staging = None;
                         chunk
                             .iter()
-                            .map(|source| self.put_blob(source))
+                            .enumerate()
+                            .map(|(index, source)| self.put_blob_in(source, &mut staging, index))
                             .collect::<Vec<_>>()
                     })
                 })
@@ -918,5 +933,44 @@ mod tests {
         fs::write(root.join("dist/file-0"), "changed").unwrap();
         assert!(cache.publish(root, &key, &outputs, &log).is_err());
         assert_eq!(fs::read(&entry).unwrap(), original);
+    }
+    #[test]
+    fn worker_staging_is_cleaned_after_a_failed_blob_without_affecting_later_copies() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = Cache::new(temp.path().join("cache"));
+        cache.initialize().unwrap();
+        let sources: Vec<_> = (0..130)
+            .map(|index| {
+                let source = temp.path().join(format!("source-{index}"));
+                fs::write(&source, format!("content-{index}")).unwrap();
+                source
+            })
+            .collect();
+        let blocked = digest_file(&sources[64]).unwrap();
+        fs::create_dir(cache.root.join("blobs").join(&blocked)).unwrap();
+        let results = cache.put_blobs(&sources);
+        assert_eq!(results.len(), sources.len());
+        for (index, result) in results.into_iter().enumerate() {
+            if index == 64 {
+                assert!(result.is_err());
+                continue;
+            }
+            let blob = result.unwrap();
+            assert_eq!(
+                fs::read(cache.root.join("blobs").join(blob)).unwrap(),
+                fs::read(&sources[index]).unwrap()
+            );
+        }
+        assert_eq!(fs::read_dir(cache.root.join("tmp")).unwrap().count(), 0);
+        // Existing blobs do not require a staging directory, and the failed
+        // source can be saved normally once its target is available.
+        fs::remove_dir(cache.root.join("blobs").join(blocked)).unwrap();
+        assert!(
+            cache
+                .put_blobs(&sources)
+                .into_iter()
+                .all(|result| result.is_ok())
+        );
+        assert_eq!(fs::read_dir(cache.root.join("tmp")).unwrap().count(), 0);
     }
 }
