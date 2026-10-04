@@ -31,10 +31,11 @@ state ever being part of a result, with a `qk:warm` key at target level
 Warm state is restored before the task runs, on a cache miss and for
 targets that are not cacheable, and never on a hit. A group already present
 on disk is left alone, since it is the newest for that checkout; otherwise
-it comes from a save in the store linked worktrees share. Each worktree
+it comes from the worktree's own save. With `portable: true`, it can also
+come from the store linked worktrees share or from the remote store. Each worktree
 keeps its own save, and a restore takes the worktree's own before the most
 recent other worktree's; the eight most recent saves of a task are kept.
-Without one there it comes from the remote store: the current branch's
+With sharing enabled and no suitable local save, it comes from the remote store: the current branch's
 save, else the default branch's (nx.json `defaultBase`, else `main`). The
 branch comes from `GITHUB_HEAD_REF` or `GITHUB_REF_NAME` in CI, else from
 git; a checkout with no branch reads the default branch's state but saves
@@ -78,13 +79,13 @@ points to verify on your project.
 
 | Tool and state | Same-worktree configuration | Different checkout path |
 | --- | --- | --- |
-| TypeScript build outputs and `.tsbuildinfo` | `outputs: true`; keep default epoch times | Relative build-info paths relocated and sources were revalidated. Custom generators or absolute paths need their own checks. |
+| TypeScript build outputs and `.tsbuildinfo` | `outputs: true`; keep default epoch times; opt into `portable: true` after relocation checks | Relative build-info paths relocated and sources were revalidated. Custom generators or absolute paths need their own checks. |
 | Make objects | Complete object/output paths, `mtimes: "preserve"`, `portable: false` | Relative rules rebuilt correctly, but epoch objects did not skip compilation. |
 | Ninja objects and logs | Complete build directory, `mtimes: "preserve"`, `portable: false` | Relative rules rebuilt correctly. Absolute paths in generated rules can bind the state to the old checkout. |
 | CMake build directory | Complete build directory, `mtimes: "preserve"`, `portable: false` | `CMakeCache.txt` retained the original source and build paths; relocation failed. Configure a new build directory. |
 | Xcode build intermediates | Explicit intermediate/DerivedData paths, `mtimes: "preserve"`, `portable: false` | A relative-source project rebuilt correctly but compiled again. CMake-generated projects also retained CMake's absolute paths. |
 | Cargo target directory | Actual target directory, `mtimes: "preserve"`, `portable: false` | A simple crate rebuilt correctly, but was `Dirty` rather than `Fresh`. Build scripts and generated absolute paths need separate checks. |
-| Metro transform cache | Default epoch times; configure the tool's cache store | Reused transforms at a different project root with the same transformer/configuration. Its file-map cache is separate. |
+| Metro transform cache | `portable: true` after validation; default epoch times; configure the tool's cache store | Reused transforms at a different project root with the same transformer/configuration. Its file-map cache is separate. |
 | Jest transform cache | Configure `cacheDirectory`; default epoch times worked; `portable: false` | babel-jest transformed modules again because the configuration/cache identity included checkout paths. |
 | Vitest filesystem module cache | Enable `fsModuleCache`, configure `fsModuleCachePath`; default epoch times worked; `portable: false` | Module-cache keys included absolute module IDs and the Vite root; transforms ran again. |
 | Gradle project history and build outputs | Complete local state, `mtimes: "preserve"`, `portable: false` | A Java project rebuilt correctly; copied history alone did not make compilation up to date. Native/CMake state can impose stricter path requirements. |
@@ -188,10 +189,16 @@ cannot validate.
 
 ## Sharing state across worktrees and CI
 
-`portable: true`, the default, permits another worktree's or a remote save.
-It does not rewrite absolute paths inside files or make incompatible tools
-accept them. `remote: false` disables remote exchange but still permits
-another worktree's save; `portable: false` restricts both.
+`portable: false` is the default: warm state is saved and restored only in
+its own worktree. Set `portable: true` to permit another worktree's save and,
+when `remote` is enabled, remote exchange. It does not rewrite absolute paths
+inside files or make incompatible tools accept them. `remote: false` disables
+remote exchange while still permitting other worktrees when `portable` is true.
+
+**Migration:** configurations that previously relied on implicit cross-worktree
+or remote warm-state sharing must now set `portable: true` explicitly. Validate
+the tool's relocation behavior before opting in. Same-worktree warm restores
+and local/remote task-result caching keep their existing behavior.
 
 Prefer a tool's content-addressed compiler/transform/task cache when the
 full build directory is tied to a checkout. ccache and Gradle's task-output
@@ -231,6 +238,7 @@ For Metro, configure its transform cache explicitly:
 ```jsonc
 "bundle": {
   "qk:warm": {
+    "portable": true,
     "env": { "METRO_CACHE_DIR": "{warm}/metro-transform" },
     "maxSize": "1GB"
   }
@@ -266,6 +274,7 @@ shared group rather than copying the project's whole `.gradle` directory:
   "options": { "command": "./gradlew compileJava --build-cache" },
   "qk:warm": {
     "group": "gradle-task-cache",
+    "portable": true,
     "env": { "GRADLE_BUILD_CACHE_DIR": "{warm}/task-cache" },
     "maxSize": "1GB"
   }
@@ -361,8 +370,9 @@ Each part is a file, by its content, or an environment variable, by its
 value as the task receives it, including the target's `options.env`. A save is restored when its key matches whole, or, with `restoreKeys`,
 when it matches in that many leading parts; one that matches whole is
 preferred. Among saves that suit equally, the worktree's own comes first,
-then the one made at the commit nearest behind `HEAD` in Git history, then
-the newest, so a worktree cut from `main` starts from `main`'s state rather
+then, with `portable: true`, the one made at the commit nearest behind
+`HEAD` in Git history, then the newest, so a worktree cut from `main` starts
+from `main`'s state rather
 than the last feature branch's.
 
 ## Shared compiler caches
@@ -373,6 +383,7 @@ that names it, as one compiler cache serves several builds:
 ```jsonc
 "qk:warm": {
   "group": "ccache",
+  "portable": true,
   "env": { "CCACHE_DIR": "{warm}/ccache", "CCACHE_BASEDIR": "{workspaceRoot}" }
 }
 ```

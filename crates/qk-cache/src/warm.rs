@@ -9,9 +9,9 @@
 //!   keeps for the task outside the working tree.
 //!
 //! A group already present on disk is left alone. Otherwise it is restored
-//! from a save: this worktree's own if it has one, else another worktree's,
-//! the most recent first. It is saved after successful runs, one record per
-//! worktree.
+//! from this worktree's own save. `portable: true` also permits other
+//! worktrees' and remote saves. It is saved after successful runs, one record
+//! per worktree.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -268,7 +268,7 @@ pub fn config(workspace: &Workspace, task: &Task) -> Result<Option<Warm>> {
         max_size,
         remote: flag("remote", true)?,
         preserve_mtimes,
-        portable: flag("portable", true)?,
+        portable: flag("portable", false)?,
         key,
         restore_keys,
         survive,

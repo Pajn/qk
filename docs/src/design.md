@@ -251,8 +251,8 @@ worktree made it.
 
 ### Groups that do not relocate
 
-`portable: false` restores a group only from the worktree that saved it. State
-that records absolute paths, such as CMake build directories, then never
+`portable: false`, the default, restores a group only from the worktree that
+saved it. State that records absolute paths, such as CMake build directories, then never
 reaches a checkout it would break or merely occupy. Portable groups can
 restore from other worktrees and the remote store.
 
@@ -261,6 +261,7 @@ restore from other worktrees and the remote store.
 ```jsonc
 "qk:warm": {
   "group": "ccache",
+  "portable": true,
   "env": { "CCACHE_DIR": "{warm}", "CCACHE_BASEDIR": "{workspaceRoot}" }
 }
 ```
