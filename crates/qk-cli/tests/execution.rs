@@ -1384,6 +1384,14 @@ fn empty_selections_write_machine_readable_task_graphs() {
             "--granularity=project",
         ],
         vec!["affected", "-t", "missing", "--base=HEAD", "--head=HEAD"],
+        vec![
+            "affected",
+            "-t",
+            "missing",
+            "--base=HEAD",
+            "--head=HEAD",
+            "--granularity=task",
+        ],
     ] {
         args.push("--graph=stdout");
         let output = success(run(temp.path(), &args));
