@@ -188,7 +188,7 @@ pub(super) fn launch(
         .env_remove("AWS_ACCESS_KEY_ID")
         .env_remove("AWS_SECRET_ACCESS_KEY")
         .env_remove("AWS_SESSION_TOKEN");
-    detach(&mut command);
+    detach(&mut command)?;
     let mut child = command.spawn().context("cannot start upload worker")?;
     let handoff = (|| -> Result<()> {
         // Credentials travel only through this private pipe, never through argv
@@ -221,7 +221,7 @@ pub(super) fn launch(
 }
 
 #[cfg(unix)]
-fn detach(command: &mut Command) {
+fn detach(command: &mut Command) -> Result<()> {
     use std::os::unix::process::CommandExt;
     // SAFETY: setsid is the only operation after fork and is async-signal-safe.
     unsafe {
@@ -232,18 +232,45 @@ fn detach(command: &mut Command) {
             Ok(())
         });
     }
+    Ok(())
 }
 
 #[cfg(windows)]
-fn detach(command: &mut Command) {
+fn detach(command: &mut Command) -> Result<()> {
     use std::os::windows::process::CommandExt;
     const DETACHED_PROCESS: u32 = 0x00000008;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+    // Windows inherits every inheritable handle, even when a child's stdio is
+    // redirected. Shell-provided stdio handles would keep the caller's pipes
+    // alive until uploads finished. Command duplicates the worker's own stdio,
+    // so these originals never need to remain inheritable.
+    use windows_sys::Win32::Foundation::{
+        HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+    };
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    for kind in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: GetStdHandle returns a borrowed process handle; clearing its
+        // inheritance flag neither closes it nor changes its read/write access.
+        unsafe {
+            let handle = GetStdHandle(kind);
+            if !handle.is_null()
+                && handle != INVALID_HANDLE_VALUE
+                && SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) == 0
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+    }
     command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    Ok(())
 }
 
 #[cfg(not(any(unix, windows)))]
-fn detach(_command: &mut Command) {}
+fn detach(_command: &mut Command) -> Result<()> {
+    Ok(())
+}
 
 pub(crate) fn run() -> Result<()> {
     let request: Request = serde_json::from_reader(std::io::stdin().lock().take(MAX_REQUEST + 1))?;
