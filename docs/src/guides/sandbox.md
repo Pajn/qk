@@ -13,6 +13,11 @@ Inside the workspace, a task may:
 - list any directory;
 - write its outputs and warm paths.
 
+Structured JSON inputs permit reading their declared JSON file, including
+its symlink target. Declared directory symlinks permit reading the whole
+linked tree and its nested link targets, matching the content in the cache
+key. These read permissions do not allow writing input files.
+
 A directory whose every tracked file is an input is allowed whole, so
 untracked files in it can be read too.
 

@@ -136,9 +136,16 @@ impl Sandbox {
         for (id, task) in &graph.tasks {
             match &resolution.tasks[id] {
                 Ok(resolved) => {
+                    let mut files = resolved.files.clone();
+                    files.extend(
+                        resolved
+                            .values
+                            .keys()
+                            .filter_map(|key| key.strip_prefix("json:").map(str::to_owned)),
+                    );
                     plans.insert(
                         id.clone(),
-                        plan(workspace, graph, task, &root, &tree, &resolved.files),
+                        plan(workspace, graph, task, &root, &tree, &files),
                     );
                 }
                 Err(reason) => {
@@ -486,13 +493,14 @@ fn plan(
     for file in ["pnpm-lock.yaml", "pnpm-workspace.yaml", "package.json"] {
         read_files.push(path(file));
     }
-    // A symlinked input is read where it points.
+    let mut read_trees = BTreeSet::new();
     for file in files {
-        let absolute = root.join(file);
-        if std::fs::symlink_metadata(&absolute).is_ok_and(|metadata| metadata.is_symlink())
-            && let Ok(target) = absolute.canonicalize()
-        {
-            read_files.push(target);
+        for target in linked_targets(root, &root.join(file)) {
+            if target.is_dir() {
+                read_trees.insert(target);
+            } else {
+                read_files.push(target);
+            }
         }
     }
     let anchors = |task: &Task| -> Vec<PathBuf> {
@@ -500,7 +508,6 @@ fn plan(
             .map(|outputs| outputs.anchors().map(path).collect())
             .unwrap_or_default()
     };
-    let mut read_trees = BTreeSet::new();
     for dependency in dependencies(graph, task) {
         read_trees.extend(anchors(dependency));
     }
@@ -516,6 +523,34 @@ fn plan(
         read_trees,
         write_trees,
     }
+}
+
+/// Linked directory inputs key the whole target tree, including nested links.
+pub(crate) fn linked_targets(root: &Path, link: &Path) -> BTreeSet<PathBuf> {
+    if !std::fs::symlink_metadata(link).is_ok_and(|metadata| metadata.is_symlink()) {
+        return BTreeSet::new();
+    }
+    let mut pending = vec![link.to_path_buf()];
+    let mut visited = BTreeSet::new();
+    while let Some(link) = pending.pop() {
+        let Ok(target) = link.canonicalize() else {
+            continue;
+        };
+        if !target.starts_with(root) || !visited.insert(target.clone()) {
+            continue;
+        }
+        if target.is_dir() {
+            pending.extend(
+                walkdir::WalkDir::new(&target)
+                    .follow_links(false)
+                    .into_iter()
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.file_type().is_symlink())
+                    .map(|entry| entry.into_path()),
+            );
+        }
+    }
+    visited
 }
 
 /// The Seatbelt profile for a task's plan.
@@ -812,6 +847,38 @@ mod tests {
         let (whole, singles) = tree.cover(&inputs);
         assert_eq!(whole, ["app/lib", "app/src/deep"]);
         assert_eq!(singles, ["app/src/a.ts"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_targets_follow_nested_links_without_cycles_or_external_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        for directory in ["shared", "nested"] {
+            std::fs::create_dir(root.join(directory)).unwrap();
+        }
+        std::fs::write(root.join("file.txt"), "input").unwrap();
+        for (target, alias) in [
+            (PathBuf::from("shared"), "selected"),
+            (PathBuf::from("../file.txt"), "shared/file.txt"),
+            (PathBuf::from("../nested"), "shared/nested"),
+            (PathBuf::from("../shared"), "shared/cycle"),
+            (external.path().to_path_buf(), "shared/external"),
+        ] {
+            std::os::unix::fs::symlink(target, root.join(alias)).unwrap();
+        }
+        assert_eq!(
+            linked_targets(&root, &root.join("selected")),
+            [
+                root.join("shared"),
+                root.join("nested"),
+                root.join("file.txt")
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert!(linked_targets(&root, &root.join("file.txt")).is_empty());
     }
 
     #[test]

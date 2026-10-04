@@ -21,7 +21,7 @@ pub struct Recorder {
     program: Option<PathBuf>,
     declared: qk_cache::Resolution,
     started: std::time::SystemTime,
-    symlinks: BTreeMap<String, PathBuf>,
+    symlinks: BTreeMap<String, BTreeSet<PathBuf>>,
     tag_prefix: String,
 }
 
@@ -60,13 +60,25 @@ impl Recorder {
             symlinks: BTreeMap::new(),
             tag_prefix,
         };
-        for path in &recorder.declared.candidates {
-            let absolute = recorder.root.join(path);
-            if std::fs::symlink_metadata(&absolute)
-                .is_ok_and(|metadata| metadata.file_type().is_symlink())
-                && let Ok(target) = absolute.canonicalize()
-            {
-                recorder.symlinks.insert(path.clone(), target);
+        let mut candidates = recorder.declared.candidates.clone();
+        for resolved in recorder
+            .declared
+            .tasks
+            .values()
+            .filter_map(|task| task.as_ref().ok())
+        {
+            candidates.extend(
+                resolved
+                    .values
+                    .keys()
+                    .filter_map(|key| key.strip_prefix("json:").map(str::to_owned)),
+            );
+        }
+        for path in candidates {
+            let targets =
+                crate::sandbox::linked_targets(&recorder.root, &recorder.root.join(&path));
+            if !targets.is_empty() {
+                recorder.symlinks.insert(path, targets);
             }
         }
         if cfg!(target_os = "macos") {
@@ -267,15 +279,19 @@ impl Recorder {
                 if event.path.is_empty() {
                     event.path = ".".into();
                 }
-                event.keyed_path = self.symlinks.iter().find_map(|(alias, target)| {
-                    let suffix = absolute.strip_prefix(target).ok()?;
-                    let keyed = if suffix.as_os_str().is_empty() {
-                        alias.clone()
-                    } else {
-                        format!("{alias}/{}", suffix.to_string_lossy())
-                    };
-                    // A directory symlink input hashes the whole linked tree.
-                    (declared.contains(&keyed) || declared.contains(alias)).then_some(alias.clone())
+                event.keyed_path = self.symlinks.iter().find_map(|(alias, targets)| {
+                    let resolved = self.declared.tasks[id].as_ref().ok()?;
+                    let alias_path = self.root.join(alias);
+                    std::iter::once(&alias_path)
+                        .chain(targets)
+                        .find_map(|target| {
+                            let suffix = absolute.strip_prefix(target).ok()?;
+                            let keyed = format!("{alias}/{}", suffix.to_string_lossy());
+                            (declared.contains(alias)
+                                || declared.contains(&keyed)
+                                || resolved.values.contains_key(&format!("json:{alias}")))
+                            .then_some(alias.clone())
+                        })
                 });
                 event.category = if event.path.split('/').any(|part| part == "node_modules") {
                     Category::InstalledPackage
@@ -300,14 +316,17 @@ impl Recorder {
                     || (!event.operation.writes() && self.root.join(&event.path).is_dir())
                 {
                     Category::Discovery
-                } else if declared.contains(&event.path) || event.keyed_path.is_some() {
-                    Category::Input
                 } else if self.declared.tasks[id].as_ref().is_ok_and(|resolved| {
                     resolved
                         .values
                         .contains_key(&format!("json:{}", event.path))
+                        || event.keyed_path.as_ref().is_some_and(|alias| {
+                            resolved.values.contains_key(&format!("json:{alias}"))
+                        })
                 }) {
                     Category::StructuredInput
+                } else if declared.contains(&event.path) || event.keyed_path.is_some() {
+                    Category::Input
                 } else if generated.contains(&event.path) && !event.operation.writes() {
                     Category::Generated
                 } else if self.declared.tasks[id].as_ref().is_ok_and(|resolved| {
