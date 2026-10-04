@@ -13,6 +13,8 @@ pub struct State {
     pub requests: Vec<String>,
     /// Close the connection halfway through each object read.
     pub cut_reads: bool,
+    /// Hold PUT responses until the test releases them.
+    pub block_puts: bool,
     /// Answer listings with a server error.
     pub fail_lists: bool,
     /// The most objects one listing response names; all when zero.
@@ -130,6 +132,9 @@ fn serve(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
     } else {
         body.resize(length, 0);
         reader.read_exact(&mut body)?;
+    }
+    while method == "PUT" && state.lock().unwrap().block_puts {
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
     let (status, response, cut) = {
         let mut state = state.lock().unwrap();

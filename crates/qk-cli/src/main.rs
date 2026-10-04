@@ -38,6 +38,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    #[command(name = "__upload-worker", hide = true)]
+    UploadWorker,
     /// Record task file accesses and review input declarations.
     Inputs {
         #[command(subcommand)]
@@ -780,6 +782,10 @@ fn current_project(workspace: &Workspace) -> Result<String> {
 }
 
 fn run(mut cli: Cli) -> Result<i32> {
+    if matches!(cli.command, Command::UploadWorker) {
+        qk_cache::run_upload_worker()?;
+        return Ok(0);
+    }
     match &mut cli.command {
         Command::Affected { changes, .. }
         | Command::Show {
@@ -796,6 +802,7 @@ fn run(mut cli: Cli) -> Result<i32> {
     };
     let workspace = Workspace::load(&root)?;
     match cli.command {
+        Command::UploadWorker => unreachable!("handled before workspace discovery"),
         Command::Inputs {
             command:
                 InputsCommand::Analyze {

@@ -1090,6 +1090,7 @@ dependencies = [
  "globset",
  "ignore",
  "jsonc-parser",
+ "libc",
  "qk-config",
  "qk-executor",
  "qk-graph",
@@ -1104,6 +1105,7 @@ dependencies = [
  "ureq",
  "url",
  "walkdir",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

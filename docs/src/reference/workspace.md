@@ -146,9 +146,13 @@ dotenv files rather than checked-in configuration.
 | `secretAccessKey` | string | Falls back to `AWS_SECRET_ACCESS_KEY` |
 | `localMode` | string | `read-write` outside CI |
 | `ciMode` | string | `read-write` in CI |
+| `uploadMode` | string | `wait`; qk can detach uploads with `background` |
 
 Modes are `read-write`, `read` (or `read-only`), and `no-cache`.
 `NX_POWERPACK_CACHE_MODE` overrides the selected mode.
+`uploadMode` is `"wait"` (the default) or `"background"`;
+`QK_REMOTE_UPLOAD_MODE` overrides it. See [Remote caching](../guides/remote-cache.md)
+for detached uploads, logs and lifecycle behavior.
 `AWS_SESSION_TOKEN` supplies a temporary credential token.
 `--skip-remote-cache`, `NX_SKIP_REMOTE_CACHE=true` and
 `NX_DISABLE_REMOTE_CACHE=true` disable the remote store.
