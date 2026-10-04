@@ -385,6 +385,9 @@ mod tests {
             .unwrap();
         cleanup_abandoned(temporary.path());
         assert!(snapshot.is_dir());
+        // Parallel tests may fork and briefly inherit this open file description.
+        // Unlock explicitly so cleanup does not depend on those children execing.
+        FileExt::unlock(&lease).unwrap();
         drop(lease);
         cleanup_abandoned(temporary.path());
         assert!(!snapshot.exists());
