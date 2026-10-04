@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::Write;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
@@ -152,7 +152,7 @@ impl Cache {
     }
 
     pub(crate) fn put_blob(&self, source: &Path) -> Result<String> {
-        // Content the store already holds is not copied or flushed again: a
+        // Content the store already holds is not copied again: a
         // rebuild rewrites most outputs with what they held before. A stored
         // blob that no longer holds its digest's content, or cannot be read, is
         // replaced below, so that a rebuild after corruption repairs it.
@@ -169,11 +169,7 @@ impl Cache {
         fs::copy(source, &temporary)?;
         // Blobs keep no meaningful mode of their own; restores apply the manifest's.
         set_mode(&temporary, if cfg!(unix) { 0o644 } else { 0 })?;
-        // Windows flushes only through a handle open for writing.
-        fs::OpenOptions::new()
-            .write(true)
-            .open(&temporary)?
-            .sync_all()?;
+        // Cache content is rebuildable, so leave disk flushing to the OS.
         // Hash the copy, not the source, so a concurrent write cannot mislabel the blob.
         let hash = digest_file(&temporary)?;
         let target = self.root.join("blobs").join(&hash);
@@ -185,6 +181,32 @@ impl Cache {
             return Err(error.into());
         }
         Ok(hash)
+    }
+
+    /// Stores independent blobs with bounded I/O concurrency, retaining input order.
+    pub(crate) fn put_warm_blobs(&self, sources: &[PathBuf]) -> Vec<Result<String>> {
+        // Bound parallel copies and avoid threads for small saves.
+        let workers = sources.len().div_ceil(64).clamp(1, 8);
+        if workers == 1 {
+            return sources.iter().map(|source| self.put_blob(source)).collect();
+        }
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = sources
+                .chunks(sources.len().div_ceil(workers))
+                .map(|chunk| {
+                    scope.spawn(move || {
+                        chunk
+                            .iter()
+                            .map(|source| self.put_blob(source))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|handle| handle.join().expect("blob writer panicked"))
+                .collect()
+        })
     }
 
     pub(crate) fn publish(
@@ -232,7 +254,6 @@ impl Cache {
         let mut file = NamedTempFile::new_in(self.root.join("tmp"))?;
         serde_json::to_writer(file.as_file_mut(), &manifest)?;
         file.flush()?;
-        file.as_file().sync_all()?;
         file.persist(self.root.join("entries").join(format!("{key}.json")))?;
         manifest.output_fingerprint(outputs.declared())
     }

@@ -382,7 +382,6 @@ impl Remote {
         };
         let mut file = tempfile::NamedTempFile::new_in(root.join("tmp"))?;
         file.write_all(&manifest)?;
-        file.as_file().sync_all()?;
         file.persist(root.join("entries").join(format!("{key}.json")))?;
         self.confirmed.lock().unwrap().insert(key.to_owned());
         Ok(true)
@@ -487,7 +486,6 @@ impl Remote {
             } else {
                 let mut file = tempfile::NamedTempFile::new_in(root.join("tmp"))?;
                 let copied = io::copy(&mut part, file.as_file_mut())?;
-                file.as_file().sync_all()?;
                 if copied == length {
                     if crate::hash::digest_file(file.path())? != blob {
                         bail!("remote blob {blob} does not match its hash");
