@@ -144,9 +144,27 @@ pub fn config(workspace: &Workspace, task: &Task) -> Result<Option<Warm>> {
         .unwrap_or_default();
     let directory = directory(workspace, &identity);
     let directory_text = directory.to_str().context("warm directory must be UTF-8")?;
+    let workspace_text = workspace
+        .root
+        .to_str()
+        .context("workspace root must be UTF-8")?;
+    let project_root = &workspace.projects[&task.project].root;
+    let project_directory = if project_root == "." {
+        workspace.root.clone()
+    } else {
+        workspace.root.join(project_root)
+    };
+    let project_text = project_directory
+        .to_str()
+        .context("project root must be UTF-8")?;
     let expand = |text: &str| -> Result<String> {
-        let text = paths::expand(workspace, &task.project, text)?;
-        Ok(text.replace("{warm}", directory_text))
+        if text.contains("{options.") || text.contains("{args.") {
+            bail!("dynamic warm environment values are not supported yet");
+        }
+        Ok(text
+            .replace("{workspaceRoot}", workspace_text)
+            .replace("{projectRoot}", project_text)
+            .replace("{warm}", directory_text))
     };
     let mut paths = Vec::new();
     for path in object

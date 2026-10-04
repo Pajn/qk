@@ -59,6 +59,87 @@ fn process_helper() {
     }
 }
 
+#[test]
+fn warm_environment_helper() {
+    if std::env::var_os("QK_WARM_ENV_HELPER").is_none() {
+        return;
+    }
+    let values: std::collections::BTreeMap<_, _> = [
+        "WORKSPACE_PATH",
+        "PROJECT_PATH",
+        "TOOL_CACHE",
+        "TEXT",
+        "LITERAL",
+    ]
+    .into_iter()
+    .map(|name| (name, std::env::var(name).unwrap()))
+    .collect();
+    println!("{}", serde_json::to_string(&values).unwrap());
+    std::process::exit(0);
+}
+
+#[test]
+fn warm_environment_paths_are_absolute_in_each_worktree() {
+    let fixture = Fixture::new(json!({
+        "executor": "nx:run-commands",
+        "options": {
+            "command": format!("\"{}\" --exact warm_environment_helper --nocapture", std::env::current_exe().unwrap().display()),
+            "cwd": "{projectRoot}",
+            "env": {"QK_WARM_ENV_HELPER": "1"}
+        },
+        "qk:warm": {"env": {
+            "WORKSPACE_PATH": "{workspaceRoot}",
+            "PROJECT_PATH": "{projectRoot}",
+            "TOOL_CACHE": "{warm}/tool",
+            "TEXT": "before:{workspaceRoot}:after",
+            "LITERAL": "a/../b"
+        }}
+    }));
+    let project = fixture.root.join("packages/app");
+    fs::create_dir_all(&project).unwrap();
+    fs::rename(
+        fixture.root.join("project.json"),
+        project.join("project.json"),
+    )
+    .unwrap();
+    fixture.git(&fixture.root, &["add", "--all"]);
+    fixture.git(
+        &fixture.root,
+        &[
+            "-c",
+            "user.name=qk",
+            "-c",
+            "user.email=qk@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "nested project",
+        ],
+    );
+    let linked = fixture.worktree();
+    for root in [&fixture.root, &linked] {
+        let output = success(fixture.build(root, &[]));
+        let text = stdout(&output);
+        let values: Value =
+            serde_json::from_str(text.lines().find(|line| line.starts_with('{')).unwrap()).unwrap();
+        let canonical = root.canonicalize().unwrap();
+        assert_eq!(
+            Path::new(values["WORKSPACE_PATH"].as_str().unwrap()),
+            canonical
+        );
+        assert_eq!(
+            Path::new(values["PROJECT_PATH"].as_str().unwrap()),
+            canonical.join("packages/app")
+        );
+        assert!(Path::new(values["TOOL_CACHE"].as_str().unwrap()).is_absolute());
+        assert_eq!(
+            values["TEXT"],
+            format!("before:{}:after", canonical.display())
+        );
+        assert_eq!(values["LITERAL"], "a/../b");
+    }
+}
+
 fn target(mode: &str, extra: Value) -> Value {
     let mut target = json!({
         "executor": "nx:run-commands",
