@@ -9,6 +9,12 @@ publish = ["crates-io"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Pajn/qk"
 
+[workspace.metadata.release]
+shared-version = true
+tag-name = "v{{version}}"
+publish = false
+allow-branch = ["main"]
+
 [workspace.dependencies]
 anyhow = "1"
 blake3 = "1"

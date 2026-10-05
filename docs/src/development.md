@@ -74,6 +74,24 @@ compare prints them beside qk's.
 
 ### Releases
 
+Releases are cut with [cargo-release](https://github.com/crate-ci/cargo-release)
+(`cargo install cargo-release --locked`), configured under
+`[workspace.metadata.release]` in the root `Cargo.toml`. From an up-to-date
+`main` with a clean working tree:
+
+```sh
+cargo release <patch|minor|major>             # dry run: shows the new version
+cargo release <patch|minor|major> --execute
+```
+
+This bumps the version shared by every crate, commits it as `chore: Release`,
+creates the single tag `v<version>` and pushes the commit and the tag. The tag
+then triggers the release workflow below, which is the only thing that
+publishes: the GitHub release, the npm packages and the crates.io crates.
+Never run `cargo publish` by hand, and do not push the tag before the version
+bump is on it, because the workflow rejects a tag that does not match the
+workspace version.
+
 Pushing a tag `v<version>` that matches the workspace version runs
 `.github/workflows/release.yml`: it builds qk for Linux x64 and arm64, macOS
 arm64 and Windows x64 and attaches the binaries to a GitHub release. When the
