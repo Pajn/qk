@@ -826,8 +826,8 @@ mod tests {
             "apps/web/graphql/manifest.json",
             "apps/web/src/graphql/manifest.json",
             "apps/web/node_modules/pkg/graphql/manifest.json",
-            "apps/mobile/app/graphql/manifest.json",
-            "apps/mobile/app/graphql/nested/extra.json",
+            "apps/client/app/graphql/manifest.json",
+            "apps/client/app/graphql/nested/extra.json",
             "packages/a/deep/x/gen/out.ts",
             "packages/b/types/index.d.ts",
             "packages/c/lib/one.js",
@@ -847,10 +847,10 @@ mod tests {
         assert_eq!(
             outputs.paths(root).unwrap().into_iter().collect::<Vec<_>>(),
             [
-                "apps/mobile/app/graphql",
-                "apps/mobile/app/graphql/manifest.json",
-                "apps/mobile/app/graphql/nested",
-                "apps/mobile/app/graphql/nested/extra.json",
+                "apps/client/app/graphql",
+                "apps/client/app/graphql/manifest.json",
+                "apps/client/app/graphql/nested",
+                "apps/client/app/graphql/nested/extra.json",
                 "apps/web/graphql/manifest.json",
                 "packages/a/deep/x/gen/out.ts",
                 "packages/b/types",
@@ -1071,8 +1071,8 @@ mod tests {
     #[test]
     fn normalizes_relative_segments() {
         assert_eq!(
-            normalize("apps/mobile/test-e2e/../ios/build/*/App.app").unwrap(),
-            "apps/mobile/ios/build/*/App.app"
+            normalize("apps/client/tests/../build/*/bundle.bin").unwrap(),
+            "apps/client/build/*/bundle.bin"
         );
         assert_eq!(normalize("./dist/./a").unwrap(), "dist/a");
         assert_eq!(normalize(".").unwrap(), ".");

@@ -4008,3 +4008,273 @@ fn runtime_inputs_do_not_inherit_runner_color_defaults() {
         assert_eq!(fixture.runs(), 2);
     }
 }
+
+#[test]
+fn shared_runtime_helper() {
+    if std::env::var_os("QK_SHARED_RUNTIME_HELPER").is_none() {
+        return;
+    }
+    let target = std::env::var("NX_TASK_TARGET_TARGET").ok();
+    let phase = if matches!(target.as_deref(), Some("a" | "b")) {
+        format!("execute {}", target.unwrap())
+    } else {
+        assert_eq!(target.as_deref(), Some("inherited"));
+        format!(
+            "runtime {}",
+            std::env::var("QK_SHARED_RUNTIME_VALUE").unwrap_or_default()
+        )
+    };
+    fs::create_dir_all(".qk").unwrap();
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(".qk/runtime-events")
+        .unwrap();
+    use std::io::Write;
+    log.write_all(format!("{phase}\n").as_bytes()).unwrap();
+    println!("{phase}");
+    std::process::exit(0);
+}
+
+#[test]
+fn local_runtime_tool_helper() {
+    if std::env::var_os("QK_CACHE_RUNTIME_PATH_HELPER").is_none() {
+        return;
+    }
+    println!("local runtime tool");
+    std::process::exit(0);
+}
+
+#[test]
+fn runtime_inputs_find_workspace_local_binaries() {
+    let command = "qk-runtime-test-tool --exact local_runtime_tool_helper --nocapture";
+    let mut definition = target("build", json!({"inputs": [{"runtime": command}]}));
+    definition["options"]["env"]["QK_CACHE_RUNTIME_PATH_HELPER"] = json!("1");
+    let fixture = Fixture::new(definition);
+    let bin = fixture.root.join("node_modules/.bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::copy(
+        std::env::current_exe().unwrap(),
+        bin.join(format!(
+            "qk-runtime-test-tool{}",
+            std::env::consts::EXE_SUFFIX
+        )),
+    )
+    .unwrap();
+    let path = std::env::join_paths(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .filter(|entry| entry.is_absolute()),
+    )
+    .unwrap();
+    let run = || {
+        fixture
+            .command(&fixture.root, &["run", "app:build"])
+            .env("PATH", &path)
+            .output()
+            .unwrap()
+    };
+    success(run());
+    let warm = success(run());
+    assert!(
+        stderr(&warm).contains("cache hit app:build"),
+        "{}",
+        stderr(&warm)
+    );
+    assert_eq!(fixture.runs(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn raw_runtime_environment_helper() {
+    use std::os::unix::ffi::OsStringExt;
+    if std::env::var_os("QK_RAW_RUNTIME_HELPER").is_none() {
+        return;
+    }
+    if std::env::var("NX_TASK_TARGET_TARGET").unwrap() == "inherited" {
+        let bytes = std::env::var_os("QK_RAW_RUNTIME_VALUE").unwrap().into_vec();
+        let value = bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        fs::create_dir_all(".qk").unwrap();
+        let mut log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(".qk/raw-runtime-values")
+            .unwrap();
+        use std::io::Write;
+        log.write_all(format!("{value}\n").as_bytes()).unwrap();
+        println!("{value}");
+    }
+    std::process::exit(0);
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_memo_keys_preserve_non_utf8_environment_values() {
+    use std::os::unix::ffi::OsStringExt;
+    let command = format!(
+        "\"{}\" --exact raw_runtime_environment_helper --nocapture",
+        std::env::current_exe().unwrap().display()
+    );
+    let definition = json!({
+        "cache": true,
+        "executor": "nx:run-commands",
+        "inputs": [{"runtime": command}],
+        "outputs": [],
+        "options": {"command": command, "env": {"QK_RAW_RUNTIME_HELPER": "1"}}
+    });
+    let mut replacement = definition.clone();
+    replacement["options"]["env"]["QK_RAW_RUNTIME_VALUE"] = json!("\u{fffd}");
+    let fixture = Fixture::with_targets(json!({"a": definition, "b": replacement}));
+    success(
+        fixture
+            .command(&fixture.root, &["run-many", "-t", "a,b", "--parallel", "2"])
+            .env("NX_TASK_TARGET_TARGET", "inherited")
+            .env(
+                "QK_RAW_RUNTIME_VALUE",
+                std::ffi::OsString::from_vec(vec![0xff]),
+            )
+            .output()
+            .unwrap(),
+    );
+    let log = fs::read_to_string(fixture.root.join(".qk/raw-runtime-values")).unwrap();
+    let mut values = log.lines().collect::<Vec<_>>();
+    values.sort_unstable();
+    assert_eq!(values, ["efbfbd", "ff"]);
+}
+
+#[test]
+fn parallel_tasks_share_runtime_inputs_before_task_metadata() {
+    let command = format!(
+        "\"{}\" --exact shared_runtime_helper --nocapture",
+        std::env::current_exe().unwrap().display()
+    );
+    let definition = json!({
+        "cache": true,
+        "executor": "nx:run-commands",
+        "inputs": [{"runtime": command}],
+        "outputs": [],
+        "options": {"command": command, "env": {"QK_SHARED_RUNTIME_HELPER": "1"}}
+    });
+    let fixture = Fixture::with_targets(json!({"a": definition, "b": definition}));
+    let run = || {
+        fixture
+            .command(
+                &fixture.root,
+                &[
+                    "run-many",
+                    "-t",
+                    "a,b",
+                    "--parallel",
+                    "2",
+                    "--output-style",
+                    "stream",
+                ],
+            )
+            .env("NX_TASK_TARGET_TARGET", "inherited")
+            .env("NX_LOAD_DOT_ENV_FILES", "true")
+            .output()
+            .unwrap()
+    };
+    success(run());
+    let events = fs::read_to_string(fixture.root.join(".qk/runtime-events")).unwrap();
+    assert_eq!(
+        events
+            .lines()
+            .filter(|line| line.starts_with("runtime"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .lines()
+            .filter(|line| line.starts_with("execute"))
+            .count(),
+        2
+    );
+    let warm = success(run());
+    assert!(
+        stderr(&warm).contains("cache hit app:a"),
+        "{}",
+        stderr(&warm)
+    );
+    assert!(
+        stderr(&warm).contains("cache hit app:b"),
+        "{}",
+        stderr(&warm)
+    );
+    let events = fs::read_to_string(fixture.root.join(".qk/runtime-events")).unwrap();
+    assert_eq!(
+        events
+            .lines()
+            .filter(|line| line.starts_with("runtime"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        events
+            .lines()
+            .filter(|line| line.starts_with("execute"))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn runtime_inputs_keep_distinct_target_dotenv_environments() {
+    let command = format!(
+        "\"{}\" --exact shared_runtime_helper --nocapture",
+        std::env::current_exe().unwrap().display()
+    );
+    let definition = json!({
+        "cache": true,
+        "executor": "nx:run-commands",
+        "inputs": [{"runtime": command}],
+        "outputs": [],
+        "options": {"command": command, "env": {"QK_SHARED_RUNTIME_HELPER": "1"}}
+    });
+    let fixture = Fixture::with_targets(json!({"a": definition, "b": definition}));
+    fs::write(fixture.root.join(".env.a"), "QK_SHARED_RUNTIME_VALUE=one\n").unwrap();
+    fs::write(fixture.root.join(".env.b"), "QK_SHARED_RUNTIME_VALUE=two\n").unwrap();
+    let run = || {
+        fixture
+            .command(
+                &fixture.root,
+                &[
+                    "run-many",
+                    "-t",
+                    "a,b",
+                    "--parallel",
+                    "2",
+                    "--output-style",
+                    "stream",
+                ],
+            )
+            .env("NX_TASK_TARGET_TARGET", "inherited")
+            .env("NX_LOAD_DOT_ENV_FILES", "true")
+            .env_remove("QK_SHARED_RUNTIME_VALUE")
+            .output()
+            .unwrap()
+    };
+    success(run());
+    let events = fs::read_to_string(fixture.root.join(".qk/runtime-events")).unwrap();
+    assert!(events.lines().any(|line| line == "runtime one"), "{events}");
+    assert!(events.lines().any(|line| line == "runtime two"));
+    fs::write(
+        fixture.root.join(".env.b"),
+        "QK_SHARED_RUNTIME_VALUE=three\n",
+    )
+    .unwrap();
+    let changed = success(run());
+    assert!(
+        stderr(&changed).contains("cache hit app:a"),
+        "{}",
+        stderr(&changed)
+    );
+    assert!(
+        stderr(&changed).contains("cache miss app:b"),
+        "{}",
+        stderr(&changed)
+    );
+}

@@ -97,9 +97,13 @@ Generated artifacts stay out of source filesets. A consumer's filesets can
 include outputs from its dependency tasks, including transitive dependencies.
 Outputs from downstream or unrelated tasks do not feed back into its cache key.
 
-`runtime` commands run once per run for each environment. Runner color defaults
-apply to task execution, not runtime inputs; an explicitly configured
-`FORCE_COLOR` remains visible to runtime commands.
+`runtime` commands share one evaluation per run when their effective runtime
+environments match, including when tasks request them concurrently. That
+environment includes dotenv, explicit settings and local binary lookup.
+As in Nx, runtime inputs are evaluated before task metadata such as
+`NX_TASK_TARGET_TARGET` is injected. Runner color defaults apply to task
+execution; an explicitly configured `FORCE_COLOR` remains visible to runtime
+commands.
 `dependentTasksOutputFiles` keys the selected artifacts directly; qk checks
 their listings and contents again after execution before saving a result.
 `.` and `..` segments in
