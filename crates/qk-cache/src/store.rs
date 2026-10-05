@@ -131,6 +131,13 @@ fn small_blob_snapshot(reader: impl Read) -> Result<Option<Vec<u8>>> {
 }
 
 fn copy_blob(source: &Path, destination: &Path) -> Result<String> {
+    let hash = copy_blob_contents(source, destination)?;
+    // Blobs carry no meaningful mode; restores apply the manifest's mode.
+    set_mode(destination, if cfg!(unix) { 0o644 } else { 0 })?;
+    Ok(hash)
+}
+
+fn copy_blob_contents(source: &Path, destination: &Path) -> Result<String> {
     let bytes = if fs::metadata(source)?.len() <= SMALL_BLOB_LIMIT as u64 {
         small_blob_snapshot(File::open(source)?)?
     } else {
@@ -150,8 +157,6 @@ fn copy_blob(source: &Path, destination: &Path) -> Result<String> {
         fs::copy(source, destination)?;
         None
     };
-    // Blobs carry no meaningful mode; restores apply the manifest's mode.
-    set_mode(destination, if cfg!(unix) { 0o644 } else { 0 })?;
     // Disk flushing stays with the OS. Hash the large-file copy, never its source.
     match hash {
         Some(hash) => Ok(hash),
@@ -411,9 +416,9 @@ impl Cache {
             }
         }
         self.stage_files(&files, started)?;
-        // Eligibility is determined before cleanup: replacing an existing output
-        // tree keeps the established per-artifact behavior, even if cleanup empties it.
-        let complete = absent_directories(root, outputs, &manifest.artifacts)?;
+        // Only complete directory selections can promote a staged tree.
+        // NOREPLACE below still checks that cleanup left the destination absent.
+        let complete = complete_directories(root, outputs, &manifest.artifacts)?;
         let current = outputs.paths(root)?;
         // Validate the complete cleanup set before deleting any output.
         for path in &current {
@@ -483,11 +488,9 @@ impl Cache {
         let stage = |files: &[(&str, u32, PathBuf)]| -> Result<()> {
             for (blob, mode, destination) in files {
                 let source = self.root.join("blobs").join(blob);
-                if digest_file(&source)? != *blob {
+                if copy_blob_contents(&source, destination)? != *blob {
                     bail!("corrupt cached artifact");
                 }
-                // A clone where supported: edits never reach the cached blob.
-                fs::copy(source, destination)?;
                 // Before its mode, which may prevent opening the file.
                 set_modified(destination, time)?;
                 set_mode(destination, *mode)?;
@@ -572,8 +575,8 @@ impl<'a> StagingDirectories<'a> {
     }
 }
 
-/// Complete staged directories whose destinations were absent before cleanup.
-fn absent_directories(
+/// Complete staged directories whose destinations are absent or real directories.
+fn complete_directories(
     root: &Path,
     outputs: &Outputs,
     artifacts: &BTreeMap<String, Artifact>,
@@ -589,6 +592,9 @@ fn absent_directories(
                 roots.push(path.to_owned())
             }
             Err(error) => return Err(error.into()),
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                roots.push(path.to_owned());
+            }
             Ok(_) => {}
         }
     }
@@ -721,15 +727,25 @@ fn output_stamps(root: &Path, outputs: &Outputs) -> Result<BTreeMap<String, Vec<
     Ok(stamps)
 }
 
+#[derive(Serialize, Deserialize)]
+struct OutputRecord {
+    key: String,
+    outputs: BTreeMap<String, Vec<i64>>,
+}
+
 /// Records the outputs a worktree now holds for a task's key.
 pub(crate) fn record_outputs(root: &Path, task: &str, key: &str, outputs: &Outputs) {
-    let record = output_stamps(root, outputs)
-        .map(|stamps| serde_json::json!({"key": key, "outputs": stamps}));
+    let record = output_stamps(root, outputs).and_then(|stamps| {
+        Ok(serde_json::to_vec(&OutputRecord {
+            key: key.to_owned(),
+            outputs: stamps,
+        })?)
+    });
     let path = outputs_record(root, task);
     if let Ok(record) = record
         && fs::create_dir_all(path.parent().expect("records have a directory")).is_ok()
     {
-        let _ = fs::write(path, record.to_string());
+        let _ = fs::write(path, record);
     }
 }
 
@@ -739,16 +755,16 @@ fn outputs_unchanged(root: &Path, task: &str, key: &str, outputs: &Outputs) -> b
     let Ok(text) = fs::read(outputs_record(root, task)) else {
         return false;
     };
-    let Ok(record) = serde_json::from_slice::<serde_json::Value>(&text) else {
+    let Ok(record) = serde_json::from_slice::<OutputRecord>(&text) else {
         return false;
     };
-    if record.get("key").and_then(serde_json::Value::as_str) != Some(key) {
+    if record.key != key {
         return false;
     }
     let Ok(current) = output_stamps(root, outputs) else {
         return false;
     };
-    serde_json::to_value(current).ok().as_ref() == record.get("outputs")
+    current == record.outputs
 }
 
 #[cfg(test)]
@@ -896,9 +912,9 @@ mod tests {
         assert!(!source.exists());
     }
 
-    /// Complete roots require a cached directory and an absent destination.
+    /// Files and symlinks cannot be promoted as complete directories.
     #[test]
-    fn directory_candidates_require_absent_manifest_directories() {
+    fn directory_candidates_require_manifest_directories() {
         let temp = tempfile::tempdir().unwrap();
         let outputs = Outputs::from_paths(&[
             "a".into(),
@@ -920,12 +936,18 @@ mod tests {
             ("partial".into(), Artifact::Directory { mode: 0o755 }),
         ]);
         assert_eq!(
-            absent_directories(temp.path(), &outputs, &artifacts).unwrap(),
+            complete_directories(temp.path(), &outputs, &artifacts).unwrap(),
             ["a", "ab"]
         );
         fs::create_dir(temp.path().join("a")).unwrap();
         assert_eq!(
-            absent_directories(temp.path(), &outputs, &artifacts).unwrap(),
+            complete_directories(temp.path(), &outputs, &artifacts).unwrap(),
+            ["a", "ab"]
+        );
+        fs::remove_dir(temp.path().join("a")).unwrap();
+        fs::write(temp.path().join("a"), "existing file").unwrap();
+        assert_eq!(
+            complete_directories(temp.path(), &outputs, &artifacts).unwrap(),
             ["ab"]
         );
     }
@@ -950,42 +972,53 @@ mod tests {
         let outputs = Outputs::from_patterns(&["out"]);
         let key = "a".repeat(64);
         let expected = cache.publish(root, &key, &outputs, &log).unwrap();
-        fs::remove_dir_all(root.join("out")).unwrap();
-        let before = SystemTime::now();
-        assert_eq!(
-            cache
-                .restore(
-                    root,
-                    "build",
-                    &Default::default(),
-                    &key,
-                    &outputs,
-                    &qk_executor::Display::Hidden,
-                    qk_executor::Shown::LocalCache
-                )
-                .unwrap(),
-            Some(expected)
-        );
-        let mut common_time = None;
-        for index in 0..130 {
-            let path = root.join(format!("out/file-{index:03}"));
+        fs::write(root.join("unselected"), "keep").unwrap();
+        for existing in [false, true] {
+            if existing {
+                fs::write(root.join("out/file-000"), "edited").unwrap();
+                fs::create_dir_all(root.join("out/stale/nested")).unwrap();
+                fs::write(root.join("out/stale/nested/value"), "stale").unwrap();
+            } else {
+                fs::remove_dir_all(root.join("out")).unwrap();
+            }
+            let before = SystemTime::now();
             assert_eq!(
-                fs::read_to_string(&path).unwrap(),
-                format!("content-{}", index % 65)
+                cache
+                    .restore(
+                        root,
+                        "build",
+                        &Default::default(),
+                        &key,
+                        &outputs,
+                        &qk_executor::Display::Hidden,
+                        qk_executor::Shown::LocalCache
+                    )
+                    .unwrap(),
+                Some(expected.clone())
             );
-            let metadata = fs::metadata(&path).unwrap();
-            let modified = metadata.modified().unwrap();
-            assert!(modified >= before);
-            assert_eq!(*common_time.get_or_insert(modified), modified);
+            let mut common_time = None;
+            for index in 0..130 {
+                let path = root.join(format!("out/file-{index:03}"));
+                assert_eq!(
+                    fs::read_to_string(&path).unwrap(),
+                    format!("content-{}", index % 65)
+                );
+                let metadata = fs::metadata(&path).unwrap();
+                let modified = metadata.modified().unwrap();
+                assert!(modified >= before);
+                assert_eq!(*common_time.get_or_insert(modified), modified);
+                #[cfg(unix)]
+                assert_eq!(mode(&metadata), if index % 2 == 0 { 0o755 } else { 0o640 });
+            }
+            assert!(root.join("out/empty").is_dir());
             #[cfg(unix)]
-            assert_eq!(mode(&metadata), if index % 2 == 0 { 0o755 } else { 0o640 });
+            assert_eq!(
+                fs::read_link(root.join("out/link")).unwrap(),
+                Path::new("file-000")
+            );
+            assert!(!root.join("out/stale").exists());
+            assert_eq!(fs::read_to_string(root.join("unselected")).unwrap(), "keep");
         }
-        assert!(root.join("out/empty").is_dir());
-        #[cfg(unix)]
-        assert_eq!(
-            fs::read_link(root.join("out/link")).unwrap(),
-            Path::new("file-000")
-        );
     }
 
     #[test]

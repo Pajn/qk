@@ -290,6 +290,42 @@ snapshots:
     let upgraded = Lockfile::parse(&text.replace("12.8.1", "12.9.0")).unwrap();
     assert_ne!(lockfile.global(), upgraded.global());
     assert_eq!(lockfile.installed("."), upgraded.installed("."));
+    let extended = text.replacen(
+        "lockfileVersion:",
+        "customEnvironmentField: original\nlockfileVersion:",
+        1,
+    );
+    let original = Lockfile::parse(&extended).unwrap();
+    let changed = Lockfile::parse(&extended.replace("original", "changed")).unwrap();
+    assert_ne!(original.global(), changed.global());
+    assert_eq!(original.installed("."), changed.installed("."));
+    let documents: Vec<_> = extended
+        .split("---")
+        .filter(|part| !part.trim().is_empty())
+        .collect();
+    let reordered = Lockfile::parse(&format!("---{}---{}", documents[1], documents[0])).unwrap();
+    assert_eq!(original.global(), reordered.global());
+    assert_eq!(original.installed("."), reordered.installed("."));
+}
+
+#[test]
+fn preserves_environment_documents_around_the_workspace() {
+    let workspace = "lockfileVersion: '9.0'\nimporters: {}\n";
+    let environments = [
+        "customField: first\nimporters:\n  .:\n    configDependencies: {}\n",
+        "customField: second\nimporters:\n  .:\n    packageManagerDependencies: {}\n",
+        "customField: third\nimporters:\n  .:\n    configDependencies: {}\n",
+    ];
+    for position in 0..=environments.len() {
+        let mut documents = environments.to_vec();
+        documents.insert(position, workspace);
+        let lockfile = Lockfile::parse(&documents.join("---\n")).unwrap();
+        let raw = lockfile.global()["environment"].as_array().unwrap();
+        assert_eq!(raw.len(), environments.len());
+        for (document, expected) in raw.iter().zip(["first", "second", "third"]) {
+            assert_eq!(document["customField"], expected);
+        }
+    }
 }
 
 #[test]

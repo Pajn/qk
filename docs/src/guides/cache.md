@@ -111,7 +111,8 @@ Task-level affected selection follows changes to symlink targets, including
 deletions, even when the target lies outside the source glob that selected the link.
 
 See [Inputs and outputs](../reference/inputs-outputs.md) for glob expansion
-rules and the differences from Nx, including bare parenthesized extension groups.
+rules and the affected-selection differences from Nx for bare parenthesized
+extension groups.
 
 ## Outputs
 

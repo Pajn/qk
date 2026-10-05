@@ -143,12 +143,24 @@ impl Installed {
 
 impl Snapshot {
     pub fn new(workspace: &Workspace, graph: &TaskGraph, cache_path: &Path) -> Result<Self> {
-        // Parsing the lockfile takes as long as listing files, and every early
-        // task needs it, so the two overlap.
-        let (files, lockfile) = std::thread::scope(|scope| {
+        // Every early task needs these, so loading saved digests and parsing
+        // the lockfile overlap listing files.
+        let canonical_root = workspace.root.canonicalize()?;
+        let (files, lockfile, (digests, workspace_prefix)) = std::thread::scope(|scope| {
             let lockfile = scope.spawn(|| parse_lockfile(&workspace.root.join("pnpm-lock.yaml")));
+            let digests = scope.spawn(|| {
+                let digests = load_digests(&workspace.root);
+                let workspace_prefix = paths::git_path(&workspace.root, "--show-toplevel")
+                    .and_then(|root| root.canonicalize().ok())
+                    .and_then(|root| canonical_root.strip_prefix(root).ok().map(PathBuf::from));
+                (digests, workspace_prefix)
+            });
             let files = source_files(&workspace.root);
-            (files, lockfile.join().expect("lockfile thread panicked"))
+            (
+                files,
+                lockfile.join().expect("lockfile thread panicked"),
+                digests.join().expect("digest thread panicked"),
+            )
         });
         let mut files = files?;
         if let Ok(cache_relative) = cache_path.strip_prefix(&workspace.root) {
@@ -188,10 +200,6 @@ impl Snapshot {
             }
         }
         files.retain(|path| !generated.contains(path));
-        let canonical_root = workspace.root.canonicalize()?;
-        let workspace_prefix = paths::git_path(&workspace.root, "--show-toplevel")
-            .and_then(|root| root.canonicalize().ok())
-            .and_then(|root| canonical_root.strip_prefix(root).ok().map(PathBuf::from));
         Ok(Self {
             files,
             extra_candidates: BTreeSet::new(),
@@ -213,7 +221,7 @@ impl Snapshot {
             canonical_root,
             workspace_prefix,
             patterns: Mutex::default(),
-            digests: Mutex::new(load_digests(&workspace.root)),
+            digests: Mutex::new(digests),
             digests_changed: Default::default(),
             directories: Mutex::default(),
             runtime: Mutex::default(),

@@ -37,9 +37,9 @@ When a name occurs in multiple sections, precedence is `dependencies`,
   extensions. Nx does not apply them.
 - Input negated-group exclusions apply to the pattern they came from in qk;
   Nx applies them across a project's patterns. qk can include extra inputs.
-- Bare parenthesized extension groups such as `**/*.(svg|png)` select files
-  in qk that Nx 23.1.0 does not. See [Inputs and outputs](reference/inputs-outputs.md)
-  for compatible syntax.
+- For affected-project selection, bare parenthesized extension groups such
+  as `**/*.(svg|png)` select projects in qk that Nx 23.1.0 does not.
+  See [Inputs and outputs](reference/inputs-outputs.md) for compatible syntax.
 
 See [Affected selection](guides/affected.md), [Inputs and outputs](reference/inputs-outputs.md)
 and [Running tasks](guides/running-tasks.md) for the detailed rules.

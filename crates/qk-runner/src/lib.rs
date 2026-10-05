@@ -273,16 +273,20 @@ pub fn run(
         tasks: graph.tasks.len(),
     });
     let waiting = AtomicBool::new(false);
-    let finished = AtomicBool::new(false);
     let load = std::sync::Mutex::new(Vec::new());
     std::thread::scope(|scope| -> Result<()> {
+        let (finish_sampling, sampling_finished) = mpsc::channel::<()>();
+        let load = &load;
+        let waiting = &waiting;
         // Samples how busy the machine is, so the summary can tell a run held
         // back by --parallel from one held back by the machine.
-        scope.spawn(|| {
+        scope.spawn(move || {
             let mut system = sysinfo::System::new();
             system.refresh_cpu_usage();
-            while !finished.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_millis(250));
+            while matches!(
+                sampling_finished.recv_timeout(Duration::from_millis(250)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ) {
                 system.refresh_cpu_usage();
                 load.lock().unwrap().push((
                     system.global_cpu_usage() / 100.0,
@@ -615,7 +619,7 @@ pub fn run(
             }
             Ok(())
         })();
-        finished.store(true, Ordering::Relaxed);
+        drop(finish_sampling);
         result
     })?;
     if let Some(cache) = &cache {

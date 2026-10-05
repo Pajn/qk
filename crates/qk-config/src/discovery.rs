@@ -114,34 +114,54 @@ pub(crate) fn project_directories(root: &Path) -> Result<BTreeSet<PathBuf>> {
                 Some("node_modules" | ".git" | ".qk" | ".nx" | ".pnpm-store")
             ) && entry.path() != build_directory
         })
-        .build();
-    for entry in walker {
-        let entry = entry.context("cannot walk workspace")?;
-        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
-            continue;
-        }
-        let directory = entry
-            .path()
-            .parent()
-            .context("configuration has no parent directory")?;
-        match entry.file_name().to_str() {
-            Some("project.json") => {
-                directories.insert(directory.to_owned());
-            }
-            Some("package.json") => {
-                let relative = relative_path(root, directory)?;
-                let included = patterns
-                    .iter()
-                    .any(|(exclude, glob)| !exclude && glob.is_match(&relative));
-                let excluded = patterns
-                    .iter()
-                    .any(|(exclude, glob)| *exclude && glob.is_match(&relative));
-                if included && !excluded {
-                    directories.insert(directory.to_owned());
+        .threads(4)
+        .build_parallel();
+    let directories = std::sync::Mutex::new(Ok(directories));
+    walker.run(|| {
+        Box::new(|entry| {
+            let visit = || -> Result<Option<PathBuf>> {
+                let entry = entry.context("cannot walk workspace")?;
+                if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+                    return Ok(None);
+                }
+                let directory = entry
+                    .path()
+                    .parent()
+                    .context("configuration has no parent directory")?;
+                match entry.file_name().to_str() {
+                    Some("project.json") => {
+                        return Ok(Some(directory.to_owned()));
+                    }
+                    Some("package.json") => {
+                        let relative = relative_path(root, directory)?;
+                        let included = patterns
+                            .iter()
+                            .any(|(exclude, glob)| !exclude && glob.is_match(&relative));
+                        let excluded = patterns
+                            .iter()
+                            .any(|(exclude, glob)| *exclude && glob.is_match(&relative));
+                        if included && !excluded {
+                            return Ok(Some(directory.to_owned()));
+                        }
+                    }
+                    _ => {}
+                }
+                Ok(None)
+            };
+            match visit() {
+                Ok(Some(directory)) => {
+                    if let Ok(directories) = &mut *directories.lock().unwrap() {
+                        directories.insert(directory);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    *directories.lock().unwrap() = Err(error);
+                    return ignore::WalkState::Quit;
                 }
             }
-            _ => {}
-        }
-    }
-    Ok(directories)
+            ignore::WalkState::Continue
+        })
+    });
+    directories.into_inner().unwrap()
 }
