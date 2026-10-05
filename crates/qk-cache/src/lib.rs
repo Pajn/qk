@@ -3,6 +3,7 @@
 mod evict;
 mod glob;
 mod hash;
+mod inputs;
 mod paths;
 mod record;
 mod remote;
@@ -22,7 +23,11 @@ use serde_json::{Value, json};
 
 pub use evict::{Pruned, max_size, parse_size, prune};
 pub use glob::Pattern;
-pub use hash::{Resolved, SourceIgnore, source_files, without_resolution};
+pub use hash::{SourceIgnore, source_files};
+pub use inputs::{
+    InputChange, InputChanges, Resolution, Resolved, resolve_each, resolve_tasks,
+    without_resolution,
+};
 pub use paths::{
     Outputs, cache_directory, cache_location, clear_worktree_state, resolved_outputs,
     worktree_state,
@@ -84,54 +89,6 @@ impl TaskResult {
             execution: None,
         }
     }
-}
-
-/// Each task's resolved inputs, for affected selection. `extra` paths are
-/// candidates beside the workspace's files, so a deleted file still matches
-/// the inputs that named it. Env and runtime inputs are not evaluated.
-pub fn resolve_tasks(
-    workspace: &Workspace,
-    graph: &TaskGraph,
-    extra: &[String],
-) -> Result<BTreeMap<String, Resolved>> {
-    let cache = paths::cache_location(workspace);
-    let snapshot = hash::Snapshot::new(workspace, graph, &cache)?.with_candidates(extra);
-    let cancelled = AtomicBool::new(false);
-    graph
-        .tasks
-        .iter()
-        .map(|(id, task)| {
-            let resolved = hash::resolve(&snapshot, workspace, task, None, &cancelled)
-                .with_context(|| format!("cannot resolve the inputs of {id}"))?;
-            Ok((id.clone(), resolved))
-        })
-        .collect()
-}
-
-/// Every task's resolved inputs, or why they could not be resolved, with the
-/// workspace files they were chosen from.
-pub struct Resolution {
-    pub candidates: std::collections::BTreeSet<String>,
-    pub tasks: BTreeMap<String, std::result::Result<Resolved, String>>,
-}
-
-pub fn resolve_each(workspace: &Workspace, graph: &TaskGraph) -> Result<Resolution> {
-    let cache = paths::cache_location(workspace);
-    let snapshot = hash::Snapshot::new(workspace, graph, &cache)?;
-    let cancelled = AtomicBool::new(false);
-    let tasks = graph
-        .tasks
-        .iter()
-        .map(|(id, task)| {
-            let resolved = hash::resolve(&snapshot, workspace, task, None, &cancelled)
-                .map_err(|error| format!("{error:#}"));
-            (id.clone(), resolved)
-        })
-        .collect();
-    Ok(Resolution {
-        candidates: snapshot.files.clone(),
-        tasks,
-    })
 }
 
 impl Cache {

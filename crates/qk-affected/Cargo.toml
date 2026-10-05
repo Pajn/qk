@@ -8,7 +8,6 @@ description = "Affected project selection for the qk task runner"
 publish.workspace = true
 
 [dependencies]
-walkdir.workspace = true
 anyhow.workspace = true
 ignore.workspace = true
 qk-cache.workspace = true

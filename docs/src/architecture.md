@@ -57,6 +57,20 @@ See [Local cache](guides/cache.md) for key construction,
 [Warm state](guides/warm-state.md) for scratch state, and
 [Run history](guides/history.md) for recorded causes.
 
+## Declared task inputs
+
+The internal `qk-cache::inputs` module owns the resolved input model,
+declaration inspection and matching changes to file, linked-path and
+installation inputs. Affected selection supplies revision contents and
+propagates changes through the task graph; input analysis uses the same
+declaration interpretation to classify observations. Hashing evaluates content
+and runtime values for cache keys.
+
+These uses preserve distinct rules: affected selection reacts to whole JSON
+input files, while keys include only the selected fields. Affected selection
+includes changes beneath links to the workspace root; hashing rejects those
+links. Revision matching does not evaluate environment or runtime inputs.
+
 ## Design proposals
 
 The [implementation plan](design.md) records design decisions and development

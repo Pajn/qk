@@ -15,6 +15,7 @@ use qk_taskgraph::{Task, TaskGraph};
 use serde_json::{Value, json};
 
 use crate::glob::is_literal;
+use crate::inputs::{Resolved, workspace_without_resolution};
 use crate::paths::{self, Outputs, Pattern};
 
 pub fn digest_file(path: &Path) -> Result<String> {
@@ -1082,27 +1083,6 @@ impl Resolver<'_> {
     }
 }
 
-/// What a task's key is computed from, as JSON: kept by the history so a
-/// changed key can be explained.
-/// What a task's key depends on, before any file is read.
-pub struct Resolved {
-    /// Workspace-relative files whose content is part of the key.
-    pub files: BTreeSet<String>,
-    /// Always-on workspace and package configuration, also useful to input analysis.
-    pub mandatory: BTreeSet<String>,
-    /// Env, runtime and other named values; env and runtime are evaluated only
-    /// with a prepared task.
-    pub values: BTreeMap<String, Value>,
-    /// With a readable pnpm lockfile: the importers whose installs count, and
-    /// packages named by `externalDependencies`.
-    pub lockfile: Option<(BTreeSet<String>, BTreeSet<String>)>,
-    /// `pnpm-workspace.yaml` counts without its resolution keys, which reach
-    /// tasks through the lockfile instead.
-    pub workspace_file: bool,
-    /// Explicit external dependency names, even without a readable lockfile.
-    pub external: BTreeSet<String>,
-}
-
 pub fn resolve(
     snapshot: &Snapshot,
     workspace: &Workspace,
@@ -1366,22 +1346,6 @@ pub fn inputs(
     Ok(hash)
 }
 
-/// `pnpm-workspace.yaml` without the keys that configure resolution, or `None`
-/// when it cannot be read as YAML.
-pub fn workspace_without_resolution(root: &Path) -> Option<Value> {
-    let text = std::fs::read_to_string(root.join("pnpm-workspace.yaml")).ok()?;
-    without_resolution(&text)
-}
-
-/// A `pnpm-workspace.yaml` text without its resolution keys.
-pub fn without_resolution(text: &str) -> Option<Value> {
-    let mut value: Value = serde_yaml_ng::from_str(text).ok()?;
-    if let Some(object) = value.as_object_mut() {
-        object.retain(|key, _| !qk_lockfile::RESOLUTION_KEYS.contains(&key.as_str()));
-    }
-    Some(value)
-}
-
 /// The key for a task's inputs.
 pub fn key(inputs: &Value) -> Result<String> {
     Ok(blake3::hash(&serde_json::to_vec(inputs)?)
@@ -1459,14 +1423,7 @@ fn dependency_keys_impl(
     fresh: bool,
 ) -> Result<BTreeMap<String, String>> {
     let resolved = resolve(snapshot, workspace, task, None, cancelled)?;
-    let selections: Vec<_> = resolved
-        .values
-        .iter()
-        .filter_map(|(name, transitive)| {
-            name.strip_prefix("dependentTasksOutputFiles:")
-                .map(|pattern| (pattern, transitive == &json!(true)))
-        })
-        .collect();
+    let selections: Vec<_> = resolved.dependency_output_inputs().collect();
     if selections.is_empty() {
         if fresh {
             return dependencies

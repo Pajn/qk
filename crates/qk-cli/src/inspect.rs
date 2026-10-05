@@ -73,18 +73,21 @@ pub fn show(workspace: &Workspace, options: Options) -> Result<i32> {
         Some(Command::Inputs(_)) => {
             let mut resolved = qk_cache::resolve_tasks(workspace, &graph, &[])?;
             let inputs = resolved.remove(&task.id).context("target inputs missing")?;
-            paths = inputs.files;
-            data["files"] = json!(paths);
-            for (prefix, category) in [
-                ("env:", "environment"),
-                ("runtime:", "runtime"),
-                ("dependentTasksOutputFiles:", "depOutputs"),
+            data["files"] = json!(inputs.files);
+            for (values, category) in [
+                (
+                    inputs.environment_inputs().collect::<Vec<_>>(),
+                    "environment",
+                ),
+                (inputs.runtime_inputs().collect::<Vec<_>>(), "runtime"),
+                (
+                    inputs
+                        .dependency_output_inputs()
+                        .map(|(pattern, _)| pattern)
+                        .collect::<Vec<_>>(),
+                    "depOutputs",
+                ),
             ] {
-                let values: Vec<_> = inputs
-                    .values
-                    .keys()
-                    .filter_map(|key| key.strip_prefix(prefix))
-                    .collect();
                 members.extend(values.iter().map(|value| (*value).to_owned()));
                 if !values.is_empty() {
                     data[category] = json!(values);
@@ -94,6 +97,7 @@ pub fn show(workspace: &Workspace, options: Options) -> Result<i32> {
             if !inputs.external.is_empty() {
                 data["external"] = json!(inputs.external);
             }
+            paths = inputs.files;
         }
         Some(Command::Outputs(_)) => {
             let (outputs, _) = qk_cache::resolved_outputs(workspace, task)?;
