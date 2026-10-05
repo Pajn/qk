@@ -42,6 +42,12 @@ exports the project and task graph without running commands.
 
 ## Storage and worktrees
 
+Within `qk-cache`, the internal `record` module owns result and warm-state
+record formats, identity checks, blob references and atomic publication.
+Remote packs, detached uploads and eviction use its shared record interpretation.
+Result and warm-state restoration retain their own selection rules and verify
+blob contents and checkout-specific paths where the files are used.
+
 By default, linked Git worktrees share a result cache and history database
 under the Git common directory. File digests, restore records and active
 scratch state live under each worktree's own Git directory. Branch names and

@@ -4,6 +4,7 @@ mod evict;
 mod glob;
 mod hash;
 mod paths;
+mod record;
 mod remote;
 mod store;
 pub mod warm;

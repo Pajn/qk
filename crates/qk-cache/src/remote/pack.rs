@@ -4,23 +4,23 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::Path;
 
+use crate::record::StoredRecord;
 use anyhow::{Context, Result, bail};
-use serde_json::Value;
 
 const LEVEL: i32 = 3;
 const LARGEST_RECORD: u64 = 1 << 30;
 const WINDOW_LOG_MAX: u32 = 27;
 
 pub(super) fn write(root: &Path, record: &[u8], output: impl Write) -> Result<()> {
-    let parsed: Value = serde_json::from_slice(record)?;
+    let parsed = crate::record::StoredRecord::read(record)?;
     let mut writer = zstd::stream::write::Encoder::new(io::BufWriter::new(output), LEVEL)?;
     writer.include_checksum(true)?;
     let mut used = 0;
     part_size(&mut used, record.len() as u64, LARGEST_RECORD)?;
     writer.write_all(&(record.len() as u64).to_le_bytes())?;
     writer.write_all(record)?;
-    for blob in crate::evict::manifest_blobs(&parsed) {
-        if !crate::store::valid_hash(&blob) {
+    for blob in parsed.blobs() {
+        if !crate::record::valid_hash(&blob) {
             bail!("invalid blob name in remote record");
         }
         let mut file = File::open(root.join("blobs").join(&blob))?;
@@ -38,7 +38,7 @@ pub(super) fn write(root: &Path, record: &[u8], output: impl Write) -> Result<()
 pub(super) fn read(
     root: &Path,
     input: impl Read,
-    check: impl Fn(&Value) -> Result<()>,
+    check: impl Fn(&StoredRecord) -> Result<()>,
 ) -> Result<Vec<u8>> {
     let mut input = input.take(super::LARGEST_UPLOAD + 1);
     let mut decoder = zstd::stream::read::Decoder::new(&mut input)?;
@@ -54,7 +54,7 @@ pub(super) fn read(
 fn read_parts(
     root: &Path,
     mut body: impl Read,
-    check: impl Fn(&Value) -> Result<()>,
+    check: impl Fn(&StoredRecord) -> Result<()>,
 ) -> Result<Vec<u8>> {
     let mut used = 0;
     let length = part_length(&mut body)?;
@@ -63,10 +63,10 @@ fn read_parts(
     if (&mut body).take(length).read_to_end(&mut record)? as u64 != length {
         bail!("remote pack ends early");
     }
-    let parsed: Value = serde_json::from_slice(&record).context("invalid remote record")?;
+    let parsed = crate::record::StoredRecord::read(&record).context("invalid remote record")?;
     check(&parsed)?;
-    for blob in crate::evict::manifest_blobs(&parsed) {
-        if !crate::store::valid_hash(&blob) {
+    for blob in parsed.blobs() {
+        if !crate::record::valid_hash(&blob) {
             bail!("invalid blob name in remote record");
         }
         let length = part_length(&mut body)?;
@@ -164,6 +164,39 @@ mod tests {
             read(destination.path(), &encoded[..], |_| Ok(())).unwrap(),
             record
         );
+    }
+
+    #[test]
+    fn key_check_precedes_blob_ingestion_without_typed_restore_validation() {
+        let source = root();
+        let (record, _) = sample(source.path());
+        let mut value: serde_json::Value = serde_json::from_slice(&record).unwrap();
+        value["key"] = serde_json::json!("requested-key");
+        value["version"] = serde_json::json!(99);
+        let record = serde_json::to_vec(&value).unwrap();
+        let mut encoded = Vec::new();
+        write(source.path(), &record, &mut encoded).unwrap();
+        let destination = root();
+        let error = read(destination.path(), &encoded[..], |record| {
+            record.check_key("another-key")
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "remote manifest is for another key");
+        assert_eq!(
+            std::fs::read_dir(destination.path().join("blobs"))
+                .unwrap()
+                .count(),
+            0
+        );
+        // Transport has historically accepted this partial record; version and
+        // structure remain the typed restore reader's decision.
+        assert_eq!(
+            read(destination.path(), &encoded[..], |record| record
+                .check_key("requested-key"))
+            .unwrap(),
+            record
+        );
+        assert!(crate::record::ResultRecord::read(&record, "requested-key").is_err());
     }
 
     #[test]
