@@ -150,8 +150,8 @@ pub fn prune(root: &Path, limit: u64) -> Result<Pruned> {
         // Unreadable manifests are misses already; they only take space.
         let blobs = fs::read(item.path())
             .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            .map(|manifest| manifest_blobs(&manifest))
+            .and_then(|bytes| crate::record::StoredRecord::read(&bytes).ok())
+            .map(|record| record.blobs())
             .unwrap_or_default();
         for blob in &blobs {
             *references.entry(blob.clone()).or_default() += 1;
@@ -242,32 +242,6 @@ fn directory_size(directory: &Path) -> Result<u64> {
         size += item?.metadata()?.len();
     }
     Ok(size)
-}
-
-/// Every blob a manifest cites: its log and its file outputs.
-pub(crate) fn manifest_blobs(manifest: &Value) -> BTreeSet<String> {
-    let mut blobs = BTreeSet::new();
-    if let Some(log) = manifest.get("log").and_then(Value::as_str) {
-        blobs.insert(log.to_owned());
-    }
-    let groups = manifest
-        .get("groups")
-        .and_then(Value::as_object)
-        .into_iter()
-        .flat_map(|groups| groups.values())
-        .filter_map(|group| group.get("artifacts").and_then(Value::as_object));
-    for artifact in manifest
-        .get("artifacts")
-        .and_then(Value::as_object)
-        .into_iter()
-        .chain(groups)
-        .flat_map(|artifacts| artifacts.values())
-    {
-        if let Some(blob) = artifact.get("blob").and_then(Value::as_str) {
-            blobs.insert(blob.to_owned());
-        }
-    }
-    blobs
 }
 
 #[cfg(test)]

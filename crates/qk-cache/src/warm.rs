@@ -26,7 +26,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::paths::{self, Outputs};
-use crate::store::{Artifact, mode, set_mode, symlink, validate_link};
+use crate::record::{self, Artifact, WarmGroup, WarmRecord, validate_link};
+use crate::store::{mode, set_mode, symlink};
 use crate::{Cache, hash::digest_file};
 
 /// When restored files say they were written. Warm state comes from another
@@ -344,7 +345,6 @@ impl Stash {
     /// Publishes ownership before moving a path, without truncating the last
     /// valid record. Sync the file before the atomic replacement.
     fn save_manifest(&self) -> Result<()> {
-        use std::io::Write;
         let mut file = tempfile::NamedTempFile::new_in(&self.root)?;
         file.write_all(&serde_json::to_vec(self)?)?;
         file.as_file().sync_all()?;
@@ -663,21 +663,7 @@ pub fn check_overlaps(workspace: &Workspace, graph: &TaskGraph) -> Result<()> {
     Ok(())
 }
 
-/// One group's saved files, relative to its base directory.
-#[derive(Clone, Default, Serialize, Deserialize)]
-pub(crate) struct Group {
-    artifacts: BTreeMap<String, Artifact>,
-    /// Metadata of each file when saved, so an unchanged file is not read
-    /// again on the next save.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    stamps: BTreeMap<String, Vec<i64>>,
-    /// Each file's modification time when saved, in nanoseconds since the
-    /// Unix epoch, for restores that keep it.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    mtimes: BTreeMap<String, i64>,
-}
-
-impl Group {
+impl WarmGroup {
     /// Total saved file bytes, excluding directories and links.
     fn size(&self, cache: &Cache) -> u64 {
         self.artifacts
@@ -692,26 +678,6 @@ impl Group {
             .sum()
     }
 }
-
-/// One save of a task's warm state.
-#[derive(Clone, Default, Serialize, Deserialize)]
-pub(crate) struct Record {
-    version: u32,
-    task: String,
-    /// The root of the worktree that saved it.
-    worktree: String,
-    /// The commit that worktree had checked out.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    commit: Option<String>,
-    /// When it was saved, in milliseconds since the Unix epoch.
-    saved: u64,
-    /// A digest of each part of the target's warm key when it was saved.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    key: Vec<String>,
-    groups: BTreeMap<String, Group>,
-}
-
-const RECORD_VERSION: u32 = 2;
 
 /// What this worktree last restored, per group: each file's metadata once
 /// restored and the artifact it came from, so a save need not read it again.
@@ -1012,7 +978,7 @@ impl Cache {
         Ok(file)
     }
 
-    fn warm_record(&self, record: &Record) -> PathBuf {
+    fn warm_record(&self, record: &WarmRecord) -> PathBuf {
         self.root.join("warm").join(format!(
             "{}-{}.json",
             self.warm_prefix(&record.task),
@@ -1021,9 +987,9 @@ impl Cache {
     }
 
     /// Every save of the task or group, newest first.
-    fn warm_records(&self, warm: &Warm) -> Vec<(PathBuf, Record)> {
+    fn warm_records(&self, warm: &Warm) -> Vec<(PathBuf, WarmRecord)> {
         let prefix = format!("{}-", self.warm_prefix(&warm.identity));
-        let mut records: Vec<(PathBuf, Record)> = fs::read_dir(self.root.join("warm"))
+        let mut records: Vec<(PathBuf, WarmRecord)> = fs::read_dir(self.root.join("warm"))
             .into_iter()
             .flatten()
             .flatten()
@@ -1035,9 +1001,8 @@ impl Cache {
             })
             .filter_map(|entry| {
                 let record =
-                    serde_json::from_slice::<Record>(&fs::read(entry.path()).ok()?).ok()?;
-                (record.version == RECORD_VERSION && record.task == warm.identity)
-                    .then(|| (entry.path(), record))
+                    WarmRecord::read(&fs::read(entry.path()).ok()?, &warm.identity).ok()?;
+                Some((entry.path(), record))
             })
             .collect();
         records.sort_by_key(|(_, record)| std::cmp::Reverse(record.saved));
@@ -1054,9 +1019,9 @@ impl Cache {
         workspace: &Workspace,
         warm: &Warm,
         current: &[String],
-    ) -> Option<(Record, String)> {
+    ) -> Option<(WarmRecord, String)> {
         let own = worktree(workspace);
-        let mut candidates: Vec<(u8, bool, Record)> = self
+        let mut candidates: Vec<(u8, bool, WarmRecord)> = self
             .warm_records(warm)
             .into_iter()
             .filter_map(|(_, record)| {
@@ -1097,18 +1062,11 @@ impl Cache {
         Some((record, source))
     }
 
-    fn store_warm(&self, record: &Record) -> Result<()> {
+    fn store_warm(&self, record: &WarmRecord) -> Result<()> {
         let path = self.warm_record(record);
         let directory = path.parent().context("warm records have a directory")?;
         fs::create_dir_all(directory)?;
-        let mut file = tempfile::NamedTempFile::new_in(self.root.join("tmp"))?;
-        {
-            let mut writer = std::io::BufWriter::new(file.as_file_mut());
-            serde_json::to_writer(&mut writer, record)?;
-            writer.flush()?;
-        }
-        file.persist(path)?;
-        Ok(())
+        record::publish(&self.root, &path, record)
     }
 
     /// Restores each warm group not already on disk from the save
@@ -1222,7 +1180,7 @@ impl Cache {
         task: &Task,
         warm: &Warm,
         current: &[String],
-    ) -> Option<(Record, String)> {
+    ) -> Option<(WarmRecord, String)> {
         let remote = self
             .remote
             .as_ref()
@@ -1230,13 +1188,7 @@ impl Cache {
         for branch in branches(workspace) {
             match remote.fetch_warm(&self.root, &warm.identity, &branch) {
                 Ok(Some(bytes)) => {
-                    let Some(record) =
-                        serde_json::from_slice::<Record>(&bytes)
-                            .ok()
-                            .filter(|record| {
-                                record.version == RECORD_VERSION && record.task == warm.identity
-                            })
-                    else {
+                    let Some(record) = WarmRecord::read(&bytes, &warm.identity).ok() else {
                         continue;
                     };
                     // A branch's save that does not suit this checkout gives
@@ -1317,15 +1269,13 @@ impl Cache {
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default();
-        let mut record = Record {
-            version: RECORD_VERSION,
-            task: warm.identity.clone(),
-            worktree: save.worktree.clone(),
-            commit: save.commit.clone(),
-            saved: now_ms(),
-            key: save.key.clone(),
-            groups: BTreeMap::new(),
-        };
+        let mut record = WarmRecord::new(
+            warm.identity.clone(),
+            save.worktree.clone(),
+            save.commit.clone(),
+            now_ms(),
+            save.key.clone(),
+        );
         let gone = |error: &std::io::Error| error.kind() == std::io::ErrorKind::NotFound;
         for location in &save.locations {
             if !location.base.exists() {
@@ -1333,7 +1283,7 @@ impl Cache {
             }
             let known = previous.and_then(|previous| previous.groups.get(location.name));
             let restored_files = noted.groups.get(location.name);
-            let mut group = Group::default();
+            let mut group = WarmGroup::default();
             let mut pending = Vec::new();
             for path in location.paths()? {
                 paths::safe_parents(&location.base, &path)?;

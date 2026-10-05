@@ -19,7 +19,7 @@ mod pack;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -395,17 +395,16 @@ impl Remote {
             return Ok(false);
         }
         let Some(manifest) = self.fetch_pack(root, &self.object("entries", key), |parsed| {
-            if parsed.get("key").and_then(Value::as_str) != Some(key) {
-                bail!("remote manifest is for another key");
-            }
-            Ok(())
+            parsed.check_key(key)
         })?
         else {
             return Ok(false);
         };
-        let mut file = tempfile::NamedTempFile::new_in(root.join("tmp"))?;
-        file.write_all(&manifest)?;
-        file.persist(root.join("entries").join(format!("{key}.json")))?;
+        crate::record::publish_bytes(
+            root,
+            &root.join("entries").join(format!("{key}.json")),
+            &manifest,
+        )?;
         self.confirmed.lock().unwrap().insert(key.to_owned());
         Ok(true)
     }
@@ -471,7 +470,7 @@ impl Remote {
         &self,
         root: &Path,
         object: &str,
-        check: impl Fn(&Value) -> Result<()>,
+        check: impl Fn(&crate::record::StoredRecord) -> Result<()>,
     ) -> Result<Option<Vec<u8>>> {
         let url = self
             .bucket

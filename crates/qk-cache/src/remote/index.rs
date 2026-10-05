@@ -86,7 +86,7 @@ pub(super) fn parse(listing: &str) -> impl Iterator<Item = (String, u64)> + '_ {
     listing.lines().filter_map(|line| {
         let (key, time) = line.split_once(' ')?;
         let time = time.parse().ok()?;
-        crate::store::valid_hash(key).then(|| (key.to_owned(), time))
+        crate::record::valid_hash(key).then(|| (key.to_owned(), time))
     })
 }
 
