@@ -111,6 +111,8 @@ impl Lockfile {
     pub fn parse(text: &str) -> Result<Self> {
         let mut main = None;
         let mut environment = Vec::new();
+        let mut raw_documents = serde_yaml_ng::Deserializer::from_str(text);
+        let mut raw_index = 0;
         for (index, document) in serde_yaml_ng::Deserializer::from_str(text).enumerate() {
             let document =
                 Document::deserialize(document).context("invalid lockfile YAML or shape")?;
@@ -124,9 +126,10 @@ impl Lockfile {
             if is_environment {
                 // Keep the whole environment document: fields unused by the
                 // workspace parser still affect the pnpm installation.
-                let raw = serde_yaml_ng::Deserializer::from_str(text)
-                    .nth(index)
+                let raw = raw_documents
+                    .nth(index - raw_index)
                     .context("missing environment document")?;
+                raw_index = index + 1;
                 environment.push(Value::deserialize(raw).context("invalid environment YAML")?);
             } else if main.replace(document).is_some() {
                 bail!("lockfile has more than one workspace document");

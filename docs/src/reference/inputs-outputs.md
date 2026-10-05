@@ -62,9 +62,11 @@ into plain globs. Some expansions follow Nx 23's approximations: `+(a|b)`
 matches one occurrence, and an omitted group in a directory segment widens
 that segment to `*`.
 
-Bare parenthesized alternation can differ: qk matches SVG and PNG files with
-`**/*.(svg|png)`, while Nx 23.1.0 treats that extension group as literal text.
-Use `**/*.{svg,png}` to select those extensions in both tools.
+Bare parenthesized alternation differs for affected-project selection. qk
+selects projects with `**/*.(svg|png)` inputs when SVG or PNG files change,
+while Nx 23.1.0's affected-project matcher treats that group as literal text.
+Nx's native cache hasher does expand the group. Use `**/*.{svg,png}` for
+consistent hashing and affected selection in both tools.
 
 
 ### `env` and `runtime`

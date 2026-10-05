@@ -309,6 +309,26 @@ snapshots:
 }
 
 #[test]
+fn preserves_environment_documents_around_the_workspace() {
+    let workspace = "lockfileVersion: '9.0'\nimporters: {}\n";
+    let environments = [
+        "customField: first\nimporters:\n  .:\n    configDependencies: {}\n",
+        "customField: second\nimporters:\n  .:\n    packageManagerDependencies: {}\n",
+        "customField: third\nimporters:\n  .:\n    configDependencies: {}\n",
+    ];
+    for position in 0..=environments.len() {
+        let mut documents = environments.to_vec();
+        documents.insert(position, workspace);
+        let lockfile = Lockfile::parse(&documents.join("---\n")).unwrap();
+        let raw = lockfile.global()["environment"].as_array().unwrap();
+        assert_eq!(raw.len(), environments.len());
+        for (document, expected) in raw.iter().zip(["first", "second", "third"]) {
+            assert_eq!(document["customField"], expected);
+        }
+    }
+}
+
+#[test]
 fn rejects_other_lockfile_versions() {
     for text in [
         "lockfileVersion: '6.0'\n",
