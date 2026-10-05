@@ -110,10 +110,8 @@ are followed; directory cycles and links outside the workspace run uncached.
 Task-level affected selection follows changes to symlink targets, including
 deletions, even when the target lies outside the source glob that selected the link.
 
-Extended globs (`?(…)`, `*(…)`, `+(…)`, `@(…)`, `!(…)`, `(a|b)` and `{,…}`) are expanded
-exactly as Nx 23 expands them, including its approximations: `+(a|b)` matches
-one occurrence, and an omitted group in a directory segment widens that
-segment to `*`. This keeps input sets written for Nx selecting the same files.
+See [Inputs and outputs](../reference/inputs-outputs.md) for glob expansion
+rules and the differences from Nx, including bare parenthesized extension groups.
 
 ## Outputs
 

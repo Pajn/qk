@@ -58,9 +58,13 @@ keyed after dependencies complete, independently of `dependentTasksOutputFiles`;
 a task's own declared outputs stay out of its source inputs.
 
 Extended globs (`?(…)`, `*(…)`, `+(…)`, `@(…)`, `!(…)`, `(a|b)` and `{,…}`) are expanded
-exactly as Nx 23 expands them, including its approximations: `+(a|b)` matches
-one occurrence, and an omitted group in a directory segment widens that
-segment to `*`. This keeps input sets written for Nx selecting the same files.
+into plain globs. Some expansions follow Nx 23's approximations: `+(a|b)`
+matches one occurrence, and an omitted group in a directory segment widens
+that segment to `*`.
+
+Bare parenthesized alternation can differ: qk matches SVG and PNG files with
+`**/*.(svg|png)`, while Nx 23.1.0 treats that extension group as literal text.
+Use `**/*.{svg,png}` to select those extensions in both tools.
 
 
 ### `env` and `runtime`
