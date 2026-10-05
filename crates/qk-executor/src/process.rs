@@ -137,7 +137,9 @@ pub fn execute_captured(
                         None => index += 1,
                     }
                 }
-                std::thread::sleep(Duration::from_millis(20));
+                if !children.0.is_empty() {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
             }
         })();
         for reader in readers {

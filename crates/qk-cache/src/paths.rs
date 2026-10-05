@@ -196,6 +196,8 @@ fn normalize(path: &str) -> Result<String> {
     })
 }
 
+type OutputEntries<'a> = Box<dyn Iterator<Item = Result<(String, std::fs::Metadata)>> + 'a>;
+
 #[derive(Clone)]
 pub struct Outputs {
     patterns: Vec<Pattern>,
@@ -370,26 +372,57 @@ impl Outputs {
                 .ancestors()
                 .any(|ancestor| patterns.iter().any(|pattern| pattern.is_match(ancestor)))
         };
-        any(&self.patterns) && !any(&self.negations)
+        (self.complete.iter().any(|root| {
+            path == root
+                || path
+                    .strip_prefix(root)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        }) || any(&self.patterns))
+            && !any(&self.negations)
     }
 
     pub fn paths(&self, root: &Path) -> Result<BTreeSet<String>> {
         self.listing(root).map(|(paths, _)| paths)
     }
 
-    pub(crate) fn entries<'a>(
-        &self,
-        root: &'a Path,
-    ) -> Result<impl Iterator<Item = Result<(String, std::fs::Metadata)>> + 'a> {
+    pub(crate) fn entries<'a>(&self, root: &'a Path) -> Result<OutputEntries<'a>> {
+        if self.explicit && self.negations.is_empty() && self.complete.len() == self.globs.len() {
+            let mut walks = Vec::new();
+            let mut symlink = false;
+            for anchor in &self.anchors {
+                safe_parents(root, anchor)?;
+                match std::fs::symlink_metadata(root.join(anchor)) {
+                    Ok(metadata) => symlink |= metadata.file_type().is_symlink(),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            for anchor in self.complete_roots() {
+                let absolute = root.join(anchor);
+                match std::fs::symlink_metadata(&absolute) {
+                    Ok(_) => walks.push(walkdir::WalkDir::new(absolute).follow_links(false)),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            if !symlink {
+                return Ok(Box::new(walks.into_iter().flatten().map(move |entry| {
+                    let entry = entry?;
+                    let path = relative(root, entry.path())?;
+                    validate_path(&path)?;
+                    Ok((path, entry.metadata()?))
+                })));
+            }
+        }
         let (paths, mut traversal) = self.listing(root)?;
-        Ok(paths.into_iter().map(move |path| {
+        Ok(Box::new(paths.into_iter().map(move |path| {
             let absolute = root.join(&path);
             let metadata = match traversal.metadata.remove(&absolute) {
                 Some(metadata) => metadata,
                 None => std::fs::symlink_metadata(&absolute)?,
             };
             Ok((path, metadata))
-        }))
+        })))
     }
 
     fn listing(&self, root: &Path) -> Result<(BTreeSet<String>, Traversal)> {
@@ -720,6 +753,69 @@ fn resolve_output(
 #[cfg(test)]
 mod tests {
     use super::{Outputs, Pattern, normalize};
+
+    #[test]
+    fn literal_entries_match_listing_for_nested_and_missing_roots() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        std::fs::create_dir_all(root.join("dist/nested/empty")).unwrap();
+        std::fs::write(root.join("dist/nested/value"), "contents").unwrap();
+        std::fs::write(root.join("single"), "one").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("single"), root.join("dist/link")).unwrap();
+        let outputs = Outputs::from_paths(&[
+            "dist".into(),
+            "dist/nested".into(),
+            "missing".into(),
+            "single".into(),
+        ])
+        .unwrap();
+        let entries = outputs
+            .entries(root)
+            .unwrap()
+            .collect::<anyhow::Result<Vec<_>>>()
+            .unwrap();
+        let paths: std::collections::BTreeSet<_> =
+            entries.iter().map(|(path, _)| path.clone()).collect();
+        assert_eq!(entries.len(), paths.len());
+        assert_eq!(paths, outputs.paths(root).unwrap());
+        for (path, metadata) in entries {
+            let expected = std::fs::symlink_metadata(root.join(path)).unwrap();
+            assert_eq!(metadata.file_type(), expected.file_type());
+            assert_eq!(metadata.len(), expected.len());
+            assert_eq!(metadata.modified().unwrap(), expected.modified().unwrap());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn literal_entries_reject_nested_roots_below_a_symlink() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        std::fs::create_dir_all(root.join("dist")).unwrap();
+        std::fs::create_dir_all(root.join("outside/nested")).unwrap();
+        std::os::unix::fs::symlink(root.join("outside"), root.join("dist/link")).unwrap();
+        let outputs = Outputs::from_paths(&["dist".into(), "dist/link/nested".into()]).unwrap();
+        assert!(outputs.entries(root).is_err());
+    }
+
+    #[test]
+    fn literal_roots_preserve_path_boundaries_and_exclusions() {
+        let outputs =
+            Outputs::from_paths(&["dist".into(), "build/*.js".into(), "!dist/private".into()])
+                .unwrap();
+        for path in ["dist", "dist/nested/file.txt", "build/app.js"] {
+            assert!(outputs.matches(path), "{path}");
+        }
+        for path in [
+            "dist2/file.txt",
+            "dist/private",
+            "dist/private/file.txt",
+            "build/app.ts",
+        ] {
+            assert!(!outputs.matches(path), "{path}");
+        }
+    }
 
     /// Directories no glob can match are skipped without losing a match.
     #[test]

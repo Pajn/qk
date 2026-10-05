@@ -290,6 +290,22 @@ snapshots:
     let upgraded = Lockfile::parse(&text.replace("12.8.1", "12.9.0")).unwrap();
     assert_ne!(lockfile.global(), upgraded.global());
     assert_eq!(lockfile.installed("."), upgraded.installed("."));
+    let extended = text.replacen(
+        "lockfileVersion:",
+        "customEnvironmentField: original\nlockfileVersion:",
+        1,
+    );
+    let original = Lockfile::parse(&extended).unwrap();
+    let changed = Lockfile::parse(&extended.replace("original", "changed")).unwrap();
+    assert_ne!(original.global(), changed.global());
+    assert_eq!(original.installed("."), changed.installed("."));
+    let documents: Vec<_> = extended
+        .split("---")
+        .filter(|part| !part.trim().is_empty())
+        .collect();
+    let reordered = Lockfile::parse(&format!("---{}---{}", documents[1], documents[0])).unwrap();
+    assert_eq!(original.global(), reordered.global());
+    assert_eq!(original.installed("."), reordered.installed("."));
 }
 
 #[test]
