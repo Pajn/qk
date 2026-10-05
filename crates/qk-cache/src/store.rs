@@ -1,56 +1,20 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use tempfile::NamedTempFile;
 
 use crate::{
-    Cache, combine_outputs, directory_output, file_output,
+    Cache,
     hash::digest_file,
-    link_output,
     paths::{self, Outputs},
+    record::{self, Artifact, ResultRecord, valid_hash, validate_link},
 };
-
-#[derive(Serialize, Deserialize)]
-struct Manifest {
-    version: u32,
-    key: String,
-    log: String,
-    artifacts: BTreeMap<String, Artifact>,
-}
-
-#[derive(Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "type")]
-pub(crate) enum Artifact {
-    File { blob: String, mode: u32 },
-    Directory { mode: u32 },
-    Symlink { target: String, directory: bool },
-}
-
-impl Manifest {
-    /// The output fingerprint of the stored artifacts, without reading any file.
-    fn output_fingerprint(&self, declared: bool) -> Result<String> {
-        let files = self
-            .artifacts
-            .iter()
-            .map(|(path, artifact)| {
-                let value = match artifact {
-                    Artifact::File { blob, mode } => file_output(blob, *mode),
-                    Artifact::Directory { .. } => directory_output(),
-                    Artifact::Symlink { target, .. } => link_output(target),
-                };
-                (path.clone(), value)
-            })
-            .collect();
-        combine_outputs(&self.key, &files, declared)
-    }
-}
 
 pub(crate) fn mode(metadata: &fs::Metadata) -> u32 {
     #[cfg(unix)]
@@ -79,25 +43,6 @@ pub(crate) fn set_mode(path: &Path, mode: u32) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn validate_link(path: &str, target: &str) -> Result<()> {
-    if target.contains(['\\', ':', '\0']) || Path::new(target).is_absolute() {
-        bail!("cache symlinks must be relative");
-    }
-    let mut depth = Path::new(path)
-        .parent()
-        .map(|path| path.components().count())
-        .unwrap_or_default();
-    for part in Path::new(target).components() {
-        match part {
-            Component::Normal(part) if part != ".git" && part != ".qk" => depth += 1,
-            Component::CurDir => {}
-            Component::ParentDir if depth > 0 => depth -= 1,
-            _ => bail!("cache symlink escapes the workspace or references a reserved directory"),
-        }
-    }
-    Ok(())
-}
-
 pub(crate) fn symlink(target: &str, path: &Path, directory: bool) -> Result<()> {
     #[cfg(unix)]
     {
@@ -113,10 +58,6 @@ pub(crate) fn symlink(target: &str, path: &Path, directory: bool) -> Result<()> 
         }
     }
     Ok(())
-}
-
-pub(crate) fn valid_hash(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 // Keep each worker's snapshot bounded, including when a source grows during a save.
@@ -314,19 +255,16 @@ impl Cache {
                 },
             );
         }
-        let manifest = Manifest {
-            version: 1,
-            key: key.into(),
-            log: blobs.next().expect("log blob result")?,
+        let manifest = ResultRecord::new(
+            key.into(),
+            blobs.next().expect("log blob result")?,
             artifacts,
-        };
-        let mut file = NamedTempFile::new_in(self.root.join("tmp"))?;
-        {
-            let mut writer = std::io::BufWriter::new(file.as_file_mut());
-            serde_json::to_writer(&mut writer, &manifest)?;
-            writer.flush()?;
-        }
-        file.persist(self.root.join("entries").join(format!("{key}.json")))?;
+        );
+        record::publish(
+            &self.root,
+            &self.root.join("entries").join(format!("{key}.json")),
+            &manifest,
+        )?;
         manifest.output_fingerprint(outputs.declared())
     }
 
@@ -356,10 +294,7 @@ impl Cache {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        let manifest: Manifest = serde_json::from_slice(&bytes)?;
-        if manifest.version != 1 || manifest.key != key || !valid_hash(&manifest.log) {
-            bail!("invalid cache manifest");
-        }
+        let manifest = ResultRecord::read(&bytes, key)?;
         let log = self.root.join("blobs").join(&manifest.log);
         if digest_file(&log)? != manifest.log {
             bail!("corrupt cached log");
@@ -1100,11 +1035,10 @@ mod tests {
         cache.initialize().unwrap();
         let blob = cache.put_blob(&source).unwrap();
         let key = "c".repeat(64);
-        let manifest = Manifest {
-            version: 1,
-            key: key.clone(),
-            log: cache.put_blob(&log).unwrap(),
-            artifacts: BTreeMap::from([
+        let manifest = ResultRecord::new(
+            key.clone(),
+            cache.put_blob(&log).unwrap(),
+            BTreeMap::from([
                 (
                     "out/file".to_owned(),
                     Artifact::File {
@@ -1117,7 +1051,7 @@ mod tests {
                     Artifact::File { blob, mode: 0o644 },
                 ),
             ]),
-        };
+        );
         fs::write(
             cache.root.join("entries").join(format!("{key}.json")),
             serde_json::to_vec(&manifest).unwrap(),
@@ -1252,7 +1186,7 @@ mod tests {
             fs::read_link(root.join("dist/link")).unwrap(),
             Path::new("file-000")
         );
-        let parsed: Manifest = serde_json::from_slice(&manifest).unwrap();
+        let parsed: ResultRecord = serde_json::from_slice(&manifest).unwrap();
         assert_eq!(
             fs::read(cache.root.join("blobs").join(parsed.log)).unwrap(),
             capture

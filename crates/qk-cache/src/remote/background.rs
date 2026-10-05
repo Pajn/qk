@@ -117,7 +117,7 @@ fn snapshot(jobs: &[Upload]) -> Result<(tempfile::TempDir, Vec<Upload>)> {
         let record = match &job.warm {
             Some((_, record)) => record.clone(),
             None => {
-                if !crate::store::valid_hash(&job.key) {
+                if !crate::record::valid_hash(&job.key) {
                     bail!("invalid upload key");
                 }
                 let record = fs::read(job.local.join("entries").join(format!("{}.json", job.key)))?;
@@ -128,9 +128,9 @@ fn snapshot(jobs: &[Upload]) -> Result<(tempfile::TempDir, Vec<Upload>)> {
                 record
             }
         };
-        let parsed: Value = serde_json::from_slice(&record)?;
-        for blob in crate::evict::manifest_blobs(&parsed) {
-            if !crate::store::valid_hash(&blob) {
+        let parsed = crate::record::StoredRecord::read(&record)?;
+        for blob in parsed.blobs() {
+            if !crate::record::valid_hash(&blob) {
                 bail!("invalid upload blob");
             }
             let destination = root.join("blobs").join(&blob);
