@@ -51,6 +51,7 @@ against the merged child environment.
 | `NX_MAX_CACHE_SIZE` | Override `nx.json`'s `maxCacheSize` |
 | `NX_POWERPACK_CACHE_MODE` | Override S3 `localMode`/`ciMode` |
 | `QK_REMOTE_UPLOAD_MODE` | Override S3 `uploadMode`: `wait` or `background` |
+| `QK_PROFILE_CACHE=1` | Enable [cache phase timings](cli.md#profiling-cache-operations), as `--profile` does |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | Remote credentials |
 | `GITHUB_HEAD_REF`, `GITHUB_REF_NAME` | CI branch for remote warm state |
 

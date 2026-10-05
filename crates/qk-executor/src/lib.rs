@@ -78,6 +78,8 @@ pub struct PreparedTask {
     pub parallel: bool,
     pub cwd: PathBuf,
     pub env: BTreeMap<OsString, OsString>,
+    /// Dotenv, explicit settings and local binary lookup without task metadata.
+    pub runtime_env: BTreeMap<OsString, OsString>,
     /// Variables set for the process after `env` that are not part of what
     /// the task is: nothing reads them to key it, such as a thread count.
     pub execution: BTreeMap<OsString, OsString>,
@@ -158,7 +160,7 @@ fn task_environment(
     workspace: &Workspace,
     task: &Task,
     base_env: &BTreeMap<OsString, OsString>,
-) -> Result<BTreeMap<OsString, OsString>> {
+) -> Result<(BTreeMap<OsString, OsString>, BTreeMap<OsString, OsString>)> {
     let mut env = base_env.clone();
     let root = &workspace.projects[&task.project].root;
     let files = if loads_dotenv(base_env) {
@@ -171,6 +173,7 @@ fn task_environment(
             env.entry(name).or_insert(value);
         }
     }
+    let runtime_env = env.clone();
     let mut set = |name: &str, value: OsString| {
         env.insert(name.into(), value);
     };
@@ -185,7 +188,7 @@ fn task_environment(
             env.remove(std::ffi::OsStr::new("NX_TASK_TARGET_CONFIGURATION"));
         }
     }
-    Ok(env)
+    Ok((env, runtime_env))
 }
 
 /// Whether dotenv files load: as in Nx, `NX_LOAD_DOT_ENV_FILES=false` turns
@@ -311,7 +314,7 @@ pub fn prepare(
     };
     let interpolation =
         interpolate::Interpolation::new(workspace, task, args, &forwarded, extra.as_deref())?;
-    let mut env = task_environment(workspace, task, base_env)?;
+    let (mut env, mut runtime_env) = task_environment(workspace, task, base_env)?;
     // As in Nx, `envFile` sets what is not set yet, beneath `env`.
     if let Some(file) = options.get("envFile") {
         let file = interpolation.text(file.as_str().context("envFile must be a string")?)?;
@@ -321,6 +324,7 @@ pub fn prepare(
                 bail!("envFile {file} does not exist");
             }
             for (name, value) in read_dotenv(&path)? {
+                runtime_env.entry(name.clone()).or_insert(value.clone());
                 env.entry(name).or_insert(value);
             }
         }
@@ -336,7 +340,9 @@ pub fn prepare(
             let value = value
                 .as_str()
                 .context("environment values must be strings")?;
-            env.insert(name.into(), interpolation.text(value)?.into());
+            let value: OsString = interpolation.text(value)?.into();
+            runtime_env.insert(name.into(), value.clone());
+            env.insert(name.into(), value);
         }
     }
     let mut execution = BTreeMap::new();
@@ -396,10 +402,9 @@ pub fn prepare(
     if let Some(path) = env.get(&path_key) {
         paths.extend(std::env::split_paths(path));
     }
-    env.insert(
-        path_key,
-        std::env::join_paths(paths).context("cannot construct task PATH")?,
-    );
+    let path = std::env::join_paths(paths).context("cannot construct task PATH")?;
+    env.insert(path_key.clone(), path.clone());
+    runtime_env.insert(path_key, path);
     let parallel = boolean(options.get("parallel"), true, "parallel")?;
     let mut decorations = Vec::new();
     let ready_when: Vec<String> = match options.get("readyWhen") {
@@ -537,6 +542,7 @@ pub fn prepare(
         parallel,
         cwd,
         env,
+        runtime_env,
         execution,
         ready_when,
         ready: Default::default(),

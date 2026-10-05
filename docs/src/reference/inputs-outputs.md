@@ -43,7 +43,8 @@ Supported declarations:
 
 As in Nx, a named input cannot use `dependencies` or `projects`. With a
 package manager other than pnpm, lockfiles are always keyed by content.
-`runtime` commands run once per run for each environment.
+The [runtime input environment](../guides/cache.md) determines which tasks can
+share a runtime evaluation.
 `dependentTasksOutputFiles` selects matching files from completed dependency
 outputs rather than their full output fingerprints. `.` and `..` segments in
 paths are resolved within the workspace. A symlinked input is keyed by its

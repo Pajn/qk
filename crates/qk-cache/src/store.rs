@@ -289,20 +289,25 @@ impl Cache {
         shown: qk_executor::Shown,
     ) -> Result<Option<String>> {
         // Read whole: a File is unbuffered, and serde_json reads byte by byte.
+        let header_profile = crate::profile::span(task, "restore_header");
         let bytes = match fs::read(self.root.join("entries").join(format!("{key}.json"))) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
         let manifest = ResultRecord::read(&bytes, key)?;
+        drop(header_profile);
+        let log_profile = crate::profile::span(task, "restore_log_validation");
         let log = self.root.join("blobs").join(&manifest.log);
         if digest_file(&log)? != manifest.log {
             bail!("corrupt cached log");
         }
         qk_executor::read_capture(File::open(&log)?, |_, _| Ok(()))?;
+        drop(log_profile);
         let started = SystemTime::now();
         // Outputs this worktree already holds for the key are left as they
         // are; when a stamp fails, they are restored anew.
+        let held_profile = crate::profile::span(task, "restore_held_outputs");
         if outputs_unchanged(root, task, key, outputs) {
             let changed = {
                 let kept = self.kept.lock().unwrap();
@@ -321,6 +326,8 @@ impl Cache {
                 return manifest.output_fingerprint(outputs.declared()).map(Some);
             }
         }
+        drop(held_profile);
+        let planning_profile = crate::profile::span(task, "restore_plan");
         // Stage on the destination filesystem; no existing output is touched yet.
         let stage_parent = paths::worktree_state(root).join("restore");
         fs::create_dir_all(&stage_parent)?;
@@ -350,7 +357,11 @@ impl Cache {
                 }
             }
         }
+        drop(planning_profile);
+        let stage_profile = crate::profile::span(task, "restore_copy_verify");
         self.stage_files(&files, started)?;
+        drop(stage_profile);
+        let selection_profile = crate::profile::span(task, "restore_select_outputs");
         // Only complete directory selections can promote a staged tree.
         // NOREPLACE below still checks that cleanup left the destination absent.
         let complete = complete_directories(root, outputs, &manifest.artifacts)?;
@@ -359,6 +370,8 @@ impl Cache {
         for path in &current {
             paths::safe_parents(root, path)?;
         }
+        drop(selection_profile);
+        let cleanup_profile = crate::profile::span(task, "restore_cleanup");
         for path in current.iter().rev() {
             let absolute = root.join(path);
             let metadata = fs::symlink_metadata(&absolute)?;
@@ -381,6 +394,8 @@ impl Cache {
                 fs::remove_file(absolute)?;
             }
         }
+        drop(cleanup_profile);
+        let promotion_profile = crate::profile::span(task, "restore_promote");
         let mut promoted = BTreeSet::new();
         for path in complete {
             paths::safe_parents(root, &path)?;
@@ -408,13 +423,20 @@ impl Cache {
                 move_staged(&stage.path().join(path), &destination)?;
             }
         }
+        drop(promotion_profile);
+        let mode_profile = crate::profile::span(task, "restore_modes");
         for (path, artifact) in manifest.artifacts.iter().rev() {
             if let Artifact::Directory { mode } = artifact {
                 set_mode(&root.join(path), *mode)?;
             }
         }
+        drop(mode_profile);
+        let record_profile = crate::profile::span(task, "restore_record_outputs");
         record_outputs(root, task, key, outputs);
+        drop(record_profile);
+        let replay_profile = crate::profile::span(task, "restore_replay");
         qk_executor::replay(File::open(log)?, display, shown)?;
+        drop(replay_profile);
         crate::evict::touch(&self.root.join("entries").join(format!("{key}.json")));
         manifest.output_fingerprint(outputs.declared()).map(Some)
     }

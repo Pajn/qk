@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -77,6 +78,12 @@ fn digests_path(root: &Path) -> PathBuf {
     paths::worktree_state(root).join("digests.json")
 }
 
+#[derive(PartialEq, Eq, Hash)]
+struct RuntimeKey {
+    command: String,
+    environment: BTreeMap<OsString, OsString>,
+}
+
 /// Workspace state shared by every fingerprint in one run. The candidate file list
 /// is taken once, like Nx's file map; file contents are still re-read whenever
 /// their metadata changes, so edits during the run are detected.
@@ -96,7 +103,7 @@ pub struct Snapshot {
     /// Directories already checked not to be symlinks.
     directories: Mutex<std::collections::HashSet<PathBuf>>,
     /// Runtime input results by command and environment, computed once per run like Nx.
-    runtime: Mutex<HashMap<String, Value>>,
+    runtime: Mutex<HashMap<RuntimeKey, Arc<Mutex<Option<Value>>>>>,
     /// The parsed pnpm lockfile, replaced whenever its content changes.
     lockfile: Mutex<Option<Arc<Installed>>>,
     /// Each dependency task's output files, listed when a task first asks and
@@ -864,23 +871,28 @@ impl Resolver<'_> {
                         .insert(format!("runtime:{command}"), Value::Null);
                     return Ok(());
                 };
-                let memo = serde_json::to_string(&(
-                    command,
-                    prepared
-                        .env
-                        .iter()
-                        .map(|(name, value)| (name.to_string_lossy(), value.to_string_lossy()))
-                        .collect::<Vec<_>>(),
-                ))?;
-                if let Some(value) = self.snapshot.runtime.lock().unwrap().get(&memo) {
+                let memo = RuntimeKey {
+                    command: command.into(),
+                    environment: prepared.runtime_env.clone(),
+                };
+                let slot = self
+                    .snapshot
+                    .runtime
+                    .lock()
+                    .unwrap()
+                    .entry(memo)
+                    .or_default()
+                    .clone();
+                let mut saved = slot.lock().unwrap();
+                if let Some(value) = saved.as_ref() {
                     self.values
                         .insert(format!("runtime:{command}"), value.clone());
                     return Ok(());
                 }
+                let _profile = crate::profile::span(command, "runtime");
                 let mut prepared = prepared.clone();
-                prepared
-                    .execution
-                    .remove(std::ffi::OsStr::new("FORCE_COLOR"));
+                prepared.env = prepared.runtime_env.clone();
+                prepared.execution.clear();
                 prepared.commands = vec![command.into()];
                 prepared.cwd = self.workspace.root.clone();
                 prepared.parallel = false;
@@ -904,11 +916,7 @@ impl Resolver<'_> {
                     stdout.finalize().to_hex().to_string(),
                     stderr.finalize().to_hex().to_string()
                 ]);
-                self.snapshot
-                    .runtime
-                    .lock()
-                    .unwrap()
-                    .insert(memo, value.clone());
+                *saved = Some(value.clone());
                 self.values.insert(format!("runtime:{command}"), value);
             }
             Value::Object(object) if object.contains_key("dependentTasksOutputFiles") => {

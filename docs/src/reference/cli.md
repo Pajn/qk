@@ -105,6 +105,7 @@ These options apply to `run`, `run-many` and `affected`:
 | `--sandbox[=audit\|enforce]` | Report (`audit`, macOS only) or refuse (`enforce`, macOS and Linux) what tasks read and write in the workspace beyond their declarations; skips the cache. See [Checking inputs in a sandbox](../guides/sandbox.md) |
 | `--sandbox-report <path>` | Write every sandbox finding as JSON |
 | `--report <path>` | Save JSON run report; defaults to `NX_RUN_REPORT` when set |
+| `--profile` | Print cache input and restore phase timings to stderr; see [Profiling cache operations](#profiling-cache-operations) |
 | `-- <args>` | Forward arguments to requested tasks |
 
 `--parallel` alone uses `NX_PARALLEL`, otherwise `3`. Percentages are
@@ -112,6 +113,25 @@ rounded down with a minimum of one task. `--skip-nx-cache` and
 `--disable-nx-cache` alias `--skip-cache`; `--disable-remote-cache` aliases
 `--skip-remote-cache`. The corresponding environment flags are documented in
 [Environment variables](environment.md).
+
+### Profiling cache operations
+
+Run `qk run web:build --profile` (or set `QK_PROFILE_CACHE=1`) to print lines
+such as `qk profile: task=web:build stage=local_restore ms=3.197`.
+Profiling is disabled by default and reads no clocks while disabled.
+
+Timings cover dependency inputs, declared inputs, runtime commands, remote
+fetches and local restore phases. Runtime lines identify the command; other
+lines identify the task. Spans can overlap: runtime evaluation is part of
+input resolution, and restore phases are part of local restoration. Do not
+sum them as exclusive costs. Shared runtime commands are timed only when
+evaluated, so a task reusing a result has no separate runtime line.
+
+The flag leaves task stdout and cache results unchanged. Timings are diagnostic
+stderr output, available with every output style, and are not task warnings.
+Compare repeated runs with the same cache state; a remote fetch, a local
+restore into missing outputs and a hit with outputs already present do
+different work.
 
 ## Change selection
 

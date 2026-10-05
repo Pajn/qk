@@ -165,6 +165,9 @@ enum Command {
 struct RunOptions {
     #[arg(skip)]
     input_analysis: Option<inputs::Options>,
+    /// Print elapsed cache input and restore phase timings to stderr.
+    #[arg(long)]
+    profile: bool,
     /// Bypass all cache reads and writes; also NX_SKIP_NX_CACHE=true.
     #[arg(long, aliases = ["skip-nx-cache", "disable-nx-cache"])]
     skip_cache: bool,
@@ -1248,6 +1251,9 @@ fn execute_tasks(
     options: &RunOptions,
     single: bool,
 ) -> Result<i32> {
+    if options.profile {
+        qk_cache::profile::enable();
+    }
     options.export();
     let graph = if requests.is_empty() && options.graph_target().is_some() {
         TaskGraph {

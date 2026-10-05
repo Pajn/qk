@@ -407,6 +407,7 @@ fn callbacks(
                 id: format!("watch:{name}"),
                 commands: vec![command.to_owned()],
                 cwd: cwd.to_owned(),
+                runtime_env: env.clone(),
                 env,
                 execution: BTreeMap::new(),
                 parallel: false,
