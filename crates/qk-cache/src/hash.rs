@@ -889,6 +889,7 @@ impl Resolver<'_> {
                         .insert(format!("runtime:{command}"), value.clone());
                     return Ok(());
                 }
+                let _profile = crate::profile::span(command, "runtime");
                 let mut prepared = prepared.clone();
                 prepared.env = prepared.runtime_env.clone();
                 prepared.execution.clear();

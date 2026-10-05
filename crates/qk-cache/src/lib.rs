@@ -5,6 +5,7 @@ mod glob;
 mod hash;
 mod inputs;
 mod paths;
+pub mod profile;
 mod record;
 mod remote;
 mod store;
@@ -299,12 +300,15 @@ impl Cache {
             Ok(snapshot) => snapshot,
             Err(reason) => return bypass(reason),
         };
+        let dependency_profile = profile::span(&task.id, "dependency_inputs");
         let dependencies =
             match hash::dependency_keys(snapshot, workspace, graph, task, &dependencies, cancelled)
             {
                 Ok(dependencies) => dependencies,
                 Err(error) => return bypass(format!("{error:#}")),
             };
+        drop(dependency_profile);
+        let input_profile = profile::span(&task.id, "inputs");
         let (key, inputs) = match hash::inputs(
             snapshot,
             workspace,
@@ -318,6 +322,7 @@ impl Cache {
             Ok(key) => key,
             Err(error) => return bypass(format!("{error:#}")),
         };
+        drop(input_profile);
         let keyed = Some((key.clone(), inputs));
         // As in Nx, the task sees its hash.
         running
@@ -425,6 +430,7 @@ impl Cache {
         {
             return bypass("inputs changed while waiting for another run".into());
         }
+        let local_profile = profile::span(&task.id, "local_restore");
         match self.restore(
             &workspace.root,
             &task.id,
@@ -456,8 +462,12 @@ impl Cache {
                 qk_executor::status!("qk: {}: ignoring unusable cache entry ({error})", task.id)
             }
         }
+        drop(local_profile);
         if let Some(remote) = &self.remote {
-            let fetched = remote.fetch(&self.root, &key).and_then(|found| {
+            let fetch_profile = profile::span(&task.id, "remote_fetch");
+            let fetched = remote.fetch(&self.root, &key);
+            drop(fetch_profile);
+            let fetched = fetched.and_then(|found| {
                 if !found {
                     return Ok(None);
                 }

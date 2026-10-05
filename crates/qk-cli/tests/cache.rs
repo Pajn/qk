@@ -290,6 +290,39 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+#[test]
+fn profiling_is_opt_in_and_preserves_cached_output_across_output_styles() {
+    let fixture = Fixture::new(target("build", json!({})));
+    let run = |args: &[&str], environment: Option<&str>| {
+        let mut command = fixture.command(&fixture.root, args);
+        command.env_remove("QK_PROFILE_CACHE");
+        if let Some(value) = environment {
+            command.env("QK_PROFILE_CACHE", value);
+        }
+        success(command.output().unwrap())
+    };
+    let cold = run(&["run", "app:build"], None);
+    assert!(!stderr(&cold).contains("qk profile:"));
+    for style in ["stream", "quiet", "dynamic"] {
+        let baseline = run(&["app:build", "--output-style", style], None);
+        let output = run(&["app:build", "--profile", "--output-style", style], None);
+        assert_eq!(output.stdout, baseline.stdout);
+        let diagnostics = stderr(&output);
+        for stage in ["inputs", "local_restore", "restore_header"] {
+            assert!(
+                diagnostics.contains(&format!("qk profile: task=app:build stage={stage} ms=")),
+                "{diagnostics}"
+            );
+        }
+        assert_eq!(fixture.runs(), 1);
+    }
+    let enabled = run(&["run", "app:build"], Some("1"));
+    assert!(stderr(&enabled).contains("qk profile:"));
+    let disabled = run(&["run", "app:build"], Some("0"));
+    assert!(!stderr(&disabled).contains("qk profile:"));
+    assert_eq!(fixture.runs(), 1);
+}
+
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
