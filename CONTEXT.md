@@ -5,6 +5,20 @@ and optional warm state across runs.
 
 ## Language
 
+**Declared input**:
+A file, environment value, runtime value or dependency artifact selected by
+a task's input rules, including configuration that qk always includes.
+
+**Installation input**:
+The package installation of a consumed workspace importer, or a named
+external package's installations across importers. It includes transitive
+dependencies, peer resolutions, patches and integrity data.
+
+**Affected task**:
+A task selected because revision changes touch its inputs, or because it
+depends on an affected task. Selection can be conservative and does not
+guarantee that the task's cache key changes.
+
 **Result record**:
 A saved successful task result, identified by its cache key, that describes
 the task's outputs and recorded log.

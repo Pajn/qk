@@ -4,8 +4,7 @@
 //! resolution keys, or it depends on an affected task. Env and runtime inputs
 //! count as unchanged, since the base revision's environment is unknowable.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Component, Path, PathBuf};
+use std::collections::BTreeMap;
 
 use anyhow::Result;
 use qk_config::Workspace;
@@ -85,7 +84,6 @@ pub fn affected_tasks(
         });
     }
     let ignore = qk_cache::SourceIgnore::new(&workspace.root)?;
-    let changed: BTreeSet<&str> = changes.files.iter().map(String::as_str).collect();
     let deleted_manifest = changes.files.iter().find(|file| {
         let name = file.rsplit('/').next().unwrap_or(file);
         matches!(name, "project.json" | "package.json")
@@ -94,7 +92,7 @@ pub fn affected_tasks(
     });
     let resolved = qk_cache::resolve_tasks(workspace, graph, &changes.files)?;
     // The lockfile at both revisions, when it changed and both can be read.
-    let lockfiles = if changed.contains("pnpm-lock.yaml") {
+    let lockfiles = if changes.files.iter().any(|file| file == "pnpm-lock.yaml") {
         match changes.change("pnpm-lock.yaml") {
             FileChange::Lockfile { before, after } => Lockfile::parse(&before)
                 .ok()
@@ -104,93 +102,47 @@ pub fn affected_tasks(
     } else {
         None
     };
-    let workspace_file_changed = changed.contains("pnpm-workspace.yaml") && {
-        let read = |revision: Option<&str>| {
-            changes
-                .read("pnpm-workspace.yaml", revision)
-                .and_then(|text| qk_cache::without_resolution(&text))
+    let workspace_file_changed = changes
+        .files
+        .iter()
+        .any(|file| file == "pnpm-workspace.yaml")
+        && {
+            let read = |revision: Option<&str>| {
+                changes
+                    .read("pnpm-workspace.yaml", revision)
+                    .and_then(|text| qk_cache::without_resolution(&text))
+            };
+            match (read(changes.base.as_deref()), read(changes.head.as_deref())) {
+                (Some(before), Some(after)) => before != after,
+                _ => true,
+            }
         };
-        match (read(changes.base.as_deref()), read(changes.head.as_deref())) {
-            (Some(before), Some(after)) => before != after,
-            _ => true,
-        }
-    };
     let mut tasks = BTreeMap::new();
-    let canonical_root = workspace.root.canonicalize()?;
-    let mut links = BTreeMap::new();
-    let mut directory_links = BTreeMap::new();
+    let mut input_changes = qk_cache::InputChanges::new(
+        &workspace.root,
+        &changes.files,
+        lockfiles.as_ref().map(|(before, after)| (before, after)),
+        workspace_file_changed,
+    )?;
     for (id, inputs) in &resolved {
         let mut reasons = Vec::new();
         if let Some(file) = deleted_manifest {
             reasons.push(TaskReason::DeletedManifest { file: file.clone() });
         }
-        let mut touched = BTreeSet::new();
-        for file in inputs.files.iter().map(String::as_str).chain(
-            inputs
-                .values
-                .keys()
-                .filter_map(|key| key.strip_prefix("json:")),
-        ) {
-            if changed.contains(file) {
-                touched.insert(file);
-                continue;
-            }
-            if !links.contains_key(file) {
-                links.insert(
-                    file.to_owned(),
-                    symlink_targets(&canonical_root, file, &mut directory_links)?,
-                );
-            }
-            for target in &links[file] {
-                touched.extend(
-                    changes
-                        .files
-                        .iter()
-                        .filter(|changed| {
-                            target.is_empty()
-                                || **changed == *target
-                                || changed
-                                    .strip_prefix(target)
-                                    .is_some_and(|suffix| suffix.starts_with('/'))
-                        })
-                        .map(String::as_str),
-                );
-            }
-        }
-        for file in touched {
-            reasons.push(TaskReason::Input {
-                file: file.to_owned(),
-            });
-        }
-        if inputs.workspace_file && workspace_file_changed {
-            reasons.push(TaskReason::WorkspaceFile);
-        }
-        match (&inputs.lockfile, &lockfiles) {
-            (Some((importers, external)), Some((before, after))) => {
-                if before.global() != after.global() {
-                    reasons.push(TaskReason::Lockfile);
-                }
-                for importer in importers {
-                    if before.installed(importer) != after.installed(importer) {
-                        reasons.push(TaskReason::Installs {
-                            importer: importer.clone(),
-                        });
+        reasons.extend(
+            input_changes
+                .reasons(inputs)?
+                .into_iter()
+                .map(|change| match change {
+                    qk_cache::InputChange::Input { file } => TaskReason::Input { file },
+                    qk_cache::InputChange::Installs { importer } => {
+                        TaskReason::Installs { importer }
                     }
-                }
-                for name in external {
-                    if before.package(name) != after.package(name) {
-                        reasons.push(TaskReason::Package { name: name.clone() });
-                    }
-                }
-            }
-            // The lockfile changed but qk could not compare it.
-            (Some(_), None) if changed.contains("pnpm-lock.yaml") => {
-                reasons.push(TaskReason::Input {
-                    file: "pnpm-lock.yaml".into(),
-                })
-            }
-            _ => {}
-        }
+                    qk_cache::InputChange::Package { name } => TaskReason::Package { name },
+                    qk_cache::InputChange::Lockfile => TaskReason::Lockfile,
+                    qk_cache::InputChange::WorkspaceFile => TaskReason::WorkspaceFile,
+                }),
+        );
         if !reasons.is_empty() {
             tasks.insert(id.clone(), TaskCause::Touched { reasons });
         }
@@ -231,78 +183,4 @@ pub fn affected_tasks(
         files: changes.files,
         tasks,
     })
-}
-
-/// Paths a selected symlink reads, including a target that has been deleted.
-fn symlink_targets(
-    root: &Path,
-    path: &str,
-    directory_links: &mut BTreeMap<PathBuf, Vec<PathBuf>>,
-) -> Result<Vec<String>> {
-    let mut pending = vec![root.join(path)];
-    let mut visited = BTreeSet::new();
-    let mut targets = BTreeSet::new();
-    while let Some(absolute) = pending.pop() {
-        if !visited.insert(absolute.clone()) {
-            continue;
-        }
-        let metadata = match std::fs::symlink_metadata(&absolute) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error.into()),
-        };
-        if !metadata.file_type().is_symlink() {
-            continue;
-        }
-        let target = absolute
-            .parent()
-            .expect("input has a parent")
-            .join(std::fs::read_link(&absolute)?);
-        let mut normalized = PathBuf::new();
-        for component in target.components() {
-            match component {
-                Component::CurDir => {}
-                Component::ParentDir => {
-                    normalized.pop();
-                }
-                component => normalized.push(component.as_os_str()),
-            }
-        }
-        let resolved = target.canonicalize().ok().or_else(|| {
-            Some(
-                target
-                    .parent()?
-                    .canonicalize()
-                    .ok()?
-                    .join(target.file_name()?),
-            )
-        });
-        if normalized.starts_with(root) {
-            pending.push(normalized.clone());
-        }
-        if let Some(resolved) = &resolved
-            && resolved.starts_with(root)
-            && resolved.is_dir()
-        {
-            if !directory_links.contains_key(resolved) {
-                let mut links = Vec::new();
-                for entry in walkdir::WalkDir::new(resolved).follow_links(false) {
-                    let entry = entry?;
-                    if entry.file_type().is_symlink() {
-                        links.push(entry.into_path());
-                    }
-                }
-                directory_links.insert(resolved.clone(), links);
-            }
-            pending.extend(directory_links[resolved].iter().cloned());
-        }
-        for target in std::iter::once(normalized).chain(resolved) {
-            if let Ok(relative) = target.strip_prefix(root)
-                && let Some(relative) = relative.to_str()
-            {
-                targets.insert(relative.replace('\\', "/"));
-            }
-        }
-    }
-    Ok(targets.into_iter().collect())
 }

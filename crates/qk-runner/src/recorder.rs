@@ -67,12 +67,7 @@ impl Recorder {
             .values()
             .filter_map(|task| task.as_ref().ok())
         {
-            candidates.extend(
-                resolved
-                    .values
-                    .keys()
-                    .filter_map(|key| key.strip_prefix("json:").map(str::to_owned)),
-            );
+            candidates.extend(resolved.json_inputs().map(str::to_owned));
         }
         for path in candidates {
             let targets =
@@ -289,7 +284,7 @@ impl Recorder {
                             let keyed = format!("{alias}/{}", suffix.to_string_lossy());
                             (declared.contains(alias)
                                 || declared.contains(&keyed)
-                                || resolved.values.contains_key(&format!("json:{alias}")))
+                                || resolved.is_json_input(alias))
                             .then_some(alias.clone())
                         })
                 });
@@ -317,22 +312,21 @@ impl Recorder {
                 {
                     Category::Discovery
                 } else if self.declared.tasks[id].as_ref().is_ok_and(|resolved| {
-                    resolved
-                        .values
-                        .contains_key(&format!("json:{}", event.path))
-                        || event.keyed_path.as_ref().is_some_and(|alias| {
-                            resolved.values.contains_key(&format!("json:{alias}"))
-                        })
+                    resolved.is_json_input(&event.path)
+                        || event
+                            .keyed_path
+                            .as_ref()
+                            .is_some_and(|alias| resolved.is_json_input(alias))
                 }) {
                     Category::StructuredInput
                 } else if declared.contains(&event.path) || event.keyed_path.is_some() {
                     Category::Input
                 } else if generated.contains(&event.path) && !event.operation.writes() {
                     Category::Generated
-                } else if self.declared.tasks[id].as_ref().is_ok_and(|resolved| {
-                    (event.path == "pnpm-lock.yaml" && resolved.lockfile.is_some())
-                        || (event.path == "pnpm-workspace.yaml" && resolved.workspace_file)
-                }) {
+                } else if self.declared.tasks[id]
+                    .as_ref()
+                    .is_ok_and(|resolved| resolved.is_resolution_metadata(&event.path))
+                {
                     Category::ResolutionMetadata
                 } else {
                     Category::Uncovered

@@ -3296,6 +3296,51 @@ fn json_inputs_key_only_the_fields_they_select() {
 }
 
 #[test]
+fn ignored_json_inputs_share_coverage_while_affected_selection_remains_conservative() {
+    let fixture = Fixture::new(target(
+        "build",
+        json!({"inputs": [
+            {"json": "{projectRoot}/meta.json", "fields": ["version"]}
+        ]}),
+    ));
+    fs::write(fixture.root.join(".nxignore"), "meta.json\n").unwrap();
+    let meta = |version, comment| {
+        fs::write(
+            fixture.root.join("meta.json"),
+            json!({"version": version, "comment": comment}).to_string(),
+        )
+        .unwrap()
+    };
+    meta(1, "before");
+    assert!(!hit(&fixture, &fixture.root));
+    for (version, expected_hit) in [(1, true), (2, false)] {
+        meta(version, "after");
+        let output = success(fixture.qk(
+            &fixture.root,
+            &[
+                "show",
+                "tasks",
+                "-t",
+                "build",
+                "--affected",
+                "--files",
+                "meta.json",
+                "--json",
+            ],
+        ));
+        let analysis: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            analysis["tasks"],
+            json!({"app:build": {
+                "cause": "touched", "reasons": [{"reason": "input", "file": "meta.json"}]
+            }})
+        );
+        assert_eq!(hit(&fixture, &fixture.root), expected_hit);
+    }
+    assert_eq!(fixture.runs(), 2);
+}
+
+#[test]
 fn the_working_directory_can_be_an_input() {
     let fixture = with_lib(json!([{"workingDirectory": "relative"}]));
     let from = |directory: &Path| {
