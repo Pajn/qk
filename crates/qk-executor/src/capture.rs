@@ -12,8 +12,15 @@ pub enum Display {
     /// Each non-empty line behind the given prefix: Nx's `stream`.
     Prefixed(String),
     /// Held until the task ends, then printed under `> qk run <id>`: Nx's
-    /// `static`. `group` folds each task into a GitHub Actions log group.
-    Static { id: String, group: bool },
+    /// `static`. `group` folds each task into a GitHub Actions log group, and
+    /// `cached` shows a cache hit's log rather than only its header.
+    Static {
+        id: String,
+        group: bool,
+        cached: bool,
+    },
+    /// Straight through under `> qk run <id>`: the task a static `run` is for.
+    Headed { id: String },
     /// Held until the task ends, and printed under a header only if it
     /// failed: for the quiet and dynamic styles.
     Failures { id: String },
@@ -35,16 +42,27 @@ pub enum Shown {
 impl Display {
     /// The display for a task under an output style. Continuous tasks never end
     /// on their own, so held output would never appear; they stream prefixed.
-    pub fn for_task(style: OutputStyle, id: &str, project: &str, continuous: bool) -> Self {
+    /// `root` is a task the run was asked for, rather than a dependency.
+    pub fn for_task(
+        style: OutputStyle,
+        id: &str,
+        project: &str,
+        continuous: bool,
+        root: bool,
+    ) -> Self {
         match style {
             OutputStyle::StreamWithoutPrefixes => Self::Stream,
-            OutputStyle::Static if !continuous => Self::Static {
+            OutputStyle::RunOne if root && !continuous => Self::Headed { id: id.to_owned() },
+            OutputStyle::Static | OutputStyle::RunOne if !continuous => Self::Static {
                 id: id.to_owned(),
                 group: std::env::var_os("GITHUB_ACTIONS").is_some()
                     && std::env::var_os("NX_SKIP_LOG_GROUPING").is_none_or(|value| value != "true"),
+                cached: style == OutputStyle::Static,
             },
             OutputStyle::Quiet => Self::Failures { id: id.to_owned() },
-            OutputStyle::Static | OutputStyle::Stream => Self::Prefixed(prefix(project)),
+            OutputStyle::Static | OutputStyle::RunOne | OutputStyle::Stream => {
+                Self::Prefixed(prefix(project))
+            }
         }
     }
 }
@@ -55,6 +73,10 @@ pub enum OutputStyle {
     Stream,
     StreamWithoutPrefixes,
     Static,
+    /// `static` for one requested task, as Nx shows `nx run`: the task streams
+    /// under its header, and its dependencies are held, with only the headers
+    /// of cache hits.
+    RunOne,
     /// Only failed tasks' output, for the quiet and dynamic styles.
     Quiet,
 }
@@ -180,7 +202,7 @@ impl Printer {
 
     fn write(&self, stderr: bool, bytes: &[u8]) -> io::Result<()> {
         match &self.display {
-            Display::Stream => write_to(stderr, bytes),
+            Display::Stream | Display::Headed { .. } => write_to(stderr, bytes),
             Display::Hidden => Ok(()),
             Display::Static { .. } | Display::Failures { .. } => {
                 self.held.lock().unwrap().extend_from_slice(bytes);
@@ -202,9 +224,20 @@ impl Printer {
         }
     }
 
+    /// Announces a task about to show its output; `shown` for a cache hit.
+    fn begin(&self, shown: Option<Shown>) -> io::Result<()> {
+        match &self.display {
+            Display::Headed { id } => {
+                let header = header(id, shown.unwrap_or(Shown::Success));
+                write_to(false, format!("\n{header}\n\n").as_bytes())
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn finish(&self, shown: Shown) -> io::Result<()> {
         match &self.display {
-            Display::Stream | Display::Hidden => Ok(()),
+            Display::Stream | Display::Headed { .. } | Display::Hidden => Ok(()),
             Display::Failures { id } => {
                 let held = std::mem::take(&mut *self.held.lock().unwrap());
                 if shown == Shown::Failure {
@@ -225,14 +258,12 @@ impl Printer {
                 }
                 Ok(())
             }
-            Display::Static { id, group } => {
-                let held = std::mem::take(&mut *self.held.lock().unwrap());
-                let status = match shown {
-                    Shown::LocalCache => "  [local cache]",
-                    Shown::RemoteCache => "  [remote cache]",
-                    Shown::Kept => "  [existing outputs match the cache, left as is]",
-                    Shown::Success | Shown::Failure => "",
-                };
+            Display::Static { id, group, cached } => {
+                let mut held = std::mem::take(&mut *self.held.lock().unwrap());
+                if !cached && matches!(shown, Shown::LocalCache | Shown::RemoteCache | Shown::Kept)
+                {
+                    held.clear();
+                }
                 let mut text = Vec::new();
                 text.push(b'\n');
                 if *group {
@@ -244,7 +275,7 @@ impl Printer {
                     };
                     text.extend_from_slice(format!("::group::{icon} ").as_bytes());
                 }
-                text.extend_from_slice(format!("> qk run {id}{status}\n\n").as_bytes());
+                text.extend_from_slice(format!("{}\n\n", header(id, shown)).as_bytes());
                 text.extend_from_slice(&held);
                 if *group {
                     if !held.ends_with(b"\n") && !held.is_empty() {
@@ -256,6 +287,17 @@ impl Printer {
             }
         }
     }
+}
+
+/// `> qk run <id>`, marked when the output came from the cache.
+fn header(id: &str, shown: Shown) -> String {
+    let status = match shown {
+        Shown::LocalCache => "  [local cache]",
+        Shown::RemoteCache => "  [remote cache]",
+        Shown::Kept => "  [existing outputs match the cache, left as is]",
+        Shown::Success | Shown::Failure => "",
+    };
+    format!("> qk run {id}{status}")
 }
 
 /// Nx's `formatPrefixedLines`: every non-empty line behind the prefix.
@@ -348,11 +390,14 @@ impl Readiness {
 
 impl Capture {
     /// Streams output through its display, optionally recording cache frames on disk.
+    /// A headed display announces the task here, as it starts.
     pub fn new(file: Option<File>, display: Display) -> Self {
+        let printer = Printer::new(display);
+        let _ = printer.begin(None);
         Self {
             file: file.map(Mutex::new),
             retained: Mutex::new(None),
-            printer: Printer::new(display),
+            printer,
             healthy: AtomicBool::new(true),
             readiness: None,
         }
@@ -492,6 +537,7 @@ pub fn read_capture(
 /// Shows a recorded log as a cache hit.
 pub fn replay(reader: impl Read, display: &Display, shown: Shown) -> io::Result<()> {
     let printer = Printer::new(display.clone());
+    printer.begin(Some(shown))?;
     read_capture(reader, |stderr, bytes| printer.write(stderr, bytes))?;
     printer.finish(shown)
 }

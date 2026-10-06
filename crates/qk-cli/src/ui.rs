@@ -24,6 +24,19 @@ impl Paint {
         Self(!set("NO_COLOR") && (set("FORCE_COLOR") || std::io::stderr().is_terminal()))
     }
 
+    /// Colours for a static log, following picocolors as task output does:
+    /// also in CI, whose log viewers render them.
+    pub fn log() -> Self {
+        let set = |name| std::env::var_os(name).is_some();
+        Self(
+            !set("NO_COLOR")
+                && (set("FORCE_COLOR")
+                    || set("CI")
+                    || (std::io::stderr().is_terminal()
+                        && std::env::var("TERM").is_ok_and(|term| term != "dumb"))),
+        )
+    }
+
     fn wrap(self, code: &str, text: &str) -> String {
         if self.0 {
             format!("\x1b[{code}m{text}\x1b[0m")
@@ -120,6 +133,96 @@ impl Sink for Quiet {
             report::write_all(stderr, bytes);
         }
     }
+}
+
+/// The static styles: task headers say how each task went, so events print
+/// nothing; warnings print as they come, and output passes through.
+pub struct Static;
+
+impl Sink for Static {
+    fn event(&self, _: &Event) {}
+
+    fn warning(&self, line: &str) {
+        report::write_all(true, format!("{line}\n").as_bytes());
+    }
+
+    fn output(&self, stderr: bool, bytes: &[u8]) {
+        report::write_all(stderr, bytes);
+    }
+}
+
+/// What a run was asked for, as Nx's static styles word it: `target build
+/// for project web and 2 tasks it depends on`.
+pub struct Title {
+    single: bool,
+    projects: Vec<String>,
+    text: String,
+}
+
+impl Title {
+    pub fn new(graph: &qk_taskgraph::TaskGraph, single: bool) -> Self {
+        let mut projects = Vec::new();
+        let mut targets = Vec::new();
+        for id in &graph.roots {
+            if let Some(task) = graph.tasks.get(id) {
+                if !projects.contains(&task.project) {
+                    projects.push(task.project.clone());
+                }
+                if !targets.contains(&task.target) {
+                    targets.push(task.target.clone());
+                }
+            }
+        }
+        let mut text = if let [target] = &targets[..] {
+            format!("target {target}")
+        } else {
+            format!("targets {}", targets.join(", "))
+        };
+        if let [project] = &projects[..] {
+            text.push_str(&format!(" for project {project}"));
+        } else {
+            text.push_str(&format!(" for {} projects", projects.len()));
+        }
+        let dependencies = graph.tasks.len().saturating_sub(graph.roots.len());
+        if dependencies > 0 {
+            text.push_str(&format!(
+                " and {dependencies} task{} {} depend{} on",
+                if dependencies == 1 { "" } else { "s" },
+                if projects.len() == 1 { "it" } else { "they" },
+                if projects.len() == 1 { "s" } else { "" },
+            ));
+        }
+        Self {
+            single,
+            projects,
+            text,
+        }
+    }
+
+    /// The banner a run starts with: the projects of several tasks, or a
+    /// single task's dependencies; nothing for a single task alone.
+    pub fn start(&self, paint: Paint) -> String {
+        if self.projects.is_empty() || (self.single && !self.text.contains(" and ")) {
+            return String::new();
+        }
+        let mut text = banner(paint, "36", &format!("Running {}:", self.text));
+        if !self.single {
+            text.push('\n');
+            for project in &self.projects {
+                text.push_str(&format!("{} {project}\n", paint.dim("-")));
+            }
+        }
+        text
+    }
+}
+
+/// Nx's banner: ` QK ` reversed, then the title, in one colour.
+fn banner(paint: Paint, colour: &str, title: &str) -> String {
+    format!(
+        "\n{}  {}\n",
+        paint.wrap(&format!("7;1;{colour}"), " QK "),
+        paint.wrap(colour, title)
+    )
 }
 
 #[derive(Default)]
@@ -472,13 +575,6 @@ pub fn summary(
         .map(|task| task.id.as_str())
         .collect();
     let skipped = skipped_names.len();
-    let list = |names: &[&str]| {
-        let mut list = names.iter().take(8).copied().collect::<Vec<_>>().join(", ");
-        if names.len() > 8 {
-            list.push_str(&format!(" and {} more", names.len() - 8));
-        }
-        list
-    };
     let cached = report
         .tasks
         .iter()
@@ -509,6 +605,33 @@ pub fn summary(
             ));
         }
     }
+    lines.extend(details(result, report, parallel, cores, warnings, paint));
+    lines.join("\n") + "\n"
+}
+
+/// Up to eight names, then how many more.
+fn list(names: &[&str]) -> String {
+    let mut list = names.iter().take(8).copied().collect::<Vec<_>>().join(", ");
+    if names.len() > 8 {
+        list.push_str(&format!(" and {} more", names.len() - 8));
+    }
+    list
+}
+
+/// What follows a run's result: tasks that started from warm state, thread
+/// shares, the critical path and what more parallelism could do, then the
+/// warnings kept for the end.
+fn details(
+    result: &RunResult,
+    report: &RunReport,
+    parallel: usize,
+    cores: usize,
+    warnings: &[String],
+    paint: Paint,
+) -> Vec<String> {
+    let wall = Duration::from_millis(report.ended.saturating_sub(report.started));
+    let total = report.tasks.len();
+    let mut lines = Vec::new();
     let warm: Vec<&str> = report
         .tasks
         .iter()
@@ -565,7 +688,11 @@ pub fn summary(
             "{} {} {}: {chain}",
             paint.dim("Critical path"),
             seconds(Duration::from_millis(path.duration)),
-            paint.dim(&format!("({} tasks)", path.tasks.len())),
+            paint.dim(&format!(
+                "({} task{})",
+                path.tasks.len(),
+                if path.tasks.len() == 1 { "" } else { "s" }
+            )),
         ));
         let mut longest: Vec<(&str, u64)> = path
             .tasks
@@ -664,13 +791,81 @@ pub fn summary(
             lines.push(format!("  … {} more", warnings.len() - 10));
         }
     }
-    lines.join("\n") + "\n"
+    lines
+}
+
+/// The banner a static run ends with, as Nx's: what ran, or the tasks that
+/// failed and those not run because of them, then the details.
+pub fn static_summary(
+    title: &Title,
+    result: &RunResult,
+    report: &RunReport,
+    parallel: usize,
+    cores: usize,
+    paint: Paint,
+) -> String {
+    if report.tasks.is_empty() {
+        return banner(paint, "36", "No tasks were run");
+    }
+    let wall = Duration::from_millis(report.ended.saturating_sub(report.started));
+    let with = |status: &str| -> Vec<&str> {
+        report
+            .tasks
+            .iter()
+            .filter(|task| task.status == status)
+            .map(|task| task.id.as_str())
+            .collect()
+    };
+    let mut failed = with("failure");
+    failed.extend(with("cancelled"));
+    let skipped = with("skipped");
+    let cached = report
+        .tasks
+        .iter()
+        .filter(|task| matches!(task.cache.as_deref(), Some("local-hit" | "remote-hit")))
+        .count();
+    let total = report.tasks.len();
+    let mut text = if failed.is_empty() {
+        banner(paint, "32", &format!("Successfully ran {}", title.text))
+    } else {
+        banner(paint, "31", &format!("Running {} failed", title.text))
+    };
+    let mut lines = vec![String::new()];
+    if !skipped.is_empty() {
+        lines.push(paint.dim("Tasks not run because their dependencies failed:"));
+        lines.push(String::new());
+        lines.extend(skipped.iter().map(|id| format!("{} {id}", paint.dim("-"))));
+        lines.push(String::new());
+    }
+    if !failed.is_empty() {
+        lines.push(paint.dim("Failed tasks:"));
+        lines.push(String::new());
+        lines.extend(failed.iter().map(|id| {
+            let code = match result.outcomes.get(*id) {
+                Some(qk_executor::Outcome::Failed(code)) => format!(" (exit {code})"),
+                Some(qk_executor::Outcome::Cancelled) => " (cancelled)".to_owned(),
+                _ => String::new(),
+            };
+            format!("{} {id}{}", paint.dim("-"), paint.dim(&code))
+        }));
+        lines.push(String::new());
+    }
+    lines.push(paint.dim(&format!(
+        "{total} task{} in {}: {cached} from cache, {} ran",
+        if total == 1 { "" } else { "s" },
+        seconds(wall),
+        total - cached - skipped.len() - failed.len(),
+    )));
+    lines.extend(details(result, report, parallel, cores, &[], paint));
+    text.push_str(&lines.join("\n"));
+    text.push('\n');
+    text
 }
 
 /// The warnings a sink kept for the summary.
 pub fn warnings(sink: &SinkKind) -> Vec<String> {
     match sink {
-        SinkKind::Lines => Vec::new(),
+        SinkKind::Lines | SinkKind::Static => Vec::new(),
         SinkKind::Quiet(quiet) => quiet.warnings.0.lock().unwrap().clone(),
         SinkKind::Dynamic(dynamic) => dynamic.warnings.0.lock().unwrap().clone(),
     }
@@ -679,6 +874,7 @@ pub fn warnings(sink: &SinkKind) -> Vec<String> {
 /// The sink the CLI installed, kept to finish it and read its warnings.
 pub enum SinkKind {
     Lines,
+    Static,
     Quiet(Arc<Quiet>),
     Dynamic(Arc<Dynamic>),
 }
