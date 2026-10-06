@@ -185,16 +185,15 @@ fn summary(inputs: &Value) -> Vec<String> {
     lines
 }
 
-/// Inputs with env values replaced by their digest: they can hold
-/// credentials, and a digest still tells two values apart.
+/// Inputs with env values left out: they can hold credentials, and even a
+/// digest of one can be matched against guesses. An unset variable stays
+/// `null`; `differences` already names the values that differ.
 fn redacted(inputs: &Value) -> Value {
     let mut inputs = inputs.clone();
     if let Some(values) = inputs.get_mut("values").and_then(Value::as_object_mut) {
         for (name, value) in values.iter_mut() {
-            if name.starts_with("env:")
-                && let Some(text) = value.as_str()
-            {
-                *value = json!({"blake3": blake3::hash(text.as_bytes()).to_hex().to_string()});
+            if name.starts_with("env:") && value.is_string() {
+                *value = json!("<redacted>");
             }
         }
     }

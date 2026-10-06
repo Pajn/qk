@@ -215,7 +215,7 @@ not match. `--json` returns each query and its membership result.
 cache the task under now, without running the task, and a summary of what the
 key covers: the declared inputs, file count, env and runtime values,
 dependencies and tooling. `--json` prints the key and everything it is computed
-from, with env values replaced by their digest. Arguments after `--` are
+from, with set env values shown as `"<redacted>"` and unset ones as `null`. Arguments after `--` are
 forwarded as `qk run` forwards them, to both tasks with `--against <task>`. A target name without a project uses the
 current project.
 
