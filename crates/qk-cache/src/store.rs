@@ -305,15 +305,16 @@ impl Cache {
         qk_executor::read_capture(File::open(&log)?, |_, _| Ok(()))?;
         drop(log_profile);
         let started = SystemTime::now();
-        // Outputs this worktree already holds for the key are left as they
-        // are; when a stamp fails, they are restored anew.
+        // A stamp mismatch can be an identical rewrite by another runner.
+        // Verify changed artifacts before replacing outputs we already hold.
         let held_profile = crate::profile::span(task, "restore_held_outputs");
-        if outputs_unchanged(root, task, key, outputs) {
+        if let Some(revalidated) = outputs_held(root, task, key, outputs, &manifest) {
             let changed = {
                 let kept = self.kept.lock().unwrap();
-                dependencies
-                    .iter()
-                    .any(|dependency| !kept.contains(dependency))
+                revalidated
+                    || dependencies
+                        .iter()
+                        .any(|dependency| !kept.contains(dependency))
             };
             if !changed || stamp_outputs(root, outputs, started).is_ok() {
                 if changed {
@@ -706,27 +707,224 @@ pub(crate) fn record_outputs(root: &Path, task: &str, key: &str, outputs: &Outpu
     }
 }
 
-/// Whether the outputs on disk are exactly those this worktree recorded for
-/// the key: the same paths, none written since.
-fn outputs_unchanged(root: &Path, task: &str, key: &str, outputs: &Outputs) -> bool {
-    let Ok(text) = fs::read(outputs_record(root, task)) else {
-        return false;
-    };
-    let Ok(record) = serde_json::from_slice::<OutputRecord>(&text) else {
-        return false;
-    };
+/// Held outputs, with `true` when changed stamps were revalidated and need
+/// fresh timestamps before timestamp-sensitive dependents can use them.
+fn outputs_held(
+    root: &Path,
+    task: &str,
+    key: &str,
+    outputs: &Outputs,
+    manifest: &ResultRecord,
+) -> Option<bool> {
+    let text = fs::read(outputs_record(root, task)).ok()?;
+    let record: OutputRecord = serde_json::from_slice(&text).ok()?;
     if record.key != key {
-        return false;
+        return None;
     }
-    let Ok(current) = output_stamps(root, outputs) else {
-        return false;
-    };
-    current == record.outputs
+    let current = output_stamps(root, outputs).ok()?;
+    if current == record.outputs {
+        return Some(false);
+    }
+    let verification = crate::profile::span(task, "restore_revalidate_outputs");
+    if !current.keys().eq(record.outputs.keys()) || !current.keys().eq(manifest.artifacts.keys()) {
+        return None;
+    }
+    let mut checked_parents = BTreeSet::new();
+    for (path, artifact) in &manifest.artifacts {
+        if !outputs.matches(path) {
+            return None;
+        }
+        if checked_parents.insert(Path::new(path).parent()?) {
+            paths::safe_parents(root, path).ok()?;
+        }
+        let stamp = &current[path];
+        if record.outputs.get(path) == Some(stamp) {
+            continue;
+        }
+        let absolute = root.join(path);
+        let matches = match artifact {
+            Artifact::File { blob, mode } => {
+                stamp[0] == 0
+                    && stamp[3] == i64::from(*mode)
+                    && fs::symlink_metadata(&absolute).ok()?.is_file()
+                    && digest_file(&absolute).ok()? == *blob
+            }
+            Artifact::Directory { mode } => stamp[0] == 1 && stamp[3] == i64::from(*mode),
+            Artifact::Symlink { target, directory } => {
+                validate_link(path, target).ok()?;
+                stamp[0] == 2
+                    && fs::read_link(&absolute).ok()? == Path::new(target)
+                    && (!cfg!(windows) || absolute.is_dir() == *directory)
+            }
+        };
+        if !matches {
+            return None;
+        }
+    }
+    // Do not bless an artifact changed while its content was being checked.
+    if output_stamps(root, outputs).ok()? != current {
+        return None;
+    }
+    drop(verification);
+    Some(true)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identical_rewrites_are_verified_and_kept_with_fresh_timestamps() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("out/empty")).unwrap();
+        let file = root.join("out/value");
+        fs::write(&file, "original").unwrap();
+        let log = root.join("log");
+        fs::write(&log, "").unwrap();
+        let cache = Cache::new(root.join("cache"));
+        cache.initialize().unwrap();
+        let outputs = Outputs::from_patterns(&["out"]);
+        let key = "d".repeat(64);
+        let fingerprint = cache.publish(root, &key, &outputs, &log).unwrap();
+        record_outputs(root, "build", &key, &outputs);
+        fs::write(&file, "original").unwrap();
+        set_modified(&file, SystemTime::UNIX_EPOCH + Duration::from_secs(100)).unwrap();
+        #[cfg(unix)]
+        let inode = {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(&file).unwrap().ino()
+        };
+        let before = SystemTime::now();
+        assert_eq!(
+            cache
+                .restore(
+                    root,
+                    "build",
+                    &Default::default(),
+                    &key,
+                    &outputs,
+                    &qk_executor::Display::Hidden,
+                    qk_executor::Shown::LocalCache
+                )
+                .unwrap(),
+            Some(fingerprint)
+        );
+        assert!(fs::metadata(&file).unwrap().modified().unwrap() >= before);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(fs::metadata(&file).unwrap().ino(), inode);
+        }
+        let manifest = ResultRecord::read(
+            &fs::read(cache.root.join("entries").join(format!("{key}.json"))).unwrap(),
+            &key,
+        )
+        .unwrap();
+        assert_eq!(
+            outputs_held(root, "build", &key, &outputs, &manifest),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn revalidation_rejects_changed_contents_and_output_sets() {
+        for change in ["contents", "extra", "missing", "kind", "empty-directory"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            fs::create_dir_all(root.join("out/empty")).unwrap();
+            fs::write(root.join("out/value"), "original").unwrap();
+            let log = root.join("log");
+            fs::write(&log, "").unwrap();
+            let cache = Cache::new(root.join("cache"));
+            cache.initialize().unwrap();
+            let outputs = Outputs::from_patterns(&["out"]);
+            let key = "e".repeat(64);
+            cache.publish(root, &key, &outputs, &log).unwrap();
+            record_outputs(root, "build", &key, &outputs);
+            match change {
+                "contents" => {
+                    let modified = fs::metadata(root.join("out/value"))
+                        .unwrap()
+                        .modified()
+                        .unwrap();
+                    fs::write(root.join("out/value"), "modified").unwrap();
+                    #[cfg(unix)]
+                    set_modified(&root.join("out/value"), modified).unwrap();
+                    #[cfg(not(unix))]
+                    let _ = modified;
+                }
+                "extra" => fs::write(root.join("out/extra"), "extra").unwrap(),
+                "missing" => fs::remove_file(root.join("out/value")).unwrap(),
+                "kind" => {
+                    fs::remove_file(root.join("out/value")).unwrap();
+                    fs::create_dir(root.join("out/value")).unwrap();
+                }
+                "empty-directory" => fs::remove_dir(root.join("out/empty")).unwrap(),
+                _ => unreachable!(),
+            }
+            let manifest = ResultRecord::read(
+                &fs::read(cache.root.join("entries").join(format!("{key}.json"))).unwrap(),
+                &key,
+            )
+            .unwrap();
+            assert_eq!(
+                outputs_held(root, "build", &key, &outputs, &manifest),
+                None,
+                "{change}"
+            );
+            cache
+                .restore(
+                    root,
+                    "build",
+                    &Default::default(),
+                    &key,
+                    &outputs,
+                    &qk_executor::Display::Hidden,
+                    qk_executor::Shown::LocalCache,
+                )
+                .unwrap();
+            assert_eq!(fs::read(root.join("out/value")).unwrap(), b"original");
+            assert!(root.join("out/empty").is_dir());
+            assert!(!root.join("out/extra").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn revalidation_checks_modes_and_symlink_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir(root.join("out")).unwrap();
+        fs::write(root.join("out/value"), "original").unwrap();
+        symlink("value", &root.join("out/link"), false).unwrap();
+        let log = root.join("log");
+        fs::write(&log, "").unwrap();
+        let cache = Cache::new(root.join("cache"));
+        cache.initialize().unwrap();
+        let outputs = Outputs::from_patterns(&["out"]);
+        let key = "f".repeat(64);
+        cache.publish(root, &key, &outputs, &log).unwrap();
+        record_outputs(root, "build", &key, &outputs);
+        let manifest = ResultRecord::read(
+            &fs::read(cache.root.join("entries").join(format!("{key}.json"))).unwrap(),
+            &key,
+        )
+        .unwrap();
+        let original_mode = mode(&fs::metadata(root.join("out/value")).unwrap());
+        set_mode(&root.join("out/value"), original_mode ^ 0o100).unwrap();
+        assert_eq!(outputs_held(root, "build", &key, &outputs, &manifest), None);
+        set_mode(&root.join("out/value"), original_mode).unwrap();
+        fs::remove_file(root.join("out/link")).unwrap();
+        symlink("value", &root.join("out/link"), false).unwrap();
+        assert_eq!(
+            outputs_held(root, "build", &key, &outputs, &manifest),
+            Some(true)
+        );
+        fs::remove_file(root.join("out/link")).unwrap();
+        symlink("other", &root.join("out/link"), false).unwrap();
+        assert_eq!(outputs_held(root, "build", &key, &outputs, &manifest), None);
+    }
 
     #[test]
     fn small_snapshot_rejects_growth_without_reading_the_entire_stream() {
