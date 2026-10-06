@@ -408,6 +408,7 @@ fn callbacks(
                 commands: vec![command.to_owned()],
                 cwd: cwd.to_owned(),
                 runtime_env: env.clone(),
+                node_path: None,
                 env,
                 execution: BTreeMap::new(),
                 parallel: false,

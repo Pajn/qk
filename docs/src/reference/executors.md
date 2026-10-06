@@ -1,8 +1,15 @@
 # Executors
 
 qk executes commands through `/bin/sh -c` on Unix and `cmd.exe /D /S /C`
-on Windows. Local `node_modules/.bin` directories from cwd to the workspace
-root are added to `PATH`. Unsupported executors fail before tasks start.
+on Windows. Task `PATH` starts with `node_modules/.bin` directories from cwd
+through every ancestor to the filesystem root, then the selected Node runtime's
+directory, then the task's environment `PATH`. Node is selected from qk's inherited
+`PATH` in the workspace root before task environment or cwd overrides, as in Nx.
+Version-manager proxies are probed when a command first starts, with a two-second limit.
+Cache hits do not probe Node. A failed probe of the first executable Node match
+does not promote a later installation from the inherited `PATH`; executable
+lookup continues through the task's `PATH` without adding a runtime directory.
+Unsupported executors fail before tasks start.
 
 ## `nx:run-commands`
 

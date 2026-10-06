@@ -236,6 +236,11 @@ fn spawn(
         } else {
             Stdio::inherit()
         });
+    if let Some(node) = &task.node_path
+        && let Some((key, path)) = node.path(&task.env)?
+    {
+        command.env(key, path);
+    }
     // Re-entered exec inherits confinement. Override any caller-supplied
     // marker so an unsandboxed task cannot accidentally claim confinement.
     command.env_remove("QK_TASK_SANDBOX");
