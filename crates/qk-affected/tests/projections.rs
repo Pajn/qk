@@ -147,7 +147,7 @@ impl Repo {
         write(
             &root,
             "nx.json",
-            &json!({"affectedProfiles":{"runtime":{"projections":[rule]}}}).to_string(),
+            &json!({"qk:affectedProfiles":{"runtime":{"projections":[rule]}}}).to_string(),
         );
         write(&root, "schemas/project.json", r#"{"name":"schema"}"#);
         for name in ["app", "other"] {
@@ -335,12 +335,65 @@ fn unsupported_comparisons_and_changed_tool_metadata_remain_conservative() {
 }
 
 #[test]
+fn legacy_profile_key_remains_compatible() {
+    let mut repo = Repo::new("ok");
+    let mut config: Value =
+        serde_json::from_slice(&std::fs::read(repo.root.join("nx.json")).unwrap()).unwrap();
+    let profiles = config
+        .as_object_mut()
+        .unwrap()
+        .remove("qk:affectedProfiles")
+        .unwrap();
+    config["affectedProfiles"] = profiles;
+    write(&repo.root, "nx.json", &config.to_string());
+    repo.base = commit(&repo.root);
+    let head = repo.changed("app=one\nother=two\ntype=after");
+    let analysis = repo.analyse(Some(head), true);
+    assert_eq!(analysis.projections[0].status, "applied");
+    assert!(analysis.projects.is_empty());
+}
+
+#[test]
+fn canonical_and_legacy_profile_keys_cannot_coexist() {
+    let repo = Repo::new("ok");
+    let head = repo.changed("app=one\nother=two\ntype=after");
+    let config: Value =
+        serde_json::from_slice(&std::fs::read(repo.root.join("nx.json")).unwrap()).unwrap();
+    // Even identical definitions are ambiguous; local overrides must not
+    // accidentally leave both key spellings active in the merged configuration.
+    write(
+        &repo.root,
+        "nx.local.json",
+        &json!({"affectedProfiles":config["qk:affectedProfiles"]}).to_string(),
+    );
+    let workspace = Workspace::load(&repo.root).unwrap();
+    let graph = ProjectGraph::build(&workspace).unwrap();
+    let error = analyse(
+        &workspace,
+        &graph,
+        &Options {
+            base: Some(repo.base),
+            head: Some(head),
+            affected_profile: Some("runtime".into()),
+            ..Options::default()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("configure only qk:affectedProfiles"),
+        "{error}"
+    );
+}
+
+#[test]
 fn invalid_profiles_are_configuration_errors() {
     let repo = Repo::new("ok");
     let head = repo.changed("app=one\nother=two\ntype=after");
     let mut config: Value =
         serde_json::from_slice(&std::fs::read(repo.root.join("nx.json")).unwrap()).unwrap();
-    config["affectedProfiles"]["runtime"]["projections"][0]["sources"] = json!(["../outside"]);
+    config["qk:affectedProfiles"]["runtime"]["projections"][0]["sources"] = json!(["../outside"]);
     write(&repo.root, "nx.json", &config.to_string());
     let workspace = Workspace::load(&repo.root).unwrap();
     let graph = ProjectGraph::build(&workspace).unwrap();
@@ -405,7 +458,7 @@ fn a_later_projection_failure_rolls_back_the_whole_profile() {
     let mut repo = Repo::new("ok");
     let mut config: Value =
         serde_json::from_slice(&std::fs::read(repo.root.join("nx.json")).unwrap()).unwrap();
-    config["affectedProfiles"]["runtime"]["projections"].as_array_mut().unwrap().push(json!({
+    config["qk:affectedProfiles"]["runtime"]["projections"].as_array_mut().unwrap().push(json!({
         "name":"second", "command":[adapter(),"fail","{revisionRoot}"], "sources":["second/**"], "outputs":["second/generated/**"]
     }));
     write(&repo.root, "nx.json", &config.to_string());
@@ -456,7 +509,7 @@ fn adapter_descendants_are_stopped_on_success_failure_and_timeout() {
         let log = logs.path().join("pids");
         let mut config: Value =
             serde_json::from_slice(&std::fs::read(repo.root.join("nx.json")).unwrap()).unwrap();
-        config["affectedProfiles"]["runtime"]["projections"][0]["command"]
+        config["qk:affectedProfiles"]["runtime"]["projections"][0]["command"]
             .as_array_mut()
             .unwrap()
             .insert(2, json!(log));
@@ -498,7 +551,7 @@ fn both_snapshots_use_committed_head_adapter_even_when_workspace_adapter_is_dirt
     let mut repo = Repo::new("ok");
     let mut config: Value =
         serde_json::from_slice(&std::fs::read(repo.root.join("nx.json")).unwrap()).unwrap();
-    config["affectedProfiles"]["runtime"]["projections"][0]["command"] =
+    config["qk:affectedProfiles"]["runtime"]["projections"][0]["command"] =
         json!(["git", "show", "HEAD:adapter-manifest.json"]);
     write(&repo.root, "nx.json", &config.to_string());
     write(
@@ -543,7 +596,7 @@ fn ignored_local_overrides_apply_to_both_snapshots_but_tracked_overrides_remain_
     write(
         &repo.root,
         "nx.local.json",
-        &json!({"affectedProfiles":{"local":{"projections":[{
+        &json!({"qk:affectedProfiles":{"local":{"projections":[{
             "name":"local-runtime", "command":[adapter(),"ok","{revisionRoot}"],
             "sources":["schemas/**"], "outputs":["apps/*/generated/**"]
         }]}}})

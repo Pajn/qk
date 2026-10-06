@@ -887,7 +887,7 @@ fn affected_profile_lists_projects_explains_projection_and_rejects_task_selectio
         );
     };
     for (path, content) in [
-        ("nx.json", json!({"affectedProfiles":{"runtime":{"projections":[{"name":"runtime","command":["git","-C","{revisionRoot}","show","HEAD:manifest.json"],"sources":["schemas/**"],"outputs":["apps/app/generated/**"],"timeoutSeconds":if cfg!(unix) { 3 } else { 60 }}]}}}).to_string()),
+        ("nx.json", json!({"qk:affectedProfiles":{"runtime":{"projections":[{"name":"runtime","command":["git","-C","{revisionRoot}","show","HEAD:manifest.json"],"sources":["schemas/**"],"outputs":["apps/app/generated/**"],"timeoutSeconds":if cfg!(unix) { 3 } else { 60 }}]}}}).to_string()),
         ("schemas/project.json", json!({"name":"schema"}).to_string()),
         ("schemas/schema.txt", "before".into()),
         ("apps/app/project.json", json!({"name":"app","implicitDependencies":["schema"],"targets":{"build":{"command":"echo build"}}}).to_string()),

@@ -132,10 +132,14 @@ pub(super) fn apply(
     changes: &Changes<'_>,
     name: &str,
 ) -> Result<(Vec<String>, Vec<ProjectionReport>)> {
-    let value = workspace
-        .config
-        .extra
-        .get("affectedProfiles")
+    let canonical = workspace.config.extra.get("qk:affectedProfiles");
+    let legacy = workspace.config.extra.get("affectedProfiles");
+    ensure!(
+        canonical.is_none() || legacy.is_none(),
+        "configure only qk:affectedProfiles; affectedProfiles is a compatibility alias and cannot be used alongside it"
+    );
+    let value = canonical
+        .or(legacy)
         .and_then(|profiles| profiles.get(name))
         .with_context(|| format!("unknown affected profile {name:?}"))?;
     let profile: Profile = serde_json::from_value(value.clone())

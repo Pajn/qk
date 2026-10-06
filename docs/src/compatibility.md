@@ -33,8 +33,8 @@ When a name occurs in multiple sections, precedence is `dependencies`,
 - `readyWhen` accepts readiness text from either stdout or stderr.
 - `exec --exclude-task-dependencies` runs the command in the selected
   projects; Nx's leaves every project out and runs nothing.
-- `project.local.json`, `nx.local.json`, `qk:threads` and `qk:warm` are qk
-  extensions. Nx does not apply them.
+- `project.local.json`, `nx.local.json`, `qk:threads`, `qk:warm` and
+  `qk:affectedProfiles` are qk extensions. Nx does not apply them.
 - Input negated-group exclusions apply to the pattern they came from in qk;
   Nx applies them across a project's patterns. qk can include extra inputs.
 - For affected-project selection, bare parenthesized extension groups such

@@ -69,11 +69,13 @@ A revision string for affected selection and remote warm state's default
 branch. The fallback is `main`. Affected selection resolves `--base`, then
 `NX_BASE`, then this setting. See [Affected selection](../guides/affected.md).
 
-## `affectedProfiles`
+## `qk:affectedProfiles`
 
 Named, opt-in project change projections. Each profile contains a `projections`
 array of adapters with `name`, `command`, `sources`, `outputs` and optional
-`timeoutSeconds`. Select a profile with `--affected-profile <name>`.
+`timeoutSeconds`. The unprefixed `affectedProfiles` key remains a compatibility
+alias; selecting a profile rejects configuration containing both keys.
+Select a profile with `--affected-profile <name>`.
 See [Project change projections](../guides/affected-projections.md) for the
 protocol, configuration example, tool setup and conservative fallback rules.
 

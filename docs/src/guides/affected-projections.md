@@ -25,11 +25,16 @@ a named change projection.
 
 ## Configure a profile
 
-Add `affectedProfiles` to `nx.json`:
+Add `qk:affectedProfiles` to `nx.json`. The unprefixed `affectedProfiles` key
+from qk 0.3.0 remains a compatibility alias. When selecting a profile, qk
+rejects configurations containing both keys, including keys combined from
+`nx.json` and `nx.local.json`.
+
+For example:
 
 ```json
 {
-  "affectedProfiles": {
+  "qk:affectedProfiles": {
     "runtime": {
       "projections": [
         {
