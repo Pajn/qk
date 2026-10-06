@@ -57,8 +57,11 @@ pub fn show(
         None => None,
         Some(Against::Task(request)) => Some(key_now(workspace, request)?),
         Some(Against::Run(run)) => {
-            let Some((key, inputs)) = crate::history::open(workspace)?.key(&run, &this.task)?
-            else {
+            let history = crate::history::open(workspace)?;
+            let Some((key, inputs)) = history.key(&run, &this.task)? else {
+                if history.run(Some(&run))?.is_none() {
+                    bail!("unknown run {run}");
+                }
                 bail!("run {run} did not key {}", this.task);
             };
             Some(Keyed {

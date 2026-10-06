@@ -4395,6 +4395,16 @@ fn show_hash_keys_a_task_as_a_run_would_and_compares_keys() {
     assert!(text.contains("keys differ in: files"), "{text}");
     assert!(text.contains("changed src/input.txt"), "{text}");
 
+    let failure = |args: &[&str]| {
+        let output = fixture.qk(&fixture.root, args);
+        assert!(!output.status.success());
+        stderr(&output)
+    };
+    let error = failure(&["show", "hash", "app:build", "--against", "0-0"]);
+    assert!(error.contains("unknown run 0-0"), "{error}");
+    let error = failure(&["show", "hash", "app:narrow", "--against", run]);
+    assert!(error.contains("did not key app:narrow"), "{error}");
+
     let text = qk(&["show", "hash", "app:build", "--against", "app:narrow"]);
     assert!(
         text.contains(r#"field definition.inputs[0]: "{projectRoot}/src/input.txt" -> "{projectRoot}/src/**/*""#),
