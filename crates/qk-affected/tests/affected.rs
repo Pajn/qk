@@ -817,6 +817,37 @@ fn versions_crossing_a_dependents_range_affect_its_tasks() {
     );
 }
 
+/// As in Nx, the root manifest is not an input of every task: editing its
+/// scripts affects no task outside the root project.
+#[test]
+fn root_manifest_scripts_affect_no_other_projects_tasks() {
+    let repo = Repo::new(&[
+        (
+            "nx.json",
+            r#"{"targetDefaults": {"build": {"command": "echo build", "inputs": ["{projectRoot}/src/**/*"]},
+                                   "test": {"command": "echo test", "inputs": ["{projectRoot}/src/**/*"]}}}"#,
+        ),
+        (
+            "package.json",
+            r#"{"name": "root", "scripts": {"lint": "echo one"}}"#,
+        ),
+        (
+            "apps/app/project.json",
+            r#"{"name": "app", "implicitDependencies": ["lib"], "targets": {"build": {}, "test": {}}}"#,
+        ),
+        (
+            "libs/lib/project.json",
+            r#"{"name": "lib", "targets": {"build": {}, "test": {}}}"#,
+        ),
+    ]);
+    write(
+        &repo.root,
+        "package.json",
+        r#"{"name": "root", "scripts": {"lint": "echo two"}}"#,
+    );
+    assert!(affected_tasks(&repo).is_empty());
+}
+
 /// Changed output candidates remain inputs of consumers, never of their producer.
 #[test]
 fn changed_declared_outputs_only_affect_tasks_that_consume_them() {

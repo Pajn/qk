@@ -33,10 +33,13 @@ one without declared outputs is fingerprinted by its key. Files are keyed
 by workspace-relative path, content and mode. Branch names and checkout
 locations are not part of the key, so identical sources in two worktrees
 share entries. Root workspace files (the root `tsconfig.base.json` or
-`tsconfig.json`, `nx.json`, `.gitignore`, `.nxignore`, `package.json`, `pnpm-workspace.yaml`,
+`tsconfig.json`, `nx.json`, `.gitignore`, `.nxignore`, `pnpm-workspace.yaml`,
 lockfiles) and the manifests of the task's project (`project.json`,
 `project.local.json` and `package.json`) are always included, its scripts and
-dependency declarations with them. Dotenv files are not, as in Nx: they hold
+dependency declarations with them. The root `package.json` is not, as in Nx:
+what the root importer installs counts for every task through the lockfile, as
+below, and the rest of it is the root project's own manifest, so editing a root
+script misses only the root project's tasks. Dotenv files are not, as in Nx: they hold
 per-machine values and credentials, so keying them would keep machines from
 sharing entries; `env` inputs key the variables a task declares.
 
