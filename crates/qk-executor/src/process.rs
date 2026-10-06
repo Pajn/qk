@@ -1,6 +1,6 @@
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use command_group::{CommandGroup, GroupChild};
@@ -80,6 +80,7 @@ pub fn execute_captured(
         let outcome = (|| {
             let mut pending = task.commands.iter().enumerate();
             let mut children = Children(Vec::new());
+            let mut launched = Instant::now();
             loop {
                 if cancelled.load(Ordering::SeqCst) {
                     children.terminate();
@@ -102,6 +103,7 @@ pub fn execute_captured(
                                 .push(scope.spawn(move || capture.copy(stderr, true, decoration)));
                         }
                         children.0.push(child);
+                        launched = Instant::now();
                         if !task.parallel {
                             break;
                         }
@@ -138,7 +140,14 @@ pub fn execute_captured(
                     }
                 }
                 if !children.0.is_empty() {
-                    std::thread::sleep(Duration::from_millis(20));
+                    // Short commands should not pay a scheduler tick at every
+                    // task boundary. Long builds retain the low polling rate.
+                    let interval = if launched.elapsed() < Duration::from_millis(250) {
+                        1
+                    } else {
+                        20
+                    };
+                    std::thread::sleep(Duration::from_millis(interval));
                 }
             }
         })();
