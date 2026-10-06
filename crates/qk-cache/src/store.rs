@@ -16,6 +16,105 @@ use crate::{
     record::{self, Artifact, ResultRecord, valid_hash, validate_link},
 };
 
+pub(crate) struct Cleanup {
+    sender: Option<std::sync::mpsc::Sender<tempfile::TempDir>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Cleanup {
+    fn new() -> Self {
+        let (sender, receiver) = std::sync::mpsc::channel::<tempfile::TempDir>();
+        let worker = std::thread::spawn(move || {
+            for stage in receiver {
+                let _profile = crate::profile::span("cache", "restore_retired_cleanup");
+                let path = stage.path().to_owned();
+                if let Err(error) = remove_retired(stage) {
+                    qk_executor::status!(
+                        "qk: retired output cleanup failed for {}: {error}",
+                        path.display()
+                    );
+                }
+            }
+        });
+        Self {
+            sender: Some(sender),
+            worker: Some(worker),
+        }
+    }
+
+    fn retire(&self, stage: tempfile::TempDir) {
+        // A stopped worker returns ownership; dropping the stage cleans it here.
+        let _ = self.sender.as_ref().unwrap().send(stage);
+    }
+}
+
+struct RestoreStage<'a> {
+    cache: &'a Cache,
+    directory: Option<tempfile::TempDir>,
+    exchanged: bool,
+}
+
+impl<'a> RestoreStage<'a> {
+    fn new(cache: &'a Cache, directory: tempfile::TempDir) -> Self {
+        Self {
+            cache,
+            directory: Some(directory),
+            exchanged: false,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        self.directory.as_ref().unwrap().path()
+    }
+
+    fn retire(&mut self) {
+        if self.exchanged {
+            self.cache
+                .cleanup
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get_or_insert_with(Cleanup::new)
+                .retire(self.directory.take().unwrap());
+            self.exchanged = false;
+        }
+    }
+}
+
+impl Drop for RestoreStage<'_> {
+    fn drop(&mut self) {
+        self.retire();
+    }
+}
+
+fn remove_retired(stage: tempfile::TempDir) -> Result<()> {
+    let path = stage.path().to_owned();
+    match stage.close() {
+        Ok(()) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+        Err(error) => return Err(error.into()),
+    }
+    // Restrictive output modes belong to the live tree. Only this private,
+    // retired copy may be made writable to finish removing it.
+    for entry in walkdir::WalkDir::new(&path).follow_links(false) {
+        let entry = entry?;
+        if entry.file_type().is_dir() {
+            let metadata = entry.metadata()?;
+            set_mode(entry.path(), mode(&metadata) | 0o700)?;
+        }
+    }
+    fs::remove_dir_all(path)?;
+    Ok(())
+}
+
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
 pub(crate) fn mode(metadata: &fs::Metadata) -> u32 {
     #[cfg(unix)]
     {
@@ -335,6 +434,7 @@ impl Cache {
         let stage = tempfile::Builder::new()
             .prefix("restore-")
             .tempdir_in(stage_parent)?;
+        let mut stage = RestoreStage::new(self, stage);
         let mut staging = StagingDirectories::new(stage.path());
         let mut files = Vec::new();
         for (path, artifact) in &manifest.artifacts {
@@ -372,8 +472,21 @@ impl Cache {
             paths::safe_parents(root, path)?;
         }
         drop(selection_profile);
+        let exchange_profile = crate::profile::span(task, "restore_exchange");
+        let mut promoted = BTreeSet::new();
+        for path in &complete {
+            paths::safe_parents(root, path)?;
+            if exchange_directory(&stage.path().join(path), &root.join(path))? {
+                stage.exchanged = true;
+                promoted.insert(path.clone());
+            }
+        }
+        drop(exchange_profile);
         let cleanup_profile = crate::profile::span(task, "restore_cleanup");
         for path in current.iter().rev() {
+            if covered_by(path, &promoted) {
+                continue;
+            }
             let absolute = root.join(path);
             let metadata = fs::symlink_metadata(&absolute)?;
             if metadata.is_dir() && !metadata.file_type().is_symlink() {
@@ -397,8 +510,10 @@ impl Cache {
         }
         drop(cleanup_profile);
         let promotion_profile = crate::profile::span(task, "restore_promote");
-        let mut promoted = BTreeSet::new();
         for path in complete {
+            if promoted.contains(&path) {
+                continue;
+            }
             paths::safe_parents(root, &path)?;
             let destination = root.join(&path);
             fs::create_dir_all(destination.parent().context("output has no parent")?)?;
@@ -407,12 +522,7 @@ impl Cache {
             }
         }
         for (path, artifact) in &manifest.artifacts {
-            if promoted.iter().any(|parent| {
-                path == parent
-                    || path
-                        .strip_prefix(parent)
-                        .is_some_and(|suffix| suffix.starts_with('/'))
-            }) {
+            if covered_by(path, &promoted) {
                 continue;
             }
             paths::safe_parents(root, path)?;
@@ -432,6 +542,7 @@ impl Cache {
             }
         }
         drop(mode_profile);
+        stage.retire();
         let record_profile = crate::profile::span(task, "restore_record_outputs");
         record_outputs(root, task, key, outputs);
         drop(record_profile);
@@ -475,6 +586,46 @@ impl Cache {
             }
             Ok(())
         })
+    }
+}
+
+fn covered_by(path: &str, roots: &BTreeSet<String>) -> bool {
+    roots.iter().any(|parent| {
+        path == parent
+            || path
+                .strip_prefix(parent)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+    })
+}
+
+fn exchange_directory(staged: &Path, destination: &Path) -> Result<bool> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let metadata = match fs::symlink_metadata(destination) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Ok(false);
+        }
+        use rustix::fs::{CWD, RenameFlags, renameat_with};
+        match renameat_with(CWD, staged, CWD, destination, RenameFlags::EXCHANGE) {
+            Ok(()) => Ok(true),
+            Err(
+                rustix::io::Errno::XDEV
+                | rustix::io::Errno::NOSYS
+                | rustix::io::Errno::INVAL
+                | rustix::io::Errno::OPNOTSUPP
+                | rustix::io::Errno::NOENT,
+            ) => Ok(false),
+            Err(error) => Err(std::io::Error::from(error).into()),
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (staged, destination);
+        Ok(false)
     }
 }
 
@@ -772,6 +923,187 @@ fn outputs_held(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn exchanged_outputs_are_ready_while_retired_tree_waits_for_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("out/nested")).unwrap();
+        fs::write(root.join("out/nested/value"), "cached").unwrap();
+        let log = root.join("log");
+        fs::write(&log, "").unwrap();
+        let cache = Cache::new(root.join("cache"));
+        cache.initialize().unwrap();
+        let outputs = Outputs::from_patterns(&["out"]);
+        let key = "c".repeat(64);
+        let fingerprint = cache.publish(root, &key, &outputs, &log).unwrap();
+        fs::write(root.join("out/nested/value"), "old").unwrap();
+        fs::write(root.join("outside"), "keep").unwrap();
+        symlink("../outside", &root.join("out/stale-link"), false).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel::<tempfile::TempDir>();
+        let (seen, observed) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let stage = receiver.recv().unwrap();
+            seen.send(stage.path().to_owned()).unwrap();
+            wait.recv().unwrap();
+            stage.close().unwrap();
+        });
+        *cache.cleanup.lock().unwrap() = Some(Cleanup {
+            sender: Some(sender),
+            worker: Some(worker),
+        });
+        assert_eq!(
+            cache
+                .restore(
+                    root,
+                    "build",
+                    &Default::default(),
+                    &key,
+                    &outputs,
+                    &qk_executor::Display::Hidden,
+                    qk_executor::Shown::LocalCache
+                )
+                .unwrap(),
+            Some(fingerprint)
+        );
+        let retired = observed.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("out/nested/value")).unwrap(),
+            "cached"
+        );
+        assert!(!root.join("out/stale-link").exists());
+        assert_eq!(
+            fs::read_to_string(retired.join("out/nested/value")).unwrap(),
+            "old"
+        );
+        release.send(()).unwrap();
+        cache.cleanup.lock().unwrap().take();
+        assert!(!retired.exists());
+        assert_eq!(fs::read_to_string(root.join("outside")).unwrap(), "keep");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_later_exchange_error_retires_readonly_outputs_without_changing_the_error() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("out/nested")).unwrap();
+        fs::create_dir_all(root.join("parent/later")).unwrap();
+        fs::write(root.join("out/nested/value"), "cached").unwrap();
+        fs::write(root.join("parent/later/value"), "cached-later").unwrap();
+        set_mode(&root.join("out/nested"), 0o500).unwrap();
+        let log = root.join("log");
+        fs::write(&log, "").unwrap();
+        let cache = Cache::new(root.join("cache"));
+        cache.initialize().unwrap();
+        let outputs = Outputs::from_patterns(&["out", "parent/later"]);
+        let key = "d".repeat(64);
+        cache.publish(root, &key, &outputs, &log).unwrap();
+        fs::write(root.join("out/nested/value"), "old").unwrap();
+        fs::write(root.join("parent/later/value"), "old-later").unwrap();
+        fs::write(root.join("out/stale"), "stale").unwrap();
+        set_mode(&root.join("parent"), 0o500).unwrap();
+        let result = cache.restore(
+            root,
+            "build",
+            &Default::default(),
+            &key,
+            &outputs,
+            &qk_executor::Display::Hidden,
+            qk_executor::Shown::LocalCache,
+        );
+        set_mode(&root.join("parent"), 0o700).unwrap();
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let live_mode = mode(&fs::metadata(root.join("out/nested")).unwrap());
+        cache.cleanup.lock().unwrap().take();
+        assert_eq!(
+            fs::read_to_string(root.join("out/nested/value")).unwrap(),
+            "cached"
+        );
+        assert!(!root.join("out/stale").exists());
+        assert_eq!(
+            fs::read_to_string(root.join("parent/later/value")).unwrap(),
+            "old-later"
+        );
+        assert_eq!(
+            mode(&fs::metadata(root.join("out/nested")).unwrap()),
+            live_mode
+        );
+        assert_eq!(
+            fs::read_dir(paths::worktree_state(root).join("restore"))
+                .unwrap()
+                .count(),
+            0
+        );
+        set_mode(&root.join("out/nested"), 0o700).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn directory_exchange_does_not_replace_files_links_or_absent_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let staged = temp.path().join("staged");
+        fs::create_dir(&staged).unwrap();
+        let destination = temp.path().join("destination");
+        assert!(!exchange_directory(&staged, &destination).unwrap());
+        fs::write(&destination, "keep").unwrap();
+        assert!(!exchange_directory(&staged, &destination).unwrap());
+        fs::remove_file(&destination).unwrap();
+        symlink("staged", &destination, true).unwrap();
+        assert!(!exchange_directory(&staged, &destination).unwrap());
+        assert!(
+            fs::symlink_metadata(&destination)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn retired_readonly_directories_are_removed_without_changing_live_modes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("out/nested")).unwrap();
+        fs::write(root.join("out/nested/value"), "cached").unwrap();
+        set_mode(&root.join("out/nested"), 0o500).unwrap();
+        let log = root.join("log");
+        fs::write(&log, "").unwrap();
+        let cache = Cache::new(root.join("cache"));
+        cache.initialize().unwrap();
+        let outputs = Outputs::from_patterns(&["out"]);
+        let key = "b".repeat(64);
+        cache.publish(root, &key, &outputs, &log).unwrap();
+        cache
+            .restore(
+                root,
+                "build",
+                &Default::default(),
+                &key,
+                &outputs,
+                &qk_executor::Display::Hidden,
+                qk_executor::Shown::LocalCache,
+            )
+            .unwrap();
+        cache.cleanup.lock().unwrap().take();
+        assert_eq!(
+            fs::read_dir(paths::worktree_state(root).join("restore"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert_eq!(mode(&fs::metadata(root.join("out/nested")).unwrap()), 0o500);
+        set_mode(&root.join("out/nested"), 0o700).unwrap();
+    }
 
     #[test]
     fn identical_rewrites_are_verified_and_kept_with_fresh_timestamps() {
