@@ -162,9 +162,10 @@ fn process_helper() {
             let _ = child.wait();
         }
         "heartbeat" => {
+            fs::write(root.join("heartbeat"), "0").unwrap();
             fs::write(root.join("heartbeat.started"), "started").unwrap();
             // Bound lifetime even if a regression prevents cleanup.
-            for value in 0..300 {
+            for value in 1..300 {
                 fs::write(root.join("heartbeat"), value.to_string()).unwrap();
                 std::thread::sleep(Duration::from_millis(20));
             }

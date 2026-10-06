@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
+use foldhash::{HashMap, HashMapExt, HashSet};
 use qk_config::Workspace;
 use qk_executor::{Capture, Display, Outcome, PreparedTask, execute_captured, read_capture};
 use qk_graph::ProjectGraph;
@@ -101,7 +102,7 @@ pub struct Snapshot {
     /// Whether `digests` gained entries worth saving.
     digests_changed: std::sync::atomic::AtomicBool,
     /// Directories already checked not to be symlinks.
-    directories: Mutex<std::collections::HashSet<PathBuf>>,
+    directories: Mutex<HashSet<PathBuf>>,
     /// Runtime input results by command and environment, computed once per run like Nx.
     runtime: Mutex<HashMap<RuntimeKey, Arc<Mutex<Option<Value>>>>>,
     /// The parsed pnpm lockfile, replaced whenever its content changes.

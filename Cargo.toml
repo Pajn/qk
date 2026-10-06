@@ -19,6 +19,7 @@ allow-branch = ["main"]
 anyhow = "1"
 blake3 = "1"
 fs2 = "0.4"
+foldhash = "0.2"
 rustix = { version = "1.1", features = ["fs"] }
 walkdir = "2"
 clap = { version = "4", features = ["derive", "env"] }
