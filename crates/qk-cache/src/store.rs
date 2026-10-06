@@ -407,10 +407,13 @@ impl Cache {
         // A stamp mismatch can be an identical rewrite by another runner.
         // Verify changed artifacts before replacing outputs we already hold.
         let held_profile = crate::profile::span(task, "restore_held_outputs");
-        if let Some(revalidated) = outputs_held(root, task, key, outputs, &manifest) {
+        let checked = check_outputs(root, task, key, outputs, &manifest);
+        if let Some(checked) = &checked
+            && checked.repair.is_empty()
+        {
             let changed = {
                 let kept = self.kept.lock().unwrap();
-                revalidated
+                checked.revalidated
                     || dependencies
                         .iter()
                         .any(|dependency| !kept.contains(dependency))
@@ -427,6 +430,7 @@ impl Cache {
             }
         }
         drop(held_profile);
+        let repair = checked.filter(|checked| !checked.repair.is_empty());
         let planning_profile = crate::profile::span(task, "restore_plan");
         // Stage on the destination filesystem; no existing output is touched yet.
         let stage_parent = paths::worktree_state(root).join("restore");
@@ -438,6 +442,12 @@ impl Cache {
         let mut staging = StagingDirectories::new(stage.path());
         let mut files = Vec::new();
         for (path, artifact) in &manifest.artifacts {
+            if repair
+                .as_ref()
+                .is_some_and(|checked| !checked.repair.contains(path))
+            {
+                continue;
+            }
             paths::safe_parents(root, path)?;
             staging.parents(path)?;
             if !outputs.matches(path) {
@@ -465,8 +475,19 @@ impl Cache {
         let selection_profile = crate::profile::span(task, "restore_select_outputs");
         // Only complete directory selections can promote a staged tree.
         // NOREPLACE below still checks that cleanup left the destination absent.
-        let complete = complete_directories(root, outputs, &manifest.artifacts)?;
-        let current = outputs.paths(root)?;
+        let complete = if repair.is_some() {
+            Vec::new()
+        } else {
+            complete_directories(root, outputs, &manifest.artifacts)?
+        };
+        let current = if let Some(checked) = &repair {
+            if output_stamps(root, outputs)? != checked.stamps {
+                bail!("outputs changed while staging partial repair");
+            }
+            checked.repair.clone()
+        } else {
+            outputs.paths(root)?
+        };
         // Validate the complete cleanup set before deleting any output.
         for path in &current {
             paths::safe_parents(root, path)?;
@@ -522,6 +543,12 @@ impl Cache {
             }
         }
         for (path, artifact) in &manifest.artifacts {
+            if repair
+                .as_ref()
+                .is_some_and(|checked| !checked.repair.contains(path))
+            {
+                continue;
+            }
             if covered_by(path, &promoted) {
                 continue;
             }
@@ -537,11 +564,21 @@ impl Cache {
         drop(promotion_profile);
         let mode_profile = crate::profile::span(task, "restore_modes");
         for (path, artifact) in manifest.artifacts.iter().rev() {
+            if repair
+                .as_ref()
+                .is_some_and(|checked| !checked.repair.contains(path))
+            {
+                continue;
+            }
             if let Artifact::Directory { mode } = artifact {
                 set_mode(&root.join(path), *mode)?;
             }
         }
         drop(mode_profile);
+        if repair.is_some() {
+            let _profile = crate::profile::span(task, "restore_repair_timestamps");
+            stamp_outputs(root, outputs, started)?;
+        }
         stage.retire();
         let record_profile = crate::profile::span(task, "restore_record_outputs");
         record_outputs(root, task, key, outputs);
@@ -858,15 +895,20 @@ pub(crate) fn record_outputs(root: &Path, task: &str, key: &str, outputs: &Outpu
     }
 }
 
-/// Held outputs, with `true` when changed stamps were revalidated and need
-/// fresh timestamps before timestamp-sensitive dependents can use them.
-fn outputs_held(
+/// Verified held outputs and artifacts that must be replaced under the same key.
+struct CheckedOutputs {
+    revalidated: bool,
+    repair: BTreeSet<String>,
+    stamps: BTreeMap<String, Vec<i64>>,
+}
+
+fn check_outputs(
     root: &Path,
     task: &str,
     key: &str,
     outputs: &Outputs,
     manifest: &ResultRecord,
-) -> Option<bool> {
+) -> Option<CheckedOutputs> {
     let text = fs::read(outputs_record(root, task)).ok()?;
     let record: OutputRecord = serde_json::from_slice(&text).ok()?;
     if record.key != key {
@@ -874,13 +916,19 @@ fn outputs_held(
     }
     let current = output_stamps(root, outputs).ok()?;
     if current == record.outputs {
-        return Some(false);
+        return Some(CheckedOutputs {
+            revalidated: false,
+            repair: BTreeSet::new(),
+            stamps: current,
+        });
     }
     let verification = crate::profile::span(task, "restore_revalidate_outputs");
     if !current.keys().eq(record.outputs.keys()) || !current.keys().eq(manifest.artifacts.keys()) {
         return None;
     }
     let mut checked_parents = BTreeSet::new();
+    let mut repair = BTreeSet::new();
+    let repair_limit = manifest.artifacts.len().div_ceil(4).clamp(1, 64);
     for (path, artifact) in &manifest.artifacts {
         if !outputs.matches(path) {
             return None;
@@ -889,6 +937,14 @@ fn outputs_held(
             paths::safe_parents(root, path).ok()?;
         }
         let stamp = &current[path];
+        let kind = match artifact {
+            Artifact::File { .. } => 0,
+            Artifact::Directory { .. } => 1,
+            Artifact::Symlink { .. } => 2,
+        };
+        if stamp[0] != kind {
+            return None;
+        }
         if record.outputs.get(path) == Some(stamp) {
             continue;
         }
@@ -909,20 +965,199 @@ fn outputs_held(
             }
         };
         if !matches {
-            return None;
+            repair.insert(path.clone());
+            // Dense changes retain full restoration and directory exchange.
+            if repair.len() > repair_limit {
+                return None;
+            }
         }
+    }
+    // Partial replacement needs writable parents; restrictive trees retain
+    // whole-directory restoration rather than changing live permissions.
+    if !repair.is_empty()
+        && manifest.artifacts.iter().any(|(path, artifact)| {
+            matches!(artifact, Artifact::Directory { .. })
+                && current[path][3] & 0o200 == 0
+                && cfg!(unix)
+        })
+    {
+        return None;
     }
     // Do not bless an artifact changed while its content was being checked.
     if output_stamps(root, outputs).ok()? != current {
         return None;
     }
     drop(verification);
-    Some(true)
+    Some(CheckedOutputs {
+        revalidated: true,
+        repair,
+        stamps: current,
+    })
+}
+
+#[cfg(test)]
+fn outputs_held(
+    root: &Path,
+    task: &str,
+    key: &str,
+    outputs: &Outputs,
+    manifest: &ResultRecord,
+) -> Option<bool> {
+    check_outputs(root, task, key, outputs, manifest)
+        .filter(|checked| checked.repair.is_empty())
+        .map(|checked| checked.revalidated)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sparse_repair_keeps_other_files_and_refreshes_all_timestamps() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("out/empty")).unwrap();
+        for index in 0..130 {
+            fs::write(
+                root.join(format!("out/file-{index:03}")),
+                format!("value-{index}"),
+            )
+            .unwrap();
+        }
+        let kept = root.join("out/file-000");
+        let changed = root.join("out/file-129");
+        #[cfg(unix)]
+        symlink("file-000", &root.join("out/link"), false).unwrap();
+        let log = root.join("log");
+        fs::write(&log, "").unwrap();
+        let cache = Cache::new(root.join("cache"));
+        cache.initialize().unwrap();
+        let outputs = Outputs::from_patterns(&["out"]);
+        let key = "a".repeat(64);
+        let fingerprint = cache.publish(root, &key, &outputs, &log).unwrap();
+        record_outputs(root, "build", &key, &outputs);
+        #[cfg(unix)]
+        let inode = {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(&kept).unwrap().ino()
+        };
+        fs::write(&changed, "edited").unwrap();
+        #[cfg(unix)]
+        {
+            fs::remove_file(root.join("out/link")).unwrap();
+            symlink("file-129", &root.join("out/link"), false).unwrap();
+            set_mode(&changed, mode(&fs::metadata(&changed).unwrap()) ^ 0o100).unwrap();
+        }
+        let before = SystemTime::now();
+        assert_eq!(
+            cache
+                .restore(
+                    root,
+                    "build",
+                    &Default::default(),
+                    &key,
+                    &outputs,
+                    &qk_executor::Display::Hidden,
+                    qk_executor::Shown::LocalCache
+                )
+                .unwrap(),
+            Some(fingerprint)
+        );
+        assert_eq!(fs::read_to_string(&changed).unwrap(), "value-129");
+        assert_eq!(fs::read_to_string(&kept).unwrap(), "value-0");
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                fs::read_link(root.join("out/link")).unwrap(),
+                Path::new("file-000")
+            );
+            assert_eq!(
+                mode(&fs::metadata(&changed).unwrap()),
+                mode(&fs::metadata(&kept).unwrap())
+            );
+        }
+        assert_eq!(
+            fs::metadata(&kept).unwrap().modified().unwrap(),
+            fs::metadata(&changed).unwrap().modified().unwrap()
+        );
+        assert!(fs::metadata(&kept).unwrap().modified().unwrap() >= before);
+        assert!(cache.cleanup.lock().unwrap().is_none());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(fs::metadata(&kept).unwrap().ino(), inode);
+        }
+        for index in 0..130 {
+            fs::write(root.join(format!("out/file-{index:03}")), "dense edit").unwrap();
+        }
+        let manifest = ResultRecord::read(
+            &fs::read(cache.root.join("entries").join(format!("{key}.json"))).unwrap(),
+            &key,
+        )
+        .unwrap();
+        assert!(check_outputs(root, "build", &key, &outputs, &manifest).is_none());
+        assert!(
+            cache
+                .restore(
+                    root,
+                    "build",
+                    &Default::default(),
+                    &key,
+                    &outputs,
+                    &qk_executor::Display::Hidden,
+                    qk_executor::Shown::LocalCache
+                )
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(fs::read_to_string(&kept).unwrap(), "value-0");
+        assert_eq!(fs::read_to_string(&changed).unwrap(), "value-129");
+    }
+
+    #[test]
+    fn corrupt_repair_blob_leaves_changed_and_kept_outputs_untouched() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir(root.join("out")).unwrap();
+        fs::write(root.join("out/keep"), "keep").unwrap();
+        fs::write(root.join("out/change"), "cached").unwrap();
+        let log = root.join("log");
+        fs::write(&log, "").unwrap();
+        let cache = Cache::new(root.join("cache"));
+        cache.initialize().unwrap();
+        let outputs = Outputs::from_patterns(&["out"]);
+        let key = "9".repeat(64);
+        cache.publish(root, &key, &outputs, &log).unwrap();
+        record_outputs(root, "build", &key, &outputs);
+        fs::write(root.join("out/change"), "edited").unwrap();
+        let before = output_stamps(root, &outputs).unwrap();
+        fs::write(
+            cache
+                .root
+                .join("blobs")
+                .join(blake3::hash(b"cached").to_hex().to_string()),
+            "corrupt",
+        )
+        .unwrap();
+        assert!(
+            cache
+                .restore(
+                    root,
+                    "build",
+                    &Default::default(),
+                    &key,
+                    &outputs,
+                    &qk_executor::Display::Hidden,
+                    qk_executor::Shown::LocalCache
+                )
+                .is_err()
+        );
+        assert_eq!(output_stamps(root, &outputs).unwrap(), before);
+        assert_eq!(
+            fs::read_to_string(root.join("out/change")).unwrap(),
+            "edited"
+        );
+    }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
