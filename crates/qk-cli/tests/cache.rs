@@ -2143,6 +2143,48 @@ snapshots:
 }
 
 #[test]
+fn versions_crossing_a_dependents_range_change_its_key() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    let write = |path: &str, text: &str| {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    };
+    write("nx.json", "{}");
+    write("pnpm-workspace.yaml", "packages:\n  - app\n  - lib\n");
+    write(
+        "app/package.json",
+        r#"{"name":"app","dependencies":{"lib":"^1.0.0"}}"#,
+    );
+    write(
+        "app/project.json",
+        r#"{"name":"app","targets":{"check":{"command":"echo checked","cache":true,"inputs":["{projectRoot}/src/**/*"]}}}"#,
+    );
+    write("app/src/main.js", "main");
+    write("lib/package.json", r#"{"name":"lib","version":"1.0.0"}"#);
+    let check = || {
+        let output = Command::new(env!("CARGO_BIN_EXE_qk"))
+            .args(["--workspace", root.to_str().unwrap(), "run", "app:check"])
+            .env_remove("CI")
+            .output()
+            .unwrap();
+        stderr(&success(output))
+    };
+    assert!(check().contains("cache miss"));
+    assert!(check().contains("cache hit"));
+    // Within the range, the version alone does not count.
+    write("lib/package.json", r#"{"name":"lib","version":"1.1.0"}"#);
+    assert!(check().contains("cache hit"));
+    // Out of it, app no longer depends on lib.
+    write("lib/package.json", r#"{"name":"lib","version":"2.0.0"}"#);
+    assert!(check().contains("cache miss"));
+    // Back in it, app depends on lib as in the first run.
+    write("lib/package.json", r#"{"name":"lib","version":"1.2.0"}"#);
+    assert!(check().contains("cache hit"));
+}
+
+#[test]
 fn dependency_manifests_named_by_inputs_count_whole() {
     let temp = TempDir::new().unwrap();
     let root = temp.path();

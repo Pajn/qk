@@ -90,7 +90,8 @@ With `--granularity task`, `qk affected` selects tasks instead of projects: a
 task is affected when a changed file is one of its resolved inputs, when what
 its lockfile importers or `externalDependencies` install changed, when
 `pnpm-workspace.yaml` changed outside its resolution keys, when a dependency
-project's `package.json` changed in a field its key reads, when a project
+project's `package.json` changed in a field its key reads or its version moved
+into or out of the range the task's project declares for it, when a project
 manifest was deleted, or when it depends on an affected task. These are the
 same inputs its cache key reads, so an unaffected task would be a cache hit,
 except that env and runtime inputs count as unchanged, since the base

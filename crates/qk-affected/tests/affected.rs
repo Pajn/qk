@@ -742,6 +742,68 @@ fn dependency_manifests_affect_dependents_by_what_they_decide() {
     ));
 }
 
+/// A version that moves a workspace package into or out of the range a
+/// dependent declares for it adds or removes that dependency, so every task
+/// of the dependent is affected, although the version itself is not keyed.
+#[test]
+fn versions_crossing_a_dependents_range_affect_its_tasks() {
+    let repo = |version: &str| {
+        Repo::new(&[
+            (
+                "nx.json",
+                r#"{"targetDefaults": {"build": {"command": "echo build", "inputs": ["{projectRoot}/src/**/*"]},
+                                       "test": {"command": "echo test", "inputs": ["{projectRoot}/src/**/*"]}}}"#,
+            ),
+            (
+                "apps/app/project.json",
+                r#"{"name": "app", "targets": {"build": {}, "test": {}}}"#,
+            ),
+            (
+                "apps/app/package.json",
+                r#"{"name": "app", "dependencies": {"lib": "^1.0.0"}}"#,
+            ),
+            (
+                "libs/lib/project.json",
+                r#"{"name": "lib", "targets": {"build": {}, "test": {}}}"#,
+            ),
+            (
+                "libs/lib/package.json",
+                &format!(r#"{{"name": "lib", "version": "{version}"}}"#),
+            ),
+        ])
+    };
+    for (before, after) in [("2.0.0", "1.1.0"), ("1.0.0", "2.0.0")] {
+        let repo = repo(before);
+        write(
+            &repo.root,
+            "libs/lib/package.json",
+            &format!(r#"{{"name": "lib", "version": "{after}"}}"#),
+        );
+        let tasks = affected_tasks(&repo);
+        assert_eq!(
+            tasks.keys().collect::<Vec<_>>(),
+            ["app:build", "app:test", "lib:build", "lib:test"],
+            "{before} -> {after}"
+        );
+        assert!(matches!(
+            &tasks["app:build"],
+            qk_affected::TaskCause::Touched { reasons }
+                if reasons.iter().any(|reason| matches!(reason, qk_affected::TaskReason::Input { file } if file == "libs/lib/package.json"))
+        ));
+    }
+    // Within the range, the dependency stays and the version alone does not count.
+    let repo = repo("1.0.0");
+    write(
+        &repo.root,
+        "libs/lib/package.json",
+        r#"{"name": "lib", "version": "1.1.0"}"#,
+    );
+    assert_eq!(
+        affected_tasks(&repo).keys().collect::<Vec<_>>(),
+        ["lib:build", "lib:test"]
+    );
+}
+
 /// Changed output candidates remain inputs of consumers, never of their producer.
 #[test]
 fn changed_declared_outputs_only_affect_tasks_that_consume_them() {

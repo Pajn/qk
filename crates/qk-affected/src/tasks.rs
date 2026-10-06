@@ -124,7 +124,7 @@ pub fn affected_tasks(
     let mut tasks = BTreeMap::new();
     // Changed manifests at both revisions: a dependency's counts for its
     // dependents by what it decides for them.
-    let manifests = changes
+    let manifests: BTreeMap<String, (Option<String>, Option<String>)> = changes
         .files
         .iter()
         .filter(|file| file.rsplit('/').next() == Some("package.json"))
@@ -134,6 +134,7 @@ pub fn affected_tasks(
             (file.clone(), (before, after))
         })
         .collect();
+    let relinked = relinked_dependents(workspace, &manifests);
     let mut input_changes = qk_cache::InputChanges::new(
         &workspace.root,
         &changes.files,
@@ -160,6 +161,13 @@ pub fn affected_tasks(
                     qk_cache::InputChange::WorkspaceFile => TaskReason::WorkspaceFile,
                 }),
         );
+        if let Some(file) = relinked.get(&graph.tasks[id].project)
+            && !reasons
+                .iter()
+                .any(|reason| matches!(reason, TaskReason::Input { file: input } if input == file))
+        {
+            reasons.push(TaskReason::Input { file: file.clone() });
+        }
         if !reasons.is_empty() {
             tasks.insert(id.clone(), TaskCause::Touched { reasons });
         }
@@ -200,4 +208,56 @@ pub fn affected_tasks(
         files: changes.files,
         tasks,
     })
+}
+
+/// Projects whose dependency on a workspace package was added or removed
+/// because the package's version moved into or out of the range they declare
+/// for it, each with that package's manifest. The keys of all their tasks
+/// change with the dependency, although the version itself is not keyed for
+/// them.
+fn relinked_dependents(
+    workspace: &Workspace,
+    manifests: &BTreeMap<String, (Option<String>, Option<String>)>,
+) -> BTreeMap<String, String> {
+    let identity = |text: &Option<String>| {
+        let value: serde_json::Value = serde_json::from_str(text.as_deref()?).ok()?;
+        let name = value.get("name")?.as_str()?.to_owned();
+        let version = value
+            .get("version")
+            .and_then(|version| version.as_str())
+            .map(String::from);
+        Some((name, version))
+    };
+    let mut relinked = BTreeMap::new();
+    for (file, (before, after)) in manifests {
+        let (before, after) = (identity(before), identity(after));
+        let names = before.iter().chain(after.iter()).map(|(name, _)| name);
+        let version = |side: &Option<(String, Option<String>)>| {
+            side.as_ref().and_then(|(_, version)| version.clone())
+        };
+        let (old, new) = (version(&before), version(&after));
+        if old == new {
+            continue;
+        }
+        let links = |version: &Option<String>, range: &str| {
+            version
+                .as_deref()
+                .is_some_and(|version| qk_graph::satisfies(version, range))
+        };
+        for name in names {
+            for (project, package) in &workspace.packages {
+                let Some(range) = package.dependency_ranges().get(name.as_str()).copied() else {
+                    continue;
+                };
+                // These link to the workspace package whatever its version.
+                if range.starts_with("workspace:") || range == "*" || range.starts_with("file:") {
+                    continue;
+                }
+                if links(&old, range) != links(&new, range) {
+                    relinked.insert(project.clone(), file.clone());
+                }
+            }
+        }
+    }
+    relinked
 }

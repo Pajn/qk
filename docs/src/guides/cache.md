@@ -46,13 +46,15 @@ of it resolve, even when the task's inputs leave the file out. Its `version`,
 `scripts`, `description`, `keywords`, `author`, `contributors`, `maintainers`,
 `license`, `homepage`, `repository`, `bugs`, `funding`, `private` and
 `publishConfig` are left out, since none of them changes what a dependent reads
-or runs. With a pnpm lockfile qk can read, so are its `dependencies`,
-`devDependencies`, `peerDependencies`, `peerDependenciesMeta`,
-`optionalDependencies` and `dependenciesMeta`: what they install is keyed
-through the lockfile, as below. A manifest the task's inputs select, as
+or runs. A version that moves into or out of the range a dependent declares for
+the package adds or removes that dependency instead, which changes the
+dependent's key through what it depends on. With a pnpm lockfile qk can read,
+its `dependencies`, `devDependencies`, `peerDependencies`,
+`peerDependenciesMeta`, `optionalDependencies` and `dependenciesMeta` are left
+out too: what they install is keyed through the lockfile, as below. A manifest the task's inputs select, as
 `^default` selects every file of each dependency, counts whole. A dependency
-releasing a new version therefore leaves its dependents cached, while a change
-to its `exports` reaches them.
+releasing a new version within its dependents' ranges therefore leaves them
+cached, while a change to its `exports` reaches them.
 
 A pnpm v9 `pnpm-lock.yaml` is keyed by what it installs rather than by its
 content: for the root importer and the importers of the task's project and

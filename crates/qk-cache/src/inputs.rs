@@ -278,7 +278,9 @@ impl<'a> InputChanges<'a> {
 
 /// Manifest fields that cannot change what a dependent task reads or runs: a
 /// dependency's scripts run only as its own tasks, and the rest is metadata
-/// that resolvers and bundlers do not read.
+/// that resolvers and bundlers do not read. A version can still add or remove
+/// a dependency through the range a dependent declares; that changes the
+/// project graph, and the dependent's key with it.
 const DEPENDENT_IGNORED_FIELDS: &[&str] = &[
     "version",
     "scripts",
