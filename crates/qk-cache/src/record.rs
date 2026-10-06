@@ -210,7 +210,10 @@ fn publish_with(
 }
 
 pub(crate) fn validate_link(path: &str, target: &str) -> Result<()> {
-    if target.contains(['\\', ':', '\0']) || Path::new(target).is_absolute() {
+    if target.contains(['\\', '\0'])
+        || (cfg!(windows) && target.contains(':'))
+        || Path::new(target).is_absolute()
+    {
         bail!("cache symlinks must be relative");
     }
     let mut depth = Path::new(path)
@@ -236,6 +239,37 @@ pub(crate) fn valid_hash(value: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn artifact_paths_obey_host_rules_without_allowing_escape() {
+        assert_eq!(
+            crate::paths::validate_path("dist/build:debug/output.txt").is_ok(),
+            !cfg!(windows)
+        );
+        assert_eq!(
+            validate_link("dist/latest", "build:debug/output.txt").is_ok(),
+            !cfg!(windows)
+        );
+        for path in [
+            "../outside",
+            "/outside",
+            "dist/../outside",
+            "dist/.git/config",
+            "dist\\outside",
+            "dist/\0outside",
+        ] {
+            assert!(crate::paths::validate_path(path).is_err(), "{path:?}");
+        }
+        for target in [
+            "../../outside",
+            "/outside",
+            "../.git/config",
+            "..\\outside",
+            "\0outside",
+        ] {
+            assert!(validate_link("dist/latest", target).is_err(), "{target:?}");
+        }
+    }
 
     #[test]
     fn result_reader_preserves_format_and_header_acceptance() {
