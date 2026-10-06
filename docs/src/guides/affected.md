@@ -1,5 +1,9 @@
 # Running affected tasks
 
+For an opt-in consumer-specific comparison of shared sources, see
+[Project change projections](affected-projections.md). Ordinary selection
+and task cache keys retain the behavior described here.
+
 ```sh
 qk show projects --affected --base main
 qk show affected web --base main

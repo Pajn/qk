@@ -1,0 +1,8 @@
+{
+  "consumers": {
+    "web": {
+      "runtime": { "operation": "query Viewer { viewer { id } }" },
+      "types": { "id": "string" }
+    }
+  }
+}

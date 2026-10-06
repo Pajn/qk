@@ -1,0 +1,9 @@
+{
+  "name": "web",
+  "implicitDependencies": ["schema"],
+  "targets": {
+    "deploy": {
+      "command": "echo deploy web"
+    }
+  }
+}

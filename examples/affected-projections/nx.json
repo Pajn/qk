@@ -1,0 +1,14 @@
+{
+  "affectedProfiles": {
+    "runtime": {
+      "projections": [
+        {
+          "name": "contract-runtime",
+          "command": ["node", "tools/snapshot.mjs"],
+          "sources": ["schemas/contract.json"],
+          "outputs": ["apps/*/generated/contract.js"]
+        }
+      ]
+    }
+  }
+}

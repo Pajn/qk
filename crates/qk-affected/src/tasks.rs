@@ -73,6 +73,10 @@ pub fn affected_tasks(
     graph: &TaskGraph,
     options: &Options,
 ) -> Result<TaskAnalysis> {
+    anyhow::ensure!(
+        options.affected_profile.is_none(),
+        "--affected-profile applies to project selection; task selection uses declared cache inputs"
+    );
     let changes = Changes::unfiltered(workspace, options)?;
     if changes.files.is_empty() {
         return Ok(TaskAnalysis {

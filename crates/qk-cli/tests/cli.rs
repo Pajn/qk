@@ -4,6 +4,37 @@ use std::process::{Command, Output};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+// Fixture repositories must not inherit hook locations, signing or global hooks.
+fn isolated_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
+    command
+        .env(
+            "GIT_CONFIG_GLOBAL",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        )
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+    for name in [
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_GRAFT_FILE",
+        "GIT_INDEX_FILE",
+        "GIT_NO_REPLACE_OBJECTS",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_PREFIX",
+        "GIT_SHALLOW_FILE",
+        "GIT_COMMON_DIR",
+    ] {
+        command.env_remove(name);
+    }
+    command
+}
+
 fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../examples/basic")
@@ -12,7 +43,7 @@ fn fixture() -> PathBuf {
 }
 
 fn qk(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_qk"))
+    isolated_command(env!("CARGO_BIN_EXE_qk"))
         .arg("--workspace")
         .arg(fixture())
         .args(args)
@@ -69,7 +100,7 @@ fn applies_cli_selectors_and_excludes() {
 
 #[test]
 fn discovers_workspace_from_nested_project_and_shows_normalized_configuration() {
-    let output = Command::new(env!("CARGO_BIN_EXE_qk"))
+    let output = isolated_command(env!("CARGO_BIN_EXE_qk"))
         .current_dir(fixture().join("apps/web/worker"))
         .args(["show", "project", "web", "--json"])
         .output()
@@ -86,7 +117,7 @@ fn discovers_workspace_from_nested_project_and_shows_normalized_configuration() 
 #[test]
 fn graph_file_matches_stdout_and_is_relative_to_invocation_directory() {
     let temp = TempDir::new().unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_qk"))
+    let output = isolated_command(env!("CARGO_BIN_EXE_qk"))
         .current_dir(temp.path())
         .args(["graph", "--file", "graph.json", "--workspace"])
         .arg(fixture())
@@ -118,7 +149,7 @@ fn unknown_projects_and_unimplemented_commands_fail_without_stdout() {
 fn help_and_version_work_without_a_workspace() {
     let temp = TempDir::new().unwrap();
     for argument in ["--help", "--version"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_qk"))
+        let output = isolated_command(env!("CARGO_BIN_EXE_qk"))
             .current_dir(temp.path())
             .arg(argument)
             .output()
@@ -126,7 +157,7 @@ fn help_and_version_work_without_a_workspace() {
         assert!(output.status.success());
         assert!(String::from_utf8_lossy(&output.stdout).contains("qk"));
     }
-    let output = Command::new(env!("CARGO_BIN_EXE_qk"))
+    let output = isolated_command(env!("CARGO_BIN_EXE_qk"))
         .current_dir(temp.path())
         .args(["show", "projects"])
         .output()
@@ -148,7 +179,7 @@ fn planned(output: Output) -> Vec<String> {
 }
 
 fn qk_in(directory: &str, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_qk"))
+    isolated_command(env!("CARGO_BIN_EXE_qk"))
         .current_dir(fixture().join(directory))
         .args(args)
         .output()
@@ -168,7 +199,7 @@ fn nx_shorthand_runs_target_of_named_project() {
         );
     }
     // Global options work on either side of the shorthand.
-    let output = Command::new(env!("CARGO_BIN_EXE_qk"))
+    let output = isolated_command(env!("CARGO_BIN_EXE_qk"))
         .args(["check", "worker", "--dry-run", "--workspace"])
         .arg(fixture())
         .output()
@@ -332,7 +363,7 @@ fn root_configuration_fallback_preserves_the_requested_name_for_dependencies() {
         ],
     ] {
         let graph = successful_json(
-            Command::new(env!("CARGO_BIN_EXE_qk"))
+            isolated_command(env!("CARGO_BIN_EXE_qk"))
                 .arg("--workspace")
                 .arg(temp.path())
                 .args(args)
@@ -349,7 +380,7 @@ fn root_configuration_fallback_preserves_the_requested_name_for_dependencies() {
     }
     let inspect = |args: &[&str]| {
         successful_json(
-            Command::new(env!("CARGO_BIN_EXE_qk"))
+            isolated_command(env!("CARGO_BIN_EXE_qk"))
                 .arg("--workspace")
                 .arg(temp.path())
                 .args(args)
@@ -485,7 +516,7 @@ fn task_granularity_selects_tasks_whose_inputs_changed() {
 #[test]
 fn graph_can_include_the_packages_the_lockfile_installs() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/parity/fixture");
-    let output = Command::new(env!("CARGO_BIN_EXE_qk"))
+    let output = isolated_command(env!("CARGO_BIN_EXE_qk"))
         .args(["--workspace", root.to_str().unwrap(), "graph", "--external"])
         .output()
         .unwrap();
@@ -506,7 +537,7 @@ fn graph_can_include_the_packages_the_lockfile_installs() {
     assert!(targets("web").contains(&react_dom.to_owned()));
     assert!(targets(react_dom).contains(&"npm:scheduler@0.26.0".to_owned()));
     // Without the flag the graph matches nx graph --file.
-    let plain = Command::new(env!("CARGO_BIN_EXE_qk"))
+    let plain = isolated_command(env!("CARGO_BIN_EXE_qk"))
         .args(["--workspace", root.to_str().unwrap(), "graph"])
         .output()
         .unwrap();
@@ -522,7 +553,7 @@ fn graph_can_include_the_packages_the_lockfile_installs() {
 fn graph_focus_and_exclude_keep_what_nx_keeps() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/parity/fixture");
     let graph = |args: &[&str]| {
-        let output = Command::new(env!("CARGO_BIN_EXE_qk"))
+        let output = isolated_command(env!("CARGO_BIN_EXE_qk"))
             .args(["--workspace", root.to_str().unwrap(), "graph"])
             .args(args)
             .output()
@@ -549,7 +580,7 @@ fn graph_focus_and_exclude_keep_what_nx_keeps() {
     let external = graph(&["--focus", "web", "--external"]);
     assert!(external["dependencies"].get("mobile").is_none());
 
-    let output = Command::new(env!("CARGO_BIN_EXE_qk"))
+    let output = isolated_command(env!("CARGO_BIN_EXE_qk"))
         .args([
             "--workspace",
             root.to_str().unwrap(),
@@ -618,7 +649,7 @@ fn inspects_targets_inputs_and_outputs_without_running_commands() {
             "configurations":{"release":{"command":"echo release"}}}
     }}).to_string()).unwrap();
     let run = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_qk"))
+        isolated_command(env!("CARGO_BIN_EXE_qk"))
             .current_dir(root)
             .args(args)
             .output()
@@ -713,7 +744,7 @@ fn affected_reads_changed_paths_from_stdin() {
     .unwrap();
     std::fs::write(root.join("app/src/a file.ts"), "source").unwrap();
     let run = |args: &[&str], input: &str| {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_qk"))
+        let mut child = isolated_command(env!("CARGO_BIN_EXE_qk"))
             .current_dir(root)
             .args(args)
             .stdin(Stdio::piped())
@@ -779,7 +810,7 @@ fn doctor_reports_unsupported_features_without_side_effects() {
         .to_string(),
     )
     .unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_qk"))
+    let output = isolated_command(env!("CARGO_BIN_EXE_qk"))
         .current_dir(root)
         .args(["doctor", "--json"])
         .output()
@@ -808,7 +839,7 @@ fn doctor_reports_unsupported_features_without_side_effects() {
     )
     .unwrap();
     let run = |strict: bool| {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_qk"));
+        let mut command = isolated_command(env!("CARGO_BIN_EXE_qk"));
         command.current_dir(root).arg("doctor");
         if strict {
             command.arg("--strict");
@@ -823,7 +854,7 @@ fn doctor_reports_unsupported_features_without_side_effects() {
     )
     .unwrap();
     assert_eq!(run(true).status.code(), Some(1));
-    let output = Command::new(env!("CARGO_BIN_EXE_qk"))
+    let output = isolated_command(env!("CARGO_BIN_EXE_qk"))
         .current_dir(root)
         .args(["doctor", "--json"])
         .output()
@@ -837,4 +868,418 @@ fn doctor_reports_unsupported_features_without_side_effects() {
     );
     std::fs::write(root.join("nx.json"), "{}").unwrap();
     assert!(run(true).status.success());
+}
+
+#[test]
+fn affected_profile_lists_projects_explains_projection_and_rejects_task_selection() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    let git = |args: &[&str]| {
+        let output = isolated_command("git")
+            .current_dir(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    for (path, content) in [
+        ("nx.json", json!({"affectedProfiles":{"runtime":{"projections":[{"name":"runtime","command":["git","-C","{revisionRoot}","show","HEAD:manifest.json"],"sources":["schemas/**"],"outputs":["apps/app/generated/**"],"timeoutSeconds":if cfg!(unix) { 3 } else { 60 }}]}}}).to_string()),
+        ("schemas/project.json", json!({"name":"schema"}).to_string()),
+        ("schemas/schema.txt", "before".into()),
+        ("apps/app/project.json", json!({"name":"app","implicitDependencies":["schema"],"targets":{"build":{"command":"echo build"}}}).to_string()),
+        ("manifest.json", json!({"version":1,"artifacts":{"apps/app/generated/runtime.js":"same"}}).to_string()),
+    ] {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+    git(&["init", "--quiet", "--initial-branch=main"]);
+    git(&["add", "."]);
+    git(&[
+        "-c",
+        "user.name=qk",
+        "-c",
+        "user.email=qk@example.invalid",
+        "commit",
+        "--quiet",
+        "-m",
+        "base",
+    ]);
+    std::fs::write(root.join("schemas/schema.txt"), "after").unwrap();
+    git(&["add", "."]);
+    git(&[
+        "-c",
+        "user.name=qk",
+        "-c",
+        "user.email=qk@example.invalid",
+        "commit",
+        "--quiet",
+        "-m",
+        "head",
+    ]);
+    let run = |args: &[&str]| {
+        isolated_command(env!("CARGO_BIN_EXE_qk"))
+            .current_dir(root)
+            .env_remove("NX_HEAD")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let comparison = [
+        "--affected-profile",
+        "runtime",
+        "--base",
+        "HEAD^",
+        "--head",
+        "HEAD",
+    ];
+    for selection in [
+        vec![],
+        vec!["--files", "schemas/schema.txt"],
+        vec!["--files", "apps/app/project.json"],
+        vec!["--stdin"],
+        vec!["--uncommitted"],
+        vec!["--untracked"],
+    ] {
+        let mut args = vec![
+            "show",
+            "projects",
+            "--json",
+            "--affected-profile",
+            "runtime",
+            "--base",
+            "HEAD^",
+            "--fail-on-projection-fallback=adapter",
+        ];
+        if !selection.is_empty() {
+            args.extend(["--head", "HEAD"]);
+        }
+        args.extend(selection);
+        let output = run(&args);
+        assert!(!output.status.success(), "{args:?}");
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("strict projection selection"));
+    }
+    let output = isolated_command(env!("CARGO_BIN_EXE_qk"))
+        .current_dir(root)
+        .env("NX_HEAD", "HEAD")
+        .args([
+            "show",
+            "projects",
+            "--json",
+            "--affected-profile",
+            "runtime",
+            "--base",
+            "HEAD^",
+            "--fail-on-projection-fallback=adapter",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(successful_json(output), json!([]));
+    let mut args = vec!["show", "projects", "--affected", "--json"];
+    args.extend(comparison);
+    assert_eq!(successful_json(run(&args)), json!([]));
+    let mut args = vec!["show", "affected", "app", "--json"];
+    args.extend(comparison);
+    let explanation = successful_json(run(&args));
+    assert_eq!(explanation["affected"], false);
+    assert_eq!(explanation["projections"][0]["status"], "applied");
+    assert_eq!(
+        explanation["projections"][0]["sources"],
+        json!(["schemas/schema.txt"])
+    );
+    assert_eq!(explanation["originalFiles"], json!(["schemas/schema.txt"]));
+    assert_eq!(explanation["files"], json!([]));
+    let mut args = vec!["show", "affected", "app"];
+    args.extend(comparison);
+    let output = run(&args);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("1 changed file between"));
+    assert!(text.contains("0 files after projection."));
+    assert!(text.contains("1 source change, 0 artifact changes"));
+    let output = run(&[
+        "show",
+        "projects",
+        "--affected-profile",
+        "runtime",
+        "--files",
+        "schemas/schema.txt",
+        "--fail-on-projection-fallback",
+    ]);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("committed base/head"));
+    let output = run(&["show", "projects", "--fail-on-projection-fallback"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--affected-profile"));
+    let mut args = vec!["affected", "-t", "build", "--granularity", "task"];
+    args.extend(comparison);
+    let output = run(&args);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("applies to project selection"));
+    let output = run(&[
+        "show",
+        "tasks",
+        "-t",
+        "build",
+        "--affected-profile",
+        "runtime",
+    ]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("applies to project selection"));
+    let output = run(&[
+        "show",
+        "projects",
+        "--affected-profile",
+        "missing",
+        "--base",
+        "HEAD^",
+        "--head",
+        "HEAD",
+    ]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown affected profile"));
+    std::fs::write(root.join("schemas/schema.txt"), "runtime change").unwrap();
+    std::fs::write(
+        root.join("manifest.json"),
+        json!({"version":1,"artifacts":{
+            "apps/app/generated/runtime.js":"changed",
+            "apps/app/generated/extra.js":"new"
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    git(&["add", "."]);
+    git(&[
+        "-c",
+        "user.name=qk",
+        "-c",
+        "user.email=qk@example.invalid",
+        "commit",
+        "--quiet",
+        "-m",
+        "runtime",
+    ]);
+    let mut args = vec!["show", "affected"];
+    args.extend(comparison);
+    let output = run(&args);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("2 changed files between"));
+    assert!(text.contains("3 files after projection."));
+    assert!(text.contains("1 source change, 2 artifact changes"));
+    args.push("--json");
+    let report = successful_json(run(&args));
+    assert_eq!(report["originalFiles"].as_array().unwrap().len(), 2);
+    assert_eq!(report["files"].as_array().unwrap().len(), 3);
+    let worktrees_before = isolated_command("git")
+        .current_dir(root)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .unwrap()
+        .stdout;
+    let mut hooked = isolated_command(env!("CARGO_BIN_EXE_qk"));
+    hooked
+        .current_dir(root)
+        .env_remove("NX_HEAD")
+        .env("GIT_DIR", root.join(".git"))
+        .env("GIT_WORK_TREE", root)
+        .env("GIT_INDEX_FILE", root.join(".git/index"))
+        .env("GIT_OBJECT_DIRECTORY", root.join(".git/objects"))
+        .env("GIT_COMMON_DIR", root.join(".git"))
+        .env("GIT_PREFIX", "hook/")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.worktree")
+        .env("GIT_CONFIG_VALUE_0", root);
+    hooked
+        .args([
+            "show",
+            "projects",
+            "--json",
+            "--fail-on-projection-fallback=adapter",
+        ])
+        .args(comparison);
+    assert_eq!(successful_json(hooked.output().unwrap()), json!(["app"]));
+    assert_eq!(
+        isolated_command("git")
+            .current_dir(root)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .unwrap()
+            .stdout,
+        worktrees_before
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let wrapper = TempDir::new().unwrap();
+        let git_path = wrapper.path().join("git");
+        std::fs::write(
+            &git_path,
+            r#"#!/bin/sh
+if [ "$QK_TEST_GIT_FAILURE_MODE" = metadata ] && [ "$1" = diff ] && [ "$2" = --quiet ]; then
+  echo 'fatal: simulated metadata comparison failure' >&2
+  exit 128
+fi
+if [ "$QK_TEST_GIT_FAILURE_MODE" = checkout ] && [ "$1" = -c ] && [ "$3" = worktree ] && [ "$4" = add ]; then
+  "$QK_TEST_REAL_GIT" "$@" || exit $?
+  previous=
+  current=
+  for argument do previous="$current"; current="$argument"; done
+  "$QK_TEST_REAL_GIT" worktree lock "$previous" || exit $?
+  sleep 30
+  exit 0
+fi
+exec "$QK_TEST_REAL_GIT" "$@"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&git_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let real_git = isolated_command("/bin/sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .unwrap();
+        assert!(real_git.status.success());
+        let mut search_path = vec![wrapper.path().to_path_buf()];
+        search_path.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+        for (mode, policy) in [
+            ("metadata", "adapter"),
+            ("metadata", "all"),
+            ("checkout", "adapter"),
+            ("checkout", "all"),
+        ] {
+            let started = std::time::Instant::now();
+            let mut args = vec!["show", "affected", "--json"];
+            args.extend(comparison);
+            let output = isolated_command(env!("CARGO_BIN_EXE_qk"))
+                .current_dir(root)
+                .env_remove("NX_HEAD")
+                .env("PATH", std::env::join_paths(&search_path).unwrap())
+                .env("QK_TEST_GIT_FAILURE_MODE", mode)
+                .env(
+                    "QK_TEST_REAL_GIT",
+                    String::from_utf8(real_git.stdout.clone()).unwrap().trim(),
+                )
+                .args(args)
+                .arg(format!("--fail-on-projection-fallback={policy}"))
+                .output()
+                .unwrap();
+            let diagnostic = String::from_utf8_lossy(&output.stderr);
+            if mode == "metadata" {
+                assert!(
+                    diagnostic.contains("cannot compare workspace metadata"),
+                    "{diagnostic}"
+                );
+                assert!(diagnostic.contains("128"), "{diagnostic}");
+                assert!(
+                    diagnostic.contains("simulated metadata comparison failure"),
+                    "{diagnostic}"
+                );
+            } else {
+                assert!(
+                    diagnostic.contains("git worktree add timed out"),
+                    "{diagnostic}"
+                );
+                assert!(started.elapsed() < std::time::Duration::from_secs(10));
+                assert_eq!(
+                    isolated_command("git")
+                        .current_dir(root)
+                        .args(["worktree", "list", "--porcelain"])
+                        .output()
+                        .unwrap()
+                        .stdout,
+                    worktrees_before
+                );
+            }
+            assert!(!diagnostic.contains("workspace configuration or tool installation changed"));
+            if policy == "adapter" {
+                assert!(output.status.success());
+                let explanation: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(explanation["projections"][0]["fallbackKind"], "comparison");
+                assert_eq!(explanation["files"], explanation["originalFiles"]);
+                assert_eq!(
+                    explanation["files"],
+                    json!(["manifest.json", "schemas/schema.txt"])
+                );
+            } else {
+                assert!(!output.status.success());
+                assert!(output.stdout.is_empty());
+            }
+        }
+    }
+
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"dependencies":{"example-tool":"1.0.0"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("schemas/schema.txt"),
+        "schema with dependency change",
+    )
+    .unwrap();
+    git(&["add", "."]);
+    git(&[
+        "-c",
+        "user.name=qk",
+        "-c",
+        "user.email=qk@example.invalid",
+        "commit",
+        "--quiet",
+        "-m",
+        "dependency",
+    ]);
+    let mut args = vec![
+        "show",
+        "projects",
+        "--json",
+        "--fail-on-projection-fallback=adapter",
+    ];
+    args.extend(comparison);
+    let output = run(&args);
+    assert!(output.status.success());
+    let notice = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(notice.lines().count(), 1);
+    assert!(notice.starts_with("qk: notice: affected projection runtime:"));
+    assert!(notice.contains("workspace configuration or tool installation changed"));
+    let projects: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(projects.as_array().unwrap().contains(&json!("app")));
+    args[3] = "--fail-on-projection-fallback=all";
+    assert!(!run(&args).status.success());
+    args[3] = "--fail-on-projection-fallback=adapter";
+    args[1] = "affected";
+    let output = run(&args);
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).starts_with("qk: notice:"));
+    let explanation: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(explanation["projections"][0]["fallbackKind"], "comparison");
+    std::fs::write(root.join("schemas/schema.txt"), "schema with output drift").unwrap();
+    std::fs::write(
+        root.join("manifest.json"),
+        r#"{"version":1,"artifacts":{"apps/stray/generated/runtime.js":"new"}}"#,
+    )
+    .unwrap();
+    git(&["add", "."]);
+    git(&[
+        "-c",
+        "user.name=qk",
+        "-c",
+        "user.email=qk@example.invalid",
+        "commit",
+        "--quiet",
+        "-m",
+        "drift",
+    ]);
+    args[1] = "projects";
+    let output = run(&args);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("apps/stray/generated/runtime.js"));
 }

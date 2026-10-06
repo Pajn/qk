@@ -234,10 +234,23 @@ struct RunOptions {
     args: Vec<String>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ProjectionFallbackPolicy {
+    All,
+    Adapter,
+}
+
 /// What counts as changed, as in Nx. Without `--head`, the working tree is
 /// compared, including uncommitted and untracked files.
 #[derive(Args)]
 struct ChangeOptions {
+    /// Project change-projection profile from nx.json.
+    #[arg(long)]
+    affected_profile: Option<String>,
+    /// Fail on all fallbacks, or only adapter failures with =adapter.
+    #[arg(long, requires = "affected_profile", value_enum, num_args = 0..=1,
+        require_equals = true, default_missing_value = "all")]
+    fail_on_projection_fallback: Option<ProjectionFallbackPolicy>,
     /// Base revision; defaults to NX_BASE, then nx.json `defaultBase`, then `main`.
     #[arg(long)]
     base: Option<String>,
@@ -276,7 +289,8 @@ impl ChangeOptions {
 
     /// Whether any change option was given.
     fn given(&self) -> bool {
-        self.base.is_some()
+        self.affected_profile.is_some()
+            || self.base.is_some()
             || self.head.is_some()
             || self.stdin
             || !self.files.is_empty()
@@ -286,6 +300,15 @@ impl ChangeOptions {
 
     fn options(&self) -> qk_affected::Options {
         qk_affected::Options {
+            affected_profile: self.affected_profile.clone(),
+            fail_on_projection_fallback: self.fail_on_projection_fallback.map(
+                |policy| match policy {
+                    ProjectionFallbackPolicy::All => qk_affected::ProjectionFallbackPolicy::All,
+                    ProjectionFallbackPolicy::Adapter => {
+                        qk_affected::ProjectionFallbackPolicy::Adapter
+                    }
+                },
+            ),
             base: self.base.clone(),
             head: self.head.clone(),
             files: self.files.clone(),
@@ -303,7 +326,26 @@ impl ChangeOptions {
 
     fn analyse(&self, workspace: &Workspace) -> Result<qk_affected::Analysis> {
         let graph = ProjectGraph::build(workspace)?;
-        qk_affected::analyse(workspace, &graph, &self.options())
+        let analysis = qk_affected::analyse(workspace, &graph, &self.options())?;
+        for projection in &analysis.projections {
+            if projection.status == "fallback" {
+                let notice = self.fail_on_projection_fallback
+                    == Some(ProjectionFallbackPolicy::Adapter)
+                    && projection.fallback_kind
+                        == Some(qk_affected::ProjectionFallbackKind::Comparison);
+                eprintln!(
+                    "qk: {}affected projection {}: {} (using original changes)",
+                    if notice { "notice: " } else { "" },
+                    projection.name,
+                    projection
+                        .detail
+                        .as_deref()
+                        .unwrap_or("failed")
+                        .replace(['\n', '\r'], " ")
+                );
+            }
+        }
+        Ok(analysis)
     }
 }
 
@@ -1025,6 +1067,10 @@ fn run(mut cli: Cli) -> Result<i32> {
             granularity: Granularity::Task,
             options,
         } => {
+            anyhow::ensure!(
+                changes.affected_profile.is_none(),
+                "--affected-profile applies to project selection; task selection uses declared cache inputs"
+            );
             let selected = select_projects(&workspace.projects, &projects, &exclude)?;
             let candidates = requests(
                 &workspace,
@@ -1164,6 +1210,10 @@ fn run(mut cli: Cli) -> Result<i32> {
                     json,
                 },
         } => {
+            anyhow::ensure!(
+                changes.affected_profile.is_none(),
+                "--affected-profile applies to project selection; show tasks uses declared cache inputs"
+            );
             let selected = select_projects(&workspace.projects, &projects, &exclude)?;
             let graph = TaskGraph::build(
                 &workspace,

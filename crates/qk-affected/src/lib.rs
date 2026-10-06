@@ -9,16 +9,19 @@
 //! exactly what they did before.
 
 mod json_diff;
+mod projections;
+mod subprocess;
 mod tasks;
 
+pub use projections::{ProjectionFallbackKind, ProjectionFallbackPolicy, ProjectionReport};
 pub use tasks::{TaskAnalysis, TaskCause, TaskReason, affected_tasks};
 
 use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::process::Command;
+use subprocess::workspace_command;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use qk_cache::Pattern;
 use qk_config::Workspace;
 use qk_graph::{ProjectGraph, select_projects};
@@ -31,6 +34,8 @@ use json_diff::{Change, Kind};
 /// What to compare, as Nx's affected options spell it.
 #[derive(Clone, Debug, Default)]
 pub struct Options {
+    pub affected_profile: Option<String>,
+    pub fail_on_projection_fallback: Option<ProjectionFallbackPolicy>,
     pub base: Option<String>,
     pub head: Option<String>,
     pub files: Vec<String>,
@@ -62,6 +67,11 @@ pub fn affected_projects(
 /// The affected projects and why each one is affected.
 #[derive(Debug, Serialize)]
 pub struct Analysis {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projections: Vec<ProjectionReport>,
+    /// Changed paths after ignore rules, before applying a selected profile.
+    #[serde(rename = "originalFiles", skip_serializing_if = "Option::is_none")]
+    pub original_files: Option<Vec<String>>,
     /// The merge base compared against.
     pub base: Option<String>,
     /// The head revision; `None` compares the working tree.
@@ -268,6 +278,8 @@ pub fn analyse(workspace: &Workspace, graph: &ProjectGraph, options: &Options) -
         }
     }
     Ok(Analysis {
+        projections: changes.projections,
+        original_files: changes.original_files,
         base: changes.base,
         head: changes.head,
         range: changes.range,
@@ -326,6 +338,8 @@ pub struct Range {
 
 /// The changed files, and each one's content at the two revisions.
 struct Changes<'a> {
+    projections: Vec<ProjectionReport>,
+    original_files: Option<Vec<String>>,
     workspace: &'a Workspace,
     before_lockfile: OnceCell<std::result::Result<Lockfile, String>>,
     after_lockfile: OnceCell<std::result::Result<Lockfile, String>>,
@@ -349,9 +363,33 @@ enum FileChange {
 
 impl<'a> Changes<'a> {
     fn new(workspace: &'a Workspace, options: &Options) -> Result<Self> {
+        ensure!(
+            options.fail_on_projection_fallback.is_none() || options.affected_profile.is_some(),
+            "--fail-on-projection-fallback requires --affected-profile"
+        );
+        if options.fail_on_projection_fallback.is_some() {
+            ensure!(
+                !options.explicit_files
+                    && options.files.is_empty()
+                    && !options.uncommitted
+                    && !options.untracked,
+                "affected profiles require a committed base/head comparison; --files, --stdin, --uncommitted and --untracked cannot be combined with strict projection selection"
+            );
+            let head = options.head.clone().or_else(|| non_empty_env("NX_HEAD"));
+            ensure!(
+                head.as_ref().is_some_and(|head| !head.trim().is_empty()),
+                "affected profiles require --head (or NX_HEAD) for strict projection selection"
+            );
+        }
         let mut changes = Self::unfiltered(workspace, options)?;
         let ignore = qk_cache::SourceIgnore::new(&workspace.root)?;
         changes.files.retain(|file| !ignore.matches(file));
+        if let Some(profile) = &options.affected_profile {
+            changes.original_files = Some(changes.files.clone());
+            let (files, reports) = projections::apply(workspace, options, &changes, profile)?;
+            changes.files = files;
+            changes.projections = reports;
+        }
         Ok(changes)
     }
 
@@ -440,6 +478,8 @@ impl<'a> Changes<'a> {
             files.into_iter().collect()
         };
         Ok(Self {
+            projections: Vec::new(),
+            original_files: None,
             workspace,
             before_lockfile: OnceCell::new(),
             after_lockfile: OnceCell::new(),
@@ -515,7 +555,7 @@ impl<'a> Changes<'a> {
         match revision {
             None => std::fs::read_to_string(self.workspace.root.join(file)).ok(),
             Some(revision) => {
-                let output = Command::new("git")
+                let output = workspace_command("git")
                     .current_dir(&self.workspace.root)
                     .args(["show", &format!("{revision}:./{file}")])
                     .output()
@@ -573,7 +613,7 @@ fn upstream_of(root: &Path, branch: &str) -> Option<String> {
 }
 
 fn is_ancestor(root: &Path, ancestor: &str, descendant: &str) -> bool {
-    Command::new("git")
+    workspace_command("git")
         .current_dir(root)
         .args(["merge-base", "--is-ancestor", ancestor, descendant])
         .output()
@@ -632,7 +672,7 @@ fn git_paths(root: &Path, args: &[&str]) -> Result<Vec<String>> {
     let (command, rest) = args.split_first().context("a git command")?;
     let mut arguments = vec![*command, "-z"];
     arguments.extend(rest);
-    let output = Command::new("git")
+    let output = workspace_command("git")
         .current_dir(root)
         .args(&arguments)
         .output()
@@ -653,7 +693,7 @@ fn git_paths(root: &Path, args: &[&str]) -> Result<Vec<String>> {
 }
 
 fn git_lines(root: &Path, args: &[&str]) -> Result<Vec<String>> {
-    let output = Command::new("git")
+    let output = workspace_command("git")
         .current_dir(root)
         .args(args)
         .output()
