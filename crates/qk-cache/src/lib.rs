@@ -45,6 +45,7 @@ pub struct Cache {
     kept: std::sync::Mutex<std::collections::BTreeSet<String>>,
     /// Warm state being saved in the background.
     saves: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>,
+    cleanup: std::sync::Mutex<Option<store::Cleanup>>,
 }
 
 /// A task's output fingerprint for its dependents' keys, or why it has none:
@@ -101,6 +102,7 @@ impl Cache {
             reuse: true,
             kept: Default::default(),
             saves: Default::default(),
+            cleanup: Default::default(),
         }
     }
 
@@ -137,8 +139,8 @@ impl Cache {
         }
     }
 
-    /// Saves what later runs reuse and waits for background uploads to the
-    /// remote store, reporting failures.
+    /// Saves what later runs reuse and waits for background saves, uploads
+    /// and retired-output cleanup, reporting failures.
     pub fn finish(&self, workspace: &Workspace) {
         if !self.reuse {
             return;
@@ -156,6 +158,8 @@ impl Cache {
                 qk_executor::status!("qk: remote cache upload failed for {failure}");
             }
         }
+        let _profile = profile::span("cache", "restore_cleanup_wait");
+        self.cleanup.lock().unwrap().take();
     }
 
     fn snapshot(
