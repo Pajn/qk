@@ -44,18 +44,24 @@ pub fn explain(
                     Cause::Touched { reasons } => json!({"project": name, "reasons": reasons}),
                 })
                 .collect();
-            let report = json!({
+            let mut report = json!({
                 "project": project,
                 "affected": chain.is_some(),
                 "base": analysis.base,
                 "head": analysis.head,
                 "chain": steps,
             });
+            if !analysis.projections.is_empty() {
+                report["projections"] = serde_json::to_value(&analysis.projections)?;
+                report["originalFiles"] = serde_json::to_value(&analysis.original_files)?;
+                report["files"] = serde_json::to_value(&analysis.files)?;
+            }
             serde_json::to_writer_pretty(&mut *out, &report)?;
             writeln!(out)?;
         }
         (None, false) => {
             writeln!(out, "{}", comparison(analysis))?;
+            explain_projections(analysis, out)?;
             let names = graph_order(&workspace.projects, analysis.projects.keys().cloned());
             let width = names.iter().map(String::len).max().unwrap_or(0);
             for name in names {
@@ -74,6 +80,7 @@ pub fn explain(
         }
         (Some(project), false) => {
             writeln!(out, "{}", comparison(analysis))?;
+            explain_projections(analysis, out)?;
             let Some(chain) = analysis.chain(project) else {
                 writeln!(out, "{project} is not affected.")?;
                 return Ok(());
@@ -130,13 +137,60 @@ pub fn explain(
     Ok(())
 }
 
+fn explain_projections(analysis: &Analysis, out: &mut impl Write) -> Result<()> {
+    for projection in &analysis.projections {
+        writeln!(
+            out,
+            "Projection {}: {}; {} source change{}, {} artifact change{}{}.",
+            projection.name,
+            projection.status,
+            projection.sources.len(),
+            if projection.sources.len() == 1 {
+                ""
+            } else {
+                "s"
+            },
+            projection.artifacts.len(),
+            if projection.artifacts.len() == 1 {
+                ""
+            } else {
+                "s"
+            },
+            projection
+                .detail
+                .as_ref()
+                .map(|detail| format!("; {detail}"))
+                .unwrap_or_default()
+        )?;
+        for path in &projection.artifacts {
+            writeln!(out, "  {path}")?;
+        }
+    }
+    Ok(())
+}
+
 fn comparison(analysis: &Analysis) -> String {
-    comparison_of(
-        analysis.files.len(),
+    let mut text = comparison_of(
+        analysis
+            .original_files
+            .as_ref()
+            .map_or(analysis.files.len(), Vec::len),
         analysis.base.as_deref(),
         analysis.head.as_deref(),
         analysis.range.as_ref(),
-    )
+    );
+    if analysis.original_files.is_some() {
+        text.push_str(&format!(
+            "\n{} {} after projection.",
+            analysis.files.len(),
+            if analysis.files.len() == 1 {
+                "file"
+            } else {
+                "files"
+            }
+        ));
+    }
+    text
 }
 
 /// What was compared, then how the base was found and a warning when the

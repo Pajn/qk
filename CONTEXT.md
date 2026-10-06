@@ -19,6 +19,11 @@ A task selected because revision changes touch its inputs, or because it
 depends on an affected task. Selection can be conservative and does not
 guarantee that the task's cache key changes.
 
+**Change projection**:
+An opt-in comparison of declared source changes through consumer-specific
+artifact fingerprints at two revisions. It refines affected project selection
+without changing declared task inputs or cache keys.
+
 **Result record**:
 A saved successful task result, identified by its cache key, that describes
 the task's outputs and recorded log.

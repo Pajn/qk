@@ -1079,6 +1079,8 @@ name = "qk-affected"
 version = "0.2.1"
 dependencies = [
  "anyhow",
+ "command-group",
+ "globset",
  "ignore",
  "qk-cache",
  "qk-config",
