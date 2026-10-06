@@ -221,9 +221,9 @@ struct RunOptions {
     #[arg(long)]
     dry_run: bool,
     /// How task output is shown, as in Nx. Defaults to NX_DEFAULT_OUTPUT_STYLE,
-    /// else raw output for `run`, and for several tasks `static` in CI or when
-    /// not on a terminal, `stream` otherwise. The interactive styles render as
-    /// `static`.
+    /// else `static` in CI, else raw output for `run`, and for several tasks
+    /// the live panel on a terminal and `quiet` otherwise. The interactive
+    /// styles render as `static` off a terminal.
     #[arg(long, value_enum)]
     output_style: Option<OutputStyle>,
     /// Write a JSON report of the run to this file; also NX_RUN_REPORT.
@@ -501,43 +501,48 @@ enum Rendered {
 
 impl OutputStyle {
     /// The style qk renders; the interactive ones need stderr to be a
-    /// terminal, and are static otherwise, as in Nx.
-    fn rendered(self) -> Rendered {
+    /// terminal, and are static otherwise, as in Nx. `static` for a single
+    /// `run` streams the requested task, as `nx run` does.
+    fn rendered(self, single: bool) -> Rendered {
         use std::io::IsTerminal;
+        let fixed = if single {
+            qk_executor::OutputStyle::RunOne
+        } else {
+            qk_executor::OutputStyle::Static
+        };
         match self {
             Self::Stream => Rendered::Lines(qk_executor::OutputStyle::Stream),
             Self::StreamWithoutPrefixes => {
                 Rendered::Lines(qk_executor::OutputStyle::StreamWithoutPrefixes)
             }
-            Self::Static => Rendered::Lines(qk_executor::OutputStyle::Static),
+            Self::Static => Rendered::Lines(fixed),
             Self::Quiet => Rendered::Quiet,
             Self::Tui | Self::Dynamic | Self::DynamicLegacy => {
                 if io::stderr().is_terminal() {
                     Rendered::Dynamic
                 } else {
-                    Rendered::Lines(qk_executor::OutputStyle::Static)
+                    Rendered::Lines(fixed)
                 }
             }
         }
     }
 }
 
-/// The output style when none is given: `NX_DEFAULT_OUTPUT_STYLE`, else raw for
-/// a single `run`, else Nx's choice for several tasks without its terminal UI.
-/// The output style when none is given: `NX_DEFAULT_OUTPUT_STYLE`, else raw
-/// for a single `run`; for several tasks `static` in CI, for full logs, the
-/// live panel on a terminal, and `quiet` otherwise, for agents and scripts.
+/// The output style when none is given: `NX_DEFAULT_OUTPUT_STYLE`, else
+/// `static` in CI, for full logs; raw for a single `run`; and for several
+/// tasks the live panel on a terminal, and `quiet` otherwise, for agents and
+/// scripts.
 fn default_output_style(single: bool) -> Rendered {
     use std::io::IsTerminal;
     if let Ok(name) = std::env::var("NX_DEFAULT_OUTPUT_STYLE")
         && let Ok(style) = OutputStyle::from_str(&name, false)
     {
-        return style.rendered();
+        return style.rendered(single);
     }
-    if single {
+    if std::env::var_os("CI").is_some_and(|value| value != "false") {
+        OutputStyle::Static.rendered(single)
+    } else if single {
         Rendered::Lines(qk_executor::OutputStyle::StreamWithoutPrefixes)
-    } else if std::env::var_os("CI").is_some_and(|value| value != "false") {
-        Rendered::Lines(qk_executor::OutputStyle::Static)
     } else if io::stderr().is_terminal() {
         Rendered::Dynamic
     } else {
@@ -1357,10 +1362,15 @@ fn execute_tasks(
     // A sandboxed task has to run to be observed.
     let skip_cache =
         options.skips_cache() || options.sandbox.is_some() || options.input_analysis.is_some();
-    let rendered = options
-        .output_style
-        .map_or_else(|| default_output_style(single), OutputStyle::rendered);
+    let rendered = options.output_style.map_or_else(
+        || default_output_style(single),
+        |style| style.rendered(single),
+    );
     let sink = match rendered {
+        Rendered::Lines(qk_executor::OutputStyle::Static | qk_executor::OutputStyle::RunOne) => {
+            qk_executor::report::install(Box::new(ui::Static));
+            ui::SinkKind::Static
+        }
         Rendered::Lines(_) => ui::SinkKind::Lines,
         Rendered::Quiet => {
             let quiet = Arc::new(ui::Quiet::default());
@@ -1412,6 +1422,10 @@ fn execute_tasks(
         std::num::NonZeroUsize::get,
     );
     let expected = history::expected(workspace);
+    let title = ui::Title::new(&graph, single);
+    if matches!(sink, ui::SinkKind::Static) {
+        qk_executor::report::write_all(true, title.start(ui::Paint::log()).as_bytes());
+    }
     let started = std::time::SystemTime::now();
     let result = qk_runner::run(
         workspace,
@@ -1458,7 +1472,11 @@ fn execute_tasks(
             Err(error) => qk_executor::status!("qk: could not prune the cache: {error:#}"),
         }
     }
-    if !single || !matches!(sink, ui::SinkKind::Lines) {
+    if matches!(sink, ui::SinkKind::Static) {
+        let summary =
+            ui::static_summary(&title, &result, &report, parallel, cores, ui::Paint::log());
+        qk_executor::report::write_all(true, summary.as_bytes());
+    } else if !single || !matches!(sink, ui::SinkKind::Lines) {
         let summary = ui::summary(
             &result,
             &report,

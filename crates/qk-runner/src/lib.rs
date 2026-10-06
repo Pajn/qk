@@ -146,17 +146,29 @@ pub fn run(
                 .with_context(|| format!("cannot execute {id}"))
                 .map(|mut prepared| {
                     let continuous = task.definition.continuous == Some(true);
-                    prepared.display = Display::for_task(style, id, &task.project, continuous);
+                    // A task without commands, as nx:noop's, has nothing to
+                    // show, and Nx leaves it out of the log.
+                    prepared.display = if prepared.commands.is_empty() {
+                        Display::Hidden
+                    } else {
+                        Display::for_task(
+                            style,
+                            id,
+                            &task.project,
+                            continuous,
+                            graph.roots.contains(id),
+                        )
+                    };
                     (id.clone(), prepared)
                 })
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
     // As in Nx, the task a run is for can be interacted with, when it is a
-    // single command writing straight to the terminal; its dependencies
+    // single command streaming its output; its dependencies
     // have finished or run beside it without the terminal's input.
     if let [root] = graph.roots.iter().collect::<Vec<_>>()[..]
         && let Some(task) = prepared.get_mut(root)
-        && task.display == Display::Stream
+        && matches!(task.display, Display::Stream | Display::Headed { .. })
         && task.commands.len() == 1
     {
         task.interactive = true;

@@ -27,6 +27,9 @@ fn command(root: &Path, args: &[&str]) -> Command {
         .args(args);
     command.env_remove("NX_PARALLEL");
     command.env_remove("NX_CACHE_DIRECTORY");
+    // Output styles follow CI; tests that want it set it themselves.
+    command.env_remove("CI");
+    command.env_remove("GITHUB_ACTIONS");
     // What a task or package script running the tests would pass on to exec.
     command.env_remove("NX_TASK_TARGET_PROJECT");
     command.env_remove("npm_lifecycle_event");
@@ -267,7 +270,12 @@ fn failure_preserves_exit_code_skips_dependents_and_runs_independent_roots() {
             "static",
         ],
     );
-    assert!(String::from_utf8_lossy(&output.stderr).contains("qk: skipped app:build"));
+    let summary = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        summary.contains("Tasks not run because their dependencies failed:"),
+        "{summary}"
+    );
+    assert!(summary.contains(" app:build\n"), "{summary}");
 }
 
 #[test]
@@ -752,6 +760,63 @@ fn output_styles_follow_nx() {
     assert!(
         grouped.starts_with("\n::group::✅ > qk run app:build\n\none\ntwo\n::endgroup::\n"),
         "{grouped}"
+    );
+}
+
+#[test]
+fn a_static_run_streams_its_task_between_banners_like_nx_run() {
+    let temp = fixture(json!({
+        "dep": {"command": "echo dep", "cache": true, "inputs": []},
+        "build": {"command": "echo built", "dependsOn": ["dep"]},
+        "fail": {"command": "echo broken && exit 3", "dependsOn": ["dep"]}
+    }));
+    let run = |task: &str| {
+        let output = command(temp.path(), &["run", task])
+            .env_remove("NX_DEFAULT_OUTPUT_STYLE")
+            .env("CI", "true")
+            .env("GITHUB_ACTIONS", "true")
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap();
+        (
+            String::from_utf8(output.stdout).unwrap(),
+            String::from_utf8(output.stderr).unwrap(),
+        )
+    };
+    let (stdout, stderr) = run("app:build");
+    assert_eq!(
+        stdout,
+        "\n::group::✅ > qk run app:dep\n\ndep\n::endgroup::\n\n> qk run app:build\n\nbuilt\n"
+    );
+    assert!(
+        stderr.starts_with(
+            "\n QK   Running target build for project app and 1 task it depends on:\n"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "\n QK   Successfully ran target build for project app and 1 task it depends on\n"
+        ),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("qk: "), "{stderr}");
+    // A dependency from the cache shows only its header.
+    let (stdout, _) = run("app:build");
+    assert!(
+        stdout.starts_with(
+            "\n::group::⏩ > qk run app:dep  [existing outputs match the cache, left as is]\n\n::endgroup::\n"
+        ),
+        "{stdout}"
+    );
+    let (_, stderr) = run("app:fail");
+    assert!(
+        stderr.contains("Running target fail for project app and 1 task it depends on failed"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("Failed tasks:\n\n- app:fail (exit 3)\n"),
+        "{stderr}"
     );
 }
 
@@ -1564,10 +1629,11 @@ fn the_sandbox_reports_and_refuses_what_a_task_does_not_declare() {
         ],
     );
     assert!(!enforced.status.success());
-    let stdout = String::from_utf8_lossy(&enforced.stdout);
+    // The task `run` is for streams, so its errors stay on stderr.
+    let stderr = String::from_utf8_lossy(&enforced.stderr);
     assert!(
-        stdout.contains("other/notes.txt: Operation not permitted"),
-        "{stdout}"
+        stderr.contains("other/notes.txt: Operation not permitted"),
+        "{stderr}"
     );
     assert!(!temp.path().join("stray.txt").exists());
     assert!(temp.path().join("dist/out.txt").is_file());

@@ -260,6 +260,9 @@ impl Fixture {
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env_remove("NX_PARALLEL")
             .env_remove("NX_CACHE_DIRECTORY")
+            // Output styles follow CI; tests that want it set it themselves.
+            .env_remove("CI")
+            .env_remove("GITHUB_ACTIONS")
             // Fixture branches must not inherit the enclosing CI checkout.
             .env_remove("GITHUB_HEAD_REF")
             .env_remove("GITHUB_REF_NAME");
@@ -332,6 +335,18 @@ fn profiling_is_opt_in_and_preserves_cached_output_across_output_styles() {
 
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// Whether a static run's header says app:build came from the cache.
+fn cached(output: &Output) -> bool {
+    let stdout = stdout(output);
+    [
+        "[local cache]",
+        "[remote cache]",
+        "[existing outputs match the cache",
+    ]
+    .iter()
+    .any(|status| stdout.contains(&format!("> qk run app:build  {status}")))
 }
 
 fn artifact(root: &Path) -> String {
@@ -1999,6 +2014,7 @@ fn dependency_inputs_cover_transitive_dependencies_like_nx() {
     let check = || {
         let output = Command::new(env!("CARGO_BIN_EXE_qk"))
             .args(["--workspace", root.to_str().unwrap(), "run", "app:check"])
+            .env_remove("CI")
             .output()
             .unwrap();
         stderr(&success(output))
@@ -2879,7 +2895,7 @@ fn local_overrides_change_the_task_and_its_key() {
     fs::remove_file(fixture.root.join("project.local.json")).unwrap();
     let output = success(fixture.build(&fixture.root, &["--output-style", "static"]));
     assert!(stdout(&output).contains("one"));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("cache hit app:build"));
+    assert!(cached(&output), "{}", stdout(&output));
 }
 
 #[cfg(unix)]
@@ -3118,7 +3134,7 @@ fn the_thread_count_is_not_part_of_the_key() {
     success(fixture.build(&fixture.root, &["--cores", "8"]));
     let output =
         success(fixture.build(&fixture.root, &["--cores", "2", "--output-style", "static"]));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("cache hit app:build"));
+    assert!(cached(&output), "{}", stdout(&output));
 }
 
 #[cfg(unix)]
@@ -3214,11 +3230,7 @@ fn outputs_read_options_and_arguments_like_nx() {
     success(fixture.build(&fixture.root, &[]));
     fs::remove_dir_all(fixture.root.join("out")).unwrap();
     let hit = success(fixture.build(&fixture.root, &["--output-style", "static"]));
-    assert!(
-        stderr(&hit).contains("cache hit app:build"),
-        "{}",
-        stderr(&hit)
-    );
+    assert!(cached(&hit), "{}", stdout(&hit));
     assert_eq!(
         fs::read_to_string(fixture.root.join("out/app/file")).unwrap(),
         "built\n"
@@ -3244,11 +3256,7 @@ fn negated_outputs_are_neither_cached_nor_removed() {
     fs::remove_file(fixture.root.join("dist/app")).unwrap();
     fs::write(fixture.root.join("dist/cache/tmp"), "local").unwrap();
     let hit = success(fixture.build(&fixture.root, &["--output-style", "static"]));
-    assert!(
-        stderr(&hit).contains("cache hit app:build"),
-        "{}",
-        stderr(&hit)
-    );
+    assert!(cached(&hit), "{}", stdout(&hit));
     assert_eq!(
         fs::read_to_string(fixture.root.join("dist/app")).unwrap(),
         "kept\n"
@@ -3274,11 +3282,7 @@ fn a_build_target_without_outputs_caches_nx_defaults() {
     success(fixture.build(&fixture.root, &[]));
     fs::remove_dir_all(fixture.root.join("build")).unwrap();
     let hit = success(fixture.build(&fixture.root, &["--output-style", "static"]));
-    assert!(
-        stderr(&hit).contains("cache hit app:build"),
-        "{}",
-        stderr(&hit)
-    );
+    assert!(cached(&hit), "{}", stdout(&hit));
     assert_eq!(
         fs::read_to_string(fixture.root.join("build/app")).unwrap(),
         "built\n"
@@ -3309,8 +3313,7 @@ fn with_lib(inputs: Value) -> Fixture {
 }
 
 fn hit(fixture: &Fixture, root: &Path) -> bool {
-    let output = success(fixture.build(root, &["--output-style", "static"]));
-    stderr(&output).contains("cache hit app:build")
+    cached(&success(fixture.build(root, &["--output-style", "static"])))
 }
 
 #[test]
@@ -3423,7 +3426,7 @@ fn the_working_directory_can_be_an_input() {
             .current_dir(directory)
             .output()
             .unwrap();
-        stderr(&success(output)).contains("cache hit app:build")
+        cached(&success(output))
     };
     let sub = fixture.root.join("libs");
     assert!(!from(&fixture.root));
@@ -3494,11 +3497,7 @@ fn skipping_the_remote_cache_keeps_to_the_local_one() {
         .env("AWS_SECRET_ACCESS_KEY", "secret")
         .env_remove("CI");
     let output = success(command.output().unwrap());
-    assert!(
-        stderr(&output).contains("cache hit app:build"),
-        "{}",
-        stderr(&output)
-    );
+    assert!(cached(&output), "{}", stdout(&output));
     assert_eq!(server.writes(), 0);
     success(remote_build(&fixture, &[]));
     fs::write(fixture.root.join("src/input.txt"), "changed\n").unwrap();
@@ -3517,12 +3516,12 @@ fn the_cache_directory_can_be_set_as_in_nx() {
         for (name, value) in env {
             command.env(name, value);
         }
-        stderr(&success(command.output().unwrap()))
+        success(command.output().unwrap())
     };
     let env = [("NX_CACHE_DIRECTORY", "shared-cache")];
     run(&env);
     // The cache inside the workspace is not an input of the task it caches.
-    assert!(run(&env).contains("cache hit app:build"));
+    assert!(cached(&run(&env)));
     assert!(fixture.root.join("shared-cache/qk/v1").is_dir());
     let path = stdout(&success(
         fixture
@@ -3555,10 +3554,9 @@ fn negated_groups_in_inputs_leave_out_what_they_name() {
     fs::write(fixture.root.join("src/app.ts"), "app").unwrap();
     fs::write(fixture.root.join("src/app.test.ts"), "test").unwrap();
     let hit = |fixture: &Fixture| {
-        stderr(&success(
+        cached(&success(
             fixture.build(&fixture.root, &["--output-style", "static"]),
         ))
-        .contains("cache hit app:build")
     };
     assert!(!hit(&fixture));
     fs::write(fixture.root.join("src/app.test.ts"), "changed test").unwrap();

@@ -59,19 +59,25 @@ requested targets and errors when nothing matches. `run`, `run-many` and
   colour for it; `stream-without-prefixes` passes output through untouched.
 - `static` holds each task's output until it ends and prints it under
   `> qk run <task>`, marked `[local cache]` for a hit, and in GitHub Actions
-  folds each task into a log group unless `NX_SKIP_LOG_GROUPING=true`.
+  folds each task into a log group unless `NX_SKIP_LOG_GROUPING=true`. As
+  in Nx, the run opens with a banner naming what it runs and ends with one
+  saying whether it succeeded, listing failed tasks and those not run
+  because of them. For `run`, `static` follows `nx run`: the requested task
+  streams under its header as it runs, and its dependencies are held, with
+  only the header shown for a cache hit.
 
-Without the option, `NX_DEFAULT_OUTPUT_STYLE` applies; otherwise `run` passes
-output through, and `run-many` and `affected` use `static` in CI, the live
-panel on a terminal, and `quiet` otherwise. The line-based styles print
-`qk:` status lines on stderr; the panel and `quiet` collect warnings for the
-summary instead. Continuous tasks stream with prefixes under `static` and
+Without the option, `NX_DEFAULT_OUTPUT_STYLE` applies; otherwise every
+command uses `static` in CI; `run` passes output through, and `run-many` and
+`affected` use the live panel on a terminal and `quiet` otherwise. `stream`
+and `stream-without-prefixes` print `qk:` status lines on stderr; `static`
+shows each task's status in its header instead, and the panel and `quiet`
+collect warnings for the summary. Continuous tasks stream with prefixes under `static` and
 `stream`, since their output would otherwise never appear. Colour follows
 picocolors: off with `NO_COLOR`, on with `FORCE_COLOR`, in CI or on a
 terminal.
 
-Runs of several tasks, and any run in the panel or `quiet`, end with a
-summary on stderr: how many tasks succeeded and came from cache, or which
+Runs of several tasks, and any run under `static`, the panel or `quiet`,
+end with a summary on stderr: how many tasks succeeded and came from cache, or which
 failed and which were skipped because of them; the critical path with its
 three longest tasks, in the order they ran; and whether `--parallel` held the
 run back. For that, qk records how long each task waited for a free slot
