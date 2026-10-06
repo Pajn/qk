@@ -1172,6 +1172,7 @@ dependencies = [
  "qk-taskgraph",
  "serde_json",
  "shlex",
+ "tempfile",
 ]
 
 [[package]]

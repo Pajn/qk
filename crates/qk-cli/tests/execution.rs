@@ -2706,3 +2706,221 @@ fn colon_target_inspection_uses_the_execution_identifier() {
     assert_eq!(configured["target"], "install:ios");
     assert_eq!(configured["configuration"], "ci");
 }
+
+#[test]
+fn task_path_helper() {
+    if std::env::var_os("QK_TASK_PATH_HELPER").is_none() {
+        return;
+    }
+    fs::write(
+        "task-path.json",
+        serde_json::to_vec(
+            &std::env::split_paths(&std::env::var_os("PATH").unwrap()).collect::<Vec<_>>(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn task_path_prioritizes_local_tools_then_the_node_directory() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().canonicalize().unwrap().join("repo");
+    let cwd = root.join("packages/app");
+    let early = temp.path().join("early");
+    let node = temp.path().join("node-bin");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&early).unwrap();
+    fs::create_dir_all(&node).unwrap();
+    fs::copy(
+        std::env::current_exe().unwrap(),
+        node.join(format!("node{}", std::env::consts::EXE_SUFFIX)),
+    )
+    .unwrap();
+    let path = std::env::join_paths([early.clone(), node.clone()]).unwrap();
+    fs::write(root.join("nx.json"), "{}").unwrap();
+    fs::write(root.join("project.json"), json!({"name":"app", "targets":{"build":{"command":format!("\"{}\" --exact task_path_helper --nocapture", std::env::current_exe().unwrap().display()), "options":{"cwd":"packages/app/../app", "env":{"QK_TASK_PATH_HELPER":"1", "PATH":early.to_str().unwrap()}}}}}).to_string()).unwrap();
+    success(
+        command(&root, &["run", "app:build"])
+            .env("PATH", &path)
+            .output()
+            .unwrap(),
+    );
+    let actual: Vec<PathBuf> =
+        serde_json::from_slice(&fs::read(cwd.join("task-path.json")).unwrap()).unwrap();
+    let task_cwd = qk_config::Workspace::load(&root)
+        .unwrap()
+        .root
+        .join("packages/app");
+    let mut expected: Vec<_> = task_cwd
+        .ancestors()
+        .map(|dir| dir.join("node_modules/.bin"))
+        .collect();
+    expected.extend([node.canonicalize().unwrap(), early.clone()]);
+    assert_eq!(actual, expected);
+    fs::remove_file(node.join(format!("node{}", std::env::consts::EXE_SUFFIX))).unwrap();
+    expected.remove(task_cwd.ancestors().count());
+    success(
+        command(&root, &["run", "app:build"])
+            .env("PATH", &path)
+            .output()
+            .unwrap(),
+    );
+    let actual: Vec<PathBuf> =
+        serde_json::from_slice(&fs::read(cwd.join("task-path.json")).unwrap()).unwrap();
+    assert_eq!(actual, expected);
+    #[cfg(unix)]
+    {
+        fs::copy(
+            std::env::current_exe().unwrap(),
+            node.join("version-manager"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("version-manager", node.join("node")).unwrap();
+        let later = temp.path().join("later-node-bin");
+        fs::create_dir_all(&later).unwrap();
+        fs::copy(std::env::current_exe().unwrap(), later.join("node")).unwrap();
+        let path = std::env::join_paths([early.clone(), node.clone(), later]).unwrap();
+        success(
+            command(&root, &["run", "app:build"])
+                .env("PATH", &path)
+                .output()
+                .unwrap(),
+        );
+        let actual: Vec<PathBuf> =
+            serde_json::from_slice(&fs::read(cwd.join("task-path.json")).unwrap()).unwrap();
+        assert_eq!(actual, expected);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn node_proxy_selection_precedes_task_environment_and_cwd_overrides() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let proxy = root.join("proxy-bin");
+    fs::create_dir_all(&proxy).unwrap();
+    for dir in ["runtime-a", "runtime-b", "nested"] {
+        fs::create_dir_all(root.join(dir)).unwrap();
+    }
+    for dir in ["runtime-a", "runtime-b"] {
+        fs::copy(
+            std::env::current_exe().unwrap(),
+            root.join(dir).join("node"),
+        )
+        .unwrap();
+    }
+    fs::write(
+        proxy.join("manager"),
+        "#!/bin/sh\nprintf 'probe\\n' >> \"$PROBE_LOG\"\nprintf '%s\\n' \"$NODE_REAL_PATH\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(proxy.join("manager"), fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink("manager", proxy.join("node")).unwrap();
+    let definition = |runtime: &str, cwd: &str| {
+        json!({"command":helper().replace("process_helper", "task_path_helper"), "cache":true, "inputs":["{workspaceRoot}/project.json", {"runtime":helper().replace("process_helper", "runtime_path_input_helper")}], "outputs":[format!("{{workspaceRoot}}/{cwd}/task-path.json")], "options":{"cwd":cwd,"env":{
+            "PATH":proxy.to_str().unwrap(), "QK_TASK_PATH_HELPER":"1", "PROBE_LOG":root.join("probes").to_str().unwrap(), "NODE_REAL_PATH":root.join(runtime).join("node").to_str().unwrap()
+        }}})
+    };
+    fs::write(root.join("nx.json"), "{}").unwrap();
+    fs::write(
+        root.join("project.json"),
+        json!({"name":"app","targets":{
+            "one":definition("runtime-a", "."), "two":definition("runtime-a", "."),
+            "three":definition("runtime-b", "."), "four":definition("runtime-a", "nested")
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    for _ in 0..2 {
+        success(
+            command(
+                &root,
+                &["run-many", "-t", "one,two,three,four", "--parallel", "1"],
+            )
+            .env("PATH", &proxy)
+            .env("PROBE_LOG", root.join("probes"))
+            .env("NODE_REAL_PATH", root.join("runtime-a/node"))
+            .output()
+            .unwrap(),
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(root.join("probes"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    fs::remove_file(proxy.join("node")).unwrap();
+    fs::copy(proxy.join("manager"), proxy.join("node")).unwrap();
+    success(
+        command(
+            &root,
+            &[
+                "run-many",
+                "-t",
+                "one,two,three,four",
+                "--parallel",
+                "1",
+                "--skip-nx-cache",
+            ],
+        )
+        .env("PATH", &proxy)
+        .env("PROBE_LOG", root.join("probes"))
+        .env("NODE_REAL_PATH", root.join("runtime-a/node"))
+        .output()
+        .unwrap(),
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("probes"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+    let actual: Vec<PathBuf> =
+        serde_json::from_slice(&fs::read(root.join("nested/task-path.json")).unwrap()).unwrap();
+    assert!(actual.contains(&root.join("runtime-a")));
+}
+
+#[test]
+fn runtime_path_input_helper() {
+    if std::env::var_os("QK_TASK_PATH_HELPER").is_none() {
+        return;
+    }
+    println!("runtime stable");
+    std::process::exit(0);
+}
+
+#[cfg(unix)]
+#[test]
+fn cwd_preserves_symlink_parent_resolution_while_path_ancestors_are_normalized() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().canonicalize().unwrap().join("repo");
+    let tools = root.join("tools");
+    let outside = root.parent().unwrap().join("outside");
+    fs::create_dir_all(&tools).unwrap();
+    fs::create_dir_all(outside.join("package")).unwrap();
+    std::os::unix::fs::symlink(outside.join("package"), tools.join("link")).unwrap();
+    fs::write(root.join("nx.json"), "{}").unwrap();
+    let definition = |cwd: String| json!({"command":helper().replace("process_helper", "task_path_helper"), "options":{"cwd":cwd,"env":{"QK_TASK_PATH_HELPER":"1"}}});
+    fs::write(
+        root.join("project.json"),
+        json!({"name":"app","targets":{
+            "relative":definition("tools/link/..".into()),
+            "absolute":definition(tools.join("link/..").to_str().unwrap().into())
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    for task in ["app:relative", "app:absolute"] {
+        success(run(&root, &["run", task]));
+        assert!(!tools.join("task-path.json").exists());
+        let paths: Vec<PathBuf> =
+            serde_json::from_slice(&fs::read(outside.join("task-path.json")).unwrap()).unwrap();
+        assert_eq!(paths[0], tools.join("node_modules/.bin"));
+        fs::remove_file(outside.join("task-path.json")).unwrap();
+    }
+}

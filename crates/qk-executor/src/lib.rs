@@ -20,6 +20,168 @@ pub use capture::{
 };
 pub use process::{Outcome, execute, execute_captured, shell};
 
+#[derive(Debug)]
+struct NodeRuntime {
+    root: PathBuf,
+    env: BTreeMap<OsString, OsString>,
+    paths: Vec<PathBuf>,
+    directory: std::sync::OnceLock<Option<PathBuf>>,
+}
+
+/// The runner's Node selection, resolved only when a command starts.
+#[derive(Clone, Debug)]
+pub struct NodePath {
+    runtime: std::sync::Arc<NodeRuntime>,
+    local_entries: usize,
+}
+
+impl NodePath {
+    fn new(root: &Path, env: &BTreeMap<OsString, OsString>, local_entries: usize) -> Self {
+        type Key = (PathBuf, BTreeMap<OsString, OsString>);
+        static RUNTIMES: std::sync::OnceLock<
+            std::sync::Mutex<BTreeMap<Key, std::sync::Arc<NodeRuntime>>>,
+        > = std::sync::OnceLock::new();
+        let mut runtimes = RUNTIMES.get_or_init(Default::default).lock().unwrap();
+        let runtime = runtimes
+            .entry((root.to_owned(), env.clone()))
+            .or_insert_with(|| {
+                let paths = env
+                    .get(&path_key(env))
+                    .map(|path| std::env::split_paths(path).collect())
+                    .unwrap_or_default();
+                std::sync::Arc::new(NodeRuntime {
+                    root: root.to_owned(),
+                    env: env.clone(),
+                    paths,
+                    directory: Default::default(),
+                })
+            })
+            .clone();
+        Self {
+            runtime,
+            local_entries,
+        }
+    }
+
+    fn path(&self, env: &BTreeMap<OsString, OsString>) -> Result<Option<(OsString, OsString)>> {
+        // Select before task overrides, like process.execPath in Nx. Cache hits
+        // never call this, and concurrent commands share the same proxy probe.
+        let Some(directory) = self.runtime.directory.get_or_init(|| {
+            node_directory(&self.runtime.root, &self.runtime.paths, &self.runtime.env)
+        }) else {
+            return Ok(None);
+        };
+        let key = path_key(env);
+        let mut paths: Vec<_> = env
+            .get(&key)
+            .map(|path| std::env::split_paths(path).collect())
+            .unwrap_or_default();
+        paths.insert(self.local_entries.min(paths.len()), directory.clone());
+        Ok(Some((
+            key,
+            std::env::join_paths(paths).context("cannot construct task PATH")?,
+        )))
+    }
+}
+
+fn path_key(env: &BTreeMap<OsString, OsString>) -> OsString {
+    if cfg!(windows) {
+        env.keys()
+            .find(|key| key.to_string_lossy().eq_ignore_ascii_case("PATH"))
+            .cloned()
+            .unwrap_or_else(|| "PATH".into())
+    } else {
+        "PATH".into()
+    }
+}
+
+fn environment_key(env: &BTreeMap<OsString, OsString>, name: OsString) -> OsString {
+    if cfg!(windows) && name.to_string_lossy().eq_ignore_ascii_case("PATH") {
+        path_key(env)
+    } else {
+        name
+    }
+}
+
+fn node_directory(
+    cwd: &Path,
+    paths: &[PathBuf],
+    env: &BTreeMap<OsString, OsString>,
+) -> Option<PathBuf> {
+    let name = if cfg!(windows) { "node.exe" } else { "node" };
+    for directory in paths {
+        let candidate = cwd.join(directory).join(name);
+        let Ok(metadata) = candidate.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o111 == 0 {
+                continue;
+            }
+        }
+        // The first executable PATH match is authoritative, even if discovery fails.
+        let actual = candidate.canonicalize().ok()?;
+        if actual.file_name()? == name {
+            use std::io::Read;
+            let mut header = [0; 2];
+            let script = std::fs::File::open(&actual)
+                .and_then(|mut file| file.read_exact(&mut header))
+                .is_ok()
+                && header == *b"#!";
+            if !script {
+                return actual.parent().map(Path::to_owned);
+            }
+        }
+        return probe_node(&candidate, cwd, env);
+    }
+    None
+}
+
+fn probe_node(candidate: &Path, cwd: &Path, env: &BTreeMap<OsString, OsString>) -> Option<PathBuf> {
+    use std::io::{Read, Seek};
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    let mut output = tempfile::tempfile().ok()?;
+    let mut child = Command::new(candidate)
+        .args(["-p", "process.execPath"])
+        .current_dir(cwd)
+        .env_clear()
+        .envs(env)
+        .stdout(Stdio::from(output.try_clone().ok()?))
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                let mut bytes = Vec::new();
+                output.rewind().ok()?;
+                output.take(4096).read_to_end(&mut bytes).ok()?;
+                let path = PathBuf::from(std::str::from_utf8(&bytes).ok()?.trim());
+                return (path.is_absolute() && path.is_file())
+                    .then(|| path.parent().unwrap().to_owned());
+            }
+            Ok(None) if started.elapsed() < Duration::from_secs(2) => {
+                std::thread::sleep(Duration::from_millis(5))
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
 /// Reports a `qk:` warning to the installed sink; by default it is written to
 /// stderr in one write, so task processes sharing stderr cannot split it.
 #[macro_export]
@@ -80,6 +242,7 @@ pub struct PreparedTask {
     pub env: BTreeMap<OsString, OsString>,
     /// Dotenv, explicit settings and local binary lookup without task metadata.
     pub runtime_env: BTreeMap<OsString, OsString>,
+    pub node_path: Option<NodePath>,
     /// Variables set for the process after `env` that are not part of what
     /// the task is: nothing reads them to key it, such as a thread count.
     pub execution: BTreeMap<OsString, OsString>,
@@ -170,6 +333,7 @@ fn task_environment(
     };
     for file in files {
         for (name, value) in read_dotenv(&workspace.root.join(file))? {
+            let name = environment_key(&env, name);
             env.entry(name).or_insert(value);
         }
     }
@@ -324,6 +488,7 @@ pub fn prepare(
                 bail!("envFile {file} does not exist");
             }
             for (name, value) in read_dotenv(&path)? {
+                let name = environment_key(&env, name);
                 runtime_env.entry(name.clone()).or_insert(value.clone());
                 env.entry(name).or_insert(value);
             }
@@ -341,8 +506,9 @@ pub fn prepare(
                 .as_str()
                 .context("environment values must be strings")?;
             let value: OsString = interpolation.text(value)?.into();
-            runtime_env.insert(name.into(), value.clone());
-            env.insert(name.into(), value);
+            let name = environment_key(&env, name.into());
+            runtime_env.insert(name.clone(), value.clone());
+            env.insert(name, value);
         }
     }
     let mut execution = BTreeMap::new();
@@ -380,25 +546,26 @@ pub fn prepare(
         .transpose()?
         .unwrap_or(default_cwd);
     let cwd = workspace.root.join(interpolation.text(cwd)?);
+    let mut resolved = PathBuf::new();
+    for part in cwd.components() {
+        match part {
+            std::path::Component::ParentDir => {
+                resolved.pop();
+            }
+            std::path::Component::CurDir => {}
+            _ => resolved.push(part.as_os_str()),
+        }
+    }
     if !cwd.is_dir() {
         bail!("working directory does not exist: {}", cwd.display());
     }
     // Expose local binaries even for plain run-commands targets.
     let mut paths = Vec::new();
-    for directory in cwd
-        .ancestors()
-        .take_while(|directory| directory.starts_with(&workspace.root))
-    {
+    for directory in resolved.ancestors() {
         paths.push(directory.join("node_modules/.bin"));
     }
-    let path_key = if cfg!(windows) {
-        env.keys()
-            .find(|key| key.to_string_lossy().eq_ignore_ascii_case("PATH"))
-            .cloned()
-            .unwrap_or_else(|| "PATH".into())
-    } else {
-        "PATH".into()
-    };
+    let node_path = NodePath::new(&workspace.root, base_env, paths.len());
+    let path_key = path_key(&env);
     if let Some(path) = env.get(&path_key) {
         paths.extend(std::env::split_paths(path));
     }
@@ -543,6 +710,7 @@ pub fn prepare(
         cwd,
         env,
         runtime_env,
+        node_path: Some(node_path),
         execution,
         ready_when,
         ready: Default::default(),

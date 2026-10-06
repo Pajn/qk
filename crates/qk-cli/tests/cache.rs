@@ -22,6 +22,13 @@ fn process_helper() {
         fs::write(&input_path, "changed during consumer execution\n").unwrap();
     }
     let input = fs::read_to_string(input_path).unwrap();
+    #[cfg(unix)]
+    if mode == "colon-output" {
+        fs::create_dir_all("dist/build:debug").unwrap();
+        fs::write("dist/build:debug/output.txt", &input).unwrap();
+        std::os::unix::fs::symlink("build:debug/output.txt", "dist/latest:debug").unwrap();
+        return;
+    }
     if mode == "generate-source" {
         fs::write("src/generated.txt", input).unwrap();
         return;
@@ -1267,6 +1274,37 @@ fn detached_uploads_survive_parent_exit_and_local_cache_removal() {
     );
     let text = fs::read_to_string(log).unwrap();
     assert!(!text.contains("secret"));
+}
+
+#[cfg(unix)]
+#[test]
+fn colon_artifacts_survive_local_and_remote_restore() {
+    let server = s3::FakeS3::start();
+    let fixture = Fixture::new(target("colon-output", json!({})));
+    with_remote(&fixture, &server, json!({}));
+    success(remote_build(&fixture, &[]));
+    for remote in [false, true] {
+        fs::remove_dir_all(fixture.root.join("dist")).unwrap();
+        if remote {
+            clear_local_cache(&fixture);
+        }
+        let output = success(remote_build(&fixture, &[]));
+        let hit = if remote {
+            "qk: remote cache hit"
+        } else {
+            "qk: cache hit"
+        };
+        assert!(stderr(&output).contains(hit), "{}", stderr(&output));
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("dist/latest:debug")).unwrap(),
+            "one\n"
+        );
+        assert_eq!(
+            fs::read_link(fixture.root.join("dist/latest:debug")).unwrap(),
+            Path::new("build:debug/output.txt")
+        );
+        assert_eq!(fixture.runs(), 1);
+    }
 }
 
 #[test]

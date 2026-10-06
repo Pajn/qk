@@ -893,6 +893,7 @@ impl Resolver<'_> {
                 let mut prepared = prepared.clone();
                 prepared.env = prepared.runtime_env.clone();
                 prepared.execution.clear();
+                prepared.node_path = None;
                 prepared.commands = vec![command.into()];
                 prepared.cwd = self.workspace.root.clone();
                 prepared.parallel = false;

@@ -117,7 +117,8 @@ pub fn relative(root: &Path, path: &Path) -> Result<String> {
 
 pub fn validate_path(path: &str) -> Result<()> {
     if path.is_empty()
-        || path.contains(['\\', ':', '\0'])
+        || path.contains(['\\', '\0'])
+        || (cfg!(windows) && path.contains(':'))
         || Path::new(path).is_absolute()
         || Path::new(path)
             .components()
