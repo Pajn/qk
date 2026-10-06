@@ -40,6 +40,11 @@ included. Dotenv files are not, as in Nx: they hold per-machine values and
 credentials, so keying them would keep machines from sharing entries; `env`
 inputs key the variables a task declares.
 
+`qk show hash <task>` prints a task's key and what it is computed from
+without running it, and `--against` compares it with another task's key or
+with the task's key in a recorded run; see
+[Key inspection](../reference/cli.md#key-inspection).
+
 A pnpm v9 `pnpm-lock.yaml` is keyed by what it installs rather than by its
 content: for the root importer and the importers of the task's project and
 its transitive project dependencies, every package installation they reach,

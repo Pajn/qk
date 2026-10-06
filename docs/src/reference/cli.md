@@ -26,6 +26,7 @@
 | `qk show flaky [task]` | Mixed successful/failed executions for identical declared inputs |
 | `qk show log <run> <task>` | Replay retained stdout/stderr from an actual cacheable execution |
 | `qk show task <project:target>` | A task's recent runs and why its cache key changed |
+| `qk show hash <project:target> [--against <task\|run>]` | A task's cache key and what it covers, or where it differs from another key, without running the task |
 | `qk cache path` | Print the local cache directory without creating it |
 | `qk cache prune [--max-size 1GB]` | Evict least recently used entries until the cache fits |
 | `qk warm suggest <project:target>` | Run a task in the sandbox and list directories it wrote outside its outputs, as candidate warm paths (macOS) |
@@ -207,6 +208,46 @@ Both input and output commands accept `--check <values...>`. File and directory
 queries use workspace-relative paths. Inputs also accept declared environment
 variable names and runtime commands. The command exits with 1 if any query does
 not match. `--json` returns each query and its membership result.
+
+## Key inspection
+
+`qk show hash <project:target[:configuration]>` prints the key `qk run` would
+cache the task under now, without running the task, and a summary of what the
+key covers: the declared inputs, file count, env and runtime values,
+dependencies and tooling. `--json` prints the key and everything it is computed
+from, with env values replaced by their digest. Arguments after `--` are
+forwarded as `qk run` forwards them, to both tasks with `--against <task>`. A target name without a project uses the
+current project.
+
+Computing a key executes the task's runtime inputs. Dependencies are not run:
+each counts as having succeeded, with its outputs as they are on disk, so a
+dependency that has not run yet, or whose outputs are stale, keys differently
+here than after it runs.
+
+`--against <task>` keys another task the same way and lists where the two keys
+differ: the definition fields with both values, the files added, removed or
+changed, and the values and dependencies that differ. `--against <run-id>`
+compares with this task's key in a recorded run, as `qk show runs` lists them,
+while that run's inputs are kept. Differences read from the `--against` key to
+this one. Two different tasks always differ in `id`. With `--json`, the report
+holds both keys and their inputs, `same`, and `differences` in the shape
+`qk show task` reports causes.
+
+```text
+$ qk show hash web:build --against web:check
+web:build  55a02f0c…
+web:check  963b6121…
+keys differ in: definition, files
+  field id: "web:check" -> "web:build"
+  field definition.inputs[0]: "{projectRoot}/src/**/*" -> "{projectRoot}/**/*"
+  field definition.inputs[1]: {"runtime":"node -v"} -> {"env":"MODE"}
+  field definition.inputs[2]: {"env":"MODE"} -> {"runtime":"node -v"}
+  added apps/web/README.md
+```
+
+The target definition is part of the key as written, so reordering `inputs`
+changes the key even when the files and values it selects do not; such a
+change shows as `definition.inputs reordered`.
 
 ## Project watch
 

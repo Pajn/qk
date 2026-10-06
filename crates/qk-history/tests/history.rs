@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use qk_history::{CriticalPath, History, RunReport, TaskReport, critical_path};
+use qk_history::{CriticalPath, History, RunReport, TaskReport, critical_path, diff};
 use serde_json::{Value, json};
 
 fn task(
@@ -122,6 +122,43 @@ fn explains_what_changed_since_the_previous_key() {
     let runs = history.runs(10).unwrap();
     assert_eq!(runs.len(), 3);
     assert_eq!(runs[0].cache["miss"], 1);
+}
+
+#[test]
+fn names_the_definition_fields_that_differ() {
+    let inputs = |id: &str, inputs: Value, command: &str| json!({"id": id, "definition": {"inputs": inputs, "options": {"command": command}}});
+    let before = inputs(
+        "app:a",
+        json!(["default", {"env": "MODE"}, {"runtime": "node -v"}]),
+        "tsc",
+    );
+    let after = inputs(
+        "app:a",
+        json!(["default", {"runtime": "node -v"}, {"env": "MODE"}]),
+        "tsc",
+    );
+    let cause = diff(&before, &after);
+    assert_eq!(cause.changed, ["definition"]);
+    assert_eq!(cause.definition, ["definition.inputs reordered"]);
+
+    let after = inputs(
+        "app:b",
+        json!(["src/**", {"env": "MODE"}, {"runtime": "node -v"}]),
+        "tsc -b",
+    );
+    assert_eq!(
+        diff(&before, &after).definition,
+        [
+            r#"id: "app:a" -> "app:b""#,
+            r#"definition.inputs[0]: "default" -> "src/**""#,
+            r#"definition.options.command: "tsc" -> "tsc -b""#,
+        ]
+    );
+    let after = inputs("app:a", json!(["default"]), "tsc");
+    assert_eq!(
+        diff(&before, &after).definition,
+        ["definition.inputs: 3 -> 1 entries"]
+    );
 }
 
 #[test]

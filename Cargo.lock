@@ -1128,6 +1128,7 @@ name = "qk-cli"
 version = "0.3.1"
 dependencies = [
  "anyhow",
+ "blake3",
  "clap",
  "ctrlc",
  "notify",
