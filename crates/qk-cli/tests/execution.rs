@@ -778,10 +778,8 @@ fn a_static_run_streams_its_task_between_banners_like_nx_run() {
             .env("NO_COLOR", "1")
             .output()
             .unwrap();
-        (
-            String::from_utf8(output.stdout).unwrap(),
-            String::from_utf8(output.stderr).unwrap(),
-        )
+        let text = |bytes: Vec<u8>| String::from_utf8(bytes).unwrap().replace("\r\n", "\n");
+        (text(output.stdout), text(output.stderr))
     };
     let (stdout, stderr) = run("app:build");
     assert_eq!(
@@ -1716,7 +1714,8 @@ fn the_sandbox_refuses_what_a_task_does_not_declare_on_linux() {
     assert!(temp.path().join("dist/out.txt").is_file());
     let peek = sandboxed("app:peek");
     assert!(!peek.status.success());
-    assert!(String::from_utf8_lossy(&peek.stdout).contains("Permission denied"));
+    // The task `run` is for streams, so its errors stay on stderr.
+    assert!(String::from_utf8_lossy(&peek.stderr).contains("Permission denied"));
     assert!(!sandboxed("app:stray").status.success());
     assert!(!temp.path().join("stray.txt").exists());
     // Audit needs reports Landlock does not give.
