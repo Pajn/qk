@@ -2030,6 +2030,154 @@ fn dependency_inputs_cover_transitive_dependencies_like_nx() {
 }
 
 #[test]
+fn dependency_manifests_count_by_what_they_decide_for_dependents() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    let write = |path: &str, text: &str| {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    };
+    let lib = |extra: Value| {
+        let mut manifest = json!({
+            "name": "lib", "version": "1.0.0", "exports": "./src/index.js",
+            "scripts": {"build": "echo lib"}, "dependencies": {"tool": "^1.0.0"},
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            manifest[key] = value.clone();
+        }
+        manifest.to_string()
+    };
+    write("nx.json", "{}");
+    write("package.json", r#"{"name":"root","private":true}"#);
+    write("pnpm-workspace.yaml", "packages:\n  - app\n  - lib\n");
+    write(
+        "app/package.json",
+        r#"{"name":"app","scripts":{"start":"echo app"},"dependencies":{"lib":"workspace:*"}}"#,
+    );
+    write(
+        "app/project.json",
+        r#"{"name":"app","targets":{"check":{"command":"echo checked","cache":true,"inputs":["{projectRoot}/src/**/*"]}}}"#,
+    );
+    write("app/src/main.js", "main");
+    write("lib/package.json", &lib(json!({})));
+    write("lib/src/index.js", "lib");
+    let check = || {
+        let output = Command::new(env!("CARGO_BIN_EXE_qk"))
+            .args(["--workspace", root.to_str().unwrap(), "run", "app:check"])
+            .env_remove("CI")
+            .output()
+            .unwrap();
+        stderr(&success(output))
+    };
+    assert!(check().contains("cache miss"));
+    assert!(check().contains("cache hit"));
+    // Metadata in a dependency's manifest cannot change what the app reads or runs.
+    write(
+        "lib/package.json",
+        &lib(
+            json!({"version": "1.1.0", "scripts": {"build": "echo other"}, "description": "a lib"}),
+        ),
+    );
+    assert!(check().contains("cache hit"));
+    // Where the app's imports of it resolve does, though the inputs leave the file out.
+    write(
+        "lib/package.json",
+        &lib(json!({"exports": "./src/other.js"})),
+    );
+    assert!(check().contains("cache miss"));
+    // Without a readable lockfile, a dependency's declarations count here.
+    write(
+        "lib/package.json",
+        &lib(json!({"exports": "./src/other.js", "dependencies": {"tool": "^2.0.0"}})),
+    );
+    assert!(check().contains("cache miss"));
+    // The task's own manifest counts whole, scripts included.
+    write(
+        "app/package.json",
+        r#"{"name":"app","scripts":{"start":"echo other"},"dependencies":{"lib":"workspace:*"}}"#,
+    );
+    assert!(check().contains("cache miss"));
+    assert!(check().contains("cache hit"));
+
+    // With a readable lockfile, declarations count through what they install.
+    let lock = |tool: &str| {
+        format!(
+            "lockfileVersion: '9.0'
+importers:
+  .: {{}}
+  app:
+    dependencies:
+      lib:
+        specifier: workspace:*
+        version: link:../lib
+  lib:
+    dependencies:
+      tool:
+        specifier: ^2.0.0
+        version: {tool}
+packages:
+  tool@{tool}:
+    resolution: {{integrity: sha512-tool}}
+snapshots:
+  tool@{tool}: {{}}
+"
+        )
+    };
+    write("pnpm-lock.yaml", &lock("2.0.0"));
+    assert!(check().contains("cache miss"));
+    assert!(check().contains("cache hit"));
+    write(
+        "lib/package.json",
+        &lib(json!({"exports": "./src/other.js", "dependencies": {"tool": "~2.0.0"}})),
+    );
+    assert!(check().contains("cache hit"));
+    // What lib installs is the app's too, since the app reaches it through lib.
+    write("pnpm-lock.yaml", &lock("2.0.1"));
+    assert!(check().contains("cache miss"));
+    // A dependency's project configuration is its own tasks' concern, as in Nx.
+    write("lib/project.json", r#"{"name":"lib","tags":["one"]}"#);
+    assert!(check().contains("cache hit"));
+    write("lib/project.json", r#"{"name":"lib","tags":["two"]}"#);
+    assert!(check().contains("cache hit"));
+}
+
+#[test]
+fn dependency_manifests_named_by_inputs_count_whole() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    let write = |path: &str, text: &str| {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    };
+    write("nx.json", "{}");
+    write("pnpm-workspace.yaml", "packages:\n  - app\n  - lib\n");
+    write(
+        "app/package.json",
+        r#"{"name":"app","dependencies":{"lib":"workspace:*"}}"#,
+    );
+    write(
+        "app/project.json",
+        r#"{"name":"app","targets":{"check":{"command":"echo checked","cache":true,"inputs":["^default"]}}}"#,
+    );
+    write("lib/package.json", r#"{"name":"lib","version":"1.0.0"}"#);
+    let check = || {
+        let output = Command::new(env!("CARGO_BIN_EXE_qk"))
+            .args(["--workspace", root.to_str().unwrap(), "run", "app:check"])
+            .env_remove("CI")
+            .output()
+            .unwrap();
+        stderr(&success(output))
+    };
+    assert!(check().contains("cache miss"));
+    assert!(check().contains("cache hit"));
+    // `^default` names every file of lib, its manifest with them.
+    write("lib/package.json", r#"{"name":"lib","version":"1.1.0"}"#);
+    assert!(check().contains("cache miss"));
+}
+
+#[test]
 fn hits_leave_matching_outputs_in_place() {
     let fixture = Fixture::new(target("build", json!({})));
     success(fixture.build(&fixture.root, &[]));

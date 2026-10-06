@@ -17,7 +17,7 @@ use qk_taskgraph::{Task, TaskGraph};
 use serde_json::{Value, json};
 
 use crate::glob::is_literal;
-use crate::inputs::{Resolved, workspace_without_resolution};
+use crate::inputs::{Resolved, manifest_for_dependents, workspace_without_resolution};
 use crate::paths::{self, Outputs, Pattern};
 
 pub fn digest_file(path: &Path) -> Result<String> {
@@ -1221,7 +1221,10 @@ pub fn resolve(
         resolver.selected.insert(extended.clone());
         mandatory.insert(extended.clone());
     }
-    // Package scripts and dependency declarations remain inputs even when filesets exclude them.
+    // The task's own manifests remain inputs even when filesets exclude them,
+    // its package scripts and dependency declarations with them. A dependency's
+    // package.json counts by what it decides for dependents, such as where
+    // their imports of it resolve; its installs count through the lockfile.
     let mut packages = BTreeSet::from([task.project.clone()]);
     let mut pending = packages.clone();
     while let Some(project) = pending.pop_first() {
@@ -1232,16 +1235,35 @@ pub fn resolve(
         }
     }
     for project in &packages {
+        let own = *project == task.project;
         for name in ["project.json", qk_config::LOCAL_OVERRIDES, "package.json"] {
+            if !own && name != "package.json" {
+                continue;
+            }
             let path = Path::new(&workspace.projects[project].root).join(name);
             let path = path.strip_prefix(".").unwrap_or(&path).to_owned();
-            if workspace.root.join(&path).is_file() {
-                let path = path
-                    .to_str()
-                    .context("project path must be UTF-8")?
-                    .replace('\\', "/");
-                resolver.selected.insert(path.clone());
-                mandatory.insert(path);
+            if !workspace.root.join(&path).is_file() {
+                continue;
+            }
+            let path = path
+                .to_str()
+                .context("project path must be UTF-8")?
+                .replace('\\', "/");
+            mandatory.insert(path.clone());
+            // A manifest the task's inputs name counts whole, as they say.
+            if own || resolver.selected.contains(&path) {
+                resolver.selected.insert(path);
+                continue;
+            }
+            let text = std::fs::read_to_string(workspace.root.join(&path))
+                .with_context(|| format!("cannot read {path}"))?;
+            match manifest_for_dependents(&text, readable) {
+                Some(value) => {
+                    resolver.values.insert(format!("manifest:{path}"), value);
+                }
+                None => {
+                    resolver.selected.insert(path);
+                }
             }
         }
     }

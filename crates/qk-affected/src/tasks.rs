@@ -122,12 +122,25 @@ pub fn affected_tasks(
             }
         };
     let mut tasks = BTreeMap::new();
+    // Changed manifests at both revisions: a dependency's counts for its
+    // dependents by what it decides for them.
+    let manifests = changes
+        .files
+        .iter()
+        .filter(|file| file.rsplit('/').next() == Some("package.json"))
+        .map(|file| {
+            let before = changes.read(file, changes.base.as_deref());
+            let after = changes.read(file, changes.head.as_deref());
+            (file.clone(), (before, after))
+        })
+        .collect();
     let mut input_changes = qk_cache::InputChanges::new(
         &workspace.root,
         &changes.files,
         lockfiles.as_ref().map(|(before, after)| (before, after)),
         workspace_file_changed,
-    )?;
+    )?
+    .with_manifests(manifests);
     for (id, inputs) in &resolved {
         let mut reasons = Vec::new();
         if let Some(file) = deleted_manifest {

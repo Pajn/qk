@@ -46,6 +46,12 @@ impl Resolved {
         self.value_names("json:")
     }
 
+    /// Dependency manifests keyed by what they decide for dependents, rather
+    /// than as files. See [`manifest_for_dependents`].
+    pub fn manifest_inputs(&self) -> impl Iterator<Item = &str> {
+        self.value_names("manifest:")
+    }
+
     pub fn is_json_input(&self, path: &str) -> bool {
         self.values.contains_key(&format!("json:{path}"))
     }
@@ -146,6 +152,8 @@ pub struct InputChanges<'a> {
     changed: BTreeSet<&'a str>,
     lockfiles: Option<(&'a Lockfile, &'a Lockfile)>,
     workspace_file_changed: bool,
+    /// Changed manifests' base and head texts, `None` where absent.
+    manifests: BTreeMap<String, (Option<String>, Option<String>)>,
     links: BTreeMap<String, Vec<String>>,
     directory_links: BTreeMap<PathBuf, Vec<PathBuf>>,
 }
@@ -166,9 +174,21 @@ impl<'a> InputChanges<'a> {
             changed: files.iter().map(String::as_str).collect(),
             lockfiles,
             workspace_file_changed,
+            manifests: BTreeMap::new(),
             links: BTreeMap::new(),
             directory_links: BTreeMap::new(),
         })
+    }
+
+    /// The base and head texts of changed manifests, so that a dependency's
+    /// manifest counts by what it decides for dependents. A changed manifest
+    /// without them counts as changed.
+    pub fn with_manifests(
+        mut self,
+        manifests: BTreeMap<String, (Option<String>, Option<String>)>,
+    ) -> Self {
+        self.manifests = manifests;
+        self
     }
 
     /// Sorted file reasons, then workspace metadata and installation reasons,
@@ -200,6 +220,23 @@ impl<'a> InputChanges<'a> {
                         })
                         .map(String::as_str),
                 );
+            }
+        }
+        let lockfile = inputs.lockfile.is_some();
+        for file in inputs.manifest_inputs() {
+            if !self.changed.contains(file) {
+                continue;
+            }
+            let unchanged = self.manifests.get(file).is_some_and(|(before, after)| {
+                let read = |text: &Option<String>| {
+                    text.as_deref()
+                        .and_then(|text| manifest_for_dependents(text, lockfile))
+                };
+                let before = read(before);
+                before.is_some() && before == read(after)
+            });
+            if !unchanged {
+                touched.insert(file);
             }
         }
         for file in touched {
@@ -237,6 +274,51 @@ impl<'a> InputChanges<'a> {
         }
         Ok(reasons)
     }
+}
+
+/// Manifest fields that cannot change what a dependent task reads or runs: a
+/// dependency's scripts run only as its own tasks, and the rest is metadata
+/// that resolvers and bundlers do not read.
+const DEPENDENT_IGNORED_FIELDS: &[&str] = &[
+    "version",
+    "scripts",
+    "description",
+    "keywords",
+    "author",
+    "contributors",
+    "maintainers",
+    "license",
+    "homepage",
+    "repository",
+    "bugs",
+    "funding",
+    "private",
+    "publishConfig",
+];
+
+/// Dependency declarations, whose effect reaches dependents through the
+/// lockfile's record of what each importer installs.
+const DECLARATION_FIELDS: &[&str] = &[
+    "dependencies",
+    "devDependencies",
+    "peerDependencies",
+    "peerDependenciesMeta",
+    "optionalDependencies",
+    "dependenciesMeta",
+];
+
+/// A dependency's `package.json` as its dependents' keys read it: without
+/// fields that cannot change what they read or run, and, when the lockfile
+/// records the installs, without the declarations it resolved. `None` when it
+/// cannot be read as a JSON object.
+pub fn manifest_for_dependents(text: &str, lockfile: bool) -> Option<Value> {
+    let mut value: Value = serde_json::from_str(text).ok()?;
+    let object = value.as_object_mut()?;
+    object.retain(|key, _| {
+        !DEPENDENT_IGNORED_FIELDS.contains(&key.as_str())
+            && !(lockfile && DECLARATION_FIELDS.contains(&key.as_str()))
+    });
+    Some(value)
 }
 
 /// `pnpm-workspace.yaml` without the keys that configure resolution, or `None`
@@ -362,6 +444,73 @@ mod tests {
         let workspace = Workspace::load(root.path()).unwrap();
         let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
         (root, workspace, graph)
+    }
+
+    #[test]
+    fn dependency_manifests_change_by_what_they_decide_for_dependents() {
+        let root = tempfile::tempdir().unwrap();
+        let path = "lib/package.json";
+        let inputs = |lockfile: bool| Resolved {
+            files: BTreeSet::new(),
+            mandatory: BTreeSet::from([path.to_owned()]),
+            values: BTreeMap::from([(format!("manifest:{path}"), Value::Null)]),
+            lockfile: lockfile.then(|| (BTreeSet::new(), BTreeSet::new())),
+            workspace_file: false,
+            external: BTreeSet::new(),
+        };
+        let changed = vec![path.to_owned()];
+        let reasons = |before: Option<&str>, after: Option<&str>, lockfile: bool| {
+            InputChanges::new(root.path(), &changed, None, false)
+                .unwrap()
+                .with_manifests(BTreeMap::from([(
+                    path.to_owned(),
+                    (before.map(String::from), after.map(String::from)),
+                )]))
+                .reasons(&inputs(lockfile))
+                .unwrap()
+        };
+        let input = [InputChange::Input { file: path.into() }];
+        let base = r#"{"name":"lib","version":"1.0.0","dependencies":{"a":"^1"}}"#;
+        assert!(
+            reasons(
+                Some(base),
+                Some(r#"{"name":"lib","version":"2.0.0","dependencies":{"a":"^1"}}"#),
+                false
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            reasons(
+                Some(base),
+                Some(r#"{"name":"lib","version":"1.0.0","dependencies":{"a":"^2"}}"#),
+                false
+            ),
+            input
+        );
+        assert!(
+            reasons(
+                Some(base),
+                Some(r#"{"name":"lib","version":"1.0.0","dependencies":{"a":"^2"}}"#),
+                true
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            reasons(Some(base), Some(r#"{"name":"other"}"#), true),
+            input
+        );
+        // Added, deleted or unreadable manifests count as changed.
+        assert_eq!(reasons(None, Some(base), true), input);
+        assert_eq!(reasons(Some(base), None, true), input);
+        assert_eq!(reasons(Some("{"), Some("{"), true), input);
+        // So does one whose revisions were not read.
+        assert_eq!(
+            InputChanges::new(root.path(), &changed, None, false)
+                .unwrap()
+                .reasons(&inputs(true))
+                .unwrap(),
+            input
+        );
     }
 
     #[test]

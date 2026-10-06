@@ -34,11 +34,25 @@ by workspace-relative path, content and mode. Branch names and checkout
 locations are not part of the key, so identical sources in two worktrees
 share entries. Root workspace files (the root `tsconfig.base.json` or
 `tsconfig.json`, `nx.json`, `.gitignore`, `.nxignore`, `package.json`, `pnpm-workspace.yaml`,
-lockfiles) and the manifests of
-the task's project and its transitive project dependencies are always
-included. Dotenv files are not, as in Nx: they hold per-machine values and
-credentials, so keying them would keep machines from sharing entries; `env`
-inputs key the variables a task declares.
+lockfiles) and the manifests of the task's project (`project.json`,
+`project.local.json` and `package.json`) are always included, its scripts and
+dependency declarations with them. Dotenv files are not, as in Nx: they hold
+per-machine values and credentials, so keying them would keep machines from
+sharing entries; `env` inputs key the variables a task declares.
+
+The `package.json` of each project the task's project depends on, directly or
+not, counts by what it decides for its dependents, such as where their imports
+of it resolve, even when the task's inputs leave the file out. Its `version`,
+`scripts`, `description`, `keywords`, `author`, `contributors`, `maintainers`,
+`license`, `homepage`, `repository`, `bugs`, `funding`, `private` and
+`publishConfig` are left out, since none of them changes what a dependent reads
+or runs. With a pnpm lockfile qk can read, so are its `dependencies`,
+`devDependencies`, `peerDependencies`, `peerDependenciesMeta`,
+`optionalDependencies` and `dependenciesMeta`: what they install is keyed
+through the lockfile, as below. A manifest the task's inputs select, as
+`^default` selects every file of each dependency, counts whole. A dependency
+releasing a new version therefore leaves its dependents cached, while a change
+to its `exports` reaches them.
 
 A pnpm v9 `pnpm-lock.yaml` is keyed by what it installs rather than by its
 content: for the root importer and the importers of the task's project and

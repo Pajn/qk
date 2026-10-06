@@ -691,6 +691,57 @@ fn ignored_json_inputs_affect_tasks_without_reincluding_ignored_sources() {
     assert_eq!(tasks.keys().collect::<Vec<_>>(), ["app:build"]);
 }
 
+/// A dependency's manifest affects its dependents' tasks by the fields their
+/// keys read, and its own tasks by all of it.
+#[test]
+fn dependency_manifests_affect_dependents_by_what_they_decide() {
+    let repo = |manifest: &str| {
+        Repo::new(&[
+            (
+                "nx.json",
+                r#"{"targetDefaults": {"build": {"command": "echo build", "inputs": ["{projectRoot}/src/**/*"]},
+                                       "test": {"command": "echo test", "inputs": ["{projectRoot}/src/**/*"]}}}"#,
+            ),
+            (
+                "apps/app/project.json",
+                r#"{"name": "app", "implicitDependencies": ["lib"], "targets": {"build": {}, "test": {}}}"#,
+            ),
+            (
+                "libs/lib/project.json",
+                r#"{"name": "lib", "targets": {"build": {}, "test": {}}}"#,
+            ),
+            ("libs/lib/package.json", manifest),
+        ])
+    };
+    let before = r#"{"name": "lib", "version": "1.0.0", "exports": "./src/index.ts"}"#;
+
+    let bumped = repo(before);
+    write(
+        &bumped.root,
+        "libs/lib/package.json",
+        r#"{"name": "lib", "version": "1.1.0", "exports": "./src/index.ts"}"#,
+    );
+    let tasks = affected_tasks(&bumped);
+    assert_eq!(tasks.keys().collect::<Vec<_>>(), ["lib:build", "lib:test"]);
+
+    let moved = repo(before);
+    write(
+        &moved.root,
+        "libs/lib/package.json",
+        r#"{"name": "lib", "version": "1.0.0", "exports": "./src/other.ts"}"#,
+    );
+    let tasks = affected_tasks(&moved);
+    assert_eq!(
+        tasks.keys().collect::<Vec<_>>(),
+        ["app:build", "app:test", "lib:build", "lib:test"]
+    );
+    assert!(matches!(
+        &tasks["app:build"],
+        qk_affected::TaskCause::Touched { reasons }
+            if matches!(&reasons[..], [qk_affected::TaskReason::Input { file }] if file == "libs/lib/package.json")
+    ));
+}
+
 /// Changed output candidates remain inputs of consumers, never of their producer.
 #[test]
 fn changed_declared_outputs_only_affect_tasks_that_consume_them() {
