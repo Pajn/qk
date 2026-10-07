@@ -422,7 +422,28 @@ pub fn tasks(
             }
             qk_affected::TaskCause::DependsOn { task } => format!("depends on {task}"),
         };
-        writeln!(out, "{id:width$}  {summary}")?;
+        match analysis.reachability.get(id) {
+            Some(decision) => writeln!(out, "{id:width$}  {summary}; {decision}")?,
+            None => writeln!(out, "{id:width$}  {summary}")?,
+        }
+        if let Some(qk_affected::TaskDecision::Cases { cases, .. }) = analysis.reachability.get(id)
+        {
+            for (case, why) in cases {
+                writeln!(out, "  {case}: {why}")?;
+            }
+        }
+    }
+    let left_out: Vec<_> = analysis
+        .reachability
+        .iter()
+        .filter(|(id, _)| !analysis.tasks.contains_key(*id))
+        .collect();
+    if !left_out.is_empty() {
+        writeln!(out, "Left out by import reachability:")?;
+        let width = left_out.iter().map(|(id, _)| id.len()).max().unwrap_or(0);
+        for (id, decision) in left_out {
+            writeln!(out, "  {id:width$}  {decision}")?;
+        }
     }
     Ok(())
 }

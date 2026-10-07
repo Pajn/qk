@@ -91,6 +91,11 @@ pub(super) fn reachability(workspace: &Workspace, name: &str) -> Result<bool> {
     Ok(profile(workspace, name)?.reachability)
 }
 
+/// Whether the named profile replaces changes through projections.
+pub(super) fn has_projections(workspace: &Workspace, name: &str) -> Result<bool> {
+    Ok(!profile(workspace, name)?.projections.is_empty())
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Projection {

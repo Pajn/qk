@@ -1088,10 +1088,6 @@ fn run(mut cli: Cli) -> Result<i32> {
             granularity: Granularity::Task,
             options,
         } => {
-            anyhow::ensure!(
-                changes.affected_profile.is_none(),
-                "--affected-profile applies to project selection; task selection uses declared cache inputs"
-            );
             let selected = select_projects(&workspace.projects, &projects, &exclude)?;
             let candidates = requests(
                 &workspace,
@@ -1232,8 +1228,8 @@ fn run(mut cli: Cli) -> Result<i32> {
                 },
         } => {
             anyhow::ensure!(
-                changes.affected_profile.is_none(),
-                "--affected-profile applies to project selection; show tasks uses declared cache inputs"
+                affected || changes.affected_profile.is_none(),
+                "--affected-profile narrows affected tasks; add --affected"
             );
             let selected = select_projects(&workspace.projects, &projects, &exclude)?;
             let graph = TaskGraph::build(

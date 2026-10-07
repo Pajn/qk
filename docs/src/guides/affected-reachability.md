@@ -11,8 +11,9 @@ qk show projects --affected --affected-profile reach --base main --head HEAD
 qk show affected app --affected-profile reach --base main --head HEAD
 ```
 
-Like [change projections](affected-projections.md), the profile is opt-in and
-applies to project selection only. Ordinary selection, task-level selection and
+The profile is opt-in. It applies to project selection, and with
+`--granularity task` to task selection, where a target can also name
+[cases](#task-selection-and-cases) it runs separately. Ordinary selection and
 cache keys do not change. Use it where a wrongly skipped project is recovered
 cheaply, such as deciding which app builds a pull request runs, and keep
 ordinary selection for checks and for the default branch.
@@ -83,6 +84,47 @@ them.
 Anything that prevents an answer keeps the project and says why: anchors that
 match no file, a `fallout.toml` that cannot be read, or a head revision that
 is not the checkout.
+
+## Task selection and cases
+
+With `--granularity task`, the profile narrows tasks whose target declares
+`qk:reachability`. A target can name `cases` too: files it runs separately,
+such as the cases of a visual regression suite, each decided on its own.
+
+```json
+{
+  "targets": {
+    "visual": {
+      "inputs": ["default", "^default", "{workspaceRoot}/.github/workflows/visual.yml"],
+      "qk:reachability": {
+        "anchors": ["{projectRoot}/visual/shell.tsx"],
+        "cases": ["{projectRoot}/visual/cases/**/*.tsx"],
+        "sources": ["{projectRoot}/src/**/*", "{projectRoot}/visual/**/*.tsx", "{workspaceRoot}/packages/*/src/**/*"]
+      }
+    }
+  }
+}
+```
+
+A target needs `anchors`, `cases` or both, and `sources`. A task that ordinary
+task selection affects is then decided by its changed inputs:
+
+1. **A changed input that is not a source runs the whole task**, as do lockfile
+   installs, a deleted manifest and an affected task it depends on, whose
+   outputs it may read. The task's ordinary inputs are what make this sound:
+   declare the suite's harness, its workflow and anything else that changes
+   how every case runs as inputs, outside `sources`.
+2. **An anchor that imports a change runs the whole task**, as does an import
+   it cannot resolve. Anchors are what every case runs inside, such as a
+   suite's shell.
+3. **Otherwise each case is decided on its own**: the cases that import a
+   change, or a changed case itself, are selected. With none, the task is left
+   out, and with it any task affected only through it.
+
+`qk show tasks -t <targets> --affected --affected-profile <name>` lists each
+selected case with the change it imports, and `--json` adds a `reachability`
+object with each task's decision. A task with selected cases still runs every
+case when qk runs it.
 
 ## Requirements
 

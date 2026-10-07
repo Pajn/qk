@@ -323,7 +323,7 @@ which shows whether its warm state is worth its size.
 
 ## Import reachability
 
-**Status: project selection implemented; task selection and cases proposed.**
+**Status: project and task selection implemented; passing cases to tasks proposed.**
 [Import reachability](guides/affected-reachability.md) describes the
 behavior; this section records why it takes this shape.
 
@@ -413,7 +413,8 @@ Under the profile with `--granularity task`, a task with `qk:reachability`
 that ordinary task selection affects is decided by its changed inputs:
 
 1. Any changed input its `sources` do not match runs the whole task, and
-   says which file.
+   says which file. So does an affected task it depends on, whose outputs it
+   may read.
 2. Otherwise, if an anchor reaches a change, or the search lost an edge, the
    whole task runs, naming the chain or the gap.
 3. Otherwise, the cases a change reaches are selected, each with the changed

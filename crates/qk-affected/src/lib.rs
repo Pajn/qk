@@ -15,7 +15,7 @@ mod subprocess;
 mod tasks;
 
 pub use projections::{ProjectionFallbackKind, ProjectionFallbackPolicy, ProjectionReport};
-pub use reachability::{Decision, Kept};
+pub use reachability::{Decision, Kept, TaskDecision};
 pub use tasks::{TaskAnalysis, TaskCause, TaskReason, affected_tasks};
 
 use std::cell::OnceCell;

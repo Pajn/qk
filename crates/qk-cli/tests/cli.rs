@@ -1148,6 +1148,11 @@ fn affected_profile_lists_projects_explains_projection_and_rejects_task_selectio
         "runtime",
     ]);
     assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("add --affected"));
+    let mut args = vec!["show", "tasks", "-t", "build", "--affected"];
+    args.extend(comparison);
+    let output = run(&args);
+    assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("applies to project selection"));
     let output = run(&[
         "show",

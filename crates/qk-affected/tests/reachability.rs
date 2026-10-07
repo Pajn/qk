@@ -331,3 +331,212 @@ fn a_profile_needs_projections_or_reachability() {
             .contains("must contain projections or enable reachability")
     );
 }
+
+/// `app:visual` has a shell every case renders in and two cases, one of which
+/// imports `used`; `app:report` reads its results.
+fn visual_repo() -> Repo {
+    Repo::new(&[
+        (
+            "apps/app/project.json",
+            r#"{
+                "name": "app",
+                "implicitDependencies": ["lib"],
+                "targets": {
+                    "visual": {
+                        "command": "echo visual",
+                        "inputs": ["default", "^default"],
+                        "qk:reachability": {
+                            "anchors": ["{projectRoot}/visual/shell.ts"],
+                            "cases": ["{projectRoot}/visual/cases/*.ts"],
+                            "sources": ["{projectRoot}/src/**/*", "{projectRoot}/visual/**/*.ts", "{workspaceRoot}/libs/*/src/**/*"]
+                        }
+                    },
+                    "report": {"command": "echo report", "dependsOn": ["visual"], "inputs": []}
+                }
+            }"#,
+        ),
+        ("apps/app/visual/shell.ts", "export const shell = 1;\n"),
+        (
+            "apps/app/visual/cases/first.ts",
+            "import { used } from \"../../../../libs/lib/src/used\";\nexport const first = used;\n",
+        ),
+        (
+            "apps/app/visual/cases/second.ts",
+            "export const second = 1;\n",
+        ),
+        ("apps/app/visual/harness.json", "{}"),
+    ])
+}
+
+impl Repo {
+    fn tasks(&self, profile: Option<&str>) -> qk_affected::TaskAnalysis {
+        use qk_taskgraph::{Request, TaskGraph};
+        let head = commit(&self.root);
+        let workspace = Workspace::load(&self.root).unwrap();
+        let requests: Vec<Request> = ["app:visual", "app:report"]
+            .into_iter()
+            .map(|id| Request::parse(id).unwrap())
+            .collect();
+        let graph = TaskGraph::build(&workspace, &requests).unwrap();
+        qk_affected::affected_tasks(
+            &workspace,
+            &graph,
+            &Options {
+                affected_profile: profile.map(str::to_owned),
+                base: Some(self.base.clone()),
+                head: Some(head),
+                ..Options::default()
+            },
+        )
+        .unwrap()
+    }
+}
+
+fn task_ids(analysis: &qk_affected::TaskAnalysis) -> Vec<&str> {
+    analysis.tasks.keys().map(String::as_str).collect()
+}
+
+#[test]
+fn a_change_no_case_imports_leaves_the_task_out_with_what_only_it_leads_to() {
+    use qk_affected::TaskDecision;
+    let repo = visual_repo();
+    write(
+        &repo.root,
+        "libs/lib/src/unused.ts",
+        "export const unused = 2;\n",
+    );
+    let analysis = repo.tasks(Some("reach"));
+    assert!(analysis.tasks.is_empty(), "{:?}", analysis.tasks);
+    assert!(
+        matches!(
+            &analysis.reachability["app:visual"],
+            TaskDecision::LeftOut { cases, changed, .. }
+                if cases.len() == 2 && changed == &["libs/lib/src/unused.ts"]
+        ),
+        "{:?}",
+        analysis.reachability
+    );
+    assert!(
+        matches!(&analysis.reachability["app:report"], TaskDecision::Through { task } if task == "app:visual"),
+        "{:?}",
+        analysis.reachability
+    );
+    let ordinary = {
+        write(
+            &repo.root,
+            "libs/lib/src/unused.ts",
+            "export const unused = 3;\n",
+        );
+        repo.tasks(None)
+    };
+    assert_eq!(task_ids(&ordinary), ["app:report", "app:visual"]);
+}
+
+#[test]
+fn only_the_cases_a_change_reaches_are_selected() {
+    use qk_affected::TaskDecision;
+    let repo = visual_repo();
+    write(
+        &repo.root,
+        "libs/lib/src/used.ts",
+        "export const used = 2;\n",
+    );
+    let analysis = repo.tasks(Some("reach"));
+    assert_eq!(task_ids(&analysis), ["app:report", "app:visual"]);
+    let TaskDecision::Cases { cases, of } = &analysis.reachability["app:visual"] else {
+        panic!("{:?}", analysis.reachability);
+    };
+    assert_eq!(*of, 2);
+    assert_eq!(
+        cases.keys().collect::<Vec<_>>(),
+        ["apps/app/visual/cases/first.ts"]
+    );
+    assert!(
+        matches!(
+            &cases["apps/app/visual/cases/first.ts"],
+            Kept::Reached { changed, .. } if changed == "libs/lib/src/used.ts"
+        ),
+        "{cases:?}"
+    );
+}
+
+#[test]
+fn a_changed_case_selects_itself() {
+    use qk_affected::TaskDecision;
+    let repo = visual_repo();
+    write(
+        &repo.root,
+        "apps/app/visual/cases/second.ts",
+        "export const second = 2;\n",
+    );
+    let analysis = repo.tasks(Some("reach"));
+    let TaskDecision::Cases { cases, .. } = &analysis.reachability["app:visual"] else {
+        panic!("{:?}", analysis.reachability);
+    };
+    assert_eq!(
+        cases.keys().collect::<Vec<_>>(),
+        ["apps/app/visual/cases/second.ts"]
+    );
+}
+
+#[test]
+fn the_whole_task_runs_when_its_shell_or_a_non_source_input_changes() {
+    use qk_affected::TaskDecision;
+    let repo = visual_repo();
+    write(
+        &repo.root,
+        "apps/app/visual/shell.ts",
+        "export const shell = 2;\n",
+    );
+    let analysis = repo.tasks(Some("reach"));
+    assert!(
+        matches!(
+            &analysis.reachability["app:visual"],
+            TaskDecision::Whole { why: Kept::Reached { anchor, .. } } if anchor == "apps/app/visual/shell.ts"
+        ),
+        "{:?}",
+        analysis.reachability
+    );
+    write(
+        &repo.root,
+        "apps/app/visual/harness.json",
+        "{\"changed\": true}",
+    );
+    let analysis = repo.tasks(Some("reach"));
+    assert!(
+        matches!(
+            &analysis.reachability["app:visual"],
+            TaskDecision::Whole {
+                why: Kept::Input { .. }
+            }
+        ),
+        "{:?}",
+        analysis.reachability
+    );
+}
+
+#[test]
+fn task_selection_refuses_profiles_with_projections() {
+    use qk_taskgraph::{Request, TaskGraph};
+    let repo = visual_repo();
+    write(
+        &repo.root,
+        "nx.json",
+        r#"{"qk:affectedProfiles": {"runtime": {"projections": [{"name": "p", "command": ["true"], "sources": ["a/**"], "outputs": ["b/**"]}]}}}"#,
+    );
+    let head = commit(&repo.root);
+    let workspace = Workspace::load(&repo.root).unwrap();
+    let graph = TaskGraph::build(&workspace, &[Request::parse("app:visual").unwrap()]).unwrap();
+    let error = qk_affected::affected_tasks(
+        &workspace,
+        &graph,
+        &Options {
+            affected_profile: Some("runtime".into()),
+            base: Some(repo.base.clone()),
+            head: Some(head),
+            ..Options::default()
+        },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("applies to project selection"));
+}

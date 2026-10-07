@@ -18,11 +18,14 @@ use qk_graph::ProjectGraph;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::tasks::{TaskCause, TaskReason};
 use crate::{Cause, Changes, Reason, git_lines};
+use qk_taskgraph::TaskGraph;
 
 /// A project's or target's `qk:reachability`, its paths expanded.
 pub(crate) struct Settings {
     pub anchors: Vec<String>,
+    pub cases: Vec<String>,
     sources: Vec<Pattern>,
 }
 
@@ -35,12 +38,14 @@ impl Settings {
 }
 
 /// Reads `qk:reachability` from `extra`, expanding paths for `project`.
-/// `what` names it in errors.
+/// `what` names it in errors; `allow_cases` says whether cases may be declared,
+/// which only a target can.
 pub(crate) fn settings(
     workspace: &Workspace,
     project: &str,
     extra: &BTreeMap<String, Value>,
     what: &str,
+    allow_cases: bool,
 ) -> Result<Option<Settings>> {
     let Some(value) = extra.get("qk:reachability") else {
         return Ok(None);
@@ -52,6 +57,7 @@ pub(crate) fn settings(
     for (key, value) in object {
         let key = match key.as_str() {
             "anchors" | "sources" => key.as_str(),
+            "cases" if allow_cases => "cases",
             "cases" => bail!("{what} qk:reachability.cases belongs on a target"),
             _ => bail!("unknown {what} qk:reachability field {key:?}"),
         };
@@ -69,14 +75,20 @@ pub(crate) fn settings(
         lists.insert(key, expanded);
     }
     let anchors = lists.remove("anchors").unwrap_or_default();
+    let cases = lists.remove("cases").unwrap_or_default();
     let sources = lists.remove("sources").unwrap_or_default();
-    ensure!(!anchors.is_empty(), "{what} qk:reachability needs anchors");
+    ensure!(
+        !anchors.is_empty() || !cases.is_empty(),
+        "{what} qk:reachability needs anchors{}",
+        if allow_cases { " or cases" } else { "" }
+    );
     ensure!(
         !sources.is_empty(),
         "{what} qk:reachability needs sources: without them no change is carried only by imports"
     );
     Ok(Some(Settings {
         anchors,
+        cases,
         sources: sources
             .iter()
             .map(|pattern| Pattern::new(pattern, false))
@@ -122,6 +134,10 @@ pub enum Kept {
     },
     /// A dependency is touched by a change imports do not carry.
     NotImported { project: String, reason: Reason },
+    /// The task is affected by a change imports do not carry.
+    Input { reason: TaskReason },
+    /// The task depends on an affected task, whose outputs it may read.
+    Dependency { task: String },
     /// The imports could not be followed.
     Unanswered { detail: String },
 }
@@ -161,6 +177,8 @@ impl std::fmt::Display for Kept {
                     "{project} is touched as {reason}, which imports do not carry"
                 )
             }
+            Self::Input { reason } => write!(f, "{reason}, which imports do not carry"),
+            Self::Dependency { task } => write!(f, "it depends on affected {task}"),
             Self::Unanswered { detail } => write!(f, "imports could not be followed: {detail}"),
         }
     }
@@ -181,7 +199,7 @@ pub(crate) fn decide(
     // change that would need them.
     let mut declared = BTreeMap::new();
     for (name, project) in &workspace.projects {
-        if let Some(settings) = settings(workspace, name, &project.extra, name)? {
+        if let Some(settings) = settings(workspace, name, &project.extra, name, false)? {
             declared.insert(name, settings);
         }
     }
@@ -314,6 +332,19 @@ fn changed_through(
         .collect()
 }
 
+/// The workspace's files each glob of `patterns` matches.
+fn matching(files: &BTreeSet<String>, patterns: &[String]) -> Result<Vec<String>> {
+    let patterns = patterns
+        .iter()
+        .map(|pattern| Pattern::new(pattern, false))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(files
+        .iter()
+        .filter(|file| patterns.iter().any(|pattern| pattern.is_match(file)))
+        .cloned()
+        .collect())
+}
+
 /// Each project's anchor files, as its globs match the workspace's files.
 fn anchor_files(
     workspace: &Workspace,
@@ -322,19 +353,7 @@ fn anchor_files(
     let files = qk_cache::source_files(&workspace.root)?;
     pending
         .iter()
-        .map(|(name, settings)| {
-            let patterns = settings
-                .anchors
-                .iter()
-                .map(|anchor| Pattern::new(anchor, false))
-                .collect::<Result<Vec<_>>>()?;
-            let matched = files
-                .iter()
-                .filter(|file| patterns.iter().any(|pattern| pattern.is_match(file)))
-                .cloned()
-                .collect();
-            Ok((name.clone(), matched))
-        })
+        .map(|(name, settings)| Ok((name.clone(), matching(&files, &settings.anchors)?)))
         .collect()
 }
 
@@ -463,4 +482,184 @@ fn not_checked_out(workspace: &Workspace, changes: &Changes) -> Option<String> {
     (!modified.is_empty()).then(|| {
         format!("the checkout has changes the head {head} does not, and imports are read from the checkout")
     })
+}
+
+/// A task's anchor and case files.
+type Matched = (Vec<String>, Vec<String>);
+
+/// What the profile decided for a task with `qk:reachability` that ordinary
+/// task selection affects.
+#[derive(Debug, Serialize)]
+#[serde(tag = "decision", rename_all = "camelCase")]
+pub enum TaskDecision {
+    /// Neither its anchors nor its cases import a change.
+    LeftOut {
+        anchors: Vec<String>,
+        cases: Vec<String>,
+        /// The changed inputs, all of them sources.
+        changed: Vec<String>,
+    },
+    /// Only some cases import a change, each with why it runs.
+    Cases {
+        cases: BTreeMap<String, Kept>,
+        /// How many cases the task has.
+        of: usize,
+    },
+    /// Affected only through tasks the profile left out.
+    Through { task: String },
+    /// The whole task runs.
+    Whole { why: Kept },
+}
+
+impl std::fmt::Display for TaskDecision {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Self::LeftOut { .. } => write!(f, "left out: nothing it imports changed"),
+            Self::Cases { cases, of } => {
+                write!(f, "{} of {of} cases import a change", cases.len())
+            }
+            Self::Through { task } => {
+                write!(f, "left out: affected only through {task}, left out too")
+            }
+            Self::Whole { why } => write!(f, "whole task: {why}"),
+        }
+    }
+}
+
+/// Decides each task with `qk:reachability` that `tasks` affects, from its
+/// reasons and the imports of its anchors and cases.
+pub(crate) fn decide_tasks(
+    workspace: &Workspace,
+    graph: &TaskGraph,
+    changes: &Changes,
+    tasks: &BTreeMap<String, TaskCause>,
+) -> Result<BTreeMap<String, TaskDecision>> {
+    let mut decisions = BTreeMap::new();
+    // Every task's settings are read, so a mistake is found before the change
+    // that would need them.
+    let mut declared = BTreeMap::new();
+    for (id, task) in &graph.tasks {
+        let extra = &task.definition.extra;
+        if let Some(settings) = settings(workspace, &task.project, extra, id, true)? {
+            declared.insert(id, settings);
+        }
+    }
+    let mut pending: BTreeMap<String, (Settings, Vec<String>)> = BTreeMap::new();
+    for (id, cause) in tasks {
+        let Some(settings) = declared.remove(id) else {
+            continue;
+        };
+        let reasons = match cause {
+            TaskCause::DependsOn { task } => {
+                let why = Kept::Dependency { task: task.clone() };
+                decisions.insert(id.clone(), TaskDecision::Whole { why });
+                continue;
+            }
+            TaskCause::Touched { reasons } => reasons,
+        };
+        let carried = |reason: &&TaskReason| matches!(reason, TaskReason::Input { file } if settings.is_source(file));
+        if let Some(reason) = reasons.iter().find(|reason| !carried(reason)) {
+            let why = Kept::Input {
+                reason: reason.clone(),
+            };
+            decisions.insert(id.clone(), TaskDecision::Whole { why });
+            continue;
+        }
+        let changed = reasons
+            .iter()
+            .filter_map(|reason| match reason {
+                TaskReason::Input { file } => Some(file.clone()),
+                _ => None,
+            })
+            .collect();
+        pending.insert(id.clone(), (settings, changed));
+    }
+    if pending.is_empty() {
+        return Ok(decisions);
+    }
+    let found = (|| -> Result<BTreeMap<String, Matched>> {
+        let files = qk_cache::source_files(&workspace.root)?;
+        pending
+            .iter()
+            .map(|(id, (settings, _))| {
+                Ok((
+                    id.clone(),
+                    (
+                        matching(&files, &settings.anchors)?,
+                        matching(&files, &settings.cases)?,
+                    ),
+                ))
+            })
+            .collect()
+    })();
+    let answers = found
+        .map_err(|error| format!("{error:#}"))
+        .and_then(|found| {
+            let answers = search(
+                workspace,
+                changes,
+                found
+                    .values()
+                    .flat_map(|(anchors, cases)| anchors.iter().chain(cases)),
+            )?;
+            Ok((found, answers))
+        });
+    let (mut found, answers) = match answers {
+        Ok(answered) => answered,
+        Err(detail) => {
+            for id in pending.into_keys() {
+                let why = Kept::Unanswered {
+                    detail: detail.clone(),
+                };
+                decisions.insert(id, TaskDecision::Whole { why });
+            }
+            return Ok(decisions);
+        }
+    };
+    for (id, (settings, changed)) in pending {
+        let (anchors, cases) = found.remove(&id).expect("every pending task is matched");
+        let named = if settings.cases.is_empty() {
+            !anchors.is_empty()
+        } else {
+            !cases.is_empty()
+        };
+        let decision = if !named {
+            TaskDecision::Whole {
+                why: Kept::Unanswered {
+                    detail: format!(
+                        "its {} name no file",
+                        if settings.cases.is_empty() {
+                            "anchors"
+                        } else {
+                            "cases"
+                        }
+                    ),
+                },
+            }
+        } else if let Some(why) = anchors
+            .iter()
+            .find_map(|anchor| answers[anchor].kept(anchor))
+        {
+            TaskDecision::Whole { why }
+        } else {
+            let selected: BTreeMap<String, Kept> = cases
+                .iter()
+                .filter_map(|case| Some((case.clone(), answers[case].kept(case)?)))
+                .collect();
+            if selected.is_empty() {
+                TaskDecision::LeftOut {
+                    anchors,
+                    cases,
+                    changed,
+                }
+            } else {
+                TaskDecision::Cases {
+                    of: cases.len(),
+                    cases: selected,
+                }
+            }
+        };
+        decisions.insert(id, decision);
+    }
+    Ok(decisions)
 }
