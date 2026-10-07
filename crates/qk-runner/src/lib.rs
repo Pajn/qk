@@ -146,7 +146,9 @@ pub fn run(
     let mut case_files = BTreeMap::new();
     if let Some(directory) = &case_directory {
         for (index, (id, list)) in cases.iter().enumerate() {
-            let path = directory.path().join(format!("cases-{index}.txt"));
+            // Absolute, so a task finds it from whatever directory it runs in.
+            let path = std::path::absolute(directory.path().join(format!("cases-{index}.txt")))
+                .context("cannot locate the directory for task cases")?;
             let text: String = list.iter().map(|case| format!("{case}\n")).collect();
             std::fs::write(&path, text)
                 .with_context(|| format!("cannot write the cases of {id}"))?;
