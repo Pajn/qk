@@ -323,7 +323,7 @@ which shows whether its warm state is worth its size.
 
 ## Import reachability
 
-**Status: project and task selection implemented; passing cases to tasks proposed.**
+**Status: implemented.**
 [Import reachability](guides/affected-reachability.md) describes the
 behavior; this section records why it takes this shape.
 

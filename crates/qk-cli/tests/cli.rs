@@ -988,6 +988,116 @@ fn reachability_profile_leaves_out_projects_and_explains_them() {
 }
 
 #[test]
+fn reachability_profile_runs_only_the_cases_a_change_reaches() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    let git = |args: &[&str]| {
+        let output = isolated_command("git")
+            .current_dir(root)
+            .args(["-c", "user.name=qk", "-c", "user.email=qk@example.invalid"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    let write = |path: &str, content: &str| {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    };
+    let command = if cfg!(windows) {
+        r#"if defined QK_AFFECTED_CASES (type "%QK_AFFECTED_CASES%") else (echo every case)"#
+    } else {
+        r#"if [ -n "$QK_AFFECTED_CASES" ]; then cat "$QK_AFFECTED_CASES"; else echo every case; fi"#
+    };
+    write(
+        "nx.json",
+        &json!({"qk:affectedProfiles": {"reach": {"reachability": true}}}).to_string(),
+    );
+    write(
+        "apps/app/project.json",
+        &json!({
+            "name": "app",
+            "targets": {
+                "visual": {
+                    "command": command,
+                    "cache": true,
+                    "qk:reachability": {
+                        "anchors": ["{projectRoot}/visual/shell.ts"],
+                        "cases": ["{projectRoot}/visual/cases/*.ts"],
+                        "sources": ["{projectRoot}/visual/**/*.ts"]
+                    }
+                }
+            }
+        })
+        .to_string(),
+    );
+    write("apps/app/visual/shell.ts", "export const shell = 1;\n");
+    write(
+        "apps/app/visual/cases/first.ts",
+        "export const first = 1;\n",
+    );
+    write(
+        "apps/app/visual/cases/second.ts",
+        "export const second = 1;\n",
+    );
+    git(&["init", "--quiet", "--initial-branch=main"]);
+    git(&["add", "."]);
+    git(&["commit", "--quiet", "-m", "base"]);
+    write(
+        "apps/app/visual/cases/second.ts",
+        "export const second = 2;\n",
+    );
+    git(&["add", "."]);
+    git(&["commit", "--quiet", "-m", "head"]);
+    let run = || {
+        let output = isolated_command(env!("CARGO_BIN_EXE_qk"))
+            .current_dir(root)
+            .args(["affected", "-t", "visual", "--granularity", "task"])
+            .args([
+                "--affected-profile",
+                "reach",
+                "--base",
+                "HEAD^",
+                "--head",
+                "HEAD",
+            ])
+            .args(["--output-style", "static"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+            + &String::from_utf8_lossy(&output.stderr)
+    };
+    // Twice: a run of some cases is never cached, so it never stands for all.
+    for _ in 0..2 {
+        let output = run();
+        assert!(
+            output.contains("apps/app/visual/cases/second.ts"),
+            "{output}"
+        );
+        assert!(
+            !output.contains("apps/app/visual/cases/first.ts"),
+            "{output}"
+        );
+        assert!(!output.contains("every case"), "{output}");
+    }
+    write("apps/app/visual/shell.ts", "export const shell = 2;\n");
+    git(&["add", "."]);
+    git(&["commit", "--quiet", "-m", "shell"]);
+    let output = run();
+    assert!(output.contains("every case"), "{output}");
+}
+
+#[test]
 fn affected_profile_lists_projects_explains_projection_and_rejects_task_selection() {
     let temp = TempDir::new().unwrap();
     let root = temp.path();

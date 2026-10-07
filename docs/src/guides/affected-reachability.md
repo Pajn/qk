@@ -123,8 +123,29 @@ task selection affects is then decided by its changed inputs:
 
 `qk show tasks -t <targets> --affected --affected-profile <name>` lists each
 selected case with the change it imports, and `--json` adds a `reachability`
-object with each task's decision. A task with selected cases still runs every
-case when qk runs it.
+object with each task's decision.
+
+### Running only the selected cases
+
+`qk affected -t <targets> --granularity task --affected-profile <name>` runs
+the affected tasks. A task narrowed to some of its cases receives
+`QK_AFFECTED_CASES`, the path of a file naming those cases one per line,
+relative to the workspace root. The variable is absent when the whole task
+runs, so a task that does not read it runs every case, which is always safe.
+
+```sh
+if [ -n "$QK_AFFECTED_CASES" ]; then
+  suite --only "$(paste -sd, "$QK_AFFECTED_CASES")"
+else
+  suite
+fi
+```
+
+Such a task runs without the cache, reads and writes both: its result covers
+the selected cases alone, so it must not stand for a run of every case, and
+tasks depending on it run uncached too. A suite's own rules, such as running
+the cases that show translated copy when a translation catalogue changes, stay
+in the suite, which can add cases to the list but should not drop them.
 
 ## Requirements
 

@@ -66,4 +66,7 @@ See [Workspace configuration](workspace.md) for defaults and
 `NX_TASK_HASH` is available when a cache key was computed.
 Targets using `qk:threads` additionally receive `QK_THREADS` and their
 configured thread variables. Targets using `qk:warm` receive their expanded
-warm environment when warm state is enabled.
+warm environment when warm state is enabled. A task an affected profile with
+reachability narrowed to some of its cases receives `QK_AFFECTED_CASES`, the
+path of a file naming those cases one per line; see
+[Import reachability](../guides/affected-reachability.md#running-only-the-selected-cases).

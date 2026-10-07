@@ -1121,7 +1121,18 @@ fn run(mut cli: Cli) -> Result<i32> {
                 eprintln!("qk: no affected tasks");
                 return Ok(0);
             }
-            return execute_tasks(&workspace, requests, &options, false);
+            // Tasks the profile narrowed to some of their cases run those.
+            let cases = analysis
+                .reachability
+                .iter()
+                .filter_map(|(id, decision)| match decision {
+                    qk_affected::TaskDecision::Cases { cases, .. } => {
+                        Some((id.clone(), cases.keys().cloned().collect()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            return execute_narrowed(&workspace, requests, &options, false, &cases);
         }
         Command::Affected {
             targets,
@@ -1348,6 +1359,23 @@ fn execute_tasks(
     options: &RunOptions,
     single: bool,
 ) -> Result<i32> {
+    execute_narrowed(
+        workspace,
+        requests,
+        options,
+        single,
+        &std::collections::BTreeMap::new(),
+    )
+}
+
+/// As [`execute_tasks`], with the cases each task narrowed to some runs.
+fn execute_narrowed(
+    workspace: &Workspace,
+    requests: Vec<Request>,
+    options: &RunOptions,
+    single: bool,
+    cases: &std::collections::BTreeMap<String, Vec<String>>,
+) -> Result<i32> {
     if options.profile {
         qk_cache::profile::enable();
     }
@@ -1484,6 +1512,7 @@ fn execute_tasks(
             }),
             expected: &expected,
             analyze_inputs: options.input_analysis.is_some(),
+            cases,
         },
         cancelled,
     );
