@@ -218,7 +218,10 @@ CI runs it on every push, writing the table to the job summary and the
 numbers to an artifact.
 
 GitHub Actions is configured for Linux, macOS and Windows. The lockfile is
-checked in for reproducible dependency resolution.
+checked in for reproducible dependency resolution. On Windows, C dependencies
+are compiled with clang-cl (`CC_x86_64_pc_windows_msvc=clang-cl`), in CI and
+for releases alike: tree-sitter-scss, which fallout parses stylesheets with,
+passes its C compiler a GCC-style warning flag that cl.exe rejects.
 
 See [Maintaining the documentation](documentation.md) for book builds and Pages setup.
 

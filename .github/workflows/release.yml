@@ -12,6 +12,10 @@ on:
 permissions:
   contents: write
 
+env:
+  # As in CI: tree-sitter-scss passes cl.exe a flag it rejects.
+  CC_x86_64_pc_windows_msvc: clang-cl
+
 jobs:
   build:
     strategy:
