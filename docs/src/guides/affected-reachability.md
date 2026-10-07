@@ -52,9 +52,21 @@ under `nx` in its `package.json`:
 Both take `{projectRoot}` and `{workspaceRoot}`, and `!` exclusions: a file
 matches when an inclusion matches it and no exclusion does, in any order. A
 `package.json` is never a source, since it decides what imports resolve to.
-Leave test files in `sources`: a changed test reaches the project only if an
-anchor imports it, while a file left out of `sources` keeps the project
-whenever it changes. A project without
+
+List code in `sources`, not every file under a directory. A GraphQL schema,
+a translation catalogue or a tool's configuration reaches a build through a
+generator or a tool rather than an import, so as sources they would let a
+change that matters leave the project out. Leave test files in: a changed
+test reaches the project only if an anchor imports it, while a file left out
+of `sources` keeps the project whenever it changes.
+
+```json
+"sources": [
+  "{projectRoot}/src/**/*.{ts,tsx,js,jsx}",
+  "{workspaceRoot}/packages/**/*.{ts,tsx,js,jsx}",
+  "!{workspaceRoot}/packages/**/*.config.{ts,js}"
+]
+``` A project without
 `qk:reachability` is never left out. An end-to-end project that drives an app
 rather than importing it can name the app's anchors, so the two are decided
 alike; without its own settings, it is left out only when it is affected
@@ -71,8 +83,10 @@ affects is left out when all of these hold:
    tsconfig.
 2. **Every change it is affected through is a source.** Each touched project
    it depends on, directly or not, is touched only by changed files its
-   `sources` match. Lockfile installs, a dependency's manifests, build
-   configuration and any other file keep it, because no import carries them.
+   `sources` match. Lockfile installs, build configuration and any other file
+   keep it, because no import carries them. A dependency's `package.json`
+   keeps it only when what its dependents read changes: a new `version` or
+   `scripts` does not, a new or moved dependency does.
 3. **No anchor imports a changed file.** fallout searches from each anchor
    through the imports, at file granularity, comparing each changed file with
    its base version. A change made only of TypeScript types does not count,

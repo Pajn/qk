@@ -395,8 +395,9 @@ affects is left out when all of these hold:
 1. It is affected only through dependencies: none of its own files changed,
    and no workspace-wide reason applies, such as `nx.json`, the root
    tsconfig, the root importer's installs or a deleted manifest.
-2. Every change it is affected through is a file its `sources` match. A
-   dependency's lockfile installs, configuration or manifest keep it.
+2. Every change it is affected through is a file its `sources` match, or a
+   dependency's `package.json` whose fields its dependents read are
+   unchanged. Lockfile installs, configuration and any other change keep it.
 3. No anchor reaches a changed file, and the search lost no edge in the
    repository: fallout reports nothing unresolved that the repository
    answers for (`in_repo`).

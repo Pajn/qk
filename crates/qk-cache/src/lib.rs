@@ -26,8 +26,8 @@ pub use evict::{Pruned, max_size, parse_size, prune};
 pub use glob::Pattern;
 pub use hash::{SourceIgnore, source_files};
 pub use inputs::{
-    InputChange, InputChanges, Resolution, Resolved, resolve_each, resolve_tasks,
-    without_resolution,
+    InputChange, InputChanges, Resolution, Resolved, manifest_for_dependents, resolve_each,
+    resolve_tasks, without_resolution,
 };
 /// Expands `{projectRoot}` and `{workspaceRoot}` in a project's path or glob.
 pub use paths::expand as expand_project_path;

@@ -624,3 +624,36 @@ fn exclusions_take_files_out_of_sources_and_cases() {
         ["apps/app/visual/cases/first.ts"]
     );
 }
+
+#[test]
+fn a_manifest_change_dependents_cannot_read_carries_nothing() {
+    let manifest = |version: &str, dependencies: &str| {
+        format!(r#"{{"name": "lib", "version": "{version}", "scripts": {{"test": "echo"}}, "dependencies": {{{dependencies}}}}}"#)
+    };
+    let repo = Repo::new(&[("libs/lib/package.json", &manifest("1.0.0", ""))]);
+    write(
+        &repo.root,
+        "libs/lib/package.json",
+        &manifest("1.0.1", "").replace("echo", "echo again"),
+    );
+    let analysis = repo.analyse(Some("reach"));
+    assert!(
+        matches!(decisions(&analysis)["app"], Decision::LeftOut { .. }),
+        "a version and a script are nothing dependents read: {:?}",
+        analysis.reachability
+    );
+    write(
+        &repo.root,
+        "libs/lib/package.json",
+        &manifest("1.0.1", r#""left-pad": "1.3.0""#).replace("echo", "echo again"),
+    );
+    let analysis = repo.analyse(Some("reach"));
+    assert!(
+        matches!(
+            decisions(&analysis)["app"],
+            Decision::Kept { why: Kept::NotImported { .. } }
+        ),
+        "a declaration still counts: {:?}",
+        analysis.reachability
+    );
+}

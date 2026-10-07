@@ -242,7 +242,7 @@ pub(crate) fn decide(
         let Some(settings) = declared.remove(name) else {
             continue;
         };
-        match not_imported(graph, projects, name, &settings) {
+        match not_imported(changes, graph, projects, name, &settings) {
             Some(why) => {
                 decisions.insert(name.clone(), Decision::Kept { why });
             }
@@ -328,6 +328,7 @@ fn touched_dependencies<'a>(
 
 /// The first reason touching a dependency that imports do not carry.
 fn not_imported(
+    changes: &Changes,
     graph: &ProjectGraph,
     projects: &BTreeMap<String, Cause>,
     project: &str,
@@ -335,7 +336,10 @@ fn not_imported(
 ) -> Option<Kept> {
     for (dependency, reasons) in touched_dependencies(graph, projects, project) {
         for reason in reasons {
-            let carried = matches!(reason, Reason::File { file } if settings.is_source(file));
+            let carried = matches!(
+                reason,
+                Reason::File { file } if settings.is_source(file) || manifest_unchanged(changes, file)
+            );
             if !carried {
                 return Some(Kept::NotImported {
                     project: dependency.to_owned(),
@@ -362,6 +366,25 @@ fn changed_through(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
+}
+
+/// Whether `file` is a `package.json` whose change decides nothing new for
+/// its dependents: the same at both revisions once the fields no dependent
+/// reads, such as `version` and `scripts`, are left out, as their cache keys
+/// read it. Its declarations stay in, so a changed dependency still counts.
+fn manifest_unchanged(changes: &Changes, file: &str) -> bool {
+    if file.rsplit('/').next() != Some("package.json") {
+        return false;
+    }
+    let read = |revision: Option<&str>| {
+        changes
+            .read(file, revision)
+            .and_then(|text| qk_cache::manifest_for_dependents(&text, false))
+    };
+    match (read(changes.base.as_deref()), read(changes.head.as_deref())) {
+        (Some(before), Some(after)) => before == after,
+        _ => false,
+    }
 }
 
 /// The workspace's files each glob of `patterns` matches.
@@ -586,7 +609,13 @@ pub(crate) fn decide_tasks(
             }
             TaskCause::Touched { reasons } => reasons,
         };
-        let carried = |reason: &&TaskReason| matches!(reason, TaskReason::Input { file } if settings.is_source(file));
+        let carried = |reason: &&TaskReason| {
+            matches!(
+                reason,
+                TaskReason::Input { file }
+                    if settings.is_source(file) || manifest_unchanged(changes, file)
+            )
+        };
         if let Some(reason) = reasons.iter().find(|reason| !carried(reason)) {
             let why = Kept::Input {
                 reason: reason.clone(),
