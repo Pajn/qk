@@ -628,7 +628,9 @@ fn exclusions_take_files_out_of_sources_and_cases() {
 #[test]
 fn a_manifest_change_dependents_cannot_read_carries_nothing() {
     let manifest = |version: &str, dependencies: &str| {
-        format!(r#"{{"name": "lib", "version": "{version}", "scripts": {{"test": "echo"}}, "dependencies": {{{dependencies}}}}}"#)
+        format!(
+            r#"{{"name": "lib", "version": "{version}", "scripts": {{"test": "echo"}}, "dependencies": {{{dependencies}}}}}"#
+        )
     };
     let repo = Repo::new(&[("libs/lib/package.json", &manifest("1.0.0", ""))]);
     write(
@@ -651,7 +653,9 @@ fn a_manifest_change_dependents_cannot_read_carries_nothing() {
     assert!(
         matches!(
             decisions(&analysis)["app"],
-            Decision::Kept { why: Kept::NotImported { .. } }
+            Decision::Kept {
+                why: Kept::NotImported { .. }
+            }
         ),
         "a declaration still counts: {:?}",
         analysis.reachability
