@@ -4,7 +4,7 @@
 //! resolution keys, or it depends on an affected task. Env and runtime inputs
 //! count as unchanged, since the base revision's environment is unknowable.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Result;
 use qk_config::Workspace;
@@ -231,7 +231,12 @@ fn relinked_dependents(
     let mut relinked = BTreeMap::new();
     for (file, (before, after)) in manifests {
         let (before, after) = (identity(before), identity(after));
-        let names = before.iter().chain(after.iter()).map(|(name, _)| name);
+        // The name at both revisions, once when it is unchanged.
+        let names: BTreeSet<&String> = before
+            .iter()
+            .chain(after.iter())
+            .map(|(name, _)| name)
+            .collect();
         let version = |side: &Option<(String, Option<String>)>| {
             side.as_ref().and_then(|(_, version)| version.clone())
         };
