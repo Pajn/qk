@@ -489,7 +489,8 @@ fn plan(
     };
     let (whole, singles) = tree.cover(files);
     let mut read_files: Vec<PathBuf> = singles.iter().map(|file| path(file)).collect();
-    // Keyed through what the lockfile installs rather than as files.
+    // Package managers and Node read these in every task. What they install is
+    // keyed through the lockfile rather than as files.
     for file in ["pnpm-lock.yaml", "pnpm-workspace.yaml", "package.json"] {
         read_files.push(path(file));
     }

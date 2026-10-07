@@ -1191,7 +1191,9 @@ pub fn resolve(
     // not keyed, as in Nx: they hold per-machine values and credentials, and a
     // task's `env` inputs key the variables it declares.
     // A pnpm lockfile qk can read is keyed by what the task's projects install instead.
-    // The root tsconfig, as Nx hashes it into every task.
+    // The root tsconfig, as Nx hashes it into every task. The root package.json
+    // is not, as in Nx: what the root importer installs counts for every task
+    // through the lockfile, and the rest of it is the root project's manifest.
     let tsconfig = ["tsconfig.base.json", "tsconfig.json"]
         .into_iter()
         .find(|name| {
@@ -1203,7 +1205,6 @@ pub fn resolve(
         ".gitignore",
         ".nxignore",
         qk_config::LOCAL_WORKSPACE,
-        "package.json",
         "pnpm-workspace.yaml",
         "pnpm-lock.yaml",
         "package-lock.json",

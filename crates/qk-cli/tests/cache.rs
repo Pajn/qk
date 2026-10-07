@@ -2185,6 +2185,77 @@ fn versions_crossing_a_dependents_range_change_its_key() {
 }
 
 #[test]
+fn the_root_manifest_counts_for_the_root_project_and_through_the_lockfile() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    let write = |path: &str, text: &str| {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    };
+    let manifest = |script: &str, react: &str| {
+        json!({
+            "name": "root", "private": true,
+            "scripts": {"lint": script}, "devDependencies": {"react": react},
+        })
+        .to_string()
+    };
+    let lock = |react: &str| {
+        format!(
+            "lockfileVersion: '9.0'
+importers:
+  .:
+    devDependencies:
+      react:
+        specifier: ^19.0.0
+        version: {react}
+  app: {{}}
+packages:
+  react@{react}:
+    resolution: {{integrity: sha512-react}}
+snapshots:
+  react@{react}: {{}}
+"
+        )
+    };
+    write("nx.json", "{}");
+    write("package.json", &manifest("echo one", "^19.0.0"));
+    write("pnpm-workspace.yaml", "packages:\n  - app\n");
+    write("pnpm-lock.yaml", &lock("19.0.0"));
+    write(
+        "project.json",
+        r#"{"name":"root","targets":{"probe":{"command":"echo probed","cache":true,"inputs":["{projectRoot}/tool.txt"]}}}"#,
+    );
+    write("tool.txt", "tool");
+    write(
+        "app/project.json",
+        r#"{"name":"app","targets":{"check":{"command":"echo checked","cache":true,"inputs":["{projectRoot}/src/**/*"]}}}"#,
+    );
+    write("app/src/main.js", "main");
+    let run = |task: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_qk"))
+            .args(["--workspace", root.to_str().unwrap(), "run", task])
+            .env_remove("CI")
+            .output()
+            .unwrap();
+        stderr(&success(output))
+    };
+    for task in ["app:check", "root:probe"] {
+        assert!(run(task).contains("cache miss"));
+        assert!(run(task).contains("cache hit"));
+    }
+    // As in Nx, the root manifest is not an input of every task.
+    write("package.json", &manifest("echo two", "^19.0.0"));
+    assert!(run("app:check").contains("cache hit"));
+    // It is the root project's own manifest, scripts and all.
+    assert!(run("root:probe").contains("cache miss"));
+    // What the root importer installs counts for every task.
+    write("package.json", &manifest("echo two", "^19.1.0"));
+    write("pnpm-lock.yaml", &lock("19.1.0"));
+    assert!(run("app:check").contains("cache miss"));
+}
+
+#[test]
 fn dependency_manifests_named_by_inputs_count_whole() {
     let temp = TempDir::new().unwrap();
     let root = temp.path();
