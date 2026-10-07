@@ -2545,6 +2545,40 @@ fn warm_directories_follow_the_task_across_worktrees() {
 
 #[cfg(unix)]
 #[test]
+fn warm_entries_keep_their_own_portability() {
+    let fixture = Fixture::new(json!({
+        "command": "if [ -f \"$TOOL_CACHE/seen\" ]; then printf 'tool warm'; else printf 'tool cold'; fi; if [ -f scratch/seen ]; then echo ', scratch warm'; else echo ', scratch cold'; fi; mkdir -p \"$TOOL_CACHE\" scratch && touch \"$TOOL_CACHE/seen\" scratch/seen",
+        "qk:warm": [
+            {"group": "tool", "portable": true, "env": {"TOOL_CACHE": "{warm}/tool"}},
+            {"paths": ["scratch"]}
+        ]
+    }));
+    assert_eq!(
+        said(&fixture, &fixture.root, &[]),
+        "tool cold, scratch cold"
+    );
+    // Removed, as in a fresh clone, both come back from this worktree's saves.
+    fs::remove_dir_all(fixture.root.join(".git/qk/warm")).unwrap();
+    fs::remove_dir_all(fixture.root.join("scratch")).unwrap();
+    assert_eq!(
+        said(&fixture, &fixture.root, &[]),
+        "tool warm, scratch warm"
+    );
+    let text = stdout(&success(
+        fixture.qk(&fixture.root, &["show", "task", "app:build"]),
+    ));
+    assert!(
+        text.contains("warm state for group tool restored from local: 1 file,")
+            && text.contains("warm state restored from local: 1 file,"),
+        "{text}"
+    );
+    // A linked worktree takes only the portable entry from the shared store.
+    let linked = fixture.worktree();
+    assert_eq!(said(&fixture, &linked, &[]), "tool warm, scratch cold");
+}
+
+#[cfg(unix)]
+#[test]
 fn warm_state_is_shared_through_the_remote_by_branch() {
     let server = s3::FakeS3::start();
     let fixture = Fixture::new(json!({

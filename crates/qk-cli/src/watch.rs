@@ -140,8 +140,9 @@ impl View {
                     {
                         outputs.push(output);
                     }
-                    if let Ok(Some(warm)) = qk_cache::warm::config(&workspace, &variant)
-                        && let Ok(output) = qk_cache::Outputs::from_paths(&warm.kept_paths())
+                    if let Ok(entries) = qk_cache::warm::config(&workspace, &variant)
+                        && let Ok(output) =
+                            qk_cache::Outputs::from_paths(&qk_cache::warm::kept_paths(&entries))
                     {
                         outputs.push(output);
                     }

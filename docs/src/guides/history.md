@@ -17,8 +17,9 @@ the dependency tasks), `lockfile` (with the importers and packages),
 `inputs`, `definition` (with each field that differs and both of its
 values), `args` and `tooling`, or `first`, `unchanged` and
 `unknown` when the previous inputs are no longer kept. For targets with warm
-state it also holds where that state came from (`local`, `worktree <root>`
-or `remote <branch>`), how many files and bytes were restored, which groups
+state it also holds, for each entry that restored any, its group and where
+that state came from (`local`, `worktree <root>` or `remote <branch>`), how
+many files and bytes were restored, which groups
 were on disk already, and how long saving it took, or that it was saved in
 the background; the run summary names the tasks that started from warm
 state, and `qk show task` compares how long the task took from warm state

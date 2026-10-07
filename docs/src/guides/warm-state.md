@@ -209,8 +209,8 @@ Prefer a tool's content-addressed compiler/transform/task cache when the
 full build directory is tied to a checkout. ccache and Gradle's task-output
 cache are separate from the local build history in the table above.
 A `group` can keep a shared compiler cache, but cannot also declare
-`paths` or `outputs`. Use separate targets when the two kinds of state need
-different portability policies.
+`paths` or `outputs`. When one task needs both, with different portability,
+list them as [several entries](#several-entries).
 
 Before enabling shared warm state:
 
@@ -357,6 +357,38 @@ Stash ownership records are replaced atomically after syncing the new file.
 Unreadable, invalid or missing metadata leaves saved contents in place and
 reports a recovery warning. This protects stopped-process recovery; it does
 not promise durability across power loss.
+
+## Several entries
+
+`qk:warm` can be an array of entries, each restored, saved and shared under
+its own settings. An Android build can then share Metro's transform cache,
+which relocates, while keeping Gradle's build history to the worktree that
+wrote it:
+
+```jsonc
+"android": {
+  "dependsOn": ["prebuild-android"],
+  "qk:warm": [
+    {
+      "group": "metro",
+      "portable": true,
+      "env": { "METRO_CACHE_DIR": "{warm}/metro" }
+    },
+    {
+      "paths": ["{projectRoot}/android/.gradle", "{projectRoot}/android/app/build"],
+      "survive": ["prebuild-android"],
+      "mtimes": "preserve",
+      "portable": false
+    }
+  ]
+}
+```
+
+At most one entry goes without a `group`: it is the task's own and the only
+one that can hold `outputs` and `paths`. No group may be named twice, and no
+variable set by two entries. Each entry's `portable`, `remote`, `key`,
+`maxSize`, `mtimes` and `save` apply to that entry alone, and each restore
+is reported with the group it belongs to.
 
 ## Matching toolchains and configurations
 

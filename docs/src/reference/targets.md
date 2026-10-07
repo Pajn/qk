@@ -135,7 +135,10 @@ See [Sharing cores](../guides/threads.md) for allocation examples.
 
 ## `qk:warm`
 
-An object describing reusable scratch state:
+An object describing reusable scratch state, or an array of them restored and
+saved separately. In an array, at most one entry omits `group`, no group is
+named twice and no variable is set by two entries. See
+[Several entries](../guides/warm-state.md#several-entries). Each object has:
 
 | Field | Type | Default |
 | --- | --- | --- |

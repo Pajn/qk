@@ -197,10 +197,10 @@ impl Snapshot {
         }
         // Warm scratch paths are never inputs either.
         for task in graph.tasks.values() {
-            let Ok(Some(warm)) = crate::warm::config(workspace, task) else {
+            let Ok(entries) = crate::warm::config(workspace, task) else {
                 continue;
             };
-            if let Ok(paths) = Outputs::from_paths(&warm.kept_paths()) {
+            if let Ok(paths) = Outputs::from_paths(&crate::warm::kept_paths(&entries)) {
                 for anchor in paths.anchors() {
                     generated.extend(
                         under(&files, anchor)

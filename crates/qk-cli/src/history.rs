@@ -334,7 +334,7 @@ fn warm_effect(records: &[(String, qk_history::TaskReport)]) -> Option<String> {
         {
             continue;
         }
-        let restored = state.get("restored").is_some_and(|value| !value.is_null());
+        let restored = !restored(state).is_empty();
         let present = state
             .get("present")
             .and_then(serde_json::Value::as_array)
@@ -370,16 +370,30 @@ pub fn bytes(bytes: u64) -> String {
     }
 }
 
+/// What each warm entry restored for a run. Records from before a target
+/// could have several entries hold one object, or null, instead of a list.
+pub fn restored(warm: &serde_json::Value) -> Vec<&serde_json::Value> {
+    match warm.get("restored") {
+        Some(serde_json::Value::Array(entries)) => entries.iter().collect(),
+        Some(entry @ serde_json::Value::Object(_)) => vec![entry],
+        _ => Vec::new(),
+    }
+}
+
 /// What warm state did for a run, in words.
 pub fn warm_line(warm: &serde_json::Value) -> Option<String> {
-    let restored = warm.get("restored").filter(|value| !value.is_null());
     let saved = warm.get("saveMs").and_then(serde_json::Value::as_u64);
     let mut parts = Vec::new();
-    if let Some(restored) = restored {
+    for restored in restored(warm) {
         let number = |field| restored.get(field).and_then(serde_json::Value::as_u64);
         let files = number("files").unwrap_or(0);
+        let group = restored
+            .get("group")
+            .and_then(serde_json::Value::as_str)
+            .map(|group| format!(" for group {group}"))
+            .unwrap_or_default();
         parts.push(format!(
-            "warm state restored from {}: {files} file{}, {:.1} MB",
+            "warm state{group} restored from {}: {files} file{}, {:.1} MB",
             restored
                 .get("source")
                 .and_then(serde_json::Value::as_str)

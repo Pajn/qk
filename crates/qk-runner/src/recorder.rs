@@ -234,8 +234,8 @@ impl Recorder {
                 }
             };
             let outputs = qk_cache::Outputs::new(workspace, task);
-            let warm = qk_cache::warm::config(workspace, task).and_then(|warm| {
-                qk_cache::Outputs::from_paths(&warm.map_or_else(Vec::new, |warm| warm.kept_paths()))
+            let warm = qk_cache::warm::config(workspace, task).and_then(|entries| {
+                qk_cache::Outputs::from_paths(&qk_cache::warm::kept_paths(&entries))
             });
             let dependencies: Vec<_> = task
                 .dependencies
