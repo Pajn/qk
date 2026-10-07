@@ -392,12 +392,13 @@ fn task_graph_repo() -> Repo {
 }
 
 fn affected_tasks(repo: &Repo) -> BTreeMap<String, qk_affected::TaskCause> {
+    affected_tasks_of(repo, &["app:build", "app:test", "lib:build", "lib:test"])
+}
+
+fn affected_tasks_of(repo: &Repo, tasks: &[&str]) -> BTreeMap<String, qk_affected::TaskCause> {
     use qk_taskgraph::{Request, TaskGraph};
     let workspace = Workspace::load(&repo.root).unwrap();
-    let requests: Vec<Request> = ["app:build", "app:test", "lib:build", "lib:test"]
-        .into_iter()
-        .map(|id| Request::parse(id).unwrap())
-        .collect();
+    let requests: Vec<Request> = tasks.iter().map(|id| Request::parse(id).unwrap()).collect();
     let graph = TaskGraph::build(&workspace, &requests).unwrap();
     let head = commit(&repo.root);
     qk_affected::affected_tasks(
@@ -846,6 +847,55 @@ fn root_manifest_scripts_affect_no_other_projects_tasks() {
         r#"{"name": "root", "scripts": {"lint": "echo two"}}"#,
     );
     assert!(affected_tasks(&repo).is_empty());
+}
+
+/// As in Nx, a project's filesets select only the files it owns, so those of a
+/// project nested in its root reach only that project's tasks.
+#[test]
+fn nested_projects_files_affect_only_their_own_tasks() {
+    const TASKS: &[&str] = &["app:test", "lib:test", "plugin:test", "root:test"];
+    let repo = Repo::new(&[
+        (
+            "nx.json",
+            r#"{"targetDefaults": {"test": {"command": "echo test"}}}"#,
+        ),
+        (
+            "project.json",
+            r#"{"name": "root", "targets": {"test": {}}}"#,
+        ),
+        ("tool.txt", "before"),
+        (
+            "apps/app/project.json",
+            r#"{"name": "app", "targets": {"test": {}}}"#,
+        ),
+        ("apps/app/src/main.ts", "before"),
+        (
+            "libs/lib/project.json",
+            r#"{"name": "lib", "targets": {"test": {}}}"#,
+        ),
+        ("libs/lib/src/index.ts", "before"),
+        (
+            "libs/lib/plugin/project.json",
+            r#"{"name": "plugin", "targets": {"test": {}}}"#,
+        ),
+        ("libs/lib/plugin/src/index.ts", "before"),
+    ]);
+    write(&repo.root, "apps/app/src/main.ts", "after");
+    write(&repo.root, "libs/lib/plugin/src/index.ts", "after");
+    std::fs::remove_file(repo.root.join("libs/lib/plugin/src/index.ts")).unwrap();
+    write(&repo.root, "libs/lib/plugin/src/added.ts", "added");
+    let tasks = affected_tasks_of(&repo, TASKS);
+    assert_eq!(
+        tasks.keys().collect::<Vec<_>>(),
+        ["app:test", "plugin:test"]
+    );
+    write(&repo.root, "tool.txt", "after");
+    write(&repo.root, "libs/lib/src/index.ts", "after");
+    let tasks = affected_tasks_of(&repo, TASKS);
+    assert_eq!(
+        tasks.keys().collect::<Vec<_>>(),
+        ["app:test", "lib:test", "plugin:test", "root:test"]
+    );
 }
 
 /// Changed output candidates remain inputs of consumers, never of their producer.

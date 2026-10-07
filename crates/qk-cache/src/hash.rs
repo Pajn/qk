@@ -92,6 +92,8 @@ pub struct Snapshot {
     pub(crate) files: BTreeSet<String>,
     extra_candidates: BTreeSet<String>,
     projects: ProjectGraph,
+    /// Each project by its root, to find the project owning a file.
+    roots: BTreeMap<String, String>,
     generated_tasks: Vec<(Task, Outputs)>,
     task_dependencies: BTreeMap<String, BTreeSet<String>>,
     source_ignore: SourceIgnore,
@@ -213,6 +215,11 @@ impl Snapshot {
             files,
             extra_candidates: BTreeSet::new(),
             projects: ProjectGraph::build(workspace)?,
+            roots: workspace
+                .projects
+                .values()
+                .map(|project| (project.root.clone(), project.name.clone()))
+                .collect(),
             source_ignore: SourceIgnore::new(&workspace.root)?,
             generated_tasks: graph
                 .tasks
@@ -536,6 +543,24 @@ fn load_digests(root: &Path) -> HashMap<String, (Stamp, String)> {
 }
 
 /// Files equal to `prefix` or below it, using the sorted order of the set.
+impl Snapshot {
+    /// The project whose root most specifically contains `path`, as Nx assigns
+    /// files to projects.
+    fn owner(&self, path: &str) -> Option<&str> {
+        let mut path = path;
+        loop {
+            if let Some(project) = self.roots.get(path) {
+                return Some(project);
+            }
+            match path.rfind('/') {
+                Some(slash) => path = &path[..slash],
+                None if path != "." => path = ".",
+                None => return None,
+            }
+        }
+    }
+}
+
 fn under<'a>(files: &'a BTreeSet<String>, prefix: &'a str) -> impl Iterator<Item = &'a String> {
     files
         .range::<str, _>((
@@ -721,6 +746,8 @@ struct FilePattern {
     matcher: Arc<Pattern>,
     prefix: String,
     excluded: bool,
+    /// The project a project fileset selects the files of.
+    owner: Option<String>,
 }
 
 #[derive(Default)]
@@ -965,11 +992,16 @@ impl Resolver<'_> {
             .strip_prefix('!')
             .map(|pattern| (true, pattern))
             .unwrap_or((false, pattern));
-        // Nx hashes workspace files and each project's files in separate scopes.
-        let scope = if pattern.contains("{workspaceRoot}") {
-            FileScope::Workspace
+        // Nx hashes workspace files and each project's files in separate
+        // scopes, a project's being only the files it owns: those of a project
+        // nested in its root are that project's.
+        let (scope, owner) = if pattern.contains("{workspaceRoot}") {
+            (FileScope::Workspace, None)
         } else {
-            FileScope::Project(project.to_owned())
+            (
+                FileScope::Project(project.to_owned()),
+                Some(project.to_owned()),
+            )
         };
         let pattern = paths::expand(self.workspace, project, pattern)?;
         let matcher = self.snapshot.pattern(&pattern, exclude)?;
@@ -983,17 +1015,24 @@ impl Resolver<'_> {
         } else {
             Box::new(under(&self.snapshot.files, &prefix))
         };
+        let snapshot = self.snapshot;
         let selection = self.scopes.entry(scope).or_default();
         let selected = if exclude {
             &mut selection.excluded
         } else {
             &mut selection.included
         };
-        selected.extend(candidates.filter(|file| matcher.is_match(file)).cloned());
+        selected.extend(
+            candidates
+                .filter(|file| matcher.is_match(file))
+                .filter(|file| owner.is_none() || snapshot.owner(file) == owner.as_deref())
+                .cloned(),
+        );
         selection.patterns.push(FilePattern {
             matcher,
             prefix,
             excluded: exclude,
+            owner,
         });
         Ok(())
     }
@@ -1164,7 +1203,10 @@ pub fn resolve(
             }
             for selection in resolver.scopes.values_mut() {
                 for pattern in &selection.patterns {
-                    if pattern.matcher.is_match(path) {
+                    if pattern.matcher.is_match(path)
+                        && (pattern.owner.is_none()
+                            || snapshot.owner(path) == pattern.owner.as_deref())
+                    {
                         if pattern.excluded {
                             selection.excluded.insert(path.clone());
                         } else {
