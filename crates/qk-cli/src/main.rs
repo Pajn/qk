@@ -1,5 +1,6 @@
 mod doctor;
 mod explain;
+mod hash;
 mod history;
 mod inputs;
 mod inspect;
@@ -667,6 +668,21 @@ enum ShowCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Show a task's cache key and what it is computed from, without running
+    /// it; with `--against`, where it differs from another key.
+    Hash {
+        /// project:target[:configuration], or a target of the current directory's project.
+        task: String,
+        /// Another task, a target of the current directory's project, or the
+        /// id of a recorded run to compare with this task's key in that run.
+        #[arg(long, value_name = "TASK|RUN")]
+        against: Option<String>,
+        #[arg(long)]
+        json: bool,
+        /// Arguments the task would be run with, as after `qk run <task> --`.
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
     /// Show a task's recent runs, and why its cache key changed in each.
     Task {
         /// A task id, `project:target[:configuration]`.
@@ -1242,6 +1258,36 @@ fn run(mut cli: Cli) -> Result<i32> {
             command: ShowCommand::Run { id, json },
         } => history::show_run(&workspace, id.as_deref(), json, &mut io::stdout().lock())?,
         Command::Show {
+            command:
+                ShowCommand::Hash {
+                    task,
+                    against,
+                    json,
+                    args,
+                },
+        } => {
+            let mut request = task_request(&workspace, task)?;
+            request.args = args;
+            // A task id has a colon, and a bare name is a task when the
+            // current project has that target, as for the task itself;
+            // anything else is a run id.
+            let is_task = |value: &str| {
+                value.contains(':')
+                    || current_project(&workspace).is_ok_and(|project| {
+                        workspace.projects[&project].targets.contains_key(value)
+                    })
+            };
+            let against = match against {
+                Some(task) if is_task(&task) => Some(hash::Against::Task(Request {
+                    args: request.args.clone(),
+                    ..task_request(&workspace, task)?
+                })),
+                Some(run) => Some(hash::Against::Run(run)),
+                None => None,
+            };
+            hash::show(&workspace, request, against, json, &mut io::stdout().lock())?;
+        }
+        Command::Show {
             command: ShowCommand::Task { id, limit, json },
         } => history::show_task(&workspace, &id, limit, json, &mut io::stdout().lock())?,
         Command::Show {
@@ -1512,13 +1558,18 @@ fn execute_tasks(
 
 /// `qk run`: one task, by `project:target[:configuration]` or a target of the
 /// current directory's project.
-fn run_task(workspace: &Workspace, task: String, options: &RunOptions) -> Result<i32> {
+/// A task, or a target of the current directory's project.
+fn task_request(workspace: &Workspace, task: String) -> Result<Request> {
     let task = if task.contains(':') {
         task
     } else {
         format!("{}:{task}", current_project(workspace)?)
     };
-    let mut request = Request::parse_in(workspace, &task)?;
+    Request::parse_in(workspace, &task)
+}
+
+fn run_task(workspace: &Workspace, task: String, options: &RunOptions) -> Result<i32> {
+    let mut request = task_request(workspace, task)?;
     if let Some(configuration) = &options.configuration() {
         if request
             .configuration

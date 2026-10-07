@@ -76,6 +76,11 @@ always included or named by an input: their effect lands in the lockfile, so
 a catalog bump invalidates only the tasks whose installs change. This is the
 same rule affected selection applies.
 
+`qk show hash <task>` prints a task's key and what it is computed from
+without running it, and `--against` compares it with another task's key or
+with the task's key in a recorded run; see
+[Key inspection](../reference/cli.md#key-inspection).
+
 ## Inputs
 
 Candidate input files are tracked and untracked-but-not-ignored files, minus

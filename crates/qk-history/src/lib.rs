@@ -97,6 +97,10 @@ pub struct Cause {
     /// Dependency tasks whose fingerprints differ.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dependencies: Vec<String>,
+    /// Where the task id or target definition differs, by path and with both
+    /// values: `definition.inputs[2]: "src/**" -> "src/**/*.ts"`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub definition: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -513,6 +517,29 @@ impl History {
         self.tasks("task_id = ?1", task, limit)
     }
 
+    /// A task's key in a run, with the inputs it was computed from while they
+    /// are kept; absent if the run did not key the task.
+    pub fn key(&self, run: &str, task: &str) -> Result<Option<(String, Option<Value>)>> {
+        let row: Option<(String, Option<String>)> = self
+            .connection
+            .query_row(
+                "SELECT tasks.key, inputs.inputs FROM tasks LEFT JOIN inputs ON inputs.key = tasks.key
+                 WHERE tasks.run_id = ?1 AND tasks.task_id = ?2 AND tasks.key IS NOT NULL",
+                params![run, task],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        row.map(|(key, inputs)| {
+            Ok((
+                key,
+                inputs
+                    .map(|inputs| serde_json::from_str(&inputs))
+                    .transpose()?,
+            ))
+        })
+        .transpose()
+    }
+
     /// Reads one execution's log; absent for old runs, cache hits or evicted logs.
     pub fn log(&self, run: &str, task: &str) -> Result<Option<Log>> {
         Ok(self.connection.query_row(
@@ -797,8 +824,14 @@ pub fn diff(before: &Value, after: &Value) -> Cause {
     if !dependencies.is_empty() {
         changed.insert("dependencies".to_owned());
     }
+    let mut definition = Vec::new();
+    for key in ["id", "definition"] {
+        differences(key, before.get(key), after.get(key), &mut definition);
+    }
+    if !definition.is_empty() {
+        changed.insert("definition".to_owned());
+    }
     for (group, keys) in [
-        ("definition", &["definition", "id"][..]),
         ("args", &["args"][..]),
         (
             "tooling",
@@ -815,6 +848,54 @@ pub fn diff(before: &Value, after: &Value) -> Cause {
         files,
         values,
         dependencies,
+        definition,
+    }
+}
+
+/// Where two JSON values differ, a path each, with both values: objects with
+/// the same keys are compared key by key, and arrays of one length entry by
+/// entry, unless they hold the same entries in another order.
+fn differences(path: &str, before: Option<&Value>, after: Option<&Value>, out: &mut Vec<String>) {
+    if before == after {
+        return;
+    }
+    match (before, after) {
+        (Some(Value::Object(old)), Some(Value::Object(new))) if old.keys().eq(new.keys()) => {
+            for (key, value) in old {
+                differences(&format!("{path}.{key}"), Some(value), new.get(key), out);
+            }
+        }
+        (Some(Value::Array(old)), Some(Value::Array(new))) if old.len() == new.len() => {
+            let sorted = |values: &[Value]| {
+                let mut values: Vec<_> = values.iter().map(Value::to_string).collect();
+                values.sort();
+                values
+            };
+            if sorted(old) == sorted(new) {
+                out.push(format!("{path} reordered"));
+                return;
+            }
+            for (index, (old, new)) in old.iter().zip(new).enumerate() {
+                differences(&format!("{path}[{index}]"), Some(old), Some(new), out);
+            }
+        }
+        (Some(Value::Array(old)), Some(Value::Array(new))) => {
+            out.push(format!("{path}: {} -> {} entries", old.len(), new.len()));
+        }
+        _ => out.push(format!("{path}: {} -> {}", brief(before), brief(after))),
+    }
+}
+
+/// A value as JSON, shortened to a line.
+fn brief(value: Option<&Value>) -> String {
+    const LONGEST: usize = 60;
+    let Some(value) = value else {
+        return "(none)".to_owned();
+    };
+    let text = value.to_string();
+    match text.char_indices().nth(LONGEST) {
+        Some((end, _)) => format!("{}...", &text[..end]),
+        None => text,
     }
 }
 
