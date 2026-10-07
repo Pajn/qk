@@ -4,7 +4,7 @@
 //! resolution keys, or it depends on an affected task. Env and runtime inputs
 //! count as unchanged, since the base revision's environment is unknowable.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Result;
 use qk_config::Workspace;
@@ -122,12 +122,26 @@ pub fn affected_tasks(
             }
         };
     let mut tasks = BTreeMap::new();
+    // Changed manifests at both revisions: a dependency's counts for its
+    // dependents by what it decides for them.
+    let manifests: BTreeMap<String, (Option<String>, Option<String>)> = changes
+        .files
+        .iter()
+        .filter(|file| file.rsplit('/').next() == Some("package.json"))
+        .map(|file| {
+            let before = changes.read(file, changes.base.as_deref());
+            let after = changes.read(file, changes.head.as_deref());
+            (file.clone(), (before, after))
+        })
+        .collect();
+    let relinked = relinked_dependents(workspace, &manifests);
     let mut input_changes = qk_cache::InputChanges::new(
         &workspace.root,
         &changes.files,
         lockfiles.as_ref().map(|(before, after)| (before, after)),
         workspace_file_changed,
-    )?;
+    )?
+    .with_manifests(manifests);
     for (id, inputs) in &resolved {
         let mut reasons = Vec::new();
         if let Some(file) = deleted_manifest {
@@ -147,6 +161,13 @@ pub fn affected_tasks(
                     qk_cache::InputChange::WorkspaceFile => TaskReason::WorkspaceFile,
                 }),
         );
+        if let Some(file) = relinked.get(&graph.tasks[id].project)
+            && !reasons
+                .iter()
+                .any(|reason| matches!(reason, TaskReason::Input { file: input } if input == file))
+        {
+            reasons.push(TaskReason::Input { file: file.clone() });
+        }
         if !reasons.is_empty() {
             tasks.insert(id.clone(), TaskCause::Touched { reasons });
         }
@@ -187,4 +208,62 @@ pub fn affected_tasks(
         files: changes.files,
         tasks,
     })
+}
+
+/// Projects whose dependency on a workspace package was added or removed
+/// because the package's name or version changed, so that what they declare
+/// for it started or stopped meaning it, each with that package's manifest.
+/// The keys of all their tasks change with the dependency, although the
+/// version itself is not keyed for them.
+fn relinked_dependents(
+    workspace: &Workspace,
+    manifests: &BTreeMap<String, (Option<String>, Option<String>)>,
+) -> BTreeMap<String, String> {
+    let identity = |text: &Option<String>| {
+        let value: serde_json::Value = serde_json::from_str(text.as_deref()?).ok()?;
+        let name = value.get("name")?.as_str()?.to_owned();
+        let version = value
+            .get("version")
+            .and_then(|version| version.as_str())
+            .map(String::from);
+        Some((name, version))
+    };
+    // Whether a dependency declared as `name` with `range` means this package,
+    // as the project graph decides it: by name, then by a range that links
+    // whatever the version or one the version satisfies.
+    let links = |package: &Option<(String, Option<String>)>, name: &str, range: &str| {
+        package.as_ref().is_some_and(|(own, version)| {
+            own == name
+                && (range.starts_with("workspace:")
+                    || range == "*"
+                    || range.starts_with("file:")
+                    || version
+                        .as_deref()
+                        .is_some_and(|version| qk_graph::satisfies(version, range)))
+        })
+    };
+    let mut relinked = BTreeMap::new();
+    for (file, (before, after)) in manifests {
+        let (before, after) = (identity(before), identity(after));
+        if before == after {
+            continue;
+        }
+        // The name at both revisions, once when it is unchanged.
+        let names: BTreeSet<&String> = before
+            .iter()
+            .chain(after.iter())
+            .map(|(name, _)| name)
+            .collect();
+        for name in names {
+            for (project, package) in &workspace.packages {
+                let Some(range) = package.dependency_ranges().get(name.as_str()).copied() else {
+                    continue;
+                };
+                if links(&before, name, range) != links(&after, name, range) {
+                    relinked.insert(project.clone(), file.clone());
+                }
+            }
+        }
+    }
+    relinked
 }

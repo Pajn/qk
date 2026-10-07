@@ -28,6 +28,12 @@ When a name occurs in multiple sections, precedence is `dependencies`,
   follows installed sets, avoiding projects whose installations are unchanged
   and including transitive installation changes Nx can miss.
 - Resolution-only pnpm workspace changes reach tasks through the lockfile.
+- Cache keys always include the task's project manifests, and each dependency
+  project's `package.json` without its version, scripts and other metadata,
+  even when the task's inputs leave them out. Nx keys these files only through
+  declared inputs. qk keeps them so that a task's scripts, and where a
+  dependency's imports resolve, cannot change without a cache miss. See
+  [What changes the key](guides/cache.md#what-changes-the-key).
 - A tracked upstream can adjust the affected base to avoid counting changes
   already landed upstream.
 - `readyWhen` accepts readiness text from either stdout or stderr.
