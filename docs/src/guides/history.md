@@ -22,8 +22,15 @@ or `remote <branch>`), how many files and bytes were restored, which groups
 were on disk already, and how long saving it took, or that it was saved in
 the background; the run summary names the tasks that started from warm
 state, and `qk show task` compares how long the task took from warm state
-with how long it took without, over its successful runs that executed. The newest 200 runs are
-kept. The schema is versioned in `schema_version`.
+with how long it took without, over its successful runs that executed. A task
+that executed also records the most memory it used: that of its commands and
+every process under them, summed, sampled every 250 ms while it runs, so a
+task too brief to be sampled records none. On macOS a process's memory is
+its physical footprint, the figure Activity Monitor shows; elsewhere it is
+its resident memory. The run
+summary gives the most the run's tasks used together and the three tasks
+that used the most, and `qk show task` what the task used in each run. The
+newest 200 runs are kept. The schema is versioned in `schema_version`.
 
 `qk show hash <task> --against <run-id>` compares the key a task would have
 now with its key in a recorded run, without running it; see
@@ -41,6 +48,7 @@ web:build, most recent first:
       key changed since run 1790687500464-74260: dependencies, files
         changed packages/ui/src/index.ts
         dependency ui:build
+      used 2.1 GB of memory at most
 ```
 
 ## Execution logs and mixed outcomes
@@ -83,3 +91,6 @@ unchanged. Logs can contain anything the command prints, including credentials.
 Schema version 4 adds execution observations and logs. Older histories upgrade
 in place; existing runs remain readable but have no execution logs and are not
 included in mixed-outcome detection.
+
+Schema version 5 adds the memory each task used. Older histories upgrade in
+place, and runs recorded before have none.

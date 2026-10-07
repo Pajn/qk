@@ -75,6 +75,7 @@ pub fn record(
                 threads: record
                     .and_then(|record| record.threads)
                     .map(|threads| threads as u64),
+                memory: record.and_then(|record| record.memory),
             }
         })
         .collect();
@@ -309,6 +310,9 @@ pub fn show_task(
                 if threads == 1 { "" } else { "s" }
             )?;
         }
+        if let Some(memory) = record.memory {
+            writeln!(out, "      used {} of memory at most", bytes(memory))?;
+        }
     }
     if let Some(effect) = warm_effect(&records) {
         writeln!(out, "{effect}")?;
@@ -354,6 +358,15 @@ fn warm_effect(records: &[(String, qk_history::TaskReport)]) -> Option<String> {
         cold.len(),
         runs(cold.len())
     ))
+}
+
+/// An amount of memory, in megabytes below a gigabyte.
+pub fn bytes(bytes: u64) -> String {
+    if bytes < 1_000_000_000 {
+        format!("{} MB", bytes.div_ceil(1_000_000))
+    } else {
+        format!("{:.1} GB", bytes as f64 / 1e9)
+    }
 }
 
 /// What warm state did for a run, in words.

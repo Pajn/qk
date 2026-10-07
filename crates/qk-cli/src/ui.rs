@@ -666,6 +666,27 @@ fn details(
             threaded.join(", ")
         ));
     }
+    if let Some(memory) = result.memory {
+        let mut tasks: Vec<(&str, u64)> = report
+            .tasks
+            .iter()
+            .filter_map(|task| Some((task.id.as_str(), task.memory?)))
+            .collect();
+        tasks.sort_by_key(|(_, memory)| std::cmp::Reverse(*memory));
+        let most: Vec<String> = tasks
+            .iter()
+            .take(3)
+            .map(|(id, memory)| format!("{id} {}", crate::history::bytes(*memory)))
+            .collect();
+        lines.push(format!(
+            "{} {}",
+            paint.dim(&format!(
+                "Memory, at most {} together:",
+                crate::history::bytes(memory)
+            )),
+            most.join(", ")
+        ));
+    }
     let path = &report.critical_path;
     if path.tasks.len() > 1 || (path.tasks.len() == 1 && total > 1) {
         let by_id: BTreeMap<&str, &qk_history::TaskReport> = report
@@ -901,6 +922,7 @@ mod tests {
             key: None,
             warm: None,
             threads: None,
+            memory: None,
             execution: None,
         };
         let report = |id: &str, started: u64, ended: u64, dependencies: &[&str]| TaskReport {
@@ -917,6 +939,7 @@ mod tests {
             cause: None,
             warm: None,
             threads: None,
+            memory: None,
         };
         let result = RunResult {
             sandbox: None,
@@ -932,6 +955,7 @@ mod tests {
                 ),
             ]),
             load: vec![(load, true), (load, false)],
+            memory: None,
         };
         let tasks = vec![
             report("app:a", 0, 1_000, &[]),

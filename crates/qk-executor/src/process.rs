@@ -1,4 +1,6 @@
+use std::collections::BTreeSet;
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -14,9 +16,23 @@ pub enum Outcome {
     Cancelled,
 }
 
-struct Children(Vec<GroupChild>);
+/// The running commands, whose ids the task publishes while they run.
+struct Children<'a>(Vec<GroupChild>, &'a Mutex<BTreeSet<u32>>);
 
-impl Drop for Children {
+impl Children<'_> {
+    fn push(&mut self, child: GroupChild) {
+        self.1.lock().unwrap().insert(child.id());
+        self.0.push(child);
+    }
+
+    fn remove(&mut self, index: usize) -> GroupChild {
+        let child = self.0.swap_remove(index);
+        self.1.lock().unwrap().remove(&child.id());
+        child
+    }
+}
+
+impl Drop for Children<'_> {
     fn drop(&mut self) {
         // Also clean up when spawning or polling one command fails.
         for child in &mut self.0 {
@@ -25,6 +41,10 @@ impl Drop for Children {
         for child in &mut self.0 {
             let _ = child.wait();
         }
+        let mut ids = self.1.lock().unwrap();
+        for child in &self.0 {
+            ids.remove(&child.id());
+        }
     }
 }
 
@@ -32,7 +52,7 @@ impl Drop for Children {
 #[cfg(unix)]
 const GRACE: Duration = Duration::from_secs(5);
 
-impl Children {
+impl Children<'_> {
     /// Asks every process group to exit, then leaves stragglers to `Drop`.
     fn terminate(&mut self) {
         #[cfg(unix)]
@@ -79,7 +99,7 @@ pub fn execute_captured(
         let mut readers = Vec::new();
         let outcome = (|| {
             let mut pending = task.commands.iter().enumerate();
-            let mut children = Children(Vec::new());
+            let mut children = Children(Vec::new(), &task.processes);
             let mut launched = Instant::now();
             loop {
                 if cancelled.load(Ordering::SeqCst) {
@@ -102,7 +122,7 @@ pub fn execute_captured(
                             readers
                                 .push(scope.spawn(move || capture.copy(stderr, true, decoration)));
                         }
-                        children.0.push(child);
+                        children.push(child);
                         launched = Instant::now();
                         if !task.parallel {
                             break;
@@ -119,7 +139,7 @@ pub fn execute_captured(
                         .context("cannot wait for command")?
                     {
                         Some(status) => {
-                            let mut child = children.0.swap_remove(index);
+                            let mut child = children.remove(index);
                             // Finite tasks may not leave background descendants running.
                             let _ = child.kill();
                             if !status.success() {
