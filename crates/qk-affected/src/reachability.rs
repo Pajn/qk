@@ -469,7 +469,8 @@ fn not_checked_out(workspace: &Workspace, changes: &Changes) -> Option<String> {
         .ok()
         .and_then(|lines| lines.into_iter().next())
     };
-    if resolve(head).is_none() || resolve(head) != resolve("HEAD") {
+    let resolved = resolve(head);
+    if resolved.is_none() || resolved != resolve("HEAD") {
         return Some(format!(
             "the head {head} is not checked out, and imports are read from the checkout"
         ));
