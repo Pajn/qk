@@ -2256,6 +2256,52 @@ snapshots:
 }
 
 #[test]
+fn project_filesets_leave_out_nested_projects_files() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    let write = |path: &str, text: &str| {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    };
+    write("nx.json", "{}");
+    write(
+        "project.json",
+        r#"{"name":"root","targets":{"probe":{"command":"echo probed","cache":true}}}"#,
+    );
+    write("tool.txt", "tool");
+    write(
+        "lib/project.json",
+        r#"{"name":"lib","targets":{"check":{"command":"echo checked","cache":true,"inputs":["{projectRoot}/**/*"]}}}"#,
+    );
+    write("lib/src/index.js", "index");
+    write("lib/plugin/project.json", r#"{"name":"plugin"}"#);
+    write("lib/plugin/src/index.js", "plugin");
+    let run = |task: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_qk"))
+            .args(["--workspace", root.to_str().unwrap(), "run", task])
+            .env_remove("CI")
+            .output()
+            .unwrap();
+        stderr(&success(output))
+    };
+    for task in ["root:probe", "lib:check"] {
+        assert!(run(task).contains("cache miss"));
+        assert!(run(task).contains("cache hit"));
+    }
+    // As in Nx, a nested project's files are its own, not its parents'.
+    write("lib/plugin/src/index.js", "changed");
+    write("lib/plugin/src/added.js", "added");
+    assert!(run("root:probe").contains("cache hit"));
+    assert!(run("lib:check").contains("cache hit"));
+    write("lib/src/index.js", "changed");
+    assert!(run("root:probe").contains("cache hit"));
+    assert!(run("lib:check").contains("cache miss"));
+    write("tool.txt", "changed");
+    assert!(run("root:probe").contains("cache miss"));
+}
+
+#[test]
 fn dependency_manifests_named_by_inputs_count_whole() {
     let temp = TempDir::new().unwrap();
     let root = temp.path();

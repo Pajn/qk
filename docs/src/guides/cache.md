@@ -89,7 +89,9 @@ digests persist between runs in the worktree's state, keyed by
 path, size, modification time and, on Unix, change time, inode and mode, so a
 warm run reads only files whose metadata changed. Without
 `inputs`, a task uses `default` and `^default`; `default` is
-`{projectRoot}/**/*` unless a named input overrides it.
+`{projectRoot}/**/*` unless a named input overrides it. As in Nx, a
+project's filesets select only the files it owns, leaving out those of
+projects nested in its root.
 
 Every input declaration of Nx 23 is supported:
 

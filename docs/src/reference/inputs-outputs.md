@@ -51,6 +51,13 @@ paths are resolved within the workspace. A symlinked input is keyed by its
 target text and the content it resolves to, including the files below a
 linked directory; links that resolve outside the workspace are not supported.
 
+As in Nx, a project's filesets select only the files the project owns, each
+file belonging to the project whose root most specifically contains it. A
+project nested in another's root owns its files, so they reach neither the
+outer project's `{projectRoot}/**/*` nor, for a root project at `.`, its
+`default`; select files outside a project's own with a `{workspaceRoot}`
+fileset.
+
 File exclusions apply to every inclusion in the same input scope, regardless of
 declaration order. Workspace filesets and each project's filesets have separate
 scopes: an exclusion in `^production` cannot remove a file selected explicitly
