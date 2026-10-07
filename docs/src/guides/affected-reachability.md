@@ -49,8 +49,12 @@ under `nx` in its `package.json`:
 | `anchors` | Nonempty array of globs naming the files the project depends on through their imports: entry points and build configuration |
 | `sources` | Nonempty array of globs naming the files whose changes matter only through imports |
 
-Both take `{projectRoot}` and `{workspaceRoot}`. A `package.json` is never a
-source, since it decides what imports resolve to. A project without
+Both take `{projectRoot}` and `{workspaceRoot}`, and `!` exclusions: a file
+matches when an inclusion matches it and no exclusion does, in any order. A
+`package.json` is never a source, since it decides what imports resolve to.
+Leave test files in `sources`: a changed test reaches the project only if an
+anchor imports it, while a file left out of `sources` keeps the project
+whenever it changes. A project without
 `qk:reachability` is never left out. An end-to-end project that drives an app
 rather than importing it can name the app's anchors, so the two are decided
 alike; without its own settings, it is left out only when it is affected

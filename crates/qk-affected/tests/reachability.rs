@@ -540,3 +540,87 @@ fn task_selection_refuses_profiles_with_projections() {
     .unwrap_err();
     assert!(error.to_string().contains("applies to project selection"));
 }
+
+#[test]
+fn exclusions_take_files_out_of_sources_and_cases() {
+    use qk_affected::TaskDecision;
+    let repo = Repo::new(&[(
+        "apps/app/project.json",
+        r#"{
+            "name": "app",
+            "implicitDependencies": ["lib"],
+            "qk:reachability": {
+                "anchors": ["{projectRoot}/src/main.ts"],
+                "sources": ["!{workspaceRoot}/libs/*/src/**/*.test.ts", "{projectRoot}/src/**/*", "{workspaceRoot}/libs/*/src/**/*"]
+            }
+        }"#,
+    )]);
+    write(
+        &repo.root,
+        "libs/lib/src/unused.test.ts",
+        "export const test = 1;\n",
+    );
+    let analysis = repo.analyse(Some("reach"));
+    assert!(
+        matches!(
+            decisions(&analysis)["app"],
+            Decision::Kept { why: Kept::NotImported { reason: qk_affected::Reason::File { file }, .. } }
+                if file == "libs/lib/src/unused.test.ts"
+        ),
+        "an excluded file is not a source: {:?}",
+        analysis.reachability
+    );
+    let repo2 = Repo::new(&[(
+        "apps/app/project.json",
+        r#"{
+            "name": "app",
+            "implicitDependencies": ["lib"],
+            "qk:reachability": {
+                "anchors": ["{projectRoot}/src/main.ts"],
+                "sources": ["{projectRoot}/src/**/*", "{workspaceRoot}/libs/*/src/**/*", "!{workspaceRoot}/libs/*/src/**/*.test.ts"]
+            }
+        }"#,
+    )]);
+    write(
+        &repo2.root,
+        "libs/lib/src/unused.ts",
+        "export const unused = 2;\n",
+    );
+    let analysis = repo2.analyse(Some("reach"));
+    assert!(
+        matches!(decisions(&analysis)["app"], Decision::LeftOut { .. }),
+        "files the exclusion does not match stay sources: {:?}",
+        analysis.reachability
+    );
+
+    let visual = visual_repo();
+    let project = std::fs::read_to_string(visual.root.join("apps/app/project.json")).unwrap();
+    write(
+        &visual.root,
+        "apps/app/project.json",
+        &project.replace(
+            r#""cases": ["{projectRoot}/visual/cases/*.ts"]"#,
+            r#""cases": ["{projectRoot}/visual/cases/*.ts", "!{projectRoot}/visual/cases/second.ts"]"#,
+        ),
+    );
+    commit(&visual.root);
+    let visual = Repo {
+        _temp: visual._temp,
+        root: visual.root.clone(),
+        base: git(&visual.root, &["rev-parse", "HEAD"]),
+    };
+    write(
+        &visual.root,
+        "libs/lib/src/used.ts",
+        "export const used = 2;\n",
+    );
+    let analysis = visual.tasks(Some("reach"));
+    let TaskDecision::Cases { cases, of } = &analysis.reachability["app:visual"] else {
+        panic!("{:?}", analysis.reachability);
+    };
+    assert_eq!(*of, 1, "the excluded case is not one of the task's cases");
+    assert_eq!(
+        cases.keys().collect::<Vec<_>>(),
+        ["apps/app/visual/cases/first.ts"]
+    );
+}

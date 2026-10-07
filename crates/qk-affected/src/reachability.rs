@@ -24,16 +24,46 @@ use qk_taskgraph::TaskGraph;
 
 /// A project's or target's `qk:reachability`, its paths expanded.
 pub(crate) struct Settings {
-    pub anchors: Vec<String>,
-    pub cases: Vec<String>,
-    sources: Vec<Pattern>,
+    pub anchors: Globs,
+    pub cases: Globs,
+    sources: Globs,
 }
 
 impl Settings {
     /// Whether a change to `file` matters only through imports.
     pub fn is_source(&self, file: &str) -> bool {
-        file.rsplit('/').next() != Some("package.json")
-            && self.sources.iter().any(|pattern| pattern.is_match(file))
+        file.rsplit('/').next() != Some("package.json") && self.sources.is_match(file)
+    }
+}
+
+/// Globs, with `!` exclusions: a path matches when an inclusion matches it
+/// and no exclusion does, whatever their order.
+#[derive(Default)]
+pub(crate) struct Globs {
+    included: Vec<Pattern>,
+    excluded: Vec<Pattern>,
+}
+
+impl Globs {
+    fn new(patterns: &[String]) -> Result<Self> {
+        let mut globs = Self::default();
+        for pattern in patterns {
+            match pattern.strip_prefix('!') {
+                Some(excluded) => globs.excluded.push(Pattern::new(excluded, true)?),
+                None => globs.included.push(Pattern::new(pattern, false)?),
+            }
+        }
+        Ok(globs)
+    }
+
+    /// Whether nothing can match.
+    pub fn is_empty(&self) -> bool {
+        self.included.is_empty()
+    }
+
+    pub fn is_match(&self, path: &str) -> bool {
+        self.included.iter().any(|pattern| pattern.is_match(path))
+            && !self.excluded.iter().any(|pattern| pattern.is_match(path))
     }
 }
 
@@ -68,15 +98,20 @@ pub(crate) fn settings(
         let expanded = paths
             .iter()
             .map(|path| {
-                qk_cache::expand_project_path(workspace, project, path.as_str().unwrap())
+                let path = path.as_str().unwrap();
+                let (bang, path) = path
+                    .strip_prefix('!')
+                    .map_or(("", path), |path| ("!", path));
+                qk_cache::expand_project_path(workspace, project, path)
+                    .map(|path| format!("{bang}{path}"))
                     .with_context(|| format!("{what} qk:reachability.{key}"))
             })
             .collect::<Result<_>>()?;
         lists.insert(key, expanded);
     }
-    let anchors = lists.remove("anchors").unwrap_or_default();
-    let cases = lists.remove("cases").unwrap_or_default();
-    let sources = lists.remove("sources").unwrap_or_default();
+    let anchors = Globs::new(&lists.remove("anchors").unwrap_or_default())?;
+    let cases = Globs::new(&lists.remove("cases").unwrap_or_default())?;
+    let sources = Globs::new(&lists.remove("sources").unwrap_or_default())?;
     ensure!(
         !anchors.is_empty() || !cases.is_empty(),
         "{what} qk:reachability needs anchors{}",
@@ -89,10 +124,7 @@ pub(crate) fn settings(
     Ok(Some(Settings {
         anchors,
         cases,
-        sources: sources
-            .iter()
-            .map(|pattern| Pattern::new(pattern, false))
-            .collect::<Result<_>>()?,
+        sources,
     }))
 }
 
@@ -333,16 +365,12 @@ fn changed_through(
 }
 
 /// The workspace's files each glob of `patterns` matches.
-fn matching(files: &BTreeSet<String>, patterns: &[String]) -> Result<Vec<String>> {
-    let patterns = patterns
+fn matching(files: &BTreeSet<String>, globs: &Globs) -> Vec<String> {
+    files
         .iter()
-        .map(|pattern| Pattern::new(pattern, false))
-        .collect::<Result<Vec<_>>>()?;
-    Ok(files
-        .iter()
-        .filter(|file| patterns.iter().any(|pattern| pattern.is_match(file)))
+        .filter(|file| globs.is_match(file))
         .cloned()
-        .collect())
+        .collect()
 }
 
 /// Each project's anchor files, as its globs match the workspace's files.
@@ -353,7 +381,7 @@ fn anchor_files(
     let files = qk_cache::source_files(&workspace.root)?;
     pending
         .iter()
-        .map(|(name, settings)| Ok((name.clone(), matching(&files, &settings.anchors)?)))
+        .map(|(name, settings)| Ok((name.clone(), matching(&files, &settings.anchors))))
         .collect()
 }
 
@@ -586,8 +614,8 @@ pub(crate) fn decide_tasks(
                 Ok((
                     id.clone(),
                     (
-                        matching(&files, &settings.anchors)?,
-                        matching(&files, &settings.cases)?,
+                        matching(&files, &settings.anchors),
+                        matching(&files, &settings.cases),
                     ),
                 ))
             })
