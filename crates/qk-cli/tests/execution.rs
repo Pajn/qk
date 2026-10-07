@@ -579,13 +579,19 @@ fn finite_dependents_start_after_continuous_dependency_starts_then_stop_it() {
                 "options": helper_target("client", "bench")["options"].clone(),
             },
         }));
-        let started = Instant::now();
         let output = success(run(
             temp.path(),
             &["run", "app:bench", "--parallel", parallel],
         ));
-        assert!(started.elapsed() < Duration::from_secs(10));
         assert!(temp.path().join("bench.done").exists());
+        // Stopped rather than left to run out its lifetime, whose last beat is
+        // 1499; a count is not thrown off by a slow machine as a clock is. A
+        // beat stopped mid-write leaves the file empty.
+        let beats: u32 = fs::read_to_string(temp.path().join("serve.beat"))
+            .unwrap()
+            .parse()
+            .unwrap_or(0);
+        assert!(beats < 1499, "app:serve ran out its lifetime");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             stderr.contains("qk: started app:serve (continuous)"),
