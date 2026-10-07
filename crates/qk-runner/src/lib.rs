@@ -113,6 +113,10 @@ pub struct Settings<'a> {
     /// What each task is expected to take; a task without one is expected to
     /// take no time.
     pub expected: &'a BTreeMap<String, Expected>,
+    /// The cases each task narrowed to some of them runs, named to it in
+    /// `QK_AFFECTED_CASES`. Such a task runs without the cache: its result
+    /// covers those cases alone.
+    pub cases: &'a BTreeMap<String, Vec<String>>,
 }
 
 pub fn run(
@@ -130,6 +134,7 @@ pub fn run(
         sandbox: sandbox_mode,
         analyze_inputs,
         expected,
+        cases,
     } = *settings;
     if analyze_inputs && sandbox_mode.is_some() {
         bail!("input analysis and sandbox enforcement/audit cannot be combined");
@@ -137,6 +142,24 @@ pub fn run(
     let skip_cache = skip_cache || analyze_inputs;
     if parallel == 0 || cores == 0 {
         bail!("parallel and cores must be at least 1");
+    }
+    // Each narrowed task's cases, one per line, in a file kept for the run.
+    let case_directory = if cases.is_empty() {
+        None
+    } else {
+        Some(tempfile::tempdir().context("cannot create a directory for task cases")?)
+    };
+    let mut case_files = BTreeMap::new();
+    if let Some(directory) = &case_directory {
+        for (index, (id, list)) in cases.iter().enumerate() {
+            // Absolute, so a task finds it from whatever directory it runs in.
+            let path = std::path::absolute(directory.path().join(format!("cases-{index}.txt")))
+                .context("cannot locate the directory for task cases")?;
+            let text: String = list.iter().map(|case| format!("{case}\n")).collect();
+            std::fs::write(&path, text)
+                .with_context(|| format!("cannot write the cases of {id}"))?;
+            case_files.insert(id.clone(), path);
+        }
     }
     // The runner's own environment includes the root dotenv files, which is
     // where remote cache credentials arrive; each task loads its own dotenv
@@ -518,19 +541,29 @@ pub fn run(
                         });
                         continue;
                     }
+                    let narrowed = case_files.get(&id);
                     report::event(Event::Started {
                         id: id.clone(),
-                        checking: cache.is_some(),
+                        checking: cache.is_some() && narrowed.is_none(),
                     });
                     let definition = &graph.tasks[&id];
                     if let (Some(threads), Some(count)) = (threads.get(&id), given.get(&id)) {
                         task.execution.extend(threads.environment(*count));
                     }
+                    if let Some(path) = narrowed {
+                        task.execution
+                            .insert("QK_AFFECTED_CASES".into(), path.as_os_str().to_owned());
+                    }
                     let dependency_keys = dependencies
                         .iter()
                         .map(|id| (id.clone(), fingerprints[id].clone()))
                         .collect::<BTreeMap<_, _>>();
-                    let cache = cache.as_ref();
+                    let cache = cache.as_ref().filter(|_| narrowed.is_none());
+                    let uncached = if narrowed.is_some() {
+                        "runs only the cases a change reaches"
+                    } else {
+                        "cache disabled"
+                    };
                     let cancelled = cancelled.clone();
                     scope.spawn(move || {
                         let result = if let Some(cache) = cache {
@@ -544,7 +577,7 @@ pub fn run(
                             )
                         } else {
                             execute(&task, &cancelled).map(|outcome| {
-                                qk_cache::TaskResult::uncached(outcome, "cache disabled".into())
+                                qk_cache::TaskResult::uncached(outcome, uncached.into())
                             })
                         };
                         let _ = sender.send((id, result));

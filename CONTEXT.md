@@ -24,6 +24,12 @@ An opt-in comparison of declared source changes through consumer-specific
 artifact fingerprints at two revisions. It refines affected project selection
 without changing declared task inputs or cache keys.
 
+**Import reachability**:
+An opt-in refinement of affected project selection that leaves out a project
+affected only through dependencies when none of its anchors, the files it
+depends on through their imports, imports a changed source. It does not change
+declared task inputs or cache keys.
+
 **Result record**:
 A saved successful task result, identified by its cache key, that describes
 the task's outputs and recorded log.

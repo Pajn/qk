@@ -100,6 +100,12 @@ target creation. Listed names initially create targets even if the script
 is absent, allowing explicit definitions to replace them; missing scripts
 fail in execution preflight, not inspection.
 
+## `qk:reachability`
+
+A qk extension: the `anchors` and `sources` an affected profile with
+`reachability` uses to leave the project out when its anchors do not import
+what changed. See [Import reachability](../guides/affected-reachability.md).
+
 ## `project.local.json`
 
 A machine-specific overlay beside `project.json` or `package.json`. It can

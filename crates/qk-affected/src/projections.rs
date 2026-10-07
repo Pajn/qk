@@ -57,7 +57,43 @@ pub struct ProjectionReport {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Profile {
+    #[serde(default)]
     projections: Vec<Projection>,
+    /// Whether projects and tasks with `qk:reachability` are narrowed by what
+    /// their anchors import.
+    #[serde(default)]
+    reachability: bool,
+}
+
+/// The named profile, from `qk:affectedProfiles` or its compatibility alias.
+fn profile(workspace: &Workspace, name: &str) -> Result<Profile> {
+    let canonical = workspace.config.extra.get("qk:affectedProfiles");
+    let legacy = workspace.config.extra.get("affectedProfiles");
+    ensure!(
+        canonical.is_none() || legacy.is_none(),
+        "configure only qk:affectedProfiles; affectedProfiles is a compatibility alias and cannot be used alongside it"
+    );
+    let value = canonical
+        .or(legacy)
+        .and_then(|profiles| profiles.get(name))
+        .with_context(|| format!("unknown affected profile {name:?}"))?;
+    let profile: Profile = serde_json::from_value(value.clone())
+        .with_context(|| format!("invalid affected profile {name:?}"))?;
+    ensure!(
+        !profile.projections.is_empty() || profile.reachability,
+        "affected profile must contain projections or enable reachability"
+    );
+    Ok(profile)
+}
+
+/// Whether the named profile narrows selection by import reachability.
+pub(super) fn reachability(workspace: &Workspace, name: &str) -> Result<bool> {
+    Ok(profile(workspace, name)?.reachability)
+}
+
+/// Whether the named profile replaces changes through projections.
+pub(super) fn has_projections(workspace: &Workspace, name: &str) -> Result<bool> {
+    Ok(!profile(workspace, name)?.projections.is_empty())
 }
 
 #[derive(Deserialize)]
@@ -132,22 +168,7 @@ pub(super) fn apply(
     changes: &Changes<'_>,
     name: &str,
 ) -> Result<(Vec<String>, Vec<ProjectionReport>)> {
-    let canonical = workspace.config.extra.get("qk:affectedProfiles");
-    let legacy = workspace.config.extra.get("affectedProfiles");
-    ensure!(
-        canonical.is_none() || legacy.is_none(),
-        "configure only qk:affectedProfiles; affectedProfiles is a compatibility alias and cannot be used alongside it"
-    );
-    let value = canonical
-        .or(legacy)
-        .and_then(|profiles| profiles.get(name))
-        .with_context(|| format!("unknown affected profile {name:?}"))?;
-    let profile: Profile = serde_json::from_value(value.clone())
-        .with_context(|| format!("invalid affected profile {name:?}"))?;
-    ensure!(
-        !profile.projections.is_empty(),
-        "affected profile must contain projections"
-    );
+    let profile = profile(workspace, name)?;
     let mut names = BTreeSet::new();
     let mut rules = Vec::new();
     for projection in profile.projections {

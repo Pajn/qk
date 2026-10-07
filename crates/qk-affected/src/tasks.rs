@@ -12,7 +12,8 @@ use qk_lockfile::Lockfile;
 use qk_taskgraph::TaskGraph;
 use serde::Serialize;
 
-use crate::{Changes, FileChange, Options};
+use crate::reachability::{self, TaskDecision};
+use crate::{Changes, FileChange, Options, projections};
 
 /// The affected tasks of a task graph and why each one is affected.
 #[derive(Debug, Serialize)]
@@ -22,6 +23,11 @@ pub struct TaskAnalysis {
     pub range: Option<crate::Range>,
     pub files: Vec<String>,
     pub tasks: BTreeMap<String, TaskCause>,
+    /// Under a profile with reachability, what it decided for each task with
+    /// `qk:reachability` that ordinary selection affects, and for each task
+    /// affected only through those it left out.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub reachability: BTreeMap<String, TaskDecision>,
 }
 
 #[derive(Debug, Serialize)]
@@ -73,10 +79,16 @@ pub fn affected_tasks(
     graph: &TaskGraph,
     options: &Options,
 ) -> Result<TaskAnalysis> {
-    anyhow::ensure!(
-        options.affected_profile.is_none(),
-        "--affected-profile applies to project selection; task selection uses declared cache inputs"
-    );
+    let reach = match &options.affected_profile {
+        Some(profile) => {
+            anyhow::ensure!(
+                !projections::has_projections(workspace, profile)?,
+                "--affected-profile with projections applies to project selection; task selection uses declared cache inputs"
+            );
+            true
+        }
+        None => false,
+    };
     let changes = Changes::unfiltered(workspace, options)?;
     if changes.files.is_empty() {
         return Ok(TaskAnalysis {
@@ -85,6 +97,7 @@ pub fn affected_tasks(
             range: changes.range,
             files: changes.files,
             tasks: BTreeMap::new(),
+            reachability: BTreeMap::new(),
         });
     }
     let ignore = qk_cache::SourceIgnore::new(&workspace.root)?;
@@ -121,7 +134,7 @@ pub fn affected_tasks(
                 _ => true,
             }
         };
-    let mut tasks = BTreeMap::new();
+    let mut touched = BTreeMap::new();
     // Changed manifests at both revisions: a dependency's counts for its
     // dependents by what it decides for them.
     let manifests: BTreeMap<String, (Option<String>, Option<String>)> = changes
@@ -169,11 +182,66 @@ pub fn affected_tasks(
             reasons.push(TaskReason::Input { file: file.clone() });
         }
         if !reasons.is_empty() {
-            tasks.insert(id.clone(), TaskCause::Touched { reasons });
+            touched.insert(id.clone(), reasons);
         }
     }
-    // Dependents of an affected task are affected, in dependency order.
-    let mut pending: Vec<&str> = graph.tasks.keys().map(String::as_str).collect();
+    let mut tasks = propagate(graph, &touched, &BTreeSet::new());
+    let mut decisions = BTreeMap::new();
+    if reach {
+        decisions = reachability::decide_tasks(workspace, graph, &changes, &tasks)?;
+        let left_out: BTreeSet<String> = decisions
+            .iter()
+            .filter(|(_, decision)| matches!(decision, TaskDecision::LeftOut { .. }))
+            .map(|(id, _)| id.clone())
+            .collect();
+        if !left_out.is_empty() {
+            touched.retain(|id, _| !left_out.contains(id));
+            let narrowed = propagate(graph, &touched, &left_out);
+            for (id, cause) in &tasks {
+                if narrowed.contains_key(id) || left_out.contains(id) {
+                    continue;
+                }
+                if let TaskCause::DependsOn { task } = cause {
+                    decisions.insert(id.clone(), TaskDecision::Through { task: task.clone() });
+                }
+            }
+            tasks = narrowed;
+        }
+    }
+    Ok(TaskAnalysis {
+        base: changes.base,
+        head: changes.head,
+        range: changes.range,
+        files: changes.files,
+        tasks,
+        reachability: decisions,
+    })
+}
+
+/// The touched tasks and, in dependency order, every task depending on an
+/// affected one, except `skipped`.
+fn propagate(
+    graph: &TaskGraph,
+    touched: &BTreeMap<String, Vec<TaskReason>>,
+    skipped: &BTreeSet<String>,
+) -> BTreeMap<String, TaskCause> {
+    let mut tasks: BTreeMap<String, TaskCause> = touched
+        .iter()
+        .map(|(id, reasons)| {
+            (
+                id.clone(),
+                TaskCause::Touched {
+                    reasons: reasons.clone(),
+                },
+            )
+        })
+        .collect();
+    let mut pending: Vec<&str> = graph
+        .tasks
+        .keys()
+        .map(String::as_str)
+        .filter(|id| !skipped.contains(*id))
+        .collect();
     loop {
         let before = tasks.len();
         pending.retain(|id| {
@@ -201,13 +269,7 @@ pub fn affected_tasks(
             break;
         }
     }
-    Ok(TaskAnalysis {
-        base: changes.base,
-        head: changes.head,
-        range: changes.range,
-        files: changes.files,
-        tasks,
-    })
+    tasks
 }
 
 /// Projects whose dependency on a workspace package was added or removed

@@ -320,3 +320,148 @@ Run records hold where warm state came from, what was restored, which
 groups were on disk already and how long saving took. `qk show task`
 compares the task's duration from warm state with its duration without,
 which shows whether its warm state is worth its size.
+
+## Import reachability
+
+**Status: implemented.**
+[Import reachability](guides/affected-reachability.md) describes the
+behavior; this section records why it takes this shape.
+
+A project is affected when a project it depends on changes, whether or not
+its code uses what changed, and a task is affected when any of its inputs
+changes. Both are safe, and both are coarse where the work is expensive: an
+app's native builds when a shared package changes in a corner only another
+app imports, or a visual regression suite whose every case runs when one
+component changes. As code moves into shared packages, more changes pay for
+work they cannot affect.
+
+[fallout](https://github.com/Pajn/fallout) answers the missing question:
+whether any file reachable by imports from an anchor, such as an app's entry
+point or a test case, is one of the changed files. qk can ask it in two
+places, with one vocabulary.
+
+### Anchors, cases and sources
+
+- **Anchors** are files whose imports a project or task depends on through,
+  such as entry points and build configuration. If any anchor reaches a
+  change, the whole project or task is kept.
+- **Cases** are files a task runs separately, such as the case files of a
+  visual regression suite. Each is asked about on its own, and a task can run
+  only the cases a change reaches.
+- **Sources** are the changed files that matter only through imports, so
+  that fallout's answer is the whole answer for them. Any other change that
+  reaches the project or task, such as build configuration, a lockfile
+  install or a test harness, keeps everything, because no import carries it.
+
+```json
+{
+  "name": "app",
+  "qk:reachability": {
+    "anchors": ["{projectRoot}/index.tsx", "{projectRoot}/bundler.config.js"],
+    "sources": ["{projectRoot}/src/**/*", "{workspaceRoot}/packages/*/src/**/*"]
+  },
+  "targets": {
+    "visual": {
+      "qk:reachability": {
+        "anchors": ["{projectRoot}/visual/shell.tsx"],
+        "cases": ["{projectRoot}/visual/cases/**/*.tsx"],
+        "sources": ["{projectRoot}/src/**/*", "{workspaceRoot}/packages/*/src/**/*"]
+      }
+    }
+  }
+}
+```
+
+Paths take the usual `{projectRoot}` and `{workspaceRoot}` tokens, and a
+target's settings can come from `targetDefaults`. A project or target
+without them is never narrowed. A `package.json` is never a source: it
+decides what imports resolve to. An end-to-end project that drives an app
+rather than importing it names the app's anchors, so the two are decided
+alike.
+
+Reachability is opt-in through an affected profile, as
+[change projections](guides/affected-projections.md) are, and changes no
+cache key:
+
+```json
+{ "qk:affectedProfiles": { "reach": { "reachability": true } } }
+```
+
+### Project selection
+
+Under the profile, a project with `qk:reachability` that ordinary selection
+affects is left out when all of these hold:
+
+1. It is affected only through dependencies: none of its own files changed,
+   and no workspace-wide reason applies, such as `nx.json`, the root
+   tsconfig, the root importer's installs or a deleted manifest.
+2. Every change it is affected through is a file its `sources` match. A
+   dependency's lockfile installs, configuration or manifest keep it.
+3. No anchor reaches a changed file, and the search lost no edge in the
+   repository: fallout reports nothing unresolved that the repository
+   answers for (`in_repo`).
+
+A project left out does not carry selection on: its dependents are affected
+through it only if another selected dependency or their own files affect
+them. This is where a workspace decides which app builds a change runs,
+while checks keep ordinary selection and the default branch builds
+everything.
+
+### Task selection and cases
+
+Under the profile with `--granularity task`, a task with `qk:reachability`
+that ordinary task selection affects is decided by its changed inputs:
+
+1. Any changed input its `sources` do not match runs the whole task, and
+   says which file. So does an affected task it depends on, whose outputs it
+   may read.
+2. Otherwise, if an anchor reaches a change, or the search lost an edge, the
+   whole task runs, naming the chain or the gap.
+3. Otherwise, the cases a change reaches are selected, each with the changed
+   file it reaches. With none, the task is not affected.
+
+`qk show tasks --affected --json` lists the selected cases and why, and qk
+passes them to the task in `QK_AFFECTED_CASES`, the path of a file listing
+them, one per line, which is absent when the whole task runs. A task that
+does not read it runs every case, which is always safe. A suite's own rules,
+such as running the cases that show translated copy when a translation
+catalogue changes, stay in the suite, which can add cases to qk's list but
+should not drop them.
+
+The task's ordinary inputs are what make this sound: a change to the suite's
+harness, its workflow or the files a native build is compiled from reaches
+the task only if they are inputs, and as inputs that are not sources they run
+every case. Declaring them is the workspace's half of the contract.
+
+### Explaining it
+
+`qk show affected` and `--json` list each project the profile left out and
+each case it did not select, with the anchors searched, and for each project,
+task or case it kept, the reason: the chain of imports that reached a change,
+the gap, or the change imports cannot carry. A workspace can record the
+profile's answer beside ordinary selection without acting on it, and compare
+what it would have skipped with what later broke on the default branch,
+before letting it skip anything.
+
+### Requirements and limits
+
+- The head revision must be the checkout, since fallout reads files from
+  disk. With `--head` naming anything else, the profile keeps everything and
+  says why.
+- Workspace packages must be linked into `node_modules`. Without them,
+  imports between workspace packages resolve to nothing, which counts as a
+  gap, so nothing is left out: the profile is safe and saves nothing.
+- Only static imports are seen. Code a bundler adds through configuration,
+  native code and requests built at run time are not, which is why changes
+  outside `sources` keep everything.
+- fallout's bundler settings, such as which `package.json` fields an app's
+  bundler reads, come from the app's `fallout.toml`.
+- fallout is a library dependency of `qk-affected`, at a released version.
+
+### Not decided yet
+
+- Whether symbol granularity is worth its cost over file granularity.
+- Whether cases should be passed to tasks in another form as well, such as
+  an argument.
+- Discovering anchors from a bundler's configuration rather than declaring
+  them.

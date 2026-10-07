@@ -7,6 +7,12 @@ on:
 permissions:
   contents: read
 
+env:
+  # tree-sitter-scss, which fallout parses stylesheets with, hands its C
+  # compiler a GCC-style warning flag unconditionally, and cl.exe rejects it.
+  # clang-cl reads that flag and the MSVC ones alike.
+  CC_x86_64_pc_windows_msvc: clang-cl
+
 jobs:
   check:
     strategy:

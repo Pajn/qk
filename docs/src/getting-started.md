@@ -1,7 +1,9 @@
 # Getting started
 
 
-Install a current stable Rust toolchain, then run from this repository:
+Install a current stable Rust toolchain, then run from this repository. On
+Windows, building also needs clang-cl, from LLVM, as the C compiler for the
+MSVC target: set `CC_x86_64_pc_windows_msvc=clang-cl`.
 
 ```sh
 cargo run -p qk-cli -- --workspace examples/basic show projects

@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+fallout.workspace = true
 ignore.workspace = true
 qk-cache.workspace = true
 qk-config.workspace = true

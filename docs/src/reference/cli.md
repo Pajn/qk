@@ -142,7 +142,7 @@ different work.
 | --- | --- |
 | `--base <revision>` | Base: `NX_BASE`, then `defaultBase`, then `main` |
 | `--head <revision>` | Head: `NX_HEAD`, otherwise working tree |
-| `--affected-profile <name>` | Opt-in project change projections from `qk:affectedProfiles`; requires a committed comparison to refine selection |
+| `--affected-profile <name>` | Opt-in refinement of selection from `qk:affectedProfiles`: change projections, which apply to project selection and require a committed comparison, and import reachability, which applies to project and task selection and requires the head to be the checkout |
 | `--fail-on-projection-fallback[=all\|adapter]` | Fail on every fallback (bare flag or `all`), or adapter failures (`adapter`) with notices for conservative comparisons; requires `--affected-profile` and a committed head, rejects explicit/working-tree file selection |
 | `--files <paths>` | Replace Git comparison with named workspace-relative paths |
 | `--stdin` | Read changed workspace-relative paths from stdin, one per line; an empty list means no changes |

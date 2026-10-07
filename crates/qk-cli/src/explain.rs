@@ -3,7 +3,7 @@
 use std::io::Write;
 
 use anyhow::{Result, bail};
-use qk_affected::{Analysis, Cause, Reason};
+use qk_affected::{Analysis, Cause, Decision, Kept, Reason};
 use qk_config::Workspace;
 use qk_graph::graph_order;
 use serde_json::json;
@@ -51,6 +51,9 @@ pub fn explain(
                 "head": analysis.head,
                 "chain": steps,
             });
+            if let Some(decision) = analysis.reachability.get(project) {
+                report["reachability"] = serde_json::to_value(decision)?;
+            }
             if !analysis.projections.is_empty() {
                 report["projections"] = serde_json::to_value(&analysis.projections)?;
                 report["originalFiles"] = serde_json::to_value(&analysis.original_files)?;
@@ -73,16 +76,55 @@ pub fn explain(
                         };
                         format!("touched: {}{more}", reasons[0])
                     }
-                    Cause::DependsOn { project, .. } => format!("depends on {project}"),
+                    Cause::DependsOn { project, .. } => match analysis.reachability.get(&name) {
+                        Some(decision) => format!("depends on {project}; {decision}"),
+                        None => format!("depends on {project}"),
+                    },
                 };
                 writeln!(out, "{name:width$}  {summary}")?;
+            }
+            let left_out = graph_order(
+                &workspace.projects,
+                analysis
+                    .reachability
+                    .iter()
+                    .filter(|(_, decision)| !matches!(decision, Decision::Kept { .. }))
+                    .map(|(name, _)| name.clone()),
+            );
+            if !left_out.is_empty() {
+                writeln!(out, "Left out by import reachability:")?;
+                let width = left_out.iter().map(String::len).max().unwrap_or(0);
+                for name in left_out {
+                    let decision = &analysis.reachability[&name];
+                    writeln!(out, "  {name:width$}  {decision}")?;
+                }
             }
         }
         (Some(project), false) => {
             writeln!(out, "{}", comparison(analysis))?;
             explain_projections(analysis, out)?;
             let Some(chain) = analysis.chain(project) else {
-                writeln!(out, "{project} is not affected.")?;
+                match analysis.reachability.get(project) {
+                    Some(Decision::LeftOut { anchors, changed }) => {
+                        writeln!(
+                            out,
+                            "{project} is left out: none of its anchors imports a change it is affected through."
+                        )?;
+                        writeln!(out, "Anchors searched:")?;
+                        for anchor in anchors {
+                            writeln!(out, "  {anchor}")?;
+                        }
+                        writeln!(out, "Changes it is affected through:")?;
+                        for file in changed {
+                            writeln!(out, "  {file}")?;
+                        }
+                    }
+                    Some(Decision::Through { project: through }) => writeln!(
+                        out,
+                        "{project} is left out: it is affected only through {through}, which import reachability left out."
+                    )?,
+                    _ => writeln!(out, "{project} is not affected.")?,
+                }
                 return Ok(());
             };
             let touched = chain.last().expect("a chain has its project");
@@ -129,6 +171,16 @@ pub fn explain(
                     }
                     if lines.len() > LISTED {
                         writeln!(out, "      ... {} more packages", lines.len() - LISTED)?;
+                    }
+                }
+            }
+            if let Some(Decision::Kept { why }) = analysis.reachability.get(project) {
+                writeln!(out, "Import reachability kept it: {why}")?;
+                if let Kept::Reached { chain, .. } = why
+                    && chain.len() > 2
+                {
+                    for pair in chain.windows(2) {
+                        writeln!(out, "  {} imports {}", pair[0], pair[1])?;
                     }
                 }
             }
@@ -370,7 +422,28 @@ pub fn tasks(
             }
             qk_affected::TaskCause::DependsOn { task } => format!("depends on {task}"),
         };
-        writeln!(out, "{id:width$}  {summary}")?;
+        match analysis.reachability.get(id) {
+            Some(decision) => writeln!(out, "{id:width$}  {summary}; {decision}")?,
+            None => writeln!(out, "{id:width$}  {summary}")?,
+        }
+        if let Some(qk_affected::TaskDecision::Cases { cases, .. }) = analysis.reachability.get(id)
+        {
+            for (case, why) in cases {
+                writeln!(out, "  {case}: {why}")?;
+            }
+        }
+    }
+    let left_out: Vec<_> = analysis
+        .reachability
+        .iter()
+        .filter(|(id, _)| !analysis.tasks.contains_key(*id))
+        .collect();
+    if !left_out.is_empty() {
+        writeln!(out, "Left out by import reachability:")?;
+        let width = left_out.iter().map(|(id, _)| id.len()).max().unwrap_or(0);
+        for (id, decision) in left_out {
+            writeln!(out, "  {id:width$}  {decision}")?;
+        }
     }
     Ok(())
 }
