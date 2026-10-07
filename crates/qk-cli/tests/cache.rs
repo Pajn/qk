@@ -4667,6 +4667,8 @@ fn show_hash_keys_a_task_as_a_run_would_and_compares_keys() {
     assert!(error.contains("did not key app:narrow"), "{error}");
 
     let text = qk(&["show", "hash", "app:build", "--against", "app:narrow"]);
+    // A target name alone names one of the current project's targets.
+    assert_eq!(qk(&["show", "hash", "build", "--against", "narrow"]), text);
     assert!(
         text.contains(r#"field definition.inputs[0]: "{projectRoot}/src/input.txt" -> "{projectRoot}/src/**/*""#),
         "{text}"

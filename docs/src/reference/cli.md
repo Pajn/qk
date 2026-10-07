@@ -224,7 +224,8 @@ each counts as having succeeded, with its outputs as they are on disk, so a
 dependency that has not run yet, or whose outputs are stale, keys differently
 here than after it runs.
 
-`--against <task>` keys another task the same way and lists where the two keys
+`--against <task>` keys another task the same way, a target name alone
+naming one of the current project's targets, and lists where the two keys
 differ: the definition fields with both values, the files added, removed or
 changed, and the values and dependencies that differ. `--against <run-id>`
 compares with this task's key in a recorded run, as `qk show runs` lists them,

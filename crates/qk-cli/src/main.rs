@@ -673,8 +673,8 @@ enum ShowCommand {
     Hash {
         /// project:target[:configuration], or a target of the current directory's project.
         task: String,
-        /// Another task, or the id of a recorded run to compare with this
-        /// task's key in that run.
+        /// Another task, a target of the current directory's project, or the
+        /// id of a recorded run to compare with this task's key in that run.
         #[arg(long, value_name = "TASK|RUN")]
         against: Option<String>,
         #[arg(long)]
@@ -1268,9 +1268,17 @@ fn run(mut cli: Cli) -> Result<i32> {
         } => {
             let mut request = task_request(&workspace, task)?;
             request.args = args;
-            // Run ids have no colon; task ids do.
+            // A task id has a colon, and a bare name is a task when the
+            // current project has that target, as for the task itself;
+            // anything else is a run id.
+            let is_task = |value: &str| {
+                value.contains(':')
+                    || current_project(&workspace).is_ok_and(|project| {
+                        workspace.projects[&project].targets.contains_key(value)
+                    })
+            };
             let against = match against {
-                Some(task) if task.contains(':') => Some(hash::Against::Task(Request {
+                Some(task) if is_task(&task) => Some(hash::Against::Task(Request {
                     args: request.args.clone(),
                     ..task_request(&workspace, task)?
                 })),
