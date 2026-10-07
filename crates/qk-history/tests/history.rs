@@ -354,14 +354,26 @@ fn upgrades_schema_three_without_inventing_logs() {
 }
 
 #[test]
-fn a_task_is_expected_to_take_the_median_of_its_recent_executions() {
+fn a_task_is_expected_to_take_the_median_time_and_most_memory_of_its_recent_executions() {
     let temp = tempfile::TempDir::new().unwrap();
     let mut history = History::open(&temp.path().join("history.db")).unwrap();
     // Oldest first: the first two fall out of the last five executions.
-    for (index, millis) in [900, 900, 40, 10, 30, 50, 20].into_iter().enumerate() {
+    for (index, (millis, memory)) in [
+        (900, Some(9_000)),
+        (900, Some(9_000)),
+        (40, Some(100)),
+        (10, None),
+        (30, Some(300)),
+        (50, Some(200)),
+        (20, None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let started = 1_000 * (index as u64 + 1);
         let mut test = task("app:test", Some("k"), started, started + millis, &[]);
         test.threads = Some(4);
+        test.memory = memory;
         history
             .record(
                 run(&format!("run{index}"), started, vec![test]),
@@ -382,7 +394,8 @@ fn a_task_is_expected_to_take_the_median_of_its_recent_executions() {
         expected.get("app:test"),
         Some(&qk_history::Expected {
             millis: 30,
-            threads: 4
+            threads: 4,
+            memory: Some(300),
         })
     );
     assert_eq!(expected.get("app:lint"), None);

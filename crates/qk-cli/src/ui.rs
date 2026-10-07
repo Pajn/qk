@@ -687,6 +687,22 @@ fn details(
             most.join(", ")
         ));
     }
+    if !result.waited_for_memory.is_empty() {
+        let waited: Vec<&str> = result
+            .waited_for_memory
+            .iter()
+            .map(String::as_str)
+            .collect();
+        lines.push(format!(
+            "{} {}",
+            paint.dim(&format!(
+                "{} task{} waited for free memory:",
+                waited.len(),
+                if waited.len() == 1 { "" } else { "s" }
+            )),
+            list(&waited)
+        ));
+    }
     let path = &report.critical_path;
     if path.tasks.len() > 1 || (path.tasks.len() == 1 && total > 1) {
         let by_id: BTreeMap<&str, &qk_history::TaskReport> = report
@@ -956,6 +972,7 @@ mod tests {
             ]),
             load: vec![(load, true), (load, false)],
             memory: None,
+            waited_for_memory: BTreeSet::new(),
         };
         let tasks = vec![
             report("app:a", 0, 1_000, &[]),

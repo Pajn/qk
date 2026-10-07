@@ -158,6 +158,7 @@ pub fn expected(workspace: &Workspace) -> std::collections::BTreeMap<String, qk_
                     let expected = qk_runner::Expected {
                         millis: expected.millis,
                         threads: expected.threads,
+                        memory: expected.memory,
                     };
                     (id, expected)
                 })

@@ -94,6 +94,24 @@ executed it, rather than restoring it from the cache, and the longest chain
 of tasks depending on it. A task without such runs is expected to take no
 time, so a workspace's first run starts tasks in the order of their ids.
 
+## Waiting for memory
+
+Tasks that each fit in memory can exhaust it together, and a machine out of
+memory freezes rather than failing one task. So a task starts only once the
+machine has the memory it is expected to use free. Free memory is the
+machine's, so other runs, worktrees and programs count. What is free, less a
+tenth of the machine's memory kept for everything else and what the run's
+running tasks are still expected to grow by, must cover what the task is
+expected to use. A task that waits leaves its slot to the next task that
+fits, and starts regardless once nothing else of the run is running, so a
+run cannot stall. The summary names the tasks that waited.
+
+A task is expected to use the most memory it used in its recent runs that
+executed it, as [run history](history.md) records. A task without such runs
+is expected to use the median of the run's other tasks of its target, so a
+type-check of a new project is expected to use what the others do. A task of
+a target none of which has been measured starts without waiting.
+
 ## Dependencies and configurations
 
 The planner expands `dependsOn` before execution: local targets, `^target`

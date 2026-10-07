@@ -176,15 +176,18 @@ pub struct Observation {
     pub log_available: bool,
 }
 
-/// How long a task can be expected to run, from the runs that executed it.
+/// How long a task can be expected to run, and the memory it can be expected
+/// to use, from the runs that executed it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Expected {
     pub millis: u64,
     /// The threads it ran with: one, unless its target has `qk:threads`.
     pub threads: u64,
+    /// The most memory, in bytes, any of those runs used, when any recorded it.
+    pub memory: Option<u64>,
 }
 
-/// Executions an expectation is the median of.
+/// Executions an expectation is drawn from: the median of their times.
 const EXPECTED_FROM: usize = 5;
 
 pub struct History {
@@ -557,11 +560,13 @@ impl History {
         ).optional()?)
     }
 
-    /// Each task's expected execution: the median of its last few that ran
-    /// the task rather than replaying it from a cache, and were not cut short.
+    /// Each task's expected execution, from its last few that ran the task
+    /// rather than replaying it from a cache, and were not cut short: the
+    /// median of their times, and the most memory any of them used, since
+    /// expecting too little memory is what costs.
     pub fn expected(&self) -> Result<BTreeMap<String, Expected>> {
         let mut statement = self.connection.prepare(
-            "SELECT task_id, ended - started, threads FROM tasks
+            "SELECT task_id, ended - started, threads, memory FROM tasks
              WHERE cache IN ('miss', 'uncached') AND status IN ('success', 'failure')
                AND started IS NOT NULL AND ended IS NOT NULL
              ORDER BY task_id, started DESC",
@@ -571,24 +576,31 @@ impl History {
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
             ))
         })?;
         let mut recent: BTreeMap<String, Vec<Expected>> = BTreeMap::new();
         for row in rows {
-            let (task, millis, threads) = row?;
+            let (task, millis, threads, memory) = row?;
             let executions = recent.entry(task).or_default();
             if executions.len() < EXPECTED_FROM {
                 executions.push(Expected {
                     millis: millis.max(0) as u64,
                     threads: threads.map_or(1, |threads| threads.max(1) as u64),
+                    memory: memory.map(|memory| memory.max(0) as u64),
                 });
             }
         }
         Ok(recent
             .into_iter()
             .map(|(task, mut executions)| {
+                let memory = executions
+                    .iter()
+                    .filter_map(|execution| execution.memory)
+                    .max();
                 executions.sort_by_key(|execution| execution.millis);
-                (task, executions[executions.len() / 2])
+                let median = executions[executions.len() / 2];
+                (task, Expected { memory, ..median })
             })
             .collect())
     }

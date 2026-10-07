@@ -26,8 +26,11 @@ with how long it took without, over its successful runs that executed. A task
 that executed also records the most memory it used: that of its commands and
 every process under them, summed, sampled every 250 ms while it runs, so a
 task too brief to be sampled records none. On macOS a process's memory is
-its physical footprint, the figure Activity Monitor shows; elsewhere it is
-its resident memory. The run
+its physical footprint, the figure Activity Monitor shows, and a task's peak
+is at least the most its largest process used in its life, which the system
+keeps, so a spike between samples is not missed; elsewhere it is its
+resident memory. The scheduler [waits for memory](running-tasks.md#waiting-for-memory)
+from these peaks. The run
 summary gives the most the run's tasks used together and the three tasks
 that used the most, and `qk show task` what the task used in each run. The
 newest 200 runs are kept. The schema is versioned in `schema_version`.
