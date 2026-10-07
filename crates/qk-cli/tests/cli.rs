@@ -871,6 +871,123 @@ fn doctor_reports_unsupported_features_without_side_effects() {
 }
 
 #[test]
+fn reachability_profile_leaves_out_projects_and_explains_them() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    let git = |args: &[&str]| {
+        let output = isolated_command("git")
+            .current_dir(root)
+            .args(["-c", "user.name=qk", "-c", "user.email=qk@example.invalid"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    let write = |path: &str, content: &str| {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    };
+    write(
+        "nx.json",
+        &json!({"qk:affectedProfiles": {"reach": {"reachability": true}}}).to_string(),
+    );
+    write(
+        "apps/app/project.json",
+        &json!({
+            "name": "app",
+            "implicitDependencies": ["lib"],
+            "qk:reachability": {
+                "anchors": ["{projectRoot}/src/main.ts"],
+                "sources": ["{projectRoot}/src/**/*", "{workspaceRoot}/libs/*/src/**/*"]
+            }
+        })
+        .to_string(),
+    );
+    write(
+        "apps/app/src/main.ts",
+        "import { used } from \"../../../libs/lib/src/used\";\nexport const app = used;\n",
+    );
+    write(
+        "apps/app-e2e/project.json",
+        &json!({"name": "app-e2e", "implicitDependencies": ["app"]}).to_string(),
+    );
+    write("libs/lib/project.json", &json!({"name": "lib"}).to_string());
+    write("libs/lib/src/used.ts", "export const used = 1;\n");
+    write("libs/lib/src/unused.ts", "export const unused = 1;\n");
+    git(&["init", "--quiet", "--initial-branch=main"]);
+    git(&["add", "."]);
+    git(&["commit", "--quiet", "-m", "base"]);
+    write("libs/lib/src/unused.ts", "export const unused = 2;\n");
+    git(&["add", "."]);
+    git(&["commit", "--quiet", "-m", "head"]);
+    let run = |args: &[&str]| {
+        let mut args = args.to_vec();
+        args.extend([
+            "--affected-profile",
+            "reach",
+            "--base",
+            "HEAD^",
+            "--head",
+            "HEAD",
+        ]);
+        isolated_command(env!("CARGO_BIN_EXE_qk"))
+            .current_dir(root)
+            .args(&args)
+            .output()
+            .unwrap()
+    };
+    assert_eq!(
+        successful_json(run(&["show", "projects", "--affected", "--json"])),
+        json!(["lib"])
+    );
+    let output = run(&["show", "affected"]);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(!text.contains("after projection"), "{text}");
+    assert!(text.contains("Left out by import reachability:"), "{text}");
+    assert!(
+        text.contains("app-e2e  left out: affected only through app, left out too"),
+        "{text}"
+    );
+    assert!(
+        text.contains("app      left out: none of its 1 anchor imports a change"),
+        "{text}"
+    );
+    let output = run(&["show", "affected", "app"]);
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.contains("app is left out: none of its anchors imports a change it is affected through.\nAnchors searched:\n  apps/app/src/main.ts\nChanges it is affected through:\n  libs/lib/src/unused.ts\n"),
+        "{text}"
+    );
+    let explanation = successful_json(run(&["show", "affected", "app", "--json"]));
+    assert_eq!(explanation["affected"], false);
+    assert_eq!(
+        explanation["reachability"],
+        json!({"decision": "leftOut", "anchors": ["apps/app/src/main.ts"], "changed": ["libs/lib/src/unused.ts"]})
+    );
+
+    write("libs/lib/src/used.ts", "export const used = 2;\n");
+    git(&["add", "."]);
+    git(&["commit", "--quiet", "-m", "used"]);
+    let output = run(&["show", "affected", "app"]);
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.contains(
+            "Import reachability kept it: apps/app/src/main.ts imports libs/lib/src/used.ts\n"
+        ),
+        "{text}"
+    );
+    let explanation = successful_json(run(&["show", "affected", "app", "--json"]));
+    assert_eq!(explanation["reachability"]["decision"], "kept");
+    assert_eq!(explanation["reachability"]["why"]["kind"], "reached");
+}
+
+#[test]
 fn affected_profile_lists_projects_explains_projection_and_rejects_task_selection() {
     let temp = TempDir::new().unwrap();
     let root = temp.path();

@@ -1135,7 +1135,7 @@ mod tests {
             cache
                 .root
                 .join("blobs")
-                .join(blake3::hash(b"cached").to_hex().to_string()),
+                .join(blake3::hash(b"cached").to_hex().as_str()),
             "corrupt",
         )
         .unwrap();
@@ -1776,7 +1776,7 @@ mod tests {
             cache
                 .root
                 .join("blobs")
-                .join(blake3::hash(b"last").to_hex().to_string()),
+                .join(blake3::hash(b"last").to_hex().as_str()),
             "corrupt",
         )
         .unwrap();

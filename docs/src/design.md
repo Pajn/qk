@@ -323,9 +323,9 @@ which shows whether its warm state is worth its size.
 
 ## Import reachability
 
-**Status: proposed.** Nothing here is implemented yet; this section records
-the intended shape and why, so the configuration and the rules can be agreed
-before the code.
+**Status: project selection implemented; task selection and cases proposed.**
+[Import reachability](guides/affected-reachability.md) describes the
+behavior; this section records why it takes this shape.
 
 A project is affected when a project it depends on changes, whether or not
 its code uses what changed, and a task is affected when any of its inputs

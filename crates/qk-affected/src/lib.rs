@@ -10,10 +10,12 @@
 
 mod json_diff;
 mod projections;
+mod reachability;
 mod subprocess;
 mod tasks;
 
 pub use projections::{ProjectionFallbackKind, ProjectionFallbackPolicy, ProjectionReport};
+pub use reachability::{Decision, Kept};
 pub use tasks::{TaskAnalysis, TaskCause, TaskReason, affected_tasks};
 
 use std::cell::OnceCell;
@@ -81,6 +83,11 @@ pub struct Analysis {
     /// The changed files considered, after ignore rules.
     pub files: Vec<String>,
     pub projects: BTreeMap<String, Cause>,
+    /// Under a profile with reachability, what it decided for each project
+    /// with `qk:reachability` affected only through dependencies, and for
+    /// each project affected only through those it left out.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub reachability: BTreeMap<String, Decision>,
 }
 
 #[derive(Debug, Serialize)]
@@ -230,6 +237,59 @@ pub fn analyse(workspace: &Workspace, graph: &ProjectGraph, options: &Options) -
     ] {
         locator(workspace, &changes, &mut touches)?;
     }
+    for project in touches.0.keys() {
+        if !workspace.projects.contains_key(project) {
+            bail!("invalid project name {project:?}");
+        }
+    }
+    let mut projects = propagate(graph, &touches.0, &BTreeSet::new());
+    let mut reachability = BTreeMap::new();
+    if let Some(profile) = &options.affected_profile
+        && projections::reachability(workspace, profile)?
+    {
+        reachability = reachability::decide(workspace, graph, &changes, &projects)?;
+        let left_out: BTreeSet<String> = reachability
+            .iter()
+            .filter(|(_, decision)| matches!(decision, Decision::LeftOut { .. }))
+            .map(|(name, _)| name.clone())
+            .collect();
+        if !left_out.is_empty() {
+            let narrowed = propagate(graph, &touches.0, &left_out);
+            for (name, cause) in &projects {
+                if narrowed.contains_key(name) || left_out.contains(name) {
+                    continue;
+                }
+                if let Cause::DependsOn { project, .. } = cause {
+                    reachability.insert(
+                        name.clone(),
+                        Decision::Through {
+                            project: project.clone(),
+                        },
+                    );
+                }
+            }
+            projects = narrowed;
+        }
+    }
+    Ok(Analysis {
+        projections: changes.projections,
+        original_files: changes.original_files,
+        base: changes.base,
+        head: changes.head,
+        range: changes.range,
+        files: changes.files,
+        projects,
+        reachability,
+    })
+}
+
+/// The touched projects and every project depending on one, except through
+/// `skipped`, which are left out with whatever only they lead to.
+fn propagate(
+    graph: &ProjectGraph,
+    touched: &BTreeMap<String, Vec<Reason>>,
+    skipped: &BTreeSet<String>,
+) -> BTreeMap<String, Cause> {
     let mut dependents: BTreeMap<&str, Vec<(&str, &str)>> = BTreeMap::new();
     for (source, edges) in &graph.dependencies {
         for edge in edges {
@@ -241,17 +301,19 @@ pub fn analyse(workspace: &Workspace, graph: &ProjectGraph, options: &Options) -
     }
     let mut projects = BTreeMap::new();
     let mut pending = std::collections::VecDeque::new();
-    for (project, reasons) in touches.0 {
-        if !workspace.projects.contains_key(&project) {
-            bail!("invalid project name {project:?}");
-        }
+    for (project, reasons) in touched {
         pending.push_back(project.clone());
-        projects.insert(project, Cause::Touched { reasons });
+        projects.insert(
+            project.clone(),
+            Cause::Touched {
+                reasons: reasons.clone(),
+            },
+        );
     }
     // Breadth first, so each dependent records a step of a shortest path.
     while let Some(project) = pending.pop_front() {
         for (dependent, kind) in dependents.get(project.as_str()).into_iter().flatten() {
-            if !projects.contains_key(*dependent) {
+            if !projects.contains_key(*dependent) && !skipped.contains(*dependent) {
                 projects.insert(
                     (*dependent).to_owned(),
                     Cause::DependsOn {
@@ -277,15 +339,7 @@ pub fn analyse(workspace: &Workspace, graph: &ProjectGraph, options: &Options) -
                 .collect();
         }
     }
-    Ok(Analysis {
-        projections: changes.projections,
-        original_files: changes.original_files,
-        base: changes.base,
-        head: changes.head,
-        range: changes.range,
-        files: changes.files,
-        projects,
-    })
+    projects
 }
 
 impl Analysis {
@@ -385,9 +439,12 @@ impl<'a> Changes<'a> {
         let ignore = qk_cache::SourceIgnore::new(&workspace.root)?;
         changes.files.retain(|file| !ignore.matches(file));
         if let Some(profile) = &options.affected_profile {
-            changes.original_files = Some(changes.files.clone());
             let (files, reports) = projections::apply(workspace, options, &changes, profile)?;
-            changes.files = files;
+            // A profile without projections, only narrowing by reachability,
+            // leaves the changes as they are.
+            if !reports.is_empty() {
+                changes.original_files = Some(std::mem::replace(&mut changes.files, files));
+            }
             changes.projections = reports;
         }
         Ok(changes)

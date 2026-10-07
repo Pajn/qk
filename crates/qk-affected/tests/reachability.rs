@@ -1,0 +1,333 @@
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use qk_affected::{Analysis, Decision, Kept, Options, analyse};
+use qk_config::Workspace;
+use qk_graph::ProjectGraph;
+use tempfile::TempDir;
+
+/// `app` imports one of `lib`'s two modules, and declares reachability.
+/// `app-e2e` drives `app`, and `other` depends on `lib` without declaring it.
+struct Repo {
+    _temp: TempDir,
+    root: PathBuf,
+    base: String,
+}
+
+const APP: &str = r#"{
+    "name": "app",
+    "implicitDependencies": ["lib"],
+    "qk:reachability": {
+        "anchors": ["{projectRoot}/src/main.ts"],
+        "sources": ["{projectRoot}/src/**/*", "{workspaceRoot}/libs/*/src/**/*"]
+    }
+}"#;
+
+impl Repo {
+    fn new(extra: &[(&str, &str)]) -> Self {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().to_path_buf();
+        let mut files = vec![
+            (
+                "nx.json",
+                r#"{"qk:affectedProfiles": {"reach": {"reachability": true}}}"#,
+            ),
+            ("apps/app/project.json", APP),
+            (
+                "apps/app/src/main.ts",
+                "import { used } from \"../../../libs/lib/src/used\";\nexport const app = used;\n",
+            ),
+            (
+                "apps/app-e2e/project.json",
+                r#"{"name": "app-e2e", "implicitDependencies": ["app"]}"#,
+            ),
+            ("apps/app-e2e/src/spec.ts", "export const spec = 1;\n"),
+            (
+                "apps/other/project.json",
+                r#"{"name": "other", "implicitDependencies": ["lib"]}"#,
+            ),
+            ("libs/lib/project.json", r#"{"name": "lib"}"#),
+            ("libs/lib/src/used.ts", "export const used = 1;\n"),
+            ("libs/lib/src/unused.ts", "export const unused = 1;\n"),
+        ];
+        files.extend_from_slice(extra);
+        for (path, text) in files {
+            write(&root, path, text);
+        }
+        git(&root, &["init", "--quiet", "--initial-branch=main"]);
+        let base = commit(&root);
+        Self {
+            _temp: temp,
+            root,
+            base,
+        }
+    }
+
+    /// Commits the working tree and analyses it from the base, under `profile`.
+    fn analyse(&self, profile: Option<&str>) -> Analysis {
+        let head = commit(&self.root);
+        self.analyse_at(profile, &head)
+    }
+
+    fn analyse_at(&self, profile: Option<&str>, head: &str) -> Analysis {
+        let workspace = Workspace::load(&self.root).unwrap();
+        let graph = ProjectGraph::build(&workspace).unwrap();
+        analyse(
+            &workspace,
+            &graph,
+            &Options {
+                affected_profile: profile.map(str::to_owned),
+                base: Some(self.base.clone()),
+                head: Some(head.to_owned()),
+                ..Options::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn error(&self, profile: &str) -> String {
+        let head = commit(&self.root);
+        let workspace = Workspace::load(&self.root).unwrap();
+        let graph = ProjectGraph::build(&workspace).unwrap();
+        let error = analyse(
+            &workspace,
+            &graph,
+            &Options {
+                affected_profile: Some(profile.into()),
+                base: Some(self.base.clone()),
+                head: Some(head),
+                ..Options::default()
+            },
+        )
+        .unwrap_err();
+        format!("{error:#}")
+    }
+}
+
+fn write(root: &Path, path: &str, text: &str) {
+    let path = root.join(path);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, text).unwrap();
+}
+
+fn git(root: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .current_dir(root)
+        .args(["-c", "user.name=qk", "-c", "user.email=qk@example.com"])
+        .args(["-c", "commit.gpgsign=false", "-c", "core.autocrlf=false"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+fn commit(root: &Path) -> String {
+    git(root, &["add", "--all"]);
+    git(
+        root,
+        &["commit", "--quiet", "--allow-empty", "--message", "change"],
+    );
+    git(root, &["rev-parse", "HEAD"])
+}
+
+fn projects(analysis: &Analysis) -> Vec<&str> {
+    analysis.projects.keys().map(String::as_str).collect()
+}
+
+fn decisions(analysis: &Analysis) -> BTreeMap<&str, &Decision> {
+    analysis
+        .reachability
+        .iter()
+        .map(|(name, decision)| (name.as_str(), decision))
+        .collect()
+}
+
+#[test]
+fn a_change_no_anchor_imports_leaves_the_project_out_with_what_only_it_leads_to() {
+    let repo = Repo::new(&[]);
+    write(
+        &repo.root,
+        "libs/lib/src/unused.ts",
+        "export const unused = 2;\n",
+    );
+    let analysis = repo.analyse(Some("reach"));
+    assert_eq!(projects(&analysis), ["lib", "other"]);
+    let decisions = decisions(&analysis);
+    assert!(
+        matches!(
+            decisions["app"],
+            Decision::LeftOut { anchors, changed }
+                if anchors == &["apps/app/src/main.ts"] && changed == &["libs/lib/src/unused.ts"]
+        ),
+        "{decisions:?}"
+    );
+    assert!(
+        matches!(decisions["app-e2e"], Decision::Through { project } if project == "app"),
+        "{decisions:?}"
+    );
+    // Ordinary selection is unchanged.
+    let ordinary = repo.analyse_at(None, &git(&repo.root, &["rev-parse", "HEAD"]));
+    assert_eq!(projects(&ordinary), ["app", "app-e2e", "lib", "other"]);
+    assert!(ordinary.reachability.is_empty());
+}
+
+#[test]
+fn a_change_an_anchor_imports_keeps_the_project_with_the_chain() {
+    let repo = Repo::new(&[]);
+    write(
+        &repo.root,
+        "libs/lib/src/used.ts",
+        "export const used = 2;\n",
+    );
+    let analysis = repo.analyse(Some("reach"));
+    assert_eq!(projects(&analysis), ["app", "app-e2e", "lib", "other"]);
+    let decisions = decisions(&analysis);
+    assert!(
+        matches!(
+            decisions["app"],
+            Decision::Kept { why: Kept::Reached { anchor, changed, chain } }
+                if anchor == "apps/app/src/main.ts"
+                    && changed == "libs/lib/src/used.ts"
+                    && chain == &["apps/app/src/main.ts", "libs/lib/src/used.ts"]
+        ),
+        "{decisions:?}"
+    );
+    assert!(!decisions.contains_key("app-e2e"), "{decisions:?}");
+}
+
+#[test]
+fn a_change_imports_do_not_carry_keeps_the_project() {
+    let repo = Repo::new(&[]);
+    write(
+        &repo.root,
+        "libs/lib/project.json",
+        r#"{"name": "lib", "tags": ["changed"]}"#,
+    );
+    let analysis = repo.analyse(Some("reach"));
+    assert_eq!(projects(&analysis), ["app", "app-e2e", "lib", "other"]);
+    assert!(
+        matches!(
+            decisions(&analysis)["app"],
+            Decision::Kept { why: Kept::NotImported { project, .. } } if project == "lib"
+        ),
+        "{:?}",
+        analysis.reachability
+    );
+}
+
+#[test]
+fn an_import_nothing_places_keeps_the_project() {
+    let repo = Repo::new(&[(
+        "apps/app/src/main.ts",
+        "import { gone } from \"./gone\";\nexport const app = gone;\n",
+    )]);
+    write(
+        &repo.root,
+        "libs/lib/src/unused.ts",
+        "export const unused = 2;\n",
+    );
+    let analysis = repo.analyse(Some("reach"));
+    assert!(
+        matches!(
+            decisions(&analysis)["app"],
+            Decision::Kept { why: Kept::Gap { specifier, .. } } if specifier == "./gone"
+        ),
+        "{:?}",
+        analysis.reachability
+    );
+    assert!(analysis.projects.contains_key("app"));
+}
+
+#[test]
+fn a_project_touched_directly_is_not_narrowed() {
+    let repo = Repo::new(&[]);
+    write(
+        &repo.root,
+        "libs/lib/src/unused.ts",
+        "export const unused = 2;\n",
+    );
+    write(
+        &repo.root,
+        "apps/app/src/main.ts",
+        "export const app = 2;\n",
+    );
+    let analysis = repo.analyse(Some("reach"));
+    assert_eq!(projects(&analysis), ["app", "app-e2e", "lib", "other"]);
+    assert!(
+        analysis.reachability.is_empty(),
+        "{:?}",
+        analysis.reachability
+    );
+}
+
+#[test]
+fn a_head_other_than_the_checkout_keeps_every_project() {
+    let repo = Repo::new(&[]);
+    write(
+        &repo.root,
+        "libs/lib/src/unused.ts",
+        "export const unused = 2;\n",
+    );
+    let head = commit(&repo.root);
+    write(&repo.root, "apps/other/README.md", "later");
+    commit(&repo.root);
+    let analysis = repo.analyse_at(Some("reach"), &head);
+    assert!(analysis.projects.contains_key("app"));
+    assert!(
+        matches!(
+            decisions(&analysis)["app"],
+            Decision::Kept { why: Kept::Unanswered { detail } } if detail.contains("not checked out")
+        ),
+        "{:?}",
+        analysis.reachability
+    );
+}
+
+#[test]
+fn invalid_settings_are_refused() {
+    for (settings, message) in [
+        (
+            r#"{"anchors": ["{projectRoot}/src/main.ts"]}"#,
+            "needs sources",
+        ),
+        (
+            r#"{"sources": ["{projectRoot}/src/**/*"]}"#,
+            "needs anchors",
+        ),
+        (
+            r#"{"anchors": ["a"], "sources": ["b"], "cases": ["c"]}"#,
+            "belongs on a target",
+        ),
+        (
+            r#"{"anchors": ["a"], "sources": ["b"], "entry": ["c"]}"#,
+            "unknown",
+        ),
+        (r#"{"anchors": "a", "sources": ["b"]}"#, "array of paths"),
+    ] {
+        let repo = Repo::new(&[(
+            "apps/app/project.json",
+            &format!(
+                r#"{{"name": "app", "implicitDependencies": ["lib"], "qk:reachability": {settings}}}"#
+            ),
+        )]);
+        // A change that does not reach the project still finds the mistake.
+        write(&repo.root, "apps/other/README.md", "changed");
+        let error = repo.error("reach");
+        assert!(error.contains(message), "{settings}: {error}");
+    }
+}
+
+#[test]
+fn a_profile_needs_projections_or_reachability() {
+    let repo = Repo::new(&[("nx.json", r#"{"qk:affectedProfiles": {"empty": {}}}"#)]);
+    assert!(
+        repo.error("empty")
+            .contains("must contain projections or enable reachability")
+    );
+}

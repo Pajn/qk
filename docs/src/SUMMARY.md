@@ -7,6 +7,7 @@
 - [Running tasks](guides/running-tasks.md)
 - [Affected selection](guides/affected.md)
 - [Project change projections](guides/affected-projections.md)
+- [Import reachability](guides/affected-reachability.md)
 - [Local cache](guides/cache.md)
 - [Remote cache and storage limits](guides/remote-cache.md)
 - [Warm state](guides/warm-state.md)

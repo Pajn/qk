@@ -29,6 +29,8 @@ pub use inputs::{
     InputChange, InputChanges, Resolution, Resolved, resolve_each, resolve_tasks,
     without_resolution,
 };
+/// Expands `{projectRoot}` and `{workspaceRoot}` in a project's path or glob.
+pub use paths::expand as expand_project_path;
 pub use paths::{
     Outputs, cache_directory, cache_location, clear_worktree_state, resolved_outputs,
     worktree_state,

@@ -245,7 +245,7 @@ enum ProjectionFallbackPolicy {
 /// compared, including uncommitted and untracked files.
 #[derive(Args)]
 struct ChangeOptions {
-    /// Project change-projection profile from nx.json.
+    /// Affected profile from nx.json: change projections, import reachability or both.
     #[arg(long)]
     affected_profile: Option<String>,
     /// Fail on all fallbacks, or only adapter failures with =adapter.
