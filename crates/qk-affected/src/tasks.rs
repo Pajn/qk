@@ -211,10 +211,10 @@ pub fn affected_tasks(
 }
 
 /// Projects whose dependency on a workspace package was added or removed
-/// because the package's version moved into or out of the range they declare
-/// for it, each with that package's manifest. The keys of all their tasks
-/// change with the dependency, although the version itself is not keyed for
-/// them.
+/// because the package's name or version changed, so that what they declare
+/// for it started or stopped meaning it, each with that package's manifest.
+/// The keys of all their tasks change with the dependency, although the
+/// version itself is not keyed for them.
 fn relinked_dependents(
     workspace: &Workspace,
     manifests: &BTreeMap<String, (Option<String>, Option<String>)>,
@@ -228,37 +228,38 @@ fn relinked_dependents(
             .map(String::from);
         Some((name, version))
     };
+    // Whether a dependency declared as `name` with `range` means this package,
+    // as the project graph decides it: by name, then by a range that links
+    // whatever the version or one the version satisfies.
+    let links = |package: &Option<(String, Option<String>)>, name: &str, range: &str| {
+        package.as_ref().is_some_and(|(own, version)| {
+            own == name
+                && (range.starts_with("workspace:")
+                    || range == "*"
+                    || range.starts_with("file:")
+                    || version
+                        .as_deref()
+                        .is_some_and(|version| qk_graph::satisfies(version, range)))
+        })
+    };
     let mut relinked = BTreeMap::new();
     for (file, (before, after)) in manifests {
         let (before, after) = (identity(before), identity(after));
+        if before == after {
+            continue;
+        }
         // The name at both revisions, once when it is unchanged.
         let names: BTreeSet<&String> = before
             .iter()
             .chain(after.iter())
             .map(|(name, _)| name)
             .collect();
-        let version = |side: &Option<(String, Option<String>)>| {
-            side.as_ref().and_then(|(_, version)| version.clone())
-        };
-        let (old, new) = (version(&before), version(&after));
-        if old == new {
-            continue;
-        }
-        let links = |version: &Option<String>, range: &str| {
-            version
-                .as_deref()
-                .is_some_and(|version| qk_graph::satisfies(version, range))
-        };
         for name in names {
             for (project, package) in &workspace.packages {
                 let Some(range) = package.dependency_ranges().get(name.as_str()).copied() else {
                     continue;
                 };
-                // These link to the workspace package whatever its version.
-                if range.starts_with("workspace:") || range == "*" || range.starts_with("file:") {
-                    continue;
-                }
-                if links(&old, range) != links(&new, range) {
+                if links(&before, name, range) != links(&after, name, range) {
                     relinked.insert(project.clone(), file.clone());
                 }
             }

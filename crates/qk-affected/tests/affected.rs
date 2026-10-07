@@ -743,8 +743,9 @@ fn dependency_manifests_affect_dependents_by_what_they_decide() {
 }
 
 /// A version that moves a workspace package into or out of the range a
-/// dependent declares for it adds or removes that dependency, so every task
-/// of the dependent is affected, although the version itself is not keyed.
+/// dependent declares for it, or a name that stops or starts matching what the
+/// dependent declares, adds or removes that dependency, so every task of the
+/// dependent is affected, although the version itself is not keyed.
 #[test]
 fn versions_crossing_a_dependents_range_affect_its_tasks() {
     let repo = |version: &str| {
@@ -791,6 +792,18 @@ fn versions_crossing_a_dependents_range_affect_its_tasks() {
                 if reasons.iter().any(|reason| matches!(reason, qk_affected::TaskReason::Input { file } if file == "libs/lib/package.json"))
         ));
     }
+    // Renamed, the package no longer answers to what app declares.
+    let renamed = repo("1.0.0");
+    write(
+        &renamed.root,
+        "libs/lib/package.json",
+        r#"{"name": "renamed", "version": "1.0.0"}"#,
+    );
+    let tasks = affected_tasks(&renamed);
+    assert_eq!(
+        tasks.keys().collect::<Vec<_>>(),
+        ["app:build", "app:test", "lib:build", "lib:test"]
+    );
     // Within the range, the dependency stays and the version alone does not count.
     let repo = repo("1.0.0");
     write(
