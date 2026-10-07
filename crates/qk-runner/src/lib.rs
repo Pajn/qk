@@ -23,6 +23,7 @@ use qk_executor::report::{self, Event};
 use qk_executor::{Display, Outcome, OutputStyle, environment, execute, prepare};
 use qk_taskgraph::TaskGraph;
 
+mod memory;
 mod recorder;
 pub mod sandbox;
 pub mod threads;
@@ -37,6 +38,8 @@ pub struct RunResult {
     /// The machine's CPU use sampled through the run, from 0 to 1, each with
     /// whether a ready task was waiting for a free slot at the time.
     pub load: Vec<(f32, bool)>,
+    /// The most memory, in bytes, the run's tasks used together.
+    pub memory: Option<u64>,
     /// Under `--sandbox`, what each task did beyond its declarations, and
     /// the tasks that ran unsandboxed with why.
     pub sandbox: Option<SandboxResult>,
@@ -64,6 +67,9 @@ pub struct TaskRecord {
     pub warm: Option<qk_cache::warm::WarmReport>,
     /// The threads it was given, for targets with `qk:threads`.
     pub threads: Option<usize>,
+    /// The most memory, in bytes, its processes used together, sampled as it
+    /// ran; none when it ran too briefly to be sampled.
+    pub memory: Option<u64>,
     /// Bounded output and input verification for an actual cacheable execution.
     pub execution: Option<qk_cache::Execution>,
 }
@@ -286,12 +292,17 @@ pub fn run(
     });
     let waiting = AtomicBool::new(false);
     let load = std::sync::Mutex::new(Vec::new());
+    // The most memory each task, and the run's tasks together, have used.
+    let peaks = std::sync::Mutex::new((BTreeMap::<String, u64>::new(), 0u64));
     std::thread::scope(|scope| -> Result<()> {
         let (finish_sampling, sampling_finished) = mpsc::channel::<()>();
         let load = &load;
         let waiting = &waiting;
+        let peaks = &peaks;
+        let prepared = &prepared;
         // Samples how busy the machine is, so the summary can tell a run held
-        // back by --parallel from one held back by the machine.
+        // back by --parallel from one held back by the machine, and the
+        // memory each running task uses.
         scope.spawn(move || {
             let mut system = sysinfo::System::new();
             system.refresh_cpu_usage();
@@ -304,6 +315,21 @@ pub fn run(
                     system.global_cpu_usage() / 100.0,
                     waiting.load(Ordering::Relaxed),
                 ));
+                let roots: BTreeMap<&str, BTreeSet<u32>> = prepared
+                    .iter()
+                    .map(|(id, task)| (id.as_str(), task.processes.lock().unwrap().clone()))
+                    .filter(|(_, processes)| !processes.is_empty())
+                    .collect();
+                if roots.is_empty() {
+                    continue;
+                }
+                let used = memory::sample(&mut system, &roots);
+                let (tasks, run) = &mut *peaks.lock().unwrap();
+                for (id, bytes) in &used {
+                    let peak = tasks.entry((*id).to_owned()).or_default();
+                    *peak = (*peak).max(*bytes);
+                }
+                *run = (*run).max(used.values().sum());
             }
         });
         let result = (|| -> Result<()> {
@@ -620,6 +646,12 @@ pub fn run(
                                 key,
                                 warm,
                                 threads: given.remove(&id),
+                                memory: peaks
+                                    .lock()
+                                    .unwrap()
+                                    .0
+                                    .remove(&id)
+                                    .filter(|bytes| *bytes > 0),
                                 execution,
                             },
                         );
@@ -660,6 +692,7 @@ pub fn run(
         exit_code,
         tasks: records,
         load: load.into_inner().unwrap(),
+        memory: Some(peaks.into_inner().unwrap().1).filter(|bytes| *bytes > 0),
         sandbox,
         input_analysis,
     })

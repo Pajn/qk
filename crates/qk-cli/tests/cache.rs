@@ -3308,6 +3308,23 @@ fn threaded_tasks_share_the_cores() {
 
 #[cfg(unix)]
 #[test]
+fn records_the_memory_a_task_used() {
+    // Long enough to be sampled, in a process under the task's shell.
+    let fixture = Fixture::with_targets(json!({"slow": {"command": "sleep 1 && true"}}));
+    let output = success(fixture.qk(
+        &fixture.root,
+        &["run-many", "-t", "slow", "--output-style", "quiet"],
+    ));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(" together: app:slow "), "{stderr}");
+    let text = stdout(&success(
+        fixture.qk(&fixture.root, &["show", "task", "app:slow"]),
+    ));
+    assert!(text.contains(" of memory at most"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
 fn a_threaded_task_waits_for_its_minimum() {
     let task = |name: &str| {
         threaded(

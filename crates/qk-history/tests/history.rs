@@ -25,6 +25,7 @@ fn task(
         cause: None,
         warm: None,
         threads: None,
+        memory: None,
     }
 }
 
@@ -340,7 +341,11 @@ fn upgrades_schema_three_without_inventing_logs() {
     drop(history);
     rusqlite::Connection::open(&path)
         .unwrap()
-        .execute_batch("DROP TABLE execution_logs; UPDATE schema_version SET version = 3;")
+        .execute_batch(
+            "DROP TABLE execution_logs;
+             ALTER TABLE tasks DROP COLUMN memory;
+             UPDATE schema_version SET version = 3;",
+        )
         .unwrap();
     let history = History::open(&path).unwrap();
     assert!(history.run(Some("old")).unwrap().is_some());
@@ -381,4 +386,45 @@ fn a_task_is_expected_to_take_the_median_of_its_recent_executions() {
         })
     );
     assert_eq!(expected.get("app:lint"), None);
+}
+
+/// Runs recorded before memory was measured stay readable, without any.
+#[test]
+fn records_the_memory_a_task_used_after_upgrading_schema_four() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("history.db");
+    let mut history = History::open(&path).unwrap();
+    history
+        .record(
+            run("old", 1, vec![task("app:test", Some("k"), 1, 2, &[])]),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+    drop(history);
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "ALTER TABLE tasks DROP COLUMN memory;
+             UPDATE schema_version SET version = 4;",
+        )
+        .unwrap();
+    let mut history = History::open(&path).unwrap();
+    let mut test = task("app:test", Some("k"), 10, 20, &[]);
+    test.memory = Some(3_000_000_000);
+    history
+        .record(run("new", 10, vec![test]), &BTreeMap::new())
+        .unwrap();
+    let memory: Vec<_> = history
+        .task("app:test", 10)
+        .unwrap()
+        .into_iter()
+        .map(|(run, task)| (run, task.memory))
+        .collect();
+    assert_eq!(
+        memory,
+        [
+            ("new".to_owned(), Some(3_000_000_000)),
+            ("old".to_owned(), None)
+        ]
+    );
 }

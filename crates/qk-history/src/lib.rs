@@ -16,7 +16,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 /// Runs kept in the database.
 pub const KEPT_RUNS: usize = 200;
 
@@ -61,6 +61,10 @@ pub struct TaskReport {
     /// The threads the task was given, for targets with `qk:threads`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threads: Option<u64>,
+    /// The most memory, in bytes, the task's processes used together, when it
+    /// executed long enough to be sampled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<u64>,
 }
 
 impl TaskReport {
@@ -234,6 +238,7 @@ impl History {
                          cause TEXT,
                          warm TEXT,
                          threads INTEGER,
+                         memory INTEGER,
                          PRIMARY KEY (run_id, task_id)
                      );
                      CREATE INDEX tasks_by_task ON tasks (task_id, started);
@@ -246,16 +251,19 @@ impl History {
             }
             Some(SCHEMA_VERSION) => {}
             // Version 2 added what warm state did for each task, version 3
-            // the threads it was given.
+            // the threads it was given, version 4 execution logs and
+            // version 5 the memory it used.
             Some(1) => transaction.execute_batch(
                 "ALTER TABLE tasks ADD COLUMN warm TEXT;
                  ALTER TABLE tasks ADD COLUMN threads INTEGER;
-                 UPDATE schema_version SET version = 3;",
+                 ALTER TABLE tasks ADD COLUMN memory INTEGER;",
             )?,
-            Some(3) => {}
+            Some(3 | 4) => {
+                transaction.execute_batch("ALTER TABLE tasks ADD COLUMN memory INTEGER;")?
+            }
             Some(2) => transaction.execute_batch(
                 "ALTER TABLE tasks ADD COLUMN threads INTEGER;
-                 UPDATE schema_version SET version = 3;",
+                 ALTER TABLE tasks ADD COLUMN memory INTEGER;",
             )?,
             Some(other) => {
                 bail!("run history has schema version {other}; this qk reads {SCHEMA_VERSION}")
@@ -271,7 +279,7 @@ impl History {
                  PRIMARY KEY (run_id, task_id),
                  FOREIGN KEY (run_id, task_id) REFERENCES tasks(run_id, task_id) ON DELETE CASCADE
              );
-             UPDATE schema_version SET version = 4;",
+             UPDATE schema_version SET version = 5;",
         )?;
         transaction.commit()?;
         connection.execute_batch("PRAGMA foreign_keys = ON;")?;
@@ -321,8 +329,8 @@ impl History {
             transaction.execute(
                 "INSERT OR REPLACE INTO tasks
                      (run_id, task_id, project, target, configuration, status, cache, key,
-                      started, ended, dependencies, cause, warm, threads)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                      started, ended, dependencies, cause, warm, threads, memory)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
                     run.id,
                     task.id,
@@ -338,6 +346,7 @@ impl History {
                     task.cause.as_ref().map(serde_json::to_string).transpose()?,
                     task.warm.as_ref().map(serde_json::to_string).transpose()?,
                     task.threads,
+                    task.memory,
                 ],
             )?;
         }
@@ -635,7 +644,7 @@ impl History {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut statement = self.connection.prepare(&format!(
             "SELECT run_id, task_id, project, target, configuration, status, cache, key,
-                    started, ended, dependencies, cause, warm, threads
+                    started, ended, dependencies, cause, warm, threads, memory
              FROM tasks WHERE {filter}
              ORDER BY started IS NULL, started DESC, task_id LIMIT ?2"
         ))?;
@@ -656,6 +665,7 @@ impl History {
                     row.get::<_, Option<String>>(11)?,
                     row.get::<_, Option<String>>(12)?,
                     row.get::<_, Option<u64>>(13)?,
+                    row.get::<_, Option<u64>>(14)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -676,6 +686,7 @@ impl History {
                     cause,
                     warm,
                     threads,
+                    memory,
                 )| {
                     Ok((
                         run,
@@ -695,6 +706,7 @@ impl History {
                                 .transpose()?,
                             warm: warm.map(|warm| serde_json::from_str(&warm)).transpose()?,
                             threads,
+                            memory,
                         },
                     ))
                 },

@@ -251,6 +251,9 @@ pub struct PreparedTask {
     pub ready_when: Vec<String>,
     /// Set once all of `ready_when` has appeared.
     pub ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The process ids of its commands while they run, from which the runner
+    /// measures the memory the task uses.
+    pub processes: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<u32>>>,
     /// Each command's prefix and colours, by position; empty without any.
     pub decorations: Vec<Decoration>,
     /// Whether the task reads qk's stdin, and has the terminal while it runs.
@@ -714,6 +717,7 @@ pub fn prepare(
         execution,
         ready_when,
         ready: Default::default(),
+        processes: Default::default(),
         decorations,
         interactive: false,
         sandbox: None,

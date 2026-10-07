@@ -79,7 +79,8 @@ terminal.
 Runs of several tasks, and any run under `static`, the panel or `quiet`,
 end with a summary on stderr: how many tasks succeeded and came from cache, or which
 failed and which were skipped because of them; the critical path with its
-three longest tasks, in the order they ran; and whether `--parallel` held the
+three longest tasks, in the order they ran; the most memory the tasks used
+together and the tasks that used the most; and whether `--parallel` held the
 run back. For that, qk records how long each task waited for a free slot
 after its dependencies finished, and samples the machine's CPU use through
 the run. When tasks on the critical path waited while the machine had
