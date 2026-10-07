@@ -143,7 +143,10 @@ impl Repo {
     fn new(mode: &str) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
-        let rule = json!({"name":"generated-runtime", "command":[adapter(),mode,"{revisionRoot}"], "sources":["schemas/**"], "outputs":["apps/*/generated/**"], "timeoutSeconds":1});
+        // Worktree checkouts share the adapter's deadline, so only adapters
+        // that hang get a short one: a slow checkout is a comparison fallback.
+        let timeout = if mode.starts_with("timeout") { 5 } else { 60 };
+        let rule = json!({"name":"generated-runtime", "command":[adapter(),mode,"{revisionRoot}"], "sources":["schemas/**"], "outputs":["apps/*/generated/**"], "timeoutSeconds":timeout});
         write(
             &root,
             "nx.json",
