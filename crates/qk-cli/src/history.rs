@@ -165,7 +165,7 @@ pub fn expected(workspace: &Workspace) -> std::collections::BTreeMap<String, qk_
         .unwrap_or_default()
 }
 
-fn open(workspace: &Workspace) -> Result<History> {
+pub fn open(workspace: &Workspace) -> Result<History> {
     let path = path(workspace);
     if !path.exists() {
         bail!("no runs recorded yet");
@@ -394,7 +394,6 @@ fn summary(cause: &Cause) -> String {
 
 /// Why a key changed, in full.
 fn details(cause: &Cause) -> Vec<String> {
-    const LISTED: usize = 10;
     let since = cause
         .previous
         .as_ref()
@@ -414,6 +413,14 @@ fn details(cause: &Cause) -> Vec<String> {
         )],
         groups => vec![format!("key changed{since}: {}", groups.join(", "))],
     };
+    lines.extend(differences(cause));
+    lines
+}
+
+/// The fields, files, values and dependencies two keys differ in, a line each.
+pub fn differences(cause: &Cause) -> Vec<String> {
+    const LISTED: usize = 10;
+    let mut lines = Vec::new();
     let mut list = |label: &str, items: &[String]| {
         for item in items.iter().take(LISTED) {
             lines.push(format!("  {label} {item}"));
@@ -422,6 +429,7 @@ fn details(cause: &Cause) -> Vec<String> {
             lines.push(format!("  {label} ... {} more", items.len() - LISTED));
         }
     };
+    list("field", &cause.definition);
     list("changed", &cause.files.changed);
     list("added", &cause.files.added);
     list("removed", &cause.files.removed);

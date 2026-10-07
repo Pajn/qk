@@ -14,7 +14,8 @@ worktrees share it. Each task's record holds its status, cache result
 differs from the previous key recorded for the task, grouped as `files` (with
 the paths added, removed and changed), `env`, `runtime`, `dependencies` (with
 the dependency tasks), `lockfile` (with the importers and packages),
-`inputs`, `definition`, `args` and `tooling`, or `first`, `unchanged` and
+`inputs`, `definition` (with each field that differs and both of its
+values), `args` and `tooling`, or `first`, `unchanged` and
 `unknown` when the previous inputs are no longer kept. For targets with warm
 state it also holds where that state came from (`local`, `worktree <root>`
 or `remote <branch>`), how many files and bytes were restored, which groups
@@ -23,6 +24,10 @@ the background; the run summary names the tasks that started from warm
 state, and `qk show task` compares how long the task took from warm state
 with how long it took without, over its successful runs that executed. The newest 200 runs are
 kept. The schema is versioned in `schema_version`.
+
+`qk show hash <task> --against <run-id>` compares the key a task would have
+now with its key in a recorded run, without running it; see
+[Key inspection](../reference/cli.md#key-inspection).
 
 `--report <path>` (or `NX_RUN_REPORT`) on `run`, `run-many` and `affected`
 writes the run as JSON: the command, commit, exit code, each task with its

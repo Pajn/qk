@@ -4608,3 +4608,67 @@ fn runtime_inputs_keep_distinct_target_dotenv_environments() {
         stderr(&changed)
     );
 }
+
+#[test]
+fn show_hash_keys_a_task_as_a_run_would_and_compares_keys() {
+    let inputs =
+        |files: &str| json!({"dependsOn": ["gen"], "inputs": [files, {"env": "QK_HASH_MODE"}]});
+    let fixture = Fixture::with_targets(json!({
+        "gen": target("generate", json!({"outputs": ["{projectRoot}/generated"]})),
+        "build": target("build", inputs("{projectRoot}/src/**/*")),
+        "narrow": target("build", inputs("{projectRoot}/src/input.txt")),
+    }));
+    let qk = |args: &[&str]| {
+        let output = fixture
+            .command(&fixture.root, args)
+            .env("QK_HASH_MODE", "secret-value")
+            .output()
+            .unwrap();
+        stdout(&success(output))
+    };
+    let report = fixture.root.parent().unwrap().join("report.json");
+    qk(&["run", "app:build", "--report", report.to_str().unwrap()]);
+    let report: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+    let run = report["id"].as_str().unwrap();
+    let recorded = report["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["id"] == "app:build")
+        .unwrap()["key"]
+        .clone();
+
+    // The key a run computed, from the dependency's outputs on disk.
+    let shown: Value = serde_json::from_str(&qk(&["show", "hash", "app:build", "--json"])).unwrap();
+    assert_eq!(shown["key"], recorded);
+    assert!(
+        shown["inputs"]["dependencies"].get("app:gen").is_some(),
+        "{shown}"
+    );
+    assert!(!shown.to_string().contains("secret-value"), "{shown}");
+    let text = qk(&["show", "hash", "app:build"]);
+    assert!(text.contains("dependency  app:gen"), "{text}");
+
+    let text = qk(&["show", "hash", "app:build", "--against", run]);
+    assert!(text.ends_with("same key\n"), "{text}");
+    fs::write(fixture.root.join("src/input.txt"), "two\n").unwrap();
+    let text = qk(&["show", "hash", "app:build", "--against", run]);
+    assert!(text.contains("keys differ in: files"), "{text}");
+    assert!(text.contains("changed src/input.txt"), "{text}");
+
+    let failure = |args: &[&str]| {
+        let output = fixture.qk(&fixture.root, args);
+        assert!(!output.status.success());
+        stderr(&output)
+    };
+    let error = failure(&["show", "hash", "app:build", "--against", "0-0"]);
+    assert!(error.contains("unknown run 0-0"), "{error}");
+    let error = failure(&["show", "hash", "app:narrow", "--against", run]);
+    assert!(error.contains("did not key app:narrow"), "{error}");
+
+    let text = qk(&["show", "hash", "app:build", "--against", "app:narrow"]);
+    assert!(
+        text.contains(r#"field definition.inputs[0]: "{projectRoot}/src/input.txt" -> "{projectRoot}/src/**/*""#),
+        "{text}"
+    );
+}

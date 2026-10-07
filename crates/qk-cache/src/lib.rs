@@ -708,6 +708,99 @@ fn output_fingerprint(root: &Path, outputs: &paths::Outputs, input: &str) -> Res
     combine_outputs(input, &files, outputs.declared())
 }
 
+/// A task's key, and the inputs it is computed from, or why it has none.
+pub type Keyed = std::result::Result<(String, Value), String>;
+
+/// The key each task in `graph` would be cached under if it ran now, and what
+/// it is computed from, without running a task. Runtime inputs are executed.
+/// A dependency counts as having succeeded, fingerprinted by its outputs as
+/// they are on disk.
+pub fn keys(
+    workspace: &Workspace,
+    graph: &TaskGraph,
+    prepared: &BTreeMap<String, PreparedTask>,
+    cancelled: &AtomicBool,
+) -> Result<BTreeMap<String, Keyed>> {
+    let snapshot = hash::Snapshot::new(workspace, graph, &paths::cache_location(workspace))?;
+    let mut keys = BTreeMap::new();
+    let mut fingerprints: BTreeMap<String, Fingerprint> = BTreeMap::new();
+    let mut pending: Vec<&Task> = graph.tasks.values().collect();
+    // Dependencies first, as the runner keys them.
+    while !pending.is_empty() {
+        let waiting = pending.len();
+        pending.retain(|task| {
+            if !task
+                .dependencies
+                .iter()
+                .all(|id| fingerprints.contains_key(id))
+            {
+                return true;
+            }
+            let keyed = key_now(
+                &snapshot,
+                workspace,
+                graph,
+                task,
+                prepared,
+                &fingerprints,
+                cancelled,
+            );
+            let fingerprint = if task.definition.continuous == Some(true) {
+                Err(format!(
+                    "{}: continuous tasks are not fingerprinted",
+                    task.id
+                ))
+            } else if !prepared[&task.id].ready_when.is_empty() {
+                Err(format!(
+                    "{}: tasks with readyWhen are not fingerprinted",
+                    task.id
+                ))
+            } else {
+                keyed.clone().and_then(|(key, _)| {
+                    let outputs = paths::Outputs::new(workspace, task)
+                        .map_err(|error| format!("{}: {error:#}", task.id))?;
+                    outputs_fingerprint(task, &workspace.root, &outputs, &key)
+                })
+            };
+            fingerprints.insert(task.id.clone(), fingerprint);
+            keys.insert(task.id.clone(), keyed);
+            false
+        });
+        anyhow::ensure!(pending.len() < waiting, "the task graph has a cycle");
+    }
+    Ok(keys)
+}
+
+fn key_now(
+    snapshot: &hash::Snapshot,
+    workspace: &Workspace,
+    graph: &TaskGraph,
+    task: &Task,
+    prepared: &BTreeMap<String, PreparedTask>,
+    fingerprints: &BTreeMap<String, Fingerprint>,
+    cancelled: &AtomicBool,
+) -> Keyed {
+    let dependencies = task
+        .dependencies
+        .iter()
+        .map(|id| fingerprints[id].clone().map(|key| (id.clone(), key)))
+        .collect::<std::result::Result<BTreeMap<_, _>, _>>()?;
+    let failed = |error: anyhow::Error| format!("{}: {error:#}", task.id);
+    let dependencies =
+        hash::dependency_keys(snapshot, workspace, graph, task, &dependencies, cancelled)
+            .map_err(failed)?;
+    let inputs = hash::inputs(
+        snapshot,
+        workspace,
+        task,
+        &prepared[&task.id],
+        &dependencies,
+        cancelled,
+    )
+    .map_err(failed)?;
+    Ok((hash::key(&inputs).map_err(failed)?, inputs))
+}
+
 /// Runs the private detached-upload protocol used by the qk executable.
 #[doc(hidden)]
 pub fn run_upload_worker() -> anyhow::Result<()> {
