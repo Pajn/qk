@@ -104,7 +104,8 @@ tenth of the machine's memory kept for everything else and what the run's
 running tasks are still expected to grow by, must cover what the task is
 expected to use. A task that waits leaves its slot to the next task that
 fits, and starts regardless once nothing else of the run is running, so a
-run cannot stall. The summary names the tasks that waited.
+run cannot stall. The summary names the tasks that waited, and does not
+count their wait for memory as a wait for a `--parallel` slot.
 
 A task is expected to use the most memory it used in its recent runs that
 executed it, as [run history](history.md) records. A task without such runs

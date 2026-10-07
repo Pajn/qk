@@ -46,8 +46,6 @@ pub struct RunResult {
     pub load: Vec<(f32, bool)>,
     /// The most memory, in bytes, the run's tasks used together.
     pub memory: Option<u64>,
-    /// The tasks that waited for memory to start.
-    pub waited_for_memory: BTreeSet<String>,
     /// Under `--sandbox`, what each task did beyond its declarations, and
     /// the tasks that ran unsandboxed with why.
     pub sandbox: Option<SandboxResult>,
@@ -78,6 +76,9 @@ pub struct TaskRecord {
     /// The most memory, in bytes, its processes used together, sampled as it
     /// ran; none when it ran too briefly to be sampled.
     pub memory: Option<u64>,
+    /// How long, of the time between `ready` and `started`, it waited for
+    /// free memory rather than for a slot.
+    pub memory_wait: Duration,
     /// Bounded output and input verification for an actual cacheable execution.
     pub execution: Option<qk_cache::Execution>,
 }
@@ -317,7 +318,10 @@ pub fn run(
         free: system.available_memory(),
         ..Seen::default()
     });
-    let mut waited_for_memory = BTreeSet::new();
+    // Since when each task has waited for memory, and how long it has
+    // waited in all.
+    let mut memory_since: BTreeMap<String, SystemTime> = BTreeMap::new();
+    let mut memory_waits: BTreeMap<String, Duration> = BTreeMap::new();
     std::thread::scope(|scope| -> Result<()> {
         let (finish_sampling, sampling_finished) = mpsc::channel::<()>();
         let load = &load;
@@ -365,6 +369,8 @@ pub fn run(
         let result = (|| -> Result<()> {
             while !pending.is_empty() || !active.is_empty() {
                 let mut waiting_now = false;
+                // The tasks this pass held back for want of memory.
+                let mut short_of_memory = BTreeSet::new();
                 // A task that became ready gives back its core.
                 held.retain(|id, _| !(announced.contains(id) && is_up(id)));
                 let dependencies_done = |id: &String| {
@@ -522,7 +528,7 @@ pub fn run(
                                 })
                                 .fold(0u64, u64::saturating_add);
                             if !memory::fits(*need, seen.free, growth, reserve) {
-                                waited_for_memory.insert(id.clone());
+                                short_of_memory.insert(id.clone());
                                 continue;
                             }
                         }
@@ -598,6 +604,20 @@ pub fn run(
                     });
                 }
                 waiting.store(waiting_now, Ordering::Relaxed);
+                // A wait for memory lasts from the first pass that held the
+                // task back for it to the first that did not.
+                let now = SystemTime::now();
+                memory_since.retain(|id, since| {
+                    if short_of_memory.contains(id) {
+                        return true;
+                    }
+                    *memory_waits.entry(id.clone()).or_default() +=
+                        now.duration_since(*since).unwrap_or_default();
+                    false
+                });
+                for id in short_of_memory {
+                    memory_since.entry(id).or_insert(now);
+                }
                 // Stop continuous dependencies that no remaining task needs.
                 for (id, stop) in &stops {
                     let needed = dependents.get(id.as_str()).is_some_and(|dependents| {
@@ -693,6 +713,7 @@ pub fn run(
                                 key,
                                 warm,
                                 threads: given.remove(&id),
+                                memory_wait: memory_waits.remove(&id).unwrap_or_default(),
                                 memory: seen
                                     .lock()
                                     .unwrap()
@@ -740,7 +761,6 @@ pub fn run(
         tasks: records,
         load: load.into_inner().unwrap(),
         memory: Some(seen.into_inner().unwrap().run).filter(|bytes| *bytes > 0),
-        waited_for_memory,
         sandbox,
         input_analysis,
     })
