@@ -2644,11 +2644,21 @@ mod tests {
             &before,
             &snapshot.current_files(&workspace.root).unwrap()
         ));
-        std::fs::write(
-            &included,
-            format!("[core]\nexcludesfile = {}\n", excludes.display()),
-        )
-        .unwrap();
+        assert!(
+            paths::git(
+                root.path(),
+                &[
+                    "config",
+                    "--file",
+                    included.to_str().unwrap(),
+                    "core.excludesfile",
+                    excludes.to_str().unwrap(),
+                ]
+            )
+            .unwrap()
+            .status
+            .success()
+        );
         assert!(
             !snapshot
                 .current_files(&workspace.root)
