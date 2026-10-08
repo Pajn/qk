@@ -78,6 +78,17 @@ fn process_helper() {
     let id = std::env::var("QK_TEST_ID").unwrap();
     let root = std::env::current_dir().unwrap();
     match mode.as_str() {
+        "large-string-control-output" => {
+            use std::io::Write;
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(b"before\x1b]0;").unwrap();
+            stdout.write_all(&vec![b'x'; 256 * 1024]).unwrap();
+            stdout
+                .write_all(b"\x1b\\after\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x07\n\x1bPunfinished")
+                .unwrap();
+            stdout.flush().unwrap();
+            std::process::exit(1);
+        }
         "large-colored-output" => {
             use std::io::Write;
             let mut stdout = std::io::stdout().lock();
@@ -871,7 +882,8 @@ fn large_output_preserves_static_groups_quiet_failures_and_long_line_prefixes() 
         "a": helper_target("large-output", "a"),
         "b": helper_target("large-output", "b"),
         "fail": helper_target("large-output", "fail"),
-        "colored": helper_target("large-colored-output", "colored")
+        "colored": helper_target("large-colored-output", "colored"),
+        "controls": helper_target("large-string-control-output", "controls")
     }));
     let invoke = |targets: &str, style: &str| {
         command(
@@ -943,6 +955,10 @@ fn large_output_preserves_static_groups_quiet_failures_and_long_line_prefixes() 
     expected.push(b'\n');
     assert!(colored.stdout.ends_with(&expected));
     assert!(!colored.stdout.contains(&0x1b));
+    let controls = invoke("controls", "quiet");
+    assert!(!controls.status.success());
+    assert!(controls.stdout.ends_with(b"beforeafterlink\n"));
+    assert!(!controls.stdout.contains(&0x1b));
 }
 
 #[test]
