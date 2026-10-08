@@ -135,6 +135,17 @@ fn process_helper() {
                 .unwrap();
             writeln!(file, "{id}").unwrap();
         }
+        "threads" => {
+            fs::write(
+                root.join(format!("{id}.json")),
+                json!({
+                    "threads": std::env::var("QK_THREADS").ok(),
+                    "workers": std::env::var("QK_TEST_WORKERS").ok(),
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
         "record" => {
             let values: std::collections::BTreeMap<_, _> = std::env::vars()
                 .filter(|(name, _)| name.starts_with("QK_TEST_"))
@@ -681,6 +692,70 @@ fn continuous_task_exiting_on_its_own_reports_its_exit_code() {
     let temp = fixture(json!({"serve": continuous_target("exit-3", "serve")}));
     let output = run(temp.path(), &["run", "app:serve"]);
     assert_eq!(output.status.code(), Some(3));
+}
+
+fn threaded_helper(id: &str, continuous: bool) -> Value {
+    let mut target = helper_target("threads", id);
+    target["continuous"] = json!(continuous);
+    target["qk:threads"] = json!({"env": {"QK_TEST_WORKERS": "{threads}"}});
+    target
+}
+
+fn thread_record(root: &Path, id: &str) -> Value {
+    serde_json::from_slice(&fs::read(root.join(format!("{id}.json"))).unwrap()).unwrap()
+}
+
+#[test]
+fn continuous_root_with_threads_runs_without_a_core_allocation() {
+    let temp = fixture(json!({"watch": threaded_helper("watch", true)}));
+    success(
+        command(temp.path(), &["run", "app:watch", "--cores", "8"])
+            .env_remove("QK_THREADS")
+            .env_remove("QK_TEST_WORKERS")
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        thread_record(temp.path(), "watch"),
+        json!({"threads": null, "workers": null})
+    );
+}
+
+#[test]
+fn continuous_thread_settings_do_not_reduce_finite_thread_shares() {
+    let temp = fixture(json!({
+        "watch": threaded_helper("watch", true),
+        "a": threaded_helper("a", false),
+        "b": threaded_helper("b", false),
+    }));
+    success(
+        command(
+            temp.path(),
+            &[
+                "run-many",
+                "-t",
+                "a,b,watch",
+                "--parallel",
+                "2",
+                "--cores",
+                "8",
+            ],
+        )
+        .env_remove("QK_THREADS")
+        .env_remove("QK_TEST_WORKERS")
+        .output()
+        .unwrap(),
+    );
+    for id in ["a", "b"] {
+        assert_eq!(
+            thread_record(temp.path(), id),
+            json!({"threads": "4", "workers": "4"})
+        );
+    }
+    assert_eq!(
+        thread_record(temp.path(), "watch"),
+        json!({"threads": null, "workers": null})
+    );
 }
 
 #[test]

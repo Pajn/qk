@@ -406,7 +406,7 @@ pub fn run(
                 // threaded ones among them share the free cores with.
                 let finite_pending = pending.difference(&continuous).count();
                 let ready_threaded = pending
-                    .iter()
+                    .difference(&continuous)
                     .filter(|id| threads.contains_key(*id) && dependencies_done(id))
                     .count();
                 // Threaded tasks starting in this pass split the free cores

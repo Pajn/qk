@@ -130,6 +130,8 @@ and selected configuration `env` can override it. See
 Opted-in tasks receive `QK_THREADS`; `true` sets only that variable.
 The share is fixed when the task starts. Without this key a task holds one
 core. The setting and allocated count do not affect cache keys.
+Continuous tasks do not take a core share; this setting does not allocate
+threads or set these environment variables for them.
 `false` is not a supported value; omit the key to disable it.
 See [Sharing cores](../guides/threads.md) for allocation examples.
 
