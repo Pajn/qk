@@ -261,22 +261,22 @@ pub fn run(
             .filter(|id| !continuous.contains(*id) && !(announced.contains(*id) && is_up(id)))
             .count()
     };
-    // As in Nx: a task that runs alone cannot run beside a continuous task it
-    // depends on, and a continuous task others depend on runs beside them.
+    // Serving dependencies stay active beside their dependents, including
+    // readyWhen tasks without continuous: true. Either side running alone
+    // would prevent the dependent from starting and the server from stopping.
     for (id, task) in &graph.tasks {
-        for dependency in task
-            .dependencies
-            .iter()
-            .filter(|id| continuous.contains(*id))
-        {
+        for dependency in task.dependencies.iter().filter(|id| serving.contains(*id)) {
+            let kind = if continuous.contains(dependency) {
+                "continuous"
+            } else {
+                "readyWhen"
+            };
             if alone.contains(id) {
-                bail!(
-                    "{id} does not support parallelism but depends on continuous task {dependency}"
-                );
+                bail!("{id} does not support parallelism but depends on {kind} task {dependency}");
             }
             if alone.contains(dependency) {
                 bail!(
-                    "continuous task {dependency} does not support parallelism but {id} depends on it"
+                    "{kind} task {dependency} does not support parallelism but {id} depends on it"
                 );
             }
         }
@@ -406,7 +406,7 @@ pub fn run(
                 // threaded ones among them share the free cores with.
                 let finite_pending = pending.difference(&continuous).count();
                 let ready_threaded = pending
-                    .iter()
+                    .difference(&continuous)
                     .filter(|id| threads.contains_key(*id) && dependencies_done(id))
                     .count();
                 // Threaded tasks starting in this pass split the free cores
