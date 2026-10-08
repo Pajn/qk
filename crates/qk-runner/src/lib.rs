@@ -8,6 +8,12 @@
 //! of the run start first: the task's own expected time and that of the
 //! longest chain of tasks depending on it. A task expected to take long thus
 //! does not start last and keep the run waiting for it alone.
+//!
+//! A task expected to use memory starts only when the machine has it free:
+//! what is free, less a reserve and what the run's running tasks are still
+//! expected to grow by, must cover what the task is expected to use. Free
+//! memory is the machine's, so other runs and programs count. A task with
+//! nothing else of the run running starts regardless, so a run cannot stall.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
@@ -70,16 +76,22 @@ pub struct TaskRecord {
     /// The most memory, in bytes, its processes used together, sampled as it
     /// ran; none when it ran too briefly to be sampled.
     pub memory: Option<u64>,
+    /// How long, of the time between `ready` and `started`, it waited for
+    /// free memory rather than for a slot.
+    pub memory_wait: Duration,
     /// Bounded output and input verification for an actual cacheable execution.
     pub execution: Option<qk_cache::Execution>,
 }
 
-/// How long a task can be expected to run, from earlier runs that executed it.
+/// How long a task can be expected to run, and the memory it can be expected
+/// to use, from earlier runs that executed it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Expected {
     pub millis: u64,
     /// The threads it ran with: one, unless its target has `qk:threads`.
     pub threads: u64,
+    /// The most memory, in bytes, it used, when that was measured.
+    pub memory: Option<u64>,
 }
 
 impl Expected {
@@ -276,6 +288,13 @@ pub fn run(
         }
     }
     let order = by_path(graph, &dependents, expected);
+    let memory_expected = memory::expected(
+        graph
+            .tasks
+            .iter()
+            .map(|(id, task)| (id.as_str(), task.target.as_str())),
+        expected,
+    );
     let mut pending: BTreeSet<_> = graph.tasks.keys().cloned().collect();
     let mut active = BTreeSet::new();
     // Stop signals for running continuous tasks, and those already asked to stop.
@@ -315,19 +334,27 @@ pub fn run(
     });
     let waiting = AtomicBool::new(false);
     let load = std::sync::Mutex::new(Vec::new());
-    // The most memory each task, and the run's tasks together, have used.
-    let peaks = std::sync::Mutex::new((BTreeMap::<String, u64>::new(), 0u64));
+    let mut system = sysinfo::System::new();
+    system.refresh_memory();
+    let reserve = system.total_memory() / 10;
+    let seen = std::sync::Mutex::new(Seen {
+        free: system.available_memory(),
+        ..Seen::default()
+    });
+    // Since when each task has waited for memory, and how long it has
+    // waited in all.
+    let mut memory_since: BTreeMap<String, SystemTime> = BTreeMap::new();
+    let mut memory_waits: BTreeMap<String, Duration> = BTreeMap::new();
     std::thread::scope(|scope| -> Result<()> {
         let (finish_sampling, sampling_finished) = mpsc::channel::<()>();
         let load = &load;
         let waiting = &waiting;
-        let peaks = &peaks;
+        let seen = &seen;
         let prepared = &prepared;
         // Samples how busy the machine is, so the summary can tell a run held
-        // back by --parallel from one held back by the machine, and the
-        // memory each running task uses.
+        // back by --parallel from one held back by the machine, and its free
+        // memory and what each running task uses.
         scope.spawn(move || {
-            let mut system = sysinfo::System::new();
             system.refresh_cpu_usage();
             while matches!(
                 sampling_finished.recv_timeout(Duration::from_millis(250)),
@@ -338,26 +365,35 @@ pub fn run(
                     system.global_cpu_usage() / 100.0,
                     waiting.load(Ordering::Relaxed),
                 ));
+                system.refresh_memory();
                 let roots: BTreeMap<&str, BTreeSet<u32>> = prepared
                     .iter()
                     .map(|(id, task)| (id.as_str(), task.processes.lock().unwrap().clone()))
                     .filter(|(_, processes)| !processes.is_empty())
                     .collect();
-                if roots.is_empty() {
-                    continue;
+                let used = if roots.is_empty() {
+                    BTreeMap::new()
+                } else {
+                    memory::sample(&mut system, &roots)
+                };
+                let seen = &mut *seen.lock().unwrap();
+                seen.free = system.available_memory();
+                seen.now = used
+                    .iter()
+                    .map(|(id, used)| ((*id).to_owned(), used.now))
+                    .collect();
+                for (id, used) in &used {
+                    let peak = seen.peaks.entry((*id).to_owned()).or_default();
+                    *peak = (*peak).max(used.peak);
                 }
-                let used = memory::sample(&mut system, &roots);
-                let (tasks, run) = &mut *peaks.lock().unwrap();
-                for (id, bytes) in &used {
-                    let peak = tasks.entry((*id).to_owned()).or_default();
-                    *peak = (*peak).max(*bytes);
-                }
-                *run = (*run).max(used.values().sum());
+                seen.run = seen.run.max(used.values().map(|used| used.now).sum());
             }
         });
         let result = (|| -> Result<()> {
             while !pending.is_empty() || !active.is_empty() {
                 let mut waiting_now = false;
+                // The tasks this pass held back for want of memory.
+                let mut short_of_memory = BTreeSet::new();
                 // A task that became ready gives back its core.
                 held.retain(|id, _| !(announced.contains(id) && is_up(id)));
                 let dependencies_done = |id: &String| {
@@ -502,6 +538,23 @@ pub fn run(
                         let Some(cores_for) = cores_for else {
                             continue;
                         };
+                        if let Some(need) = memory_expected.get(id.as_str())
+                            && !held.is_empty()
+                        {
+                            let seen = seen.lock().unwrap();
+                            let growth = held
+                                .keys()
+                                .filter_map(|other| {
+                                    let expected = memory_expected.get(other.as_str())?;
+                                    let now = seen.now.get(other).copied().unwrap_or(0);
+                                    Some(expected.saturating_sub(now))
+                                })
+                                .fold(0u64, u64::saturating_add);
+                            if !memory::fits(*need, seen.free, growth, reserve) {
+                                short_of_memory.insert(id.clone());
+                                continue;
+                            }
+                        }
                         held.insert(id.clone(), cores_for);
                         if threads.contains_key(&id) {
                             given.insert(id.clone(), cores_for);
@@ -584,6 +637,20 @@ pub fn run(
                     });
                 }
                 waiting.store(waiting_now, Ordering::Relaxed);
+                // A wait for memory lasts from the first pass that held the
+                // task back for it to the first that did not.
+                let now = SystemTime::now();
+                memory_since.retain(|id, since| {
+                    if short_of_memory.contains(id) {
+                        return true;
+                    }
+                    *memory_waits.entry(id.clone()).or_default() +=
+                        now.duration_since(*since).unwrap_or_default();
+                    false
+                });
+                for id in short_of_memory {
+                    memory_since.entry(id).or_insert(now);
+                }
                 // Stop continuous dependencies that no remaining task needs.
                 for (id, stop) in &stops {
                     let needed = dependents.get(id.as_str()).is_some_and(|dependents| {
@@ -679,10 +746,11 @@ pub fn run(
                                 key,
                                 warm,
                                 threads: given.remove(&id),
-                                memory: peaks
+                                memory_wait: memory_waits.remove(&id).unwrap_or_default(),
+                                memory: seen
                                     .lock()
                                     .unwrap()
-                                    .0
+                                    .peaks
                                     .remove(&id)
                                     .filter(|bytes| *bytes > 0),
                                 execution,
@@ -725,10 +793,23 @@ pub fn run(
         exit_code,
         tasks: records,
         load: load.into_inner().unwrap(),
-        memory: Some(peaks.into_inner().unwrap().1).filter(|bytes| *bytes > 0),
+        memory: Some(seen.into_inner().unwrap().run).filter(|bytes| *bytes > 0),
         sandbox,
         input_analysis,
     })
+}
+
+/// What the sampler last saw of memory, in bytes.
+#[derive(Default)]
+struct Seen {
+    /// Free on the machine.
+    free: u64,
+    /// What each running task uses now.
+    now: BTreeMap<String, u64>,
+    /// The most each task has used.
+    peaks: BTreeMap<String, u64>,
+    /// The most the run's tasks have used together.
+    run: u64,
 }
 
 /// The tasks, those with the longest expected path to the end of the run
@@ -789,6 +870,7 @@ mod tests {
         let expected = Expected {
             millis: 1_000,
             threads: 4,
+            memory: None,
         };
         assert_eq!(expected.remaining(Duration::ZERO, 8), 4_000);
         assert_eq!(expected.remaining(Duration::from_millis(250), 8), 2_000);

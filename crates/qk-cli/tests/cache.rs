@@ -3325,6 +3325,78 @@ fn records_the_memory_a_task_used() {
 
 #[cfg(unix)]
 #[test]
+fn tasks_wait_for_the_memory_they_are_expected_to_use() {
+    let log = |name: &str, sleep: &str| json!({"command": format!("echo start {name} >> ../log && {sleep}echo end {name} >> ../log")});
+    let fixture = Fixture::with_targets(json!({
+        "big": log("big", "sleep 1 && "),
+        "a": log("a", ""),
+        "b": log("b", ""),
+    }));
+    // Earlier runs found `big` to take long and need more memory than any
+    // machine has, and the others to need a little.
+    let task = |target: &str, millis: u64, memory: u64| qk_history::TaskReport {
+        id: format!("app:{target}"),
+        project: "app".into(),
+        target: target.into(),
+        configuration: None,
+        status: "success".into(),
+        cache: Some("uncached".into()),
+        key: None,
+        started: Some(1_000),
+        ended: Some(1_000 + millis),
+        dependencies: Vec::new(),
+        cause: None,
+        warm: None,
+        threads: None,
+        memory: Some(memory),
+    };
+    qk_history::History::open(&fixture.root.join(".git/qk/history.db"))
+        .unwrap()
+        .record(
+            qk_history::RunReport {
+                schema_version: qk_history::SCHEMA_VERSION,
+                id: "earlier".into(),
+                command: Vec::new(),
+                sha: None,
+                started: 1_000,
+                ended: 11_000,
+                exit_code: 0,
+                tasks: vec![
+                    task("big", 10_000, 1 << 60),
+                    task("a", 1, 1),
+                    task("b", 1, 1),
+                ],
+                critical_path: Default::default(),
+            },
+            &Default::default(),
+        )
+        .unwrap();
+    let output = success(fixture.qk(
+        &fixture.root,
+        &[
+            "run-many",
+            "-t",
+            "big,a,b",
+            "--parallel",
+            "3",
+            "--output-style",
+            "quiet",
+        ],
+    ));
+    // `big` starts first, as the longest, and with nothing else running; the
+    // others wait for the memory it is still expected to take.
+    let log = fs::read_to_string(fixture.root.join("../log")).unwrap();
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(lines[..2], ["start big", "end big"], "{log}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("2 tasks waited for free memory: app:a, app:b"),
+        "{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn a_threaded_task_waits_for_its_minimum() {
     let task = |name: &str| {
         threaded(

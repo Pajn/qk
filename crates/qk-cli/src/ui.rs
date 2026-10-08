@@ -687,6 +687,23 @@ fn details(
             most.join(", ")
         ));
     }
+    let waited: Vec<&str> = result
+        .tasks
+        .iter()
+        .filter(|(_, task)| !task.memory_wait.is_zero())
+        .map(|(id, _)| id.as_str())
+        .collect();
+    if !waited.is_empty() {
+        lines.push(format!(
+            "{} {}",
+            paint.dim(&format!(
+                "{} task{} waited for free memory:",
+                waited.len(),
+                if waited.len() == 1 { "" } else { "s" }
+            )),
+            list(&waited)
+        ));
+    }
     let path = &report.critical_path;
     if path.tasks.len() > 1 || (path.tasks.len() == 1 && total > 1) {
         let by_id: BTreeMap<&str, &qk_history::TaskReport> = report
@@ -749,7 +766,10 @@ fn details(
             result
                 .tasks
                 .get(id)
-                .map_or(Duration::ZERO, |task| since(task.started, task.ready))
+                // Waiting for memory is not waiting for a slot.
+                .map_or(Duration::ZERO, |task| {
+                    since(task.started, task.ready).saturating_sub(task.memory_wait)
+                })
         };
         let critical_wait: Duration = path.tasks.iter().map(|id| waited(id)).sum();
         let mean = |samples: Vec<f32>| {
@@ -923,6 +943,7 @@ mod tests {
             warm: None,
             threads: None,
             memory: None,
+            memory_wait: Duration::ZERO,
             execution: None,
         };
         let report = |id: &str, started: u64, ended: u64, dependencies: &[&str]| TaskReport {
@@ -997,6 +1018,21 @@ mod tests {
         assert!(
             busy.contains("95% busy") && busy.contains("would not help"),
             "{busy}"
+        );
+    }
+
+    #[test]
+    fn a_wait_for_memory_is_not_a_wait_for_a_slot() {
+        let (mut result, report) = run(1_500, 0.3);
+        result.tasks.get_mut("app:b").unwrap().memory_wait = Duration::from_millis(1_500);
+        let text = summary(&result, &report, 4, 8, &[], Paint(false));
+        assert!(
+            text.contains("no task on the critical path waited for a slot"),
+            "{text}"
+        );
+        assert!(
+            text.contains("1 task waited for free memory: app:b"),
+            "{text}"
         );
     }
 
