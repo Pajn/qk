@@ -29,6 +29,9 @@ fn process_helper() {
         std::os::unix::fs::symlink("build:debug/output.txt", "dist/latest:debug").unwrap();
         return;
     }
+    if mode == "add-source" && runs == 0 {
+        fs::write("src/added.txt", "added during execution\n").unwrap();
+    }
     if mode == "generate-source" {
         fs::write("src/generated.txt", input).unwrap();
         return;
@@ -973,6 +976,36 @@ fn symlink_inputs_track_target_executable_mode() {
     let output = fixture.build(&fixture.root, &[]);
     assert!(!output.status.success());
     assert!(!stderr(&output).contains("cache hit app:build"));
+}
+
+/// A source added during execution must not publish a result under the old
+/// membership, even if the source is removed before the next invocation.
+#[test]
+fn added_sources_are_rechecked_after_execution() {
+    let fixture = Fixture::new(target("add-source", json!({})));
+    let first = success(fixture.build(&fixture.root, &[]));
+    assert!(stderr(&first).contains("not caching because inputs changed during execution"));
+    fs::remove_file(fixture.root.join("src/added.txt")).unwrap();
+    let second = success(fixture.build(&fixture.root, &[]));
+    assert!(!stderr(&second).contains("cache hit app:build"));
+    assert_eq!(fixture.runs(), 2);
+    let third = success(fixture.build(&fixture.root, &[]));
+    assert!(stderr(&third).contains("cache hit app:build"));
+    assert_eq!(fixture.runs(), 2);
+}
+
+/// A task starting after a source-producing dependency must key that source,
+/// even when the dependency has no declared outputs to select separately.
+#[test]
+fn later_tasks_fingerprint_sources_added_since_snapshot_start() {
+    let fixture = Fixture::with_targets(json!({
+        "generate": target("generate-source", json!({"cache": false, "outputs": [], "inputs": ["{projectRoot}/src/input.txt"]})),
+        "build": target("build", json!({"dependsOn": ["generate"]})),
+    }));
+    success(fixture.build(&fixture.root, &[]));
+    let second = success(fixture.build(&fixture.root, &[]));
+    assert!(stderr(&second).contains("cache hit app:build"));
+    assert_eq!(fixture.runs(), 3);
 }
 
 /// Changed dependency artifacts must not be published under their earlier key.

@@ -61,6 +61,34 @@ impl Stamp {
         Self(values)
     }
 
+    /// Membership stamps also use change time: restoring a directory's mtime
+    /// must not allow changes inside a coarse timestamp window to go unnoticed.
+    fn membership_settled(&self) -> bool {
+        #[cfg(unix)]
+        let width = 6;
+        #[cfg(not(unix))]
+        let width = 2;
+        self.0.chunks_exact(width).all(|values| {
+            let modified = SystemTime::UNIX_EPOCH + Duration::from_nanos(values[1].max(0) as u64);
+            let settled = |time| {
+                SystemTime::now()
+                    .duration_since(time)
+                    .is_ok_and(|age| age > Duration::from_secs(2))
+            };
+            if values[1] < 0 || !settled(modified) {
+                return false;
+            }
+            #[cfg(unix)]
+            {
+                let changed = SystemTime::UNIX_EPOCH
+                    + Duration::new(values[2].max(0) as u64, values[3].max(0) as u32);
+                values[2] >= 0 && settled(changed)
+            }
+            #[cfg(not(unix))]
+            true
+        })
+    }
+
     /// A file written within the timestamp resolution window could change again
     /// without changing its stamp, so recent files are always re-read.
     fn settled(&self) -> bool {
@@ -85,18 +113,22 @@ struct RuntimeKey {
     environment: BTreeMap<OsString, OsString>,
 }
 
-/// Workspace state shared by every fingerprint in one run. The candidate file list
-/// is taken once, like Nx's file map; file contents are still re-read whenever
-/// their metadata changes, so edits during the run are detected.
+/// Workspace state shared by every fingerprint in one run. Inspection uses the
+/// initial candidate list; execution fingerprints refresh membership so files
+/// added or removed during the run cannot escape input verification.
 pub struct Snapshot {
     pub(crate) files: BTreeSet<String>,
     extra_candidates: BTreeSet<String>,
+    membership: Mutex<Option<Arc<Membership>>>,
+    membership_prefixes: Mutex<HashMap<String, Arc<Vec<PathBuf>>>>,
+    source_exclusions: Vec<Outputs>,
+    cache_relative: Option<PathBuf>,
     projects: ProjectGraph,
     /// Each project by its root, to find the project owning a file.
     roots: BTreeMap<String, String>,
     generated_tasks: Vec<(Task, Outputs)>,
     task_dependencies: BTreeMap<String, BTreeSet<String>>,
-    source_ignore: SourceIgnore,
+    source_ignore: Arc<SourceIgnore>,
     canonical_root: PathBuf,
     workspace_prefix: Option<PathBuf>,
     patterns: Mutex<HashMap<(String, bool), Arc<Pattern>>>,
@@ -114,6 +146,467 @@ pub struct Snapshot {
     dependency_outputs: Mutex<HashMap<String, Arc<DependencyOutputs>>>,
     /// Counts drops, so a listing taken while a task finished is not kept.
     outputs_written: std::sync::atomic::AtomicU64,
+}
+
+/// Membership depends on directory entries and Git/ignore listing policy, not
+/// on every source file's contents. Empty directories must also be watched.
+#[derive(Clone)]
+struct Membership {
+    files: Arc<BTreeSet<String>>,
+    source_ignore: Arc<SourceIgnore>,
+    stamps: BTreeMap<PathBuf, Option<Stamp>>,
+    directories: BTreeSet<PathBuf>,
+    directory_entries: BTreeMap<PathBuf, BTreeSet<(OsString, u8)>>,
+    root: PathBuf,
+    outputs: Vec<Outputs>,
+    output_anchors: BTreeMap<PathBuf, Vec<usize>>,
+    excluded_roots: BTreeSet<PathBuf>,
+    cache: Option<PathBuf>,
+    policies: BTreeSet<PathBuf>,
+    git_policies: BTreeSet<PathBuf>,
+    ignore_contents: BTreeMap<PathBuf, String>,
+    settled: bool,
+}
+
+/// A candidate listing and the ignore policy captured with it. Keeping both
+/// alive prevents a concurrent refresh from changing dependency-output selection.
+#[derive(Clone)]
+struct Candidates {
+    files: Arc<BTreeSet<String>>,
+    source_ignore: Arc<SourceIgnore>,
+}
+
+impl Membership {
+    /// Inventory source directories and policy stamps before a new listing.
+    fn new(
+        root: &Path,
+        files: &BTreeSet<String>,
+        source_ignore: &Arc<SourceIgnore>,
+        outputs: &[Outputs],
+        cache: Option<&Path>,
+        git_policies: Option<&BTreeSet<PathBuf>>,
+    ) -> Result<Self> {
+        let excluded: BTreeSet<_> = outputs
+            .iter()
+            .flat_map(Outputs::complete_roots)
+            .map(PathBuf::from)
+            .collect();
+        let excluded_roots = excluded.clone();
+        let walk_root = root.to_owned();
+        let walk_cache = cache.map(PathBuf::from);
+        let mut directories = BTreeSet::new();
+        let mut stamps = BTreeMap::new();
+        for entry in ignore::WalkBuilder::new(root)
+            .hidden(false)
+            .parents(false)
+            .git_global(false)
+            .require_git(false)
+            .ignore(false)
+            .git_ignore(false)
+            .git_exclude(false)
+            .follow_links(false)
+            .filter_entry(move |entry| {
+                let relative = entry
+                    .path()
+                    .strip_prefix(&walk_root)
+                    .unwrap_or(entry.path());
+                !matches!(
+                    entry.file_name().to_str(),
+                    Some(".git" | ".qk" | "node_modules")
+                ) && walk_cache
+                    .as_ref()
+                    .is_none_or(|cache| !relative.starts_with(cache))
+                    && !relative.ancestors().any(|path| excluded.contains(path))
+            })
+            .build()
+        {
+            let entry = entry?;
+            if entry.file_type().is_some_and(|kind| kind.is_dir()) {
+                let directory = entry.path().to_owned();
+                stamps.insert(directory.clone(), membership_stamp(&directory)?);
+                directories.insert(directory);
+            }
+        }
+        // Git lists tracked files even beneath ignored directories. Watching
+        // only the ignore walker would miss deletion/rename of those files.
+        for path in files {
+            for parent in Path::new(path).ancestors().skip(1) {
+                let directory = root.join(parent);
+                if directories.insert(directory.clone()) {
+                    stamps.insert(directory.clone(), membership_stamp(&directory)?);
+                }
+            }
+        }
+        let mut policies = BTreeSet::new();
+        for directory in &directories {
+            for name in [".gitignore", ".nxignore"] {
+                let path = directory.join(name);
+                // Creation of a new ignore file changes its directory stamp.
+                // Existing rules can be edited without changing the directory.
+                if membership_stamp(&path)?.is_some() {
+                    policies.insert(path);
+                }
+            }
+        }
+        for directory in root.ancestors() {
+            policies.insert(directory.join(".gitignore"));
+            // Also detect a newly initialized repository or changed worktree pointer.
+            policies.insert(directory.join(".git"));
+        }
+        let git_policies = git_policies
+            .cloned()
+            .unwrap_or_else(|| git_membership_policies(root));
+        policies.extend(git_policies.iter().cloned());
+        for policy in &policies {
+            stamps.insert(policy.clone(), membership_stamp(policy)?);
+        }
+        // Capture contents before listing, so a later policy change cannot be
+        // mistaken for the rules that produced that listing.
+        let mut ignore_contents = BTreeMap::new();
+        for policy in &policies {
+            if matches!(
+                policy.file_name().and_then(|name| name.to_str()),
+                Some(".gitignore" | ".nxignore")
+            ) && let Some(content) = ignore_content(policy, &stamps[policy])?
+            {
+                ignore_contents.insert(policy.clone(), content);
+            }
+        }
+        let mut output_anchors: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
+        for (index, outputs) in outputs.iter().enumerate() {
+            for anchor in outputs.anchors() {
+                output_anchors
+                    .entry(PathBuf::from(anchor))
+                    .or_default()
+                    .push(index);
+            }
+        }
+        let mut membership = Self {
+            files: Arc::new(BTreeSet::new()),
+            source_ignore: source_ignore.clone(),
+            stamps,
+            directories,
+            directory_entries: BTreeMap::new(),
+            root: root.to_owned(),
+            outputs: outputs.to_vec(),
+            output_anchors,
+            excluded_roots,
+            cache: cache.map(PathBuf::from),
+            policies,
+            git_policies,
+            ignore_contents,
+            settled: false,
+        };
+        for directory in &membership.directories {
+            if let Some(entries) = membership.entries(directory)? {
+                membership
+                    .directory_entries
+                    .insert(directory.clone(), entries);
+            }
+        }
+        Ok(membership)
+    }
+
+    /// Names and types that can affect source membership in this directory.
+    /// Output files may be skipped, but partially excluded output directories
+    /// must remain visible because they can contain source files or ignore rules.
+    fn entries(&self, directory: &Path) -> Result<Option<BTreeSet<(OsString, u8)>>> {
+        let entries = match std::fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let relative_directory = directory.strip_prefix(&self.root).unwrap_or(directory);
+        let mut outputs = BTreeSet::new();
+        for ancestor in relative_directory.ancestors() {
+            if let Some(indices) = self.output_anchors.get(ancestor) {
+                outputs.extend(indices.iter().copied());
+            }
+        }
+        for (_, indices) in self
+            .output_anchors
+            .range(relative_directory.to_owned()..)
+            .take_while(|(anchor, _)| anchor.starts_with(relative_directory))
+        {
+            outputs.extend(indices.iter().copied());
+        }
+        let mut names = BTreeSet::new();
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let path = entry.path();
+            let relative = path.strip_prefix(&self.root).unwrap_or(&path);
+            if matches!(name.to_str(), Some(".git" | ".qk" | "node_modules"))
+                || self
+                    .cache
+                    .as_ref()
+                    .is_some_and(|cache| relative.starts_with(cache))
+                || relative
+                    .ancestors()
+                    .any(|root| self.excluded_roots.contains(root))
+            {
+                continue;
+            }
+            // A policy created between policy discovery and name capture must
+            // get its own stamp before its in-place edits can permit reuse.
+            if matches!(name.to_str(), Some(".gitignore" | ".nxignore"))
+                && !self.policies.contains(&path)
+            {
+                return Ok(None);
+            }
+            let kind = entry.file_type()?;
+            // An empty directory created after the inventory walk would not
+            // appear among source files. Never bless its parent signature until
+            // that directory is itself watched by the inventory.
+            if kind.is_dir() && !self.directories.contains(&path) {
+                return Ok(None);
+            }
+            if !kind.is_dir()
+                && !matches!(name.to_str(), Some(".gitignore" | ".nxignore"))
+                && relative.to_str().is_some_and(|path| {
+                    outputs
+                        .iter()
+                        .any(|index| self.outputs[*index].matches(path))
+                })
+            {
+                continue;
+            }
+            names.insert((
+                name,
+                if kind.is_dir() {
+                    1
+                } else if kind.is_symlink() {
+                    2
+                } else {
+                    0
+                },
+            ));
+        }
+        Ok(Some(names))
+    }
+
+    /// Check source-relevant directory membership and every listing policy.
+    /// Recent directory stamps require fresh entry names; recent ignore files
+    /// require matching contents, while other listing policies must settle.
+    fn state(&self, prefixes: Option<&[PathBuf]>) -> Result<(bool, bool)> {
+        let mut settled = true;
+        let selected = prefixes.map(|prefixes| {
+            let mut selected = BTreeSet::new();
+            for prefix in prefixes {
+                for ancestor in prefix.ancestors() {
+                    if let Some(directory) = self.directories.get(ancestor) {
+                        selected.insert(directory);
+                    }
+                }
+                selected.extend(
+                    self.directories
+                        .range(prefix.clone()..)
+                        .take_while(|directory| directory.starts_with(prefix)),
+                );
+            }
+            selected
+        });
+        let paths: Box<dyn Iterator<Item = (&PathBuf, bool)>> = match selected {
+            Some(selected) => Box::new(
+                selected
+                    .into_iter()
+                    .map(|path| (path, true))
+                    .chain(self.policies.iter().map(|path| (path, false))),
+            ),
+            None => Box::new(
+                self.stamps
+                    .keys()
+                    .map(|path| (path, self.directories.contains(path))),
+            ),
+        };
+        for (path, directory) in paths {
+            let before = &self.stamps[path];
+            let after = membership_stamp(path)?;
+            if directory {
+                if after.is_some() && !self.directory_entries.contains_key(path) {
+                    return Ok((false, false));
+                }
+                // Output publication changes its parent's timestamp too. Check
+                // source-relevant names rather than relisting the whole workspace.
+                // Recent directories are always read, even with an equal stamp:
+                // coarse timestamps can conceal an addition or removal.
+                if *before != after
+                    || after
+                        .as_ref()
+                        .is_some_and(|stamp| !stamp.membership_settled())
+                {
+                    let entries = self.entries(path)?;
+                    if entries.as_ref() != self.directory_entries.get(path)
+                        || membership_stamp(path)? != after
+                    {
+                        return Ok((false, false));
+                    }
+                }
+            } else {
+                let recent = after
+                    .as_ref()
+                    .is_some_and(|stamp| !stamp.membership_settled());
+                if (*before != after || recent)
+                    && let Some(content) = self.ignore_contents.get(path)
+                {
+                    if ignore_content(path, &after)?.as_ref() != Some(content) {
+                        return Ok((false, false));
+                    }
+                    continue;
+                }
+                if *before != after {
+                    return Ok((false, false));
+                }
+                settled &= !recent;
+            }
+        }
+        Ok((true, settled))
+    }
+
+    /// Retain a matched listing and policy for use after releasing the lock.
+    fn candidates(&self) -> Candidates {
+        Candidates {
+            files: self.files.clone(),
+            source_ignore: self.source_ignore.clone(),
+        }
+    }
+}
+
+/// Find Git index, exclusion and config files that can change source visibility,
+/// including absent policy files whose later creation must invalidate reuse.
+fn git_membership_policies(root: &Path) -> BTreeSet<PathBuf> {
+    let mut policies = BTreeSet::new();
+    if let Ok(output) = paths::git(
+        root,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "index",
+            "--git-path",
+            "info/exclude",
+            "--git-path",
+            "config",
+            "--git-path",
+            "config.worktree",
+        ],
+    ) && output.status.success()
+        && let Ok(paths) = String::from_utf8(output.stdout)
+    {
+        policies.extend(paths.lines().map(PathBuf::from));
+    }
+    // Config can include other files. Track every origin used by Git, as
+    // well as currently missing standard config and excludes files.
+    if let Ok(output) = paths::git(root, &["config", "--null", "--show-origin", "--list"])
+        && output.status.success()
+    {
+        // NUL mode emits raw origins, without Git's C-style path quoting,
+        // and separates each origin from its key/newline/value record. Values
+        // may themselves contain newlines (including include/excludes paths).
+        let output = String::from_utf8_lossy(&output.stdout);
+        let mut fields = output.split_terminator('\0');
+        while let (Some(origin), Some(entry)) = (fields.next(), fields.next()) {
+            if let Some(path) = origin.strip_prefix("file:") {
+                let origin = root.join(path);
+                if let Some((name, value)) = entry.split_once('\n')
+                    && name.starts_with("include")
+                    && name.ends_with(".path")
+                {
+                    let included = if let Some(relative) = value.strip_prefix("~/") {
+                        std::env::var_os("HOME")
+                            .map(PathBuf::from)
+                            .unwrap_or_default()
+                            .join(relative)
+                    } else {
+                        origin.parent().unwrap_or(root).join(value)
+                    };
+                    // Git omits missing includes from the origin listing, but
+                    // creating one later can change core.excludesfile.
+                    policies.insert(included);
+                }
+                policies.insert(origin);
+            }
+        }
+    }
+    if let Ok(output) = paths::git(
+        root,
+        &["config", "--null", "--path", "--get", "core.excludesfile"],
+    ) && output.status.success()
+        && let Ok(path) = String::from_utf8(output.stdout)
+    {
+        policies.insert(root.join(path.strip_suffix('\0').unwrap_or(&path)));
+    }
+    for variable in ["GIT_CONFIG_SYSTEM", "GIT_CONFIG_GLOBAL"] {
+        if let Some(path) = std::env::var_os(variable) {
+            policies.insert(PathBuf::from(path));
+        }
+    }
+    policies.insert(PathBuf::from("/etc/gitconfig"));
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        policies.insert(home.join(".gitconfig"));
+        let config = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".config"));
+        policies.insert(config.join("git/config"));
+        policies.insert(config.join("git/ignore"));
+    }
+    policies
+}
+
+/// Read a regular ignore policy only when the captured metadata remains stable.
+/// A digest read after a listing must never replace the pre-listing digest.
+fn ignore_content(path: &Path, expected: &Option<Stamp>) -> Result<Option<String>> {
+    if expected.is_none() || membership_stamp(path)? != *expected {
+        return Ok(None);
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let content = match std::fs::read(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    Ok((membership_stamp(path)? == *expected).then(|| blake3::hash(&content).to_hex().to_string()))
+}
+
+/// Stamp a directory or listing policy, including a symlink's resolved target.
+fn membership_stamp(path: &Path) -> Result<Option<Stamp>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let mut stamp = Stamp::new(&metadata);
+            if metadata.is_symlink() {
+                // Follow the current chain on every check. In-place target
+                // edits or retargeted intermediate links can change policy.
+                match std::fs::metadata(path) {
+                    Ok(target) => stamp.0.extend(Stamp::new(&target).0),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => stamp.0[1] = -1,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Ok(Some(stamp))
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error).with_context(|| format!("cannot inspect {}", path.display())),
+    }
 }
 
 /// One dependency task's output files, and the value of each one a pattern
@@ -174,53 +667,41 @@ impl Snapshot {
             )
         });
         let mut files = files?;
-        if let Ok(cache_relative) = cache_path.strip_prefix(&workspace.root) {
-            files.retain(|path| !Path::new(path).starts_with(cache_relative));
-        }
-        // Generated artifacts must not make the next invocation invalidate itself.
-        // Another task's unsupported outputs stay candidates: that only costs misses,
-        // and so do Nx's default outputs, which may well hold sources.
-        let mut generated = BTreeSet::new();
-        for outputs in graph
+        let cache_relative = cache_path
+            .strip_prefix(&workspace.root)
+            .ok()
+            .map(PathBuf::from);
+        // Keep the patterns, not only the artifacts present at startup: new
+        // outputs and warm scratch files must be excluded on every refresh.
+        let mut source_exclusions: Vec<_> = graph
             .tasks
             .values()
             .filter_map(|task| Outputs::new(workspace, task).ok())
             .filter(Outputs::is_explicit)
-        {
-            for anchor in outputs.anchors() {
-                generated.extend(
-                    under(&files, anchor)
-                        .filter(|path| outputs.matches(path))
-                        .cloned(),
-                );
-            }
-        }
-        // Warm scratch paths are never inputs either.
+            .collect();
         for task in graph.tasks.values() {
             let Ok(entries) = crate::warm::config(workspace, task) else {
                 continue;
             };
             if let Ok(paths) = Outputs::from_paths(&crate::warm::kept_paths(&entries)) {
-                for anchor in paths.anchors() {
-                    generated.extend(
-                        under(&files, anchor)
-                            .filter(|path| paths.matches(path))
-                            .cloned(),
-                    );
-                }
+                source_exclusions.push(paths);
             }
         }
-        files.retain(|path| !generated.contains(path));
+        exclude_artifacts(&mut files, &source_exclusions, cache_relative.as_deref());
         Ok(Self {
             files,
             extra_candidates: BTreeSet::new(),
+            membership: Mutex::default(),
+            membership_prefixes: Mutex::default(),
+            source_exclusions,
+            cache_relative,
             projects: ProjectGraph::build(workspace)?,
             roots: workspace
                 .projects
                 .values()
                 .map(|project| (project.root.clone(), project.name.clone()))
                 .collect(),
-            source_ignore: SourceIgnore::new(&workspace.root)?,
+            source_ignore: Arc::new(SourceIgnore::new(&workspace.root)?),
             generated_tasks: graph
                 .tasks
                 .values()
@@ -245,6 +726,113 @@ impl Snapshot {
             dependency_outputs: Mutex::default(),
             outputs_written: Default::default(),
         })
+    }
+
+    /// Restrict directory checks to the positive fileset prefixes a task reads.
+    fn membership_prefixes(&self, workspace: &Workspace, task: &Task) -> Result<Arc<Vec<PathBuf>>> {
+        let mut prefixes = self.membership_prefixes.lock().unwrap();
+        if let Some(prefixes) = prefixes.get(&task.id) {
+            return Ok(prefixes.clone());
+        }
+        let empty = BTreeSet::new();
+        let cancelled = AtomicBool::new(false);
+        let mut resolver = Resolver::new(self, workspace, None, &cancelled, &empty);
+        resolver.task_inputs(task)?;
+        let paths = Arc::new(
+            resolver
+                .scopes
+                .values()
+                .flat_map(|scope| &scope.patterns)
+                .filter(|pattern| !pattern.excluded)
+                .map(|pattern| workspace.root.join(&pattern.prefix))
+                .collect(),
+        );
+        prefixes.insert(task.id.clone(), Arc::clone(&paths));
+        Ok(paths)
+    }
+
+    /// Reuse membership while source directories and listing policy are unchanged.
+    /// Content changes are checked separately by the file digest cache.
+    #[cfg(test)]
+    fn current_files(&self, root: &Path) -> Result<Arc<BTreeSet<String>>> {
+        Ok(self.current_files_for(root, None)?.files)
+    }
+
+    /// Refresh candidates as needed, returning their policy in the same snapshot.
+    fn current_files_for(&self, root: &Path, prefixes: Option<&[PathBuf]>) -> Result<Candidates> {
+        loop {
+            let previous = self.membership.lock().unwrap().clone();
+            // Immutable entries let independent fingerprints validate their
+            // directory stamps concurrently. Only a refresh needs serialization.
+            let (unchanged, settled) = match &previous {
+                Some(entry) => entry.state(prefixes)?,
+                None => (false, false),
+            };
+            if settled && previous.as_ref().unwrap().settled {
+                return Ok(previous.as_ref().unwrap().candidates());
+            }
+            let mut cached = self.membership.lock().unwrap();
+            let current = match (&previous, &*cached) {
+                (Some(previous), Some(current)) => Arc::ptr_eq(previous, current),
+                (None, None) => true,
+                _ => false,
+            };
+            if !current {
+                // Another fingerprint refreshed while this one validated.
+                // Recheck that newer inventory before making any replacement.
+                continue;
+            }
+            drop(previous);
+            // Recent listing policies may conceal edits on coarse filesystems.
+            // Re-list sources while they settle, then rebuild the directory inventory
+            // once before enabling reuse (including any newly created empty dirs).
+            // Recent directories are checked by freshly reading their child names.
+            let rebuilt = !unchanged || settled;
+            let mut membership = if !rebuilt {
+                Arc::unwrap_or_clone(cached.take().unwrap())
+            } else {
+                // Capture directories before listing files, then compare afterward.
+                // An addition during listing must not hide behind a newer stamp.
+                Membership::new(
+                    root,
+                    cached.as_ref().map_or(&self.files, |entry| &entry.files),
+                    &self.source_ignore,
+                    &self.source_exclusions,
+                    self.cache_relative.as_deref(),
+                    cached
+                        .as_ref()
+                        .filter(|entry| unchanged && entry.settled)
+                        .map(|entry| &entry.git_policies),
+                )?
+            };
+            let mut files = source_files(root)?;
+            exclude_artifacts(
+                &mut files,
+                &self.source_exclusions,
+                self.cache_relative.as_deref(),
+            );
+            let ignore = SourceIgnore::new(root)?;
+            files.extend(
+                self.extra_candidates
+                    .iter()
+                    .filter(|path| !ignore.matches(path))
+                    .cloned(),
+            );
+            membership.source_ignore = Arc::new(ignore);
+            membership.files = Arc::new(files);
+            let candidates = membership.candidates();
+            // An unstable inventory or recent policy never enables the fast path.
+            // Keep candidates so a rebuild also watches tracked, ignored parents.
+            let covered = candidates.files.iter().all(|path| {
+                Path::new(path)
+                    .ancestors()
+                    .skip(1)
+                    .all(|parent| membership.stamps.contains_key(&root.join(parent)))
+            });
+            membership.settled = rebuilt && covered && membership.state(None)?.1;
+            *cached = Some(Arc::new(membership));
+            return Ok(candidates);
+        }
     }
 
     /// Saves the digests of files that still exist, for the next run.
@@ -542,6 +1130,24 @@ fn load_digests(root: &Path) -> HashMap<String, (Stamp, String)> {
         .unwrap_or_default()
 }
 
+/// Apply the same source policy to startup and refreshed file membership.
+/// Remove declared artifacts and cache storage from a refreshed source listing.
+fn exclude_artifacts(files: &mut BTreeSet<String>, outputs: &[Outputs], cache: Option<&Path>) {
+    let mut generated = BTreeSet::new();
+    for outputs in outputs {
+        for anchor in outputs.anchors() {
+            generated.extend(
+                under(files, anchor)
+                    .filter(|path| outputs.matches(path))
+                    .cloned(),
+            );
+        }
+    }
+    files.retain(|path| {
+        !generated.contains(path) && cache.is_none_or(|cache| !Path::new(path).starts_with(cache))
+    });
+}
+
 /// Files equal to `prefix` or below it, using the sorted order of the set.
 impl Snapshot {
     /// The project whose root most specifically contains `path`, as Nx assigns
@@ -766,6 +1372,7 @@ enum FileScope {
 struct Resolver<'a> {
     workspace: &'a Workspace,
     snapshot: &'a Snapshot,
+    candidates: &'a BTreeSet<String>,
     selected: BTreeSet<String>,
     scopes: BTreeMap<FileScope, FileSelection>,
     values: BTreeMap<String, Value>,
@@ -779,7 +1386,37 @@ struct Resolver<'a> {
     cancelled: &'a AtomicBool,
 }
 
-impl Resolver<'_> {
+impl<'a> Resolver<'a> {
+    fn new(
+        snapshot: &'a Snapshot,
+        workspace: &'a Workspace,
+        prepared: Option<&'a PreparedTask>,
+        cancelled: &'a AtomicBool,
+        candidates: &'a BTreeSet<String>,
+    ) -> Self {
+        Self {
+            workspace,
+            snapshot,
+            candidates,
+            selected: BTreeSet::new(),
+            scopes: BTreeMap::new(),
+            values: BTreeMap::new(),
+            named_stack: Vec::new(),
+            expanded: BTreeSet::new(),
+            external: BTreeSet::new(),
+            prepared,
+            cancelled,
+        }
+    }
+
+    fn task_inputs(&mut self, task: &Task) -> Result<()> {
+        let default = vec![json!("default"), json!("^default")];
+        for input in task.definition.inputs.as_ref().unwrap_or(&default) {
+            self.input(&task.project, input)?;
+        }
+        Ok(())
+    }
+
     fn input(&mut self, project: &str, input: &Value) -> Result<()> {
         match input {
             // As in Nx, `^name` is `name` of every project the project depends
@@ -1011,9 +1648,9 @@ impl Resolver<'_> {
             .collect::<Vec<_>>()
             .join("/");
         let candidates: Box<dyn Iterator<Item = &String>> = if prefix.is_empty() {
-            Box::new(self.snapshot.files.iter())
+            Box::new(self.candidates.iter())
         } else {
-            Box::new(under(&self.snapshot.files, &prefix))
+            Box::new(under(self.candidates, &prefix))
         };
         let snapshot = self.snapshot;
         let selection = self.scopes.entry(scope).or_default();
@@ -1139,22 +1776,28 @@ pub fn resolve(
     prepared: Option<&PreparedTask>,
     cancelled: &AtomicBool,
 ) -> Result<Resolved> {
-    let mut resolver = Resolver {
-        workspace,
+    resolve_candidates(
         snapshot,
-        selected: BTreeSet::new(),
-        scopes: BTreeMap::new(),
-        values: BTreeMap::new(),
-        named_stack: Vec::new(),
-        expanded: BTreeSet::new(),
-        external: BTreeSet::new(),
+        workspace,
+        task,
         prepared,
         cancelled,
-    };
-    let default = vec![json!("default"), json!("^default")];
-    for input in task.definition.inputs.as_ref().unwrap_or(&default) {
-        resolver.input(&task.project, input)?;
-    }
+        &snapshot.files,
+        &snapshot.source_ignore,
+    )
+}
+
+fn resolve_candidates(
+    snapshot: &Snapshot,
+    workspace: &Workspace,
+    task: &Task,
+    prepared: Option<&PreparedTask>,
+    cancelled: &AtomicBool,
+    candidates: &BTreeSet<String>,
+    source_ignore: &SourceIgnore,
+) -> Result<Resolved> {
+    let mut resolver = Resolver::new(snapshot, workspace, prepared, cancelled, candidates);
+    resolver.task_inputs(task)?;
     // Dependency outputs may also be declared sources. Downstream and unrelated
     // outputs remain artifacts, so producing them cannot invalidate an upstream task.
     let mut upstream = BTreeSet::new();
@@ -1187,7 +1830,7 @@ pub fn resolve(
             .any(|pattern| {
                 declared.anchors().any(|anchor| {
                     overlaps(&pattern.prefix, anchor)
-                        && (!snapshot.source_ignore.matches_directory(anchor)
+                        && (!source_ignore.matches_directory(anchor)
                             || !workspace.root.join(anchor).is_dir())
                 })
             });
@@ -1196,7 +1839,7 @@ pub fn resolve(
         }
         let outputs = snapshot.dependency_outputs(workspace, producer)?;
         for path in &outputs.files {
-            if snapshot.source_ignore.matches(path)
+            if source_ignore.matches(path)
                 || own_outputs.as_ref().is_some_and(|own| own.matches(path))
             {
                 continue;
@@ -1348,13 +1991,23 @@ pub fn inputs(
     dependencies: &BTreeMap<String, String>,
     cancelled: &AtomicBool,
 ) -> Result<Value> {
+    let prefixes = snapshot.membership_prefixes(workspace, task)?;
+    let candidates = snapshot.current_files_for(&workspace.root, Some(&prefixes))?;
     let Resolved {
         files,
         mut values,
         lockfile,
         workspace_file,
         ..
-    } = resolve(snapshot, workspace, task, Some(prepared), cancelled)?;
+    } = resolve_candidates(
+        snapshot,
+        workspace,
+        task,
+        Some(prepared),
+        cancelled,
+        &candidates.files,
+        &candidates.source_ignore,
+    )?;
     let installed = snapshot.installed(&workspace.root)?;
     if let (Some((importers, external)), Some(installed)) = (lockfile, &installed)
         && let Some(lockfile) = &installed.lockfile
@@ -1591,6 +2244,672 @@ mod tests {
         let workspace = Workspace::load(root.path()).unwrap();
         let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
         (root, workspace, graph)
+    }
+
+    #[test]
+    fn execution_fingerprints_refresh_sources_and_preserve_artifact_exclusions() {
+        let (root, mut workspace, _) = fixture(Some(json!(["dist"])));
+        let definition = workspace
+            .projects
+            .get_mut("app")
+            .unwrap()
+            .targets
+            .get_mut("post")
+            .unwrap();
+        definition
+            .extra
+            .insert("qk:warm".into(), json!({"paths": ["scratch"]}));
+        std::fs::write(root.path().join(".gitignore"), "ignored/\n").unwrap();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src/original"), "one").unwrap();
+        let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
+        let task = &graph.tasks["app:post"];
+        let prepared = qk_executor::prepare(&workspace, task, &BTreeMap::new()).unwrap();
+        let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
+        let inputs = || {
+            super::inputs(
+                &snapshot,
+                &workspace,
+                task,
+                &prepared,
+                &BTreeMap::new(),
+                &AtomicBool::new(false),
+            )
+            .unwrap()
+        };
+        let before = inputs();
+        // Artifacts created after startup must not change the execution key.
+        for directory in ["generated", "dist", "scratch", "cache", "ignored"] {
+            std::fs::create_dir_all(root.path().join(directory)).unwrap();
+            std::fs::write(root.path().join(directory).join("new"), "artifact").unwrap();
+        }
+        assert_eq!(before, inputs());
+        // This covers both post-execution verification and a later task's first
+        // fingerprint against a snapshot created before this source existed.
+        std::fs::write(root.path().join("src/added"), "two").unwrap();
+        let after = inputs();
+        assert!(after["files"].get("src/added").is_some());
+        assert_ne!(key(&before).unwrap(), key(&after).unwrap());
+        std::fs::remove_file(root.path().join("src/added")).unwrap();
+        assert_eq!(before, inputs());
+        std::fs::remove_file(root.path().join("src/original")).unwrap();
+        assert!(inputs()["files"].get("src/original").is_none());
+    }
+
+    #[test]
+    fn membership_reuses_settled_candidates_and_detects_directory_changes() {
+        let mut fixtures = Vec::new();
+        for git in [false, true] {
+            let (root, workspace, graph) = fixture(Some(json!(["dist"])));
+            for directory in ["src/empty", "dist", "cache", "ignored"] {
+                std::fs::create_dir_all(root.path().join(directory)).unwrap();
+            }
+            std::fs::write(root.path().join(".gitignore"), "ignored/\n").unwrap();
+            std::fs::write(root.path().join("src/original"), "one").unwrap();
+            if git {
+                assert!(
+                    paths::git(root.path(), &["init", "-q"])
+                        .unwrap()
+                        .status
+                        .success()
+                );
+                assert!(
+                    paths::git(root.path(), &["add", "."])
+                        .unwrap()
+                        .status
+                        .success()
+                );
+            }
+            let snapshot =
+                Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
+            snapshot.current_files(root.path()).unwrap();
+            fixtures.push((root, snapshot));
+        }
+        // Recent directory metadata deliberately uses the conservative listing
+        // path. Waiting lets this test exercise the actual reuse path too.
+        std::thread::sleep(Duration::from_millis(2100));
+        for (root, snapshot) in fixtures {
+            let files = || snapshot.current_files(root.path()).unwrap();
+            let before = files();
+            assert!(Arc::ptr_eq(&before, &files()));
+            for directory in ["generated", "dist", "cache"] {
+                std::fs::write(root.path().join(directory).join("new"), "artifact").unwrap();
+            }
+            assert!(Arc::ptr_eq(&before, &files()));
+            std::fs::write(root.path().join("src/empty/added"), "two").unwrap();
+            assert!(files().contains("src/empty/added"));
+            std::fs::create_dir_all(root.path().join("src/new/nested")).unwrap();
+            std::fs::write(root.path().join("src/new/nested/added"), "three").unwrap();
+            assert!(files().contains("src/new/nested/added"));
+            std::fs::rename(
+                root.path().join("src/original"),
+                root.path().join("src/renamed"),
+            )
+            .unwrap();
+            let renamed = files();
+            assert!(!renamed.contains("src/original"));
+            assert!(renamed.contains("src/renamed"));
+            std::fs::remove_file(root.path().join("src/renamed")).unwrap();
+            assert!(!files().contains("src/renamed"));
+            // Policy files must be checked even when directory entries do not
+            // change (editing an existing ignore file in place).
+            std::fs::write(root.path().join(".gitignore"), "ignored/\nsrc/empty/\n").unwrap();
+            assert!(!files().contains("src/empty/added"));
+            std::fs::write(root.path().join(".gitignore"), "ignored/\n").unwrap();
+            assert!(files().contains("src/empty/added"));
+        }
+    }
+
+    #[test]
+    fn identical_ignore_rewrites_reuse_candidates_and_changed_rules_refresh() {
+        for name in [".gitignore", ".nxignore"] {
+            let (root, workspace, graph) = fixture(None);
+            let policy = root.path().join(name);
+            std::fs::write(root.path().join("alpha"), "a").unwrap();
+            std::fs::write(root.path().join("bravo"), "b").unwrap();
+            std::fs::write(&policy, "alpha\n").unwrap();
+            let snapshot =
+                Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
+            let original = snapshot.current_files(root.path()).unwrap();
+            assert!(!original.contains("alpha"));
+            assert!(original.contains("bravo"));
+            for _ in 0..3 {
+                std::fs::write(&policy, "alpha\n").unwrap();
+                assert!(Arc::ptr_eq(
+                    &original,
+                    &snapshot.current_files(root.path()).unwrap()
+                ));
+            }
+            // Same-length content can change while coarse timestamps appear
+            // identical. Recent policies must still compare their contents.
+            std::fs::write(&policy, "bravo\n").unwrap();
+            {
+                let mut cached = snapshot.membership.lock().unwrap();
+                Arc::make_mut(cached.as_mut().unwrap())
+                    .stamps
+                    .insert(policy.clone(), membership_stamp(&policy).unwrap());
+            }
+            let changed = snapshot.current_files(root.path()).unwrap();
+            assert!(!Arc::ptr_eq(&original, &changed));
+            assert!(changed.contains("alpha"));
+            assert!(!changed.contains("bravo"));
+            std::fs::remove_file(&policy).unwrap();
+            assert!(
+                snapshot
+                    .current_files(root.path())
+                    .unwrap()
+                    .contains("bravo")
+            );
+        }
+    }
+
+    #[test]
+    fn ignore_contents_changed_after_inventory_cannot_bless_a_listing() {
+        let (root, workspace, graph) = fixture(None);
+        let policy = root.path().join(".nxignore");
+        std::fs::write(&policy, "alpha\n").unwrap();
+        let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
+        snapshot.current_files(root.path()).unwrap();
+        let membership = snapshot.membership.lock().unwrap().clone().unwrap();
+        std::fs::write(&policy, "bravo\n").unwrap();
+        assert!(!membership.state(None).unwrap().0);
+    }
+
+    #[test]
+    fn a_directory_missed_by_the_inventory_cannot_enable_reuse() {
+        let (root, workspace, graph) = fixture(None);
+        let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
+        snapshot.current_files(root.path()).unwrap();
+        std::fs::create_dir(root.path().join("new-empty")).unwrap();
+        let mut cached = snapshot.membership.lock().unwrap();
+        let membership = Arc::make_mut(cached.as_mut().unwrap());
+        // Model creation between the directory walk and child-name capture:
+        // the new directory is in its parent's names but not in the inventory.
+        membership
+            .directory_entries
+            .get_mut(root.path())
+            .unwrap()
+            .insert((OsString::from("new-empty"), 1));
+        assert!(membership.entries(root.path()).unwrap().is_none());
+        assert!(!membership.state(None).unwrap().0);
+    }
+
+    #[test]
+    fn a_policy_missed_by_discovery_cannot_enable_reuse() {
+        let (root, workspace, graph) = fixture(None);
+        let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
+        snapshot.current_files(root.path()).unwrap();
+        std::fs::write(root.path().join(".nxignore"), "hidden\n").unwrap();
+        let mut cached = snapshot.membership.lock().unwrap();
+        let membership = Arc::make_mut(cached.as_mut().unwrap());
+        // Model a new policy appearing after discovery but before capturing
+        // its parent's entries; its content would otherwise have no stamp.
+        membership
+            .directory_entries
+            .get_mut(root.path())
+            .unwrap()
+            .insert((OsString::from(".nxignore"), 0));
+        assert!(membership.entries(root.path()).unwrap().is_none());
+        assert!(!membership.state(None).unwrap().0);
+    }
+
+    #[test]
+    fn output_publication_reuses_candidates_but_source_names_still_refresh() {
+        for partial in [false, true] {
+            let outputs = if partial {
+                json!(["dist", "!dist/keep"])
+            } else {
+                json!(["dist"])
+            };
+            let (root, workspace, graph) = fixture(Some(outputs));
+            std::fs::create_dir_all(root.path().join("src")).unwrap();
+            std::fs::write(root.path().join("src/original"), "one").unwrap();
+            if partial {
+                std::fs::create_dir_all(root.path().join("dist/keep")).unwrap();
+            }
+            let snapshot =
+                Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
+            snapshot.current_files(root.path()).unwrap();
+            // Policies retain their conservative timestamp window. Directory
+            // names are freshly verified throughout the window instead.
+            std::thread::sleep(Duration::from_millis(2100));
+            let before = snapshot.current_files(root.path()).unwrap();
+            std::fs::create_dir_all(root.path().join("dist")).unwrap();
+            std::fs::write(root.path().join("dist/restored"), "artifact").unwrap();
+            let restored = snapshot.current_files(root.path()).unwrap();
+            assert!(Arc::ptr_eq(&before, &restored));
+            std::fs::remove_file(root.path().join("dist/restored")).unwrap();
+            assert!(Arc::ptr_eq(
+                &before,
+                &snapshot.current_files(root.path()).unwrap()
+            ));
+            let source = if partial { "dist/keep/new" } else { "src/new" };
+            std::fs::write(root.path().join(source), "source").unwrap();
+            let after = snapshot.current_files(root.path()).unwrap();
+            assert!(after.contains(source));
+            assert!(!Arc::ptr_eq(&before, &after));
+            std::fs::remove_file(root.path().join(source)).unwrap();
+            assert!(
+                !snapshot
+                    .current_files(root.path())
+                    .unwrap()
+                    .contains(source)
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_fingerprints_refresh_without_replacing_newer_membership() {
+        let (root, workspace, graph) = fixture(None);
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
+        let original = snapshot.current_files(root.path()).unwrap();
+        let barrier = std::sync::Barrier::new(9);
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut rounds = Vec::new();
+                        for _ in 0..6 {
+                            barrier.wait();
+                            rounds.push(snapshot.current_files(root.path()));
+                            barrier.wait();
+                        }
+                        rounds
+                    })
+                })
+                .collect();
+            for round in 0..6 {
+                std::fs::write(root.path().join(format!("src/new{round}")), "source").unwrap();
+                barrier.wait();
+                barrier.wait();
+            }
+            // Assertions run after synchronization, so a failed membership
+            // check cannot strand other workers at a barrier.
+            for worker in workers {
+                for (round, files) in worker.join().unwrap().into_iter().enumerate() {
+                    let files = files.unwrap();
+                    for added in 0..=round {
+                        assert!(files.contains(&format!("src/new{added}")));
+                    }
+                }
+            }
+        });
+        assert!(!original.contains("src/new0"));
+        assert!(
+            snapshot
+                .current_files(root.path())
+                .unwrap()
+                .contains("src/new5")
+        );
+    }
+
+    #[test]
+    fn retained_candidates_keep_their_dependency_output_ignore_policy() {
+        let (root, mut workspace, _) = fixture(None);
+        workspace
+            .projects
+            .get_mut("app")
+            .unwrap()
+            .targets
+            .get_mut("build")
+            .unwrap()
+            .inputs = Some(vec![json!("{workspaceRoot}/**/*.txt")]);
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        for name in ["alpha", "beta", "gamma"] {
+            for directory in ["src", "generated"] {
+                std::fs::write(root.path().join(format!("{directory}/{name}.txt")), name).unwrap();
+            }
+        }
+        let policy = |keep: &str| {
+            let ignored: String = ["alpha", "beta", "gamma"]
+                .into_iter()
+                .filter(|name| *name != keep)
+                .flat_map(|name| {
+                    [
+                        format!("src/{name}.txt\n"),
+                        format!("generated/{name}.txt\n"),
+                    ]
+                })
+                .collect();
+            std::fs::write(root.path().join(".nxignore"), ignored).unwrap();
+        };
+        policy("alpha");
+        let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
+        let snapshot = Snapshot::new(&workspace, &graph, &root.path().join("cache")).unwrap();
+        let first = snapshot.current_files_for(root.path(), None).unwrap();
+        policy("beta");
+        let second = snapshot.current_files_for(root.path(), None).unwrap();
+        policy("gamma");
+        let third = snapshot.current_files_for(root.path(), None).unwrap();
+        // Deterministically pause two fingerprints after candidate acquisition,
+        // then let another fingerprint refresh policy twice before they resolve.
+        let cancelled = AtomicBool::new(false);
+        let expected = |name: &str| {
+            BTreeSet::from([
+                ".nxignore".into(),
+                "nx.json".into(),
+                "project.json".into(),
+                format!("src/{name}.txt"),
+                format!("generated/{name}.txt"),
+            ])
+        };
+        for (candidates, name) in [(first, "alpha"), (second, "beta"), (third, "gamma")] {
+            let resolved = resolve_candidates(
+                &snapshot,
+                &workspace,
+                &graph.tasks["app:build"],
+                None,
+                &cancelled,
+                &candidates.files,
+                &candidates.source_ignore,
+            )
+            .unwrap();
+            assert_eq!(resolved.files, expected(name));
+        }
+        // Inspection still uses its original candidate list and original policy.
+        let inspected = resolve(
+            &snapshot,
+            &workspace,
+            &graph.tasks["app:build"],
+            None,
+            &cancelled,
+        )
+        .unwrap();
+        assert_eq!(inspected.files, expected("alpha"));
+    }
+
+    #[test]
+    fn scoped_membership_defers_unrelated_changes_until_a_matching_task_asks() {
+        let (root, mut workspace, _) = fixture(Some(json!(["dist"])));
+        let targets = &mut workspace.projects.get_mut("app").unwrap().targets;
+        targets.get_mut("post").unwrap().inputs =
+            Some(vec![json!("{workspaceRoot}/left/**/*.txt")]);
+        targets.get_mut("gen").unwrap().inputs =
+            Some(vec![json!("{workspaceRoot}/right/**/*.txt")]);
+        targets.get_mut("build").unwrap().inputs = Some(vec![json!("{workspaceRoot}/**/*.txt")]);
+        for directory in ["left/empty", "right/empty"] {
+            std::fs::create_dir_all(root.path().join(directory)).unwrap();
+        }
+        let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
+        let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
+        snapshot.current_files(&workspace.root).unwrap();
+        std::thread::sleep(Duration::from_millis(2100));
+        let left = snapshot
+            .membership_prefixes(&workspace, &graph.tasks["app:post"])
+            .unwrap();
+        let right = snapshot
+            .membership_prefixes(&workspace, &graph.tasks["app:gen"])
+            .unwrap();
+        let all = snapshot
+            .membership_prefixes(&workspace, &graph.tasks["app:build"])
+            .unwrap();
+        let before = snapshot
+            .current_files_for(&workspace.root, Some(&left))
+            .unwrap();
+        std::fs::write(root.path().join("right/empty/new.txt"), "right").unwrap();
+        let unrelated = snapshot
+            .current_files_for(&workspace.root, Some(&left))
+            .unwrap();
+        assert!(Arc::ptr_eq(&before.files, &unrelated.files));
+        assert!(!unrelated.files.contains("right/empty/new.txt"));
+        assert!(
+            snapshot
+                .current_files_for(&workspace.root, Some(&right))
+                .unwrap()
+                .files
+                .contains("right/empty/new.txt")
+        );
+        std::fs::create_dir_all(root.path().join("left/empty/nested")).unwrap();
+        std::fs::write(root.path().join("left/empty/nested/new.txt"), "left").unwrap();
+        assert!(
+            snapshot
+                .current_files_for(&workspace.root, Some(&left))
+                .unwrap()
+                .files
+                .contains("left/empty/nested/new.txt")
+        );
+        std::fs::write(root.path().join("right/empty/another.txt"), "right").unwrap();
+        assert!(
+            snapshot
+                .current_files_for(&workspace.root, Some(&all))
+                .unwrap()
+                .files
+                .contains("right/empty/another.txt")
+        );
+    }
+
+    #[test]
+    fn membership_watches_git_ignored_tracked_parents_and_index_policy() {
+        let (root, workspace, graph) = fixture(Some(json!(["dist"])));
+        std::fs::create_dir_all(root.path().join("tracked/nested")).unwrap();
+        std::fs::write(root.path().join("tracked/.gitignore"), "nested/\n").unwrap();
+        std::fs::write(root.path().join("tracked/nested/source"), "one").unwrap();
+        assert!(
+            paths::git(root.path(), &["init", "-q"])
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(
+            paths::git(root.path(), &["add", "-f", "tracked/nested/source"])
+                .unwrap()
+                .status
+                .success()
+        );
+        let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
+        let files = || snapshot.current_files(root.path()).unwrap();
+        assert!(files().contains("tracked/nested/source"));
+        std::fs::remove_file(root.path().join("tracked/nested/source")).unwrap();
+        assert!(!files().contains("tracked/nested/source"));
+        std::fs::write(root.path().join("tracked/nested/another"), "two").unwrap();
+        assert!(!files().contains("tracked/nested/another"));
+        assert!(
+            paths::git(root.path(), &["add", "-f", "tracked/nested/another"])
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(files().contains("tracked/nested/another"));
+        std::fs::write(root.path().join("untracked"), "three").unwrap();
+        assert!(files().contains("untracked"));
+        std::fs::write(root.path().join(".git/info/exclude"), "untracked\n").unwrap();
+        assert!(!files().contains("untracked"));
+    }
+
+    #[test]
+    fn a_new_git_config_include_invalidates_settled_listing_policy() {
+        let (root, workspace, graph) = fixture(Some(json!(["dist"])));
+        let policy = tempfile::tempdir().unwrap();
+        let included = policy.path().join("included.config");
+        let excludes = policy.path().join("excludes");
+        std::fs::write(&excludes, "hidden\n").unwrap();
+        std::fs::write(root.path().join("hidden"), "source").unwrap();
+        assert!(
+            paths::git(root.path(), &["init", "-q"])
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(
+            paths::git(
+                root.path(),
+                &["config", "include.path", included.to_str().unwrap()]
+            )
+            .unwrap()
+            .status
+            .success()
+        );
+        let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
+        snapshot.current_files(&workspace.root).unwrap();
+        std::thread::sleep(Duration::from_millis(2100));
+        let before = snapshot.current_files(&workspace.root).unwrap();
+        assert!(before.contains("hidden"));
+        assert!(Arc::ptr_eq(
+            &before,
+            &snapshot.current_files(&workspace.root).unwrap()
+        ));
+        assert!(
+            paths::git(
+                root.path(),
+                &[
+                    "config",
+                    "--file",
+                    included.to_str().unwrap(),
+                    "core.excludesfile",
+                    excludes.to_str().unwrap(),
+                ]
+            )
+            .unwrap()
+            .status
+            .success()
+        );
+        assert!(
+            !snapshot
+                .current_files(&workspace.root)
+                .unwrap()
+                .contains("hidden")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_policy_paths_preserve_quoted_origins_and_multiline_values() {
+        let (root, workspace, graph) = fixture(Some(json!(["dist"])));
+        let policy = tempfile::tempdir().unwrap();
+        // Git's text output C-quotes these origins and octal-escapes UTF-8.
+        let included = policy.path().join("included\\é\t\n.config");
+        let excludes = policy.path().join("excludes\\é\t\n");
+        let replacement = policy.path().join("replacement\n");
+        std::fs::write(&excludes, "hidden\n").unwrap();
+        std::fs::write(&replacement, "visible\n").unwrap();
+        for file in ["hidden", "visible"] {
+            std::fs::write(root.path().join(file), "source").unwrap();
+        }
+        let git = |args: &[&str]| {
+            let output = paths::git(root.path(), args).unwrap();
+            assert!(output.status.success(), "{output:?}");
+            output
+        };
+        git(&["init", "-q"]);
+        git(&["config", "include.path", included.to_str().unwrap()]);
+        git(&[
+            "config",
+            "--file",
+            included.to_str().unwrap(),
+            "core.excludesfile",
+            excludes.to_str().unwrap(),
+        ]);
+        let text = git(&["config", "--show-origin", "--list"]);
+        let text = String::from_utf8_lossy(&text.stdout);
+        let quoted_origin = text
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("file:\"")
+                    .and_then(|_| line.split_once('\t'))
+            })
+            .unwrap()
+            .0
+            .strip_prefix("file:")
+            .unwrap();
+        let policies = git_membership_policies(root.path());
+        assert!(!policies.contains(&root.path().join(quoted_origin)));
+        assert!(policies.contains(&included));
+        assert!(policies.contains(&excludes));
+        let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
+        let initial = snapshot.current_files(&workspace.root).unwrap();
+        assert!(!initial.contains("hidden"));
+        assert!(initial.contains("visible"));
+        std::thread::sleep(Duration::from_millis(2100));
+        let settled = snapshot.current_files(&workspace.root).unwrap();
+        assert!(Arc::ptr_eq(
+            &settled,
+            &snapshot.current_files(&workspace.root).unwrap()
+        ));
+        git(&[
+            "config",
+            "--file",
+            included.to_str().unwrap(),
+            "core.excludesfile",
+            replacement.to_str().unwrap(),
+        ]);
+        let changed = snapshot.current_files(&workspace.root).unwrap();
+        assert!(changed.contains("hidden"));
+        assert!(!changed.contains("visible"));
+        assert!(git_membership_policies(root.path()).contains(&replacement));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_ignore_policy_never_reuses_stale_membership() {
+        let (root, workspace, graph) = fixture(Some(json!(["dist"])));
+        let policy = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(policy.path(), "hidden\n").unwrap();
+        std::os::unix::fs::symlink(policy.path(), root.path().join(".gitignore")).unwrap();
+        std::fs::write(root.path().join("hidden"), "source").unwrap();
+        let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
+        assert!(
+            !snapshot
+                .current_files(root.path())
+                .unwrap()
+                .contains("hidden")
+        );
+        assert!(
+            !snapshot
+                .membership
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .settled
+        );
+        std::thread::sleep(Duration::from_millis(2100));
+        let before = snapshot.current_files(root.path()).unwrap();
+        assert!(Arc::ptr_eq(
+            &before,
+            &snapshot.current_files(root.path()).unwrap()
+        ));
+        std::fs::write(policy.path(), "").unwrap();
+        assert!(
+            snapshot
+                .current_files(root.path())
+                .unwrap()
+                .contains("hidden")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recent_change_time_prevents_membership_reuse_despite_old_mtime() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        File::open(root.path())
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        let metadata = std::fs::metadata(root.path()).unwrap();
+        assert!(metadata.ctime() > 1);
+        let stamp = Stamp::new(&metadata);
+        assert!(stamp.settled());
+        assert!(!stamp.membership_settled());
+    }
+
+    #[test]
+    fn inspection_keeps_deleted_candidates() {
+        let (root, workspace, graph) = fixture(Some(json!(["dist"])));
+        let snapshot = Snapshot::new(&workspace, &graph, &root.path().join("cache"))
+            .unwrap()
+            .with_candidates(&["src/deleted".into()]);
+        let resolved = resolve(
+            &snapshot,
+            &workspace,
+            &graph.tasks["app:post"],
+            None,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(resolved.files.contains("src/deleted"));
     }
 
     #[test]

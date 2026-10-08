@@ -22,7 +22,8 @@ naming `{threads}`; `"qk:threads": true` sets only `QK_THREADS`. A tool
 without such a variable reads it in its configuration, as Vitest's
 `maxWorkers: Number(process.env.QK_THREADS) || undefined` does. Under Nx
 neither is set, so the tool keeps its default there. Every other task holds
-one core.
+one core. Continuous tasks are outside the core budget: `qk:threads` does
+not allocate a share or set these environment variables for them.
 
 A share is fixed when the task starts, since a tool cannot give up workers
 it has started. Threaded tasks starting together split the free cores

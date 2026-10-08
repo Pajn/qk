@@ -156,6 +156,17 @@ fn process_helper() {
                 .unwrap();
             writeln!(file, "{id}").unwrap();
         }
+        "threads" => {
+            fs::write(
+                root.join(format!("{id}.json")),
+                json!({
+                    "threads": std::env::var("QK_THREADS").ok(),
+                    "workers": std::env::var("QK_TEST_WORKERS").ok(),
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
         "record" => {
             let values: std::collections::BTreeMap<_, _> = std::env::vars()
                 .filter(|(name, _)| name.starts_with("QK_TEST_"))
@@ -704,6 +715,70 @@ fn continuous_task_exiting_on_its_own_reports_its_exit_code() {
     assert_eq!(output.status.code(), Some(3));
 }
 
+fn threaded_helper(id: &str, continuous: bool) -> Value {
+    let mut target = helper_target("threads", id);
+    target["continuous"] = json!(continuous);
+    target["qk:threads"] = json!({"env": {"QK_TEST_WORKERS": "{threads}"}});
+    target
+}
+
+fn thread_record(root: &Path, id: &str) -> Value {
+    serde_json::from_slice(&fs::read(root.join(format!("{id}.json"))).unwrap()).unwrap()
+}
+
+#[test]
+fn continuous_root_with_threads_runs_without_a_core_allocation() {
+    let temp = fixture(json!({"watch": threaded_helper("watch", true)}));
+    success(
+        command(temp.path(), &["run", "app:watch", "--cores", "8"])
+            .env_remove("QK_THREADS")
+            .env_remove("QK_TEST_WORKERS")
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        thread_record(temp.path(), "watch"),
+        json!({"threads": null, "workers": null})
+    );
+}
+
+#[test]
+fn continuous_thread_settings_do_not_reduce_finite_thread_shares() {
+    let temp = fixture(json!({
+        "watch": threaded_helper("watch", true),
+        "a": threaded_helper("a", false),
+        "b": threaded_helper("b", false),
+    }));
+    success(
+        command(
+            temp.path(),
+            &[
+                "run-many",
+                "-t",
+                "a,b,watch",
+                "--parallel",
+                "2",
+                "--cores",
+                "8",
+            ],
+        )
+        .env_remove("QK_THREADS")
+        .env_remove("QK_TEST_WORKERS")
+        .output()
+        .unwrap(),
+    );
+    for id in ["a", "b"] {
+        assert_eq!(
+            thread_record(temp.path(), id),
+            json!({"threads": "4", "workers": "4"})
+        );
+    }
+    assert_eq!(
+        thread_record(temp.path(), "watch"),
+        json!({"threads": null, "workers": null})
+    );
+}
+
 #[test]
 fn dependents_of_continuous_tasks_run_uncached_and_say_why() {
     let temp = fixture(json!({
@@ -1071,6 +1146,62 @@ fn arguments_naming_run_commands_options_set_them() {
         &["run", "app:where", "--", "--cwd=sub", "--env.MODE=cli"],
     ));
     assert_eq!(String::from_utf8(output.stdout).unwrap(), "sub cli\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn serving_dependencies_reject_exclusive_tasks_before_running_commands() {
+    for continuous in [false, true] {
+        for exclusive_server in [false, true] {
+            let temp = fixture(json!({
+                "serve": {
+                    "command": "touch server-started; echo ready; sleep 2",
+                    "continuous": continuous,
+                    "parallelism": !exclusive_server,
+                    "options": {"readyWhen": "ready"}
+                },
+                "build": {
+                    "command": "touch build-started",
+                    "parallelism": exclusive_server,
+                    "dependsOn": ["serve"]
+                }
+            }));
+            let mut child = command(temp.path(), &["run", "app:build"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while child.try_wait().unwrap().is_none() {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("exclusive task validation did not finish");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(!output.status.success());
+            let kind = if continuous {
+                "continuous"
+            } else {
+                "readyWhen"
+            };
+            let expected = if exclusive_server {
+                format!(
+                    "{kind} task app:serve does not support parallelism but app:build depends on it"
+                )
+            } else {
+                format!(
+                    "app:build does not support parallelism but depends on {kind} task app:serve"
+                )
+            };
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains(&expected), "{stderr}");
+            assert!(!temp.path().join("server-started").exists());
+            assert!(!temp.path().join("build-started").exists());
+        }
+    }
 }
 
 #[cfg(unix)]
