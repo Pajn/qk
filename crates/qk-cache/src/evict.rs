@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// How long an unreferenced blob or scratch file may be part of a publish.
@@ -93,10 +94,21 @@ struct Entry {
 /// bytes, and removes what no entry needs. Another prune in progress makes
 /// this one return without doing anything.
 ///
-/// Runs call this after every run, so a cache under its limit is only summed:
-/// the full pass, which reads every manifest, runs when the cache is over its
-/// limit or when the last full pass is more than an hour old.
+/// Explicit pruning always remeasures the cache, including files changed in
+/// place by external tools. Normal runs use [`prune_automatic`].
 pub fn prune(root: &Path, limit: u64) -> Result<Pruned> {
+    prune_inner(root, limit, false)
+}
+
+/// Enforces the limit after a run, reusing size accounting while the cache's
+/// directories are unchanged. Normal publication replaces records atomically
+/// and blobs are immutable, so directory changes invalidate the memo. A full
+/// reconciliation still runs at least once an hour.
+pub fn prune_automatic(root: &Path, limit: u64) -> Result<Pruned> {
+    prune_inner(root, limit, true)
+}
+
+fn prune_inner(root: &Path, limit: u64, automatic: bool) -> Result<Pruned> {
     if !root.join("entries").is_dir() {
         return Ok(Pruned::default());
     }
@@ -107,15 +119,8 @@ pub fn prune(root: &Path, limit: u64) -> Result<Pruned> {
         .and_then(|metadata| metadata.modified().ok())
         .and_then(|modified| SystemTime::now().duration_since(modified).ok())
         .is_some_and(|age| age < IN_FLIGHT);
-    if recent {
-        let warm = root.join("warm");
-        let size = directory_size(&root.join("entries"))?
-            + directory_size(&root.join("blobs"))?
-            + if warm.is_dir() {
-                directory_size(&warm)?
-            } else {
-                0
-            };
+    if automatic && recent {
+        let size = cached_size(root)?;
         if size <= limit {
             return Ok(Pruned {
                 size,
@@ -131,6 +136,9 @@ pub fn prune(root: &Path, limit: u64) -> Result<Pruned> {
     if guard.try_lock_exclusive().is_err() {
         return Ok(Pruned::default());
     }
+    // Never associate a computed post-eviction size with stamps taken only
+    // after eviction: a concurrent publisher could have added uncounted bytes.
+    let _ = fs::remove_file(root.join("locks").join(".size"));
     let _ = guard.set_modified(SystemTime::now());
     let now = SystemTime::now();
     let age = |metadata: &fs::Metadata| {
@@ -232,8 +240,116 @@ pub fn prune(root: &Path, limit: u64) -> Result<Pruned> {
             let _ = fs::remove_file(item.path());
         }
     }
-    pruned.size = size;
+    pruned.size = if automatic { cached_size(root)? } else { size };
     Ok(pruned)
+}
+
+// Recent timestamps may have coarse resolution on the backing filesystem.
+const STAMP_SETTLE: Duration = Duration::from_secs(2);
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct DirectoryStamp {
+    modified: SystemTime,
+    len: u64,
+    #[cfg(unix)]
+    identity: (u64, u64, i64, i64),
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct SizeMemo {
+    measured: SystemTime,
+    stamps: Vec<Option<DirectoryStamp>>,
+    size: u64,
+}
+
+fn directory_stamps(root: &Path) -> Result<Vec<Option<DirectoryStamp>>> {
+    ["entries", "blobs", "warm"]
+        .iter()
+        .map(|name| {
+            let metadata = match fs::metadata(root.join(name)) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            #[cfg(unix)]
+            use std::os::unix::fs::MetadataExt;
+            Ok(Some(DirectoryStamp {
+                modified: metadata.modified()?,
+                len: metadata.len(),
+                #[cfg(unix)]
+                identity: (
+                    metadata.dev(),
+                    metadata.ino(),
+                    metadata.ctime(),
+                    metadata.ctime_nsec(),
+                ),
+            }))
+        })
+        .collect()
+}
+
+fn settled(stamps: &[Option<DirectoryStamp>], now: SystemTime) -> bool {
+    stamps.iter().flatten().all(|stamp| {
+        let old_enough = |time| {
+            now.duration_since(time)
+                .is_ok_and(|age| age >= STAMP_SETTLE)
+        };
+        if !old_enough(stamp.modified) {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            let (_, _, seconds, nanos) = stamp.identity;
+            if seconds < 0 || !(0..1_000_000_000).contains(&nanos) {
+                return false;
+            }
+            let changed = SystemTime::UNIX_EPOCH + Duration::new(seconds as u64, nanos as u32);
+            if !old_enough(changed) {
+                return false;
+            }
+        }
+        true
+    })
+}
+
+fn cached_size(root: &Path) -> Result<u64> {
+    let memo_path = root.join("locks").join(".size");
+    let now = SystemTime::now();
+    let before = directory_stamps(root)?;
+    if settled(&before, now)
+        && let Some(memo) = fs::read(&memo_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<SizeMemo>(&bytes).ok())
+        && now
+            .duration_since(memo.measured)
+            .is_ok_and(|age| age < IN_FLIGHT)
+        && memo.stamps == before
+    {
+        return Ok(memo.size);
+    }
+    let size = ["entries", "blobs", "warm"]
+        .iter()
+        .zip(&before)
+        .filter(|(_, stamp)| stamp.is_some())
+        .try_fold(0u64, |total, (name, _)| {
+            directory_size(&root.join(name)).map(|size| total.saturating_add(size))
+        })?;
+    let after = directory_stamps(root)?;
+    if before == after && settled(&after, now) {
+        let memo = SizeMemo {
+            measured: now,
+            stamps: after,
+            size,
+        };
+        // Concurrent writers can replace this memo safely: readers still compare
+        // its stamps with the current directories. Partial writes are misses.
+        let mut temporary = tempfile::NamedTempFile::new_in(root.join("locks"))?;
+        serde_json::to_writer(temporary.as_file_mut(), &memo)?;
+        temporary.persist(&memo_path).map_err(|error| error.error)?;
+    } else {
+        let _ = fs::remove_file(memo_path);
+    }
+    Ok(size)
 }
 
 fn directory_size(directory: &Path) -> Result<u64> {
@@ -247,6 +363,77 @@ fn directory_size(directory: &Path) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["entries", "blobs", "locks"] {
+            fs::create_dir(root.path().join(name)).unwrap();
+        }
+        fs::write(root.path().join("entries/a.json"), b"bad record").unwrap();
+        fs::write(root.path().join("blobs/a"), [0; 100]).unwrap();
+        fs::write(root.path().join("locks/.prune"), []).unwrap();
+        root
+    }
+
+    #[test]
+    fn automatic_size_memo_reuses_and_reconciles() {
+        let root = fixture();
+        let root = root.path();
+        // No memo can be trusted while directory timestamps are recent.
+        assert_eq!(prune_automatic(root, 1_000).unwrap().size, 110);
+        assert!(!root.join("locks/.size").exists());
+        std::thread::sleep(STAMP_SETTLE + Duration::from_millis(100));
+        assert_eq!(prune_automatic(root, 1_000).unwrap().size, 110);
+        assert!(root.join("locks/.size").exists());
+
+        // Unsupported external in-place changes intentionally demonstrate that
+        // the automatic path reads only directory stamps, rather than each file.
+        fs::write(root.join("blobs/a"), [0; 200]).unwrap();
+        touch(&root.join("entries/a.json"));
+        assert_eq!(prune_automatic(root, 1_000).unwrap().size, 110);
+        assert_eq!(prune(root, 1_000).unwrap().size, 210);
+        assert!(!root.join("locks/.size").exists());
+
+        assert_eq!(prune_automatic(root, 1_000).unwrap().size, 210);
+        fs::write(root.join("locks/.size"), b"corrupt").unwrap();
+        assert_eq!(prune_automatic(root, 1_000).unwrap().size, 210);
+        let mut memo: SizeMemo =
+            serde_json::from_slice(&fs::read(root.join("locks/.size")).unwrap()).unwrap();
+        memo.measured = SystemTime::UNIX_EPOCH;
+        memo.size = 0;
+        fs::write(root.join("locks/.size"), serde_json::to_vec(&memo).unwrap()).unwrap();
+        assert_eq!(prune_automatic(root, 1_000).unwrap().size, 210);
+
+        // An atomic publication invalidates accounting immediately.
+        let temp = root.join("entries/new.tmp");
+        fs::write(&temp, [0; 30]).unwrap();
+        fs::rename(temp, root.join("entries/new.json")).unwrap();
+        assert_eq!(prune_automatic(root, 1_000).unwrap().size, 240);
+        fs::create_dir(root.join("warm")).unwrap();
+        fs::write(root.join("warm/a.json"), [0; 40]).unwrap();
+        assert_eq!(prune_automatic(root, 1_000).unwrap().size, 280);
+        std::thread::sleep(STAMP_SETTLE + Duration::from_millis(100));
+        assert_eq!(prune_automatic(root, 1_000).unwrap().size, 280);
+        assert!(root.join("locks/.size").exists());
+        // A lower limit must still trigger eviction with an unchanged memo.
+        let result = prune_automatic(root, 250).unwrap();
+        assert!(result.entries > 0);
+        assert!(result.size <= 250);
+    }
+
+    #[test]
+    fn old_prune_marker_forces_full_reconciliation() {
+        let root = fixture();
+        let root = root.path();
+        let marker = File::options()
+            .write(true)
+            .open(root.join("locks/.prune"))
+            .unwrap();
+        marker.set_modified(SystemTime::UNIX_EPOCH).unwrap();
+        let result = prune_automatic(root, 100).unwrap();
+        assert_eq!(result.entries, 1);
+        assert_eq!(result.size, 100);
+    }
 
     #[test]
     fn parses_sizes_like_nx() {
