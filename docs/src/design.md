@@ -414,8 +414,9 @@ Under the profile with `--granularity task`, a task with `qk:reachability`
 that ordinary task selection affects is decided by its changed inputs:
 
 1. Any changed input its `sources` do not match runs the whole task, and
-   says which file. So does an affected task it depends on, whose outputs it
-   may read.
+   says which file, unless it is a dependency's `package.json` whose fields
+   its dependents read are unchanged. So does an affected task it depends
+   on, whose outputs it may read.
 2. Otherwise, if an anchor reaches a change, or the search lost an edge, the
    whole task runs, naming the chain or the gap.
 3. Otherwise, the cases a change reaches are selected, each with the changed

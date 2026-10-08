@@ -66,7 +66,9 @@ of `sources` keeps the project whenever it changes.
   "{workspaceRoot}/packages/**/*.{ts,tsx,js,jsx}",
   "!{workspaceRoot}/packages/**/*.config.{ts,js}"
 ]
-``` A project without
+```
+
+A project without
 `qk:reachability` is never left out. An end-to-end project that drives an app
 rather than importing it can name the app's anchors, so the two are decided
 alike; without its own settings, it is left out only when it is affected
@@ -131,7 +133,9 @@ task selection affects is then decided by its changed inputs:
    installs, a deleted manifest and an affected task it depends on, whose
    outputs it may read. The task's ordinary inputs are what make this sound:
    declare the suite's harness, its workflow and anything else that changes
-   how every case runs as inputs, outside `sources`.
+   how every case runs as inputs, outside `sources`. A dependency's
+   `package.json` whose fields dependents read are unchanged, such as one
+   with only a new `version`, is the exception: it does not count.
 2. **An anchor that imports a change runs the whole task**, as does an import
    it cannot resolve. Anchors are what every case runs inside, such as a
    suite's shell.
