@@ -478,16 +478,18 @@ fn git_membership_policies(root: &Path) -> BTreeSet<PathBuf> {
     }
     // Config can include other files. Track every origin used by Git, as
     // well as currently missing standard config and excludes files.
-    if let Ok(output) = paths::git(root, &["config", "--show-origin", "--list"])
+    if let Ok(output) = paths::git(root, &["config", "--null", "--show-origin", "--list"])
         && output.status.success()
     {
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            if let Some((path, entry)) = line
-                .strip_prefix("file:")
-                .and_then(|line| line.split_once('\t'))
-            {
+        // NUL mode emits raw origins, without Git's C-style path quoting,
+        // and separates each origin from its key/newline/value record. Values
+        // may themselves contain newlines (including include/excludes paths).
+        let output = String::from_utf8_lossy(&output.stdout);
+        let mut fields = output.split_terminator('\0');
+        while let (Some(origin), Some(entry)) = (fields.next(), fields.next()) {
+            if let Some(path) = origin.strip_prefix("file:") {
                 let origin = root.join(path);
-                if let Some((name, value)) = entry.split_once('=')
+                if let Some((name, value)) = entry.split_once('\n')
                     && name.starts_with("include")
                     && name.ends_with(".path")
                 {
@@ -507,11 +509,13 @@ fn git_membership_policies(root: &Path) -> BTreeSet<PathBuf> {
             }
         }
     }
-    if let Ok(output) = paths::git(root, &["config", "--path", "--get", "core.excludesfile"])
-        && output.status.success()
+    if let Ok(output) = paths::git(
+        root,
+        &["config", "--null", "--path", "--get", "core.excludesfile"],
+    ) && output.status.success()
         && let Ok(path) = String::from_utf8(output.stdout)
     {
-        policies.insert(root.join(path.trim_end_matches(['\r', '\n'])));
+        policies.insert(root.join(path.strip_suffix('\0').unwrap_or(&path)));
     }
     for variable in ["GIT_CONFIG_SYSTEM", "GIT_CONFIG_GLOBAL"] {
         if let Some(path) = std::env::var_os(variable) {
@@ -2665,6 +2669,73 @@ mod tests {
                 .unwrap()
                 .contains("hidden")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_policy_paths_preserve_quoted_origins_and_multiline_values() {
+        let (root, workspace, graph) = fixture(Some(json!(["dist"])));
+        let policy = tempfile::tempdir().unwrap();
+        // Git's text output C-quotes these origins and octal-escapes UTF-8.
+        let included = policy.path().join("included\\é\t\n.config");
+        let excludes = policy.path().join("excludes\\é\t\n");
+        let replacement = policy.path().join("replacement\n");
+        std::fs::write(&excludes, "hidden\n").unwrap();
+        std::fs::write(&replacement, "visible\n").unwrap();
+        for file in ["hidden", "visible"] {
+            std::fs::write(root.path().join(file), "source").unwrap();
+        }
+        let git = |args: &[&str]| {
+            let output = paths::git(root.path(), args).unwrap();
+            assert!(output.status.success(), "{output:?}");
+            output
+        };
+        git(&["init", "-q"]);
+        git(&["config", "include.path", included.to_str().unwrap()]);
+        git(&[
+            "config",
+            "--file",
+            included.to_str().unwrap(),
+            "core.excludesfile",
+            excludes.to_str().unwrap(),
+        ]);
+        let text = git(&["config", "--show-origin", "--list"]);
+        let text = String::from_utf8_lossy(&text.stdout);
+        let quoted_origin = text
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("file:\"")
+                    .and_then(|_| line.split_once('\t'))
+            })
+            .unwrap()
+            .0
+            .strip_prefix("file:")
+            .unwrap();
+        let policies = git_membership_policies(root.path());
+        assert!(!policies.contains(&root.path().join(quoted_origin)));
+        assert!(policies.contains(&included));
+        assert!(policies.contains(&excludes));
+        let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
+        let initial = snapshot.current_files(&workspace.root).unwrap();
+        assert!(!initial.contains("hidden"));
+        assert!(initial.contains("visible"));
+        std::thread::sleep(Duration::from_millis(2100));
+        let settled = snapshot.current_files(&workspace.root).unwrap();
+        assert!(Arc::ptr_eq(
+            &settled,
+            &snapshot.current_files(&workspace.root).unwrap()
+        ));
+        git(&[
+            "config",
+            "--file",
+            included.to_str().unwrap(),
+            "core.excludesfile",
+            replacement.to_str().unwrap(),
+        ]);
+        let changed = snapshot.current_files(&workspace.root).unwrap();
+        assert!(changed.contains("hidden"));
+        assert!(!changed.contains("visible"));
+        assert!(git_membership_policies(root.path()).contains(&replacement));
     }
 
     #[cfg(unix)]
