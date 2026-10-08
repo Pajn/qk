@@ -119,7 +119,7 @@ struct RuntimeKey {
 pub struct Snapshot {
     pub(crate) files: BTreeSet<String>,
     extra_candidates: BTreeSet<String>,
-    membership: Mutex<Option<Membership>>,
+    membership: Mutex<Option<Arc<Membership>>>,
     membership_prefixes: Mutex<HashMap<String, Arc<Vec<PathBuf>>>>,
     source_exclusions: Vec<Outputs>,
     cache_relative: Option<PathBuf>,
@@ -150,11 +150,19 @@ pub struct Snapshot {
 
 /// Membership depends on directory entries and Git/ignore listing policy, not
 /// on every source file's contents. Empty directories must also be watched.
+#[derive(Clone)]
 struct Membership {
     files: Arc<BTreeSet<String>>,
     source_ignore: Arc<SourceIgnore>,
     stamps: BTreeMap<PathBuf, Option<Stamp>>,
     directories: BTreeSet<PathBuf>,
+    directory_entries: BTreeMap<PathBuf, BTreeSet<(OsString, u8)>>,
+    root: PathBuf,
+    outputs: Vec<Outputs>,
+    output_anchors: BTreeMap<PathBuf, Vec<usize>>,
+    excluded_roots: BTreeSet<PathBuf>,
+    cache: Option<PathBuf>,
+    policies: BTreeSet<PathBuf>,
     git_policies: BTreeSet<PathBuf>,
     settled: bool,
 }
@@ -177,11 +185,12 @@ impl Membership {
         cache: Option<&Path>,
         git_policies: Option<&BTreeSet<PathBuf>>,
     ) -> Result<Self> {
-        let excluded: Vec<_> = outputs
+        let excluded: BTreeSet<_> = outputs
             .iter()
             .flat_map(Outputs::complete_roots)
             .map(PathBuf::from)
             .collect();
+        let excluded_roots = excluded.clone();
         let walk_root = root.to_owned();
         let walk_cache = cache.map(PathBuf::from);
         let mut directories = BTreeSet::new();
@@ -206,7 +215,7 @@ impl Membership {
                 ) && walk_cache
                     .as_ref()
                     .is_none_or(|cache| !relative.starts_with(cache))
-                    && !excluded.iter().any(|path| relative.starts_with(path))
+                    && !relative.ancestors().any(|path| excluded.contains(path))
             })
             .build()
         {
@@ -247,38 +256,190 @@ impl Membership {
             .cloned()
             .unwrap_or_else(|| git_membership_policies(root));
         policies.extend(git_policies.iter().cloned());
-        for policy in policies {
-            stamps.insert(policy.clone(), membership_stamp(&policy)?);
+        for policy in &policies {
+            stamps.insert(policy.clone(), membership_stamp(policy)?);
         }
-        Ok(Self {
+        let mut output_anchors: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
+        for (index, outputs) in outputs.iter().enumerate() {
+            for anchor in outputs.anchors() {
+                output_anchors
+                    .entry(PathBuf::from(anchor))
+                    .or_default()
+                    .push(index);
+            }
+        }
+        let mut membership = Self {
             files: Arc::new(BTreeSet::new()),
             source_ignore: source_ignore.clone(),
             stamps,
             directories,
+            directory_entries: BTreeMap::new(),
+            root: root.to_owned(),
+            outputs: outputs.to_vec(),
+            output_anchors,
+            excluded_roots,
+            cache: cache.map(PathBuf::from),
+            policies,
             git_policies,
             settled: false,
-        })
+        };
+        for directory in &membership.directories {
+            if let Some(entries) = membership.entries(directory)? {
+                membership
+                    .directory_entries
+                    .insert(directory.clone(), entries);
+            }
+        }
+        Ok(membership)
     }
 
-    /// Check whether the requested directories and all policies are unchanged
-    /// and whether their timestamps are old enough to permit listing reuse.
-    fn state(&self, prefixes: Option<&[PathBuf]>) -> Result<(bool, bool)> {
-        let mut settled = true;
-        for (path, before) in &self.stamps {
-            if self.directories.contains(path)
-                && prefixes.is_some_and(|prefixes| {
-                    !prefixes
+    /// Names and types that can affect source membership in this directory.
+    /// Output files may be skipped, but partially excluded output directories
+    /// must remain visible because they can contain source files or ignore rules.
+    fn entries(&self, directory: &Path) -> Result<Option<BTreeSet<(OsString, u8)>>> {
+        let entries = match std::fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let relative_directory = directory.strip_prefix(&self.root).unwrap_or(directory);
+        let mut outputs = BTreeSet::new();
+        for ancestor in relative_directory.ancestors() {
+            if let Some(indices) = self.output_anchors.get(ancestor) {
+                outputs.extend(indices.iter().copied());
+            }
+        }
+        for (_, indices) in self
+            .output_anchors
+            .range(relative_directory.to_owned()..)
+            .take_while(|(anchor, _)| anchor.starts_with(relative_directory))
+        {
+            outputs.extend(indices.iter().copied());
+        }
+        let mut names = BTreeSet::new();
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let path = entry.path();
+            let relative = path.strip_prefix(&self.root).unwrap_or(&path);
+            if matches!(name.to_str(), Some(".git" | ".qk" | "node_modules"))
+                || self
+                    .cache
+                    .as_ref()
+                    .is_some_and(|cache| relative.starts_with(cache))
+                || relative
+                    .ancestors()
+                    .any(|root| self.excluded_roots.contains(root))
+            {
+                continue;
+            }
+            // A policy created between policy discovery and name capture must
+            // get its own stamp before its in-place edits can permit reuse.
+            if matches!(name.to_str(), Some(".gitignore" | ".nxignore"))
+                && !self.policies.contains(&path)
+            {
+                return Ok(None);
+            }
+            let kind = entry.file_type()?;
+            // An empty directory created after the inventory walk would not
+            // appear among source files. Never bless its parent signature until
+            // that directory is itself watched by the inventory.
+            if kind.is_dir() && !self.directories.contains(&path) {
+                return Ok(None);
+            }
+            if !kind.is_dir()
+                && !matches!(name.to_str(), Some(".gitignore" | ".nxignore"))
+                && relative.to_str().is_some_and(|path| {
+                    outputs
                         .iter()
-                        .any(|prefix| path.starts_with(prefix) || prefix.starts_with(path))
+                        .any(|index| self.outputs[*index].matches(path))
                 })
             {
                 continue;
             }
-            let after = membership_stamp(path)?;
-            if *before != after {
-                return Ok((false, false));
+            names.insert((
+                name,
+                if kind.is_dir() {
+                    1
+                } else if kind.is_symlink() {
+                    2
+                } else {
+                    0
+                },
+            ));
+        }
+        Ok(Some(names))
+    }
+
+    /// Check source-relevant directory membership and every listing policy.
+    /// Recent directory stamps require fresh entry names; policies must settle.
+    fn state(&self, prefixes: Option<&[PathBuf]>) -> Result<(bool, bool)> {
+        let mut settled = true;
+        let selected = prefixes.map(|prefixes| {
+            let mut selected = BTreeSet::new();
+            for prefix in prefixes {
+                for ancestor in prefix.ancestors() {
+                    if let Some(directory) = self.directories.get(ancestor) {
+                        selected.insert(directory);
+                    }
+                }
+                selected.extend(
+                    self.directories
+                        .range(prefix.clone()..)
+                        .take_while(|directory| directory.starts_with(prefix)),
+                );
             }
-            settled &= after.as_ref().is_none_or(Stamp::membership_settled);
+            selected
+        });
+        let paths: Box<dyn Iterator<Item = (&PathBuf, bool)>> = match selected {
+            Some(selected) => Box::new(
+                selected
+                    .into_iter()
+                    .map(|path| (path, true))
+                    .chain(self.policies.iter().map(|path| (path, false))),
+            ),
+            None => Box::new(
+                self.stamps
+                    .keys()
+                    .map(|path| (path, self.directories.contains(path))),
+            ),
+        };
+        for (path, directory) in paths {
+            let before = &self.stamps[path];
+            let after = membership_stamp(path)?;
+            if directory {
+                if after.is_some() && !self.directory_entries.contains_key(path) {
+                    return Ok((false, false));
+                }
+                // Output publication changes its parent's timestamp too. Check
+                // source-relevant names rather than relisting the whole workspace.
+                // Recent directories are always read, even with an equal stamp:
+                // coarse timestamps can conceal an addition or removal.
+                if *before != after
+                    || after
+                        .as_ref()
+                        .is_some_and(|stamp| !stamp.membership_settled())
+                {
+                    let entries = self.entries(path)?;
+                    if entries.as_ref() != self.directory_entries.get(path)
+                        || membership_stamp(path)? != after
+                    {
+                        return Ok((false, false));
+                    }
+                }
+            } else {
+                if *before != after {
+                    return Ok((false, false));
+                }
+                settled &= after.as_ref().is_none_or(Stamp::membership_settled);
+            }
         }
         Ok((true, settled))
     }
@@ -549,62 +710,79 @@ impl Snapshot {
 
     /// Refresh candidates as needed, returning their policy in the same snapshot.
     fn current_files_for(&self, root: &Path, prefixes: Option<&[PathBuf]>) -> Result<Candidates> {
-        let mut cached = self.membership.lock().unwrap();
-        let (unchanged, settled) = match &*cached {
-            Some(entry) => entry.state(prefixes)?,
-            None => (false, false),
-        };
-        if settled && cached.as_ref().unwrap().settled {
-            return Ok(cached.as_ref().unwrap().candidates());
-        }
-        // Recent directory stamps may conceal changes on coarse filesystems.
-        // Re-list sources while they settle, then rebuild the directory inventory
-        // once before enabling reuse (including any newly created empty dirs).
-        let rebuilt = !unchanged || settled;
-        let mut membership = if !rebuilt {
-            cached.take().unwrap()
-        } else {
-            // Capture directories before listing files, then compare afterward.
-            // An addition during listing must not hide behind a newer stamp.
-            Membership::new(
-                root,
-                cached.as_ref().map_or(&self.files, |entry| &entry.files),
-                &self.source_ignore,
+        loop {
+            let previous = self.membership.lock().unwrap().clone();
+            // Immutable entries let independent fingerprints validate their
+            // directory stamps concurrently. Only a refresh needs serialization.
+            let (unchanged, settled) = match &previous {
+                Some(entry) => entry.state(prefixes)?,
+                None => (false, false),
+            };
+            if settled && previous.as_ref().unwrap().settled {
+                return Ok(previous.as_ref().unwrap().candidates());
+            }
+            let mut cached = self.membership.lock().unwrap();
+            let current = match (&previous, &*cached) {
+                (Some(previous), Some(current)) => Arc::ptr_eq(previous, current),
+                (None, None) => true,
+                _ => false,
+            };
+            if !current {
+                // Another fingerprint refreshed while this one validated.
+                // Recheck that newer inventory before making any replacement.
+                continue;
+            }
+            drop(previous);
+            // Recent listing policies may conceal edits on coarse filesystems.
+            // Re-list sources while they settle, then rebuild the directory inventory
+            // once before enabling reuse (including any newly created empty dirs).
+            // Recent directories are checked by freshly reading their child names.
+            let rebuilt = !unchanged || settled;
+            let mut membership = if !rebuilt {
+                Arc::unwrap_or_clone(cached.take().unwrap())
+            } else {
+                // Capture directories before listing files, then compare afterward.
+                // An addition during listing must not hide behind a newer stamp.
+                Membership::new(
+                    root,
+                    cached.as_ref().map_or(&self.files, |entry| &entry.files),
+                    &self.source_ignore,
+                    &self.source_exclusions,
+                    self.cache_relative.as_deref(),
+                    cached
+                        .as_ref()
+                        .filter(|entry| unchanged && entry.settled)
+                        .map(|entry| &entry.git_policies),
+                )?
+            };
+            let mut files = source_files(root)?;
+            exclude_artifacts(
+                &mut files,
                 &self.source_exclusions,
                 self.cache_relative.as_deref(),
-                cached
-                    .as_ref()
-                    .filter(|entry| unchanged && entry.settled)
-                    .map(|entry| &entry.git_policies),
-            )?
-        };
-        let mut files = source_files(root)?;
-        exclude_artifacts(
-            &mut files,
-            &self.source_exclusions,
-            self.cache_relative.as_deref(),
-        );
-        let ignore = SourceIgnore::new(root)?;
-        files.extend(
-            self.extra_candidates
-                .iter()
-                .filter(|path| !ignore.matches(path))
-                .cloned(),
-        );
-        membership.source_ignore = Arc::new(ignore);
-        membership.files = Arc::new(files);
-        let candidates = membership.candidates();
-        // An unstable or recent inventory never enables the fast path. Keep
-        // its candidates so a rebuild also watches tracked, ignored parents.
-        let covered = candidates.files.iter().all(|path| {
-            Path::new(path)
-                .ancestors()
-                .skip(1)
-                .all(|parent| membership.stamps.contains_key(&root.join(parent)))
-        });
-        membership.settled = rebuilt && covered && membership.state(None)?.1;
-        *cached = Some(membership);
-        Ok(candidates)
+            );
+            let ignore = SourceIgnore::new(root)?;
+            files.extend(
+                self.extra_candidates
+                    .iter()
+                    .filter(|path| !ignore.matches(path))
+                    .cloned(),
+            );
+            membership.source_ignore = Arc::new(ignore);
+            membership.files = Arc::new(files);
+            let candidates = membership.candidates();
+            // An unstable inventory or recent policy never enables the fast path.
+            // Keep candidates so a rebuild also watches tracked, ignored parents.
+            let covered = candidates.files.iter().all(|path| {
+                Path::new(path)
+                    .ancestors()
+                    .skip(1)
+                    .all(|parent| membership.stamps.contains_key(&root.join(parent)))
+            });
+            membership.settled = rebuilt && covered && membership.state(None)?.1;
+            *cached = Some(Arc::new(membership));
+            return Ok(candidates);
+        }
     }
 
     /// Saves the digests of files that still exist, for the next run.
@@ -2130,6 +2308,135 @@ mod tests {
             std::fs::write(root.path().join(".gitignore"), "ignored/\n").unwrap();
             assert!(files().contains("src/empty/added"));
         }
+    }
+
+    #[test]
+    fn a_directory_missed_by_the_inventory_cannot_enable_reuse() {
+        let (root, workspace, graph) = fixture(None);
+        let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
+        snapshot.current_files(root.path()).unwrap();
+        std::fs::create_dir(root.path().join("new-empty")).unwrap();
+        let mut cached = snapshot.membership.lock().unwrap();
+        let membership = Arc::make_mut(cached.as_mut().unwrap());
+        // Model creation between the directory walk and child-name capture:
+        // the new directory is in its parent's names but not in the inventory.
+        membership
+            .directory_entries
+            .get_mut(root.path())
+            .unwrap()
+            .insert((OsString::from("new-empty"), 1));
+        assert!(membership.entries(root.path()).unwrap().is_none());
+        assert!(!membership.state(None).unwrap().0);
+    }
+
+    #[test]
+    fn a_policy_missed_by_discovery_cannot_enable_reuse() {
+        let (root, workspace, graph) = fixture(None);
+        let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
+        snapshot.current_files(root.path()).unwrap();
+        std::fs::write(root.path().join(".nxignore"), "hidden\n").unwrap();
+        let mut cached = snapshot.membership.lock().unwrap();
+        let membership = Arc::make_mut(cached.as_mut().unwrap());
+        // Model a new policy appearing after discovery but before capturing
+        // its parent's entries; its content would otherwise have no stamp.
+        membership
+            .directory_entries
+            .get_mut(root.path())
+            .unwrap()
+            .insert((OsString::from(".nxignore"), 0));
+        assert!(membership.entries(root.path()).unwrap().is_none());
+        assert!(!membership.state(None).unwrap().0);
+    }
+
+    #[test]
+    fn output_publication_reuses_candidates_but_source_names_still_refresh() {
+        for partial in [false, true] {
+            let outputs = if partial {
+                json!(["dist", "!dist/keep"])
+            } else {
+                json!(["dist"])
+            };
+            let (root, workspace, graph) = fixture(Some(outputs));
+            std::fs::create_dir_all(root.path().join("src")).unwrap();
+            std::fs::write(root.path().join("src/original"), "one").unwrap();
+            if partial {
+                std::fs::create_dir_all(root.path().join("dist/keep")).unwrap();
+            }
+            let snapshot =
+                Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
+            snapshot.current_files(root.path()).unwrap();
+            // Policies retain their conservative timestamp window. Directory
+            // names are freshly verified throughout the window instead.
+            std::thread::sleep(Duration::from_millis(2100));
+            let before = snapshot.current_files(root.path()).unwrap();
+            std::fs::create_dir_all(root.path().join("dist")).unwrap();
+            std::fs::write(root.path().join("dist/restored"), "artifact").unwrap();
+            let restored = snapshot.current_files(root.path()).unwrap();
+            assert!(Arc::ptr_eq(&before, &restored));
+            std::fs::remove_file(root.path().join("dist/restored")).unwrap();
+            assert!(Arc::ptr_eq(
+                &before,
+                &snapshot.current_files(root.path()).unwrap()
+            ));
+            let source = if partial { "dist/keep/new" } else { "src/new" };
+            std::fs::write(root.path().join(source), "source").unwrap();
+            let after = snapshot.current_files(root.path()).unwrap();
+            assert!(after.contains(source));
+            assert!(!Arc::ptr_eq(&before, &after));
+            std::fs::remove_file(root.path().join(source)).unwrap();
+            assert!(
+                !snapshot
+                    .current_files(root.path())
+                    .unwrap()
+                    .contains(source)
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_fingerprints_refresh_without_replacing_newer_membership() {
+        let (root, workspace, graph) = fixture(None);
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
+        let original = snapshot.current_files(root.path()).unwrap();
+        let barrier = std::sync::Barrier::new(9);
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut rounds = Vec::new();
+                        for _ in 0..6 {
+                            barrier.wait();
+                            rounds.push(snapshot.current_files(root.path()));
+                            barrier.wait();
+                        }
+                        rounds
+                    })
+                })
+                .collect();
+            for round in 0..6 {
+                std::fs::write(root.path().join(format!("src/new{round}")), "source").unwrap();
+                barrier.wait();
+                barrier.wait();
+            }
+            // Assertions run after synchronization, so a failed membership
+            // check cannot strand other workers at a barrier.
+            for worker in workers {
+                for (round, files) in worker.join().unwrap().into_iter().enumerate() {
+                    let files = files.unwrap();
+                    for added in 0..=round {
+                        assert!(files.contains(&format!("src/new{added}")));
+                    }
+                }
+            }
+        });
+        assert!(!original.contains("src/new0"));
+        assert!(
+            snapshot
+                .current_files(root.path())
+                .unwrap()
+                .contains("src/new5")
+        );
     }
 
     #[test]
