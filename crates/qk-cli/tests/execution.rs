@@ -974,6 +974,62 @@ fn arguments_naming_run_commands_options_set_them() {
 
 #[cfg(unix)]
 #[test]
+fn serving_dependencies_reject_exclusive_tasks_before_running_commands() {
+    for continuous in [false, true] {
+        for exclusive_server in [false, true] {
+            let temp = fixture(json!({
+                "serve": {
+                    "command": "touch server-started; echo ready; sleep 2",
+                    "continuous": continuous,
+                    "parallelism": !exclusive_server,
+                    "options": {"readyWhen": "ready"}
+                },
+                "build": {
+                    "command": "touch build-started",
+                    "parallelism": exclusive_server,
+                    "dependsOn": ["serve"]
+                }
+            }));
+            let mut child = command(temp.path(), &["run", "app:build"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while child.try_wait().unwrap().is_none() {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("exclusive task validation did not finish");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(!output.status.success());
+            let kind = if continuous {
+                "continuous"
+            } else {
+                "readyWhen"
+            };
+            let expected = if exclusive_server {
+                format!(
+                    "{kind} task app:serve does not support parallelism but app:build depends on it"
+                )
+            } else {
+                format!(
+                    "app:build does not support parallelism but depends on {kind} task app:serve"
+                )
+            };
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains(&expected), "{stderr}");
+            assert!(!temp.path().join("server-started").exists());
+            assert!(!temp.path().join("build-started").exists());
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn ready_when_starts_dependents_once_the_output_appears() {
     let temp = fixture(json!({
         // The marker is written just before the ready text.

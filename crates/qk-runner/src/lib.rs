@@ -261,22 +261,22 @@ pub fn run(
             .filter(|id| !continuous.contains(*id) && !(announced.contains(*id) && is_up(id)))
             .count()
     };
-    // As in Nx: a task that runs alone cannot run beside a continuous task it
-    // depends on, and a continuous task others depend on runs beside them.
+    // Serving dependencies stay active beside their dependents, including
+    // readyWhen tasks without continuous: true. Either side running alone
+    // would prevent the dependent from starting and the server from stopping.
     for (id, task) in &graph.tasks {
-        for dependency in task
-            .dependencies
-            .iter()
-            .filter(|id| continuous.contains(*id))
-        {
+        for dependency in task.dependencies.iter().filter(|id| serving.contains(*id)) {
+            let kind = if continuous.contains(dependency) {
+                "continuous"
+            } else {
+                "readyWhen"
+            };
             if alone.contains(id) {
-                bail!(
-                    "{id} does not support parallelism but depends on continuous task {dependency}"
-                );
+                bail!("{id} does not support parallelism but depends on {kind} task {dependency}");
             }
             if alone.contains(dependency) {
                 bail!(
-                    "continuous task {dependency} does not support parallelism but {id} depends on it"
+                    "{kind} task {dependency} does not support parallelism but {id} depends on it"
                 );
             }
         }
