@@ -118,7 +118,7 @@ impl EscapeState {
         for &byte in bytes {
             match *self {
                 Self::Csi => {
-                    if byte.is_ascii_alphabetic() {
+                    if (0x40..=0x7e).contains(&byte) {
                         *self = Self::Text;
                     }
                 }
@@ -1041,6 +1041,25 @@ mod tests {
             .find(|line| line.starts_with("Parallel"))
             .unwrap()
             .to_owned()
+    }
+
+    #[test]
+    fn quiet_strips_csi_with_punctuation_final_bytes() {
+        for final_byte in b"@[\\]^_`{|}~" {
+            let mut bytes = b"\x1b[1".to_vec();
+            bytes.push(*final_byte);
+            bytes.extend_from_slice(b"12345\n");
+            for split in 0..=bytes.len() {
+                let mut state = EscapeState::default();
+                let mut result = state.strip(&bytes[..split]);
+                result.extend_from_slice(&state.strip(&bytes[split..]));
+                assert_eq!(
+                    result, b"12345\n",
+                    "final byte {final_byte:#x}, split {split}"
+                );
+                assert!(!state.finish());
+            }
+        }
     }
 
     #[test]
