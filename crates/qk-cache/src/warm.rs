@@ -162,8 +162,15 @@ fn entry(
                 .context("qk:warm.group must be a name")
         })
         .transpose()?;
-    if group.is_some() && (object.contains_key("outputs") || object.contains_key("paths")) {
-        bail!("a qk:warm.group shares {{warm}} alone; outputs and paths belong to one task");
+    // `survive` keeps `paths` across a dependency, which a group has none of.
+    if group.is_some()
+        && ["outputs", "paths", "survive"]
+            .iter()
+            .any(|key| object.contains_key(*key))
+    {
+        bail!(
+            "a qk:warm.group shares {{warm}} alone; outputs, paths and survive belong to one task"
+        );
     }
     let identity = group.map_or_else(|| task.id.clone(), |group| format!("{GROUP}{group}"));
     const SURVIVE_SHAPE: &str = "qk:warm.survive must be an array of target names";

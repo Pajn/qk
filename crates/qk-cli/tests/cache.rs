@@ -2883,17 +2883,23 @@ fn a_warm_group_is_shared_by_the_targets_that_name_it() {
 #[cfg(unix)]
 #[test]
 fn a_warm_group_cannot_keep_one_task_s_paths() {
-    let fixture = Fixture::new(json!({
-        "command": "echo ran",
-        "qk:warm": {"group": "tool", "paths": ["{projectRoot}/scratch"]}
-    }));
-    let output = fixture.build(&fixture.root, &[]);
-    assert!(!output.status.success());
-    assert!(
-        stderr(&output).contains("a qk:warm.group shares {warm} alone"),
-        "{}",
-        stderr(&output)
-    );
+    for (field, value) in [
+        ("paths", json!(["{projectRoot}/scratch"])),
+        // It would keep paths the group does not have.
+        ("survive", json!(["prebuild"])),
+    ] {
+        let fixture = Fixture::new(json!({
+            "command": "echo ran",
+            "qk:warm": {"group": "tool", field: value}
+        }));
+        let output = fixture.build(&fixture.root, &[]);
+        assert!(!output.status.success(), "{field}");
+        assert!(
+            stderr(&output).contains("a qk:warm.group shares {warm} alone"),
+            "{field}: {}",
+            stderr(&output)
+        );
+    }
 }
 
 #[cfg(unix)]
