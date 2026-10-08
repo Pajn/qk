@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -170,6 +170,95 @@ impl Decoration {
     }
 }
 
+/// Small logs stay in memory; larger logs and unfinished lines spill to an
+/// anonymous file that is removed when dropped. Replay never copies the log.
+const MEMORY_OUTPUT_BYTES: usize = 64 * 1024;
+
+#[derive(Default)]
+struct Spool {
+    memory: Vec<u8>,
+    file: Option<File>,
+    last: Option<u8>,
+}
+
+impl Spool {
+    fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if self.file.is_none() && self.memory.len() + bytes.len() > MEMORY_OUTPUT_BYTES {
+            let mut file = tempfile::tempfile()?;
+            file.write_all(&self.memory)?;
+            self.file = Some(file);
+            self.memory = Vec::new();
+        }
+        if let Some(file) = &mut self.file {
+            file.write_all(bytes)?;
+        } else {
+            self.memory.extend_from_slice(bytes);
+        }
+        if let Some(last) = bytes.last() {
+            self.last = Some(*last);
+        }
+        Ok(())
+    }
+
+    fn visit(&mut self, mut consume: impl FnMut(&[u8]) -> io::Result<()>) -> io::Result<()> {
+        if let Some(file) = &mut self.file {
+            file.seek(SeekFrom::Start(0))?;
+            let mut buffer = [0; 16 * 1024];
+            loop {
+                let count = file.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                consume(&buffer[..count])?;
+            }
+            // A visit need not end this spool's lifetime.
+            file.seek(SeekFrom::End(0))?;
+        } else {
+            for bytes in self.memory.chunks(16 * 1024) {
+                consume(bytes)?;
+            }
+        }
+        Ok(())
+    }
+    fn prefixed(&mut self, stderr: bool, prefix: &str) -> io::Result<()> {
+        if self.file.is_none() {
+            return write_to(stderr, &prefixed(prefix, &self.memory));
+        }
+        crate::report::output_batch(|output| {
+            let mut started = false;
+            self.visit(|bytes| {
+                for piece in bytes.split_inclusive(|byte| matches!(byte, b'\n' | b'\r')) {
+                    let complete = piece
+                        .last()
+                        .is_some_and(|byte| matches!(byte, b'\n' | b'\r'));
+                    let content = if complete {
+                        &piece[..piece.len() - 1]
+                    } else {
+                        piece
+                    };
+                    if !content.is_empty() {
+                        if !started {
+                            output(stderr, prefix.as_bytes());
+                            output(stderr, b" ");
+                            started = true;
+                        }
+                        output(stderr, content);
+                    }
+                    if complete && started {
+                        output(stderr, b"\n");
+                        started = false;
+                    }
+                }
+                Ok(())
+            })?;
+            if started {
+                output(stderr, b"\n");
+            }
+            Ok(())
+        })
+    }
+}
+
 /// picocolors' rule: colour unless NO_COLOR, when forced, in CI, or on a
 /// terminal that is not dumb.
 fn colour() -> bool {
@@ -187,8 +276,8 @@ fn colour() -> bool {
 struct Printer {
     display: Display,
     /// Partial lines of stdout and stderr, for prefixing whole lines.
-    lines: Mutex<[Vec<u8>; 2]>,
-    held: Mutex<Vec<u8>>,
+    lines: Mutex<[Spool; 2]>,
+    held: Mutex<Spool>,
 }
 
 impl Printer {
@@ -205,21 +294,24 @@ impl Printer {
             Display::Stream | Display::Headed { .. } => write_to(stderr, bytes),
             Display::Hidden => Ok(()),
             Display::Static { .. } | Display::Failures { .. } => {
-                self.held.lock().unwrap().extend_from_slice(bytes);
-                Ok(())
+                self.held.lock().unwrap().append(bytes)
             }
             Display::Prefixed(prefix) => {
                 let mut lines = self.lines.lock().unwrap();
                 let buffer = &mut lines[usize::from(stderr)];
-                buffer.extend_from_slice(bytes);
-                let Some(end) = buffer
+                let end = bytes
                     .iter()
                     .rposition(|byte| matches!(byte, b'\n' | b'\r'))
-                else {
-                    return Ok(());
-                };
-                let complete: Vec<u8> = buffer.drain(..=end).collect();
-                write_to(stderr, &prefixed(prefix, &complete))
+                    .map(|end| end + 1);
+                if let Some(end) = end {
+                    buffer.append(&bytes[..end])?;
+                    let mut complete = std::mem::take(buffer);
+                    complete.prefixed(stderr, prefix)?;
+                    buffer.append(&bytes[end..])?;
+                } else {
+                    buffer.append(bytes)?;
+                }
+                Ok(())
             }
         }
     }
@@ -239,22 +331,27 @@ impl Printer {
         match &self.display {
             Display::Stream | Display::Headed { .. } | Display::Hidden => Ok(()),
             Display::Failures { id } => {
-                let held = std::mem::take(&mut *self.held.lock().unwrap());
+                let mut held = std::mem::take(&mut *self.held.lock().unwrap());
                 if shown == Shown::Failure {
-                    let mut text = format!("\n✖ qk run {id} failed\n\n").into_bytes();
-                    text.extend_from_slice(&held);
-                    if !held.ends_with(b"\n") {
-                        text.push(b'\n');
-                    }
-                    write_to(false, &text)?;
+                    crate::report::output_batch(|output| -> io::Result<()> {
+                        output(false, format!("\n✖ qk run {id} failed\n\n").as_bytes());
+                        held.visit(|bytes| {
+                            output(false, bytes);
+                            Ok(())
+                        })?;
+                        if held.last != Some(b'\n') {
+                            output(false, b"\n");
+                        }
+                        Ok(())
+                    })?;
                 }
                 Ok(())
             }
             Display::Prefixed(prefix) => {
                 let mut lines = self.lines.lock().unwrap();
                 for stderr in [false, true] {
-                    let rest = std::mem::take(&mut lines[usize::from(stderr)]);
-                    write_to(stderr, &prefixed(prefix, &rest))?;
+                    let mut rest = std::mem::take(&mut lines[usize::from(stderr)]);
+                    rest.prefixed(stderr, prefix)?;
                 }
                 Ok(())
             }
@@ -262,28 +359,32 @@ impl Printer {
                 let mut held = std::mem::take(&mut *self.held.lock().unwrap());
                 if !cached && matches!(shown, Shown::LocalCache | Shown::RemoteCache | Shown::Kept)
                 {
-                    held.clear();
+                    held = Spool::default();
                 }
-                let mut text = Vec::new();
-                text.push(b'\n');
-                if *group {
-                    let icon = match shown {
-                        Shown::Success => "✅",
-                        Shown::Failure => "❌",
-                        Shown::LocalCache | Shown::RemoteCache => "🔁",
-                        Shown::Kept => "⏩",
-                    };
-                    text.extend_from_slice(format!("::group::{icon} ").as_bytes());
-                }
-                text.extend_from_slice(format!("{}\n\n", header(id, shown)).as_bytes());
-                text.extend_from_slice(&held);
-                if *group {
-                    if !held.ends_with(b"\n") && !held.is_empty() {
-                        text.push(b'\n');
+                crate::report::output_batch(|output| -> io::Result<()> {
+                    output(false, b"\n");
+                    if *group {
+                        let icon = match shown {
+                            Shown::Success => "✅",
+                            Shown::Failure => "❌",
+                            Shown::LocalCache | Shown::RemoteCache => "🔁",
+                            Shown::Kept => "⏩",
+                        };
+                        output(false, format!("::group::{icon} ").as_bytes());
                     }
-                    text.extend_from_slice(b"::endgroup::\n");
-                }
-                write_to(false, &text)
+                    output(false, format!("{}\n\n", header(id, shown)).as_bytes());
+                    held.visit(|bytes| {
+                        output(false, bytes);
+                        Ok(())
+                    })?;
+                    if *group {
+                        if held.last.is_some() && held.last != Some(b'\n') {
+                            output(false, b"\n");
+                        }
+                        output(false, b"::endgroup::\n");
+                    }
+                    Ok(())
+                })
             }
         }
     }
@@ -545,6 +646,80 @@ pub fn replay(reader: impl Read, display: &Display, shown: Shown) -> io::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn held_output_spills_without_losing_binary_stream_order() {
+        let printer = Printer::new(Display::Failures { id: "large".into() });
+        let chunk = [0, 255, b'x', b'\n'].repeat(4096);
+        for index in 0..32 {
+            printer.write(index % 2 == 1, &chunk).unwrap();
+        }
+        let mut held = printer.held.lock().unwrap();
+        assert!(held.file.is_some());
+        assert!(held.memory.is_empty());
+        let mut count = 0;
+        held.visit(|bytes| {
+            assert_eq!(bytes, chunk.as_slice());
+            count += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(count, 32);
+        // A successful quiet task drops its spool without reading or displaying it.
+        drop(held);
+        printer.finish(Shown::Success).unwrap();
+        assert!(printer.held.lock().unwrap().file.is_none());
+    }
+
+    #[test]
+    fn unfinished_prefixed_lines_spill_and_keep_streams_separate() {
+        let printer = Printer::new(Display::Prefixed("app:".into()));
+        let bytes = vec![b'x'; MEMORY_OUTPUT_BYTES + 1];
+        printer.write(false, &bytes).unwrap();
+        printer.write(true, b"partial stderr").unwrap();
+        let mut lines = printer.lines.lock().unwrap();
+        assert!(lines[0].file.is_some());
+        assert!(lines[0].memory.is_empty());
+        let mut length = 0;
+        lines[0]
+            .visit(|chunk| {
+                assert!(chunk.len() <= 16 * 1024);
+                assert!(chunk.iter().all(|byte| *byte == b'x'));
+                length += chunk.len();
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(length, bytes.len());
+        assert_eq!(lines[1].memory, b"partial stderr");
+    }
+
+    #[test]
+    fn small_spools_stay_in_memory_and_can_replay_then_append() {
+        let mut spool = Spool::default();
+        spool.append(b"small").unwrap();
+        assert!(spool.file.is_none());
+        let mut output = Vec::new();
+        spool
+            .visit(|chunk| {
+                output.extend_from_slice(chunk);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(output, b"small");
+        spool.append(&vec![b'x'; MEMORY_OUTPUT_BYTES]).unwrap();
+        assert!(spool.file.is_some());
+        spool.visit(|_| Ok(())).unwrap();
+        spool.append(b"last").unwrap();
+        output.clear();
+        spool
+            .visit(|chunk| {
+                output.extend_from_slice(chunk);
+                Ok(())
+            })
+            .unwrap();
+        assert!(output.starts_with(b"small"));
+        assert!(output.ends_with(b"last"));
+    }
 
     /// Retention preserves binary streams and valid framing at the byte limit.
     #[test]

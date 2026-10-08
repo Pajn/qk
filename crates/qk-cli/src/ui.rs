@@ -85,6 +85,7 @@ impl Warnings {
 pub struct Quiet {
     warnings: Warnings,
     plain: [bool; 2],
+    escapes: Mutex<[EscapeState; 2]>,
 }
 
 impl Default for Quiet {
@@ -92,6 +93,7 @@ impl Default for Quiet {
         let plain = |terminal: bool| !terminal && std::env::var_os("FORCE_COLOR").is_none();
         Self {
             warnings: Warnings::default(),
+            escapes: Mutex::default(),
             plain: [
                 plain(std::io::stdout().is_terminal()),
                 plain(std::io::stderr().is_terminal()),
@@ -100,23 +102,50 @@ impl Default for Quiet {
     }
 }
 
-/// Text without ANSI escape sequences.
-fn strip_escapes(bytes: &[u8]) -> Vec<u8> {
-    let mut result = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'[') {
-            index += 2;
-            while index < bytes.len() && !bytes[index].is_ascii_alphabetic() {
-                index += 1;
+/// Incremental ANSI removal: held logs replay in bounded chunks, so the
+/// escape introducer and its final character can arrive in different writes.
+#[derive(Clone, Copy, Default)]
+enum EscapeState {
+    #[default]
+    Text,
+    Escape,
+    Csi,
+}
+
+impl EscapeState {
+    fn strip(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let mut result = Vec::with_capacity(bytes.len());
+        for &byte in bytes {
+            match *self {
+                Self::Csi => {
+                    if byte.is_ascii_alphabetic() {
+                        *self = Self::Text;
+                    }
+                }
+                Self::Escape if byte == b'[' => *self = Self::Csi,
+                Self::Escape => {
+                    result.push(0x1b);
+                    *self = Self::Text;
+                    if byte == 0x1b {
+                        *self = Self::Escape;
+                    } else {
+                        result.push(byte);
+                    }
+                }
+                Self::Text if byte == 0x1b => *self = Self::Escape,
+                Self::Text => result.push(byte),
             }
-            index += 1;
-        } else {
-            result.push(bytes[index]);
-            index += 1;
         }
+        result
     }
-    result
+
+    /// Preserve a literal trailing escape; discard an unfinished CSI as the
+    /// original complete-buffer decoder did. Never carry it into another task.
+    fn finish(&mut self) -> bool {
+        let trailing = matches!(self, Self::Escape);
+        *self = Self::Text;
+        trailing
+    }
 }
 
 impl Sink for Quiet {
@@ -128,9 +157,18 @@ impl Sink for Quiet {
 
     fn output(&self, stderr: bool, bytes: &[u8]) {
         if self.plain[usize::from(stderr)] {
-            report::write_all(stderr, &strip_escapes(bytes));
+            let mut escapes = self.escapes.lock().unwrap();
+            report::write_all(stderr, &escapes[usize::from(stderr)].strip(bytes));
         } else {
             report::write_all(stderr, bytes);
+        }
+    }
+    fn output_finished(&self) {
+        let mut escapes = self.escapes.lock().unwrap();
+        for stderr in [false, true] {
+            if self.plain[usize::from(stderr)] && escapes[usize::from(stderr)].finish() {
+                report::write_all(stderr, b"\x1b");
+            }
         }
     }
 }
@@ -1003,6 +1041,24 @@ mod tests {
             .find(|line| line.starts_with("Parallel"))
             .unwrap()
             .to_owned()
+    }
+
+    #[test]
+    fn quiet_strips_escapes_split_between_replay_chunks() {
+        for split in 0..=14 {
+            let bytes = b"a\x1b[31mred\x1b[0m!";
+            let mut state = EscapeState::default();
+            let mut result = state.strip(&bytes[..split]);
+            result.extend_from_slice(&state.strip(&bytes[split..]));
+            assert_eq!(result, b"ared!");
+            assert!(!state.finish());
+        }
+        let mut state = EscapeState::default();
+        assert_eq!(state.strip(b"one\x1b["), b"one");
+        assert!(!state.finish());
+        assert_eq!(state.strip(b"> qk run next"), b"> qk run next");
+        assert!(state.strip(b"\x1b").is_empty());
+        assert!(state.finish());
     }
 
     #[test]
