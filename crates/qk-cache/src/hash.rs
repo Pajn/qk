@@ -164,6 +164,7 @@ struct Membership {
     cache: Option<PathBuf>,
     policies: BTreeSet<PathBuf>,
     git_policies: BTreeSet<PathBuf>,
+    ignore_contents: BTreeMap<PathBuf, String>,
     settled: bool,
 }
 
@@ -259,6 +260,18 @@ impl Membership {
         for policy in &policies {
             stamps.insert(policy.clone(), membership_stamp(policy)?);
         }
+        // Capture contents before listing, so a later policy change cannot be
+        // mistaken for the rules that produced that listing.
+        let mut ignore_contents = BTreeMap::new();
+        for policy in &policies {
+            if matches!(
+                policy.file_name().and_then(|name| name.to_str()),
+                Some(".gitignore" | ".nxignore")
+            ) && let Some(content) = ignore_content(policy, &stamps[policy])?
+            {
+                ignore_contents.insert(policy.clone(), content);
+            }
+        }
         let mut output_anchors: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
         for (index, outputs) in outputs.iter().enumerate() {
             for anchor in outputs.anchors() {
@@ -281,6 +294,7 @@ impl Membership {
             cache: cache.map(PathBuf::from),
             policies,
             git_policies,
+            ignore_contents,
             settled: false,
         };
         for directory in &membership.directories {
@@ -379,7 +393,8 @@ impl Membership {
     }
 
     /// Check source-relevant directory membership and every listing policy.
-    /// Recent directory stamps require fresh entry names; policies must settle.
+    /// Recent directory stamps require fresh entry names; recent ignore files
+    /// require matching contents, while other listing policies must settle.
     fn state(&self, prefixes: Option<&[PathBuf]>) -> Result<(bool, bool)> {
         let mut settled = true;
         let selected = prefixes.map(|prefixes| {
@@ -435,10 +450,21 @@ impl Membership {
                     }
                 }
             } else {
+                let recent = after
+                    .as_ref()
+                    .is_some_and(|stamp| !stamp.membership_settled());
+                if (*before != after || recent)
+                    && let Some(content) = self.ignore_contents.get(path)
+                {
+                    if ignore_content(path, &after)?.as_ref() != Some(content) {
+                        return Ok((false, false));
+                    }
+                    continue;
+                }
                 if *before != after {
                     return Ok((false, false));
                 }
-                settled &= after.as_ref().is_none_or(Stamp::membership_settled);
+                settled &= !recent;
             }
         }
         Ok((true, settled))
@@ -533,6 +559,26 @@ fn git_membership_policies(root: &Path) -> BTreeSet<PathBuf> {
         policies.insert(config.join("git/ignore"));
     }
     policies
+}
+
+/// Read a regular ignore policy only when the captured metadata remains stable.
+/// A digest read after a listing must never replace the pre-listing digest.
+fn ignore_content(path: &Path, expected: &Option<Stamp>) -> Result<Option<String>> {
+    if expected.is_none() || membership_stamp(path)? != *expected {
+        return Ok(None);
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let content = match std::fs::read(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    Ok((membership_stamp(path)? == *expected).then(|| blake3::hash(&content).to_hex().to_string()))
 }
 
 /// Stamp a directory or listing policy, including a symlink's resolved target.
@@ -2312,6 +2358,61 @@ mod tests {
             std::fs::write(root.path().join(".gitignore"), "ignored/\n").unwrap();
             assert!(files().contains("src/empty/added"));
         }
+    }
+
+    #[test]
+    fn identical_ignore_rewrites_reuse_candidates_and_changed_rules_refresh() {
+        for name in [".gitignore", ".nxignore"] {
+            let (root, workspace, graph) = fixture(None);
+            let policy = root.path().join(name);
+            std::fs::write(root.path().join("alpha"), "a").unwrap();
+            std::fs::write(root.path().join("bravo"), "b").unwrap();
+            std::fs::write(&policy, "alpha\n").unwrap();
+            let snapshot =
+                Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
+            let original = snapshot.current_files(root.path()).unwrap();
+            assert!(!original.contains("alpha"));
+            assert!(original.contains("bravo"));
+            for _ in 0..3 {
+                std::fs::write(&policy, "alpha\n").unwrap();
+                assert!(Arc::ptr_eq(
+                    &original,
+                    &snapshot.current_files(root.path()).unwrap()
+                ));
+            }
+            // Same-length content can change while coarse timestamps appear
+            // identical. Recent policies must still compare their contents.
+            std::fs::write(&policy, "bravo\n").unwrap();
+            {
+                let mut cached = snapshot.membership.lock().unwrap();
+                Arc::make_mut(cached.as_mut().unwrap())
+                    .stamps
+                    .insert(policy.clone(), membership_stamp(&policy).unwrap());
+            }
+            let changed = snapshot.current_files(root.path()).unwrap();
+            assert!(!Arc::ptr_eq(&original, &changed));
+            assert!(changed.contains("alpha"));
+            assert!(!changed.contains("bravo"));
+            std::fs::remove_file(&policy).unwrap();
+            assert!(
+                snapshot
+                    .current_files(root.path())
+                    .unwrap()
+                    .contains("bravo")
+            );
+        }
+    }
+
+    #[test]
+    fn ignore_contents_changed_after_inventory_cannot_bless_a_listing() {
+        let (root, workspace, graph) = fixture(None);
+        let policy = root.path().join(".nxignore");
+        std::fs::write(&policy, "alpha\n").unwrap();
+        let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
+        snapshot.current_files(root.path()).unwrap();
+        let membership = snapshot.membership.lock().unwrap().clone().unwrap();
+        std::fs::write(&policy, "bravo\n").unwrap();
+        assert!(!membership.state(None).unwrap().0);
     }
 
     #[test]
