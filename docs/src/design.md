@@ -395,8 +395,9 @@ affects is left out when all of these hold:
 1. It is affected only through dependencies: none of its own files changed,
    and no workspace-wide reason applies, such as `nx.json`, the root
    tsconfig, the root importer's installs or a deleted manifest.
-2. Every change it is affected through is a file its `sources` match. A
-   dependency's lockfile installs, configuration or manifest keep it.
+2. Every change it is affected through is a file its `sources` match, or a
+   dependency's `package.json` whose fields its dependents read are
+   unchanged. Lockfile installs, configuration and any other change keep it.
 3. No anchor reaches a changed file, and the search lost no edge in the
    repository: fallout reports nothing unresolved that the repository
    answers for (`in_repo`).
@@ -413,8 +414,9 @@ Under the profile with `--granularity task`, a task with `qk:reachability`
 that ordinary task selection affects is decided by its changed inputs:
 
 1. Any changed input its `sources` do not match runs the whole task, and
-   says which file. So does an affected task it depends on, whose outputs it
-   may read.
+   says which file, unless it is a dependency's `package.json` whose fields
+   its dependents read are unchanged. So does an affected task it depends
+   on, whose outputs it may read.
 2. Otherwise, if an anchor reaches a change, or the search lost an edge, the
    whole task runs, naming the chain or the gap.
 3. Otherwise, the cases a change reaches are selected, each with the changed

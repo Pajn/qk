@@ -540,3 +540,168 @@ fn task_selection_refuses_profiles_with_projections() {
     .unwrap_err();
     assert!(error.to_string().contains("applies to project selection"));
 }
+
+#[test]
+fn exclusions_take_files_out_of_sources_and_cases() {
+    use qk_affected::TaskDecision;
+    let repo = Repo::new(&[(
+        "apps/app/project.json",
+        r#"{
+            "name": "app",
+            "implicitDependencies": ["lib"],
+            "qk:reachability": {
+                "anchors": ["{projectRoot}/src/main.ts"],
+                "sources": ["!{workspaceRoot}/libs/*/src/**/*.test.ts", "{projectRoot}/src/**/*", "{workspaceRoot}/libs/*/src/**/*"]
+            }
+        }"#,
+    )]);
+    write(
+        &repo.root,
+        "libs/lib/src/unused.test.ts",
+        "export const test = 1;\n",
+    );
+    let analysis = repo.analyse(Some("reach"));
+    assert!(
+        matches!(
+            decisions(&analysis)["app"],
+            Decision::Kept { why: Kept::NotImported { reason: qk_affected::Reason::File { file }, .. } }
+                if file == "libs/lib/src/unused.test.ts"
+        ),
+        "an excluded file is not a source: {:?}",
+        analysis.reachability
+    );
+    let repo2 = Repo::new(&[(
+        "apps/app/project.json",
+        r#"{
+            "name": "app",
+            "implicitDependencies": ["lib"],
+            "qk:reachability": {
+                "anchors": ["{projectRoot}/src/main.ts"],
+                "sources": ["{projectRoot}/src/**/*", "{workspaceRoot}/libs/*/src/**/*", "!{workspaceRoot}/libs/*/src/**/*.test.ts"]
+            }
+        }"#,
+    )]);
+    write(
+        &repo2.root,
+        "libs/lib/src/unused.ts",
+        "export const unused = 2;\n",
+    );
+    let analysis = repo2.analyse(Some("reach"));
+    assert!(
+        matches!(decisions(&analysis)["app"], Decision::LeftOut { .. }),
+        "files the exclusion does not match stay sources: {:?}",
+        analysis.reachability
+    );
+
+    let visual = visual_repo();
+    let project = std::fs::read_to_string(visual.root.join("apps/app/project.json")).unwrap();
+    write(
+        &visual.root,
+        "apps/app/project.json",
+        &project.replace(
+            r#""cases": ["{projectRoot}/visual/cases/*.ts"]"#,
+            r#""cases": ["{projectRoot}/visual/cases/*.ts", "!{projectRoot}/visual/cases/second.ts"]"#,
+        ),
+    );
+    commit(&visual.root);
+    let visual = Repo {
+        _temp: visual._temp,
+        root: visual.root.clone(),
+        base: git(&visual.root, &["rev-parse", "HEAD"]),
+    };
+    write(
+        &visual.root,
+        "libs/lib/src/used.ts",
+        "export const used = 2;\n",
+    );
+    let analysis = visual.tasks(Some("reach"));
+    let TaskDecision::Cases { cases, of } = &analysis.reachability["app:visual"] else {
+        panic!("{:?}", analysis.reachability);
+    };
+    assert_eq!(*of, 1, "the excluded case is not one of the task's cases");
+    assert_eq!(
+        cases.keys().collect::<Vec<_>>(),
+        ["apps/app/visual/cases/first.ts"]
+    );
+}
+
+#[test]
+fn a_manifest_change_dependents_cannot_read_carries_nothing() {
+    let manifest = |version: &str, dependencies: &str| {
+        format!(
+            r#"{{"name": "lib", "version": "{version}", "scripts": {{"test": "echo"}}, "dependencies": {{{dependencies}}}}}"#
+        )
+    };
+    let repo = Repo::new(&[("libs/lib/package.json", &manifest("1.0.0", ""))]);
+    write(
+        &repo.root,
+        "libs/lib/package.json",
+        &manifest("1.0.1", "").replace("echo", "echo again"),
+    );
+    let analysis = repo.analyse(Some("reach"));
+    assert!(
+        matches!(decisions(&analysis)["app"], Decision::LeftOut { .. }),
+        "a version and a script are nothing dependents read: {:?}",
+        analysis.reachability
+    );
+    write(
+        &repo.root,
+        "libs/lib/package.json",
+        &manifest("1.0.1", r#""left-pad": "1.3.0""#).replace("echo", "echo again"),
+    );
+    let analysis = repo.analyse(Some("reach"));
+    assert!(
+        matches!(
+            decisions(&analysis)["app"],
+            Decision::Kept {
+                why: Kept::NotImported { .. }
+            }
+        ),
+        "a declaration still counts: {:?}",
+        analysis.reachability
+    );
+}
+
+#[test]
+fn a_dependency_relinked_by_its_version_runs_the_whole_task() {
+    use qk_affected::{TaskDecision, TaskReason};
+    let repo = visual_repo();
+    write(
+        &repo.root,
+        "apps/app/package.json",
+        r#"{"name": "app", "dependencies": {"lib": "^1.0.0"}}"#,
+    );
+    write(
+        &repo.root,
+        "libs/lib/package.json",
+        r#"{"name": "lib", "version": "1.0.0"}"#,
+    );
+    commit(&repo.root);
+    let repo = Repo {
+        base: git(&repo.root, &["rev-parse", "HEAD"]),
+        root: repo.root.clone(),
+        _temp: repo._temp,
+    };
+    // Out of the range app declares, lib stops being its dependency: what
+    // its tasks depend on changed, though no field dependents read did.
+    write(
+        &repo.root,
+        "libs/lib/package.json",
+        r#"{"name": "lib", "version": "2.0.0"}"#,
+    );
+    let analysis = repo.tasks(Some("reach"));
+    assert!(
+        analysis.tasks.contains_key("app:visual"),
+        "{:?}",
+        analysis.reachability
+    );
+    assert!(
+        matches!(
+            &analysis.reachability["app:visual"],
+            TaskDecision::Whole { why: Kept::Input { reason: TaskReason::Relinked { file } } }
+                if file == "libs/lib/package.json"
+        ),
+        "{:?}",
+        analysis.reachability
+    );
+}

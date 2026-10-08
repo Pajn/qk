@@ -24,16 +24,46 @@ use qk_taskgraph::TaskGraph;
 
 /// A project's or target's `qk:reachability`, its paths expanded.
 pub(crate) struct Settings {
-    pub anchors: Vec<String>,
-    pub cases: Vec<String>,
-    sources: Vec<Pattern>,
+    pub anchors: Globs,
+    pub cases: Globs,
+    sources: Globs,
 }
 
 impl Settings {
     /// Whether a change to `file` matters only through imports.
     pub fn is_source(&self, file: &str) -> bool {
-        file.rsplit('/').next() != Some("package.json")
-            && self.sources.iter().any(|pattern| pattern.is_match(file))
+        file.rsplit('/').next() != Some("package.json") && self.sources.is_match(file)
+    }
+}
+
+/// Globs, with `!` exclusions: a path matches when an inclusion matches it
+/// and no exclusion does, whatever their order.
+#[derive(Default)]
+pub(crate) struct Globs {
+    included: Vec<Pattern>,
+    excluded: Vec<Pattern>,
+}
+
+impl Globs {
+    fn new(patterns: &[String]) -> Result<Self> {
+        let mut globs = Self::default();
+        for pattern in patterns {
+            match pattern.strip_prefix('!') {
+                Some(excluded) => globs.excluded.push(Pattern::new(excluded, true)?),
+                None => globs.included.push(Pattern::new(pattern, false)?),
+            }
+        }
+        Ok(globs)
+    }
+
+    /// Whether nothing can match.
+    pub fn is_empty(&self) -> bool {
+        self.included.is_empty()
+    }
+
+    pub fn is_match(&self, path: &str) -> bool {
+        self.included.iter().any(|pattern| pattern.is_match(path))
+            && !self.excluded.iter().any(|pattern| pattern.is_match(path))
     }
 }
 
@@ -68,15 +98,20 @@ pub(crate) fn settings(
         let expanded = paths
             .iter()
             .map(|path| {
-                qk_cache::expand_project_path(workspace, project, path.as_str().unwrap())
+                let path = path.as_str().unwrap();
+                let (bang, path) = path
+                    .strip_prefix('!')
+                    .map_or(("", path), |path| ("!", path));
+                qk_cache::expand_project_path(workspace, project, path)
+                    .map(|path| format!("{bang}{path}"))
                     .with_context(|| format!("{what} qk:reachability.{key}"))
             })
             .collect::<Result<_>>()?;
         lists.insert(key, expanded);
     }
-    let anchors = lists.remove("anchors").unwrap_or_default();
-    let cases = lists.remove("cases").unwrap_or_default();
-    let sources = lists.remove("sources").unwrap_or_default();
+    let anchors = Globs::new(&lists.remove("anchors").unwrap_or_default())?;
+    let cases = Globs::new(&lists.remove("cases").unwrap_or_default())?;
+    let sources = Globs::new(&lists.remove("sources").unwrap_or_default())?;
     ensure!(
         !anchors.is_empty() || !cases.is_empty(),
         "{what} qk:reachability needs anchors{}",
@@ -89,10 +124,7 @@ pub(crate) fn settings(
     Ok(Some(Settings {
         anchors,
         cases,
-        sources: sources
-            .iter()
-            .map(|pattern| Pattern::new(pattern, false))
-            .collect::<Result<_>>()?,
+        sources,
     }))
 }
 
@@ -210,7 +242,7 @@ pub(crate) fn decide(
         let Some(settings) = declared.remove(name) else {
             continue;
         };
-        match not_imported(graph, projects, name, &settings) {
+        match not_imported(changes, graph, projects, name, &settings) {
             Some(why) => {
                 decisions.insert(name.clone(), Decision::Kept { why });
             }
@@ -296,6 +328,7 @@ fn touched_dependencies<'a>(
 
 /// The first reason touching a dependency that imports do not carry.
 fn not_imported(
+    changes: &Changes,
     graph: &ProjectGraph,
     projects: &BTreeMap<String, Cause>,
     project: &str,
@@ -303,7 +336,10 @@ fn not_imported(
 ) -> Option<Kept> {
     for (dependency, reasons) in touched_dependencies(graph, projects, project) {
         for reason in reasons {
-            let carried = matches!(reason, Reason::File { file } if settings.is_source(file));
+            let carried = matches!(
+                reason,
+                Reason::File { file } if settings.is_source(file) || manifest_unchanged(changes, file)
+            );
             if !carried {
                 return Some(Kept::NotImported {
                     project: dependency.to_owned(),
@@ -332,17 +368,32 @@ fn changed_through(
         .collect()
 }
 
+/// Whether `file` is a `package.json` whose change decides nothing new for
+/// its dependents: the same at both revisions once the fields no dependent
+/// reads, such as `version` and `scripts`, are left out, as their cache keys
+/// read it. Its declarations stay in, so a changed dependency still counts.
+fn manifest_unchanged(changes: &Changes, file: &str) -> bool {
+    if file.rsplit('/').next() != Some("package.json") {
+        return false;
+    }
+    let read = |revision: Option<&str>| {
+        changes
+            .read(file, revision)
+            .and_then(|text| qk_cache::manifest_for_dependents(&text, false))
+    };
+    match (read(changes.base.as_deref()), read(changes.head.as_deref())) {
+        (Some(before), Some(after)) => before == after,
+        _ => false,
+    }
+}
+
 /// The workspace's files each glob of `patterns` matches.
-fn matching(files: &BTreeSet<String>, patterns: &[String]) -> Result<Vec<String>> {
-    let patterns = patterns
+fn matching(files: &BTreeSet<String>, globs: &Globs) -> Vec<String> {
+    files
         .iter()
-        .map(|pattern| Pattern::new(pattern, false))
-        .collect::<Result<Vec<_>>>()?;
-    Ok(files
-        .iter()
-        .filter(|file| patterns.iter().any(|pattern| pattern.is_match(file)))
+        .filter(|file| globs.is_match(file))
         .cloned()
-        .collect())
+        .collect()
 }
 
 /// Each project's anchor files, as its globs match the workspace's files.
@@ -353,7 +404,7 @@ fn anchor_files(
     let files = qk_cache::source_files(&workspace.root)?;
     pending
         .iter()
-        .map(|(name, settings)| Ok((name.clone(), matching(&files, &settings.anchors)?)))
+        .map(|(name, settings)| Ok((name.clone(), matching(&files, &settings.anchors))))
         .collect()
 }
 
@@ -558,7 +609,13 @@ pub(crate) fn decide_tasks(
             }
             TaskCause::Touched { reasons } => reasons,
         };
-        let carried = |reason: &&TaskReason| matches!(reason, TaskReason::Input { file } if settings.is_source(file));
+        let carried = |reason: &&TaskReason| {
+            matches!(
+                reason,
+                TaskReason::Input { file }
+                    if settings.is_source(file) || manifest_unchanged(changes, file)
+            )
+        };
         if let Some(reason) = reasons.iter().find(|reason| !carried(reason)) {
             let why = Kept::Input {
                 reason: reason.clone(),
@@ -586,8 +643,8 @@ pub(crate) fn decide_tasks(
                 Ok((
                     id.clone(),
                     (
-                        matching(&files, &settings.anchors)?,
-                        matching(&files, &settings.cases)?,
+                        matching(&files, &settings.anchors),
+                        matching(&files, &settings.cases),
                     ),
                 ))
             })
