@@ -208,69 +208,78 @@ impl Cache {
         let _kept = self
             .reuse
             .then(|| warm::keep_across(workspace, graph, task));
-        let warm = if self.reuse {
-            match warm::config(workspace, task) {
-                Ok(warm) => warm,
-                Err(error) => {
-                    qk_executor::status!("qk: {}: warm state ignored ({error:#})", task.id);
-                    None
-                }
-            }
+        let entries = if self.reuse {
+            warm::config(workspace, task).unwrap_or_else(|error| {
+                qk_executor::status!("qk: {}: warm state ignored ({error:#})", task.id);
+                Vec::new()
+            })
         } else {
-            None
+            Vec::new()
+        };
+        // Names an entry in messages: the group it shares, if any.
+        let entry_label = |warm: &warm::Warm| match warm.group() {
+            Some(group) => format!(" (group {group})"),
+            None => String::new(),
         };
         // The warm variables point tools at their state; they are not inputs,
         // so the key is computed from the task without them.
         let mut running = prepared.clone();
-        if let Some(warm) = &warm {
+        for warm in &entries {
             for (name, value) in &warm.env {
                 running.execution.insert(name.into(), value.into());
             }
         }
-        // What was restored, and which groups were on disk already.
-        let before = |running: &PreparedTask| -> (Option<warm::Restored>, Vec<String>) {
-            let Some(warm) = warm.as_ref() else {
-                return (None, Vec::new());
-            };
-            match self
-                .initialize()
-                .and_then(|()| self.restore_warm(workspace, task, warm, running))
-            {
-                Ok((restored, present)) => {
-                    ((!restored.groups.is_empty()).then_some(restored), present)
-                }
-                Err(error) => {
-                    qk_executor::status!("qk: {}: warm state not restored ({error:#})", task.id);
-                    (None, Vec::new())
+        // What each entry restored, and which groups were on disk already.
+        let before = |running: &PreparedTask| -> (Vec<warm::Restored>, Vec<String>) {
+            let (mut restored, mut present) = (Vec::new(), Vec::new());
+            for warm in &entries {
+                match self
+                    .initialize()
+                    .and_then(|()| self.restore_warm(workspace, task, warm, running))
+                {
+                    Ok((entry, groups)) => {
+                        if !entry.groups.is_empty() {
+                            restored.push(entry);
+                        }
+                        present.extend(groups);
+                    }
+                    Err(error) => qk_executor::status!(
+                        "qk: {}: warm state{} not restored ({error:#})",
+                        task.id,
+                        entry_label(warm)
+                    ),
                 }
             }
+            (restored, present)
         };
         let after = |outcome: Outcome,
-                     (restored, present): (Option<warm::Restored>, Vec<String>),
+                     (restored, present): (Vec<warm::Restored>, Vec<String>),
                      running: &PreparedTask|
          -> Option<warm::WarmReport> {
-            let warm = warm.as_ref()?;
-            let started = std::time::Instant::now();
+            if entries.is_empty() {
+                return None;
+            }
+            let mut save_ms = None;
             let mut background = false;
-            let save_ms = if outcome != Outcome::Success {
-                None
-            } else if warm.background {
-                match self.save_warm_in_background(workspace, task, warm, running) {
-                    Ok(()) => background = true,
-                    Err(error) => {
-                        qk_executor::status!("qk: {}: warm state not saved ({error:#})", task.id);
+            for warm in entries.iter().filter(|_| outcome == Outcome::Success) {
+                let started = std::time::Instant::now();
+                let saved = if warm.background {
+                    self.save_warm_in_background(workspace, task, warm, running)
+                } else {
+                    self.save_warm(workspace, task, warm, running)
+                };
+                match saved {
+                    Ok(()) if warm.background => background = true,
+                    Ok(()) => {
+                        *save_ms.get_or_insert(0) += started.elapsed().as_millis() as u64;
                     }
+                    Err(error) => qk_executor::status!(
+                        "qk: {}: warm state{} not saved ({error:#})",
+                        task.id,
+                        entry_label(warm)
+                    ),
                 }
-                None
-            } else {
-                match self.save_warm(workspace, task, warm, running) {
-                    Ok(()) => Some(started.elapsed().as_millis() as u64),
-                    Err(error) => {
-                        qk_executor::status!("qk: {}: warm state not saved ({error:#})", task.id);
-                        None
-                    }
-                }
-            };
+            }
             Some(warm::WarmReport {
                 restored,
                 present,

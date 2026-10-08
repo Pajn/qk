@@ -638,8 +638,7 @@ fn details(
         .filter(|task| {
             task.warm
                 .as_ref()
-                .and_then(|warm| warm.get("restored"))
-                .is_some_and(|restored| !restored.is_null())
+                .is_some_and(|warm| !crate::history::restored(warm).is_empty())
         })
         .map(|task| task.id.as_str())
         .collect();

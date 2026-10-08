@@ -17,11 +17,12 @@ the dependency tasks), `lockfile` (with the importers and packages),
 `inputs`, `definition` (with each field that differs and both of its
 values), `args` and `tooling`, or `first`, `unchanged` and
 `unknown` when the previous inputs are no longer kept. For targets with warm
-state it also holds where that state came from (`local`, `worktree <root>`
-or `remote <branch>`), how many files and bytes were restored, which groups
-were on disk already, and how long saving it took, or that it was saved in
-the background; the run summary names the tasks that started from warm
-state, and `qk show task` compares how long the task took from warm state
+state it also holds, for each entry that restored any, its group when it
+has one, where that state came from (`local`, `worktree <root>` or
+`remote <branch>`) and how many files and bytes were restored; and, once for
+the task, which groups were on disk already and how long saving took, or that
+saving happened in the background. The run summary names the tasks that
+started from warm state, and `qk show task` compares how long the task took from warm state
 with how long it took without, over its successful runs that executed. A task
 that executed also records the most memory it used: that of its commands and
 every process under them, summed, sampled every 250 ms while it runs, so a

@@ -2545,6 +2545,40 @@ fn warm_directories_follow_the_task_across_worktrees() {
 
 #[cfg(unix)]
 #[test]
+fn warm_entries_keep_their_own_portability() {
+    let fixture = Fixture::new(json!({
+        "command": "if [ -f \"$TOOL_CACHE/seen\" ]; then printf 'tool warm'; else printf 'tool cold'; fi; if [ -f scratch/seen ]; then echo ', scratch warm'; else echo ', scratch cold'; fi; mkdir -p \"$TOOL_CACHE\" scratch && touch \"$TOOL_CACHE/seen\" scratch/seen",
+        "qk:warm": [
+            {"group": "tool", "portable": true, "env": {"TOOL_CACHE": "{warm}/tool"}},
+            {"paths": ["scratch"]}
+        ]
+    }));
+    assert_eq!(
+        said(&fixture, &fixture.root, &[]),
+        "tool cold, scratch cold"
+    );
+    // Removed, as in a fresh clone, both come back from this worktree's saves.
+    fs::remove_dir_all(fixture.root.join(".git/qk/warm")).unwrap();
+    fs::remove_dir_all(fixture.root.join("scratch")).unwrap();
+    assert_eq!(
+        said(&fixture, &fixture.root, &[]),
+        "tool warm, scratch warm"
+    );
+    let text = stdout(&success(
+        fixture.qk(&fixture.root, &["show", "task", "app:build"]),
+    ));
+    assert!(
+        text.contains("warm state for group tool restored from local: 1 file,")
+            && text.contains("warm state restored from local: 1 file,"),
+        "{text}"
+    );
+    // A linked worktree takes only the portable entry from the shared store.
+    let linked = fixture.worktree();
+    assert_eq!(said(&fixture, &linked, &[]), "tool warm, scratch cold");
+}
+
+#[cfg(unix)]
+#[test]
 fn warm_state_is_shared_through_the_remote_by_branch() {
     let server = s3::FakeS3::start();
     let fixture = Fixture::new(json!({
@@ -2849,17 +2883,23 @@ fn a_warm_group_is_shared_by_the_targets_that_name_it() {
 #[cfg(unix)]
 #[test]
 fn a_warm_group_cannot_keep_one_task_s_paths() {
-    let fixture = Fixture::new(json!({
-        "command": "echo ran",
-        "qk:warm": {"group": "tool", "paths": ["{projectRoot}/scratch"]}
-    }));
-    let output = fixture.build(&fixture.root, &[]);
-    assert!(!output.status.success());
-    assert!(
-        stderr(&output).contains("a qk:warm.group shares {warm} alone"),
-        "{}",
-        stderr(&output)
-    );
+    for (field, value) in [
+        ("paths", json!(["{projectRoot}/scratch"])),
+        // It would keep paths the group does not have.
+        ("survive", json!(["prebuild"])),
+    ] {
+        let fixture = Fixture::new(json!({
+            "command": "echo ran",
+            "qk:warm": {"group": "tool", field: value}
+        }));
+        let output = fixture.build(&fixture.root, &[]);
+        assert!(!output.status.success(), "{field}");
+        assert!(
+            stderr(&output).contains("a qk:warm.group shares {warm} alone"),
+            "{field}: {}",
+            stderr(&output)
+        );
+    }
 }
 
 #[cfg(unix)]

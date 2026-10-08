@@ -12,6 +12,9 @@
 //! from this worktree's own save. `portable: true` also permits other
 //! worktrees' and remote saves. It is saved after successful runs, one record
 //! per worktree.
+//!
+//! `qk:warm` may also be an array of such objects, each restored and saved on
+//! its own, so state that relocates can be portable beside state that cannot.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -35,6 +38,9 @@ use crate::{Cache, hash::digest_file};
 /// trust timestamps, as `tsc --build` does, then check the sources against it
 /// instead of taking a restored build for an up-to-date one.
 pub const RESTORED_AT: std::time::SystemTime = std::time::UNIX_EPOCH;
+
+/// What a group's identity starts with, before its name.
+const GROUP: &str = "group ";
 
 /// How many saves are kept for a task, across worktrees and keys.
 const KEPT: usize = 8;
@@ -80,12 +86,47 @@ pub enum KeyPart {
     Env(String),
 }
 
-/// The target's `qk:warm`, or `None` without one.
-pub fn config(workspace: &Workspace, task: &Task) -> Result<Option<Warm>> {
-    let Some(value) = task.definition.extra.get("qk:warm") else {
-        return Ok(None);
+/// The target's `qk:warm` entries, none without one.
+///
+/// Entries of an array keep their saves apart, so at most one of them may
+/// belong to the task itself, and the rest name groups. No two may set the
+/// same variable.
+pub fn config(workspace: &Workspace, task: &Task) -> Result<Vec<Warm>> {
+    const SHAPE: &str = "qk:warm must be an object or an array of objects";
+    let objects = match task.definition.extra.get("qk:warm") {
+        None => return Ok(Vec::new()),
+        Some(Value::Object(object)) => vec![object],
+        Some(Value::Array(entries)) => entries
+            .iter()
+            .map(|entry| entry.as_object().context(SHAPE))
+            .collect::<Result<_>>()?,
+        Some(_) => bail!(SHAPE),
     };
-    let object = value.as_object().context("qk:warm must be an object")?;
+    let mut entries: Vec<Warm> = Vec::new();
+    for object in objects {
+        let warm = entry(workspace, task, object)?;
+        if entries.iter().any(|other| other.identity == warm.identity) {
+            bail!(match warm.group() {
+                Some(group) => format!("qk:warm names group {group:?} twice"),
+                None => "only one qk:warm entry may go without a group".to_owned(),
+            });
+        }
+        for name in warm.env.keys() {
+            if entries.iter().any(|other| other.env.contains_key(name)) {
+                bail!("qk:warm sets {name} in more than one entry");
+            }
+        }
+        entries.push(warm);
+    }
+    Ok(entries)
+}
+
+/// One `qk:warm` object.
+fn entry(
+    workspace: &Workspace,
+    task: &Task,
+    object: &serde_json::Map<String, Value>,
+) -> Result<Warm> {
     for key in object.keys() {
         if !matches!(
             key.as_str(),
@@ -121,10 +162,17 @@ pub fn config(workspace: &Workspace, task: &Task) -> Result<Option<Warm>> {
                 .context("qk:warm.group must be a name")
         })
         .transpose()?;
-    if group.is_some() && (object.contains_key("outputs") || object.contains_key("paths")) {
-        bail!("a qk:warm.group shares {{warm}} alone; outputs and paths belong to one task");
+    // `survive` keeps `paths` across a dependency, which a group has none of.
+    if group.is_some()
+        && ["outputs", "paths", "survive"]
+            .iter()
+            .any(|key| object.contains_key(*key))
+    {
+        bail!(
+            "a qk:warm.group shares {{warm}} alone; outputs, paths and survive belong to one task"
+        );
     }
-    let identity = group.map_or_else(|| task.id.clone(), |group| format!("group {group}"));
+    let identity = group.map_or_else(|| task.id.clone(), |group| format!("{GROUP}{group}"));
     const SURVIVE_SHAPE: &str = "qk:warm.survive must be an array of target names";
     let survive = object
         .get("survive")
@@ -261,7 +309,7 @@ pub fn config(workspace: &Workspace, task: &Task) -> Result<Option<Warm>> {
         Some(Some("background")) => true,
         Some(_) => bail!("qk:warm.save must be \"wait\" or \"background\""),
     };
-    Ok(Some(Warm {
+    Ok(Warm {
         identity,
         outputs: flag("outputs", false)?,
         paths,
@@ -275,7 +323,7 @@ pub fn config(workspace: &Workspace, task: &Task) -> Result<Option<Warm>> {
         restore_keys,
         survive,
         background,
-    }))
+    })
 }
 
 /// The directory `{warm}` names for a task or group, in the worktree's state.
@@ -286,6 +334,11 @@ fn directory(workspace: &Workspace, identity: &str) -> PathBuf {
 }
 
 impl Warm {
+    /// The group the entry shares its saves with, if it names one.
+    pub fn group(&self) -> Option<&str> {
+        self.identity.strip_prefix(GROUP)
+    }
+
     /// The scratch paths without their exclusions: what the task keeps,
     /// whether or not it is saved, and so never an input.
     pub fn kept_paths(&self) -> Vec<String> {
@@ -295,6 +348,11 @@ impl Warm {
             .cloned()
             .collect()
     }
+}
+
+/// The scratch paths every entry keeps.
+pub fn kept_paths(entries: &[Warm]) -> Vec<String> {
+    entries.iter().flat_map(Warm::kept_paths).collect()
 }
 
 /// Paths moved aside while a dependency that deletes them runs, and moved
@@ -460,7 +518,11 @@ fn depends_on(graph: &TaskGraph, from: &str, on: &str) -> bool {
 pub fn keep_across(workspace: &Workspace, graph: &TaskGraph, task: &Task) -> Kept {
     let mut kept = Kept::default();
     for owner in graph.tasks.values() {
-        let Ok(Some(warm)) = config(workspace, owner) else {
+        let Ok(entries) = config(workspace, owner) else {
+            continue;
+        };
+        // Only the task's own entry has paths to keep.
+        let Some(warm) = entries.into_iter().find(|warm| warm.group().is_none()) else {
             continue;
         };
         if !warm.survive.iter().any(|entry| names(owner, entry, task))
@@ -646,10 +708,7 @@ fn stash(
 pub fn check_overlaps(workspace: &Workspace, graph: &TaskGraph) -> Result<()> {
     let mut claimed: Vec<(String, &str)> = Vec::new();
     for (id, task) in &graph.tasks {
-        let Some(warm) = config(workspace, task)? else {
-            continue;
-        };
-        for path in warm.kept_paths() {
+        for path in kept_paths(&config(workspace, task)?) {
             if let Some((_, other)) = claimed.iter().find(|(known, _)| {
                 known == &path
                     || known.starts_with(&format!("{path}/"))
@@ -689,6 +748,9 @@ struct RestoredFiles {
 /// What a restore brought back.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Restored {
+    /// The group the entry shares its saves with, absent for the task's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     /// `local` for this worktree's own save, `worktree <root>` for another
     /// worktree's, or `remote <branch>`.
     pub source: String,
@@ -701,15 +763,18 @@ pub struct Restored {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WarmReport {
-    /// What was restored before the run, if anything.
-    pub restored: Option<Restored>,
-    /// The groups already on disk before the run, which were left as they were.
+    /// What each entry restored before the run, for those that restored any.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub restored: Vec<Restored>,
+    /// The groups already on disk before the run, which were left as they
+    /// were: `outputs`, `paths` and `directory` for the task's own entry, and
+    /// a named group's name for its directory.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub present: Vec<String>,
-    /// How long saving it after the run took, when it was saved before the
-    /// task reported.
+    /// How long saving the entries after the run took, when any was saved
+    /// before the task reported.
     pub save_ms: Option<u64>,
-    /// Whether it was saved in the background, after the task reported.
+    /// Whether any entry was saved in the background, after the task reported.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub background: bool,
 }
@@ -1081,7 +1146,10 @@ impl Cache {
         warm: &Warm,
         prepared: &qk_executor::PreparedTask,
     ) -> Result<(Restored, Vec<String>)> {
-        let mut restored = Restored::default();
+        let mut restored = Restored {
+            group: warm.group().map(str::to_owned),
+            ..Restored::default()
+        };
         let _lock = self.lock_warm(warm)?;
         // Local state wins: it is the newest for this checkout.
         let mut present = Vec::new();
@@ -1090,7 +1158,7 @@ impl Cache {
             if location.paths()?.is_empty() {
                 missing.push(location);
             } else {
-                present.push(location.name.to_owned());
+                present.push(warm.group().map_or(location.name, |group| group).to_owned());
             }
         }
         if missing.is_empty() {
@@ -1478,13 +1546,67 @@ mod tests {
         (temp, workspace, graph)
     }
 
+    /// The `qk:warm` entries of an `app:build` whose target declares `warm`.
+    fn entries(warm: Value) -> Result<Vec<Warm>> {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("nx.json"), "{}").unwrap();
+        fs::write(
+            temp.path().join("project.json"),
+            json!({"name": "app", "targets": {"build": {"command": "true", "qk:warm": warm}}})
+                .to_string(),
+        )
+        .unwrap();
+        let workspace = Workspace::load(temp.path()).unwrap();
+        let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
+        config(&workspace, &graph.tasks["app:build"])
+    }
+
+    #[test]
+    fn an_array_holds_the_task_entry_beside_groups() {
+        let entries = entries(json!([
+            {"group": "metro", "portable": true, "env": {"METRO_CACHE_ROOT": "{warm}/metro"}},
+            {"paths": ["build"], "mtimes": "preserve"}
+        ]))
+        .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].group(), Some("metro"));
+        assert!(entries[0].portable && entries[0].directory);
+        assert_eq!(entries[1].group(), None);
+        assert!(!entries[1].portable && entries[1].preserve_mtimes);
+        assert_eq!(kept_paths(&entries), ["build"]);
+    }
+
+    #[test]
+    fn entries_cannot_share_saves_or_variables() {
+        let error = |warm| format!("{:#}", entries(warm).unwrap_err());
+        assert_eq!(
+            error(json!([{"paths": ["one"]}, {"paths": ["two"]}])),
+            "only one qk:warm entry may go without a group"
+        );
+        assert_eq!(
+            error(json!([{"group": "metro"}, {"group": "metro"}])),
+            "qk:warm names group \"metro\" twice"
+        );
+        assert_eq!(
+            error(json!([
+                {"group": "one", "env": {"CACHE": "{warm}/one"}},
+                {"group": "two", "env": {"CACHE": "{warm}/two"}}
+            ])),
+            "qk:warm sets CACHE in more than one entry"
+        );
+        assert_eq!(
+            error(json!(["build"])),
+            "qk:warm must be an object or an array of objects"
+        );
+    }
+
     /// An external owner lock must not prevent another stash's final release.
     #[test]
     fn waiting_for_an_owner_does_not_block_other_releases() {
         let (_temp, workspace, graph) = fixture();
         let one = &graph.tasks["app:one"];
         let two = &graph.tasks["app:two"];
-        let first = acquire(&workspace, one, &config(&workspace, one).unwrap().unwrap()).unwrap();
+        let first = acquire(&workspace, one, &config(&workspace, one).unwrap()[0]).unwrap();
         let state = paths::worktree_state(&workspace.root).join("warm-kept");
         let lock = fs::OpenOptions::new()
             .create(true)
@@ -1498,7 +1620,7 @@ mod tests {
         let completed = std::thread::scope(|scope| {
             scope.spawn(|| {
                 let second =
-                    acquire(&workspace, two, &config(&workspace, two).unwrap().unwrap()).unwrap();
+                    acquire(&workspace, two, &config(&workspace, two).unwrap()[0]).unwrap();
                 release(&second);
             });
             std::thread::sleep(Duration::from_millis(100));
@@ -1525,7 +1647,7 @@ mod tests {
     fn unreadable_ownership_preserves_saved_paths() {
         let (_temp, workspace, graph) = fixture();
         let owner = &graph.tasks["app:one"];
-        let warm = config(&workspace, owner).unwrap().unwrap();
+        let warm = config(&workspace, owner).unwrap().remove(0);
         let root = acquire(&workspace, owner, &warm).unwrap();
         let entry = ACTIVE.lock().unwrap().remove(&root).unwrap();
         drop(entry); // Simulate a stopped process, without returning its paths.
@@ -1546,7 +1668,7 @@ mod tests {
     fn inspection_errors_keep_recovery_incomplete() {
         let (_temp, workspace, graph) = fixture();
         let owner = &graph.tasks["app:one"];
-        let warm = config(&workspace, owner).unwrap().unwrap();
+        let warm = config(&workspace, owner).unwrap().remove(0);
         let root = acquire(&workspace, owner, &warm).unwrap();
         let entry = ACTIVE.lock().unwrap().remove(&root).unwrap();
         let saved = root.with_extension("saved");
