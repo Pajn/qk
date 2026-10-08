@@ -790,7 +790,7 @@ fn versions_crossing_a_dependents_range_affect_its_tasks() {
         assert!(matches!(
             &tasks["app:build"],
             qk_affected::TaskCause::Touched { reasons }
-                if reasons.iter().any(|reason| matches!(reason, qk_affected::TaskReason::Input { file } if file == "libs/lib/package.json"))
+                if reasons.iter().any(|reason| matches!(reason, qk_affected::TaskReason::Relinked { file } if file == "libs/lib/package.json"))
         ));
     }
     // Renamed, the package no longer answers to what app declares.

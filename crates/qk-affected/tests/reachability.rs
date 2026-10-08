@@ -661,3 +661,47 @@ fn a_manifest_change_dependents_cannot_read_carries_nothing() {
         analysis.reachability
     );
 }
+
+#[test]
+fn a_dependency_relinked_by_its_version_runs_the_whole_task() {
+    use qk_affected::{TaskDecision, TaskReason};
+    let repo = visual_repo();
+    write(
+        &repo.root,
+        "apps/app/package.json",
+        r#"{"name": "app", "dependencies": {"lib": "^1.0.0"}}"#,
+    );
+    write(
+        &repo.root,
+        "libs/lib/package.json",
+        r#"{"name": "lib", "version": "1.0.0"}"#,
+    );
+    commit(&repo.root);
+    let repo = Repo {
+        base: git(&repo.root, &["rev-parse", "HEAD"]),
+        root: repo.root.clone(),
+        _temp: repo._temp,
+    };
+    // Out of the range app declares, lib stops being its dependency: what
+    // its tasks depend on changed, though no field dependents read did.
+    write(
+        &repo.root,
+        "libs/lib/package.json",
+        r#"{"name": "lib", "version": "2.0.0"}"#,
+    );
+    let analysis = repo.tasks(Some("reach"));
+    assert!(
+        analysis.tasks.contains_key("app:visual"),
+        "{:?}",
+        analysis.reachability
+    );
+    assert!(
+        matches!(
+            &analysis.reachability["app:visual"],
+            TaskDecision::Whole { why: Kept::Input { reason: TaskReason::Relinked { file } } }
+                if file == "libs/lib/package.json"
+        ),
+        "{:?}",
+        analysis.reachability
+    );
+}

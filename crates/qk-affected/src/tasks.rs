@@ -47,6 +47,10 @@ pub enum TaskCause {
 pub enum TaskReason {
     /// A changed file is one of the task's inputs.
     Input { file: String },
+    /// A dependency's `package.json` moved its name or version into or out of
+    /// what the task's project declares for it, adding or removing that
+    /// dependency.
+    Relinked { file: String },
     /// What an importer the task uses installs differs.
     Installs { importer: String },
     /// A package named by `externalDependencies` is installed differently.
@@ -63,6 +67,10 @@ impl std::fmt::Display for TaskReason {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             Self::Input { file } => write!(f, "input {file} changed"),
+            Self::Relinked { file } => write!(
+                f,
+                "{file} moved into or out of what this project declares for it"
+            ),
             Self::Installs { importer } => write!(f, "what {importer} installs changed"),
             Self::Package { name } => write!(f, "external dependency {name} changed"),
             Self::Lockfile => write!(f, "the lockfile's version or settings changed"),
@@ -174,12 +182,8 @@ pub fn affected_tasks(
                     qk_cache::InputChange::WorkspaceFile => TaskReason::WorkspaceFile,
                 }),
         );
-        if let Some(file) = relinked.get(&graph.tasks[id].project)
-            && !reasons
-                .iter()
-                .any(|reason| matches!(reason, TaskReason::Input { file: input } if input == file))
-        {
-            reasons.push(TaskReason::Input { file: file.clone() });
+        if let Some(file) = relinked.get(&graph.tasks[id].project) {
+            reasons.push(TaskReason::Relinked { file: file.clone() });
         }
         if !reasons.is_empty() {
             touched.insert(id.clone(), reasons);
