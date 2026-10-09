@@ -3,7 +3,7 @@
 use std::io::Write;
 
 use anyhow::{Result, bail};
-use qk_affected::{Analysis, Cause, Decision, Kept, Reason};
+use qk_affected::{Analysis, Cause, Decision, Kept, Reason, TaskDecision};
 use qk_config::Workspace;
 use qk_graph::graph_order;
 use serde_json::json;
@@ -33,7 +33,7 @@ pub fn explain(
             let steps: Vec<_> = chain
                 .iter()
                 .flatten()
-                .map(|name| match &analysis.projects[*name] {
+                .map(|name| match analysis.cause(name).expect("a chain step is affected") {
                     Cause::DependsOn {
                         project,
                         kind,
@@ -76,12 +76,12 @@ pub fn explain(
                         };
                         format!("touched: {}{more}", reasons[0])
                     }
-                    Cause::DependsOn { project, .. } => match analysis.reachability.get(&name) {
-                        Some(decision) => format!("depends on {project}; {decision}"),
-                        None => format!("depends on {project}"),
-                    },
+                    Cause::DependsOn { project, .. } => format!("depends on {project}"),
                 };
-                writeln!(out, "{name:width$}  {summary}")?;
+                match analysis.reachability.get(&name) {
+                    Some(decision) => writeln!(out, "{name:width$}  {summary}; {decision}")?,
+                    None => writeln!(out, "{name:width$}  {summary}")?,
+                }
             }
             let left_out = graph_order(
                 &workspace.projects,
@@ -105,24 +105,16 @@ pub fn explain(
             explain_projections(analysis, out)?;
             let Some(chain) = analysis.chain(project) else {
                 match analysis.reachability.get(project) {
-                    Some(Decision::LeftOut { anchors, changed }) => {
+                    Some(Decision::LeftOut { tasks }) => {
                         writeln!(
                             out,
-                            "{project} is left out: none of its anchors imports a change it is affected through."
+                            "{project} is left out: import reachability left out each task of it a change affects."
                         )?;
-                        writeln!(out, "Anchors searched:")?;
-                        for anchor in anchors {
-                            writeln!(out, "  {anchor}")?;
-                        }
-                        writeln!(out, "Changes it is affected through:")?;
-                        for file in changed {
-                            writeln!(out, "  {file}")?;
+                        let width = tasks.keys().map(String::len).max().unwrap_or(0);
+                        for (id, decision) in tasks {
+                            writeln!(out, "  {id:width$}  {decision}")?;
                         }
                     }
-                    Some(Decision::Through { project: through }) => writeln!(
-                        out,
-                        "{project} is left out: it is affected only through {through}, which import reachability left out."
-                    )?,
                     _ => writeln!(out, "{project} is not affected.")?,
                 }
                 return Ok(());
@@ -136,7 +128,9 @@ pub fn explain(
                     "{project} is affected because it depends on {touched}:"
                 )?;
                 for pair in chain.windows(2) {
-                    let Cause::DependsOn { kind, .. } = &analysis.projects[pair[0]] else {
+                    let Cause::DependsOn { kind, .. } =
+                        analysis.cause(pair[0]).expect("a chain step is affected")
+                    else {
                         unreachable!("only the last step of a chain is touched");
                     };
                     writeln!(out, "  {} -> {} ({kind})", pair[0], pair[1])?;
@@ -152,7 +146,10 @@ pub fn explain(
                 }
                 writeln!(out, "{touched} is touched:")?;
             }
-            let Cause::Touched { reasons } = &analysis.projects[*touched] else {
+            let Cause::Touched { reasons } = analysis
+                .cause(touched)
+                .expect("a chain ends at an affected project")
+            else {
                 unreachable!("a chain ends at a touched project");
             };
             for reason in reasons {
@@ -174,9 +171,13 @@ pub fn explain(
                     }
                 }
             }
-            if let Some(Decision::Kept { why }) = analysis.reachability.get(project) {
-                writeln!(out, "Import reachability kept it: {why}")?;
-                if let Kept::Reached { chain, .. } = why
+            if let Some(decision @ Decision::Kept { decision: task, .. }) =
+                analysis.reachability.get(project)
+            {
+                writeln!(out, "Import reachability {decision}")?;
+                if let Some(TaskDecision::Whole {
+                    why: Kept::Reached { chain, .. },
+                }) = task
                     && chain.len() > 2
                 {
                     for pair in chain.windows(2) {

@@ -13,7 +13,7 @@ use qk_lockfile::Lockfile;
 use qk_taskgraph::TaskGraph;
 use serde::Serialize;
 
-use crate::reachability::{self, TaskDecision};
+use crate::reachability::{self, Configs, TaskDecision};
 use crate::{Changes, FileChange, Options, projections};
 
 /// The affected tasks of a task graph and why each one is affected.
@@ -24,9 +24,9 @@ pub struct TaskAnalysis {
     pub range: Option<crate::Range>,
     pub files: Vec<String>,
     pub tasks: BTreeMap<String, TaskCause>,
-    /// Under a profile with reachability, what it decided for each task with
-    /// `qk:reachability` that ordinary selection affects, and for each task
-    /// affected only through those it left out.
+    /// Under a profile with reachability, what it decided for each task it
+    /// narrows that ordinary selection affects, and for each task affected
+    /// only through those it left out.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub reachability: BTreeMap<String, TaskDecision>,
 }
@@ -88,17 +88,34 @@ pub fn affected_tasks(
     graph: &TaskGraph,
     options: &Options,
 ) -> Result<TaskAnalysis> {
-    let reach = match &options.affected_profile {
+    let configs = match &options.affected_profile {
         Some(profile) => {
             anyhow::ensure!(
                 !projections::has_projections(workspace, profile)?,
                 "--affected-profile with projections applies to project selection; task selection uses declared cache inputs"
             );
-            true
+            projections::reachability(workspace, profile)?
+                .map(|reach| Configs::load(workspace, reach))
+                .transpose()?
         }
-        None => false,
+        None => None,
     };
-    let changes = Changes::unfiltered(workspace, options)?;
+    analyse(
+        workspace,
+        graph,
+        Changes::unfiltered(workspace, options)?,
+        configs.as_ref(),
+    )
+}
+
+/// The tasks of `graph` that `changes` affect, narrowed by `configs` when
+/// given.
+pub(crate) fn analyse(
+    workspace: &Workspace,
+    graph: &TaskGraph,
+    changes: Changes,
+    configs: Option<&Configs>,
+) -> Result<TaskAnalysis> {
     if changes.files.is_empty() {
         return Ok(TaskAnalysis {
             base: changes.base,
@@ -192,8 +209,8 @@ pub fn affected_tasks(
     }
     let mut tasks = propagate(graph, &touched, &BTreeSet::new());
     let mut decisions = BTreeMap::new();
-    if reach {
-        decisions = reachability::decide_tasks(workspace, graph, &changes, &tasks)?;
+    if let Some(configs) = configs {
+        decisions = reachability::decide_tasks(workspace, graph, &changes, &tasks, configs)?;
         let left_out: BTreeSet<String> = decisions
             .iter()
             .filter(|(_, decision)| matches!(decision, TaskDecision::LeftOut { .. }))

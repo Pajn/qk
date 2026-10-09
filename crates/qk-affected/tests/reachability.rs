@@ -2,25 +2,35 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use qk_affected::{Analysis, Decision, Kept, Options, analyse};
+use qk_affected::{Analysis, Decision, Kept, Options, TaskDecision, analyse};
 use qk_config::Workspace;
 use qk_graph::ProjectGraph;
 use tempfile::TempDir;
 
-/// `app` imports one of `lib`'s two modules, and declares reachability.
-/// `app-e2e` drives `app`, and `other` depends on `lib` without declaring it.
+/// `app` imports one of `lib`'s two modules, and its `build` names the `app`
+/// config. `app-e2e` drives `app` through `app`'s entry point, and `other`
+/// depends on `lib` without narrowing.
 struct Repo {
     _temp: TempDir,
     root: PathBuf,
     base: String,
 }
 
+const NX_JSON: &str = r#"{
+    "qk:reachability": {
+        "app": {
+            "anchors": ["{projectRoot}/src/main.ts"],
+            "sources": ["{projectRoot}/src/**/*", "{workspaceRoot}/libs/*/src/**/*"]
+        }
+    },
+    "qk:affectedProfiles": {"reach": {"reachability": true}}
+}"#;
+
 const APP: &str = r#"{
     "name": "app",
     "implicitDependencies": ["lib"],
-    "qk:reachability": {
-        "anchors": ["{projectRoot}/src/main.ts"],
-        "sources": ["{projectRoot}/src/**/*", "{workspaceRoot}/libs/*/src/**/*"]
+    "targets": {
+        "build": {"command": "echo build", "inputs": ["default", "^default"], "qk:reachability": "app"}
     }
 }"#;
 
@@ -29,10 +39,7 @@ impl Repo {
         let temp = TempDir::new().unwrap();
         let root = temp.path().to_path_buf();
         let mut files = vec![
-            (
-                "nx.json",
-                r#"{"qk:affectedProfiles": {"reach": {"reachability": true}}}"#,
-            ),
+            ("nx.json", NX_JSON),
             ("apps/app/project.json", APP),
             (
                 "apps/app/src/main.ts",
@@ -40,14 +47,30 @@ impl Repo {
             ),
             (
                 "apps/app-e2e/project.json",
-                r#"{"name": "app-e2e", "implicitDependencies": ["app"]}"#,
+                r#"{
+                    "name": "app-e2e",
+                    "implicitDependencies": ["app"],
+                    "targets": {
+                        "e2e": {
+                            "command": "echo e2e",
+                            "inputs": ["default", "^default"],
+                            "qk:reachability": {
+                                "anchors": ["{workspaceRoot}/apps/app/src/main.ts"],
+                                "sources": ["{workspaceRoot}/apps/app/src/**/*", "{workspaceRoot}/libs/*/src/**/*"]
+                            }
+                        }
+                    }
+                }"#,
             ),
             ("apps/app-e2e/src/spec.ts", "export const spec = 1;\n"),
             (
                 "apps/other/project.json",
-                r#"{"name": "other", "implicitDependencies": ["lib"]}"#,
+                r#"{"name": "other", "implicitDependencies": ["lib"], "targets": {"build": {"command": "echo build", "inputs": ["default", "^default"]}}}"#,
             ),
-            ("libs/lib/project.json", r#"{"name": "lib"}"#),
+            (
+                "libs/lib/project.json",
+                r#"{"name": "lib", "targets": {"build": {"command": "echo build", "inputs": ["default"]}}}"#,
+            ),
             ("libs/lib/src/used.ts", "export const used = 1;\n"),
             ("libs/lib/src/unused.ts", "export const unused = 1;\n"),
         ];
@@ -148,8 +171,16 @@ fn decisions(analysis: &Analysis) -> BTreeMap<&str, &Decision> {
         .collect()
 }
 
+/// The decision for the task a project was kept for.
+fn kept<'a>(analysis: &'a Analysis, project: &str) -> (&'a str, Option<&'a TaskDecision>) {
+    match &analysis.reachability[project] {
+        Decision::Kept { task, decision } => (task, decision.as_ref()),
+        decision => panic!("{project}: {decision:?}"),
+    }
+}
+
 #[test]
-fn a_change_no_anchor_imports_leaves_the_project_out_with_what_only_it_leads_to() {
+fn a_change_no_anchor_imports_leaves_the_project_out() {
     let repo = Repo::new(&[]);
     write(
         &repo.root,
@@ -162,13 +193,16 @@ fn a_change_no_anchor_imports_leaves_the_project_out_with_what_only_it_leads_to(
     assert!(
         matches!(
             decisions["app"],
-            Decision::LeftOut { anchors, changed }
-                if anchors == &["apps/app/src/main.ts"] && changed == &["libs/lib/src/unused.ts"]
+            Decision::LeftOut { tasks } if matches!(
+                &tasks["app:build"],
+                TaskDecision::LeftOut { anchors, changed, .. }
+                    if anchors == &["apps/app/src/main.ts"] && changed == &["libs/lib/src/unused.ts"]
+            )
         ),
         "{decisions:?}"
     );
     assert!(
-        matches!(decisions["app-e2e"], Decision::Through { project } if project == "app"),
+        matches!(decisions["app-e2e"], Decision::LeftOut { tasks } if tasks.contains_key("app-e2e:e2e")),
         "{decisions:?}"
     );
     // Ordinary selection is unchanged.
@@ -187,18 +221,19 @@ fn a_change_an_anchor_imports_keeps_the_project_with_the_chain() {
     );
     let analysis = repo.analyse(Some("reach"));
     assert_eq!(projects(&analysis), ["app", "app-e2e", "lib", "other"]);
-    let decisions = decisions(&analysis);
     assert!(
         matches!(
-            decisions["app"],
-            Decision::Kept { why: Kept::Reached { anchor, changed, chain } }
+            kept(&analysis, "app"),
+            ("app:build", Some(TaskDecision::Whole { why: Kept::Reached { anchor, changed, chain } }))
                 if anchor == "apps/app/src/main.ts"
                     && changed == "libs/lib/src/used.ts"
                     && chain == &["apps/app/src/main.ts", "libs/lib/src/used.ts"]
         ),
-        "{decisions:?}"
+        "{:?}",
+        analysis.reachability
     );
-    assert!(!decisions.contains_key("app-e2e"), "{decisions:?}");
+    // A project without a narrowed task is not decided.
+    assert!(!analysis.reachability.contains_key("other"));
 }
 
 #[test]
@@ -207,14 +242,19 @@ fn a_change_imports_do_not_carry_keeps_the_project() {
     write(
         &repo.root,
         "libs/lib/project.json",
-        r#"{"name": "lib", "tags": ["changed"]}"#,
+        r#"{"name": "lib", "tags": ["changed"], "targets": {"build": {"command": "echo build", "inputs": ["default"]}}}"#,
     );
     let analysis = repo.analyse(Some("reach"));
     assert_eq!(projects(&analysis), ["app", "app-e2e", "lib", "other"]);
     assert!(
         matches!(
-            decisions(&analysis)["app"],
-            Decision::Kept { why: Kept::NotImported { project, .. } } if project == "lib"
+            kept(&analysis, "app"),
+            (
+                "app:build",
+                Some(TaskDecision::Whole {
+                    why: Kept::Input { .. }
+                })
+            )
         ),
         "{:?}",
         analysis.reachability
@@ -235,8 +275,8 @@ fn an_import_nothing_places_keeps_the_project() {
     let analysis = repo.analyse(Some("reach"));
     assert!(
         matches!(
-            decisions(&analysis)["app"],
-            Decision::Kept { why: Kept::Gap { specifier, .. } } if specifier == "./gone"
+            kept(&analysis, "app"),
+            (_, Some(TaskDecision::Whole { why: Kept::Gap { specifier, .. } })) if specifier == "./gone"
         ),
         "{:?}",
         analysis.reachability
@@ -245,12 +285,18 @@ fn an_import_nothing_places_keeps_the_project() {
 }
 
 #[test]
-fn a_project_touched_directly_is_not_narrowed() {
+fn a_project_is_decided_by_its_own_changes_too() {
     let repo = Repo::new(&[]);
     write(
         &repo.root,
-        "libs/lib/src/unused.ts",
-        "export const unused = 2;\n",
+        "apps/app/src/stray.ts",
+        "export const stray = 1;\n",
+    );
+    let analysis = repo.analyse(Some("reach"));
+    assert!(
+        matches!(decisions(&analysis)["app"], Decision::LeftOut { .. }),
+        "a file of its own no anchor imports: {:?}",
+        analysis.reachability
     );
     write(
         &repo.root,
@@ -258,9 +304,133 @@ fn a_project_touched_directly_is_not_narrowed() {
         "export const app = 2;\n",
     );
     let analysis = repo.analyse(Some("reach"));
-    assert_eq!(projects(&analysis), ["app", "app-e2e", "lib", "other"]);
     assert!(
-        analysis.reachability.is_empty(),
+        matches!(
+            kept(&analysis, "app"),
+            (
+                _,
+                Some(TaskDecision::Whole {
+                    why: Kept::Reached { .. }
+                })
+            )
+        ),
+        "a changed anchor: {:?}",
+        analysis.reachability
+    );
+}
+
+#[test]
+fn a_project_runs_while_any_affected_task_of_it_does() {
+    // `test` runs inside a harness that imports `unused`, which the app does not.
+    let repo = Repo::new(&[
+        (
+            "nx.json",
+            &NX_JSON.replace(
+                r#""app": {"#,
+                r#""unit": {
+                    "anchors": ["{projectRoot}/test/setup.ts"],
+                    "cases": ["{projectRoot}/src/**/*.test.ts"],
+                    "sources": ["{projectRoot}/src/**/*", "{projectRoot}/test/**/*", "{workspaceRoot}/libs/*/src/**/*"]
+                },
+                "app": {"#,
+            ),
+        ),
+        (
+            "apps/app/project.json",
+            &APP.replace(
+                r#""qk:reachability": "app"}"#,
+                r#""qk:reachability": "app"},
+                "test": {"command": "echo test", "inputs": ["default", "^default"], "qk:reachability": "unit"}"#,
+            ),
+        ),
+        (
+            "apps/app/test/setup.ts",
+            "import { unused } from \"../../../libs/lib/src/unused\";\nexport const setup = unused;\n",
+        ),
+        ("apps/app/src/main.test.ts", "export const test = 1;\n"),
+    ]);
+    write(
+        &repo.root,
+        "libs/lib/src/unused.ts",
+        "export const unused = 2;\n",
+    );
+    let analysis = repo.analyse(Some("reach"));
+    assert!(analysis.projects.contains_key("app"));
+    assert!(
+        matches!(
+            kept(&analysis, "app"),
+            ("app:test", Some(TaskDecision::Whole { why: Kept::Reached { anchor, .. } }))
+                if anchor == "apps/app/test/setup.ts"
+        ),
+        "{:?}",
+        analysis.reachability
+    );
+}
+
+#[test]
+fn the_default_narrows_tasks_that_name_no_config_and_false_declines_it() {
+    let repo = Repo::new(&[
+        (
+            "nx.json",
+            &NX_JSON.replace(
+                r#""reachability": true"#,
+                r#""reachability": {"default": "app"}"#,
+            ),
+        ),
+        (
+            "apps/app/project.json",
+            r#"{
+                "name": "app",
+                "implicitDependencies": ["lib"],
+                "targets": {
+                    "build": {"command": "echo build", "inputs": ["default", "^default"]},
+                    "lint": {"command": "echo lint", "inputs": ["default", "^default"], "qk:reachability": false}
+                }
+            }"#,
+        ),
+    ]);
+    write(
+        &repo.root,
+        "libs/lib/src/unused.ts",
+        "export const unused = 2;\n",
+    );
+    let analysis = repo.analyse(Some("reach"));
+    assert!(
+        matches!(kept(&analysis, "app"), ("app:lint", None)),
+        "{:?}",
+        analysis.reachability
+    );
+    // `other` takes the default too, and has no file it anchors.
+    assert!(
+        matches!(
+            kept(&analysis, "other"),
+            ("other:build", Some(TaskDecision::Whole { why: Kept::Unanswered { detail } }))
+                if detail.contains("name no file")
+        ),
+        "{:?}",
+        analysis.reachability
+    );
+
+    let project = std::fs::read_to_string(repo.root.join("apps/app/project.json")).unwrap();
+    write(
+        &repo.root,
+        "apps/app/project.json",
+        &project.replace(r#""qk:reachability": false"#, r#""qk:reachability": "app""#),
+    );
+    commit(&repo.root);
+    let repo = Repo {
+        base: git(&repo.root, &["rev-parse", "HEAD"]),
+        root: repo.root.clone(),
+        _temp: repo._temp,
+    };
+    write(
+        &repo.root,
+        "libs/lib/src/unused.ts",
+        "export const unused = 3;\n",
+    );
+    let analysis = repo.analyse(Some("reach"));
+    assert!(
+        matches!(&decisions(&analysis)["app"], Decision::LeftOut { tasks } if tasks.len() == 2),
         "{:?}",
         analysis.reachability
     );
@@ -281,8 +451,9 @@ fn a_head_other_than_the_checkout_keeps_every_project() {
     assert!(analysis.projects.contains_key("app"));
     assert!(
         matches!(
-            decisions(&analysis)["app"],
-            Decision::Kept { why: Kept::Unanswered { detail } } if detail.contains("not checked out")
+            kept(&analysis, "app"),
+            (_, Some(TaskDecision::Whole { why: Kept::Unanswered { detail } }))
+                if detail.contains("not checked out")
         ),
         "{:?}",
         analysis.reachability
@@ -291,45 +462,93 @@ fn a_head_other_than_the_checkout_keeps_every_project() {
 
 #[test]
 fn invalid_settings_are_refused() {
-    for (settings, message) in [
+    let target = |settings: &str| {
         (
-            r#"{"anchors": ["{projectRoot}/src/main.ts"]}"#,
+            "apps/app/project.json",
+            APP.replace(
+                r#""qk:reachability": "app""#,
+                &format!(r#""qk:reachability": {settings}"#),
+            ),
+        )
+    };
+    for (file, message) in [
+        (
+            target(r#"{"anchors": ["{projectRoot}/src/main.ts"]}"#),
             "needs sources",
         ),
         (
-            r#"{"sources": ["{projectRoot}/src/**/*"]}"#,
-            "needs anchors",
+            target(r#"{"sources": ["{projectRoot}/src/**/*"]}"#),
+            "needs anchors or cases",
         ),
         (
-            r#"{"anchors": ["a"], "sources": ["b"], "cases": ["c"]}"#,
-            "belongs on a target",
-        ),
-        (
-            r#"{"anchors": ["a"], "sources": ["b"], "entry": ["c"]}"#,
+            target(r#"{"anchors": ["a"], "sources": ["b"], "entry": ["c"]}"#),
             "unknown",
         ),
-        (r#"{"anchors": "a", "sources": ["b"]}"#, "array of paths"),
-    ] {
-        let repo = Repo::new(&[(
-            "apps/app/project.json",
-            &format!(
-                r#"{{"name": "app", "implicitDependencies": ["lib"], "qk:reachability": {settings}}}"#
+        (
+            target(r#"{"anchors": "a", "sources": ["b"]}"#),
+            "array of paths",
+        ),
+        (target(r#""missing""#), "\"missing\", which is not a config"),
+        (
+            target("true"),
+            "must name a config, be false or be an object",
+        ),
+        (
+            (
+                "nx.json",
+                NX_JSON.replace(r#""anchors": ["{projectRoot}/src/main.ts"],"#, ""),
             ),
-        )]);
-        // A change that does not reach the project still finds the mistake.
+            "nx.json qk:reachability.app needs anchors or cases",
+        ),
+        (
+            (
+                "nx.json",
+                NX_JSON.replace(
+                    r#""reachability": true"#,
+                    r#""reachability": {"default": "none"}"#,
+                ),
+            ),
+            "default \"none\" is not a config",
+        ),
+        (
+            (
+                "nx.json",
+                NX_JSON.replace(
+                    r#""reachability": true"#,
+                    r#""reachability": {"fallback": "app"}"#,
+                ),
+            ),
+            "unknown reachability field",
+        ),
+        (
+            (
+                "apps/other/project.json",
+                r#"{"name": "other", "qk:reachability": {"anchors": ["a"], "sources": ["b"]}}"#
+                    .into(),
+            ),
+            "project other declares qk:reachability, which is read from targets",
+        ),
+    ] {
+        let repo = Repo::new(&[(file.0, &file.1)]);
+        // A change that does not reach the task still finds the mistake.
         write(&repo.root, "apps/other/README.md", "changed");
         let error = repo.error("reach");
-        assert!(error.contains(message), "{settings}: {error}");
+        assert!(error.contains(message), "{}: {error}", file.1);
     }
 }
 
 #[test]
 fn a_profile_needs_projections_or_reachability() {
-    let repo = Repo::new(&[("nx.json", r#"{"qk:affectedProfiles": {"empty": {}}}"#)]);
-    assert!(
-        repo.error("empty")
-            .contains("must contain projections or enable reachability")
-    );
+    for profile in ["{}", r#"{"reachability": false}"#] {
+        let repo = Repo::new(&[(
+            "nx.json",
+            &format!(r#"{{"qk:affectedProfiles": {{"empty": {profile}}}}}"#),
+        )]);
+        assert!(
+            repo.error("empty")
+                .contains("must contain projections or enable reachability")
+        );
+    }
 }
 
 /// `app:visual` has a shell every case renders in and two cases, one of which
@@ -398,7 +617,6 @@ fn task_ids(analysis: &qk_affected::TaskAnalysis) -> Vec<&str> {
 
 #[test]
 fn a_change_no_case_imports_leaves_the_task_out_with_what_only_it_leads_to() {
-    use qk_affected::TaskDecision;
     let repo = visual_repo();
     write(
         &repo.root,
@@ -434,7 +652,6 @@ fn a_change_no_case_imports_leaves_the_task_out_with_what_only_it_leads_to() {
 
 #[test]
 fn only_the_cases_a_change_reaches_are_selected() {
-    use qk_affected::TaskDecision;
     let repo = visual_repo();
     write(
         &repo.root,
@@ -462,7 +679,6 @@ fn only_the_cases_a_change_reaches_are_selected() {
 
 #[test]
 fn a_changed_case_selects_itself() {
-    use qk_affected::TaskDecision;
     let repo = visual_repo();
     write(
         &repo.root,
@@ -481,7 +697,6 @@ fn a_changed_case_selects_itself() {
 
 #[test]
 fn the_whole_task_runs_when_its_shell_or_a_non_source_input_changes() {
-    use qk_affected::TaskDecision;
     let repo = visual_repo();
     write(
         &repo.root,
@@ -543,17 +758,12 @@ fn task_selection_refuses_profiles_with_projections() {
 
 #[test]
 fn exclusions_take_files_out_of_sources_and_cases() {
-    use qk_affected::TaskDecision;
     let repo = Repo::new(&[(
-        "apps/app/project.json",
-        r#"{
-            "name": "app",
-            "implicitDependencies": ["lib"],
-            "qk:reachability": {
-                "anchors": ["{projectRoot}/src/main.ts"],
-                "sources": ["!{workspaceRoot}/libs/*/src/**/*.test.ts", "{projectRoot}/src/**/*", "{workspaceRoot}/libs/*/src/**/*"]
-            }
-        }"#,
+        "nx.json",
+        &NX_JSON.replace(
+            r#""sources": ["{projectRoot}/src/**/*""#,
+            r#""sources": ["!{workspaceRoot}/libs/*/src/**/*.test.ts", "{projectRoot}/src/**/*""#,
+        ),
     )]);
     write(
         &repo.root,
@@ -563,23 +773,19 @@ fn exclusions_take_files_out_of_sources_and_cases() {
     let analysis = repo.analyse(Some("reach"));
     assert!(
         matches!(
-            decisions(&analysis)["app"],
-            Decision::Kept { why: Kept::NotImported { reason: qk_affected::Reason::File { file }, .. } }
+            kept(&analysis, "app"),
+            (_, Some(TaskDecision::Whole { why: Kept::Input { reason: qk_affected::TaskReason::Input { file } } }))
                 if file == "libs/lib/src/unused.test.ts"
         ),
         "an excluded file is not a source: {:?}",
         analysis.reachability
     );
     let repo2 = Repo::new(&[(
-        "apps/app/project.json",
-        r#"{
-            "name": "app",
-            "implicitDependencies": ["lib"],
-            "qk:reachability": {
-                "anchors": ["{projectRoot}/src/main.ts"],
-                "sources": ["{projectRoot}/src/**/*", "{workspaceRoot}/libs/*/src/**/*", "!{workspaceRoot}/libs/*/src/**/*.test.ts"]
-            }
-        }"#,
+        "nx.json",
+        &NX_JSON.replace(
+            r#""{workspaceRoot}/libs/*/src/**/*"]"#,
+            r#""{workspaceRoot}/libs/*/src/**/*", "!{workspaceRoot}/libs/*/src/**/*.test.ts"]"#,
+        ),
     )]);
     write(
         &repo2.root,
@@ -652,10 +858,13 @@ fn a_manifest_change_dependents_cannot_read_carries_nothing() {
     let analysis = repo.analyse(Some("reach"));
     assert!(
         matches!(
-            decisions(&analysis)["app"],
-            Decision::Kept {
-                why: Kept::NotImported { .. }
-            }
+            kept(&analysis, "app"),
+            (
+                _,
+                Some(TaskDecision::Whole {
+                    why: Kept::Input { .. }
+                })
+            )
         ),
         "a declaration still counts: {:?}",
         analysis.reachability
@@ -664,7 +873,7 @@ fn a_manifest_change_dependents_cannot_read_carries_nothing() {
 
 #[test]
 fn a_dependency_relinked_by_its_version_runs_the_whole_task() {
-    use qk_affected::{TaskDecision, TaskReason};
+    use qk_affected::TaskReason;
     let repo = visual_repo();
     write(
         &repo.root,
@@ -704,4 +913,38 @@ fn a_dependency_relinked_by_its_version_runs_the_whole_task() {
         "{:?}",
         analysis.reachability
     );
+}
+
+#[test]
+fn target_defaults_can_name_a_config() {
+    let repo = Repo::new(&[
+        (
+            "nx.json",
+            &NX_JSON.replace(
+                r#""qk:affectedProfiles""#,
+                r#""targetDefaults": {"build": {"qk:reachability": "app"}},
+                "qk:affectedProfiles""#,
+            ),
+        ),
+        (
+            "apps/app/project.json",
+            &APP.replace(r#", "qk:reachability": "app""#, ""),
+        ),
+        (
+            "apps/other/project.json",
+            r#"{"name": "other", "implicitDependencies": ["lib"], "targets": {"build": {"command": "echo build", "inputs": ["default", "^default"], "qk:reachability": false}}}"#,
+        ),
+    ]);
+    write(
+        &repo.root,
+        "libs/lib/src/unused.ts",
+        "export const unused = 2;\n",
+    );
+    let analysis = repo.analyse(Some("reach"));
+    assert!(
+        matches!(decisions(&analysis)["app"], Decision::LeftOut { .. }),
+        "{:?}",
+        analysis.reachability
+    );
+    assert!(analysis.projects.contains_key("other"));
 }

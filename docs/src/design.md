@@ -342,76 +342,81 @@ places, with one vocabulary.
 
 ### Anchors, cases and sources
 
-- **Anchors** are files whose imports a project or task depends on through,
-  such as entry points and build configuration. If any anchor reaches a
-  change, the whole project or task is kept.
+- **Anchors** are files whose imports a task depends on through, such as an
+  app's entry points and build configuration, or a test suite's harness. If
+  any anchor reaches a change, the whole task runs.
 - **Cases** are files a task runs separately, such as the case files of a
   visual regression suite. Each is asked about on its own, and a task can run
   only the cases a change reaches.
 - **Sources** are the changed files that matter only through imports, so
   that fallout's answer is the whole answer for them. Any other change that
-  reaches the project or task, such as build configuration, a lockfile
-  install or a test harness, keeps everything, because no import carries it.
+  reaches the task, such as build configuration, a lockfile install or a
+  test harness outside its anchors, runs it, because no import carries it.
+
+A workspace names its configs once in `nx.json`, and each target takes part
+through a name, settings of its own, `false`, or the profile's default:
+
+```json
+{
+  "qk:reachability": {
+    "app": {
+      "anchors": ["{projectRoot}/index.tsx", "{projectRoot}/bundler.config.js"],
+      "sources": ["{projectRoot}/src/**/*.ts", "{workspaceRoot}/packages/*/src/**/*.ts"]
+    },
+    "unit": {
+      "anchors": ["{projectRoot}/test/setup.ts"],
+      "cases": ["{projectRoot}/src/**/*.test.ts"],
+      "sources": ["{projectRoot}/src/**/*.ts", "{projectRoot}/test/**/*.ts", "{workspaceRoot}/packages/*/src/**/*.ts"]
+    }
+  },
+  "qk:affectedProfiles": { "reach": { "reachability": { "default": "app" } } }
+}
+```
 
 ```json
 {
   "name": "app",
-  "qk:reachability": {
-    "anchors": ["{projectRoot}/index.tsx", "{projectRoot}/bundler.config.js"],
-    "sources": ["{projectRoot}/src/**/*", "{workspaceRoot}/packages/*/src/**/*"]
-  },
   "targets": {
-    "visual": {
-      "qk:reachability": {
-        "anchors": ["{projectRoot}/visual/shell.tsx"],
-        "cases": ["{projectRoot}/visual/cases/**/*.tsx"],
-        "sources": ["{projectRoot}/src/**/*", "{workspaceRoot}/packages/*/src/**/*"]
-      }
-    }
+    "build": {},
+    "test": { "qk:reachability": "unit" },
+    "lint": { "qk:reachability": false }
   }
 }
 ```
 
-Paths take the usual `{projectRoot}` and `{workspaceRoot}` tokens, and a
-target's settings can come from `targetDefaults`. A project or target
-without them is never narrowed. A `package.json` is never a source: it
-decides what imports resolve to. An end-to-end project that drives an app
-rather than importing it names the app's anchors, so the two are decided
-alike.
+Paths take the usual `{projectRoot}` and `{workspaceRoot}` tokens, expanded
+for each task's project, so one config serves every project laid out alike,
+and a target's value can come from `targetDefaults`. A task that takes part
+in no config is never narrowed. A `package.json` is never a source: it
+decides what imports resolve to.
+
+The settings belong to tasks because what a project's tasks read differs. An
+app's build reads what its entry points import, while its unit tests read a
+harness and helpers the app never imports. Settings on the project could
+only describe one of them, and leaving the project out would skip the other.
 
 Reachability is opt-in through an affected profile, as
 [change projections](guides/affected-projections.md) are, and changes no
-cache key:
-
-```json
-{ "qk:affectedProfiles": { "reach": { "reachability": true } } }
-```
+cache key. `"reachability": true` enables it without a default.
 
 ### Project selection
 
-Under the profile, a project with `qk:reachability` that ordinary selection
-affects is left out when all of these hold:
+Under the profile, project selection decides each project ordinary
+selection affects by its tasks: every target of it, with the tasks they
+depend on, are selected by their inputs and decided as below. The project is
+left out when the profile left out every task of it a change affects. One
+with a task that still runs is kept, and so is one none of whose affected
+tasks the profile decides, so reachability is the only way a project is left
+out. Each dependent is decided by its own tasks, since its inputs say what
+reaches it.
 
-1. It is affected only through dependencies: none of its own files changed,
-   and no workspace-wide reason applies, such as `nx.json`, the root
-   tsconfig, the root importer's installs or a deleted manifest.
-2. Every change it is affected through is a file its `sources` match, or a
-   dependency's `package.json` whose fields its dependents read are
-   unchanged. Lockfile installs, configuration and any other change keep it.
-3. No anchor reaches a changed file, and the search lost no edge in the
-   repository: fallout reports nothing unresolved that the repository
-   answers for (`in_repo`).
-
-A project left out does not carry selection on: its dependents are affected
-through it only if another selected dependency or their own files affect
-them. This is where a workspace decides which app builds a change runs,
-while checks keep ordinary selection and the default branch builds
-everything.
+This is where a workspace decides which app builds a change runs, while
+checks keep ordinary selection and the default branch builds everything.
 
 ### Task selection and cases
 
-Under the profile with `--granularity task`, a task with `qk:reachability`
-that ordinary task selection affects is decided by its changed inputs:
+Under the profile, a task with settings that ordinary task selection affects
+is decided by its changed inputs:
 
 1. Any changed input its `sources` do not match runs the whole task, and
    says which file, unless it is a dependency's `package.json` whose fields
@@ -437,9 +442,10 @@ every case. Declaring them is the workspace's half of the contract.
 
 ### Explaining it
 
-`qk show affected` and `--json` list each project the profile left out and
-each case it did not select, with the anchors searched, and for each project,
-task or case it kept, the reason: the chain of imports that reached a change,
+`qk show affected` and `--json` list each project the profile left out with
+what it decided for each affected task, and `qk show tasks --affected` each
+task and case it did not select, with the anchors searched. For each project,
+task or case it kept, they give the reason: the chain of imports that reached a change,
 the gap, or the change imports cannot carry. A workspace can record the
 profile's answer beside ordinary selection without acting on it, and compare
 what it would have skipped with what later broke on the default branch,

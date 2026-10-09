@@ -83,11 +83,14 @@ pub struct Analysis {
     /// The changed files considered, after ignore rules.
     pub files: Vec<String>,
     pub projects: BTreeMap<String, Cause>,
-    /// Under a profile with reachability, what it decided for each project
-    /// with `qk:reachability` affected only through dependencies, and for
-    /// each project affected only through those it left out.
+    /// Under a profile with reachability, what it decided for each affected
+    /// project with a task it narrows.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub reachability: BTreeMap<String, Decision>,
+    /// Why each project the profile left out was affected, so a project
+    /// affected through one still explains its chain.
+    #[serde(skip)]
+    left_out: BTreeMap<String, Cause>,
 }
 
 #[derive(Debug, Serialize)]
@@ -244,31 +247,51 @@ pub fn analyse(workspace: &Workspace, graph: &ProjectGraph, options: &Options) -
     }
     let mut projects = propagate(graph, &touches.0, &BTreeSet::new());
     let mut reachability = BTreeMap::new();
+    let mut left_out = BTreeMap::new();
     if let Some(profile) = &options.affected_profile
-        && projections::reachability(workspace, profile)?
+        && let Some(reach) = projections::reachability(workspace, profile)?
     {
-        reachability = reachability::decide(workspace, graph, &changes, &projects)?;
-        let left_out: BTreeSet<String> = reachability
-            .iter()
-            .filter(|(_, decision)| matches!(decision, Decision::LeftOut { .. }))
-            .map(|(name, _)| name.clone())
+        // A project is decided by its tasks: every target of it, with what
+        // they depend on. One without a narrowed target cannot be left out,
+        // so its tasks are not looked at.
+        let configs = reachability::Configs::load(workspace, reach)?;
+        let requests: Vec<qk_taskgraph::Request> = projects
+            .keys()
+            .filter(|project| {
+                workspace.projects[*project]
+                    .targets
+                    .values()
+                    .any(|target| configs.narrows(&target.extra))
+            })
+            .flat_map(|project| {
+                workspace.projects[project]
+                    .targets
+                    .keys()
+                    .map(|target| qk_taskgraph::Request {
+                        project: project.clone(),
+                        target: target.clone(),
+                        configuration: None,
+                        requested_configuration: None,
+                        args: Vec::new(),
+                    })
+            })
             .collect();
-        if !left_out.is_empty() {
-            let narrowed = propagate(graph, &touches.0, &left_out);
-            for (name, cause) in &projects {
-                if narrowed.contains_key(name) || left_out.contains(name) {
-                    continue;
-                }
-                if let Cause::DependsOn { project, .. } = cause {
-                    reachability.insert(
-                        name.clone(),
-                        Decision::Through {
-                            project: project.clone(),
-                        },
-                    );
+        if !requests.is_empty() {
+            let tasks = qk_taskgraph::TaskGraph::build(workspace, &requests)?;
+            let analysis = tasks::analyse(
+                workspace,
+                &tasks,
+                Changes::unfiltered(workspace, options)?,
+                Some(&configs),
+            )?;
+            reachability = reachability::decide_projects(&tasks, &analysis, &projects);
+            for (name, decision) in &reachability {
+                if matches!(decision, Decision::LeftOut { .. })
+                    && let Some(cause) = projects.remove(name)
+                {
+                    left_out.insert(name.clone(), cause);
                 }
             }
-            projects = narrowed;
         }
     }
     Ok(Analysis {
@@ -280,6 +303,7 @@ pub fn analyse(workspace: &Workspace, graph: &ProjectGraph, options: &Options) -
         files: changes.files,
         projects,
         reachability,
+        left_out,
     })
 }
 
@@ -347,11 +371,17 @@ impl Analysis {
     /// starting with `project`, or `None` when it is not affected.
     pub fn chain(&self, project: &str) -> Option<Vec<&str>> {
         let mut chain = vec![self.projects.get_key_value(project)?.0.as_str()];
-        while let Some(Cause::DependsOn { project, .. }) = self.projects.get(*chain.last().unwrap())
-        {
+        while let Some(Cause::DependsOn { project, .. }) = self.cause(chain.last().unwrap()) {
             chain.push(project);
         }
         Some(chain)
+    }
+
+    /// Why `project` is affected, also when the profile left it out.
+    pub fn cause(&self, project: &str) -> Option<&Cause> {
+        self.projects
+            .get(project)
+            .or_else(|| self.left_out.get(project))
     }
 }
 
