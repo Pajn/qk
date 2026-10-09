@@ -16,7 +16,7 @@ publish = false
 allow-branch = ["main"]
 
 [workspace.dependencies]
-fallout = "0.4"
+fallout = "0.4.2"
 anyhow = "1"
 blake3 = "1"
 fs2 = "0.4"
