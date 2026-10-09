@@ -73,14 +73,23 @@ branch. The fallback is `main`. Affected selection resolves `--base`, then
 
 Named, opt-in refinements of affected project selection. Each profile
 contains a `projections` array of adapters with `name`, `command`, `sources`,
-`outputs` and optional `timeoutSeconds`, `"reachability": true`, or both. The
-unprefixed `affectedProfiles` key remains a compatibility alias; selecting a
-profile rejects configuration containing both keys.
+`outputs` and optional `timeoutSeconds`, `reachability`, or both.
+`reachability` is `true`, or `{"default": "<name>"}` naming the
+`qk:reachability` config for targets that declare none. The unprefixed
+`affectedProfiles` key remains a compatibility alias; selecting a profile
+rejects configuration containing both keys.
 Select a profile with `--affected-profile <name>`.
 See [Project change projections](../guides/affected-projections.md) for the
 protocol, configuration example, tool setup and conservative fallback rules,
-and [Import reachability](../guides/affected-reachability.md) for the
-`qk:reachability` settings projects declare.
+and [Import reachability](../guides/affected-reachability.md) for
+reachability.
+
+## `qk:reachability`
+
+Named import reachability configs, each an object with `anchors`, `cases`
+and `sources` arrays of globs. A target's `qk:reachability` names one, is
+`false`, or declares its own settings; without one, it takes its profile's
+default. See [Import reachability](../guides/affected-reachability.md).
 
 ## `parallel`
 

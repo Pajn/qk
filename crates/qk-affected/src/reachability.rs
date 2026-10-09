@@ -1,28 +1,31 @@
 //! Opt-in import reachability: under an affected profile with `reachability`,
-//! a project affected only through its dependencies is left out when none of
-//! its anchors imports what changed.
+//! a task is left out when none of its anchors or cases imports what changed,
+//! and a project when every task of it that ordinary selection affects is.
 //!
-//! A project declares `qk:reachability` with `anchors`, the files whose
-//! imports it depends on through, and `sources`, the changed files that matter
-//! to it only through imports. Any other change it is affected through keeps
-//! it, because no import carries it. Imports are followed by fallout, over the
-//! checkout.
+//! A task is narrowed by `qk:reachability` settings: `anchors`, the files
+//! whose imports it depends on through, `cases`, the files it runs separately,
+//! and `sources`, the changed files that matter to it only through imports.
+//! Any other change it is affected by keeps it, because no import carries it.
+//! A target declares the settings, names a config from nx.json's
+//! `qk:reachability`, or takes the profile's default. Imports are followed by
+//! fallout, over the checkout.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 use qk_cache::Pattern;
 use qk_config::Workspace;
-use qk_graph::ProjectGraph;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::tasks::{TaskCause, TaskReason};
-use crate::{Cause, Changes, Reason, git_lines};
-use qk_taskgraph::TaskGraph;
+use crate::projections::Reach;
+use crate::tasks::{TaskAnalysis, TaskCause, TaskReason};
+use crate::{Cause, Changes, git_lines};
+use qk_taskgraph::{Task, TaskGraph};
 
-/// A project's or target's `qk:reachability`, its paths expanded.
+/// A task's `qk:reachability`, its paths expanded.
 pub(crate) struct Settings {
     pub anchors: Globs,
     pub cases: Globs,
@@ -67,87 +70,185 @@ impl Globs {
     }
 }
 
-/// Reads `qk:reachability` from `extra`, expanding paths for `project`.
-/// `what` names it in errors; `allow_cases` says whether cases may be declared,
-/// which only a target can.
-pub(crate) fn settings(
-    workspace: &Workspace,
-    project: &str,
-    extra: &BTreeMap<String, Value>,
-    what: &str,
-    allow_cases: bool,
-) -> Result<Option<Settings>> {
-    let Some(value) = extra.get("qk:reachability") else {
-        return Ok(None);
-    };
-    let object = value
-        .as_object()
-        .with_context(|| format!("{what} qk:reachability must be an object"))?;
-    let mut lists: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-    for (key, value) in object {
-        let key = match key.as_str() {
-            "anchors" | "sources" => key.as_str(),
-            "cases" if allow_cases => "cases",
-            "cases" => bail!("{what} qk:reachability.cases belongs on a target"),
-            _ => bail!("unknown {what} qk:reachability field {key:?}"),
-        };
-        let paths = value
-            .as_array()
-            .filter(|paths| paths.iter().all(Value::is_string))
-            .with_context(|| format!("{what} qk:reachability.{key} must be an array of paths"))?;
-        let expanded = paths
-            .iter()
-            .map(|path| {
-                let path = path.as_str().unwrap();
-                let (bang, path) = path
-                    .strip_prefix('!')
-                    .map_or(("", path), |path| ("!", path));
-                qk_cache::expand_project_path(workspace, project, path)
-                    .map(|path| format!("{bang}{path}"))
-                    .with_context(|| format!("{what} qk:reachability.{key}"))
-            })
-            .collect::<Result<_>>()?;
-        lists.insert(key, expanded);
-    }
-    let anchors = Globs::new(&lists.remove("anchors").unwrap_or_default())?;
-    let cases = Globs::new(&lists.remove("cases").unwrap_or_default())?;
-    let sources = Globs::new(&lists.remove("sources").unwrap_or_default())?;
-    ensure!(
-        !anchors.is_empty() || !cases.is_empty(),
-        "{what} qk:reachability needs anchors{}",
-        if allow_cases { " or cases" } else { "" }
-    );
-    ensure!(
-        !sources.is_empty(),
-        "{what} qk:reachability needs sources: without them no change is carried only by imports"
-    );
-    Ok(Some(Settings {
-        anchors,
-        cases,
-        sources,
-    }))
+/// One `qk:reachability` object, checked, its paths not yet expanded for a
+/// project.
+#[derive(Clone, Default)]
+struct Declared {
+    anchors: Vec<String>,
+    cases: Vec<String>,
+    sources: Vec<String>,
 }
 
-/// What the profile decided for a project ordinary selection affects only
-/// through its dependencies.
+/// Reads a `qk:reachability` object; `what` names it in errors.
+fn declared(value: &Value, what: &str) -> Result<Declared> {
+    let object = value
+        .as_object()
+        .with_context(|| format!("{what} must be an object"))?;
+    let mut declared = Declared::default();
+    for (key, value) in object {
+        let list = match key.as_str() {
+            "anchors" => &mut declared.anchors,
+            "cases" => &mut declared.cases,
+            "sources" => &mut declared.sources,
+            _ => bail!("unknown {what} field {key:?}"),
+        };
+        *list = value
+            .as_array()
+            .filter(|paths| paths.iter().all(Value::is_string))
+            .with_context(|| format!("{what}.{key} must be an array of paths"))?
+            .iter()
+            .map(|path| path.as_str().unwrap().to_owned())
+            .collect();
+    }
+    let includes = |paths: &[String]| paths.iter().any(|path| !path.starts_with('!'));
+    ensure!(
+        includes(&declared.anchors) || includes(&declared.cases),
+        "{what} needs anchors or cases"
+    );
+    ensure!(
+        includes(&declared.sources),
+        "{what} needs sources: without them no change is carried only by imports"
+    );
+    Ok(declared)
+}
+
+impl Declared {
+    /// The settings with paths expanded for `project`.
+    fn expand(&self, workspace: &Workspace, project: &str, what: &str) -> Result<Settings> {
+        let globs = |paths: &[String], key: &str| -> Result<Globs> {
+            let expanded: Vec<String> = paths
+                .iter()
+                .map(|path| {
+                    let (bang, path) = path
+                        .strip_prefix('!')
+                        .map_or(("", path.as_str()), |path| ("!", path));
+                    qk_cache::expand_project_path(workspace, project, path)
+                        .map(|path| format!("{bang}{path}"))
+                        .with_context(|| format!("{what}.{key}"))
+                })
+                .collect::<Result<_>>()?;
+            Globs::new(&expanded)
+        };
+        Ok(Settings {
+            anchors: globs(&self.anchors, "anchors")?,
+            cases: globs(&self.cases, "cases")?,
+            sources: globs(&self.sources, "sources")?,
+        })
+    }
+}
+
+/// The configs nx.json names in `qk:reachability`, and the one the profile
+/// gives tasks that declare none.
+pub(crate) struct Configs {
+    named: BTreeMap<String, Declared>,
+    default: Option<String>,
+}
+
+impl Configs {
+    pub fn load(workspace: &Workspace, reach: Reach) -> Result<Self> {
+        for (name, project) in &workspace.projects {
+            ensure!(
+                !project.extra.contains_key("qk:reachability"),
+                "project {name} declares qk:reachability, which is read from targets: declare it on \
+                 its targets, name a config from nx.json's qk:reachability there, or give the \
+                 affected profile a default"
+            );
+        }
+        let mut named = BTreeMap::new();
+        if let Some(value) = workspace.config.extra.get("qk:reachability") {
+            let configs = value
+                .as_object()
+                .context("nx.json qk:reachability must map config names to settings")?;
+            for (name, value) in configs {
+                let what = format!("nx.json qk:reachability.{name}");
+                named.insert(name.clone(), declared(value, &what)?);
+            }
+        }
+        if let Some(default) = &reach.default {
+            ensure!(
+                named.contains_key(default),
+                "the affected profile's reachability default {default:?} is not a config in nx.json's qk:reachability"
+            );
+        }
+        let configs = Self {
+            named,
+            default: reach.default,
+        };
+        // Every target is read, so a mistake is found before the change that
+        // would need it.
+        for (name, project) in &workspace.projects {
+            for (target, definition) in &project.targets {
+                let id = format!("{name}:{target}");
+                configs.settings(workspace, &id, name, &definition.extra)?;
+            }
+        }
+        Ok(configs)
+    }
+
+    /// Whether a target with `extra` is narrowed by anything, as its settings
+    /// were found valid when the configs were loaded.
+    pub fn narrows(&self, extra: &BTreeMap<String, Value>) -> bool {
+        match extra.get("qk:reachability") {
+            None => self.default.is_some(),
+            Some(value) => value != &Value::Bool(false),
+        }
+    }
+
+    /// What `task` is narrowed by: its own settings, the config it names, or
+    /// the default. `false` declines the default.
+    fn task(&self, workspace: &Workspace, id: &str, task: &Task) -> Result<Option<Settings>> {
+        self.settings(workspace, id, &task.project, &task.definition.extra)
+    }
+
+    fn settings(
+        &self,
+        workspace: &Workspace,
+        id: &str,
+        project: &str,
+        extra: &BTreeMap<String, Value>,
+    ) -> Result<Option<Settings>> {
+        let what = format!("{id} qk:reachability");
+        let declared = match extra.get("qk:reachability") {
+            None => match &self.default {
+                Some(name) => Cow::Borrowed(&self.named[name]),
+                None => return Ok(None),
+            },
+            Some(Value::Bool(false)) => return Ok(None),
+            Some(Value::String(name)) => {
+                Cow::Borrowed(self.named.get(name).with_context(|| {
+                    format!(
+                        "{what} names {name:?}, which is not a config in nx.json's qk:reachability"
+                    )
+                })?)
+            }
+            Some(value @ Value::Object(_)) => Cow::Owned(declared(value, &what)?),
+            Some(_) => bail!("{what} must name a config, be false or be an object"),
+        };
+        declared.expand(workspace, project, &what).map(Some)
+    }
+}
+
+/// What the profile decided for a project ordinary selection affects, from
+/// its tasks.
 #[derive(Debug, Serialize)]
 #[serde(tag = "decision", rename_all = "camelCase")]
 pub enum Decision {
-    /// No anchor imports a change.
+    /// Every task of it that ordinary selection affects is left out.
     LeftOut {
-        /// The anchor files searched.
-        anchors: Vec<String>,
-        /// The changes the project was affected through.
-        changed: Vec<String>,
+        tasks: BTreeMap<String, TaskDecision>,
     },
-    /// Affected only through projects the profile left out.
-    Through { project: String },
-    /// Kept as ordinary selection affects it.
-    Kept { why: Kept },
+    /// A task of it still runs.
+    Kept {
+        task: String,
+        /// What the profile decided for that task, absent when it is not
+        /// narrowed.
+        #[serde(rename = "taskDecision", skip_serializing_if = "Option::is_none")]
+        decision: Option<TaskDecision>,
+    },
 }
 
-/// Why a project with `qk:reachability` was kept.
-#[derive(Debug, Serialize)]
+/// Why a task with `qk:reachability` runs, or a case of it.
+#[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum Kept {
     /// An anchor imports a changed file.
@@ -164,8 +265,6 @@ pub enum Kept {
         specifier: String,
         from: Vec<String>,
     },
-    /// A dependency is touched by a change imports do not carry.
-    NotImported { project: String, reason: Reason },
     /// The task is affected by a change imports do not carry.
     Input { reason: TaskReason },
     /// The task depends on an affected task, whose outputs it may read.
@@ -177,15 +276,19 @@ pub enum Kept {
 impl std::fmt::Display for Decision {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            Self::LeftOut { anchors, .. } => {
-                let count = anchors.len();
-                let noun = if count == 1 { "anchor" } else { "anchors" };
-                write!(f, "left out: none of its {count} {noun} imports a change")
+            Self::LeftOut { tasks } => {
+                let count = tasks.len();
+                let noun = if count == 1 { "task" } else { "tasks" };
+                write!(f, "left out: none of its {count} affected {noun} runs")
             }
-            Self::Through { project } => {
-                write!(f, "left out: affected only through {project}, left out too")
-            }
-            Self::Kept { why } => write!(f, "kept: {why}"),
+            Self::Kept {
+                task,
+                decision: Some(decision),
+            } => write!(f, "kept: {task} runs ({decision})"),
+            Self::Kept {
+                task,
+                decision: None,
+            } => write!(f, "kept: {task} runs, not narrowed by reachability"),
         }
     }
 }
@@ -203,12 +306,6 @@ impl std::fmt::Display for Kept {
                 "{} imports {specifier:?}, which could not be resolved",
                 from.first().map_or("a file", String::as_str)
             ),
-            Self::NotImported { project, reason } => {
-                write!(
-                    f,
-                    "{project} is touched as {reason}, which imports do not carry"
-                )
-            }
             Self::Input { reason } => write!(f, "{reason}, which imports do not carry"),
             Self::Dependency { task } => write!(f, "it depends on affected {task}"),
             Self::Unanswered { detail } => write!(f, "imports could not be followed: {detail}"),
@@ -216,156 +313,42 @@ impl std::fmt::Display for Kept {
     }
 }
 
-/// Decides each project with `qk:reachability` that `projects` affects only
-/// through dependencies, from the touched projects' reasons and the imports of
-/// its anchors.
-pub(crate) fn decide(
-    workspace: &Workspace,
-    graph: &ProjectGraph,
-    changes: &Changes,
+/// Decides each project in `projects` by its tasks in `graph`, as `tasks`
+/// selected them. A project is left out when the profile left out every task
+/// of it that ordinary selection affects; one with no such task, or none the
+/// profile decided, is not decided.
+pub(crate) fn decide_projects(
+    graph: &TaskGraph,
+    tasks: &TaskAnalysis,
     projects: &BTreeMap<String, Cause>,
-) -> Result<BTreeMap<String, Decision>> {
-    let mut decisions = BTreeMap::new();
-    let mut pending: BTreeMap<String, Settings> = BTreeMap::new();
-    // Every project's settings are read, so a mistake is found before the
-    // change that would need them.
-    let mut declared = BTreeMap::new();
-    for (name, project) in &workspace.projects {
-        if let Some(settings) = settings(workspace, name, &project.extra, name, false)? {
-            declared.insert(name, settings);
-        }
-    }
-    for (name, cause) in projects {
-        if !matches!(cause, Cause::DependsOn { .. }) {
-            continue;
-        }
-        let Some(settings) = declared.remove(name) else {
-            continue;
-        };
-        match not_imported(changes, graph, projects, name, &settings) {
-            Some(why) => {
-                decisions.insert(name.clone(), Decision::Kept { why });
-            }
-            None => {
-                pending.insert(name.clone(), settings);
-            }
-        }
-    }
-    if pending.is_empty() {
-        return Ok(decisions);
-    }
-    let anchors = match anchor_files(workspace, &pending) {
-        Ok(anchors) => anchors,
-        Err(error) => {
-            return Ok(unanswered(decisions, pending, format!("{error:#}")));
-        }
-    };
-    let answers = match search(workspace, changes, anchors.values().flatten()) {
-        Ok(answers) => answers,
-        Err(detail) => return Ok(unanswered(decisions, pending, detail)),
-    };
-    for (name, _) in pending {
-        let files = &anchors[&name];
-        let decision = if files.is_empty() {
-            Decision::Kept {
-                why: Kept::Unanswered {
-                    detail: "its anchors name no file".into(),
-                },
-            }
-        } else if let Some(why) = files.iter().find_map(|anchor| answers[anchor].kept(anchor)) {
-            Decision::Kept { why }
-        } else {
-            Decision::LeftOut {
-                anchors: files.clone(),
-                changed: changed_through(graph, projects, &name),
-            }
-        };
-        decisions.insert(name, decision);
-    }
-    Ok(decisions)
-}
-
-fn unanswered(
-    mut decisions: BTreeMap<String, Decision>,
-    pending: BTreeMap<String, Settings>,
-    detail: String,
 ) -> BTreeMap<String, Decision> {
-    for name in pending.into_keys() {
-        decisions.insert(
-            name,
-            Decision::Kept {
-                why: Kept::Unanswered {
-                    detail: detail.clone(),
-                },
+    let mut by_project: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (id, task) in &graph.tasks {
+        let affected = tasks.tasks.contains_key(id) || tasks.reachability.contains_key(id);
+        if affected && projects.contains_key(&task.project) {
+            by_project.entry(&task.project).or_default().push(id);
+        }
+    }
+    let mut decisions = BTreeMap::new();
+    for (project, ids) in by_project {
+        if !ids.iter().any(|id| tasks.reachability.contains_key(*id)) {
+            continue;
+        }
+        let decision = match ids.iter().find(|id| tasks.tasks.contains_key(**id)) {
+            Some(id) => Decision::Kept {
+                task: (*id).to_owned(),
+                decision: tasks.reachability.get(*id).cloned(),
             },
-        );
+            None => Decision::LeftOut {
+                tasks: ids
+                    .iter()
+                    .map(|id| ((*id).to_owned(), tasks.reachability[*id].clone()))
+                    .collect(),
+            },
+        };
+        decisions.insert(project.to_owned(), decision);
     }
     decisions
-}
-
-/// The touched projects `project` depends on, directly or not.
-fn touched_dependencies<'a>(
-    graph: &'a ProjectGraph,
-    projects: &'a BTreeMap<String, Cause>,
-    project: &str,
-) -> Vec<(&'a str, &'a [Reason])> {
-    let mut seen = BTreeSet::new();
-    let mut pending = vec![project];
-    let mut touched = Vec::new();
-    while let Some(current) = pending.pop() {
-        for edge in &graph.dependencies[current] {
-            if !seen.insert(edge.target.as_str()) {
-                continue;
-            }
-            pending.push(&edge.target);
-            if let Some(Cause::Touched { reasons }) = projects.get(&edge.target) {
-                touched.push((edge.target.as_str(), reasons.as_slice()));
-            }
-        }
-    }
-    touched
-}
-
-/// The first reason touching a dependency that imports do not carry.
-fn not_imported(
-    changes: &Changes,
-    graph: &ProjectGraph,
-    projects: &BTreeMap<String, Cause>,
-    project: &str,
-    settings: &Settings,
-) -> Option<Kept> {
-    for (dependency, reasons) in touched_dependencies(graph, projects, project) {
-        for reason in reasons {
-            let carried = matches!(
-                reason,
-                Reason::File { file } if settings.is_source(file) || manifest_unchanged(changes, file)
-            );
-            if !carried {
-                return Some(Kept::NotImported {
-                    project: dependency.to_owned(),
-                    reason: reason.clone(),
-                });
-            }
-        }
-    }
-    None
-}
-
-fn changed_through(
-    graph: &ProjectGraph,
-    projects: &BTreeMap<String, Cause>,
-    project: &str,
-) -> Vec<String> {
-    touched_dependencies(graph, projects, project)
-        .into_iter()
-        .flat_map(|(_, reasons)| reasons)
-        .filter_map(|reason| match reason {
-            Reason::File { file } => Some(file.clone()),
-            _ => None,
-        })
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
 }
 
 /// Whether `file` is a `package.json` whose change decides nothing new for
@@ -393,18 +376,6 @@ fn matching(files: &BTreeSet<String>, globs: &Globs) -> Vec<String> {
         .iter()
         .filter(|file| globs.is_match(file))
         .cloned()
-        .collect()
-}
-
-/// Each project's anchor files, as its globs match the workspace's files.
-fn anchor_files(
-    workspace: &Workspace,
-    pending: &BTreeMap<String, Settings>,
-) -> Result<BTreeMap<String, Vec<String>>> {
-    let files = qk_cache::source_files(&workspace.root)?;
-    pending
-        .iter()
-        .map(|(name, settings)| Ok((name.clone(), matching(&files, &settings.anchors))))
         .collect()
 }
 
@@ -539,9 +510,9 @@ fn not_checked_out(workspace: &Workspace, changes: &Changes) -> Option<String> {
 /// A task's anchor and case files.
 type Matched = (Vec<String>, Vec<String>);
 
-/// What the profile decided for a task with `qk:reachability` that ordinary
+/// What the profile decided for a task narrowed by reachability that ordinary
 /// task selection affects.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(tag = "decision", rename_all = "camelCase")]
 pub enum TaskDecision {
     /// Neither its anchors nor its cases import a change.
@@ -578,21 +549,21 @@ impl std::fmt::Display for TaskDecision {
     }
 }
 
-/// Decides each task with `qk:reachability` that `tasks` affects, from its
+/// Decides each task narrowed by reachability that `tasks` affects, from its
 /// reasons and the imports of its anchors and cases.
 pub(crate) fn decide_tasks(
     workspace: &Workspace,
     graph: &TaskGraph,
     changes: &Changes,
     tasks: &BTreeMap<String, TaskCause>,
+    configs: &Configs,
 ) -> Result<BTreeMap<String, TaskDecision>> {
     let mut decisions = BTreeMap::new();
     // Every task's settings are read, so a mistake is found before the change
     // that would need them.
     let mut declared = BTreeMap::new();
     for (id, task) in &graph.tasks {
-        let extra = &task.definition.extra;
-        if let Some(settings) = settings(workspace, &task.project, extra, id, true)? {
+        if let Some(settings) = configs.task(workspace, id, task)? {
             declared.insert(id, settings);
         }
     }

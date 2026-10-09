@@ -894,17 +894,23 @@ fn reachability_profile_leaves_out_projects_and_explains_them() {
     };
     write(
         "nx.json",
-        &json!({"qk:affectedProfiles": {"reach": {"reachability": true}}}).to_string(),
+        &json!({
+            "qk:reachability": {
+                "app": {
+                    "anchors": ["{projectRoot}/src/main.ts"],
+                    "sources": ["{projectRoot}/src/**/*", "{workspaceRoot}/libs/*/src/**/*"]
+                }
+            },
+            "qk:affectedProfiles": {"reach": {"reachability": {"default": "app"}}}
+        })
+        .to_string(),
     );
     write(
         "apps/app/project.json",
         &json!({
             "name": "app",
             "implicitDependencies": ["lib"],
-            "qk:reachability": {
-                "anchors": ["{projectRoot}/src/main.ts"],
-                "sources": ["{projectRoot}/src/**/*", "{workspaceRoot}/libs/*/src/**/*"]
-            }
+            "targets": {"build": {"command": "echo build", "inputs": ["default", "^default"]}}
         })
         .to_string(),
     );
@@ -914,7 +920,19 @@ fn reachability_profile_leaves_out_projects_and_explains_them() {
     );
     write(
         "apps/app-e2e/project.json",
-        &json!({"name": "app-e2e", "implicitDependencies": ["app"]}).to_string(),
+        &json!({
+            "name": "app-e2e",
+            "implicitDependencies": ["app"],
+            "targets": {"e2e": {
+                "command": "echo e2e",
+                "inputs": ["default", "^default"],
+                "qk:reachability": {
+                    "anchors": ["{workspaceRoot}/apps/app/src/main.ts"],
+                    "sources": ["{workspaceRoot}/apps/app/src/**/*", "{workspaceRoot}/libs/*/src/**/*"]
+                }
+            }}
+        })
+        .to_string(),
     );
     write("libs/lib/project.json", &json!({"name": "lib"}).to_string());
     write("libs/lib/src/used.ts", "export const used = 1;\n");
@@ -951,24 +969,29 @@ fn reachability_profile_leaves_out_projects_and_explains_them() {
     assert!(!text.contains("after projection"), "{text}");
     assert!(text.contains("Left out by import reachability:"), "{text}");
     assert!(
-        text.contains("app-e2e  left out: affected only through app, left out too"),
+        text.contains("app-e2e  left out: none of its 1 affected task runs"),
         "{text}"
     );
     assert!(
-        text.contains("app      left out: none of its 1 anchor imports a change"),
+        text.contains("app      left out: none of its 1 affected task runs"),
         "{text}"
     );
     let output = run(&["show", "affected", "app"]);
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(
-        text.contains("app is left out: none of its anchors imports a change it is affected through.\nAnchors searched:\n  apps/app/src/main.ts\nChanges it is affected through:\n  libs/lib/src/unused.ts\n"),
+        text.contains("app is left out: import reachability left out each task of it a change affects.\n  app:build  left out: nothing it imports changed\n"),
         "{text}"
     );
     let explanation = successful_json(run(&["show", "affected", "app", "--json"]));
     assert_eq!(explanation["affected"], false);
     assert_eq!(
         explanation["reachability"],
-        json!({"decision": "leftOut", "anchors": ["apps/app/src/main.ts"], "changed": ["libs/lib/src/unused.ts"]})
+        json!({"decision": "leftOut", "tasks": {"app:build": {
+            "decision": "leftOut",
+            "anchors": ["apps/app/src/main.ts"],
+            "cases": [],
+            "changed": ["libs/lib/src/unused.ts"]
+        }}})
     );
 
     write("libs/lib/src/used.ts", "export const used = 2;\n");
@@ -978,13 +1001,17 @@ fn reachability_profile_leaves_out_projects_and_explains_them() {
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(
         text.contains(
-            "Import reachability kept it: apps/app/src/main.ts imports libs/lib/src/used.ts\n"
+            "Import reachability kept: app:build runs (whole task: apps/app/src/main.ts imports libs/lib/src/used.ts)\n"
         ),
         "{text}"
     );
     let explanation = successful_json(run(&["show", "affected", "app", "--json"]));
     assert_eq!(explanation["reachability"]["decision"], "kept");
-    assert_eq!(explanation["reachability"]["why"]["kind"], "reached");
+    assert_eq!(explanation["reachability"]["task"], "app:build");
+    assert_eq!(
+        explanation["reachability"]["taskDecision"]["why"]["kind"],
+        "reached"
+    );
 }
 
 #[test]

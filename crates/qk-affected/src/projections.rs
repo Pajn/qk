@@ -59,10 +59,45 @@ pub struct ProjectionReport {
 struct Profile {
     #[serde(default)]
     projections: Vec<Projection>,
-    /// Whether projects and tasks with `qk:reachability` are narrowed by what
-    /// their anchors import.
+    /// `true` or `{"default": name}`: whether tasks are narrowed by what their
+    /// anchors and cases import, and the named config tasks without their own
+    /// `qk:reachability` use.
     #[serde(default)]
-    reachability: bool,
+    reachability: Option<serde_json::Value>,
+}
+
+/// A profile's reachability.
+pub(super) struct Reach {
+    /// The config in nx.json's `qk:reachability` for tasks that name none.
+    pub default: Option<String>,
+}
+
+impl Profile {
+    fn reach(&self) -> Result<Option<Reach>> {
+        use serde_json::Value;
+        Ok(match &self.reachability {
+            None | Some(Value::Bool(false)) => None,
+            Some(Value::Bool(true)) => Some(Reach { default: None }),
+            Some(Value::Object(object)) => {
+                let mut default = None;
+                for (key, value) in object {
+                    match key.as_str() {
+                        "default" => {
+                            default = Some(
+                                value
+                                    .as_str()
+                                    .context("reachability.default must name a config")?
+                                    .to_owned(),
+                            );
+                        }
+                        _ => bail!("unknown reachability field {key:?}"),
+                    }
+                }
+                Some(Reach { default })
+            }
+            Some(_) => bail!("reachability must be true or an object with a default"),
+        })
+    }
 }
 
 /// The named profile, from `qk:affectedProfiles` or its compatibility alias.
@@ -79,16 +114,19 @@ fn profile(workspace: &Workspace, name: &str) -> Result<Profile> {
         .with_context(|| format!("unknown affected profile {name:?}"))?;
     let profile: Profile = serde_json::from_value(value.clone())
         .with_context(|| format!("invalid affected profile {name:?}"))?;
+    let reach = profile
+        .reach()
+        .with_context(|| format!("invalid affected profile {name:?}"))?;
     ensure!(
-        !profile.projections.is_empty() || profile.reachability,
+        !profile.projections.is_empty() || reach.is_some(),
         "affected profile must contain projections or enable reachability"
     );
     Ok(profile)
 }
 
-/// Whether the named profile narrows selection by import reachability.
-pub(super) fn reachability(workspace: &Workspace, name: &str) -> Result<bool> {
-    Ok(profile(workspace, name)?.reachability)
+/// How the named profile narrows selection by import reachability, if it does.
+pub(super) fn reachability(workspace: &Workspace, name: &str) -> Result<Option<Reach>> {
+    profile(workspace, name)?.reach()
 }
 
 /// Whether the named profile replaces changes through projections.
