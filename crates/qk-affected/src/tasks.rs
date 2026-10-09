@@ -4,7 +4,8 @@
 //! resolution keys, or it depends on an affected task. Env and runtime inputs
 //! count as unchanged, since the base revision's environment is unknowable.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
 
 use anyhow::Result;
 use qk_config::Workspace;
@@ -240,37 +241,58 @@ fn propagate(
             )
         })
         .collect();
-    let mut pending: Vec<&str> = graph
-        .tasks
-        .keys()
-        .map(String::as_str)
-        .filter(|id| !skipped.contains(*id))
+    if tasks.is_empty() {
+        return tasks;
+    }
+    let ids: Vec<&str> = graph.tasks.keys().map(String::as_str).collect();
+    let indices: HashMap<&str, usize> = ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| (*id, index))
         .collect();
-    loop {
-        let before = tasks.len();
-        pending.retain(|id| {
-            if tasks.contains_key(*id) {
-                return false;
+    let mut dependents = vec![Vec::new(); ids.len()];
+    let mut scheduled = vec![false; ids.len()];
+    let mut pending = BinaryHeap::new();
+    for (index, id) in ids.iter().enumerate() {
+        if tasks.contains_key(*id) || skipped.contains(*id) {
+            scheduled[index] = true;
+            continue;
+        }
+        for dependency in &graph.tasks[*id].dependencies {
+            if let Some(&dependency_index) = indices.get(dependency.as_str()) {
+                dependents[dependency_index].push(index);
             }
-            match graph.tasks[*id]
-                .dependencies
-                .iter()
-                .find(|dependency| tasks.contains_key(dependency.as_str()))
-            {
-                Some(dependency) => {
-                    tasks.insert(
-                        (*id).to_owned(),
-                        TaskCause::DependsOn {
-                            task: dependency.clone(),
-                        },
-                    );
-                    false
-                }
-                None => true,
+            if tasks.contains_key(dependency.as_str()) && !scheduled[index] {
+                scheduled[index] = true;
+                pending.push(Reverse((0, index)));
             }
-        });
-        if tasks.len() == before {
-            break;
+        }
+    }
+    // Reproduce the old sorted scans without visiting unaffected tasks on every
+    // pass. A dependency affects a later task in the same pass, or an earlier
+    // task in the next one. Ordering those activation events by (pass, index)
+    // preserves which dependency supplies the explanation, including diamonds
+    // where several dependencies become affected before the task's turn.
+    // Each task is queued once and each reverse edge is visited once.
+    while let Some(Reverse((pass, index))) = pending.pop() {
+        let id = ids[index];
+        let dependency = graph.tasks[id]
+            .dependencies
+            .iter()
+            .find(|dependency| tasks.contains_key(dependency.as_str()))
+            .expect("a queued task has an affected dependency");
+        tasks.insert(
+            id.to_owned(),
+            TaskCause::DependsOn {
+                task: dependency.clone(),
+            },
+        );
+        for &dependent in &dependents[index] {
+            if !scheduled[dependent] {
+                scheduled[dependent] = true;
+                let next_pass = pass + usize::from(dependent < index);
+                pending.push(Reverse((next_pass, dependent)));
+            }
         }
     }
     tasks
@@ -332,4 +354,216 @@ fn relinked_dependents(
         }
     }
     relinked
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use qk_config::Target;
+    use qk_taskgraph::Task;
+
+    fn graph(edges: &[(&str, &[&str])]) -> TaskGraph {
+        TaskGraph {
+            roots: BTreeSet::new(),
+            cycles: Vec::new(),
+            tasks: edges
+                .iter()
+                .map(|(id, dependencies)| {
+                    (
+                        (*id).to_owned(),
+                        Task {
+                            id: (*id).to_owned(),
+                            project: (*id).to_owned(),
+                            target: "build".into(),
+                            configuration: None,
+                            args: Vec::new(),
+                            definition: Target::default(),
+                            dependencies: dependencies.iter().map(|id| (*id).to_owned()).collect(),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn touched(ids: &[&str]) -> BTreeMap<String, Vec<TaskReason>> {
+        ids.iter()
+            .map(|id| {
+                (
+                    (*id).to_owned(),
+                    vec![TaskReason::Input {
+                        file: format!("{id}/source.rs"),
+                    }],
+                )
+            })
+            .collect()
+    }
+
+    // The previous repeated-scan implementation is retained only as a test
+    // oracle for explanation compatibility and the opt-in performance test.
+    fn legacy_propagate(
+        graph: &TaskGraph,
+        touched: &BTreeMap<String, Vec<TaskReason>>,
+        skipped: &BTreeSet<String>,
+    ) -> BTreeMap<String, TaskCause> {
+        let mut tasks: BTreeMap<_, _> = touched
+            .iter()
+            .map(|(id, reasons)| {
+                (
+                    id.clone(),
+                    TaskCause::Touched {
+                        reasons: reasons.clone(),
+                    },
+                )
+            })
+            .collect();
+        let mut pending: Vec<_> = graph
+            .tasks
+            .keys()
+            .filter(|id| !skipped.contains(*id))
+            .collect();
+        loop {
+            let before = tasks.len();
+            pending.retain(|id| {
+                if tasks.contains_key(*id) {
+                    return false;
+                }
+                if let Some(dependency) = graph.tasks[*id]
+                    .dependencies
+                    .iter()
+                    .find(|dependency| tasks.contains_key(*dependency))
+                {
+                    tasks.insert(
+                        (*id).clone(),
+                        TaskCause::DependsOn {
+                            task: dependency.clone(),
+                        },
+                    );
+                    false
+                } else {
+                    true
+                }
+            });
+            if tasks.len() == before {
+                return tasks;
+            }
+        }
+    }
+
+    fn assert_compatible(
+        graph: &TaskGraph,
+        touched: &BTreeMap<String, Vec<TaskReason>>,
+        skipped: &BTreeSet<String>,
+    ) {
+        assert_eq!(
+            serde_json::to_value(propagate(graph, touched, skipped)).unwrap(),
+            serde_json::to_value(legacy_propagate(graph, touched, skipped)).unwrap(),
+        );
+    }
+
+    #[test]
+    fn explanations_keep_scan_order_with_multiple_touched_and_skipped_tasks() {
+        let graph = graph(&[
+            ("a", &["z"]),
+            ("b", &[]),
+            ("c", &["a", "b"]),
+            ("d", &["c"]),
+            ("e", &["d"]),
+            ("f", &["b", "e"]),
+            ("z", &[]),
+        ]);
+        let touched = touched(&["b", "z"]);
+        let skipped = BTreeSet::from(["d".to_owned()]);
+        assert_compatible(&graph, &touched, &skipped);
+        let tasks = propagate(&graph, &touched, &skipped);
+        assert!(matches!(&tasks["c"], TaskCause::DependsOn { task } if task == "a"));
+        assert!(!tasks.contains_key("d"));
+        assert!(!tasks.contains_key("e"));
+        assert!(matches!(&tasks["f"], TaskCause::DependsOn { task } if task == "b"));
+        assert!(matches!(&tasks["z"], TaskCause::Touched { reasons }
+            if matches!(&reasons[..], [TaskReason::Input { file }] if file == "z/source.rs")));
+        // Direct callers historically keep touched entries even if also skipped.
+        assert_compatible(&graph, &touched, &BTreeSet::from(["z".to_owned()]));
+    }
+
+    #[test]
+    fn explanations_match_legacy_scans_across_dependency_shapes() {
+        let mut state = 41_u64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            state >> 32
+        };
+        let ids: Vec<_> = (0..12).map(|index| format!("task-{index:02}")).collect();
+        for _ in 0..256 {
+            let mut graph = graph(&[]);
+            let mut touched_ids = Vec::new();
+            let mut skipped = BTreeSet::new();
+            for (index, id) in ids.iter().enumerate() {
+                let dependencies: Vec<_> = ids
+                    .iter()
+                    .enumerate()
+                    .filter(|(dependency, _)| *dependency != index && next() % 7 == 0)
+                    .map(|(_, id)| id.as_str())
+                    .collect();
+                graph
+                    .tasks
+                    .extend(self::graph(&[(id, &dependencies)]).tasks);
+                if next() % 5 == 0 {
+                    touched_ids.push(id.as_str());
+                }
+                if next() % 8 == 0 {
+                    skipped.insert(id.clone());
+                }
+            }
+            assert_compatible(&graph, &touched(&touched_ids), &skipped);
+        }
+    }
+
+    fn reverse_chain(count: usize) -> (TaskGraph, BTreeMap<String, Vec<TaskReason>>) {
+        let ids: Vec<_> = (0..count).map(|index| format!("task-{index:06}")).collect();
+        let mut graph = graph(&[]);
+        for (index, id) in ids.iter().enumerate() {
+            let dependencies = ids
+                .get(index + 1)
+                .map(|id| vec![id.as_str()])
+                .unwrap_or_default();
+            graph
+                .tasks
+                .extend(self::graph(&[(id, &dependencies)]).tasks);
+        }
+        let touched = touched(&[ids.last().unwrap()]);
+        (graph, touched)
+    }
+
+    #[test]
+    fn long_reverse_chain_propagates_without_recursion_or_repeated_scans() {
+        let (graph, touched) = reverse_chain(20_000);
+        let tasks = propagate(&graph, &touched, &BTreeSet::new());
+        assert_eq!(tasks.len(), graph.tasks.len());
+        assert!(
+            matches!(&tasks["task-000000"], TaskCause::DependsOn { task }
+            if task == "task-000001")
+        );
+        assert!(matches!(&tasks["task-019999"], TaskCause::Touched { .. }));
+    }
+
+    #[test]
+    #[ignore = "manual performance comparison; run with --release --ignored --nocapture"]
+    fn benchmark_reverse_chain_propagation() {
+        for count in [1_000, 2_000, 4_000, 8_000] {
+            let (graph, touched) = reverse_chain(count);
+            let skipped = BTreeSet::new();
+            let start = std::time::Instant::now();
+            let legacy = legacy_propagate(&graph, &touched, &skipped);
+            let old_elapsed = start.elapsed();
+            let start = std::time::Instant::now();
+            let queued = propagate(&graph, &touched, &skipped);
+            let new_elapsed = start.elapsed();
+            assert_eq!(
+                serde_json::to_value(legacy).unwrap(),
+                serde_json::to_value(queued).unwrap()
+            );
+            eprintln!("{count} tasks: repeated scans {old_elapsed:?}, queue {new_elapsed:?}");
+        }
+    }
 }

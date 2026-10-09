@@ -1531,7 +1531,7 @@ fn execute_narrowed(
         let cache = qk_cache::cache_location(workspace);
         let pruned = qk_cache::max_size(workspace.config.extra.get("maxCacheSize"), &cache)
             .and_then(|limit| match limit {
-                Some(limit) => qk_cache::prune(&cache, limit).map(Some),
+                Some(limit) => qk_cache::prune_automatic(&cache, limit).map(Some),
                 None => Ok(None),
             });
         match pruned {

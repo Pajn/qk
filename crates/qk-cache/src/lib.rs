@@ -22,7 +22,7 @@ use qk_executor::{Capture, Outcome, PreparedTask, execute, execute_captured};
 use qk_taskgraph::{Task, TaskGraph};
 use serde_json::{Value, json};
 
-pub use evict::{Pruned, max_size, parse_size, prune};
+pub use evict::{Pruned, max_size, parse_size, prune, prune_automatic};
 pub use glob::Pattern;
 pub use hash::{SourceIgnore, source_files};
 pub use inputs::{

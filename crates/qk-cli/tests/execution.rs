@@ -78,6 +78,38 @@ fn process_helper() {
     let id = std::env::var("QK_TEST_ID").unwrap();
     let root = std::env::current_dir().unwrap();
     match mode.as_str() {
+        "large-string-control-output" => {
+            use std::io::Write;
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(b"before\x1b]0;").unwrap();
+            stdout.write_all(&vec![b'x'; 256 * 1024]).unwrap();
+            stdout
+                .write_all(b"\x1b\\after\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x07\n\x1bPunfinished")
+                .unwrap();
+            stdout.flush().unwrap();
+            std::process::exit(1);
+        }
+        "large-colored-output" => {
+            use std::io::Write;
+            let mut stdout = std::io::stdout().lock();
+            stdout
+                .write_all(&b"\x1b[31mx\x1b[0m".repeat(32 * 1024))
+                .unwrap();
+            stdout.write_all(b"\n\x1b[").unwrap();
+            stdout.flush().unwrap();
+            std::process::exit(1);
+        }
+        "large-output" => {
+            use std::io::Write;
+            let mut stdout = std::io::stdout().lock();
+            writeln!(stdout, "BEGIN-{id}").unwrap();
+            let bytes = vec![b'x'; 256 * 1024];
+            stdout.write_all(&bytes).unwrap();
+            stdout.write_all(b"\0\xff").unwrap();
+            writeln!(stdout, "\nEND-{id}").unwrap();
+            stdout.flush().unwrap();
+            std::process::exit(i32::from(id == "fail"));
+        }
         "watch-portable" => {
             let records = PathBuf::from(std::env::var("QK_WATCH_RECORDS").unwrap());
             let n = fs::read_dir(&records)
@@ -842,6 +874,91 @@ fn output_styles_follow_nx() {
         grouped.starts_with("\n::group::✅ > qk run app:build\n\none\ntwo\n::endgroup::\n"),
         "{grouped}"
     );
+}
+
+#[test]
+fn large_output_preserves_static_groups_quiet_failures_and_long_line_prefixes() {
+    let temp = fixture(json!({
+        "a": helper_target("large-output", "a"),
+        "b": helper_target("large-output", "b"),
+        "fail": helper_target("large-output", "fail"),
+        "colored": helper_target("large-colored-output", "colored"),
+        "controls": helper_target("large-string-control-output", "controls")
+    }));
+    let invoke = |targets: &str, style: &str| {
+        command(
+            temp.path(),
+            &[
+                "run-many",
+                "-t",
+                targets,
+                "--output-style",
+                style,
+                "--parallel",
+                "2",
+            ],
+        )
+        .env("GITHUB_ACTIONS", "true")
+        .env("NO_COLOR", "1")
+        .env_remove("FORCE_COLOR")
+        .output()
+        .unwrap()
+    };
+    let body = |id: &str| {
+        let mut body = format!("BEGIN-{id}\n").into_bytes();
+        body.extend_from_slice(&vec![b'x'; 256 * 1024]);
+        body.extend_from_slice(b"\0\xff\n");
+        body.extend_from_slice(format!("END-{id}\n").as_bytes());
+        body
+    };
+    let output = success(invoke("a,b", "static"));
+    for id in ["a", "b"] {
+        let header = format!("::group::✅ > qk run app:{id}\n\n");
+        let start = output
+            .stdout
+            .windows(header.len())
+            .position(|bytes| bytes == header.as_bytes())
+            .unwrap()
+            + header.len();
+        let end = output.stdout[start..]
+            .windows(b"::endgroup::\n".len())
+            .position(|bytes| bytes == b"::endgroup::\n")
+            .unwrap()
+            + start;
+        let grouped = &output.stdout[start..end];
+        let expected = body(id);
+        assert!(grouped.ends_with(&expected));
+        assert!(
+            !grouped
+                .windows(b"::group::".len())
+                .any(|bytes| bytes == b"::group::")
+        );
+    }
+    assert!(success(invoke("a", "quiet")).stdout.is_empty());
+    let failed = invoke("fail", "quiet");
+    assert!(!failed.status.success());
+    assert!(
+        failed
+            .stdout
+            .starts_with("\n✖ qk run app:fail failed\n\n".as_bytes())
+    );
+    assert!(failed.stdout.ends_with(&body("fail")));
+
+    let prefixed = success(invoke("a", "stream"));
+    let mut expected = b"app: ".to_vec();
+    expected.extend_from_slice(&vec![b'x'; 256 * 1024]);
+    expected.extend_from_slice(b"\0\xff\napp: END-a\n");
+    assert!(prefixed.stdout.ends_with(&expected));
+    let colored = invoke("colored", "quiet");
+    assert!(!colored.status.success());
+    let mut expected = vec![b'x'; 32 * 1024];
+    expected.push(b'\n');
+    assert!(colored.stdout.ends_with(&expected));
+    assert!(!colored.stdout.contains(&0x1b));
+    let controls = invoke("controls", "quiet");
+    assert!(!controls.status.success());
+    assert!(controls.stdout.ends_with(b"beforeafterlink\n"));
+    assert!(!controls.stdout.contains(&0x1b));
 }
 
 #[test]

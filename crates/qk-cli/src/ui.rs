@@ -85,6 +85,7 @@ impl Warnings {
 pub struct Quiet {
     warnings: Warnings,
     plain: [bool; 2],
+    escapes: Mutex<[EscapeState; 2]>,
 }
 
 impl Default for Quiet {
@@ -92,6 +93,7 @@ impl Default for Quiet {
         let plain = |terminal: bool| !terminal && std::env::var_os("FORCE_COLOR").is_none();
         Self {
             warnings: Warnings::default(),
+            escapes: Mutex::default(),
             plain: [
                 plain(std::io::stdout().is_terminal()),
                 plain(std::io::stderr().is_terminal()),
@@ -100,23 +102,72 @@ impl Default for Quiet {
     }
 }
 
-/// Text without ANSI escape sequences.
-fn strip_escapes(bytes: &[u8]) -> Vec<u8> {
-    let mut result = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'[') {
-            index += 2;
-            while index < bytes.len() && !bytes[index].is_ascii_alphabetic() {
-                index += 1;
+/// Incremental ANSI removal: held logs replay in bounded chunks, so the
+/// escape introducer and its final character can arrive in different writes.
+#[derive(Clone, Copy, Default)]
+enum EscapeState {
+    #[default]
+    Text,
+    Escape,
+    Csi,
+    String {
+        osc: bool,
+    },
+    StringEscape {
+        osc: bool,
+    },
+}
+
+impl EscapeState {
+    fn strip(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let mut result = Vec::with_capacity(bytes.len());
+        for &byte in bytes {
+            match *self {
+                Self::Csi => {
+                    if (0x40..=0x7e).contains(&byte) {
+                        *self = Self::Text;
+                    }
+                }
+                Self::Escape if byte == b'[' => *self = Self::Csi,
+                Self::Escape if matches!(byte, b']' | b'P' | b'X' | b'^' | b'_') => {
+                    *self = Self::String { osc: byte == b']' };
+                }
+                Self::String { osc } | Self::StringEscape { osc }
+                    if (osc && byte == 0x07)
+                        || (matches!(*self, Self::StringEscape { .. }) && byte == b'\\') =>
+                {
+                    *self = Self::Text;
+                }
+                Self::String { osc } | Self::StringEscape { osc } => {
+                    *self = if byte == 0x1b {
+                        Self::StringEscape { osc }
+                    } else {
+                        Self::String { osc }
+                    };
+                }
+                Self::Escape => {
+                    result.push(0x1b);
+                    *self = Self::Text;
+                    if byte == 0x1b {
+                        *self = Self::Escape;
+                    } else {
+                        result.push(byte);
+                    }
+                }
+                Self::Text if byte == 0x1b => *self = Self::Escape,
+                Self::Text => result.push(byte),
             }
-            index += 1;
-        } else {
-            result.push(bytes[index]);
-            index += 1;
         }
+        result
     }
-    result
+
+    /// Preserve a literal trailing escape; discard unfinished control sequences.
+    /// Never carry them into another task.
+    fn finish(&mut self) -> bool {
+        let trailing = matches!(self, Self::Escape);
+        *self = Self::Text;
+        trailing
+    }
 }
 
 impl Sink for Quiet {
@@ -128,9 +179,18 @@ impl Sink for Quiet {
 
     fn output(&self, stderr: bool, bytes: &[u8]) {
         if self.plain[usize::from(stderr)] {
-            report::write_all(stderr, &strip_escapes(bytes));
+            let mut escapes = self.escapes.lock().unwrap();
+            report::write_all(stderr, &escapes[usize::from(stderr)].strip(bytes));
         } else {
             report::write_all(stderr, bytes);
+        }
+    }
+    fn output_finished(&self) {
+        let mut escapes = self.escapes.lock().unwrap();
+        for stderr in [false, true] {
+            if self.plain[usize::from(stderr)] && escapes[usize::from(stderr)].finish() {
+                report::write_all(stderr, b"\x1b");
+            }
         }
     }
 }
@@ -1003,6 +1063,95 @@ mod tests {
             .find(|line| line.starts_with("Parallel"))
             .unwrap()
             .to_owned()
+    }
+
+    #[test]
+    fn quiet_strips_string_controls_across_writes() {
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"before\x1b]0;title\x07after", b"beforeafter"),
+            (
+                b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\!",
+                b"link!",
+            ),
+            (b"a\x1bPdata\x07more\x1b\\b", b"ab"),
+            (b"a\x1bXdata\x1b\\b", b"ab"),
+            (b"a\x1b^data\x1b\\b", b"ab"),
+            (b"a\x1b_data\x1b\\b", b"ab"),
+            (b"a\x1b]data\x1b\x1b\\b", b"ab"),
+            (b"a\x1b]data\x1bxmore\x1b\x07b", b"ab"),
+            // Ordinary escapes and UTF-8 continuation bytes stay intact.
+            (b"a\x1bZ\xc5\x9cb", b"a\x1bZ\xc5\x9cb"),
+        ];
+        for &(bytes, expected) in cases {
+            for split in 0..=bytes.len() {
+                let mut state = EscapeState::default();
+                let mut result = state.strip(&bytes[..split]);
+                result.extend_from_slice(&state.strip(&bytes[split..]));
+                assert_eq!(result, expected, "{bytes:?}, split {split}");
+                assert!(!state.finish());
+            }
+            let mut state = EscapeState::default();
+            let result: Vec<_> = bytes
+                .iter()
+                .flat_map(|byte| state.strip(std::slice::from_ref(byte)))
+                .collect();
+            assert_eq!(result, expected);
+            assert!(!state.finish());
+        }
+    }
+
+    #[test]
+    fn quiet_discards_unfinished_string_controls_before_the_next_task() {
+        for introducer in b"]PX^_" {
+            for trailing_escape in [false, true] {
+                let mut state = EscapeState::default();
+                let mut bytes = vec![0x1b, *introducer];
+                bytes.extend_from_slice(b"unfinished");
+                if trailing_escape {
+                    bytes.push(0x1b);
+                }
+                assert!(state.strip(&bytes).is_empty());
+                assert!(!state.finish());
+                assert_eq!(state.strip(b"> qk run next"), b"> qk run next");
+            }
+        }
+    }
+
+    #[test]
+    fn quiet_strips_csi_with_punctuation_final_bytes() {
+        for final_byte in b"@[\\]^_`{|}~" {
+            let mut bytes = b"\x1b[1".to_vec();
+            bytes.push(*final_byte);
+            bytes.extend_from_slice(b"12345\n");
+            for split in 0..=bytes.len() {
+                let mut state = EscapeState::default();
+                let mut result = state.strip(&bytes[..split]);
+                result.extend_from_slice(&state.strip(&bytes[split..]));
+                assert_eq!(
+                    result, b"12345\n",
+                    "final byte {final_byte:#x}, split {split}"
+                );
+                assert!(!state.finish());
+            }
+        }
+    }
+
+    #[test]
+    fn quiet_strips_escapes_split_between_replay_chunks() {
+        for split in 0..=14 {
+            let bytes = b"a\x1b[31mred\x1b[0m!";
+            let mut state = EscapeState::default();
+            let mut result = state.strip(&bytes[..split]);
+            result.extend_from_slice(&state.strip(&bytes[split..]));
+            assert_eq!(result, b"ared!");
+            assert!(!state.finish());
+        }
+        let mut state = EscapeState::default();
+        assert_eq!(state.strip(b"one\x1b["), b"one");
+        assert!(!state.finish());
+        assert_eq!(state.strip(b"> qk run next"), b"> qk run next");
+        assert!(state.strip(b"\x1b").is_empty());
+        assert!(state.finish());
     }
 
     #[test]

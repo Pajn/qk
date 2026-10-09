@@ -3,7 +3,7 @@
 //! output style. Without one, events print as `qk:` status lines on stderr.
 
 use std::io::{self, Write};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use crate::Outcome;
 
@@ -100,6 +100,8 @@ pub trait Sink: Send + Sync {
     fn warning(&self, line: &str);
     /// Task output, to stdout or stderr.
     fn output(&self, stderr: bool, bytes: &[u8]);
+    /// Ends one atomic output batch, including any incremental replay chunks.
+    fn output_finished(&self) {}
 }
 
 impl<T: Sink + ?Sized> Sink for std::sync::Arc<T> {
@@ -111,6 +113,9 @@ impl<T: Sink + ?Sized> Sink for std::sync::Arc<T> {
     }
     fn output(&self, stderr: bool, bytes: &[u8]) {
         (**self).output(stderr, bytes);
+    }
+    fn output_finished(&self) {
+        (**self).output_finished();
     }
 }
 
@@ -155,15 +160,30 @@ fn sink() -> &'static dyn Sink {
 }
 
 pub fn event(event: Event) {
+    let _guard = OUTPUT.lock().unwrap();
     sink().event(&event);
 }
 
 pub fn warning(line: &str) {
+    let _guard = OUTPUT.lock().unwrap();
     sink().warning(line);
 }
 
+// Held logs replay in bounded chunks while keeping each task's complete output
+// together, including its header and GitHub Actions group delimiters.
+static OUTPUT: Mutex<()> = Mutex::new(());
+
+pub(crate) fn output_batch<T>(consume: impl FnOnce(&mut dyn FnMut(bool, &[u8])) -> T) -> T {
+    let _guard = OUTPUT.lock().unwrap();
+    let result = consume(&mut |stderr, bytes| {
+        if !bytes.is_empty() {
+            sink().output(stderr, bytes);
+        }
+    });
+    sink().output_finished();
+    result
+}
+
 pub fn output(stderr: bool, bytes: &[u8]) {
-    if !bytes.is_empty() {
-        sink().output(stderr, bytes);
-    }
+    output_batch(|output| output(stderr, bytes));
 }
