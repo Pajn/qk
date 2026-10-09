@@ -142,6 +142,18 @@ out when the profile left out every task of it that a change affects. One
 with a task that still runs is kept, as is one none of whose affected tasks
 the profile decides. Its dependents are decided by their own tasks.
 
+A project with many targets is left out rarely, since any of its tasks
+without settings keeps it. To ask about the targets a job runs, such as which
+apps' builds a pull request needs, select projects by those targets instead:
+
+```sh
+qk show projects --affected --affected-targets build,export --affected-profile reach --json
+```
+
+This lists the projects where a task of one of the targets is affected, by
+its inputs and then by the profile. A profile with projections cannot be used
+here, since task selection reads declared inputs.
+
 ## Cases
 
 A target can name `cases`: files it runs separately, such as the cases of a

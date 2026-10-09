@@ -616,6 +616,11 @@ enum ShowCommand {
         /// Only projects with one of these targets.
         #[arg(long, short = 't', value_delimiter = ',', action = clap::ArgAction::Append)]
         with_target: Vec<String>,
+        /// Only projects where a task of one of these targets is affected, as
+        /// task selection decides it, under the affected profile if one is
+        /// given.
+        #[arg(long, value_delimiter = ',', action = clap::ArgAction::Append)]
+        affected_targets: Vec<String>,
         /// Only projects of this type.
         #[arg(long = "type", value_enum)]
         kind: Option<ProjectKind>,
@@ -1167,6 +1172,7 @@ fn run(mut cli: Cli) -> Result<i32> {
                     projects,
                     exclude,
                     with_target,
+                    affected_targets,
                     kind,
                     json,
                     sep,
@@ -1190,7 +1196,28 @@ fn run(mut cli: Cli) -> Result<i32> {
                 });
             }
             // As in Nx, naming what changed implies --affected.
-            if affected || changes.given() {
+            let affected = affected || changes.given();
+            if !affected_targets.is_empty() {
+                anyhow::ensure!(
+                    affected,
+                    "--affected-targets selects affected projects; add --affected"
+                );
+                let requests = requests(&workspace, selected.clone(), &affected_targets, None, &[]);
+                let mut running = std::collections::BTreeSet::new();
+                if !requests.is_empty() {
+                    let graph = TaskGraph::build(&workspace, &requests)?;
+                    let analysis =
+                        qk_affected::affected_tasks(&workspace, &graph, &changes.options())?;
+                    warn_landed(analysis.range.as_ref());
+                    running = graph
+                        .roots
+                        .iter()
+                        .filter(|id| analysis.tasks.contains_key(*id))
+                        .map(|id| graph.tasks[id].project.clone())
+                        .collect();
+                }
+                selected.retain(|project| running.contains(project));
+            } else if affected {
                 let affected = changes.affected(&workspace)?;
                 selected.retain(|project| affected.contains(project));
             }

@@ -963,6 +963,43 @@ fn reachability_profile_leaves_out_projects_and_explains_them() {
         successful_json(run(&["show", "projects", "--affected", "--json"])),
         json!(["lib"])
     );
+    // Selected by their tasks: build is left out, e2e is not a target named.
+    assert_eq!(
+        successful_json(run(&[
+            "show",
+            "projects",
+            "--affected",
+            "--affected-targets",
+            "build,e2e",
+            "--json"
+        ])),
+        json!([])
+    );
+    let ordinary = isolated_command(env!("CARGO_BIN_EXE_qk"))
+        .current_dir(root)
+        .args([
+            "show",
+            "projects",
+            "--affected",
+            "--affected-targets",
+            "build",
+            "--json",
+        ])
+        .args(["--base", "HEAD^", "--head", "HEAD"])
+        .output()
+        .unwrap();
+    assert_eq!(successful_json(ordinary), json!(["app"]));
+    let output = isolated_command(env!("CARGO_BIN_EXE_qk"))
+        .current_dir(root)
+        .args(["show", "projects", "--affected-targets", "build"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("add --affected"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let output = run(&["show", "affected"]);
     assert!(output.status.success());
     let text = String::from_utf8(output.stdout).unwrap();
@@ -1004,6 +1041,17 @@ fn reachability_profile_leaves_out_projects_and_explains_them() {
             "Import reachability kept: app:build runs (whole task: apps/app/src/main.ts imports libs/lib/src/used.ts)\n"
         ),
         "{text}"
+    );
+    assert_eq!(
+        successful_json(run(&[
+            "show",
+            "projects",
+            "--affected",
+            "--affected-targets",
+            "build",
+            "--json"
+        ])),
+        json!(["app"])
     );
     let explanation = successful_json(run(&["show", "affected", "app", "--json"]));
     assert_eq!(explanation["reachability"]["decision"], "kept");

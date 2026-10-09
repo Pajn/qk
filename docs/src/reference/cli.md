@@ -7,6 +7,7 @@
 | `qk show projects [--json]` | Project names in Nx graph order, one per line or as a compact JSON array |
 | `qk show projects -p 'web,tag:library' --exclude 'experimental-*'` | Union of matching names, globs and tags, minus exclusions |
 | `qk show projects --with-target e2e --type app [--sep ,]` | Projects with one of the targets, of a type (`app`, `lib` or `e2e`, as Nx types them), joined by a separator |
+| `qk show projects --affected --affected-targets build,export` | Affected projects where a task of one of the targets is affected, as task selection decides it |
 | `qk show project <name> [--json]` | Normalized project configuration as JSON |
 | `qk graph --file <path>` | Workspace project graph in a `{ "graph": { "nodes": ..., "dependencies": ... } }` envelope |
 | `qk graph` or `qk graph --file -` | The same graph on stdout |
@@ -160,7 +161,10 @@ See [Affected selection](../guides/affected.md) for merge-base behavior.
 `run-many`, `affected` and `show tasks` accept `-t/--targets`,
 `-p/--projects` and `--exclude`; lists accept commas, spaces or repeated flags.
 `show projects` accepts `-p/--projects`, `--exclude`, `-t/--with-target`,
-`--type app|lib|e2e`, and `--sep`. `--sep` conflicts with `--json`.
+`--type app|lib|e2e`, and `--sep`. `--sep` conflicts with `--json`. With
+`--affected`, `--affected-targets` lists the projects where a task of one of
+the targets is affected by its inputs, narrowed by `--affected-profile`, in
+place of project selection; it has no Nx equivalent.
 Quote name/tag globs so the shell does not expand them.
 
 `show runs --limit` defaults to `20`, and `show task <id> --limit` to `10`.
