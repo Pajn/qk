@@ -70,6 +70,27 @@ pub fn show(workspace: &Workspace, json: bool, strict: bool) -> Result<i32> {
                     },
                 });
             }
+            for (key, fields) in [
+                ("qk:warm", qk_cache::warm::FIELDS),
+                ("qk:threads", qk_runner::threads::FIELDS),
+            ] {
+                let objects = match definition.extra.get(key) {
+                    Some(serde_json::Value::Object(object)) => vec![object],
+                    Some(serde_json::Value::Array(entries)) => entries
+                        .iter()
+                        .filter_map(serde_json::Value::as_object)
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                for field in objects.into_iter().flat_map(|object| object.keys()) {
+                    if !fields.contains(&field.as_str()) {
+                        findings.push(Finding {
+                            severity: "warning", code: "unknown-field", location: location.clone(),
+                            message: format!("{key}.{field} is not a field this qk knows, so it is ignored; check its spelling or update qk."),
+                        });
+                    }
+                }
+            }
             if definition
                 .extra
                 .get("syncGenerators")

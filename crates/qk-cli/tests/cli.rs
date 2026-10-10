@@ -870,6 +870,67 @@ fn doctor_reports_unsupported_features_without_side_effects() {
     assert!(run(true).status.success());
 }
 
+/// A field a newer qk added is ignored, as Nx ignores keys it does not know,
+/// and doctor names it.
+#[test]
+fn unknown_qk_fields_are_ignored_and_reported_by_doctor() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    std::fs::write(root.join("nx.json"), "{}").unwrap();
+    std::fs::write(
+        root.join("project.json"),
+        json!({"name":"app","targets":{"build":{
+            "command":"echo ran> ran",
+            "qk:warm":[
+                {"paths":["{projectRoot}/scratch"], "fromNewerQk":true},
+                {"group":"shared", "env":{"SHARED":"{warm}"}, "alsoNewer":1}
+            ],
+            "qk:threads":{"max":2, "threadsNewer":1}
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let output = isolated_command(env!("CARGO_BIN_EXE_qk"))
+        .current_dir(root)
+        .args(["run", "app:build"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(!stderr.contains("ignored ("), "{stderr}");
+    assert!(root.join("ran").exists());
+
+    let doctor = |args: &[&str]| {
+        isolated_command(env!("CARGO_BIN_EXE_qk"))
+            .current_dir(root)
+            .arg("doctor")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let output = doctor(&["--json"]);
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["warnings"], 3);
+    for (index, field) in [
+        "qk:warm.fromNewerQk",
+        "qk:warm.alsoNewer",
+        "qk:threads.threadsNewer",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let finding = &report["findings"][index];
+        assert_eq!(finding["code"], "unknown-field");
+        assert_eq!(finding["location"], "app:build");
+        assert!(
+            finding["message"].as_str().unwrap().contains(field),
+            "{finding}"
+        );
+    }
+    assert_eq!(doctor(&["--strict"]).status.code(), Some(1));
+}
+
 #[test]
 fn reachability_profile_leaves_out_projects_and_explains_them() {
     let temp = TempDir::new().unwrap();

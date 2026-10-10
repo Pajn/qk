@@ -285,8 +285,9 @@ selected project do not trigger callbacks. Watch uses no daemon or Nx plugins.
 
 ## Compatibility diagnostics
 
-`qk doctor` reports unsupported executors, configured Nx plugins and sync
-generators without executing commands, loading dotenv files or running plugins.
+`qk doctor` reports unsupported executors, configured Nx plugins, sync
+generators and fields in `qk:warm` or `qk:threads` that this qk does not know,
+without executing commands, loading dotenv files or running plugins.
 It also lists Nx CLI options accepted without effect. `--json` returns a
 versioned report with stable finding codes, locations and error/warning counts.
 Unsupported executors cause exit code 1; `--strict` also fails on warnings.

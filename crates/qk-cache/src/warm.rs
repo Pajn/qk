@@ -43,6 +43,25 @@ pub const RESTORED_AT: std::time::SystemTime = std::time::UNIX_EPOCH;
 /// What a group's identity starts with, before its name.
 const GROUP: &str = "group ";
 
+/// The fields a `qk:warm` object can set. Others are ignored, as Nx ignores
+/// keys it does not know, so a configuration can use fields a newer qk added;
+/// `qk doctor` reports them.
+pub const FIELDS: &[&str] = &[
+    "outputs",
+    "paths",
+    "env",
+    "maxSize",
+    "remote",
+    "mtimes",
+    "portable",
+    "key",
+    "restoreKeys",
+    "group",
+    "survive",
+    "save",
+    "restore",
+];
+
 /// How many saves are kept for a task, across worktrees and keys.
 const KEPT: usize = 8;
 /// Files restored at once.
@@ -138,26 +157,6 @@ fn entry(
     task: &Task,
     object: &serde_json::Map<String, Value>,
 ) -> Result<Warm> {
-    for key in object.keys() {
-        if !matches!(
-            key.as_str(),
-            "outputs"
-                | "paths"
-                | "env"
-                | "maxSize"
-                | "remote"
-                | "mtimes"
-                | "portable"
-                | "key"
-                | "restoreKeys"
-                | "group"
-                | "survive"
-                | "save"
-                | "restore"
-        ) {
-            bail!("unknown qk:warm field {key:?}");
-        }
-    }
     let flag = |name: &str, default: bool| -> Result<bool> {
         object.get(name).map_or(Ok(default), |value| {
             value

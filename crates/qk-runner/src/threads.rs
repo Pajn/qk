@@ -19,6 +19,10 @@ use anyhow::{Context, Result, bail};
 use qk_taskgraph::Task;
 use serde_json::Value;
 
+/// The fields a `qk:threads` object can set. Others are ignored, as Nx ignores
+/// keys it does not know; `qk doctor` reports them.
+pub const FIELDS: &[&str] = &["env", "min", "max"];
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Threads {
     pub env: BTreeMap<String, String>,
@@ -36,11 +40,6 @@ impl Threads {
             Value::Object(object) => object,
             _ => bail!("qk:threads must be true or an object"),
         };
-        for key in object.keys() {
-            if !matches!(key.as_str(), "env" | "min" | "max") {
-                bail!("unknown qk:threads field {key:?}");
-            }
-        }
         let count = |name: &str| -> Result<Option<usize>> {
             object
                 .get(name)
