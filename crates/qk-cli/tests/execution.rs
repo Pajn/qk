@@ -336,6 +336,38 @@ fn validates_entire_plan_before_running_and_dry_run_has_no_side_effects() {
 }
 
 #[test]
+fn working_directory_may_be_created_by_a_dependency() {
+    // As `expo prebuild` creates the native project a Gradle task runs in.
+    let temp = fixture(json!({
+        "generate":{"command":"mkdir generated"},
+        "build":{"command":"echo built> out", "dependsOn":["generate"],
+                 "options":{"cwd":"generated"}}
+    }));
+    success(run(temp.path(), &["run", "app:build"]));
+    assert!(temp.path().join("generated/out").exists());
+    fs::remove_dir_all(temp.path().join("generated")).unwrap();
+    success(run(temp.path(), &["run", "app:build", "--dry-run"]));
+}
+
+#[test]
+fn missing_working_directory_fails_its_task_when_it_runs() {
+    let temp = fixture(json!({
+        "independent":{"command":"echo ok> independent"},
+        "build":{"command":"echo wrong> must-not-exist", "dependsOn":["independent"],
+                 "options":{"cwd":"missing"}}
+    }));
+    let output = run(temp.path(), &["run", "app:build"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("working directory does not exist"),
+        "{stderr}"
+    );
+    assert!(temp.path().join("independent").exists());
+    assert!(!temp.path().join("missing").exists());
+}
+
+#[test]
 fn configuration_cwd_tokens_and_environment_precedence() {
     let mut target = helper_target("record", "result");
     target["options"]["cwd"] = json!("{workspaceRoot}/working directory");
