@@ -83,6 +83,9 @@ pub struct Warm {
     /// Whether saving happens after the task has reported, in the
     /// background, rather than before.
     pub background: bool,
+    /// Whether each of `paths` is restored when it alone is missing, rather
+    /// than all of them only when none is on disk.
+    pub each_path: bool,
 }
 
 /// One part of a warm key.
@@ -150,6 +153,7 @@ fn entry(
                 | "group"
                 | "survive"
                 | "save"
+                | "restore"
         ) {
             bail!("unknown qk:warm field {key:?}");
         }
@@ -312,6 +316,12 @@ fn entry(
                 .context("qk:warm.restoreKeys must be a count no larger than qk:warm.key")
         })
         .transpose()?;
+    let each_path = match object.get("restore").map(Value::as_str) {
+        None | Some(Some("whole")) => false,
+        Some(Some("each-path")) if !paths.is_empty() => true,
+        Some(Some("each-path")) => bail!("qk:warm.restore \"each-path\" needs qk:warm.paths"),
+        Some(_) => bail!("qk:warm.restore must be \"whole\" or \"each-path\""),
+    };
     let background = match object.get("save").map(Value::as_str) {
         None | Some(Some("wait")) => false,
         Some(Some("background")) => true,
@@ -331,6 +341,7 @@ fn entry(
         restore_keys,
         survive,
         background,
+        each_path,
     })
 }
 
@@ -798,6 +809,9 @@ struct Location {
     base: PathBuf,
     /// `None` for everything below `base`.
     outputs: Option<Outputs>,
+    /// With `restore: "each-path"`, each configured path on its own, with the
+    /// exclusions, so each can be restored when it alone is missing.
+    each: Vec<Outputs>,
 }
 
 impl Location {
@@ -828,16 +842,31 @@ impl Location {
             .as_ref()
             .is_none_or(|outputs| outputs.matches(path))
     }
+
+    /// The configured paths that are on disk, when restoring each path on its
+    /// own and some of them are missing; `None` restores the group whole.
+    fn present(&self) -> Result<Option<Vec<&Outputs>>> {
+        let mut present = Vec::new();
+        for outputs in &self.each {
+            if !outputs.paths(&self.base)?.is_empty() {
+                present.push(outputs);
+            }
+        }
+        Ok((!present.is_empty() && present.len() < self.each.len()).then_some(present))
+    }
 }
 
 /// Removes what a failed restore put in a location, children before their
-/// directories. Only a location with nothing on disk is restored, so all of it
-/// came from the attempt.
-fn remove_restored(location: &Location) {
+/// directories, leaving the paths it kept. Nothing else of the location was on
+/// disk, so all of it came from the attempt.
+fn remove_restored(location: &Location, kept: &[&Outputs]) {
     let Ok(paths) = location.paths() else {
         return;
     };
     for path in paths.iter().rev() {
+        if kept.iter().any(|outputs| outputs.matches(path)) {
+            continue;
+        }
         let absolute = location.base.join(path);
         let _ = match fs::symlink_metadata(&absolute) {
             Ok(metadata) if metadata.is_dir() => fs::remove_dir(&absolute),
@@ -855,13 +884,25 @@ fn locations(workspace: &Workspace, task: &Task, warm: &Warm) -> Result<Vec<Loca
             name: "outputs",
             base: workspace.root.clone(),
             outputs: Some(Outputs::new(workspace, task)?),
+            each: Vec::new(),
         });
     }
     if !warm.paths.is_empty() {
+        let mut each = Vec::new();
+        if warm.each_path {
+            let (excluded, included): (Vec<_>, Vec<_>) =
+                warm.paths.iter().partition(|path| path.starts_with('!'));
+            for path in included {
+                let mut patterns = vec![path.clone()];
+                patterns.extend(excluded.iter().map(|path| (*path).clone()));
+                each.push(Outputs::from_paths(&patterns)?);
+            }
+        }
         locations.push(Location {
             name: "paths",
             base: workspace.root.clone(),
             outputs: Some(Outputs::from_paths(&warm.paths)?),
+            each,
         });
     }
     if warm.directory {
@@ -869,6 +910,7 @@ fn locations(workspace: &Workspace, task: &Task, warm: &Warm) -> Result<Vec<Loca
             name: "directory",
             base: directory(workspace, &warm.identity),
             outputs: None,
+            each: Vec::new(),
         });
     }
     Ok(locations)
@@ -1182,9 +1224,14 @@ impl Cache {
         // Local state wins: it is the newest for this checkout.
         let mut present = Vec::new();
         let mut missing = Vec::new();
-        for location in locations(workspace, task, warm)? {
+        let locations = locations(workspace, task, warm)?;
+        for location in &locations {
             if location.paths()?.is_empty() {
-                missing.push(location);
+                missing.push((location, Vec::new()));
+            } else if let Some(kept) = location.present()? {
+                // Only what no path on disk covers comes back, so a file the
+                // tool removed from a kept path is not restored into it.
+                missing.push((location, kept));
             } else {
                 present.push(warm.group().map_or(location.name, |group| group).to_owned());
             }
@@ -1206,24 +1253,33 @@ impl Cache {
         let keep_mtimes = warm.preserve_mtimes && source == "local";
         restored.source = source;
         let mut noted = read_restored_files(workspace, warm);
-        for location in missing {
+        for (location, kept) in missing {
             let Some(group) = record.groups.get(location.name) else {
                 continue;
             };
             let (files, bytes) =
-                match self.restore_location(&task.id, &location, group, keep_mtimes) {
+                match self.restore_location(&task.id, location, &kept, group, keep_mtimes) {
                     Ok(restored) => restored,
                     Err(error) => {
-                        // Nothing of the location was on disk, so all that is there
-                        // now came from this attempt. A fragment left behind would
-                        // count as present and keep the rest from being restored.
-                        remove_restored(&location);
+                        // What no kept path covers was not on disk, so all of it
+                        // there now came from this attempt. A fragment left behind
+                        // would count as present and keep the rest from coming back.
+                        remove_restored(location, &kept);
                         return Err(error);
                     }
                 };
             restored.files += files.len();
             restored.bytes += bytes;
-            noted.groups.insert(location.name.to_owned(), files);
+            if kept.is_empty() {
+                noted.groups.insert(location.name.to_owned(), files);
+            } else {
+                // The kept paths' notes from an earlier restore still hold.
+                noted
+                    .groups
+                    .entry(location.name.to_owned())
+                    .or_default()
+                    .extend(files);
+            }
             restored.groups.push(location.name.to_owned());
         }
         if !restored.groups.is_empty() {
@@ -1240,6 +1296,7 @@ impl Cache {
         &self,
         task: &str,
         location: &Location,
+        kept: &[&Outputs],
         group: &WarmGroup,
         keep_mtimes: bool,
     ) -> Result<(GroupFiles, u64)> {
@@ -1253,6 +1310,9 @@ impl Cache {
             paths::safe_parents(&location.base, path)?;
             if !location.matches(path) {
                 bail!("warm state for {task} holds {path}, outside its paths");
+            }
+            if kept.iter().any(|outputs| outputs.matches(path)) {
+                continue;
             }
             let destination = location.base.join(path);
             if let Some(parent) = destination.parent()

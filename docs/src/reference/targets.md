@@ -156,6 +156,7 @@ named twice and no variable is set by two entries. See
 | `group` | string | None; share `{warm}` and its saves with every target naming the group; an entry with a group cannot set `outputs`, `paths` or `survive` |
 | `survive` | array of targets, `target` or `project:target` | Empty; keep `paths` across these dependencies |
 | `save` | `"wait"` or `"background"` | `"wait"`; `"background"` saves after the task has reported |
+| `restore` | `"whole"` or `"each-path"` | `"whole"`; `"each-path"` restores each missing path from `paths` and leaves those on disk; see [Restoring paths one by one](../guides/warm-state.md#restoring-paths-one-by-one) |
 
 Put it beside `inputs` and `outputs`, rather than in executor `options`.
 Environment values retain their other text unchanged; their directory tokens
