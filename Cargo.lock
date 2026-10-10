@@ -513,9 +513,9 @@ checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
 name = "fallout"
-version = "0.4.2"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "adc0da0cee1bda22e866e96454926365e24266d149a88ada88312bc967930080"
+checksum = "d570a68c078ce91754133b2a9b264e083cfc4a0da872a4e6c76c3304e5fd69df"
 dependencies = [
  "ahash",
  "clap",
