@@ -348,6 +348,19 @@ impl Cache {
             Ok(outputs) => outputs,
             Err(error) => return bypass(format!("{error:#}")),
         };
+        // Only dependents read a fingerprint. Hashing the outputs of a task none
+        // depends on, after it ran, can mean reading gigabytes for nothing.
+        let depended_on = graph
+            .tasks
+            .values()
+            .any(|other| other.dependencies.contains(&task.id));
+        let fingerprint_outputs = |key: &str| {
+            if depended_on {
+                outputs_fingerprint(task, &workspace.root, &outputs, key)
+            } else {
+                Err(format!("{}: no task depends on it", task.id))
+            }
+        };
         if !cacheable {
             let restored = before(running);
             let outcome = execute(running, cancelled)?;
@@ -363,7 +376,7 @@ impl Cache {
                 outcome,
                 cancelled,
             ) {
-                outputs_fingerprint(task, &workspace.root, &outputs, &key)
+                fingerprint_outputs(&key)
             } else {
                 Err(format!("{}: did not complete unchanged", task.id))
             };
@@ -390,7 +403,7 @@ impl Cache {
                 cancelled,
             );
             let fingerprint = if outcome == Outcome::Success && inputs_unchanged {
-                outputs_fingerprint(task, &workspace.root, &outputs, &key)
+                fingerprint_outputs(&key)
             } else {
                 Err(format!("{}: did not complete unchanged", task.id))
             };
@@ -547,7 +560,7 @@ impl Cache {
         let fingerprint = if outcome != Outcome::Success || !inputs_unchanged {
             Err(format!("{}: did not complete unchanged", task.id))
         } else if !capture.healthy() {
-            outputs_fingerprint(task, &workspace.root, &outputs, &key)
+            fingerprint_outputs(&key)
         } else {
             // The saved manifest already hashes every output; reuse it.
             match self.publish(&workspace.root, &key, &outputs, log.path()) {
@@ -560,7 +573,7 @@ impl Cache {
                 }
                 Err(error) => {
                     qk_executor::status!("qk: {}: could not save cache entry ({error})", task.id);
-                    outputs_fingerprint(task, &workspace.root, &outputs, &key)
+                    fingerprint_outputs(&key)
                 }
             }
         };
