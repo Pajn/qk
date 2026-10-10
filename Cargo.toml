@@ -3,7 +3,7 @@ members = ["crates/qk-cli", "crates/qk-config", "crates/qk-graph", "crates/qk-ta
 resolver = "3"
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 publish = ["crates-io"]
 license = "MIT OR Apache-2.0"
@@ -44,16 +44,16 @@ sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 terminal_size = "0.4"
 url = "2"
 zstd = { version = "0.13", default-features = false }
-qk-config = { path = "crates/qk-config", version = "=0.4.0" }
-qk-graph = { path = "crates/qk-graph", version = "=0.4.0" }
-qk-taskgraph = { path = "crates/qk-taskgraph", version = "=0.4.0" }
-qk-executor = { path = "crates/qk-executor", version = "=0.4.0" }
-qk-runner = { path = "crates/qk-runner", version = "=0.4.0" }
-qk-cache = { path = "crates/qk-cache", version = "=0.4.0" }
-qk-lockfile = { path = "crates/qk-lockfile", version = "=0.4.0" }
-qk-affected = { path = "crates/qk-affected", version = "=0.4.0" }
-qk-history = { path = "crates/qk-history", version = "=0.4.0" }
-qk-input-analysis = { path = "crates/qk-input-analysis", version = "=0.4.0" }
+qk-config = { path = "crates/qk-config", version = "=0.5.0" }
+qk-graph = { path = "crates/qk-graph", version = "=0.5.0" }
+qk-taskgraph = { path = "crates/qk-taskgraph", version = "=0.5.0" }
+qk-executor = { path = "crates/qk-executor", version = "=0.5.0" }
+qk-runner = { path = "crates/qk-runner", version = "=0.5.0" }
+qk-cache = { path = "crates/qk-cache", version = "=0.5.0" }
+qk-lockfile = { path = "crates/qk-lockfile", version = "=0.5.0" }
+qk-affected = { path = "crates/qk-affected", version = "=0.5.0" }
+qk-history = { path = "crates/qk-history", version = "=0.5.0" }
+qk-input-analysis = { path = "crates/qk-input-analysis", version = "=0.5.0" }
 
 [profile.release]
 lto = "thin"
