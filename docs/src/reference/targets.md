@@ -133,6 +133,8 @@ core. The setting and allocated count do not affect cache keys.
 Continuous tasks do not take a core share; this setting does not allocate
 threads or set these environment variables for them.
 `false` is not a supported value; omit the key to disable it.
+Other fields are ignored, as Nx ignores keys it does not know, so a
+configuration can use fields a newer qk added; `qk doctor` reports them.
 See [Sharing cores](../guides/threads.md) for allocation examples.
 
 ## `qk:warm`
@@ -158,6 +160,7 @@ named twice and no variable is set by two entries. See
 | `save` | `"wait"` or `"background"` | `"wait"`; `"background"` saves after the task has reported |
 | `restore` | `"whole"` or `"each-path"` | `"whole"`; `"each-path"` restores each missing path from `paths` and leaves those on disk; see [Restoring paths one by one](../guides/warm-state.md#restoring-paths-one-by-one) |
 
+Other fields are ignored, as in `qk:threads`, and `qk doctor` reports them.
 Put it beside `inputs` and `outputs`, rather than in executor `options`.
 Environment values retain their other text unchanged; their directory tokens
 are absolute even when the task runs from a project subdirectory.
