@@ -177,7 +177,7 @@ fn copy_blob(source: &Path, destination: &Path) -> Result<String> {
     Ok(hash)
 }
 
-fn copy_blob_contents(source: &Path, destination: &Path) -> Result<String> {
+pub(crate) fn copy_blob_contents(source: &Path, destination: &Path) -> Result<String> {
     let bytes = if fs::metadata(source)?.len() <= SMALL_BLOB_LIMIT as u64 {
         small_blob_snapshot(File::open(source)?)?
     } else {
@@ -784,7 +784,7 @@ fn outputs_record(root: &Path, task: &str) -> std::path::PathBuf {
 
 /// Sets a file's modification time. Unix needs a handle only to read it;
 /// Windows one that may write its attributes.
-fn set_modified(path: &Path, time: SystemTime) -> Result<()> {
+pub(crate) fn set_modified(path: &Path, time: SystemTime) -> Result<()> {
     #[cfg(windows)]
     let file = {
         use std::os::windows::fs::OpenOptionsExt;

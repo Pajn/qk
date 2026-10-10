@@ -216,6 +216,12 @@ fn spawn(
     capture: bool,
     interactive: bool,
 ) -> Result<GroupChild> {
+    // Checked here rather than when the task is prepared: a dependency may
+    // create the directory, as a native prebuild creates the project a build
+    // runs in.
+    if !task.cwd.is_dir() {
+        anyhow::bail!("working directory does not exist: {}", task.cwd.display());
+    }
     #[cfg(windows)]
     let mut command = shell(text);
     #[cfg(not(windows))]

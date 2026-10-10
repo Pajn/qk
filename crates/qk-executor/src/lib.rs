@@ -559,9 +559,6 @@ pub fn prepare(
             _ => resolved.push(part.as_os_str()),
         }
     }
-    if !cwd.is_dir() {
-        bail!("working directory does not exist: {}", cwd.display());
-    }
     // Expose local binaries even for plain run-commands targets.
     let mut paths = Vec::new();
     for directory in resolved.ancestors() {

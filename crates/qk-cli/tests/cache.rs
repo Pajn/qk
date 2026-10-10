@@ -2789,6 +2789,35 @@ fn preserved_modification_times_come_back_only_to_their_worktree() {
 }
 
 #[cfg(unix)]
+#[test]
+fn a_failed_warm_restore_leaves_nothing_behind() {
+    // More files than one restore worker takes, so they are copied in parallel.
+    let fixture = Fixture::new(json!({
+        "command": "if [ -d scratch ]; then cat scratch/*; else echo cold; fi; mkdir -p scratch; for i in $(seq 100 299); do echo $i > scratch/$i; done",
+        "qk:warm": {"paths": ["{projectRoot}/scratch"]}
+    }));
+    assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
+    let cache =
+        PathBuf::from(stdout(&success(fixture.qk(&fixture.root, &["cache", "path"]))).trim());
+    for blob in fs::read_dir(cache.join("blobs")).unwrap() {
+        let path = blob.unwrap().path();
+        if fs::read(&path).unwrap() == b"150\n" {
+            fs::write(&path, "corrupt\n").unwrap();
+        }
+    }
+    fs::remove_dir_all(fixture.root.join("scratch")).unwrap();
+    let output = success(fixture.qk(&fixture.root, &["run", "app:build"]));
+    assert!(
+        stderr(&output).contains("not restored"),
+        "{}",
+        stderr(&output)
+    );
+    // Nothing of the failed restore is left, not even the files that copied
+    // cleanly, so the next run does not take a fragment for the whole group.
+    assert_eq!(stdout(&output), "cold\n");
+}
+
+#[cfg(unix)]
 fn said_with(fixture: &Fixture, root: &Path, env: &[(&str, &str)]) -> String {
     let mut command = fixture.command(root, &["run", "app:build"]);
     for (name, value) in env {

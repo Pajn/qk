@@ -16,10 +16,11 @@
 //! `qk:warm` may also be an array of such objects, each restored and saved on
 //! its own, so state that relocates can be portable beside state that cannot.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -30,8 +31,8 @@ use serde_json::Value;
 
 use crate::paths::{self, Outputs};
 use crate::record::{self, Artifact, WarmGroup, WarmRecord, validate_link};
-use crate::store::{mode, set_mode, symlink};
-use crate::{Cache, hash::digest_file};
+use crate::store::{copy_blob_contents, mode, set_mode, set_modified, symlink};
+use crate::{Cache, hash::digest_file, profile};
 
 /// When restored files say they were written. Warm state comes from another
 /// checkout, so it must look older than every file in this one: tools that
@@ -44,6 +45,13 @@ const GROUP: &str = "group ";
 
 /// How many saves are kept for a task, across worktrees and keys.
 const KEPT: usize = 8;
+/// Files restored at once.
+const RESTORERS: usize = 8;
+
+/// A warm file to restore: its path, blob, mode, destination and modification time.
+type PendingFile<'a> = (&'a String, &'a str, u32, PathBuf, SystemTime);
+/// A restored file's stamp and size.
+type RestoredFile = (Vec<i64>, u64);
 
 /// A target's `qk:warm`.
 #[derive(Clone, Debug, Default)]
@@ -742,8 +750,11 @@ impl WarmGroup {
 /// restored and the artifact it came from, so a save need not read it again.
 #[derive(Default, Serialize, Deserialize)]
 struct RestoredFiles {
-    groups: BTreeMap<String, BTreeMap<String, (Vec<i64>, Artifact)>>,
+    groups: BTreeMap<String, GroupFiles>,
 }
+
+/// A group's restored files: each one's stamp and artifact, by path.
+type GroupFiles = BTreeMap<String, (Vec<i64>, Artifact)>;
 
 /// What a restore brought back.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -816,6 +827,23 @@ impl Location {
         self.outputs
             .as_ref()
             .is_none_or(|outputs| outputs.matches(path))
+    }
+}
+
+/// Removes what a failed restore put in a location, children before their
+/// directories. Only a location with nothing on disk is restored, so all of it
+/// came from the attempt.
+fn remove_restored(location: &Location) {
+    let Ok(paths) = location.paths() else {
+        return;
+    };
+    for path in paths.iter().rev() {
+        let absolute = location.base.join(path);
+        let _ = match fs::symlink_metadata(&absolute) {
+            Ok(metadata) if metadata.is_dir() => fs::remove_dir(&absolute),
+            Ok(_) => fs::remove_file(&absolute),
+            Err(_) => continue,
+        };
     }
 }
 
@@ -1164,6 +1192,7 @@ impl Cache {
         if missing.is_empty() {
             return Ok((restored, present));
         }
+        let choosing = profile::span(&task.id, "warm_restore_choose");
         let current = key_digests(workspace, warm, prepared)?;
         let (record, source) = match self.choose_warm(workspace, warm, &current) {
             Some(chosen) => chosen,
@@ -1172,6 +1201,8 @@ impl Cache {
                 None => return Ok((restored, present)),
             },
         };
+        drop(choosing);
+        let _files = profile::span(&task.id, "warm_restore_files");
         let keep_mtimes = warm.preserve_mtimes && source == "local";
         restored.source = source;
         let mut noted = read_restored_files(workspace, warm);
@@ -1179,56 +1210,19 @@ impl Cache {
             let Some(group) = record.groups.get(location.name) else {
                 continue;
             };
-            fs::create_dir_all(&location.base)?;
-            let mut files = BTreeMap::new();
-            for (path, artifact) in &group.artifacts {
-                paths::safe_parents(&location.base, path)?;
-                if !location.matches(path) {
-                    bail!("warm state for {} holds {path}, outside its paths", task.id);
-                }
-                let destination = location.base.join(path);
-                if let Some(parent) = destination.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                match artifact {
-                    Artifact::File { blob, mode } => {
-                        let source = self.root.join("blobs").join(blob);
-                        if digest_file(&source)? != *blob {
-                            bail!("warm state for {} has a corrupt blob", task.id);
-                        }
-                        fs::copy(&source, &destination)?;
-                        let modified = keep_mtimes
-                            .then(|| group.mtimes.get(path))
-                            .flatten()
-                            .and_then(|nanos| u64::try_from(*nanos).ok())
-                            .map_or(RESTORED_AT, |nanos| {
-                                UNIX_EPOCH + Duration::from_nanos(nanos)
-                            });
-                        fs::File::options()
-                            .write(true)
-                            .open(&destination)?
-                            .set_modified(modified)?;
-                        set_mode(&destination, *mode)?;
-                        restored.files += 1;
-                        restored.bytes += fs::metadata(&destination)?.len();
-                        files.insert(
-                            path.clone(),
-                            (
-                                stamp(&fs::symlink_metadata(&destination)?),
-                                artifact.clone(),
-                            ),
-                        );
+            let (files, bytes) =
+                match self.restore_location(&task.id, &location, group, keep_mtimes) {
+                    Ok(restored) => restored,
+                    Err(error) => {
+                        // Nothing of the location was on disk, so all that is there
+                        // now came from this attempt. A fragment left behind would
+                        // count as present and keep the rest from being restored.
+                        remove_restored(&location);
+                        return Err(error);
                     }
-                    Artifact::Directory { mode } => {
-                        fs::create_dir_all(&destination)?;
-                        set_mode(&destination, *mode)?;
-                    }
-                    Artifact::Symlink { target, directory } => {
-                        validate_link(path, target)?;
-                        symlink(target, &destination, *directory)?;
-                    }
-                }
-            }
+                };
+            restored.files += files.len();
+            restored.bytes += bytes;
             noted.groups.insert(location.name.to_owned(), files);
             restored.groups.push(location.name.to_owned());
         }
@@ -1238,6 +1232,126 @@ impl Cache {
             fs::write(path, serde_json::to_vec(&noted)?)?;
         }
         Ok((restored, present))
+    }
+
+    /// Restores one missing location from its saved group: the restored files'
+    /// stamps and artifacts, and how many bytes they hold.
+    fn restore_location(
+        &self,
+        task: &str,
+        location: &Location,
+        group: &WarmGroup,
+        keep_mtimes: bool,
+    ) -> Result<(GroupFiles, u64)> {
+        fs::create_dir_all(&location.base)?;
+        // Validate every path and lay out directories and links first, so the
+        // files, which are most of the work, can be copied in parallel.
+        let mut created = BTreeSet::new();
+        let mut directories = Vec::new();
+        let mut pending = Vec::new();
+        for (path, artifact) in &group.artifacts {
+            paths::safe_parents(&location.base, path)?;
+            if !location.matches(path) {
+                bail!("warm state for {task} holds {path}, outside its paths");
+            }
+            let destination = location.base.join(path);
+            if let Some(parent) = destination.parent()
+                && created.insert(parent.to_owned())
+            {
+                fs::create_dir_all(parent)?;
+            }
+            match artifact {
+                Artifact::File { blob, mode } => {
+                    let modified = keep_mtimes
+                        .then(|| group.mtimes.get(path))
+                        .flatten()
+                        .and_then(|nanos| u64::try_from(*nanos).ok())
+                        .map_or(RESTORED_AT, |nanos| {
+                            UNIX_EPOCH + Duration::from_nanos(nanos)
+                        });
+                    pending.push((path, blob.as_str(), *mode, destination, modified));
+                }
+                Artifact::Directory { mode } => {
+                    fs::create_dir_all(&destination)?;
+                    created.insert(destination.clone());
+                    directories.push((destination, *mode));
+                }
+                Artifact::Symlink { target, directory } => {
+                    validate_link(path, target)?;
+                    symlink(target, &destination, *directory)?;
+                }
+            }
+        }
+        let copied = self
+            .restore_warm_files(&pending)
+            .with_context(|| format!("warm state for {task} not restored"))?;
+        // Directory modes come last, since one may forbid writing into it.
+        for (destination, mode) in directories {
+            set_mode(&destination, mode)?;
+        }
+        let mut files = BTreeMap::new();
+        let mut bytes = 0;
+        for ((path, blob, mode, _, _), (metadata, size)) in pending.into_iter().zip(copied) {
+            bytes += size;
+            let artifact = Artifact::File {
+                blob: blob.to_owned(),
+                mode,
+            };
+            files.insert(path.clone(), (metadata, artifact));
+        }
+        Ok((files, bytes))
+    }
+
+    /// Copies warm files out of their blobs, verifying each copy, with bounded
+    /// parallelism. Returns each file's stamp and size, in the given order.
+    fn restore_warm_files(&self, files: &[PendingFile]) -> Result<Vec<RestoredFile>> {
+        let restore =
+            |(_, blob, mode, destination, modified): &PendingFile| -> Result<RestoredFile> {
+                let source = self.root.join("blobs").join(blob);
+                if copy_blob_contents(&source, destination)? != *blob {
+                    // A corrupt copy must not stay where the tool would use it.
+                    let _ = fs::remove_file(destination);
+                    bail!("corrupt blob {blob}");
+                }
+                // Before its mode, which may prevent opening the file.
+                set_modified(destination, *modified)?;
+                set_mode(destination, *mode)?;
+                let metadata = fs::symlink_metadata(destination)?;
+                Ok((stamp(&metadata), metadata.len()))
+            };
+        let workers = files.len().div_ceil(64).clamp(1, RESTORERS);
+        if workers == 1 {
+            return files.iter().map(restore).collect();
+        }
+        // Sizes vary widely, so each worker takes the next file rather than a
+        // fixed share, and none starts another after a failure.
+        let next = AtomicUsize::new(0);
+        let failed = AtomicBool::new(false);
+        let mut results: Vec<(usize, Result<RestoredFile>)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..workers)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut done = Vec::new();
+                        while !failed.load(Ordering::Relaxed) {
+                            let index = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(file) = files.get(index) else { break };
+                            let result = restore(file);
+                            if result.is_err() {
+                                failed.store(true, Ordering::Relaxed);
+                            }
+                            done.push((index, result));
+                        }
+                        done
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|handle| handle.join().expect("warm restore worker panicked"))
+                .collect()
+        });
+        results.sort_by_key(|(index, _)| *index);
+        results.into_iter().map(|(_, result)| result).collect()
     }
 
     /// The task's warm state from the remote store: the current branch's, else
@@ -1326,6 +1440,7 @@ impl Cache {
     fn save_prepared(&self, save: &Save) -> Result<()> {
         let warm = &save.warm;
         let _lock = self.lock_warm(warm)?;
+        let _save = profile::span(&save.task, "warm_save");
         let records = self.warm_records(warm);
         // This worktree's save under the same key, else under any.
         let previous = records
@@ -1407,6 +1522,7 @@ impl Cache {
                 };
                 group.artifacts.insert(path, artifact);
             }
+            let storing = profile::span(&save.task, "warm_save_blobs");
             let sources: Vec<_> = pending
                 .iter()
                 .map(|(_, absolute, _)| absolute.clone())
@@ -1431,6 +1547,7 @@ impl Cache {
                     },
                 );
             }
+            drop(storing);
             if let Some(limit) = warm.max_size
                 && group.size(self) > limit
             {
