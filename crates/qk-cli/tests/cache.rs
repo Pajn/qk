@@ -2789,6 +2789,29 @@ fn preserved_modification_times_come_back_only_to_their_worktree() {
 }
 
 #[cfg(unix)]
+#[test]
+fn a_corrupt_warm_blob_is_not_left_for_the_task() {
+    // More files than one restore worker takes, so they are copied in parallel.
+    let fixture = Fixture::new(json!({
+        "command": "if [ -d scratch ]; then cat scratch/*; else echo cold; fi; mkdir -p scratch; for i in $(seq 100 299); do echo $i > scratch/$i; done",
+        "qk:warm": {"paths": ["{projectRoot}/scratch"]}
+    }));
+    assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
+    let cache =
+        PathBuf::from(stdout(&success(fixture.qk(&fixture.root, &["cache", "path"]))).trim());
+    for blob in fs::read_dir(cache.join("blobs")).unwrap() {
+        let path = blob.unwrap().path();
+        if fs::read(&path).unwrap() == b"150\n" {
+            fs::write(&path, "corrupt\n").unwrap();
+        }
+    }
+    fs::remove_dir_all(fixture.root.join("scratch")).unwrap();
+    let output = success(fixture.qk(&fixture.root, &["run", "app:build"]));
+    assert!(stderr(&output).contains("not restored"), "{}", stderr(&output));
+    assert!(!stdout(&output).contains("corrupt"), "{}", stdout(&output));
+}
+
+#[cfg(unix)]
 fn said_with(fixture: &Fixture, root: &Path, env: &[(&str, &str)]) -> String {
     let mut command = fixture.command(root, &["run", "app:build"]);
     for (name, value) in env {
