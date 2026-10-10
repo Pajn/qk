@@ -31,8 +31,10 @@ state ever being part of a result, with a `qk:warm` key at target level
 Warm state is restored before the task runs, on a cache miss and for
 targets that are not cacheable, and never on a hit. A group already present
 on disk is left alone, since it is the newest for that checkout; otherwise
-it comes from the worktree's own save. With `portable: true`, it can also
-come from the store linked worktrees share or from the remote store. Each worktree
+it comes from the worktree's own save. The task's `paths` count as one group
+unless they are [restored one by one](#restoring-paths-one-by-one). With
+`portable: true`, it can also come from the store linked worktrees share or
+from the remote store. Each worktree
 keeps its own save, and a restore takes the worktree's own before the most
 recent other worktree's; the eight most recent saves of a task are kept.
 With sharing enabled and no suitable local save, it comes from the remote store: the current branch's
@@ -357,6 +359,32 @@ Stash ownership records are replaced atomically after syncing the new file.
 Unreadable, invalid or missing metadata leaves saved contents in place and
 reports a recovery warning. This protects stopped-process recovery; it does
 not promise durability across power loss.
+
+## Restoring paths one by one
+
+All of a task's `paths` are restored together, and only when none of them is
+on disk. Then one directory left behind, such as a native library's CMake
+state in `node_modules`, keeps the rest from coming back when another is
+deleted. `restore: "each-path"` restores every path that is missing, from the
+save, and leaves those on disk as they are:
+
+```jsonc
+"android": {
+  "qk:warm": {
+    "paths": [
+      "{projectRoot}/android/app/build",
+      "{workspaceRoot}/node_modules/.pnpm/*/node_modules/*/android/.cxx"
+    ],
+    "restore": "each-path"
+  }
+}
+```
+
+A restore can then put an older save beside newer state on disk. Use it only
+when every path is state a tool validates on its own, as Gradle and CMake
+check their outputs against their inputs. Keep state that one tool writes and
+reads together, such as an index and the files it describes, under one path,
+or leave the default, `"whole"`.
 
 ## Several entries
 

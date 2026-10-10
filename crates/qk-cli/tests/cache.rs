@@ -2818,6 +2818,87 @@ fn a_failed_warm_restore_leaves_nothing_behind() {
 }
 
 #[cfg(unix)]
+#[test]
+fn each_path_restores_a_missing_path_beside_one_on_disk() {
+    for (restore, expected) in [
+        (None, "cold-a\nnewer-b\n"),
+        (Some("whole"), "cold-a\nnewer-b\n"),
+        (Some("each-path"), "saved-a\nnewer-b\n"),
+    ] {
+        let mut warm = json!({"paths": ["{projectRoot}/scratch-a", "{projectRoot}/scratch-b"]});
+        if let Some(restore) = restore {
+            warm["restore"] = json!(restore);
+        }
+        let fixture = Fixture::new(json!({
+            "command": "for d in a b; do if [ -f scratch-$d/state ]; then cat scratch-$d/state; else echo cold-$d; fi; done; if [ -f scratch-b/old ]; then echo old-b; fi; mkdir -p scratch-a scratch-b; echo saved-a > scratch-a/state; echo saved-b > scratch-b/state; touch scratch-b/old",
+            "qk:warm": warm
+        }));
+        success(fixture.qk(&fixture.root, &["run", "app:build"]));
+        // One path is gone. The other is on disk, newer than the save, and
+        // without a file the save holds, which must not come back.
+        fs::remove_dir_all(fixture.root.join("scratch-a")).unwrap();
+        fs::write(fixture.root.join("scratch-b/state"), "newer-b\n").unwrap();
+        fs::remove_file(fixture.root.join("scratch-b/old")).unwrap();
+        let output = success(fixture.qk(&fixture.root, &["run", "app:build"]));
+        assert_eq!(stdout(&output), expected, "restore {restore:?}");
+        assert!(
+            !stderr(&output).contains("not restored"),
+            "{}",
+            stderr(&output)
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_each_path_restore_keeps_the_paths_on_disk() {
+    let fixture = Fixture::new(json!({
+        "command": "for d in a b; do if [ -f scratch-$d/state ]; then cat scratch-$d/state; else echo cold-$d; fi; done; mkdir -p scratch-a scratch-b; echo saved-a > scratch-a/state; echo saved-b > scratch-b/state",
+        "qk:warm": {
+            "paths": ["{projectRoot}/scratch-a", "{projectRoot}/scratch-b"],
+            "restore": "each-path"
+        }
+    }));
+    success(fixture.qk(&fixture.root, &["run", "app:build"]));
+    let cache =
+        PathBuf::from(stdout(&success(fixture.qk(&fixture.root, &["cache", "path"]))).trim());
+    for blob in fs::read_dir(cache.join("blobs")).unwrap() {
+        let path = blob.unwrap().path();
+        if fs::read(&path).unwrap() == b"saved-a\n" {
+            fs::write(&path, "corrupt\n").unwrap();
+        }
+    }
+    fs::remove_dir_all(fixture.root.join("scratch-a")).unwrap();
+    fs::write(fixture.root.join("scratch-b/state"), "newer-b\n").unwrap();
+    let output = success(fixture.qk(&fixture.root, &["run", "app:build"]));
+    assert!(
+        stderr(&output).contains("not restored"),
+        "{}",
+        stderr(&output)
+    );
+    // The failed path is cleared; the path that was on disk is untouched.
+    assert_eq!(stdout(&output), "cold-a\nnewer-b\n");
+}
+
+#[test]
+fn each_path_restore_needs_paths() {
+    for (warm, message) in [
+        (
+            json!({"outputs": true, "restore": "each-path"}),
+            "needs qk:warm.paths",
+        ),
+        (
+            json!({"paths": ["{projectRoot}/scratch"], "restore": "each"}),
+            r#"must be "whole" or "each-path""#,
+        ),
+    ] {
+        let fixture = Fixture::new(json!({"command": "true", "qk:warm": warm}));
+        let output = fixture.qk(&fixture.root, &["run", "app:build"]);
+        assert!(stderr(&output).contains(message), "{}", stderr(&output));
+    }
+}
+
+#[cfg(unix)]
 fn said_with(fixture: &Fixture, root: &Path, env: &[(&str, &str)]) -> String {
     let mut command = fixture.command(root, &["run", "app:build"]);
     for (name, value) in env {
