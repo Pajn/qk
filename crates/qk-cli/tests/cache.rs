@@ -2790,7 +2790,7 @@ fn preserved_modification_times_come_back_only_to_their_worktree() {
 
 #[cfg(unix)]
 #[test]
-fn a_corrupt_warm_blob_is_not_left_for_the_task() {
+fn a_failed_warm_restore_leaves_nothing_behind() {
     // More files than one restore worker takes, so they are copied in parallel.
     let fixture = Fixture::new(json!({
         "command": "if [ -d scratch ]; then cat scratch/*; else echo cold; fi; mkdir -p scratch; for i in $(seq 100 299); do echo $i > scratch/$i; done",
@@ -2807,8 +2807,14 @@ fn a_corrupt_warm_blob_is_not_left_for_the_task() {
     }
     fs::remove_dir_all(fixture.root.join("scratch")).unwrap();
     let output = success(fixture.qk(&fixture.root, &["run", "app:build"]));
-    assert!(stderr(&output).contains("not restored"), "{}", stderr(&output));
-    assert!(!stdout(&output).contains("corrupt"), "{}", stdout(&output));
+    assert!(
+        stderr(&output).contains("not restored"),
+        "{}",
+        stderr(&output)
+    );
+    // Nothing of the failed restore is left, not even the files that copied
+    // cleanly, so the next run does not take a fragment for the whole group.
+    assert_eq!(stdout(&output), "cold\n");
 }
 
 #[cfg(unix)]

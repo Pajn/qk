@@ -750,8 +750,11 @@ impl WarmGroup {
 /// restored and the artifact it came from, so a save need not read it again.
 #[derive(Default, Serialize, Deserialize)]
 struct RestoredFiles {
-    groups: BTreeMap<String, BTreeMap<String, (Vec<i64>, Artifact)>>,
+    groups: BTreeMap<String, GroupFiles>,
 }
+
+/// A group's restored files: each one's stamp and artifact, by path.
+type GroupFiles = BTreeMap<String, (Vec<i64>, Artifact)>;
 
 /// What a restore brought back.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -824,6 +827,23 @@ impl Location {
         self.outputs
             .as_ref()
             .is_none_or(|outputs| outputs.matches(path))
+    }
+}
+
+/// Removes what a failed restore put in a location, children before their
+/// directories. Only a location with nothing on disk is restored, so all of it
+/// came from the attempt.
+fn remove_restored(location: &Location) {
+    let Ok(paths) = location.paths() else {
+        return;
+    };
+    for path in paths.iter().rev() {
+        let absolute = location.base.join(path);
+        let _ = match fs::symlink_metadata(&absolute) {
+            Ok(metadata) if metadata.is_dir() => fs::remove_dir(&absolute),
+            Ok(_) => fs::remove_file(&absolute),
+            Err(_) => continue,
+        };
     }
 }
 
@@ -1190,62 +1210,19 @@ impl Cache {
             let Some(group) = record.groups.get(location.name) else {
                 continue;
             };
-            fs::create_dir_all(&location.base)?;
-            // Validate every path and lay out directories and links first, so
-            // the files, which are most of the work, can be copied in parallel.
-            let mut created = BTreeSet::new();
-            let mut directories = Vec::new();
-            let mut pending = Vec::new();
-            for (path, artifact) in &group.artifacts {
-                paths::safe_parents(&location.base, path)?;
-                if !location.matches(path) {
-                    bail!("warm state for {} holds {path}, outside its paths", task.id);
-                }
-                let destination = location.base.join(path);
-                if let Some(parent) = destination.parent()
-                    && created.insert(parent.to_owned())
-                {
-                    fs::create_dir_all(parent)?;
-                }
-                match artifact {
-                    Artifact::File { blob, mode } => {
-                        let modified = keep_mtimes
-                            .then(|| group.mtimes.get(path))
-                            .flatten()
-                            .and_then(|nanos| u64::try_from(*nanos).ok())
-                            .map_or(RESTORED_AT, |nanos| {
-                                UNIX_EPOCH + Duration::from_nanos(nanos)
-                            });
-                        pending.push((path, blob.as_str(), *mode, destination, modified));
+            let (files, bytes) =
+                match self.restore_location(&task.id, &location, group, keep_mtimes) {
+                    Ok(restored) => restored,
+                    Err(error) => {
+                        // Nothing of the location was on disk, so all that is there
+                        // now came from this attempt. A fragment left behind would
+                        // count as present and keep the rest from being restored.
+                        remove_restored(&location);
+                        return Err(error);
                     }
-                    Artifact::Directory { mode } => {
-                        fs::create_dir_all(&destination)?;
-                        created.insert(destination.clone());
-                        directories.push((destination, *mode));
-                    }
-                    Artifact::Symlink { target, directory } => {
-                        validate_link(path, target)?;
-                        symlink(target, &destination, *directory)?;
-                    }
-                }
-            }
-            let copied = self
-                .restore_warm_files(&pending)
-                .with_context(|| format!("warm state for {} not restored", task.id))?;
-            // Directory modes come last, since one may forbid writing into it.
-            for (destination, mode) in directories {
-                set_mode(&destination, mode)?;
-            }
-            let mut files = BTreeMap::new();
-            for ((path, blob, mode, _, _), (metadata, bytes)) in pending.into_iter().zip(copied) {
-                restored.files += 1;
-                restored.bytes += bytes;
-                let artifact = Artifact::File {
-                    blob: blob.to_owned(),
-                    mode,
                 };
-                files.insert(path.clone(), (metadata, artifact));
-            }
+            restored.files += files.len();
+            restored.bytes += bytes;
             noted.groups.insert(location.name.to_owned(), files);
             restored.groups.push(location.name.to_owned());
         }
@@ -1255,6 +1232,74 @@ impl Cache {
             fs::write(path, serde_json::to_vec(&noted)?)?;
         }
         Ok((restored, present))
+    }
+
+    /// Restores one missing location from its saved group: the restored files'
+    /// stamps and artifacts, and how many bytes they hold.
+    fn restore_location(
+        &self,
+        task: &str,
+        location: &Location,
+        group: &WarmGroup,
+        keep_mtimes: bool,
+    ) -> Result<(GroupFiles, u64)> {
+        fs::create_dir_all(&location.base)?;
+        // Validate every path and lay out directories and links first, so the
+        // files, which are most of the work, can be copied in parallel.
+        let mut created = BTreeSet::new();
+        let mut directories = Vec::new();
+        let mut pending = Vec::new();
+        for (path, artifact) in &group.artifacts {
+            paths::safe_parents(&location.base, path)?;
+            if !location.matches(path) {
+                bail!("warm state for {task} holds {path}, outside its paths");
+            }
+            let destination = location.base.join(path);
+            if let Some(parent) = destination.parent()
+                && created.insert(parent.to_owned())
+            {
+                fs::create_dir_all(parent)?;
+            }
+            match artifact {
+                Artifact::File { blob, mode } => {
+                    let modified = keep_mtimes
+                        .then(|| group.mtimes.get(path))
+                        .flatten()
+                        .and_then(|nanos| u64::try_from(*nanos).ok())
+                        .map_or(RESTORED_AT, |nanos| {
+                            UNIX_EPOCH + Duration::from_nanos(nanos)
+                        });
+                    pending.push((path, blob.as_str(), *mode, destination, modified));
+                }
+                Artifact::Directory { mode } => {
+                    fs::create_dir_all(&destination)?;
+                    created.insert(destination.clone());
+                    directories.push((destination, *mode));
+                }
+                Artifact::Symlink { target, directory } => {
+                    validate_link(path, target)?;
+                    symlink(target, &destination, *directory)?;
+                }
+            }
+        }
+        let copied = self
+            .restore_warm_files(&pending)
+            .with_context(|| format!("warm state for {task} not restored"))?;
+        // Directory modes come last, since one may forbid writing into it.
+        for (destination, mode) in directories {
+            set_mode(&destination, mode)?;
+        }
+        let mut files = BTreeMap::new();
+        let mut bytes = 0;
+        for ((path, blob, mode, _, _), (metadata, size)) in pending.into_iter().zip(copied) {
+            bytes += size;
+            let artifact = Artifact::File {
+                blob: blob.to_owned(),
+                mode,
+            };
+            files.insert(path.clone(), (metadata, artifact));
+        }
+        Ok((files, bytes))
     }
 
     /// Copies warm files out of their blobs, verifying each copy, with bounded
