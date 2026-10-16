@@ -82,7 +82,11 @@ try {
       env: { ...quiet, QK_STORE_SERVER_TOKEN: token, QK_PROFILE_CACHE: "1", ...env },
     });
   const cache = () => spawnSync(qk, ["cache", "path"], { cwd: root, encoding: "utf8" }).stdout.trim();
-  const received = (output) => Number(output.stderr.match(/stage=remote_body \S+ bytes=(\d+)/)?.[1] ?? NaN);
+  const received = (output) => {
+    const bytes = output.stderr.match(/stage=remote_body \S+ bytes=(\d+)/)?.[1];
+    if (bytes === undefined) throw new Error(`no remote_body span in qk's output:\n${output.stderr}`);
+    return Number(bytes);
+  };
   const restored = () => readFileSync(join(root, "app/dist/large.bin")).equals(readFileSync(join(root, "app/large.bin")));
 
   for (const [name, env] of [
