@@ -463,6 +463,12 @@ impl Cache {
         {
             return bypass("inputs changed while waiting for another run".into());
         }
+        // An entry fetched ahead of this task is local, but it came from the
+        // remote store, and is reported as such.
+        let prefetched = self.remote.as_ref().is_some_and(|remote| {
+            remote.resolved(&key);
+            remote.prefetched(&key)
+        });
         let local_profile = profile::span(&task.id, "local_restore");
         match self.restore(
             &workspace.root,
@@ -471,20 +477,37 @@ impl Cache {
             &key,
             &outputs,
             &prepared.display,
-            qk_executor::Shown::LocalCache,
+            if prefetched {
+                qk_executor::Shown::RemoteCache
+            } else {
+                qk_executor::Shown::LocalCache
+            },
         ) {
             Ok(Some(fingerprint)) => {
-                if let Some(remote) = &self.remote {
-                    remote.held(&key);
-                }
+                let claimed = match &self.remote {
+                    Some(remote) if prefetched && remote.claim(&key) => true,
+                    Some(remote) => {
+                        remote.held(&key);
+                        false
+                    }
+                    None => false,
+                };
                 qk_executor::report::event(qk_executor::report::Event::Cache {
                     id: task.id.clone(),
-                    cached: qk_executor::report::Cached::Hit,
+                    cached: if claimed {
+                        qk_executor::report::Cached::RemoteHit
+                    } else {
+                        qk_executor::report::Cached::Hit
+                    },
                 });
                 return Ok(TaskResult {
                     outcome: Outcome::Success,
                     fingerprint: Ok(fingerprint),
-                    cache: CacheStatus::LocalHit,
+                    cache: if claimed {
+                        CacheStatus::RemoteHit
+                    } else {
+                        CacheStatus::LocalHit
+                    },
                     key: keyed,
                     warm: None,
                     execution: None,

@@ -17,6 +17,7 @@
 pub(crate) mod background;
 mod index;
 mod pack;
+mod prefetch;
 mod s3;
 mod store;
 
@@ -93,6 +94,10 @@ pub struct Remote {
     /// Fetches in progress, by key, so a key is fetched once however many
     /// ask for it at a time.
     flights: Mutex<HashMap<String, Arc<Flight>>>,
+    /// Entries fetched ahead of the tasks that need them, unless
+    /// `QK_REMOTE_PREFETCH=off`.
+    prefetch: prefetch::Prefetch,
+    prefetching: bool,
 }
 
 /// A fetch in progress, and how it ended.
@@ -259,12 +264,9 @@ pub fn configure(
         }
         other => bail!("unknown s3 upload mode {other:?}; use wait or background"),
     };
-    Ok(Some(Remote::new(
-        Box::new(store),
-        mode,
-        background,
-        threshold,
-    )))
+    let mut remote = Remote::new(Box::new(store), mode, background, threshold);
+    remote.prefetching = variable("QK_REMOTE_PREFETCH").as_deref() != Some("off");
+    Ok(Some(remote))
 }
 
 impl Remote {
@@ -291,6 +293,8 @@ impl Remote {
             stored: Mutex::default(),
             blob_requests: Slots::new(BLOB_REQUESTS),
             flights: Mutex::default(),
+            prefetch: prefetch::Prefetch::default(),
+            prefetching: true,
         }
     }
 
@@ -340,7 +344,7 @@ impl Remote {
     /// before it is kept. A fetch of the same key already in progress is
     /// waited for rather than repeated, until `cancelled`.
     pub(crate) fn fetch(
-        &self,
+        self: &Arc<Self>,
         root: &Path,
         key: &str,
         task: &str,
@@ -360,7 +364,8 @@ impl Remote {
             let _waiting = crate::profile::span(task, "remote_flight_wait");
             match wait(&flight, cancelled) {
                 Some(Outcome::Published) => {
-                    self.used(key);
+                    self.prefetch.claim(key);
+                    self.confirm(key);
                     return Ok(true);
                 }
                 Some(Outcome::Absent) | None => return Ok(false),
@@ -374,8 +379,35 @@ impl Remote {
                 }
             }
         }
-        let fetched = self.fetch_entry(root, key, task);
-        let outcome = match &fetched {
+        let fetched = self.fetch_entry(root, key, task, &AtomicU64::new(0));
+        self.land(key, &fetched);
+        if let Ok(true) = fetched {
+            self.confirm(key);
+            if self.prefetching {
+                self.prefetch.follow(self, root, key);
+            }
+        }
+        fetched
+    }
+
+    /// Fetches the entry for `key` ahead of the task that needs it, unless it
+    /// is being fetched already, returning whether it was fetched.
+    fn fetch_ahead(&self, root: &Path, key: &str) -> bool {
+        {
+            let mut flights = self.flights.lock().unwrap();
+            if flights.contains_key(key) {
+                return false;
+            }
+            flights.insert(key.to_owned(), Arc::default());
+        }
+        let fetched = self.fetch_entry(root, key, "prefetch", &self.prefetch.received);
+        self.land(key, &fetched);
+        matches!(fetched, Ok(true))
+    }
+
+    /// Ends the fetch of `key` in progress, telling whoever waits for it how.
+    fn land(&self, key: &str, fetched: &Result<bool>) {
+        let outcome = match fetched {
             Ok(true) => Outcome::Published,
             Ok(false) => Outcome::Absent,
             Err(_) => Outcome::Failed,
@@ -384,19 +416,56 @@ impl Remote {
             *flight.outcome.lock().unwrap() = Some(outcome);
             flight.done.notify_all();
         }
-        fetched
     }
 
-    fn fetch_entry(&self, root: &Path, key: &str, task: &str) -> Result<bool> {
+    /// Notes that a task of this run used the entry for `key`, which the
+    /// store holds.
+    fn confirm(&self, key: &str) {
+        self.confirmed.lock().unwrap().insert(key.to_owned());
+        self.used(key);
+    }
+
+    /// Notes that the run resolved `key`, so prefetching can tell whether the
+    /// run still follows the runs it fetches ahead for.
+    pub(crate) fn resolved(&self, key: &str) {
+        self.prefetch.resolved(key);
+    }
+
+    /// Whether the local entry for `key` was fetched ahead and no task has
+    /// claimed it yet.
+    pub(crate) fn prefetched(&self, key: &str) -> bool {
+        self.prefetch.holds(key)
+    }
+
+    /// Claims the entry for `key` fetched ahead, for the task restoring it,
+    /// returning whether it was.
+    pub(crate) fn claim(&self, key: &str) -> bool {
+        let claimed = self.prefetch.claim(key);
+        if claimed {
+            self.confirm(key);
+        }
+        claimed
+    }
+
+    /// Copies the entry for `key` into the local store at `root`, adding the
+    /// bytes received to `received`.
+    fn fetch_entry(
+        &self,
+        root: &Path,
+        key: &str,
+        task: &str,
+        received: &AtomicU64,
+    ) -> Result<bool> {
         let waiting = crate::profile::span(task, "remote_index_wait");
         let known = self.known();
         drop(waiting);
         if known.is_some_and(|known| !known.keys.contains_key(key)) {
             return Ok(false);
         }
-        let Some((manifest, pin)) = self.fetch_pack(root, Object::Entry(key), task, |parsed| {
-            parsed.check_key(key)
-        })?
+        let Some((manifest, pin)) =
+            self.fetch_pack(root, Object::Entry(key), task, received, |parsed| {
+                parsed.check_key(key)
+            })?
         else {
             return Ok(false);
         };
@@ -407,8 +476,6 @@ impl Remote {
         )?;
         // The published manifest now keeps its blobs.
         drop(pin);
-        self.confirmed.lock().unwrap().insert(key.to_owned());
-        self.used(key);
         Ok(true)
     }
 
@@ -468,7 +535,9 @@ impl Remote {
         branch: &str,
         accept: impl Fn(&[String]) -> bool,
     ) -> Result<Option<(Vec<u8>, crate::evict::Pin)>> {
-        let fetched = self.fetch_pack(root, Object::Warm { identity, branch }, task, |record| {
+        let object = Object::Warm { identity, branch };
+        let received = AtomicU64::new(0);
+        let fetched = self.fetch_pack(root, object, task, &received, |record| {
             if record.warm_key().is_some_and(|key| accept(&key)) {
                 Ok(())
             } else {
@@ -490,6 +559,7 @@ impl Remote {
         root: &Path,
         object: Object,
         task: &str,
+        received: &AtomicU64,
         check: impl Fn(&crate::record::StoredRecord) -> Result<()>,
     ) -> Result<Option<(Vec<u8>, crate::evict::Pin)>> {
         let Some(body) = self.store.get(object, task)? else {
@@ -505,6 +575,10 @@ impl Remote {
         receiving.count("held_bytes", transfer.held);
         receiving.count("apart_bytes", apart.load(Ordering::Relaxed));
         receiving.count("skipped_bytes", transfer.skipped);
+        received.fetch_add(
+            transfer.received + apart.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         match read {
             Err(error) if error.is::<MissingBlob>() => Ok(None),
             read => read.map(Some),
@@ -706,6 +780,16 @@ impl Remote {
     /// Waits for queued uploads, then adds this run's listing to the index,
     /// returning what failed.
     pub(crate) fn finish(&self) -> Vec<String> {
+        // Prefetches in progress finish on their own; the run does not wait
+        // for what it may not need.
+        self.prefetch.stop();
+        let (entries, claimed) = self.prefetch.summary();
+        if entries > 0 {
+            let mut summary = crate::profile::span("run", "remote_prefetch");
+            summary.count("entries", entries as u64);
+            summary.count("claimed", claimed as u64);
+            summary.count("bytes", self.prefetch.received.load(Ordering::Relaxed));
+        }
         if let Some(configuration) = &self.background {
             let pending = std::mem::take(&mut *self.pending.lock().unwrap());
             if !pending.is_empty() {
@@ -976,7 +1060,7 @@ mod flight_tests {
             .lock()
             .unwrap()
             .insert(format!("entries/{key}"), pack);
-        let remote = Remote::new(Box::new(memory), Mode::Read, None, u64::MAX);
+        let remote = Arc::new(Remote::new(Box::new(memory), Mode::Read, None, u64::MAX));
         let destination = cache();
         let cancelled = std::sync::atomic::AtomicBool::new(false);
         let fetched: Vec<bool> = std::thread::scope(|scope| {

@@ -2220,6 +2220,114 @@ fn a_run_lists_its_keys_in_the_order_it_used_them() {
     }
 }
 
+/// A chain of three cached targets, each writing its own output.
+fn chain() -> Fixture {
+    let step = |name: &str, after: Option<&str>| {
+        let mut target = json!({
+            "command": format!("mkdir -p out/{name} && echo {name} > out/{name}/done.txt"),
+            "cache": true,
+            "outputs": [format!("{{projectRoot}}/out/{name}")],
+        });
+        if let Some(after) = after {
+            target["dependsOn"] = json!([after]);
+        }
+        target
+    };
+    Fixture::with_targets(json!({
+        "one": step("one", None),
+        "two": step("two", Some("one")),
+        "three": step("three", Some("two")),
+    }))
+}
+
+fn run_three(fixture: &Fixture, env: &[(&str, &str)]) -> Output {
+    let mut command = fixture.command(&fixture.root, &["run", "app:three"]);
+    command
+        .env("AWS_ACCESS_KEY_ID", "key")
+        .env("AWS_SECRET_ACCESS_KEY", "secret")
+        .env_remove("CI")
+        .env_remove("NX_POWERPACK_CACHE_MODE");
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    success(command.output().unwrap())
+}
+
+/// Each step's entry object, by the step's name.
+fn chain_entries(fixture: &Fixture) -> std::collections::BTreeMap<String, String> {
+    let cache = PathBuf::from(
+        stdout(&success(fixture.qk(&fixture.root, &["cache", "path"])))
+            .trim()
+            .to_owned(),
+    );
+    let mut entries = std::collections::BTreeMap::new();
+    for item in fs::read_dir(cache.join("entries")).unwrap().flatten() {
+        let record = fs::read_to_string(item.path()).unwrap();
+        let key = item.file_name().to_string_lossy().replace(".json", "");
+        for name in ["one", "two", "three"] {
+            if record.contains(&format!("out/{name}/done.txt")) {
+                entries.insert(name.to_owned(), s3::path(&format!("entries/{key}")));
+            }
+        }
+    }
+    entries
+}
+
+/// Machine B's run of the chain machine A cached, with each request taking a
+/// while: when each step's entry was requested and answered.
+fn cold_chain(
+    env: &[(&str, &str)],
+) -> (
+    Output,
+    std::collections::BTreeMap<String, (std::time::Instant, std::time::Instant)>,
+) {
+    let server = s3::FakeS3::start();
+    let fixture = chain();
+    with_remote(&fixture, &server, json!({}));
+    run_three(&fixture, &[]);
+    let entries = chain_entries(&fixture);
+    clear_local_cache(&fixture);
+    fs::remove_dir_all(fixture.root.join("out")).unwrap();
+    server.state.lock().unwrap().latency = std::time::Duration::from_millis(150);
+    let output = run_three(&fixture, env);
+    let timed = server.requests_timed(&s3::path("entries/"));
+    let mut times = std::collections::BTreeMap::new();
+    for (name, object) in entries {
+        let gets: Vec<_> = timed
+            .iter()
+            .filter(|(request, _, _)| *request == format!("GET {object}"))
+            .collect();
+        assert_eq!(gets.len(), 1, "{name} was fetched {} times", gets.len());
+        times.insert(name, (gets[0].1, gets[0].2));
+    }
+    for name in ["one", "two", "three"] {
+        assert!(
+            stderr(&output).contains(&format!("qk: remote cache hit app:{name}")),
+            "{}",
+            stderr(&output)
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.root.join(format!("out/{name}/done.txt"))).unwrap(),
+            format!("{name}\n")
+        );
+    }
+    (output, times)
+}
+
+#[test]
+fn a_remote_hit_prefetches_the_entries_recent_runs_used_after_it() {
+    let (_, times) = cold_chain(&[]);
+    // three's entry is asked for before two's arrives: both were fetched
+    // ahead once one's entry was a hit.
+    assert!(times["three"].0 < times["two"].1, "{times:?}");
+}
+
+#[test]
+fn prefetching_can_be_turned_off() {
+    let (_, times) = cold_chain(&[("QK_REMOTE_PREFETCH", "off")]);
+    assert!(times["three"].0 >= times["two"].1, "{times:?}");
+}
+
 #[test]
 fn the_remote_index_merges_its_listings() {
     let server = s3::FakeS3::start();
