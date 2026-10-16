@@ -60,6 +60,9 @@ const BLOB_REQUESTS: usize = 24;
 /// lower threshold restores as fast there, but that chain's large files are
 /// all 4 MiB, so it does not show what many medium blobs per entry would cost.
 const BLOB_THRESHOLD: u64 = 1 << 20;
+/// The most an upload to a store server carries inline, counted raw, below the
+/// 100 MiB a server accepts in one body (`tools/store-server/PROTOCOL.md`).
+const UPLOAD_INLINE: u64 = 64 << 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -793,8 +796,22 @@ impl Remote {
     fn place_all(&self, root: &Path, record: &[u8]) -> Result<HashMap<String, pack::Placement>> {
         let parsed = crate::record::StoredRecord::read(record)?;
         let mut placements = HashMap::new();
+        // A store server takes one bounded body per record, so once its inline
+        // blobs fill that, the rest of this record's go apart. Raw sizes bound
+        // the compressed ones.
+        let bounded = self.store.framing() == store::Framing::Upload;
+        let mut inline = 0;
         for blob in parsed.blobs() {
-            let placement = self.place(root, &blob)?;
+            let mut placement = self.place(root, &blob)?;
+            if bounded && placement == pack::Placement::Inline {
+                let size = fs::metadata(root.join("blobs").join(&blob))?.len();
+                if inline + size > UPLOAD_INLINE {
+                    self.store_apart(root, &blob, None)?;
+                    placement = pack::Placement::Apart;
+                } else {
+                    inline += size;
+                }
+            }
             placements.insert(blob, placement);
         }
         Ok(placements)
@@ -1110,7 +1127,7 @@ impl std::error::Error for OtherWarmKey {}
 
 #[cfg(test)]
 mod flight_tests {
-    use super::store::{Body, Object, Store};
+    use super::store::{self, Body, Object, Store};
     use super::*;
 
     /// A store in memory whose reads take a while and are counted.
@@ -1118,6 +1135,8 @@ mod flight_tests {
     struct Memory {
         objects: Mutex<HashMap<String, Vec<u8>>>,
         reads: Arc<AtomicUsize>,
+        /// Whether it takes upload bodies, as a store server does.
+        uploads: bool,
     }
 
     fn name(object: Object) -> String {
@@ -1131,6 +1150,14 @@ mod flight_tests {
     impl Store for Memory {
         fn location(&self) -> String {
             "memory".into()
+        }
+
+        fn framing(&self) -> store::Framing {
+            if self.uploads {
+                store::Framing::Upload
+            } else {
+                store::Framing::Pack
+            }
         }
 
         fn sync_index(&self, _: &mut index::Known) -> Result<()> {
@@ -1179,6 +1206,42 @@ mod flight_tests {
             fs::create_dir(root.path().join(name)).unwrap();
         }
         root
+    }
+
+    #[test]
+    fn an_upload_to_a_store_server_carries_a_bounded_amount_inline() {
+        let source = cache();
+        let mut blobs = Vec::new();
+        for index in 0..3u8 {
+            let path = source.path().join("blobs").join(format!("{index}"));
+            // Sparse, and the same bytes each time; the names stand in for
+            // hashes, which placement never checks.
+            fs::File::create(&path)
+                .unwrap()
+                .set_len(UPLOAD_INLINE / 2 - 1)
+                .unwrap();
+            let name = format!("{index}").repeat(64);
+            fs::rename(&path, source.path().join("blobs").join(&name)).unwrap();
+            blobs.push(name);
+        }
+        let record = serde_json::to_vec(&serde_json::json!({
+            "artifacts": blobs
+                .iter()
+                .map(|blob| (blob.clone(), serde_json::json!({"blob": blob})))
+                .collect::<serde_json::Map<_, _>>()
+        }))
+        .unwrap();
+        let memory = Memory {
+            uploads: true,
+            ..Memory::default()
+        };
+        let remote = Remote::new(Box::new(memory), Mode::ReadWrite, None, u64::MAX);
+        let placements = remote.place_all(source.path(), &record).unwrap();
+        // Two fit under the bound; the third goes apart.
+        assert_eq!(placements[&blobs[0]], pack::Placement::Inline);
+        assert_eq!(placements[&blobs[1]], pack::Placement::Inline);
+        assert_eq!(placements[&blobs[2]], pack::Placement::Apart);
+        assert!(remote.store.has(Object::Blob(&blobs[2])).unwrap());
     }
 
     #[test]
