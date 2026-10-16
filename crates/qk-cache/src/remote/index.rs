@@ -12,6 +12,10 @@
 //! by the first 16 hex digits of each key the run used, in the order it used
 //! them. Merging keeps the most recent runs, so a reader knows which entries
 //! were used together and can fetch them before they are asked for.
+//!
+//! A line `apart <key> <hash> …` names the blobs a key's entry stores apart,
+//! so a reader lacking them can fetch them beside the entry rather than
+//! after it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
@@ -42,6 +46,8 @@ pub(super) struct Known {
     pub keys: HashMap<String, u64>,
     /// Recent runs, by their id.
     pub runs: BTreeMap<String, Run>,
+    /// The blobs each key's entry stores apart, where a listing named them.
+    pub apart: HashMap<String, Vec<String>>,
 }
 
 /// A run that wrote to the store: when, and the keys it used, in order, by
@@ -61,6 +67,7 @@ impl Known {
             *known = (*known).max(time);
         }
         self.runs.extend(parse_runs(listing));
+        self.apart.extend(parse_apart(listing));
     }
 
     /// Drops the keys no run has found within [`KEPT_FOR`] of `now`, and the
@@ -68,6 +75,8 @@ impl Known {
     pub fn expire(&mut self, now: u64) {
         let oldest = now.saturating_sub(KEPT_FOR.as_millis() as u64);
         self.keys.retain(|_, time| *time >= oldest);
+        let keys = &self.keys;
+        self.apart.retain(|key, _| keys.contains_key(key));
         let oldest = now.saturating_sub(HISTORY_FOR.as_millis() as u64);
         let mut runs: Vec<(String, Run)> = std::mem::take(&mut self.runs)
             .into_iter()
@@ -115,6 +124,7 @@ impl Known {
             self.keys.iter().map(|(key, time)| (key.as_str(), *time)),
         ));
         text.push_str(&format_runs(&self.runs));
+        text.push_str(&format_apart(&self.apart));
         let mut file = tempfile::NamedTempFile::new_in(directory)?;
         std::io::Write::write_all(&mut file, text.as_bytes())?;
         file.persist(path)?;
@@ -162,6 +172,30 @@ pub(super) fn format_runs(runs: &BTreeMap<String, Run>) -> String {
         text.push('\n');
     }
     text
+}
+
+/// The blobs a listing says keys store apart. A line naming no valid key, or
+/// an invalid hash, is left out.
+pub(super) fn parse_apart(listing: &str) -> impl Iterator<Item = (String, Vec<String>)> + '_ {
+    listing.lines().filter_map(|line| {
+        let mut words = line.strip_prefix("apart ")?.split(' ');
+        let key = words.next().filter(|key| crate::record::valid_hash(key))?;
+        let hashes: Option<Vec<String>> = words
+            .map(|hash| crate::record::valid_hash(hash).then(|| hash.to_owned()))
+            .collect();
+        Some((key.to_owned(), hashes?))
+    })
+}
+
+/// The lines of `apart`, one per key that stores blobs apart.
+pub(super) fn format_apart(apart: &HashMap<String, Vec<String>>) -> String {
+    let mut lines: Vec<String> = apart
+        .iter()
+        .filter(|(_, hashes)| !hashes.is_empty())
+        .map(|(key, hashes)| format!("apart {key} {}\n", hashes.join(" ")))
+        .collect();
+    lines.sort();
+    lines.concat()
 }
 
 /// The name a run gives `key`.
@@ -333,6 +367,26 @@ mod tests {
         }
         known.expire(now);
         assert_eq!(known.runs.len(), 2);
+    }
+
+    #[test]
+    fn blobs_stored_apart_round_trip_and_expire_with_their_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("store");
+        let mut known = Known::default();
+        let apart = HashMap::from([(key('a'), vec![key('c'), key('d')])]);
+        known.add(&format!(
+            "{}{}apart {} zz\napart short {}\n",
+            format([(key('a').as_str(), 3)].into_iter()),
+            format_apart(&apart),
+            key('b'),
+            key('c')
+        ));
+        assert_eq!(known.apart, apart);
+        known.save(&path).unwrap();
+        assert_eq!(Known::load(&path).apart, apart);
+        known.expire(KEPT_FOR.as_millis() as u64 * 2);
+        assert!(known.apart.is_empty());
     }
 
     #[test]

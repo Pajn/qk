@@ -261,7 +261,7 @@ impl Store for Server {
         }
     }
 
-    fn announce(&self, _key: &str) -> Result<Option<String>> {
+    fn announce(&self, _key: &str, _apart: &[String]) -> Result<Option<String>> {
         // The server lists an entry when it commits it.
         Ok(None)
     }
@@ -269,6 +269,8 @@ impl Store for Server {
     fn list(
         &self,
         keys: BTreeSet<String>,
+        // The server sends a client the blobs it lacks with the entry.
+        _apart: std::collections::HashMap<String, Vec<String>>,
         members: Vec<String>,
         _known: Option<&index::Known>,
         _announcements: BTreeSet<String>,

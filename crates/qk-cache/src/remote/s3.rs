@@ -1,7 +1,7 @@
 //! The remote store on S3-compatible storage, configured by nx.json's `s3` key
 //! as `@nx/s3-cache` reads it.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::io;
 use std::sync::atomic::AtomicUsize;
@@ -272,9 +272,13 @@ impl Store for S3 {
     // Announce the key before publishing its entry. If the run stops or the
     // final listing fails, readers can still discover the entry. An
     // announcement whose upload fails merely causes a normal GET miss.
-    fn announce(&self, key: &str) -> Result<Option<String>> {
+    fn announce(&self, key: &str, apart: &[String]) -> Result<Option<String>> {
         let now = index::now();
-        let listing = index::format(std::iter::once((key, now)));
+        let mut listing = index::format(std::iter::once((key, now)));
+        listing.push_str(&index::format_apart(&HashMap::from([(
+            key.to_owned(),
+            apart.to_vec(),
+        )])));
         let announcement = index::name(now);
         self.put_object(&self.object("index", &announcement), listing.as_bytes())?;
         Ok(Some(announcement))
@@ -285,6 +289,7 @@ impl Store for S3 {
     fn list(
         &self,
         keys: BTreeSet<String>,
+        apart: HashMap<String, Vec<String>>,
         members: Vec<String>,
         known: Option<&index::Known>,
         announcements: BTreeSet<String>,
@@ -296,8 +301,10 @@ impl Store for S3 {
         if let Some(known) = merged {
             listing.keys = known.keys.clone();
             listing.runs = known.runs.clone();
+            listing.apart = known.apart.clone();
         }
         listing.keys.extend(keys.into_iter().map(|key| (key, now)));
+        listing.apart.extend(apart);
         listing.runs.insert(
             name.clone(),
             index::Run {
@@ -311,6 +318,7 @@ impl Store for S3 {
         listing.expire(now);
         let mut text = index::format(listing.keys.iter().map(|(key, time)| (key.as_str(), *time)));
         text.push_str(&index::format_runs(&listing.runs));
+        text.push_str(&index::format_apart(&listing.apart));
         self.put_object(&self.object("index", &name), text.as_bytes())?;
         // The final listing now covers every confirmed announcement. Leave
         // announcements in place on any earlier failure, including uploads

@@ -126,6 +126,8 @@ pub(super) struct Transfer {
     pub(super) received: u64,
     pub(super) held: u64,
     pub(super) skipped: u64,
+    /// Every blob the pack stores apart, held or not.
+    pub(super) apart: Vec<String>,
 }
 
 struct Counting<'a, R> {
@@ -162,8 +164,12 @@ pub(super) fn read(
     let mut input = input.take(super::LARGEST_UPLOAD + 1);
     let mut decoder = zstd::stream::read::Decoder::new(&mut input)?;
     decoder.window_log_max(WINDOW_LOG_MAX)?;
-    let (held, skipped) = (&mut transfer.held, &mut transfer.skipped);
-    let read = read_parts(root, &mut decoder, check, held, skipped, apart)?;
+    let counts = (
+        &mut transfer.held,
+        &mut transfer.skipped,
+        &mut transfer.apart,
+    );
+    let read = read_parts(root, &mut decoder, check, counts, apart)?;
     drop(decoder);
     if input.limit() == 0 {
         bail!("remote pack exceeds 5 GiB");
@@ -175,8 +181,7 @@ fn read_parts(
     root: &Path,
     mut body: impl Read,
     check: impl Fn(&StoredRecord) -> Result<()>,
-    held: &mut u64,
-    skipped: &mut u64,
+    (held, skipped, listed): (&mut u64, &mut u64, &mut Vec<String>),
     apart: impl FnOnce(Vec<String>) -> Result<()> + Send,
 ) -> Result<(Vec<u8>, crate::evict::Pin)> {
     let mut magic = [0; 4];
@@ -218,8 +223,14 @@ fn read_parts(
                 inline.push((blob, length));
             }
             0 if length > super::LARGEST_UPLOAD => bail!("remote pack part is too large"),
-            0 if root.join("blobs").join(&blob).is_file() => *skipped += length,
-            0 => missing.push(blob),
+            0 => {
+                listed.push(blob.clone());
+                if root.join("blobs").join(&blob).is_file() {
+                    *skipped += length;
+                } else {
+                    missing.push(blob);
+                }
+            }
             _ => bail!("invalid blob placement in remote pack"),
         }
     }

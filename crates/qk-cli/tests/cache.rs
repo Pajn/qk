@@ -1678,6 +1678,68 @@ fn large_blobs_are_stored_apart_and_fetched_only_when_missing() {
 }
 
 #[test]
+fn a_cold_machine_fetches_large_blobs_the_index_names_beside_their_entry() {
+    let server = s3::FakeS3::start();
+    let (fixture, env) = large_outputs(1);
+    with_remote(&fixture, &server, json!({}));
+    success(remote_build(&fixture, &env));
+    let blob = server.objects(&s3::path("blobs/")).remove(0);
+    let hash = blob.rsplit('/').next().unwrap().to_owned();
+    let listed = {
+        let state = server.state.lock().unwrap();
+        state
+            .objects
+            .iter()
+            .filter(|(name, _)| name.starts_with(&s3::path("index/")))
+            .any(|(_, listing)| String::from_utf8_lossy(listing).contains(&hash))
+    };
+    assert!(listed, "the index does not name {hash}");
+    clear_local_cache(&fixture);
+    fs::remove_dir_all(fixture.root.join("dist")).unwrap();
+    server.state.lock().unwrap().latency = std::time::Duration::from_millis(150);
+    let cold = success(remote_build(&fixture, &env));
+    assert!(stderr(&cold).contains("qk: remote cache hit app:build"));
+    let timed = server.requests_timed(&s3::path(""));
+    let get = |prefix: &str| {
+        timed
+            .iter()
+            .find(|(request, _, _)| request.starts_with(&format!("GET {}", s3::path(prefix))))
+            .cloned()
+            .unwrap()
+    };
+    let (_, _, entry_answered) = get("entries/");
+    let (_, blob_asked, _) = get("blobs/");
+    assert!(blob_asked < entry_answered, "the blob waited for its entry");
+    assert_eq!(
+        fs::read(fixture.root.join("dist/0.bin")).unwrap(),
+        incompressible(8 << 10, 0)
+    );
+}
+
+#[test]
+fn an_index_naming_a_blob_wrongly_costs_only_a_request() {
+    let server = s3::FakeS3::start();
+    let (fixture, env) = large_outputs(1);
+    with_remote(&fixture, &server, json!({}));
+    success(remote_build(&fixture, &env));
+    let entry = server.objects(&s3::path("entries/")).remove(0);
+    let key = entry.rsplit('/').next().unwrap().to_owned();
+    server.state.lock().unwrap().objects.insert(
+        s3::path("index/9999999999999-wrong"),
+        format!("{key} 9999999999999\napart {key} {}\n", "0".repeat(64)).into_bytes(),
+    );
+    clear_local_cache(&fixture);
+    fs::remove_dir_all(fixture.root.join("dist")).unwrap();
+    let cold = success(remote_build(&fixture, &env));
+    assert!(
+        stderr(&cold).contains("qk: remote cache hit app:build"),
+        "{}",
+        stderr(&cold)
+    );
+    assert_eq!(executions(&fixture), 1);
+}
+
+#[test]
 fn a_large_blob_two_entries_share_is_uploaded_once() {
     let server = s3::FakeS3::start();
     let (fixture, env) = large_outputs(1);

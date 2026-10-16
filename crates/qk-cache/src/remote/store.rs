@@ -1,7 +1,7 @@
 //! What the remote cache needs from the storage behind it. [`super::Remote`]
 //! decides what to fetch, upload and list; a [`Store`] moves the bytes.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -87,17 +87,20 @@ pub(super) trait Store: Send + Sync {
     /// Writes the pack in `file` as `object`.
     fn put(&self, object: Object, file: File) -> Result<()>;
 
-    /// Records ahead of an upload that the store is about to hold `key`, so
-    /// readers find it even if this run never lists it, returning what to
-    /// [`list`](Store::list) as replaced once it does.
-    fn announce(&self, key: &str) -> Result<Option<String>>;
+    /// Records ahead of an upload that the store is about to hold `key`, whose
+    /// entry stores the blobs `apart` on their own, so readers find it even
+    /// if this run never lists it, returning what to [`list`](Store::list) as
+    /// replaced once it does.
+    fn announce(&self, key: &str, apart: &[String]) -> Result<Option<String>>;
 
-    /// Lists `keys` as held by the store now, with the run that used
-    /// `members` in that order, given what `known` read of its index, and
-    /// retires the `announcements` the listing replaces.
+    /// Lists `keys` as held by the store now, with the blobs `apart` names
+    /// for them and the run that used `members` in that order, given what
+    /// `known` read of its index, and retires the `announcements` the listing
+    /// replaces.
     fn list(
         &self,
         keys: BTreeSet<String>,
+        apart: HashMap<String, Vec<String>>,
         members: Vec<String>,
         known: Option<&index::Known>,
         announcements: BTreeSet<String>,

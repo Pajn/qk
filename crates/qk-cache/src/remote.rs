@@ -91,6 +91,8 @@ pub struct Remote {
     placements: Mutex<HashMap<String, pack::Placement>>,
     /// Blobs stored apart that the store is known to hold.
     stored: Mutex<HashSet<String>>,
+    /// The blobs each key this run used stores apart, for its listing.
+    kept_apart: Mutex<HashMap<String, Vec<String>>>,
     /// Requests for blobs stored apart that may start now.
     blob_requests: Slots,
     /// Fetches in progress, by key, so a key is fetched once however many
@@ -310,6 +312,7 @@ impl Remote {
             threshold,
             placements: Mutex::default(),
             stored: Mutex::default(),
+            kept_apart: Mutex::default(),
             blob_requests: Slots::new(BLOB_REQUESTS),
             flights: Mutex::default(),
             prefetch: prefetch::Prefetch::default(),
@@ -482,8 +485,13 @@ impl Remote {
         if known.is_some_and(|known| !known.keys.contains_key(key)) {
             return Ok(false);
         }
-        let Some((manifest, pin)) =
-            self.fetch_pack(root, Object::Entry(key), task, received, |parsed| {
+        let listed = known
+            .and_then(|known| known.apart.get(key))
+            .cloned()
+            .unwrap_or_default();
+        let object = Object::Entry(key);
+        let Some((manifest, pin, apart)) =
+            self.fetch_pack(root, object, task, received, &listed, |parsed| {
                 parsed.check_key(key)
             })?
         else {
@@ -496,6 +504,10 @@ impl Remote {
         )?;
         // The published manifest now keeps its blobs.
         drop(pin);
+        self.kept_apart
+            .lock()
+            .unwrap()
+            .insert(key.to_owned(), apart);
         Ok(true)
     }
 
@@ -557,7 +569,7 @@ impl Remote {
     ) -> Result<Option<(Vec<u8>, crate::evict::Pin)>> {
         let object = Object::Warm { identity, branch };
         let received = AtomicU64::new(0);
-        let fetched = self.fetch_pack(root, object, task, &received, |record| {
+        let fetched = self.fetch_pack(root, object, task, &received, &[], |record| {
             if record.warm_key().is_some_and(|key| accept(&key)) {
                 Ok(())
             } else {
@@ -566,43 +578,75 @@ impl Remote {
         });
         match fetched {
             Err(error) if error.is::<OtherWarmKey>() => Ok(None),
-            fetched => fetched,
+            fetched => fetched.map(|fetched| fetched.map(|(record, pin, _)| (record, pin))),
         }
     }
 
     /// The record in the pack at `object`, once `check` accepts it and the
     /// blobs it cites that the local store lacks are kept there, with a pin on
-    /// all of them, or `None` when there is no such object. `task` names the
-    /// task the fetch is for in profile timings.
+    /// all of them, or `None` when there is no such object. Blobs `listed` as
+    /// stored apart that the local store lacks are fetched beside the pack
+    /// rather than after it. `task` names the task the fetch is for in profile
+    /// timings, and the bytes received are added to `received`.
     fn fetch_pack(
         &self,
         root: &Path,
         object: Object,
         task: &str,
         received: &AtomicU64,
+        listed: &[String],
         check: impl Fn(&crate::record::StoredRecord) -> Result<()>,
-    ) -> Result<Option<(Vec<u8>, crate::evict::Pin)>> {
-        let Some(body) = self.store.get(object, task)? else {
-            return Ok(None);
+    ) -> Result<Option<Fetched>> {
+        let early: Vec<String> = listed
+            .iter()
+            .filter(|hash| !root.join("blobs").join(hash.as_str()).is_file())
+            .cloned()
+            .collect();
+        // Held until the pack's own pin covers them.
+        let _early_pin = match early.is_empty() {
+            true => None,
+            false => Some(crate::evict::pin(root, &early.iter().cloned().collect())?),
         };
-        let mut receiving = crate::profile::span(task, "remote_body");
-        let mut transfer = pack::Transfer::default();
         let apart = AtomicU64::new(0);
-        let read = pack::read(root, body, check, &mut transfer, |missing| {
-            self.fetch_blobs(root, object, &missing, task, &apart)
-        });
-        receiving.count("bytes", transfer.received);
-        receiving.count("held_bytes", transfer.held);
-        receiving.count("apart_bytes", apart.load(Ordering::Relaxed));
-        receiving.count("skipped_bytes", transfer.skipped);
-        received.fetch_add(
-            transfer.received + apart.load(Ordering::Relaxed),
-            Ordering::Relaxed,
-        );
-        match read {
-            Err(error) if error.is::<MissingBlob>() => Ok(None),
-            read => read.map(Some),
-        }
+        std::thread::scope(|scope| {
+            let early_fetch = (!early.is_empty()).then(|| {
+                // A blob the index wrongly lists is fetched after the pack.
+                scope.spawn(|| self.fetch_blobs(root, object, &early, task, &apart).ok())
+            });
+            let early_fetch = Mutex::new(early_fetch);
+            let wait_early = || {
+                if let Some(fetching) = early_fetch.lock().unwrap().take() {
+                    let _ = fetching.join();
+                }
+            };
+            let Some(body) = self.store.get(object, task)? else {
+                wait_early();
+                return Ok(None);
+            };
+            let mut receiving = crate::profile::span(task, "remote_body");
+            let mut transfer = pack::Transfer::default();
+            let read = pack::read(root, body, check, &mut transfer, |missing| {
+                wait_early();
+                let missing: Vec<String> = missing
+                    .into_iter()
+                    .filter(|hash| !root.join("blobs").join(hash).is_file())
+                    .collect();
+                self.fetch_blobs(root, object, &missing, task, &apart)
+            });
+            wait_early();
+            receiving.count("bytes", transfer.received);
+            receiving.count("held_bytes", transfer.held);
+            receiving.count("apart_bytes", apart.load(Ordering::Relaxed));
+            receiving.count("skipped_bytes", transfer.skipped);
+            received.fetch_add(
+                transfer.received + apart.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            match read {
+                Err(error) if error.is::<MissingBlob>() => Ok(None),
+                read => read.map(|(record, pin)| Some((record, pin, transfer.apart))),
+            }
+        })
     }
 
     /// Fetches `blobs`, stored apart, into the local store at `root`, a few
@@ -698,11 +742,30 @@ impl Remote {
         }
         let object = Object::Entry(&job.key);
         let exists = self.store.has(object)?;
-        let announcement = self.store.announce(&job.key)?;
-        if !exists {
+        // Blobs stored apart go up first, so the announcement can name them
+        // and the entry never cites one the store lacks.
+        let placed = if exists {
+            None
+        } else {
             let manifest = fs::read(job.local.join("entries").join(format!("{}.json", job.key)))?;
-            self.put_pack(&job.local, object, &manifest)?;
+            let placements = self.place_all(&job.local, &manifest)?;
+            Some((manifest, placements))
+        };
+        let apart: Vec<String> = match &placed {
+            Some((_, placements)) => apart_of(placements),
+            None => self
+                .known()
+                .and_then(|known| known.apart.get(&job.key).cloned())
+                .unwrap_or_default(),
+        };
+        let announcement = self.store.announce(&job.key, &apart)?;
+        if let Some((manifest, placements)) = placed {
+            self.put_placed(&job.local, object, &manifest, &placements)?;
         }
+        self.kept_apart
+            .lock()
+            .unwrap()
+            .insert(job.key.clone(), apart);
         self.confirmed.lock().unwrap().insert(job.key.clone());
         self.announcements.lock().unwrap().extend(announcement);
         Ok(())
@@ -712,12 +775,30 @@ impl Remote {
     /// `root`: large blobs on their own, once the store lacks them, then a
     /// pack with the rest, so the pack never cites a blob not yet stored.
     fn put_pack(&self, root: &Path, object: Object, record: &[u8]) -> Result<()> {
+        let placements = self.place_all(root, record)?;
+        self.put_placed(root, object, record, &placements)
+    }
+
+    /// Where packs carry each blob `record` cites, uploading those stored
+    /// apart that the store lacks.
+    fn place_all(&self, root: &Path, record: &[u8]) -> Result<HashMap<String, pack::Placement>> {
         let parsed = crate::record::StoredRecord::read(record)?;
         let mut placements = HashMap::new();
         for blob in parsed.blobs() {
             let placement = self.place(root, &blob)?;
             placements.insert(blob, placement);
         }
+        Ok(placements)
+    }
+
+    /// Uploads `record` as `object`, carrying its blobs as `placements` says.
+    fn put_placed(
+        &self,
+        root: &Path,
+        object: Object,
+        record: &[u8],
+        placements: &HashMap<String, pack::Placement>,
+    ) -> Result<()> {
         let place = |blob: &str| {
             placements
                 .get(blob)
@@ -893,8 +974,34 @@ impl Remote {
             .into_iter()
             .filter(|key| confirmed.contains(key))
             .collect();
-        self.store.list(confirmed, members, known, announcements)
+        let kept = std::mem::take(&mut *self.kept_apart.lock().unwrap());
+        let apart = confirmed
+            .iter()
+            .filter_map(|key| {
+                let hashes = kept
+                    .get(key)
+                    .or_else(|| known.and_then(|known| known.apart.get(key)))?;
+                Some((key.clone(), hashes.clone()))
+            })
+            .collect();
+        self.store
+            .list(confirmed, apart, members, known, announcements)
     }
+}
+
+/// A fetched pack's record, the pin on the blobs it cites, and the blobs it
+/// stores apart.
+type Fetched = (Vec<u8>, crate::evict::Pin, Vec<String>);
+
+/// The blobs `placements` stores apart, in order.
+fn apart_of(placements: &HashMap<String, pack::Placement>) -> Vec<String> {
+    let mut apart: Vec<String> = placements
+        .iter()
+        .filter(|(_, placement)| **placement == pack::Placement::Apart)
+        .map(|(blob, _)| blob.clone())
+        .collect();
+    apart.sort();
+    apart
 }
 
 /// How `flight` ended, or `None` if `cancelled` first.
@@ -1041,13 +1148,14 @@ mod flight_tests {
             Ok(())
         }
 
-        fn announce(&self, _: &str) -> Result<Option<String>> {
+        fn announce(&self, _: &str, _: &[String]) -> Result<Option<String>> {
             Ok(None)
         }
 
         fn list(
             &self,
             _: BTreeSet<String>,
+            _: HashMap<String, Vec<String>>,
             _: Vec<String>,
             _: Option<&index::Known>,
             _: BTreeSet<String>,

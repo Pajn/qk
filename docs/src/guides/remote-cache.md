@@ -21,9 +21,10 @@ outputs the local cache lacks, verifying each against its hash, and shows
 
 An output whose compressed size reaches 1 MiB is stored apart, as
 `blobs/<hash>`, uploaded once for every entry that has it and only when the
-store lacks it. A machine fetches it only when its local cache lacks it, a few
-at a time while the rest of the entry streams, so a machine that already holds
-a build's large files receives little more than the manifest.
+store lacks it. A machine fetches it only when its local cache lacks it, so a
+machine that already holds a build's large files receives little more than the
+manifest. The index names each entry's large outputs, so a machine lacking
+them fetches them beside the entry, a few at a time, rather than after it.
 `QK_REMOTE_BLOB_THRESHOLD` sets another size, such as `256KB`, or `off` to keep
 every output in its entry. Large outputs are shared between entries, so do not
 expire `blobs/` with a storage lifecycle rule: an entry whose output is gone is
