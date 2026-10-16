@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// The layout qk writes under, after `cacheKeyPrefix`.
-pub const LAYOUT: &str = "qk/v3/";
+pub const LAYOUT: &str = "qk/v4/";
 
 /// An object's path in the `cache` bucket without a key prefix.
 pub fn path(rest: &str) -> String {
@@ -84,6 +84,22 @@ impl FakeS3 {
             .requests
             .iter()
             .filter(|request| {
+                request
+                    .split_once(' ')
+                    .is_some_and(|(_, path)| path.starts_with(prefix))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The requests whose path starts with `prefix`, with when each arrived
+    /// and was answered, in the order they were answered.
+    pub fn requests_timed(&self, prefix: &str) -> Vec<(String, Instant, Instant)> {
+        let state = self.state.lock().unwrap();
+        state
+            .timed
+            .iter()
+            .filter(|(request, _, _)| {
                 request
                     .split_once(' ')
                     .is_some_and(|(_, path)| path.starts_with(prefix))

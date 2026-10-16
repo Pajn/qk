@@ -2,16 +2,17 @@
 //! that moves the bytes. Today that is S3-compatible storage ([`s3`]),
 //! configured by nx.json's `s3` key as `@nx/s3-cache` reads it.
 //!
-//! Objects live under `<cacheKeyPrefix>qk/v3/`, so a bucket shared with Nx never
-//! mixes the two: `entries/<key>` for results and `warm/<task>/<branch>` for
-//! warm records. Each object is a Zstandard level 3 pack holding a manifest or
-//! record with every blob it cites, so one request reads or writes it whole;
-//! the store's
-//! latency is per request, and an entry can cite thousands of blobs. A local
-//! miss fetches the pack and keeps the blobs missing locally, verifying each
-//! against its hash; the restore then runs locally. Uploads run in the
-//! background after a task is saved. An [`index`] of the entries the store
-//! holds spares the lookups it would answer with a miss.
+//! Objects live under `<cacheKeyPrefix>qk/v4/`, so a bucket shared with Nx never
+//! mixes the two: `entries/<key>` for results, `warm/<task>/<branch>` for warm
+//! records and `blobs/<hash>` for large blobs. Each entry or record is a
+//! Zstandard level 3 [`pack`] holding it with the small blobs it cites, so one
+//! request reads or writes it whole; the store's latency is per request, and
+//! an entry can cite thousands of blobs. A blob whose compressed size reaches
+//! a threshold is stored apart instead, uploaded once and fetched only by a
+//! machine that lacks it. A local miss fetches the pack and the blobs missing
+//! locally, verifying each against its hash; the restore then runs locally.
+//! Uploads run in the background after a task is saved. An [`index`] of the
+//! entries the store holds spares the lookups it would answer with a miss.
 
 pub(crate) mod background;
 mod index;
@@ -19,14 +20,14 @@ mod pack;
 mod s3;
 mod store;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -43,6 +44,15 @@ const IDLE_CONNECTIONS: usize = 32;
 const LARGEST_UPLOAD: u64 = 5 << 30;
 /// The most a reader of the index keeps of all its listings together.
 const LARGEST_INDEX: usize = 32 << 20;
+/// Blobs stored apart one fetch requests at once.
+const BLOB_FETCHERS: usize = 8;
+/// Blobs stored apart requested at once by every fetch together, leaving
+/// connections for entries and uploads.
+const BLOB_REQUESTS: usize = 24;
+/// The compressed size from which a blob is stored apart, unless
+/// `QK_REMOTE_BLOB_THRESHOLD` says otherwise. Below it, a request costs more
+/// than the bytes it would save.
+const BLOB_THRESHOLD: u64 = 1 << 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -69,7 +79,61 @@ pub struct Remote {
     /// Entries this run found in the local cache, which its listing names
     /// too when the index already does.
     held: Mutex<BTreeSet<String>>,
+    /// The compressed size from which a blob is stored apart.
+    threshold: u64,
+    /// Where uploads carry each blob, decided once per blob.
+    placements: Mutex<HashMap<String, pack::Placement>>,
+    /// Blobs stored apart that the store is known to hold.
+    stored: Mutex<HashSet<String>>,
+    /// Requests for blobs stored apart that may start now.
+    blob_requests: Slots,
 }
+
+/// A counting semaphore.
+struct Slots {
+    free: Mutex<usize>,
+    freed: Condvar,
+}
+
+impl Slots {
+    fn new(count: usize) -> Self {
+        Self {
+            free: Mutex::new(count),
+            freed: Condvar::new(),
+        }
+    }
+
+    fn take(&self) -> Slot<'_> {
+        let mut free = self.free.lock().unwrap();
+        while *free == 0 {
+            free = self.freed.wait(free).unwrap();
+        }
+        *free -= 1;
+        Slot(self)
+    }
+}
+
+struct Slot<'a>(&'a Slots);
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        *self.0.free.lock().unwrap() += 1;
+        self.0.freed.notify_one();
+    }
+}
+
+/// A blob a pack stores apart that the store does not hold, which makes the
+/// entry a miss rather than an error.
+#[derive(Debug)]
+struct MissingBlob(String);
+
+impl std::fmt::Display for MissingBlob {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "remote blob {} is missing", self.0)
+    }
+}
+
+impl std::error::Error for MissingBlob {}
 
 struct Uploads {
     sender: Sender<Upload>,
@@ -145,6 +209,15 @@ pub fn configure(
         other => bail!("unknown remote cache mode {other:?}; use read-write, read or no-cache"),
     };
     let store = s3::configure(config, variable)?;
+    let threshold = match variable("QK_REMOTE_BLOB_THRESHOLD").as_deref() {
+        None => BLOB_THRESHOLD,
+        Some("off") => u64::MAX,
+        Some(size) => crate::evict::parse_size(size).map_err(|_| {
+            anyhow::anyhow!(
+                "invalid QK_REMOTE_BLOB_THRESHOLD {size:?}; use a size such as 1MB, or off"
+            )
+        })?,
+    };
     let upload_mode = variable("QK_REMOTE_UPLOAD_MODE")
         .or_else(|| setting("uploadMode"))
         .unwrap_or_else(|| "wait".into());
@@ -174,6 +247,10 @@ pub fn configure(
         confirmed: Mutex::default(),
         announcements: Mutex::default(),
         held: Mutex::default(),
+        threshold,
+        placements: Mutex::default(),
+        stored: Mutex::default(),
+        blob_requests: Slots::new(BLOB_REQUESTS),
     }))
 }
 
@@ -321,10 +398,58 @@ impl Remote {
         };
         let mut receiving = crate::profile::span(task, "remote_body");
         let mut transfer = pack::Transfer::default();
-        let record = pack::read(root, body, check, &mut transfer);
+        let apart = AtomicU64::new(0);
+        let read = pack::read(root, body, check, &mut transfer, |missing| {
+            self.fetch_blobs(root, &missing, task, &apart)
+        });
         receiving.count("bytes", transfer.received);
         receiving.count("held_bytes", transfer.held);
-        record.map(Some)
+        receiving.count("apart_bytes", apart.load(Ordering::Relaxed));
+        receiving.count("skipped_bytes", transfer.skipped);
+        match read {
+            Err(error) if error.is::<MissingBlob>() => Ok(None),
+            read => read.map(Some),
+        }
+    }
+
+    /// Fetches `blobs`, stored apart, into the local store at `root`, a few
+    /// at a time, adding the bytes received to `received`.
+    fn fetch_blobs(
+        &self,
+        root: &Path,
+        blobs: &[String],
+        task: &str,
+        received: &AtomicU64,
+    ) -> Result<()> {
+        let mut fetching = crate::profile::span(task, "remote_blobs");
+        fetching.count("blobs", blobs.len() as u64);
+        let queue = Mutex::new(blobs.iter());
+        let fetch = || -> Result<()> {
+            loop {
+                let Some(hash) = queue.lock().unwrap().next() else {
+                    return Ok(());
+                };
+                let _slot = self.blob_requests.take();
+                let body = self
+                    .store
+                    .get(Object::Blob(hash), task)?
+                    .ok_or_else(|| MissingBlob(hash.clone()))?;
+                let bytes = pack::read_blob(root, hash, body)?;
+                received.fetch_add(bytes, Ordering::Relaxed);
+            }
+        };
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..blobs.len().min(BLOB_FETCHERS))
+                .map(|_| scope.spawn(fetch))
+                .collect();
+            // Every worker is joined before an error is returned, so none
+            // outlives the pin the caller holds.
+            let results: Vec<Result<()>> = workers
+                .into_iter()
+                .map(|worker| worker.join().expect("blob fetch panicked"))
+                .collect();
+            results.into_iter().collect()
+        })
     }
 
     fn enqueue(self: &Arc<Self>, upload: Upload) {
@@ -390,15 +515,93 @@ impl Remote {
     }
 
     /// Uploads `record` with the blobs it cites from the local store at
-    /// `root`, as one pack.
+    /// `root`: large blobs on their own, once the store lacks them, then a
+    /// pack with the rest, so the pack never cites a blob not yet stored.
     fn put_pack(&self, root: &Path, object: Object, record: &[u8]) -> Result<()> {
+        let parsed = crate::record::StoredRecord::read(record)?;
+        let mut placements = HashMap::new();
+        for blob in parsed.blobs() {
+            let placement = self.place(root, &blob)?;
+            placements.insert(blob, placement);
+        }
         let mut pack = tempfile::NamedTempFile::new_in(root.join("tmp"))?;
-        pack::write(root, record, pack.as_file_mut())?;
+        pack::write(
+            root,
+            record,
+            |blob| {
+                placements
+                    .get(blob)
+                    .copied()
+                    .ok_or_else(|| anyhow::anyhow!("blob {blob} was not placed"))
+            },
+            pack.as_file_mut(),
+        )?;
         let file = pack.reopen()?;
         if file.metadata()?.len() > LARGEST_UPLOAD {
             bail!("too large to upload as one object");
         }
         self.store.put(object, file)
+    }
+
+    /// Decides where packs carry the blob `hash`, uploading it on its own if
+    /// it goes apart and the store lacks it. A blob goes apart when its
+    /// compressed size, what it costs to transfer, reaches the threshold.
+    fn place(&self, root: &Path, hash: &str) -> Result<pack::Placement> {
+        let known = self.placements.lock().unwrap().get(hash).copied();
+        let placement = match known {
+            Some(placement) => placement,
+            None => {
+                let size = fs::metadata(root.join("blobs").join(hash))?.len();
+                let compressed = if size < self.threshold {
+                    None
+                } else {
+                    Some(pack::compress(root, hash)?).filter(|compressed| {
+                        compressed
+                            .as_file()
+                            .metadata()
+                            .is_ok_and(|metadata| metadata.len() >= self.threshold)
+                    })
+                };
+                let placement = match compressed {
+                    None => pack::Placement::Inline,
+                    Some(compressed) => {
+                        self.store_apart(root, hash, Some(compressed))?;
+                        pack::Placement::Apart
+                    }
+                };
+                self.placements
+                    .lock()
+                    .unwrap()
+                    .insert(hash.to_owned(), placement);
+                return Ok(placement);
+            }
+        };
+        if placement == pack::Placement::Apart {
+            self.store_apart(root, hash, None)?;
+        }
+        Ok(placement)
+    }
+
+    /// Uploads the blob `hash` on its own unless the store is known to hold
+    /// it, or answers that it does.
+    fn store_apart(
+        &self,
+        root: &Path,
+        hash: &str,
+        compressed: Option<tempfile::NamedTempFile>,
+    ) -> Result<()> {
+        if self.stored.lock().unwrap().contains(hash) {
+            return Ok(());
+        }
+        if !self.store.has(Object::Blob(hash))? {
+            let compressed = match compressed {
+                Some(compressed) => compressed,
+                None => pack::compress(root, hash)?,
+            };
+            self.store.put(Object::Blob(hash), compressed.reopen()?)?;
+        }
+        self.stored.lock().unwrap().insert(hash.to_owned());
+        Ok(())
     }
 
     /// Waits for queued uploads, then adds this run's listing to the index,

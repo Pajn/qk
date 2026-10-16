@@ -100,6 +100,7 @@ fn pin_gate(root: &Path) -> Result<File> {
 /// its holder keeps locked, so a prune can tell a live pin from an abandoned
 /// one, and one naming the blobs, which a prune can read even where a lock
 /// keeps other processes from reading the file it covers.
+#[derive(Debug)]
 pub(crate) struct Pin {
     lock: Option<File>,
     path: PathBuf,

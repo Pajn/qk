@@ -1416,6 +1416,185 @@ fn remote_cache_restores_what_another_machine_uploaded() {
     assert!(stderr(&success(remote_build(&fixture, &[]))).contains("qk: cache hit app:build"));
 }
 
+/// Bytes that do not compress, the same in every run.
+fn incompressible(length: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    (0..length)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 56) as u8
+        })
+        .collect()
+}
+
+/// How often the target from [`large_outputs`] ran.
+fn executions(fixture: &Fixture) -> usize {
+    fs::read_to_string(fixture.root.parent().unwrap().join("executions"))
+        .map_or(0, |runs| runs.lines().count())
+}
+
+/// A target that copies `large/*.bin` into `dist/` beside a small file.
+fn large_outputs(fixture_files: usize) -> (Fixture, Vec<(&'static str, &'static str)>) {
+    let fixture = Fixture::new(json!({
+        "command": "echo run >> ../executions; mkdir -p dist && cp large/*.bin dist/ && cp src/input.txt dist/small.txt",
+        "cache": true,
+        "outputs": ["{projectRoot}/dist"],
+    }));
+    fs::create_dir_all(fixture.root.join("large")).unwrap();
+    for index in 0..fixture_files {
+        fs::write(
+            fixture.root.join("large").join(format!("{index}.bin")),
+            incompressible(8 << 10, index as u64),
+        )
+        .unwrap();
+    }
+    (fixture, vec![("QK_REMOTE_BLOB_THRESHOLD", "1KB")])
+}
+
+#[test]
+fn large_blobs_are_stored_apart_and_fetched_only_when_missing() {
+    let server = s3::FakeS3::start();
+    let (fixture, env) = large_outputs(1);
+    with_remote(&fixture, &server, json!({}));
+    success(remote_build(&fixture, &env));
+    assert_eq!(executions(&fixture), 1);
+    // The large file is its own object; the small file and the log ride in
+    // the entry.
+    assert_eq!(server.objects(&s3::path("blobs/")).len(), 1);
+    assert_eq!(server.objects(&s3::path("entries/")).len(), 1);
+
+    // A machine that holds the large file, but not the entry, fetches only
+    // the entry.
+    let cache = PathBuf::from(
+        stdout(&success(fixture.qk(&fixture.root, &["cache", "path"])))
+            .trim()
+            .to_owned(),
+    );
+    fs::remove_dir_all(cache.join("entries")).unwrap();
+    fs::remove_dir_all(fixture.root.join("dist")).unwrap();
+    let blobs = server.requests(&s3::path("blobs/")).len();
+    let held = success(remote_build(&fixture, &env));
+    assert!(
+        stderr(&held).contains("qk: remote cache hit app:build"),
+        "{}",
+        stderr(&held)
+    );
+    assert_eq!(server.requests(&s3::path("blobs/")).len(), blobs);
+    assert_eq!(
+        fs::read(fixture.root.join("dist/0.bin")).unwrap(),
+        incompressible(8 << 10, 0)
+    );
+
+    // A machine with nothing fetches the large file by its hash.
+    clear_local_cache(&fixture);
+    fs::remove_dir_all(fixture.root.join("dist")).unwrap();
+    let cold = success(remote_build(&fixture, &env));
+    assert!(stderr(&cold).contains("qk: remote cache hit app:build"));
+    let blob = server.objects(&s3::path("blobs/")).remove(0);
+    assert_eq!(
+        server.requests(&s3::path("blobs/"))[blobs..],
+        [format!("GET {blob}")]
+    );
+    assert_eq!(
+        fs::read(fixture.root.join("dist/0.bin")).unwrap(),
+        incompressible(8 << 10, 0)
+    );
+    assert_eq!(executions(&fixture), 1);
+}
+
+#[test]
+fn a_large_blob_two_entries_share_is_uploaded_once() {
+    let server = s3::FakeS3::start();
+    let (fixture, env) = large_outputs(1);
+    with_remote(&fixture, &server, json!({}));
+    success(remote_build(&fixture, &env));
+    fs::write(fixture.root.join("src/input.txt"), "two\n").unwrap();
+    success(remote_build(&fixture, &env));
+    assert_eq!(server.objects(&s3::path("entries/")).len(), 2);
+    assert_eq!(server.objects(&s3::path("blobs/")).len(), 1);
+    let puts = server
+        .requests(&s3::path("blobs/"))
+        .into_iter()
+        .filter(|request| request.starts_with("PUT "))
+        .count();
+    assert_eq!(puts, 1);
+}
+
+#[test]
+fn a_blob_stored_apart_that_the_store_lost_makes_a_miss() {
+    let server = s3::FakeS3::start();
+    let (fixture, env) = large_outputs(1);
+    with_remote(&fixture, &server, json!({}));
+    success(remote_build(&fixture, &env));
+    let blob = server.objects(&s3::path("blobs/")).remove(0);
+    server.state.lock().unwrap().objects.remove(&blob);
+    clear_local_cache(&fixture);
+    fs::remove_dir_all(fixture.root.join("dist")).unwrap();
+    let output = success(remote_build(&fixture, &env));
+    assert_eq!(executions(&fixture), 2);
+    assert!(
+        !stderr(&output).contains("remote cache unavailable"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn a_corrupt_blob_stored_apart_is_rejected() {
+    let server = s3::FakeS3::start();
+    let (fixture, env) = large_outputs(1);
+    with_remote(&fixture, &server, json!({}));
+    success(remote_build(&fixture, &env));
+    let blob = server.objects(&s3::path("blobs/")).remove(0);
+    let other = zstd::stream::encode_all(&b"something else"[..], 3).unwrap();
+    server.state.lock().unwrap().objects.insert(blob, other);
+    clear_local_cache(&fixture);
+    fs::remove_dir_all(fixture.root.join("dist")).unwrap();
+    let output = success(remote_build(&fixture, &env));
+    assert_eq!(executions(&fixture), 2);
+    assert!(
+        stderr(&output).contains("does not match its hash"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn blobs_stored_apart_are_fetched_a_few_at_a_time() {
+    let server = s3::FakeS3::start();
+    let (fixture, env) = large_outputs(20);
+    with_remote(&fixture, &server, json!({}));
+    success(remote_build(&fixture, &env));
+    assert_eq!(server.objects(&s3::path("blobs/")).len(), 20);
+    clear_local_cache(&fixture);
+    fs::remove_dir_all(fixture.root.join("dist")).unwrap();
+    server.state.lock().unwrap().latency = std::time::Duration::from_millis(50);
+    let cold = success(remote_build(&fixture, &env));
+    assert!(stderr(&cold).contains("qk: remote cache hit app:build"));
+    let fetches: Vec<_> = server
+        .requests_timed(&s3::path("blobs/"))
+        .into_iter()
+        .filter(|(request, _, _)| request.starts_with("GET "))
+        .collect();
+    assert_eq!(fetches.len(), 20);
+    let most = fetches
+        .iter()
+        .map(|(_, arrived, _)| {
+            fetches
+                .iter()
+                .filter(|(_, other, answered)| other <= arrived && arrived < answered)
+                .count()
+        })
+        .max()
+        .unwrap();
+    // In parallel, but no more than one fetch's share at once.
+    assert!((2..=8).contains(&most), "{most} fetches overlapped");
+}
+
 #[test]
 fn remote_cache_cutover_does_not_fetch_or_replace_legacy_packs() {
     let server = s3::FakeS3::start();
@@ -1430,11 +1609,10 @@ fn remote_cache_cutover_does_not_fetch_or_replace_legacy_packs() {
             .find(|name| name.contains(&format!("/{}entries/", s3::LAYOUT)))
             .unwrap()
             .clone();
-        let compressed = state.objects.remove(&entry).unwrap();
-        let raw = zstd::stream::decode_all(&compressed[..]).unwrap();
+        let pack = state.objects.remove(&entry).unwrap();
         state
             .objects
-            .insert(entry.replace(&format!("/{}", s3::LAYOUT), "/qk/v2/"), raw);
+            .insert(entry.replace(&format!("/{}", s3::LAYOUT), "/qk/v3/"), pack);
         state
             .objects
             .retain(|name, _| !name.contains(&format!("/{}index/", s3::LAYOUT)));
@@ -1449,8 +1627,8 @@ fn remote_cache_cutover_does_not_fetch_or_replace_legacy_packs() {
     );
     assert_eq!(artifact(&fixture.root), "built:one\n");
     assert_eq!(fixture.runs(), 2);
-    assert!(server.requests("/cache/team/qk/v2/").is_empty());
-    assert_eq!(server.objects("/cache/team/qk/v2/entries/").len(), 1);
+    assert!(server.requests("/cache/team/qk/v3/").is_empty());
+    assert_eq!(server.objects("/cache/team/qk/v3/entries/").len(), 1);
     assert_eq!(
         server
             .objects(&format!("/cache/team/{}entries/", s3::LAYOUT))
@@ -2671,13 +2849,16 @@ fn warm_state_is_shared_through_the_remote_by_branch() {
             .unwrap()
     };
     let pack = zstd::stream::decode_all(&pack[..]).unwrap();
-    // A decoded pack starts with its record's length and the record, then the blobs.
-    let length = u64::from_le_bytes(pack[..8].try_into().unwrap()) as usize;
-    let record: Value = serde_json::from_slice(&pack[8..8 + length]).unwrap();
+    // A decoded pack starts with its magic, its record's length and the
+    // record, then its blob table and blobs.
+    assert_eq!(&pack[..4], b"qkp4");
+    let length = u64::from_le_bytes(pack[4..12].try_into().unwrap()) as usize;
+    let record: Value = serde_json::from_slice(&pack[12..12 + length]).unwrap();
     let repack = |record: &[u8]| {
-        let mut bytes = (record.len() as u64).to_le_bytes().to_vec();
+        let mut bytes = b"qkp4".to_vec();
+        bytes.extend_from_slice(&(record.len() as u64).to_le_bytes());
         bytes.extend_from_slice(record);
-        bytes.extend_from_slice(&pack[8 + length..]);
+        bytes.extend_from_slice(&pack[12 + length..]);
         zstd::stream::encode_all(&bytes[..], 3).unwrap()
     };
     let mut legacy = record.clone();
@@ -2730,8 +2911,8 @@ fn a_remote_warm_save_for_another_key_is_not_downloaded() {
     let pack = server.objects(&s3::path("warm/")).pop().unwrap();
     let pack = server.state.lock().unwrap().objects[&pack].clone();
     let pack = zstd::stream::decode_all(&pack[..]).unwrap();
-    let length = u64::from_le_bytes(pack[..8].try_into().unwrap()) as usize;
-    let record: Value = serde_json::from_slice(&pack[8..8 + length]).unwrap();
+    let length = u64::from_le_bytes(pack[4..12].try_into().unwrap()) as usize;
+    let record: Value = serde_json::from_slice(&pack[12..12 + length]).unwrap();
     fn blobs(value: &Value, found: &mut Vec<String>) {
         match value {
             Value::Object(map) => {

@@ -19,6 +19,8 @@ pub(super) enum Object<'a> {
     Entry(&'a str),
     /// A task's warm record, saved for a branch.
     Warm { identity: &'a str, branch: &'a str },
+    /// A blob stored apart from the packs that cite it, named by its hash.
+    Blob(&'a str),
 }
 
 pub(super) trait Store: Send + Sync {

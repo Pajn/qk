@@ -22,7 +22,7 @@ const LISTING_READERS: usize = 16;
 const LARGEST_LISTING: usize = 4 << 20;
 const LARGEST_LIST_RESPONSE: usize = 1 << 20;
 /// The layout objects live under, after `cacheKeyPrefix`.
-pub(super) const LAYOUT: &str = "qk/v3/";
+pub(super) const LAYOUT: &str = "qk/v4/";
 
 pub(super) struct S3 {
     bucket: Bucket,
@@ -93,6 +93,7 @@ impl S3 {
                     &format!("{}/{}.json", hash(&identity), hash(branch)),
                 )
             }
+            Object::Blob(hash) => self.object("blobs", hash),
         }
     }
 
