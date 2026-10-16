@@ -51,9 +51,9 @@ server, whose summary of local blobs is a hint, not a promise: a Bloom filter
 has false positives, so the server can leave out a blob the client lacks, and
 the local cache can prune a blob after the summary was sent. The client checks
 the record against its local cache, requests any missing blobs by hash in one
-follow-up request, and keeps blobs an in-flight fetch relies on safe from
-pruning until the record is published. A hit therefore costs one request when
-the summary is right and two when it is not, and never becomes an execution
+follow-up wave of requests, and keeps blobs an in-flight fetch relies on safe from
+pruning until the record is published. A hit on a store server therefore
+costs one request when the summary is right and one more wave when it is not, and never becomes an execution
 miss because of it.
 
 ## What makes a blob large

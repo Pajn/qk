@@ -14,8 +14,9 @@ local cache carries on.
 Entries are stored under `<cacheKeyPrefix>qk/v4/`, so a bucket shared with Nx
 never mixes the two. Result entries and portable warm state use streaming
 Zstandard level 3 compression with a frame checksum. Each entry is one object
-holding its manifest and its small outputs, so that a lookup or restore is one
-request however many files the task wrote. A local miss fetches it, keeps the
+holding its manifest and its small outputs, so that a lookup or restore of an
+entry whose outputs are all small is one request however many files the task
+wrote. A local miss fetches it, keeps the
 outputs the local cache lacks, verifying each against its hash, and shows
 `[remote cache]`; any failure is a miss.
 

@@ -61,7 +61,15 @@ Point qk at the Worker in `nx.json`:
 ```
 
 and give it a token in `QK_STORE_SERVER_TOKEN`: a write token where results
-should be stored, such as CI on the main branch, a read token elsewhere.
+should be stored, such as CI on the main branch, a read token elsewhere. Where
+a read token is used, set that mode to `read` too, so qk does not try to
+upload:
+
+```json
+{
+  "storeServer": { "url": "…", "localMode": "read", "ciMode": "read-write" }
+}
+```
 
 ## Developing
 
