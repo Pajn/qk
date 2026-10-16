@@ -107,13 +107,17 @@ jobs:
       - run: cargo build --release --locked -p qk-cli
       - run: node tools/bench/bench.mjs --qk target/release/qk --json bench.json --markdown bench.md
       - run: node tools/bench/output-globs.mjs --qk target/release/qk --json output-globs.json
-      - run: cat bench.md >> "$GITHUB_STEP_SUMMARY"
+      # Fails when storing large blobs apart makes a cold restore slower than
+      # keeping every blob inline.
+      - run: node tools/bench/remote.mjs --qk target/release/qk --gate --json remote.json --markdown remote.md
+      - run: cat bench.md remote.md >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
         with:
           name: bench-${{ github.sha }}
           path: |
             bench.json
             output-globs.json
+            remote.json
 
   package:
     runs-on: ubuntu-latest
