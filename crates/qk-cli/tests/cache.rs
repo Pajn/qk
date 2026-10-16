@@ -1208,6 +1208,7 @@ fn server_build(fixture: &Fixture, token: &str, env: &[(&str, &str)]) -> Output 
     command.output().unwrap()
 }
 
+#[cfg(unix)]
 fn cache_path(fixture: &Fixture) -> PathBuf {
     PathBuf::from(
         stdout(&success(fixture.qk(&fixture.root, &["cache", "path"])))

@@ -94,6 +94,7 @@ impl FakeS3 {
 
     /// The requests whose path starts with `prefix`, with when each arrived
     /// and was answered, in the order they were answered.
+    #[cfg(unix)]
     pub fn requests_timed(&self, prefix: &str) -> Vec<(String, Instant, Instant)> {
         let state = self.state.lock().unwrap();
         state

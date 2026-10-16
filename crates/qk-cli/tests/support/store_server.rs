@@ -55,6 +55,7 @@ impl FakeStoreServer {
     }
 
     /// The requests whose path starts with `/v4/<prefix>`.
+    #[cfg(unix)]
     pub fn requests(&self, prefix: &str) -> Vec<(String, usize)> {
         let prefix = format!("/v4/{prefix}");
         self.state
