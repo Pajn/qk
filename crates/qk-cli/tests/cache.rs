@@ -3052,14 +3052,15 @@ fn a_remote_warm_save_for_another_key_is_not_downloaded() {
 
     // Nor does a save whose key holds the matching digest beside something
     // that is not a digest.
-    let name = server.objects("/cache/qk/v3/warm/").pop().unwrap();
+    let name = server.objects(&s3::path("warm/")).pop().unwrap();
     let mut malformed = record.clone();
     let digest = record["key"][0].clone();
     malformed["key"] = json!([digest, null]);
     let malformed = serde_json::to_vec(&malformed).unwrap();
-    let mut bytes = (malformed.len() as u64).to_le_bytes().to_vec();
+    let mut bytes = b"qkp4".to_vec();
+    bytes.extend_from_slice(&(malformed.len() as u64).to_le_bytes());
     bytes.extend_from_slice(&malformed);
-    bytes.extend_from_slice(&pack[8 + length..]);
+    bytes.extend_from_slice(&pack[12 + length..]);
     server
         .state
         .lock()
