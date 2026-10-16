@@ -35,15 +35,41 @@ pub(super) fn write(root: &Path, record: &[u8], output: impl Write) -> Result<()
     Ok(())
 }
 
+/// What reading a pack moved: the bytes received, as compressed, and how many
+/// of the blob bytes it carried the local store held already.
+#[derive(Default)]
+pub(super) struct Transfer {
+    pub(super) received: u64,
+    pub(super) held: u64,
+}
+
+struct Counting<'a, R> {
+    inner: R,
+    count: &'a mut u64,
+}
+
+impl<R: Read> Read for Counting<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        *self.count += read as u64;
+        Ok(read)
+    }
+}
+
 pub(super) fn read(
     root: &Path,
     input: impl Read,
     check: impl Fn(&StoredRecord) -> Result<()>,
+    transfer: &mut Transfer,
 ) -> Result<Vec<u8>> {
+    let input = Counting {
+        inner: input,
+        count: &mut transfer.received,
+    };
     let mut input = input.take(super::LARGEST_UPLOAD + 1);
     let mut decoder = zstd::stream::read::Decoder::new(&mut input)?;
     decoder.window_log_max(WINDOW_LOG_MAX)?;
-    let record = read_parts(root, &mut decoder, check)?;
+    let record = read_parts(root, &mut decoder, check, &mut transfer.held)?;
     drop(decoder);
     if input.limit() == 0 {
         bail!("remote pack exceeds 5 GiB");
@@ -55,6 +81,7 @@ fn read_parts(
     root: &Path,
     mut body: impl Read,
     check: impl Fn(&StoredRecord) -> Result<()>,
+    held: &mut u64,
 ) -> Result<Vec<u8>> {
     let mut used = 0;
     let length = part_length(&mut body)?;
@@ -74,7 +101,9 @@ fn read_parts(
         let mut part = (&mut body).take(length);
         let target = root.join("blobs").join(&blob);
         let copied = if target.is_file() {
-            io::copy(&mut part, &mut io::sink())?
+            let copied = io::copy(&mut part, &mut io::sink())?;
+            *held += copied;
+            copied
         } else {
             let mut file = tempfile::NamedTempFile::new_in(root.join("tmp"))?;
             let copied = io::copy(&mut part, file.as_file_mut())?;
@@ -119,6 +148,36 @@ fn part_size(used: &mut u64, length: u64, limit: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn read(
+        root: &Path,
+        input: impl Read,
+        check: impl Fn(&StoredRecord) -> Result<()>,
+    ) -> Result<Vec<u8>> {
+        super::read(root, input, check, &mut Transfer::default())
+    }
+
+    #[test]
+    fn reading_counts_received_and_held_bytes() {
+        let source = root();
+        let blob = source.path().join("blobs/a");
+        std::fs::write(&blob, "contents").unwrap();
+        let name = crate::hash::digest_file(&blob).unwrap();
+        std::fs::rename(&blob, source.path().join("blobs").join(&name)).unwrap();
+        let record = serde_json::to_vec(&serde_json::json!({
+            "artifacts": {"file": {"blob": name}}
+        }))
+        .unwrap();
+        let mut encoded = Vec::new();
+        write(source.path(), &record, &mut encoded).unwrap();
+        let mut empty = Transfer::default();
+        super::read(root().path(), &encoded[..], |_| Ok(()), &mut empty).unwrap();
+        assert_eq!(empty.received, encoded.len() as u64);
+        assert_eq!(empty.held, 0);
+        let mut holding = Transfer::default();
+        super::read(source.path(), &encoded[..], |_| Ok(()), &mut holding).unwrap();
+        assert_eq!(holding.held, "contents".len() as u64);
+    }
 
     fn root() -> tempfile::TempDir {
         let root = tempfile::tempdir().unwrap();

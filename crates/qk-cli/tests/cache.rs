@@ -1377,12 +1377,32 @@ fn remote_cache_restores_what_another_machine_uploaded() {
     clear_local_cache(&fixture);
     fs::remove_dir_all(fixture.root.join("dist")).unwrap();
     let before_entries = server.requests("/cache/qk/v3/entries/").len();
-    let second = success(remote_build(&fixture, &[]));
+    let second = success(remote_build(&fixture, &[("QK_PROFILE_CACHE", "1")]));
     let entry = server.objects("/cache/qk/v3/entries/").remove(0);
     assert_eq!(
         server.requests("/cache/qk/v3/entries/")[before_entries..],
         [format!("GET {entry}")]
     );
+    // Profiling splits the fetch into waiting for the store and receiving
+    // the pack, and counts what was received and what was already held.
+    let diagnostics = stderr(&second);
+    assert!(
+        diagnostics.contains("qk profile: task=app:build stage=remote_response ms="),
+        "{diagnostics}"
+    );
+    let body = diagnostics
+        .lines()
+        .find(|line| line.contains("stage=remote_body "))
+        .unwrap_or_else(|| panic!("{diagnostics}"));
+    let count = |name: &str| -> u64 {
+        body.split(' ')
+            .find_map(|field| field.strip_prefix(&format!("{name}=")))
+            .unwrap_or_else(|| panic!("{body}"))
+            .parse()
+            .unwrap()
+    };
+    assert!(count("bytes") > 0, "{body}");
+    assert_eq!(count("held_bytes"), 0, "{body}");
     assert!(
         stderr(&second).contains("qk: remote cache hit app:build"),
         "{}",

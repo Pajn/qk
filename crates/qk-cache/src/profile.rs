@@ -15,6 +15,7 @@ pub(crate) struct Span<'a> {
     task: &'a str,
     stage: &'static str,
     started: Option<Instant>,
+    counts: Vec<(&'static str, u64)>,
 }
 
 pub(crate) fn span<'a>(task: &'a str, stage: &'static str) -> Span<'a> {
@@ -24,22 +25,33 @@ pub(crate) fn span<'a>(task: &'a str, stage: &'static str) -> Span<'a> {
         task,
         stage,
         started: enabled.then(Instant::now),
+        counts: Vec::new(),
+    }
+}
+
+impl Span<'_> {
+    /// Adds a count to the span's line, such as the bytes it received.
+    pub(crate) fn count(&mut self, name: &'static str, value: u64) {
+        if self.started.is_some() {
+            self.counts.push((name, value));
+        }
     }
 }
 
 impl Drop for Span<'_> {
     fn drop(&mut self) {
         if let Some(started) = self.started {
-            qk_executor::report::output(
-                true,
-                format!(
-                    "qk profile: task={} stage={} ms={:.3}\n",
-                    self.task,
-                    self.stage,
-                    started.elapsed().as_secs_f64() * 1000.0
-                )
-                .as_bytes(),
+            let mut line = format!(
+                "qk profile: task={} stage={} ms={:.3}",
+                self.task,
+                self.stage,
+                started.elapsed().as_secs_f64() * 1000.0
             );
+            for (name, value) in &self.counts {
+                line.push_str(&format!(" {name}={value}"));
+            }
+            line.push('\n');
+            qk_executor::report::output(true, line.as_bytes());
         }
     }
 }

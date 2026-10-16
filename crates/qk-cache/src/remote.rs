@@ -395,16 +395,17 @@ impl Remote {
     /// Copies the entry for `key` into the local store at `root`, returning
     /// whether the remote had it. Every blob the local store lacks is verified
     /// before it is kept.
-    pub(crate) fn fetch(&self, root: &Path, key: &str) -> Result<bool> {
-        if self
-            .known()
-            .is_some_and(|known| !known.keys.contains_key(key))
-        {
+    pub(crate) fn fetch(&self, root: &Path, key: &str, task: &str) -> Result<bool> {
+        let waiting = crate::profile::span(task, "remote_index_wait");
+        let known = self.known();
+        drop(waiting);
+        if known.is_some_and(|known| !known.keys.contains_key(key)) {
             return Ok(false);
         }
-        let Some(manifest) = self.fetch_pack(root, &self.object("entries", key), |parsed| {
-            parsed.check_key(key)
-        })?
+        let Some(manifest) =
+            self.fetch_pack(root, &self.object("entries", key), task, |parsed| {
+                parsed.check_key(key)
+            })?
         else {
             return Ok(false);
         };
@@ -466,11 +467,13 @@ impl Remote {
     pub(crate) fn fetch_warm(
         &self,
         root: &Path,
+        identity: &str,
         task: &str,
         branch: &str,
         accept: impl Fn(&[String]) -> bool,
     ) -> Result<Option<Vec<u8>>> {
-        let fetched = self.fetch_pack(root, &self.warm_object(task, branch), |record| {
+        let object = self.warm_object(identity, branch);
+        let fetched = self.fetch_pack(root, &object, task, |record| {
             if record.warm_key().is_some_and(|key| accept(&key)) {
                 Ok(())
             } else {
@@ -486,17 +489,23 @@ impl Remote {
     /// The record in the pack at `object`, once `check` accepts it and the
     /// blobs it cites that the local store lacks are kept there, or `None`
     /// when there is no such object.
+    /// `task` names the task the fetch is for in profile timings.
     fn fetch_pack(
         &self,
         root: &Path,
         object: &str,
+        task: &str,
         check: impl Fn(&crate::record::StoredRecord) -> Result<()>,
     ) -> Result<Option<Vec<u8>>> {
         let url = self
             .bucket
             .get_object(Some(&self.credentials), object)
             .sign(SIGNED_FOR);
+        // Until the store's response headers arrive: the round trip, and a
+        // connection when none is open.
+        let waiting = crate::profile::span(task, "remote_response");
         let response = self.agent.get(url.as_str()).call()?;
+        drop(waiting);
         let status = response.status().as_u16();
         let mut body = io::BufReader::new(response.into_body().into_reader());
         if status != 200 {
@@ -506,7 +515,12 @@ impl Remote {
                 status => bail!("GET {object} returned {status}"),
             }
         }
-        pack::read(root, body, check).map(Some)
+        let mut receiving = crate::profile::span(task, "remote_body");
+        let mut transfer = pack::Transfer::default();
+        let record = pack::read(root, body, check, &mut transfer);
+        receiving.count("bytes", transfer.received);
+        receiving.count("held_bytes", transfer.held);
+        record.map(Some)
     }
 
     fn enqueue(self: &Arc<Self>, upload: Upload) {
