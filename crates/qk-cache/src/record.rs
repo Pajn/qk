@@ -150,6 +150,19 @@ impl StoredRecord {
         Ok(())
     }
 
+    /// The warm key a warm record was saved under, a digest of each part, or
+    /// `None` when its key is not a list of digests. A record without a key
+    /// was saved under an empty one.
+    pub(crate) fn warm_key(&self) -> Option<Vec<String>> {
+        let Some(key) = self.0.get("key") else {
+            return Some(Vec::new());
+        };
+        key.as_array()?
+            .iter()
+            .map(|part| part.as_str().map(str::to_owned))
+            .collect()
+    }
+
     /// Sorted, deduplicated blob names, including result logs and warm groups.
     pub(crate) fn blobs(&self) -> BTreeSet<String> {
         let mut blobs = BTreeSet::new();
