@@ -453,10 +453,8 @@ impl Remote {
 
     /// The task's warm record saved on `branch`, with every blob it cites
     /// fetched into the local store and verified, or `None` when there is
-    /// none.
-    /// A branch's warm save, or `None` when there is none or `accept` rejects
-    /// its key. The key is checked before any blob is read, so a save that
-    /// does not suit this checkout costs only its record.
+    /// none or `accept` rejects its key. The key is checked before any blob is
+    /// read, so a save that does not suit this checkout costs only its record.
     pub(crate) fn fetch_warm(
         &self,
         root: &Path,
