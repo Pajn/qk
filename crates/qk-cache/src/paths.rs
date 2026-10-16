@@ -27,6 +27,31 @@ pub fn git_path(root: &Path, flag: &str) -> Option<PathBuf> {
     Some(PathBuf::from(path.trim_end_matches(['\r', '\n'])))
 }
 
+/// The worktree's git directory and the repository's common one, read from
+/// the `.git` entry at or above `root`, for when `git` cannot answer. A linked
+/// worktree's `.git` is a file naming its git directory, whose `commondir`
+/// names the common one; without this, a failed `git` would put a linked
+/// worktree's state and history at its root as if it were outside Git.
+fn dot_git(root: &Path) -> Option<(PathBuf, PathBuf)> {
+    let (parent, entry) = root
+        .ancestors()
+        .map(|dir| (dir, dir.join(".git")))
+        .find(|(_, entry)| entry.exists())?;
+    let git_dir = if entry.is_dir() {
+        entry
+    } else {
+        let content = std::fs::read_to_string(&entry).ok()?;
+        let named = content.strip_prefix("gitdir:")?.trim();
+        parent.join(named)
+    };
+    let common = match std::fs::read_to_string(git_dir.join("commondir")) {
+        Ok(named) => git_dir.join(named.trim()),
+        Err(_) => git_dir.clone(),
+    };
+    let absolute = |path: PathBuf| std::fs::canonicalize(&path).unwrap_or(path);
+    Some((absolute(git_dir), absolute(common)))
+}
+
 /// Where qk keeps what belongs to one worktree: digests of its files, records
 /// of the outputs it holds, and restores in progress. Inside Git that is the
 /// worktree's own git directory, so nothing appears in the working tree;
@@ -40,6 +65,7 @@ pub fn worktree_state(root: &Path) -> PathBuf {
         return state.clone();
     }
     let state = git_path(root, "--git-dir")
+        .or_else(|| dot_git(root).map(|(git_dir, _)| git_dir))
         .map(|dir| dir.join("qk"))
         .unwrap_or_else(|| root.join(".qk"));
     known.lock().unwrap().insert(root.to_owned(), state.clone());
@@ -97,6 +123,7 @@ pub fn cache_location(workspace: &Workspace) -> PathBuf {
 /// The cache's default place, in the repository's common git directory.
 pub fn cache_directory(root: &Path) -> PathBuf {
     git_path(root, "--git-common-dir")
+        .or_else(|| dot_git(root).map(|(_, common)| common))
         .map(|dir| dir.join("qk/cache/v1"))
         .unwrap_or_else(|| root.join(".qk/cache/v1"))
 }
@@ -753,7 +780,29 @@ fn resolve_output(
 
 #[cfg(test)]
 mod tests {
-    use super::{Outputs, Pattern, normalize};
+    use super::{Outputs, Pattern, dot_git, normalize};
+
+    #[test]
+    fn dot_git_finds_a_linked_worktrees_directories_without_git() {
+        let scratch = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(scratch.path()).unwrap();
+        let common = base.join("main/.git");
+        let git_dir = common.join("worktrees/linked");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(git_dir.join("commondir"), "../..\n").unwrap();
+        std::fs::create_dir_all(base.join("linked/apps/web")).unwrap();
+        std::fs::write(
+            base.join("linked/.git"),
+            "gitdir: ../main/.git/worktrees/linked\n",
+        )
+        .unwrap();
+        assert_eq!(
+            dot_git(&base.join("linked/apps/web")),
+            Some((git_dir, common.clone()))
+        );
+        assert_eq!(dot_git(&base.join("main")), Some((common.clone(), common)));
+        assert_eq!(dot_git(&base.join("elsewhere")), None);
+    }
 
     #[test]
     fn literal_entries_match_listing_for_nested_and_missing_roots() {
