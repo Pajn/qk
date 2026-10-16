@@ -43,3 +43,16 @@ does not establish a successful task result or a cache hit.
 **Blob**:
 Saved file or log content identified by its content hash. Several result
 records or warm-state records can cite the same blob.
+
+**Remote store**:
+Shared storage of result records, warm-state records and blobs, through which
+one machine reuses what another saved.
+
+**Run listing**:
+The cache keys one run found in or added to the remote store. It tells readers
+what the store holds, and which keys were used together.
+
+**Store server**:
+A service that answers qk's remote store requests itself, in front of the
+storage that holds the records and blobs, rather than the storage serving them
+directly.
