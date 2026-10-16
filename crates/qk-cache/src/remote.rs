@@ -90,6 +90,26 @@ pub struct Remote {
     stored: Mutex<HashSet<String>>,
     /// Requests for blobs stored apart that may start now.
     blob_requests: Slots,
+    /// Fetches in progress, by key, so a key is fetched once however many
+    /// ask for it at a time.
+    flights: Mutex<HashMap<String, Arc<Flight>>>,
+}
+
+/// A fetch in progress, and how it ended.
+#[derive(Default)]
+struct Flight {
+    outcome: Mutex<Option<Outcome>>,
+    done: Condvar,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Outcome {
+    /// The entry is in the local cache.
+    Published,
+    /// The store does not hold it.
+    Absent,
+    /// The fetch failed, and whoever waited for it may try again.
+    Failed,
 }
 
 /// A counting semaphore.
@@ -239,26 +259,41 @@ pub fn configure(
         }
         other => bail!("unknown s3 upload mode {other:?}; use wait or background"),
     };
-    Ok(Some(Remote {
-        store: Box::new(store),
+    Ok(Some(Remote::new(
+        Box::new(store),
         mode,
-        uploads: Mutex::new(None),
         background,
-        pending: Mutex::new(Vec::new()),
-        known: OnceLock::new(),
-        reading: Mutex::new(None),
-        confirmed: Mutex::default(),
-        announcements: Mutex::default(),
-        held: Mutex::default(),
-        order: Mutex::default(),
         threshold,
-        placements: Mutex::default(),
-        stored: Mutex::default(),
-        blob_requests: Slots::new(BLOB_REQUESTS),
-    }))
+    )))
 }
 
 impl Remote {
+    fn new(
+        store: Box<dyn Store>,
+        mode: Mode,
+        background: Option<background::Configuration>,
+        threshold: u64,
+    ) -> Self {
+        Remote {
+            store,
+            mode,
+            uploads: Mutex::new(None),
+            background,
+            pending: Mutex::new(Vec::new()),
+            known: OnceLock::new(),
+            reading: Mutex::new(None),
+            confirmed: Mutex::default(),
+            announcements: Mutex::default(),
+            held: Mutex::default(),
+            order: Mutex::default(),
+            threshold,
+            placements: Mutex::default(),
+            stored: Mutex::default(),
+            blob_requests: Slots::new(BLOB_REQUESTS),
+            flights: Mutex::default(),
+        }
+    }
+
     /// Starts reading the store's index in the background, keeping a copy in
     /// the local cache at `root` so that later runs fetch only what is new.
     pub(crate) fn read_index(self: &Arc<Self>, root: &Path) {
@@ -302,8 +337,57 @@ impl Remote {
 
     /// Copies the entry for `key` into the local store at `root`, returning
     /// whether the remote had it. Every blob the local store lacks is verified
-    /// before it is kept.
-    pub(crate) fn fetch(&self, root: &Path, key: &str, task: &str) -> Result<bool> {
+    /// before it is kept. A fetch of the same key already in progress is
+    /// waited for rather than repeated, until `cancelled`.
+    pub(crate) fn fetch(
+        &self,
+        root: &Path,
+        key: &str,
+        task: &str,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Result<bool> {
+        let joined = {
+            let mut flights = self.flights.lock().unwrap();
+            match flights.get(key) {
+                Some(flight) => Some(flight.clone()),
+                None => {
+                    flights.insert(key.to_owned(), Arc::default());
+                    None
+                }
+            }
+        };
+        if let Some(flight) = joined {
+            let _waiting = crate::profile::span(task, "remote_flight_wait");
+            match wait(&flight, cancelled) {
+                Some(Outcome::Published) => {
+                    self.used(key);
+                    return Ok(true);
+                }
+                Some(Outcome::Absent) | None => return Ok(false),
+                // Try once more, as this fetch's own.
+                Some(Outcome::Failed) => {
+                    self.flights
+                        .lock()
+                        .unwrap()
+                        .entry(key.to_owned())
+                        .or_default();
+                }
+            }
+        }
+        let fetched = self.fetch_entry(root, key, task);
+        let outcome = match &fetched {
+            Ok(true) => Outcome::Published,
+            Ok(false) => Outcome::Absent,
+            Err(_) => Outcome::Failed,
+        };
+        if let Some(flight) = self.flights.lock().unwrap().remove(key) {
+            *flight.outcome.lock().unwrap() = Some(outcome);
+            flight.done.notify_all();
+        }
+        fetched
+    }
+
+    fn fetch_entry(&self, root: &Path, key: &str, task: &str) -> Result<bool> {
         let waiting = crate::profile::span(task, "remote_index_wait");
         let known = self.known();
         drop(waiting);
@@ -698,6 +782,24 @@ impl Remote {
     }
 }
 
+/// How `flight` ended, or `None` if `cancelled` first.
+fn wait(flight: &Flight, cancelled: &std::sync::atomic::AtomicBool) -> Option<Outcome> {
+    let mut outcome = flight.outcome.lock().unwrap();
+    loop {
+        if let Some(outcome) = *outcome {
+            return Some(outcome);
+        }
+        if cancelled.load(Ordering::SeqCst) {
+            return None;
+        }
+        outcome = flight
+            .done
+            .wait_timeout(outcome, Duration::from_millis(50))
+            .unwrap()
+            .0;
+    }
+}
+
 /// Read bounded index payloads without trusting Content-Length. Each reader
 /// charges the shared budget before retaining bytes; failed reads remain
 /// charged so parallel failures cannot exceed the synchronization budget.
@@ -774,3 +876,132 @@ impl std::fmt::Display for OtherWarmKey {
 }
 
 impl std::error::Error for OtherWarmKey {}
+
+#[cfg(test)]
+mod flight_tests {
+    use super::store::{Body, Object, Store};
+    use super::*;
+
+    /// A store in memory whose reads take a while and are counted.
+    #[derive(Default)]
+    struct Memory {
+        objects: Mutex<HashMap<String, Vec<u8>>>,
+        reads: Arc<AtomicUsize>,
+    }
+
+    fn name(object: Object) -> String {
+        match object {
+            Object::Entry(key) => format!("entries/{key}"),
+            Object::Warm { identity, branch } => format!("warm/{identity}/{branch}"),
+            Object::Blob(hash) => format!("blobs/{hash}"),
+        }
+    }
+
+    impl Store for Memory {
+        fn location(&self) -> String {
+            "memory".into()
+        }
+
+        fn sync_index(&self, _: &mut index::Known) -> Result<()> {
+            Ok(())
+        }
+
+        fn get(&self, object: Object, _: &str) -> Result<Option<Body>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(200));
+            let objects = self.objects.lock().unwrap();
+            Ok(objects
+                .get(&name(object))
+                .map(|bytes| Box::new(std::io::Cursor::new(bytes.clone())) as Body))
+        }
+
+        fn has(&self, object: Object) -> Result<bool> {
+            Ok(self.objects.lock().unwrap().contains_key(&name(object)))
+        }
+
+        fn put(&self, object: Object, mut file: fs::File) -> Result<()> {
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            self.objects.lock().unwrap().insert(name(object), bytes);
+            Ok(())
+        }
+
+        fn announce(&self, _: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+
+        fn list(
+            &self,
+            _: BTreeSet<String>,
+            _: Vec<String>,
+            _: Option<&index::Known>,
+            _: BTreeSet<String>,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn cache() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["entries", "blobs", "tmp"] {
+            fs::create_dir(root.path().join(name)).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn concurrent_fetches_of_one_key_download_it_once() {
+        let source = cache();
+        let log = source.path().join("blobs/log");
+        fs::write(&log, "log").unwrap();
+        let hash = crate::hash::digest_file(&log).unwrap();
+        fs::rename(&log, source.path().join("blobs").join(&hash)).unwrap();
+        let key = "a".repeat(64);
+        let record = serde_json::to_vec(&serde_json::json!({
+            "version": 1, "key": key, "log": hash, "artifacts": {}
+        }))
+        .unwrap();
+        let mut pack = Vec::new();
+        pack::write(
+            source.path(),
+            &record,
+            |_| Ok(pack::Placement::Inline),
+            &mut pack,
+        )
+        .unwrap();
+        let memory = Memory::default();
+        let reads = memory.reads.clone();
+        memory
+            .objects
+            .lock()
+            .unwrap()
+            .insert(format!("entries/{key}"), pack);
+        let remote = Remote::new(Box::new(memory), Mode::Read, None, u64::MAX);
+        let destination = cache();
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let fetched: Vec<bool> = std::thread::scope(|scope| {
+            let fetches: Vec<_> = (0..3)
+                .map(|_| {
+                    scope.spawn(|| {
+                        remote
+                            .fetch(destination.path(), &key, "app:build", &cancelled)
+                            .unwrap()
+                    })
+                })
+                .collect();
+            fetches
+                .into_iter()
+                .map(|fetch| fetch.join().unwrap())
+                .collect()
+        });
+        assert_eq!(fetched, [true, true, true]);
+        assert!(
+            destination
+                .path()
+                .join("entries")
+                .join(format!("{key}.json"))
+                .is_file()
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+    }
+}
