@@ -66,6 +66,31 @@ jobs:
         working-directory: tools/parity/nx
       - run: node tools/parity/parity.mjs capture --check
 
+  # The reference store server's own tests, then qk against it, so the client
+  # and the server are checked against each other.
+  store-server:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Rust
+        run: |
+          rustup show
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 12.8.1
+      - run: pnpm install --frozen-lockfile
+        working-directory: tools/store-server
+      - run: pnpm typecheck
+        working-directory: tools/store-server
+      - run: pnpm test
+        working-directory: tools/store-server
+      - run: cargo build --locked -p qk-cli
+      - run: node e2e.mjs --qk ../../target/debug/qk
+        working-directory: tools/store-server
+
   # qk's hot paths on a generated workspace, recorded per commit in the job
   # summary and as an artifact.
   bench:
