@@ -2027,9 +2027,12 @@ fn local_hits_renew_remote_index_entries_without_advertising_unuploaded_results(
                 let text = String::from_utf8(bytes.clone()).unwrap();
                 let aged: String = text
                     .lines()
-                    .map(|line| {
-                        let (key, time) = line.split_once(' ').unwrap();
-                        format!("{key} {}\n", time.parse::<u64>().unwrap() - 2 * day)
+                    .map(|line| match line.split_once(' ') {
+                        // Key lines age; run lines keep their place.
+                        Some((key, time)) if key != "run" => {
+                            format!("{key} {}\n", time.parse::<u64>().unwrap() - 2 * day)
+                        }
+                        _ => format!("{line}\n"),
                     })
                     .collect();
                 *bytes = aged.into_bytes();
@@ -2094,7 +2097,7 @@ fn oversized_remote_index_payloads_fall_back_to_entry_lookups() {
             let (count, bytes) = if aggregate {
                 (9, 4 << 20)
             } else {
-                (1, (4 << 20) + 1)
+                (1, (8 << 20) + 1)
             };
             for index in 0..count {
                 state
@@ -2117,6 +2120,103 @@ fn oversized_remote_index_payloads_fall_back_to_entry_lookups() {
         assert_eq!(fixture.runs(), 1);
         let cache = stdout(&success(fixture.qk(&fixture.root, &["cache", "path"])));
         assert!(!Path::new(cache.trim()).join("remote").exists());
+    }
+}
+
+/// Each run line in the store's index listings: its time and members.
+fn index_runs(server: &s3::FakeS3) -> Vec<(u64, Vec<String>)> {
+    let state = server.state.lock().unwrap();
+    let mut runs: Vec<(u64, Vec<String>)> = state
+        .objects
+        .iter()
+        .filter(|(name, _)| name.starts_with(&s3::path("index/")))
+        .flat_map(|(_, listing)| {
+            String::from_utf8_lossy(listing)
+                .lines()
+                .filter_map(|line| {
+                    let mut words = line.strip_prefix("run ")?.split(' ');
+                    words.next()?;
+                    let time = words.next()?.parse().ok()?;
+                    Some((time, words.map(str::to_owned).collect()))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    runs.sort();
+    runs
+}
+
+#[test]
+fn merging_the_index_keeps_recent_runs() {
+    let server = s3::FakeS3::start();
+    let fixture = Fixture::new(target("build", json!({})));
+    with_remote(&fixture, &server, json!({}));
+    for run in 0..20 {
+        fs::write(fixture.root.join("src/input.txt"), format!("{run}\n")).unwrap();
+        success(remote_build(&fixture, &[]));
+    }
+    // Listings were merged, but every run is still remembered, each with the
+    // one key it used.
+    assert!(server.objects(&s3::path("index/")).len() < 20);
+    let runs = index_runs(&server);
+    assert_eq!(runs.len(), 20);
+    let entries: Vec<String> = server
+        .objects(&s3::path("entries/"))
+        .into_iter()
+        .map(|name| name.rsplit('/').next().unwrap()[..16].to_owned())
+        .collect();
+    for (_, members) in &runs {
+        assert_eq!(members.len(), 1);
+        assert!(entries.contains(&members[0]), "{members:?}");
+    }
+}
+
+#[test]
+fn a_run_lists_its_keys_in_the_order_it_used_them() {
+    let server = s3::FakeS3::start();
+    let fixture = Fixture::with_targets(json!({
+        "build": target("build", json!({})),
+        "check": {
+            "command": "mkdir -p report && echo checked > report/out.txt",
+            "cache": true,
+            "outputs": ["{projectRoot}/report"],
+            "dependsOn": ["build"],
+        },
+    }));
+    with_remote(&fixture, &server, json!({}));
+    let check = |fixture: &Fixture| {
+        let mut command = fixture.command(&fixture.root, &["run", "app:check"]);
+        command
+            .env("AWS_ACCESS_KEY_ID", "key")
+            .env("AWS_SECRET_ACCESS_KEY", "secret")
+            .env_remove("CI")
+            .env_remove("NX_POWERPACK_CACHE_MODE");
+        success(command.output().unwrap())
+    };
+    check(&fixture);
+    // Again from the local cache: held keys are listed in order too.
+    check(&fixture);
+    let cache = PathBuf::from(
+        stdout(&success(fixture.qk(&fixture.root, &["cache", "path"])))
+            .trim()
+            .to_owned(),
+    );
+    let mut build = None;
+    let mut checked = None;
+    for item in fs::read_dir(cache.join("entries")).unwrap().flatten() {
+        let record = fs::read_to_string(item.path()).unwrap();
+        let key = item.file_name().to_string_lossy()[..16].to_owned();
+        if record.contains("report/out.txt") {
+            checked = Some(key);
+        } else {
+            build = Some(key);
+        }
+    }
+    let order = vec![build.unwrap(), checked.unwrap()];
+    let runs = index_runs(&server);
+    assert_eq!(runs.len(), 2);
+    for (_, members) in runs {
+        assert_eq!(members, order);
     }
 }
 

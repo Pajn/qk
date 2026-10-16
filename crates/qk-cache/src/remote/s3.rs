@@ -19,7 +19,7 @@ const SIGNED_FOR: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 /// Listings fetched at once.
 const LISTING_READERS: usize = 16;
 /// Limits on index payloads, which are optional hints rather than task results.
-const LARGEST_LISTING: usize = 4 << 20;
+const LARGEST_LISTING: usize = 8 << 20;
 const LARGEST_LIST_RESPONSE: usize = 1 << 20;
 /// The layout objects live under, after `cacheKeyPrefix`.
 pub(super) const LAYOUT: &str = "qk/v4/";
@@ -288,23 +288,38 @@ impl Store for S3 {
         Ok(Some(announcement))
     }
 
-    /// With many listings already, merges them into this one and deletes them.
+    /// With many listings already, merges them into this one, keeping the
+    /// history of recent runs, and deletes them.
     fn list(
         &self,
         keys: BTreeSet<String>,
+        members: Vec<String>,
         known: Option<&index::Known>,
         announcements: BTreeSet<String>,
     ) -> Result<()> {
         let now = index::now();
+        let name = index::name(now);
         let mut listing = index::Known::default();
         let merged = known.filter(|known| known.listings.len() >= index::MERGE_AFTER);
         if let Some(known) = merged {
             listing.keys = known.keys.clone();
+            listing.runs = known.runs.clone();
         }
         listing.keys.extend(keys.into_iter().map(|key| (key, now)));
+        listing.runs.insert(
+            name.clone(),
+            index::Run {
+                time: now,
+                members: members
+                    .iter()
+                    .map(|key| index::member(key).to_owned())
+                    .collect(),
+            },
+        );
         listing.expire(now);
-        let text = index::format(listing.keys.iter().map(|(key, time)| (key.as_str(), *time)));
-        self.put_object(&self.object("index", &index::name(now)), text.as_bytes())?;
+        let mut text = index::format(listing.keys.iter().map(|(key, time)| (key.as_str(), *time)));
+        text.push_str(&index::format_runs(&listing.runs));
+        self.put_object(&self.object("index", &name), text.as_bytes())?;
         // The final listing now covers every confirmed announcement. Leave
         // announcements in place on any earlier failure, including uploads
         // whose outcome was uncertain, so entries remain discoverable.

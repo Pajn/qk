@@ -30,6 +30,8 @@ struct Request {
     jobs: Vec<Upload>,
     held: Vec<String>,
     confirmed: Vec<String>,
+    /// The keys the run used, in order, for its run listing.
+    used: Vec<String>,
 }
 
 struct Cleanup(PathBuf);
@@ -153,6 +155,7 @@ pub(super) fn launch(
     jobs: &[Upload],
     held: Vec<String>,
     confirmed: Vec<String>,
+    used: Vec<String>,
 ) -> Result<PathBuf> {
     let (snapshot, jobs) = snapshot(jobs)?;
     let lease = fs::File::create(snapshot.path().join("lease"))?;
@@ -166,6 +169,7 @@ pub(super) fn launch(
         jobs,
         held,
         confirmed,
+        used,
     };
     let bytes = serde_json::to_vec(&request)?;
     if bytes.len() as u64 > MAX_REQUEST {
@@ -297,6 +301,9 @@ pub(crate) fn run() -> Result<()> {
         std::process::id()
     );
     remote.read_index(&request.snapshot);
+    for key in &request.used {
+        remote.used(key);
+    }
     remote.confirmed.lock().unwrap().extend(request.confirmed);
     for key in request.held {
         remote.held(&key);

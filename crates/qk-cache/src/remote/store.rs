@@ -45,11 +45,13 @@ pub(super) trait Store: Send + Sync {
     /// [`list`](Store::list) as replaced once it does.
     fn announce(&self, key: &str) -> Result<Option<String>>;
 
-    /// Lists `keys` as held by the store now, given what `known` read of its
-    /// index, and retires the `announcements` the listing replaces.
+    /// Lists `keys` as held by the store now, with the run that used
+    /// `members` in that order, given what `known` read of its index, and
+    /// retires the `announcements` the listing replaces.
     fn list(
         &self,
         keys: BTreeSet<String>,
+        members: Vec<String>,
         known: Option<&index::Known>,
         announcements: BTreeSet<String>,
     ) -> Result<()>;

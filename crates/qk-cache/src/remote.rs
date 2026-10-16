@@ -79,6 +79,9 @@ pub struct Remote {
     /// Entries this run found in the local cache, which its listing names
     /// too when the index already does.
     held: Mutex<BTreeSet<String>>,
+    /// The keys this run used, in the order it first used them, for the run
+    /// its listing records.
+    order: Mutex<(Vec<String>, HashSet<String>)>,
     /// The compressed size from which a blob is stored apart.
     threshold: u64,
     /// Where uploads carry each blob, decided once per blob.
@@ -247,6 +250,7 @@ pub fn configure(
         confirmed: Mutex::default(),
         announcements: Mutex::default(),
         held: Mutex::default(),
+        order: Mutex::default(),
         threshold,
         placements: Mutex::default(),
         stored: Mutex::default(),
@@ -320,16 +324,27 @@ impl Remote {
         // The published manifest now keeps its blobs.
         drop(pin);
         self.confirmed.lock().unwrap().insert(key.to_owned());
+        self.used(key);
         Ok(true)
     }
 
     /// Notes that the local cache held the entry for `key`.
     pub(crate) fn held(&self, key: &str) {
         self.held.lock().unwrap().insert(key.to_owned());
+        self.used(key);
+    }
+
+    /// Notes that this run used the entry for `key`, if it has not yet.
+    fn used(&self, key: &str) {
+        let mut order = self.order.lock().unwrap();
+        if order.1.insert(key.to_owned()) {
+            order.0.push(key.to_owned());
+        }
     }
 
     /// Queues the local entry for `key` for upload.
     pub(crate) fn upload(self: &Arc<Self>, root: &Path, key: &str) {
+        self.used(key);
         self.enqueue(Upload {
             key: key.to_owned(),
             local: root.to_owned(),
@@ -615,6 +630,7 @@ impl Remote {
                     &pending,
                     self.held.lock().unwrap().iter().cloned().collect(),
                     self.confirmed.lock().unwrap().iter().cloned().collect(),
+                    self.order.lock().unwrap().0.clone(),
                 ) {
                     Ok(log) => {
                         qk_executor::status!(
@@ -674,7 +690,11 @@ impl Remote {
             return Ok(());
         }
         let announcements = std::mem::take(&mut *self.announcements.lock().unwrap());
-        self.store.list(confirmed, known, announcements)
+        let members = std::mem::take(&mut self.order.lock().unwrap().0)
+            .into_iter()
+            .filter(|key| confirmed.contains(key))
+            .collect();
+        self.store.list(confirmed, members, known, announcements)
     }
 }
 
