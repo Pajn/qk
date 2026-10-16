@@ -796,11 +796,12 @@ impl Remote {
     fn place_all(&self, root: &Path, record: &[u8]) -> Result<HashMap<String, pack::Placement>> {
         let parsed = crate::record::StoredRecord::read(record)?;
         let mut placements = HashMap::new();
-        // A store server takes one bounded body per record, so once its inline
-        // blobs fill that, the rest of this record's go apart. Raw sizes bound
-        // the compressed ones.
+        // A store server takes one bounded body per record, so once the record,
+        // its header and its inline blobs fill that, the rest of this record's
+        // blobs go apart. Raw sizes bound the compressed ones; each blob's
+        // header entry is a hash and two numbers.
         let bounded = self.store.framing() == store::Framing::Upload;
-        let mut inline = 0;
+        let mut inline = record.len() as u64 + 128 * parsed.blobs().len() as u64 + 64;
         for blob in parsed.blobs() {
             let mut placement = self.place(root, &blob)?;
             if bounded && placement == pack::Placement::Inline {
@@ -1218,30 +1219,43 @@ mod flight_tests {
             // hashes, which placement never checks.
             fs::File::create(&path)
                 .unwrap()
-                .set_len(UPLOAD_INLINE / 2 - 1)
+                .set_len(UPLOAD_INLINE / 2 - 4096)
                 .unwrap();
             let name = format!("{index}").repeat(64);
             fs::rename(&path, source.path().join("blobs").join(&name)).unwrap();
             blobs.push(name);
         }
-        let record = serde_json::to_vec(&serde_json::json!({
-            "artifacts": blobs
-                .iter()
-                .map(|blob| (blob.clone(), serde_json::json!({"blob": blob})))
-                .collect::<serde_json::Map<_, _>>()
-        }))
-        .unwrap();
-        let memory = Memory {
-            uploads: true,
-            ..Memory::default()
+        let record = |note: &str| {
+            serde_json::to_vec(&serde_json::json!({
+                "note": note,
+                "artifacts": blobs
+                    .iter()
+                    .map(|blob| (blob.clone(), serde_json::json!({"blob": blob})))
+                    .collect::<serde_json::Map<_, _>>()
+            }))
+            .unwrap()
         };
-        let remote = Remote::new(Box::new(memory), Mode::ReadWrite, None, u64::MAX);
-        let placements = remote.place_all(source.path(), &record).unwrap();
+        let remote = || {
+            let memory = Memory {
+                uploads: true,
+                ..Memory::default()
+            };
+            Remote::new(Box::new(memory), Mode::ReadWrite, None, u64::MAX)
+        };
+        let small = remote();
+        let placements = small.place_all(source.path(), &record("")).unwrap();
         // Two fit under the bound; the third goes apart.
         assert_eq!(placements[&blobs[0]], pack::Placement::Inline);
         assert_eq!(placements[&blobs[1]], pack::Placement::Inline);
         assert_eq!(placements[&blobs[2]], pack::Placement::Apart);
-        assert!(remote.store.has(Object::Blob(&blobs[2])).unwrap());
+        assert!(small.store.has(Object::Blob(&blobs[2])).unwrap());
+        // The record counts against the bound too.
+        let large = remote();
+        let placements = large
+            .place_all(source.path(), &record(&"x".repeat(16 << 10)))
+            .unwrap();
+        assert_eq!(placements[&blobs[0]], pack::Placement::Inline);
+        assert_eq!(placements[&blobs[1]], pack::Placement::Apart);
     }
 
     #[test]

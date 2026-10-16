@@ -51,8 +51,8 @@ for each blob whose compressed length is not null, in order: a zstd frame of it
 
 `blobs` lists every blob the record cites, in the order the record's blob set
 sorts (lexically by hash). A server accepts upload bodies of up to 100 MiB, so a
-client carries at most 64 MiB of blobs inline, counted before compression, and
-stores the rest apart. A blob with a compressed length is carried inline;
+client keeps the record, the header and its inline blobs within 64 MiB,
+counted before compression, and stores the rest apart. A blob with a compressed length is carried inline;
 one without is stored apart, as `blobs/<hash>`, and must be there before the
 record is committed.
 
