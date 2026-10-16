@@ -288,6 +288,7 @@ impl Cache {
             })
         };
         let fallback = |reason: String| {
+            let _profile = profile::span(&task.id, "execute");
             execute(prepared, cancelled).map(|outcome| TaskResult::uncached(outcome, reason))
         };
         // Reports why this task runs uncached, attributing the reason to this task.
@@ -393,7 +394,9 @@ impl Cache {
         }
         if !self.reuse {
             let capture = Capture::new(None, prepared.display.clone()).retain_log();
+            let executing = profile::span(&task.id, "execute");
             let outcome = execute_captured(running, cancelled, Some(&capture))?;
+            drop(executing);
             let inputs_unchanged = self.inputs_match(
                 snapshot,
                 workspace,
