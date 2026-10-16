@@ -123,11 +123,16 @@ such as `qk profile: task=web:build stage=local_restore ms=3.197`.
 Profiling is disabled by default and reads no clocks while disabled.
 
 Timings cover dependency inputs, declared inputs, runtime commands, remote
-fetches, local restore phases, and restoring and saving
-[warm state](../guides/warm-state.md). Runtime lines identify the command; other
-lines identify the task. Spans can overlap: runtime evaluation is part of
-input resolution, restore phases are part of local restoration, and storing new
-warm files is part of saving warm state. Do not sum them as exclusive costs. Shared runtime commands are timed only when
+fetches, local restore phases, restoring and saving
+[warm state](../guides/warm-state.md), the command itself (`execute`), the
+input recheck after it (`inputs_recheck`) and storing its result
+(`publish`). Input resolution also times listing the workspace's files
+(`inventory_list`), waiting for another task's listing (`inventory_wait`) and
+parsing `pnpm-lock.yaml` (`lockfile_parse`); each is charged to the task that
+needed it. Runtime lines identify the command; other lines identify the task.
+Spans can overlap: runtime evaluation and the inventory are part of input
+resolution, restore phases are part of local restoration, and storing new warm
+files is part of saving warm state. Do not sum them as exclusive costs. Shared runtime commands are timed only when
 evaluated, so a task reusing a result has no separate runtime line.
 
 The flag leaves task stdout and cache results unchanged. Timings are diagnostic

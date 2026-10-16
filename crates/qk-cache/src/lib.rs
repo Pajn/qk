@@ -363,7 +363,9 @@ impl Cache {
         };
         if !cacheable {
             let restored = before(running);
+            let executing = profile::span(&task.id, "execute");
             let outcome = execute(running, cancelled)?;
+            drop(executing);
             let warm_report = after(outcome, restored, running);
             let fingerprint = if self.unchanged(
                 snapshot,
@@ -541,7 +543,9 @@ impl Cache {
         let capture =
             Capture::new(Some(log.as_file().try_clone()?), prepared.display.clone()).retain_log();
         let restored = before(running);
+        let executing = profile::span(&task.id, "execute");
         let outcome = execute_captured(running, cancelled, Some(&capture))?;
+        drop(executing);
         let warm_report = after(outcome, restored, running);
         let inputs_unchanged = self.inputs_match(
             snapshot,
@@ -563,7 +567,10 @@ impl Cache {
             fingerprint_outputs(&key)
         } else {
             // The saved manifest already hashes every output; reuse it.
-            match self.publish(&workspace.root, &key, &outputs, log.path()) {
+            let publishing = profile::span(&task.id, "publish");
+            let published = self.publish(&workspace.root, &key, &outputs, log.path());
+            drop(publishing);
+            match published {
                 Ok(fingerprint) => {
                     store::record_outputs(&workspace.root, &task.id, &key, &outputs);
                     if let Some(remote) = &self.remote {
@@ -632,6 +639,7 @@ impl Cache {
         if cancelled.load(Ordering::SeqCst) {
             return false;
         }
+        let _profile = profile::span(&task.id, "inputs_recheck");
         let after = hash::recheck_dependency_keys(
             snapshot,
             workspace,
