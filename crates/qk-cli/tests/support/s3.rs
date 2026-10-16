@@ -1,10 +1,19 @@
 //! An in-process stand-in for S3: path-style objects in memory over plain
 //! HTTP, with signatures ignored. Enough to exercise qk's remote cache.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// The layout qk writes under, after `cacheKeyPrefix`.
+pub const LAYOUT: &str = "qk/v4/";
+
+/// An object's path in the `cache` bucket without a key prefix.
+pub fn path(rest: &str) -> String {
+    format!("/cache/{LAYOUT}{rest}")
+}
 
 #[derive(Default)]
 pub struct State {
@@ -26,6 +35,14 @@ pub struct State {
     pub compact_index_read: bool,
     /// While returning a first page, replace unseen listings before its cursor.
     pub compact_index_page: bool,
+    /// How long each response waits before it is sent, as a store's round
+    /// trip would.
+    pub latency: Duration,
+    /// Answer GETs of paths ending with any of these with a server error.
+    pub fail_get: BTreeSet<String>,
+    /// Each request's method and path, with when it arrived and when its
+    /// response was sent.
+    pub timed: Vec<(String, Instant, Instant)>,
 }
 
 pub struct FakeS3 {
@@ -67,6 +84,23 @@ impl FakeS3 {
             .requests
             .iter()
             .filter(|request| {
+                request
+                    .split_once(' ')
+                    .is_some_and(|(_, path)| path.starts_with(prefix))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The requests whose path starts with `prefix`, with when each arrived
+    /// and was answered, in the order they were answered.
+    #[cfg(unix)]
+    pub fn requests_timed(&self, prefix: &str) -> Vec<(String, Instant, Instant)> {
+        let state = self.state.lock().unwrap();
+        state
+            .timed
+            .iter()
+            .filter(|(request, _, _)| {
                 request
                     .split_once(' ')
                     .is_some_and(|(_, path)| path.starts_with(prefix))
@@ -133,9 +167,12 @@ fn serve(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
         body.resize(length, 0);
         reader.read_exact(&mut body)?;
     }
+    let arrived = Instant::now();
     while method == "PUT" && state.lock().unwrap().block_puts {
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(10));
     }
+    let latency = state.lock().unwrap().latency;
+    std::thread::sleep(latency);
     let (status, response, cut) = {
         let mut state = state.lock().unwrap();
         state.requests.push(format!("{method} {path}"));
@@ -176,7 +213,10 @@ fn serve(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
                         ));
                     }
                     xml.push_str("</ListBucketResult>");
-                    if more && state.compact_index_page && prefix.contains("/qk/v3/index/") {
+                    if more
+                        && state.compact_index_page
+                        && prefix.contains(&format!("/{LAYOUT}index/"))
+                    {
                         let cursor = format!("{bucket}{}", listed.last().unwrap());
                         let unseen: Vec<_> = state
                             .objects
@@ -196,7 +236,15 @@ fn serve(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
                     (200, xml.into_bytes(), false)
                 }
             }
-            "GET" if state.compact_index_read && path.contains("/qk/v3/index/") => {
+            "GET"
+                if state
+                    .fail_get
+                    .iter()
+                    .any(|suffix| path.ends_with(suffix.as_str())) =>
+            {
+                (500, Vec::new(), false)
+            }
+            "GET" if state.compact_index_read && path.contains(&format!("/{LAYOUT}index/")) => {
                 let bytes = state.objects.remove(&path).unwrap();
                 state.objects.insert(format!("{path}-merged"), bytes);
                 state.compact_index_read = false;
@@ -230,14 +278,15 @@ fn serve(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
             }
             "PUT" if chunked => (501, Vec::new(), false),
             "PUT"
-                if path.contains("/qk/v3/index/")
+                if path.contains(&format!("/{LAYOUT}index/"))
                     && state.fail_index_put
                         == Some(
                             state
                                 .requests
                                 .iter()
                                 .filter(|request| {
-                                    request.starts_with("PUT ") && request.contains("/qk/v3/index/")
+                                    request.starts_with("PUT ")
+                                        && request.contains(&format!("/{LAYOUT}index/"))
                                 })
                                 .count(),
                         ) =>
@@ -245,7 +294,7 @@ fn serve(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
                 (500, Vec::new(), false)
             }
             "PUT" => {
-                state.objects.insert(path, body);
+                state.objects.insert(path.clone(), body);
                 (200, Vec::new(), false)
             }
             "GET" | "HEAD" => match state.objects.get(&path) {
@@ -266,7 +315,13 @@ fn serve(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
     } else if method != "HEAD" {
         stream.write_all(&response)?;
     }
-    stream.flush()
+    stream.flush()?;
+    state
+        .lock()
+        .unwrap()
+        .timed
+        .push((format!("{method} {path}"), arrived, Instant::now()));
+    Ok(())
 }
 
 /// A query value with its percent-escapes decoded.

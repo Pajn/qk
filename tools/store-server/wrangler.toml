@@ -1,0 +1,15 @@
+name = "qk-store-server"
+main = "src/worker.ts"
+compatibility_date = "2026-08-01"
+
+[[r2_buckets]]
+binding = "STORE"
+bucket_name = "qk-store"
+
+[[durable_objects.bindings]]
+name = "INDEX"
+class_name = "Index"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Index"]

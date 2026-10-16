@@ -17,10 +17,22 @@ use super::Upload;
 
 const MAX_REQUEST: u64 = 32 << 20;
 
+#[derive(Clone, Copy, Serialize, Deserialize)]
+pub(super) enum Kind {
+    S3,
+    Server,
+}
+
 #[derive(Serialize, Deserialize)]
 pub(super) struct Configuration {
+    pub kind: Kind,
     pub config: Value,
+    /// The S3 session token, or the store server's token.
     pub token: Option<String>,
+    /// Variables the run's settings came from, beside nx.json, so the worker
+    /// resolves the same store and threshold.
+    #[serde(default)]
+    pub overrides: BTreeMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -30,6 +42,8 @@ struct Request {
     jobs: Vec<Upload>,
     held: Vec<String>,
     confirmed: Vec<String>,
+    /// The keys the run used, in order, for its run listing.
+    used: Vec<String>,
 }
 
 struct Cleanup(PathBuf);
@@ -115,7 +129,7 @@ fn snapshot(jobs: &[Upload]) -> Result<(tempfile::TempDir, Vec<Upload>)> {
     let mut pinned = Vec::with_capacity(jobs.len());
     for job in jobs {
         let record = match &job.warm {
-            Some((_, record)) => record.clone(),
+            Some(warm) => warm.record.clone(),
             None => {
                 if !crate::record::valid_hash(&job.key) {
                     bail!("invalid upload key");
@@ -153,19 +167,23 @@ pub(super) fn launch(
     jobs: &[Upload],
     held: Vec<String>,
     confirmed: Vec<String>,
+    used: Vec<String>,
 ) -> Result<PathBuf> {
     let (snapshot, jobs) = snapshot(jobs)?;
     let lease = fs::File::create(snapshot.path().join("lease"))?;
     FileExt::lock_exclusive(&lease)?;
     let request = Request {
         configuration: Configuration {
+            kind: configuration.kind,
             config: configuration.config.clone(),
             token: configuration.token.clone(),
+            overrides: configuration.overrides.clone(),
         },
         snapshot: snapshot.path().to_owned(),
         jobs,
         held,
         confirmed,
+        used,
     };
     let bytes = serde_json::to_vec(&request)?;
     if bytes.len() as u64 > MAX_REQUEST {
@@ -275,13 +293,20 @@ fn detach(_command: &mut Command) -> Result<()> {
 pub(crate) fn run() -> Result<()> {
     let request: Request = serde_json::from_reader(std::io::stdin().lock().take(MAX_REQUEST + 1))?;
     let mut environment = BTreeMap::new();
+    for (name, value) in &request.configuration.overrides {
+        environment.insert(name.into(), value.into());
+    }
     environment.insert("NX_POWERPACK_CACHE_MODE".into(), "read-write".into());
-    if let Some(token) = request.configuration.token {
-        environment.insert("AWS_SESSION_TOKEN".into(), token.into());
+    let config = &request.configuration.config;
+    let (s3, server, token) = match request.configuration.kind {
+        Kind::S3 => (Some(config), None, "AWS_SESSION_TOKEN"),
+        Kind::Server => (None, Some(config), "QK_STORE_SERVER_TOKEN"),
+    };
+    if let Some(value) = &request.configuration.token {
+        environment.insert(token.into(), value.into());
     }
     let remote = Arc::new(
-        super::configure(Some(&request.configuration.config), &environment)?
-            .context("worker remote cache is disabled")?,
+        super::configure(s3, server, &environment)?.context("worker remote cache is disabled")?,
     );
     // Do not adopt/delete a snapshot until the complete request is accepted.
     let cleanup = Cleanup(request.snapshot.clone());
@@ -297,6 +322,9 @@ pub(crate) fn run() -> Result<()> {
         std::process::id()
     );
     remote.read_index(&request.snapshot);
+    for key in &request.used {
+        remote.used(key);
+    }
     remote.confirmed.lock().unwrap().extend(request.confirmed);
     for key in request.held {
         remote.held(&key);
@@ -346,13 +374,14 @@ mod tests {
             Upload {
                 key: "warm state".into(),
                 local: root.clone(),
-                warm: Some((
-                    "warm/object".into(),
-                    serde_json::to_vec(
+                warm: Some(super::super::Warm {
+                    identity: "app:build".into(),
+                    branch: "main".into(),
+                    record: serde_json::to_vec(
                         &json!({"groups": {"paths": {"artifacts": {"scratch": {"blob": blob}}}}}),
                     )
                     .unwrap(),
-                )),
+                }),
             },
         ];
         let (pinned, jobs) = snapshot(&jobs).unwrap();

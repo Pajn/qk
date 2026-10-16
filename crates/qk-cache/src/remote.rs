@@ -1,51 +1,68 @@
-//! A remote store on S3-compatible storage, configured by nx.json's `s3` key as
-//! `@nx/s3-cache` reads it.
+//! The remote store: what to fetch, upload and list, over a [`store::Store`]
+//! that moves the bytes. Today that is S3-compatible storage ([`s3`]),
+//! configured by nx.json's `s3` key as `@nx/s3-cache` reads it.
 //!
-//! Objects live under `<cacheKeyPrefix>qk/v3/`, so a bucket shared with Nx never
-//! mixes the two: `entries/<key>` for results and `warm/<task>/<branch>` for
-//! warm records. Each object is a Zstandard level 3 pack holding a manifest or
-//! record with every blob it cites, so one request reads or writes it whole;
-//! the store's
-//! latency is per request, and an entry can cite thousands of blobs. A local
-//! miss fetches the pack and keeps the blobs missing locally, verifying each
-//! against its hash; the restore then runs locally. Uploads run in the
-//! background after a task is saved. An [`index`] of the entries the store
-//! holds spares the lookups it would answer with a miss.
+//! Objects live under `<cacheKeyPrefix>qk/v4/`, so a bucket shared with Nx never
+//! mixes the two: `entries/<key>` for results, `warm/<task>/<branch>` for warm
+//! records and `blobs/<hash>` for large blobs. Each entry or record is a
+//! Zstandard level 3 [`pack`] holding it with the small blobs it cites, so one
+//! request reads or writes it whole; the store's latency is per request, and
+//! an entry can cite thousands of blobs. A blob whose compressed size reaches
+//! a threshold is stored apart instead, uploaded once and fetched only by a
+//! machine that lacks it. A local miss fetches the pack and the blobs missing
+//! locally, verifying each against its hash; the restore then runs locally.
+//! Uploads run in the background after a task is saved. An [`index`] of the
+//! entries the store holds spares the lookups it would answer with a miss.
 
 pub(crate) mod background;
+mod bloom;
 mod index;
 mod pack;
+mod prefetch;
+mod s3;
+mod server;
+mod store;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
-use rusty_s3::actions::{DeleteObjectsResponse, ListObjectsV2, ObjectIdentifier};
-use rusty_s3::{Bucket, Credentials, S3Action, UrlStyle};
+use anyhow::{Result, bail};
 use serde_json::Value;
 
-/// How long a signed request stays valid; requests are made at once.
-const SIGNED_FOR: Duration = Duration::from_secs(15 * 60);
+use store::{Object, Store};
+
 /// Uploads in flight at once.
 const UPLOADERS: usize = 8;
 /// Connections kept open between requests to the store.
 const IDLE_CONNECTIONS: usize = 32;
 /// The most a single upload may hold, as S3 allows.
 const LARGEST_UPLOAD: u64 = 5 << 30;
-/// Listings fetched at once.
-const LISTING_READERS: usize = 16;
-/// Limits on index payloads, which are optional hints rather than task results.
-const LARGEST_LISTING: usize = 4 << 20;
+/// The most a reader of the index keeps of all its listings together.
 const LARGEST_INDEX: usize = 32 << 20;
-const LARGEST_LIST_RESPONSE: usize = 1 << 20;
+/// Blobs stored apart one fetch requests at once.
+const BLOB_FETCHERS: usize = 8;
+/// Blobs stored apart requested at once by every fetch together, leaving
+/// connections for entries and uploads.
+const BLOB_REQUESTS: usize = 24;
+/// The compressed size from which a blob is stored apart, unless
+/// `QK_REMOTE_BLOB_THRESHOLD` says otherwise. Below it, a request costs more
+/// than the bytes it would save. In `tools/bench/remote.mjs`, at 230 ms and
+/// 200 Mbps, a cold restore with blobs from this size apart takes as long as
+/// one with every blob inline, and one with the files held a quarter less. A
+/// lower threshold restores as fast there, but that chain's large files are
+/// all 4 MiB, so it does not show what many medium blobs per entry would cost.
+const BLOB_THRESHOLD: u64 = 1 << 20;
+/// The most an upload to a store server carries inline, counted raw, below the
+/// 100 MiB a server accepts in one body (`tools/store-server/PROTOCOL.md`).
+const UPLOAD_INLINE: u64 = 64 << 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -54,10 +71,7 @@ pub enum Mode {
 }
 
 pub struct Remote {
-    bucket: Bucket,
-    credentials: Credentials,
-    prefix: String,
-    agent: ureq::Agent,
+    store: Box<dyn Store>,
     pub mode: Mode,
     uploads: Mutex<Option<Uploads>>,
     background: Option<background::Configuration>,
@@ -75,7 +89,90 @@ pub struct Remote {
     /// Entries this run found in the local cache, which its listing names
     /// too when the index already does.
     held: Mutex<BTreeSet<String>>,
+    /// The keys this run used, in the order it first used them, for the run
+    /// its listing records.
+    order: Mutex<(Vec<String>, HashSet<String>)>,
+    /// The compressed size from which a blob is stored apart.
+    threshold: u64,
+    /// Where uploads carry each blob, decided once per blob.
+    placements: Mutex<HashMap<String, pack::Placement>>,
+    /// Blobs stored apart that the store is known to hold.
+    stored: Mutex<HashSet<String>>,
+    /// The blobs each key this run used stores apart, for its listing.
+    kept_apart: Mutex<HashMap<String, Vec<String>>>,
+    /// Requests for blobs stored apart that may start now.
+    blob_requests: Slots,
+    /// Fetches in progress, by key, so a key is fetched once however many
+    /// ask for it at a time.
+    flights: Mutex<HashMap<String, Arc<Flight>>>,
+    /// Entries fetched ahead of the tasks that need them, unless
+    /// `QK_REMOTE_PREFETCH=off`.
+    prefetch: prefetch::Prefetch,
+    prefetching: bool,
 }
+
+/// A fetch in progress, and how it ended.
+#[derive(Default)]
+struct Flight {
+    outcome: Mutex<Option<Outcome>>,
+    done: Condvar,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Outcome {
+    /// The entry is in the local cache.
+    Published,
+    /// The store does not hold it.
+    Absent,
+    /// The fetch failed, and whoever waited for it may try again.
+    Failed,
+}
+
+/// A counting semaphore.
+struct Slots {
+    free: Mutex<usize>,
+    freed: Condvar,
+}
+
+impl Slots {
+    fn new(count: usize) -> Self {
+        Self {
+            free: Mutex::new(count),
+            freed: Condvar::new(),
+        }
+    }
+
+    fn take(&self) -> Slot<'_> {
+        let mut free = self.free.lock().unwrap();
+        while *free == 0 {
+            free = self.freed.wait(free).unwrap();
+        }
+        *free -= 1;
+        Slot(self)
+    }
+}
+
+struct Slot<'a>(&'a Slots);
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        *self.0.free.lock().unwrap() += 1;
+        self.0.freed.notify_one();
+    }
+}
+
+/// A blob a pack stores apart that the store does not hold, which makes the
+/// entry a miss rather than an error.
+#[derive(Debug)]
+struct MissingBlob(String);
+
+impl std::fmt::Display for MissingBlob {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "remote blob {} is missing", self.0)
+    }
+}
+
+impl std::error::Error for MissingBlob {}
 
 struct Uploads {
     sender: Sender<Upload>,
@@ -88,18 +185,46 @@ struct Upload {
     /// The entry's key, or the warm record's task, for reporting failures.
     key: String,
     local: PathBuf,
-    /// A warm record to write, with its object name, instead of the entry.
-    warm: Option<(String, Vec<u8>)>,
+    /// A warm record to write, with its task identity and branch, instead of
+    /// the entry.
+    warm: Option<Warm>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct Warm {
+    identity: String,
+    branch: String,
+    record: Vec<u8>,
+}
+
+/// An HTTP client for a store: statuses are answers, not errors.
+fn agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_connect(Some(Duration::from_secs(10)))
+        .timeout_global(Some(Duration::from_secs(10 * 60)))
+        // Fetches run in every task slot at once, beside the uploaders, all to
+        // one host. Keeping that many connections idle lets a burst reuse
+        // them, where ureq's default of three would make most of it open a
+        // new connection and repeat the TLS handshake.
+        .max_idle_connections(IDLE_CONNECTIONS)
+        .max_idle_connections_per_host(IDLE_CONNECTIONS)
+        .build()
+        .into()
 }
 
 /// The remote store for a workspace, `Ok(None)` when none is configured or the
 /// mode turns it off, or why a configured store cannot be used.
 pub fn configure(
-    config: Option<&Value>,
+    s3: Option<&Value>,
+    server: Option<&Value>,
     environment: &BTreeMap<OsString, OsString>,
 ) -> Result<Option<Remote>> {
-    let Some(config) = config else {
-        return Ok(None);
+    let (config, kind) = match (s3, server) {
+        (None, None) => return Ok(None),
+        (Some(config), None) => (config, background::Kind::S3),
+        (None, Some(config)) => (config, background::Kind::Server),
+        (Some(_), Some(_)) => bail!("configure s3 or storeServer, not both"),
     };
     let variable = |name: &str| {
         environment
@@ -126,98 +251,94 @@ pub fn configure(
         "no-cache" => return Ok(None),
         other => bail!("unknown remote cache mode {other:?}; use read-write, read or no-cache"),
     };
-    if setting("encryptionKey").is_some() {
-        bail!("s3.encryptionKey is not supported");
-    }
-    let bucket_name = setting("bucket").context("s3.bucket is required")?;
-    let region = setting("region").context("s3.region is required")?;
-    let endpoint =
-        setting("endpoint").unwrap_or_else(|| format!("https://s3.{region}.amazonaws.com"));
-    let style = if config.get("forcePathStyle").and_then(Value::as_bool) == Some(true) {
-        UrlStyle::Path
-    } else {
-        UrlStyle::VirtualHost
+    let threshold = match variable("QK_REMOTE_BLOB_THRESHOLD").as_deref() {
+        None => BLOB_THRESHOLD,
+        Some("off") => u64::MAX,
+        Some(size) => crate::evict::parse_size(size).map_err(|_| {
+            anyhow::anyhow!(
+                "invalid QK_REMOTE_BLOB_THRESHOLD {size:?}; use a size such as 1MB, or off"
+            )
+        })?,
     };
-    let bucket = Bucket::new(
-        endpoint
-            .parse()
-            .with_context(|| format!("invalid s3.endpoint {endpoint:?}"))?,
-        style,
-        bucket_name,
-        region,
-    )
-    .map_err(|error| anyhow::anyhow!("invalid s3 configuration: {error:?}"))?;
-    let key = setting("accessKeyId").or_else(|| variable("AWS_ACCESS_KEY_ID"));
-    let secret = setting("secretAccessKey").or_else(|| variable("AWS_SECRET_ACCESS_KEY"));
-    let (Some(key), Some(secret)) = (key, secret) else {
-        bail!("no credentials: set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY");
-    };
-    let token = variable("AWS_SESSION_TOKEN");
     let upload_mode = variable("QK_REMOTE_UPLOAD_MODE")
         .or_else(|| setting("uploadMode"))
         .unwrap_or_else(|| "wait".into());
     let background = match upload_mode.as_str() {
-        "wait" => None,
-        "background" => {
-            let mut config = config.clone();
-            config["accessKeyId"] = key.clone().into();
-            config["secretAccessKey"] = secret.clone().into();
-            config["uploadMode"] = "wait".into();
-            Some(background::Configuration {
-                config,
-                token: token.clone(),
-            })
+        "wait" => false,
+        "background" => true,
+        other => bail!("unknown remote upload mode {other:?}; use wait or background"),
+    };
+    // The background worker re-enters this function with these settings, its
+    // credentials included, and waits for its own uploads.
+    let mut detached = config.clone();
+    detached["uploadMode"] = "wait".into();
+    let (store, token): (Box<dyn Store>, Option<String>) = match kind {
+        background::Kind::S3 => {
+            let store = s3::configure(config, variable)?;
+            let credentials = &store.credentials;
+            detached["accessKeyId"] = credentials.key().into();
+            detached["secretAccessKey"] = credentials.secret().into();
+            let token = credentials.token().map(str::to_owned);
+            (Box::new(store), token)
         }
-        other => bail!("unknown s3 upload mode {other:?}; use wait or background"),
+        background::Kind::Server => {
+            let store = server::configure(config, variable)?;
+            let token = Some(store.token.clone());
+            (Box::new(store), token)
+        }
     };
-    let credentials = match token {
-        Some(token) => Credentials::new_with_token(key, secret, token),
-        None => Credentials::new(key, secret),
-    };
-    let agent = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .timeout_connect(Some(Duration::from_secs(10)))
-        .timeout_global(Some(Duration::from_secs(10 * 60)))
-        // Fetches run in every task slot at once, beside the uploaders, all to
-        // one host. Keeping that many connections idle lets a burst reuse
-        // them, where ureq's default of three would make most of it open a
-        // new connection and repeat the TLS handshake.
-        .max_idle_connections(IDLE_CONNECTIONS)
-        .max_idle_connections_per_host(IDLE_CONNECTIONS)
-        .build()
-        .into();
-    Ok(Some(Remote {
-        bucket,
-        credentials,
-        prefix: format!("{}qk/v3/", setting("cacheKeyPrefix").unwrap_or_default()),
-        agent,
-        mode,
-        uploads: Mutex::new(None),
-        background,
-        pending: Mutex::new(Vec::new()),
-        known: OnceLock::new(),
-        reading: Mutex::new(None),
-        confirmed: Mutex::default(),
-        announcements: Mutex::default(),
-        held: Mutex::default(),
-    }))
+    let overrides = ["QK_STORE_SERVER_URL", "QK_REMOTE_BLOB_THRESHOLD"]
+        .into_iter()
+        .filter_map(|name| Some((name.to_owned(), variable(name)?)))
+        .collect();
+    let background = background.then_some(background::Configuration {
+        kind,
+        config: detached,
+        token,
+        overrides,
+    });
+    let mut remote = Remote::new(store, mode, background, threshold);
+    remote.prefetching = variable("QK_REMOTE_PREFETCH").as_deref() != Some("off");
+    Ok(Some(remote))
 }
 
 impl Remote {
-    fn object(&self, kind: &str, name: &str) -> String {
-        format!("{}{kind}/{name}", self.prefix)
+    fn new(
+        store: Box<dyn Store>,
+        mode: Mode,
+        background: Option<background::Configuration>,
+        threshold: u64,
+    ) -> Self {
+        Remote {
+            store,
+            mode,
+            uploads: Mutex::new(None),
+            background,
+            pending: Mutex::new(Vec::new()),
+            known: OnceLock::new(),
+            reading: Mutex::new(None),
+            confirmed: Mutex::default(),
+            announcements: Mutex::default(),
+            held: Mutex::default(),
+            order: Mutex::default(),
+            threshold,
+            placements: Mutex::default(),
+            stored: Mutex::default(),
+            kept_apart: Mutex::default(),
+            blob_requests: Slots::new(BLOB_REQUESTS),
+            flights: Mutex::default(),
+            prefetch: prefetch::Prefetch::default(),
+            prefetching: true,
+        }
     }
 
     /// Starts reading the store's index in the background, keeping a copy in
     /// the local cache at `root` so that later runs fetch only what is new.
     pub(crate) fn read_index(self: &Arc<Self>, root: &Path) {
-        let store = self
-            .bucket
-            .object_url(&self.prefix)
-            .map_or_else(|_| self.prefix.clone(), |url| url.to_string());
+        self.store.begin(root);
         let path = root
             .join("remote")
-            .join(&blake3::hash(store.as_bytes()).to_hex()[..32]);
+            .join(&blake3::hash(self.store.location().as_bytes()).to_hex()[..32]);
         let remote = self.clone();
         let reading = std::thread::spawn(move || match remote.sync_index(&path) {
             Ok(known) => Some(known),
@@ -241,41 +362,11 @@ impl Remote {
             .as_ref()
     }
 
-    /// The local copy at `path` brought up to date with the listings the store
+    /// The local copy at `path` brought up to date with the index the store
     /// holds now.
     fn sync_index(&self, path: &Path) -> Result<index::Known> {
         let mut known = index::Known::load(path);
-        let names = self.list(&self.object("index", ""))?;
-        let new: Vec<&String> = names
-            .iter()
-            .filter(|name| !known.listings.contains(*name))
-            .collect();
-        let budget = AtomicUsize::new(0);
-        let fetched: Vec<Result<Option<Vec<u8>>>> = std::thread::scope(|scope| {
-            let budget = &budget;
-            new.chunks(new.len().div_ceil(LISTING_READERS).max(1))
-                .map(|names| {
-                    scope.spawn(move || {
-                        names
-                            .iter()
-                            .map(|name| self.get(&self.object("index", name), budget))
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .flat_map(|reader| reader.join().unwrap())
-                .collect()
-        });
-        for listing in fetched {
-            // Compaction may replace a listing after LIST. This snapshot is
-            // then incomplete and cannot safely rule out any entry.
-            let Some(listing) = listing? else {
-                bail!("remote index changed while it was read");
-            };
-            known.add(&String::from_utf8_lossy(&listing));
-        }
-        known.listings = names.into_iter().collect();
+        self.store.sync_index(&mut known)?;
         known.expire(index::now());
         if let Err(error) = known.save(path) {
             qk_executor::status!("qk: could not save the remote cache index ({error:#})");
@@ -283,127 +374,136 @@ impl Remote {
         Ok(known)
     }
 
-    /// Names from a single complete LIST response. Pagination has no snapshot
-    /// semantics: a replacement can sort before the continuation position while
-    /// compaction removes an unseen old listing. Such an index cannot rule out
-    /// entries, so use the direct-lookup fallback instead.
-    fn list(&self, prefix: &str) -> Result<Vec<String>> {
-        let mut action = self.bucket.list_objects_v2(Some(&self.credentials));
-        action.with_prefix(prefix);
-        let url = action.sign(SIGNED_FOR);
-        let response = self.agent.get(url.as_str()).call()?;
-        let status = response.status().as_u16();
-        if status != 200 {
-            bail!("listing {prefix} returned {status}");
-        }
-        let body = read_bounded(
-            response.into_body().into_reader(),
-            LARGEST_LIST_RESPONSE,
-            None,
-        )?;
-        let body = String::from_utf8(body).context("invalid index listing response")?;
-        let parsed = ListObjectsV2::parse_response(&body)
-            .map_err(|error| anyhow::anyhow!("invalid listing of {prefix}: {error:?}"))?;
-        if parsed.next_continuation_token.is_some() {
-            bail!("paginated remote index cannot provide a complete snapshot");
-        }
-        Ok(parsed
-            .contents
-            .into_iter()
-            .filter_map(|object| object.key.strip_prefix(prefix).map(str::to_owned))
-            .collect())
-    }
-
-    /// A bounded listing body, or `None` when concurrent compaction removed it.
-    fn get(&self, object: &str, budget: &AtomicUsize) -> Result<Option<Vec<u8>>> {
-        let url = self
-            .bucket
-            .get_object(Some(&self.credentials), object)
-            .sign(SIGNED_FOR);
-        let response = self.agent.get(url.as_str()).call()?;
-        match response.status().as_u16() {
-            200 => Ok(Some(read_bounded(
-                response.into_body().into_reader(),
-                LARGEST_LISTING,
-                Some(budget),
-            )?)),
-            404 => Ok(None),
-            status => bail!("GET {object} returned {status}"),
-        }
-    }
-
-    /// Delete listings in batches, keeping cleanup latency per batch rather
-    /// than per uploaded entry. S3 accepts at most 1,000 keys per request.
-    fn delete_listings(&self, names: BTreeSet<String>) -> Result<()> {
-        let objects: Vec<_> = names
-            .into_iter()
-            .map(|name| ObjectIdentifier::new(self.object("index", &name)))
-            .collect();
-        for objects in objects.chunks(1_000) {
-            let mut action = self
-                .bucket
-                .delete_objects(Some(&self.credentials), objects.iter());
-            action.set_quiet(true);
-            let url = action.sign(SIGNED_FOR);
-            let (body, content_md5) = action.body_with_md5();
-            let response = self
-                .agent
-                .post(url.as_str())
-                .header("Content-MD5", content_md5)
-                .send(body)?;
-            let status = response.status().as_u16();
-            let body = response.into_body().read_to_string()?;
-            if !(200..=299).contains(&status) {
-                bail!("deleting index listings returned {status}");
-            }
-            let response = DeleteObjectsResponse::parse(&body)?;
-            if !response.errors.is_empty() {
-                bail!("deleting index listings failed: {:?}", response.errors);
-            }
-        }
-        Ok(())
-    }
-
-    fn exists(&self, object: &str) -> Result<bool> {
-        let url = self
-            .bucket
-            .head_object(Some(&self.credentials), object)
-            .sign(SIGNED_FOR);
-        let response = self.agent.head(url.as_str()).call()?;
-        match response.status().as_u16() {
-            200 => Ok(true),
-            404 => Ok(false),
-            status => bail!("HEAD {object} returned {status}"),
-        }
-    }
-
-    /// Uploads with a known length: S3 refuses chunked uploads to signed URLs.
-    fn put(&self, object: &str, body: impl ureq::AsSendBody) -> Result<()> {
-        let url = self
-            .bucket
-            .put_object(Some(&self.credentials), object)
-            .sign(SIGNED_FOR);
-        let response = self.agent.put(url.as_str()).send(body)?;
-        let status = response.status().as_u16();
-        io::copy(&mut response.into_body().into_reader(), &mut io::sink())?;
-        match status {
-            200..=299 => Ok(()),
-            status => bail!("PUT {object} returned {status}"),
-        }
-    }
-
     /// Copies the entry for `key` into the local store at `root`, returning
     /// whether the remote had it. Every blob the local store lacks is verified
-    /// before it is kept.
-    pub(crate) fn fetch(&self, root: &Path, key: &str, task: &str) -> Result<bool> {
+    /// before it is kept. A fetch of the same key already in progress is
+    /// waited for rather than repeated, until `cancelled`.
+    pub(crate) fn fetch(
+        self: &Arc<Self>,
+        root: &Path,
+        key: &str,
+        task: &str,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Result<bool> {
+        let joined = {
+            let mut flights = self.flights.lock().unwrap();
+            match flights.get(key) {
+                Some(flight) => Some(flight.clone()),
+                None => {
+                    flights.insert(key.to_owned(), Arc::default());
+                    None
+                }
+            }
+        };
+        if let Some(flight) = joined {
+            let _waiting = crate::profile::span(task, "remote_flight_wait");
+            match wait(&flight, cancelled) {
+                Some(Outcome::Published) => {
+                    self.prefetch.claim(key);
+                    self.confirm(key);
+                    return Ok(true);
+                }
+                Some(Outcome::Absent) | None => return Ok(false),
+                // Try once more, as this fetch's own.
+                Some(Outcome::Failed) => {
+                    self.flights
+                        .lock()
+                        .unwrap()
+                        .entry(key.to_owned())
+                        .or_default();
+                }
+            }
+        }
+        let fetched = self.fetch_entry(root, key, task, &AtomicU64::new(0));
+        self.land(key, &fetched);
+        if let Ok(true) = fetched {
+            self.confirm(key);
+            if self.prefetching {
+                self.prefetch.follow(self, root, key);
+            }
+        }
+        fetched
+    }
+
+    /// Fetches the entry for `key` ahead of the task that needs it, unless it
+    /// is being fetched already, returning whether it was fetched.
+    fn fetch_ahead(&self, root: &Path, key: &str) -> bool {
+        {
+            let mut flights = self.flights.lock().unwrap();
+            if flights.contains_key(key) {
+                return false;
+            }
+            flights.insert(key.to_owned(), Arc::default());
+        }
+        let fetched = self.fetch_entry(root, key, "prefetch", &self.prefetch.received);
+        self.land(key, &fetched);
+        matches!(fetched, Ok(true))
+    }
+
+    /// Ends the fetch of `key` in progress, telling whoever waits for it how.
+    fn land(&self, key: &str, fetched: &Result<bool>) {
+        let outcome = match fetched {
+            Ok(true) => Outcome::Published,
+            Ok(false) => Outcome::Absent,
+            Err(_) => Outcome::Failed,
+        };
+        if let Some(flight) = self.flights.lock().unwrap().remove(key) {
+            *flight.outcome.lock().unwrap() = Some(outcome);
+            flight.done.notify_all();
+        }
+    }
+
+    /// Notes that a task of this run used the entry for `key`, which the
+    /// store holds.
+    fn confirm(&self, key: &str) {
+        self.confirmed.lock().unwrap().insert(key.to_owned());
+        self.used(key);
+    }
+
+    /// Notes that the run resolved `key`, so prefetching can tell whether the
+    /// run still follows the runs it fetches ahead for.
+    pub(crate) fn resolved(&self, key: &str) {
+        self.prefetch.resolved(key);
+    }
+
+    /// Whether the local entry for `key` was fetched ahead and no task has
+    /// claimed it yet.
+    pub(crate) fn prefetched(&self, key: &str) -> bool {
+        self.prefetch.holds(key)
+    }
+
+    /// Claims the entry for `key` fetched ahead, for the task restoring it,
+    /// returning whether it was.
+    pub(crate) fn claim(&self, key: &str) -> bool {
+        let claimed = self.prefetch.claim(key);
+        if claimed {
+            self.confirm(key);
+        }
+        claimed
+    }
+
+    /// Copies the entry for `key` into the local store at `root`, adding the
+    /// bytes received to `received`.
+    fn fetch_entry(
+        &self,
+        root: &Path,
+        key: &str,
+        task: &str,
+        received: &AtomicU64,
+    ) -> Result<bool> {
         let waiting = crate::profile::span(task, "remote_index_wait");
         let known = self.known();
         drop(waiting);
         if known.is_some_and(|known| !known.keys.contains_key(key)) {
             return Ok(false);
         }
-        let Some(manifest) =
-            self.fetch_pack(root, &self.object("entries", key), task, |parsed| {
+        let listed = known
+            .and_then(|known| known.apart.get(key))
+            .cloned()
+            .unwrap_or_default();
+        let object = Object::Entry(key);
+        let Some((manifest, pin, apart)) =
+            self.fetch_pack(root, object, task, received, &listed, |parsed| {
                 parsed.check_key(key)
             })?
         else {
@@ -414,17 +514,32 @@ impl Remote {
             &root.join("entries").join(format!("{key}.json")),
             &manifest,
         )?;
-        self.confirmed.lock().unwrap().insert(key.to_owned());
+        // The published manifest now keeps its blobs.
+        drop(pin);
+        self.kept_apart
+            .lock()
+            .unwrap()
+            .insert(key.to_owned(), apart);
         Ok(true)
     }
 
     /// Notes that the local cache held the entry for `key`.
     pub(crate) fn held(&self, key: &str) {
         self.held.lock().unwrap().insert(key.to_owned());
+        self.used(key);
+    }
+
+    /// Notes that this run used the entry for `key`, if it has not yet.
+    fn used(&self, key: &str) {
+        let mut order = self.order.lock().unwrap();
+        if order.1.insert(key.to_owned()) {
+            order.0.push(key.to_owned());
+        }
     }
 
     /// Queues the local entry for `key` for upload.
     pub(crate) fn upload(self: &Arc<Self>, root: &Path, key: &str) {
+        self.used(key);
         self.enqueue(Upload {
             key: key.to_owned(),
             local: root.to_owned(),
@@ -443,27 +558,19 @@ impl Remote {
         self.enqueue(Upload {
             key: format!("{task} warm state"),
             local: root.to_owned(),
-            warm: Some((self.warm_object(task, branch), record)),
+            warm: Some(Warm {
+                identity: task.to_owned(),
+                branch: branch.to_owned(),
+                record,
+            }),
         });
-    }
-
-    fn warm_object(&self, task: &str, branch: &str) -> String {
-        let hash = |text: &str| blake3::hash(text.as_bytes()).to_hex()[..32].to_owned();
-        let identity = format!(
-            "{task}\0{}\0{}",
-            std::env::consts::OS,
-            std::env::consts::ARCH
-        );
-        self.object(
-            "warm",
-            &format!("{}/{}.json", hash(&identity), hash(branch)),
-        )
     }
 
     /// The task's warm record saved on `branch`, with every blob it cites
     /// fetched into the local store and verified, or `None` when there is
     /// none or `accept` rejects its key. The key is checked before any blob is
     /// read, so a save that does not suit this checkout costs only its record.
+    /// The pin keeps the blobs until the caller has stored the record.
     pub(crate) fn fetch_warm(
         &self,
         root: &Path,
@@ -471,9 +578,10 @@ impl Remote {
         task: &str,
         branch: &str,
         accept: impl Fn(&[String]) -> bool,
-    ) -> Result<Option<Vec<u8>>> {
-        let object = self.warm_object(identity, branch);
-        let fetched = self.fetch_pack(root, &object, task, |record| {
+    ) -> Result<Option<(Vec<u8>, crate::evict::Pin)>> {
+        let object = Object::Warm { identity, branch };
+        let received = AtomicU64::new(0);
+        let fetched = self.fetch_pack(root, object, task, &received, &[], |record| {
             if record.warm_key().is_some_and(|key| accept(&key)) {
                 Ok(())
             } else {
@@ -482,45 +590,116 @@ impl Remote {
         });
         match fetched {
             Err(error) if error.is::<OtherWarmKey>() => Ok(None),
-            fetched => fetched,
+            fetched => fetched.map(|fetched| fetched.map(|(record, pin, _)| (record, pin))),
         }
     }
 
     /// The record in the pack at `object`, once `check` accepts it and the
-    /// blobs it cites that the local store lacks are kept there, or `None`
-    /// when there is no such object.
-    /// `task` names the task the fetch is for in profile timings.
+    /// blobs it cites that the local store lacks are kept there, with a pin on
+    /// all of them, or `None` when there is no such object. Blobs `listed` as
+    /// stored apart that the local store lacks are fetched beside the pack
+    /// rather than after it. `task` names the task the fetch is for in profile
+    /// timings, and the bytes received are added to `received`.
     fn fetch_pack(
         &self,
         root: &Path,
-        object: &str,
+        object: Object,
         task: &str,
+        received: &AtomicU64,
+        listed: &[String],
         check: impl Fn(&crate::record::StoredRecord) -> Result<()>,
-    ) -> Result<Option<Vec<u8>>> {
-        let url = self
-            .bucket
-            .get_object(Some(&self.credentials), object)
-            .sign(SIGNED_FOR);
-        // Until the store's response headers arrive: the round trip, and a
-        // connection when none is open.
-        let waiting = crate::profile::span(task, "remote_response");
-        let response = self.agent.get(url.as_str()).call()?;
-        drop(waiting);
-        let status = response.status().as_u16();
-        let mut body = io::BufReader::new(response.into_body().into_reader());
-        if status != 200 {
-            io::copy(&mut body, &mut io::sink())?;
-            match status {
-                404 => return Ok(None),
-                status => bail!("GET {object} returned {status}"),
+    ) -> Result<Option<Fetched>> {
+        let early: Vec<String> = listed
+            .iter()
+            .filter(|hash| !root.join("blobs").join(hash.as_str()).is_file())
+            .cloned()
+            .collect();
+        // Held until the pack's own pin covers them.
+        let _early_pin = match early.is_empty() {
+            true => None,
+            false => Some(crate::evict::pin(root, &early.iter().cloned().collect())?),
+        };
+        let apart = AtomicU64::new(0);
+        std::thread::scope(|scope| {
+            let early_fetch = (!early.is_empty()).then(|| {
+                // A blob the index wrongly lists is fetched after the pack.
+                scope.spawn(|| self.fetch_blobs(root, object, &early, task, &apart).ok())
+            });
+            let early_fetch = Mutex::new(early_fetch);
+            let wait_early = || {
+                if let Some(fetching) = early_fetch.lock().unwrap().take() {
+                    let _ = fetching.join();
+                }
+            };
+            let Some(body) = self.store.get(object, task)? else {
+                wait_early();
+                return Ok(None);
+            };
+            let mut receiving = crate::profile::span(task, "remote_body");
+            let mut transfer = pack::Transfer::default();
+            let read = pack::read(root, body, check, &mut transfer, |missing| {
+                wait_early();
+                let missing: Vec<String> = missing
+                    .into_iter()
+                    .filter(|hash| !root.join("blobs").join(hash).is_file())
+                    .collect();
+                self.fetch_blobs(root, object, &missing, task, &apart)
+            });
+            wait_early();
+            receiving.count("bytes", transfer.received);
+            receiving.count("held_bytes", transfer.held);
+            receiving.count("apart_bytes", apart.load(Ordering::Relaxed));
+            receiving.count("skipped_bytes", transfer.skipped);
+            received.fetch_add(
+                transfer.received + apart.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            match read {
+                Err(error) if error.is::<MissingBlob>() => Ok(None),
+                read => read.map(|(record, pin)| Some((record, pin, transfer.apart))),
             }
-        }
-        let mut receiving = crate::profile::span(task, "remote_body");
-        let mut transfer = pack::Transfer::default();
-        let record = pack::read(root, body, check, &mut transfer);
-        receiving.count("bytes", transfer.received);
-        receiving.count("held_bytes", transfer.held);
-        record.map(Some)
+        })
+    }
+
+    /// Fetches `blobs`, stored apart, into the local store at `root`, a few
+    /// at a time, adding the bytes received to `received`.
+    fn fetch_blobs(
+        &self,
+        root: &Path,
+        owner: Object,
+        blobs: &[String],
+        task: &str,
+        received: &AtomicU64,
+    ) -> Result<()> {
+        let mut fetching = crate::profile::span(task, "remote_blobs");
+        fetching.count("blobs", blobs.len() as u64);
+        let queue = Mutex::new(blobs.iter());
+        let fetch = || -> Result<()> {
+            loop {
+                let Some(hash) = queue.lock().unwrap().next() else {
+                    return Ok(());
+                };
+                let _slot = self.blob_requests.take();
+                let body = self
+                    .store
+                    .get_blob(hash, owner, task)?
+                    .ok_or_else(|| MissingBlob(hash.clone()))?;
+                let bytes = pack::read_blob(root, hash, body)?;
+                received.fetch_add(bytes, Ordering::Relaxed);
+            }
+        };
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..blobs.len().min(BLOB_FETCHERS))
+                .map(|_| scope.spawn(fetch))
+                .collect();
+            // Every worker is joined before an error is returned, so none
+            // outlives the pin the caller holds.
+            let results: Vec<Result<()>> = workers
+                .into_iter()
+                .map(|worker| worker.join().expect("blob fetch panicked"))
+                .collect();
+            results.into_iter().collect()
+        })
     }
 
     fn enqueue(self: &Arc<Self>, upload: Upload) {
@@ -565,43 +744,191 @@ impl Remote {
     }
 
     fn send(&self, job: &Upload) -> Result<()> {
-        if let Some((object, record)) = &job.warm {
+        if let Some(warm) = &job.warm {
             // The newest save for the branch replaces the last one.
-            return self.put_pack(&job.local, object, record);
+            let object = Object::Warm {
+                identity: &warm.identity,
+                branch: &warm.branch,
+            };
+            return self.put_pack(&job.local, object, &warm.record);
         }
-        let object = self.object("entries", &job.key);
-        let exists = self.exists(&object)?;
-        // Announce the key before publishing its entry. If the run stops or
-        // the final listing fails, readers can still discover the entry. An
-        // announcement whose upload fails merely causes a normal GET miss.
-        let now = index::now();
-        let listing = index::format(std::iter::once((job.key.as_str(), now)));
-        let announcement = index::name(now);
-        self.put(&self.object("index", &announcement), listing.as_bytes())?;
-        if !exists {
+        let object = Object::Entry(&job.key);
+        let exists = self.store.has(object)?;
+        // Blobs stored apart go up first, so the announcement can name them
+        // and the entry never cites one the store lacks.
+        let placed = if exists {
+            None
+        } else {
             let manifest = fs::read(job.local.join("entries").join(format!("{}.json", job.key)))?;
-            self.put_pack(&job.local, &object, &manifest)?;
+            let placements = self.place_all(&job.local, &manifest)?;
+            Some((manifest, placements))
+        };
+        let apart: Vec<String> = match &placed {
+            Some((_, placements)) => apart_of(placements),
+            None => self
+                .known()
+                .and_then(|known| known.apart.get(&job.key).cloned())
+                .unwrap_or_default(),
+        };
+        let announcement = self.store.announce(&job.key, &apart)?;
+        if let Some((manifest, placements)) = placed {
+            self.put_placed(&job.local, object, &manifest, &placements)?;
         }
+        self.kept_apart
+            .lock()
+            .unwrap()
+            .insert(job.key.clone(), apart);
         self.confirmed.lock().unwrap().insert(job.key.clone());
-        self.announcements.lock().unwrap().insert(announcement);
+        self.announcements.lock().unwrap().extend(announcement);
         Ok(())
     }
 
     /// Uploads `record` with the blobs it cites from the local store at
-    /// `root`, as one pack.
-    fn put_pack(&self, root: &Path, object: &str, record: &[u8]) -> Result<()> {
+    /// `root`: large blobs on their own, once the store lacks them, then a
+    /// pack with the rest, so the pack never cites a blob not yet stored.
+    fn put_pack(&self, root: &Path, object: Object, record: &[u8]) -> Result<()> {
+        let placements = self.place_all(root, record)?;
+        self.put_placed(root, object, record, &placements)
+    }
+
+    /// Where packs carry each blob `record` cites, uploading those stored
+    /// apart that the store lacks.
+    fn place_all(&self, root: &Path, record: &[u8]) -> Result<HashMap<String, pack::Placement>> {
+        let parsed = crate::record::StoredRecord::read(record)?;
+        let mut placements = HashMap::new();
+        // A store server takes one bounded body per record, so once the record,
+        // its header and its inline blobs fill that, the rest of this record's
+        // blobs go apart. Raw sizes bound the compressed ones; each blob's
+        // header entry is a hash and two numbers.
+        let bounded = self.store.framing() == store::Framing::Upload;
+        let mut inline = record.len() as u64 + 128 * parsed.blobs().len() as u64 + 64;
+        for blob in parsed.blobs() {
+            let mut placement = self.place(root, &blob)?;
+            if bounded && placement == pack::Placement::Inline {
+                let size = fs::metadata(root.join("blobs").join(&blob))?.len();
+                if inline + size > UPLOAD_INLINE {
+                    self.store_apart(root, &blob, None)?;
+                    placement = pack::Placement::Apart;
+                } else {
+                    inline += size;
+                }
+            }
+            placements.insert(blob, placement);
+        }
+        Ok(placements)
+    }
+
+    /// Uploads `record` as `object`, carrying its blobs as `placements` says.
+    fn put_placed(
+        &self,
+        root: &Path,
+        object: Object,
+        record: &[u8],
+        placements: &HashMap<String, pack::Placement>,
+    ) -> Result<()> {
+        let place = |blob: &str| {
+            placements
+                .get(blob)
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("blob {blob} was not placed"))
+        };
         let mut pack = tempfile::NamedTempFile::new_in(root.join("tmp"))?;
-        pack::write(root, record, pack.as_file_mut())?;
-        let file = pack.reopen()?;
-        if file.metadata()?.len() > LARGEST_UPLOAD {
+        match self.store.framing() {
+            store::Framing::Pack => pack::write(root, record, place, pack.as_file_mut())?,
+            store::Framing::Upload => pack::write_upload(root, record, place, pack.as_file_mut())?,
+        }
+        if pack.as_file().metadata()?.len() > LARGEST_UPLOAD {
             bail!("too large to upload as one object");
         }
-        self.put(object, file)
+        match self.store.put(object, pack.reopen()?) {
+            // The store lost blobs this process took it to hold: send them,
+            // and commit once more.
+            Err(error) if error.is::<store::MissingBlobs>() => {
+                let missing = error.downcast::<store::MissingBlobs>().unwrap().0;
+                for blob in &missing {
+                    self.stored.lock().unwrap().remove(blob);
+                    self.store_apart(root, blob, None)?;
+                }
+                self.store.put(object, pack.reopen()?)
+            }
+            put => put,
+        }
+    }
+
+    /// Decides where packs carry the blob `hash`, uploading it on its own if
+    /// it goes apart and the store lacks it. A blob goes apart when its
+    /// compressed size, what it costs to transfer, reaches the threshold.
+    fn place(&self, root: &Path, hash: &str) -> Result<pack::Placement> {
+        let known = self.placements.lock().unwrap().get(hash).copied();
+        let placement = match known {
+            Some(placement) => placement,
+            None => {
+                let size = fs::metadata(root.join("blobs").join(hash))?.len();
+                let compressed = if size < self.threshold {
+                    None
+                } else {
+                    Some(pack::compress(root, hash)?).filter(|compressed| {
+                        compressed
+                            .as_file()
+                            .metadata()
+                            .is_ok_and(|metadata| metadata.len() >= self.threshold)
+                    })
+                };
+                let placement = match compressed {
+                    None => pack::Placement::Inline,
+                    Some(compressed) => {
+                        self.store_apart(root, hash, Some(compressed))?;
+                        pack::Placement::Apart
+                    }
+                };
+                self.placements
+                    .lock()
+                    .unwrap()
+                    .insert(hash.to_owned(), placement);
+                return Ok(placement);
+            }
+        };
+        if placement == pack::Placement::Apart {
+            self.store_apart(root, hash, None)?;
+        }
+        Ok(placement)
+    }
+
+    /// Uploads the blob `hash` on its own unless the store is known to hold
+    /// it, or answers that it does.
+    fn store_apart(
+        &self,
+        root: &Path,
+        hash: &str,
+        compressed: Option<tempfile::NamedTempFile>,
+    ) -> Result<()> {
+        if self.stored.lock().unwrap().contains(hash) {
+            return Ok(());
+        }
+        if !self.store.has(Object::Blob(hash))? {
+            let compressed = match compressed {
+                Some(compressed) => compressed,
+                None => pack::compress(root, hash)?,
+            };
+            self.store.put(Object::Blob(hash), compressed.reopen()?)?;
+        }
+        self.stored.lock().unwrap().insert(hash.to_owned());
+        Ok(())
     }
 
     /// Waits for queued uploads, then adds this run's listing to the index,
     /// returning what failed.
     pub(crate) fn finish(&self) -> Vec<String> {
+        // Prefetches in progress finish on their own; the run does not wait
+        // for what it may not need.
+        self.prefetch.stop();
+        let (entries, claimed) = self.prefetch.summary();
+        if entries > 0 {
+            let mut summary = crate::profile::span("run", "remote_prefetch");
+            summary.count("entries", entries as u64);
+            summary.count("claimed", claimed as u64);
+            summary.count("bytes", self.prefetch.received.load(Ordering::Relaxed));
+        }
         if let Some(configuration) = &self.background {
             let pending = std::mem::take(&mut *self.pending.lock().unwrap());
             if !pending.is_empty() {
@@ -610,6 +937,7 @@ impl Remote {
                     &pending,
                     self.held.lock().unwrap().iter().cloned().collect(),
                     self.confirmed.lock().unwrap().iter().cloned().collect(),
+                    self.order.lock().unwrap().0.clone(),
                 ) {
                     Ok(log) => {
                         qk_executor::status!(
@@ -652,15 +980,13 @@ impl Remote {
         failures
     }
 
-    /// Lists the entries this run found in the store or put there. With many
-    /// listings already, merges them into this one and deletes them.
+    /// Lists the entries this run found in the store or put there.
     fn add_listing(&self) -> Result<()> {
         let mut confirmed = std::mem::take(&mut *self.confirmed.lock().unwrap());
         let held = std::mem::take(&mut *self.held.lock().unwrap());
         if confirmed.is_empty() && held.is_empty() {
             return Ok(());
         }
-        let now = index::now();
         let known = self.known();
         if let Some(known) = known {
             confirmed.extend(held.into_iter().filter(|key| known.keys.contains_key(key)));
@@ -670,27 +996,56 @@ impl Remote {
         if confirmed.is_empty() {
             return Ok(());
         }
-        let mut listing = index::Known::default();
-        let merged = known.filter(|known| known.listings.len() >= index::MERGE_AFTER);
-        if let Some(known) = merged {
-            listing.keys = known.keys.clone();
+        let announcements = std::mem::take(&mut *self.announcements.lock().unwrap());
+        let members = std::mem::take(&mut self.order.lock().unwrap().0)
+            .into_iter()
+            .filter(|key| confirmed.contains(key))
+            .collect();
+        let kept = std::mem::take(&mut *self.kept_apart.lock().unwrap());
+        let apart = confirmed
+            .iter()
+            .filter_map(|key| {
+                let hashes = kept
+                    .get(key)
+                    .or_else(|| known.and_then(|known| known.apart.get(key)))?;
+                Some((key.clone(), hashes.clone()))
+            })
+            .collect();
+        self.store
+            .list(confirmed, apart, members, known, announcements)
+    }
+}
+
+/// A fetched pack's record, the pin on the blobs it cites, and the blobs it
+/// stores apart.
+type Fetched = (Vec<u8>, crate::evict::Pin, Vec<String>);
+
+/// The blobs `placements` stores apart, in order.
+fn apart_of(placements: &HashMap<String, pack::Placement>) -> Vec<String> {
+    let mut apart: Vec<String> = placements
+        .iter()
+        .filter(|(_, placement)| **placement == pack::Placement::Apart)
+        .map(|(blob, _)| blob.clone())
+        .collect();
+    apart.sort();
+    apart
+}
+
+/// How `flight` ended, or `None` if `cancelled` first.
+fn wait(flight: &Flight, cancelled: &std::sync::atomic::AtomicBool) -> Option<Outcome> {
+    let mut outcome = flight.outcome.lock().unwrap();
+    loop {
+        if let Some(outcome) = *outcome {
+            return Some(outcome);
         }
-        listing
-            .keys
-            .extend(confirmed.into_iter().map(|key| (key, now)));
-        listing.expire(now);
-        let text = index::format(listing.keys.iter().map(|(key, time)| (key.as_str(), *time)));
-        self.put(&self.object("index", &index::name(now)), text.as_bytes())?;
-        // The final listing now covers every confirmed announcement. Leave
-        // announcements in place on any earlier failure, including uploads
-        // whose outcome was uncertain, so entries remain discoverable.
-        let mut obsolete = std::mem::take(&mut *self.announcements.lock().unwrap());
-        obsolete.extend(
-            merged
-                .iter()
-                .flat_map(|known| known.listings.iter().cloned()),
-        );
-        self.delete_listings(obsolete)
+        if cancelled.load(Ordering::SeqCst) {
+            return None;
+        }
+        outcome = flight
+            .done
+            .wait_timeout(outcome, Duration::from_millis(50))
+            .unwrap()
+            .0;
     }
 }
 
@@ -770,3 +1125,192 @@ impl std::fmt::Display for OtherWarmKey {
 }
 
 impl std::error::Error for OtherWarmKey {}
+
+#[cfg(test)]
+mod flight_tests {
+    use super::store::{self, Body, Object, Store};
+    use super::*;
+
+    /// A store in memory whose reads take a while and are counted.
+    #[derive(Default)]
+    struct Memory {
+        objects: Mutex<HashMap<String, Vec<u8>>>,
+        reads: Arc<AtomicUsize>,
+        /// Whether it takes upload bodies, as a store server does.
+        uploads: bool,
+    }
+
+    fn name(object: Object) -> String {
+        match object {
+            Object::Entry(key) => format!("entries/{key}"),
+            Object::Warm { identity, branch } => format!("warm/{identity}/{branch}"),
+            Object::Blob(hash) => format!("blobs/{hash}"),
+        }
+    }
+
+    impl Store for Memory {
+        fn location(&self) -> String {
+            "memory".into()
+        }
+
+        fn framing(&self) -> store::Framing {
+            if self.uploads {
+                store::Framing::Upload
+            } else {
+                store::Framing::Pack
+            }
+        }
+
+        fn sync_index(&self, _: &mut index::Known) -> Result<()> {
+            Ok(())
+        }
+
+        fn get(&self, object: Object, _: &str) -> Result<Option<Body>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(200));
+            let objects = self.objects.lock().unwrap();
+            Ok(objects
+                .get(&name(object))
+                .map(|bytes| Box::new(std::io::Cursor::new(bytes.clone())) as Body))
+        }
+
+        fn has(&self, object: Object) -> Result<bool> {
+            Ok(self.objects.lock().unwrap().contains_key(&name(object)))
+        }
+
+        fn put(&self, object: Object, mut file: fs::File) -> Result<()> {
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            self.objects.lock().unwrap().insert(name(object), bytes);
+            Ok(())
+        }
+
+        fn announce(&self, _: &str, _: &[String]) -> Result<Option<String>> {
+            Ok(None)
+        }
+
+        fn list(
+            &self,
+            _: BTreeSet<String>,
+            _: HashMap<String, Vec<String>>,
+            _: Vec<String>,
+            _: Option<&index::Known>,
+            _: BTreeSet<String>,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn cache() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["entries", "blobs", "tmp"] {
+            fs::create_dir(root.path().join(name)).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn an_upload_to_a_store_server_carries_a_bounded_amount_inline() {
+        let source = cache();
+        let mut blobs = Vec::new();
+        for index in 0..3u8 {
+            let path = source.path().join("blobs").join(format!("{index}"));
+            // Sparse, and the same bytes each time; the names stand in for
+            // hashes, which placement never checks.
+            fs::File::create(&path)
+                .unwrap()
+                .set_len(UPLOAD_INLINE / 2 - 4096)
+                .unwrap();
+            let name = format!("{index}").repeat(64);
+            fs::rename(&path, source.path().join("blobs").join(&name)).unwrap();
+            blobs.push(name);
+        }
+        let record = |note: &str| {
+            serde_json::to_vec(&serde_json::json!({
+                "note": note,
+                "artifacts": blobs
+                    .iter()
+                    .map(|blob| (blob.clone(), serde_json::json!({"blob": blob})))
+                    .collect::<serde_json::Map<_, _>>()
+            }))
+            .unwrap()
+        };
+        let remote = || {
+            let memory = Memory {
+                uploads: true,
+                ..Memory::default()
+            };
+            Remote::new(Box::new(memory), Mode::ReadWrite, None, u64::MAX)
+        };
+        let small = remote();
+        let placements = small.place_all(source.path(), &record("")).unwrap();
+        // Two fit under the bound; the third goes apart.
+        assert_eq!(placements[&blobs[0]], pack::Placement::Inline);
+        assert_eq!(placements[&blobs[1]], pack::Placement::Inline);
+        assert_eq!(placements[&blobs[2]], pack::Placement::Apart);
+        assert!(small.store.has(Object::Blob(&blobs[2])).unwrap());
+        // The record counts against the bound too.
+        let large = remote();
+        let placements = large
+            .place_all(source.path(), &record(&"x".repeat(16 << 10)))
+            .unwrap();
+        assert_eq!(placements[&blobs[0]], pack::Placement::Inline);
+        assert_eq!(placements[&blobs[1]], pack::Placement::Apart);
+    }
+
+    #[test]
+    fn concurrent_fetches_of_one_key_download_it_once() {
+        let source = cache();
+        let log = source.path().join("blobs/log");
+        fs::write(&log, "log").unwrap();
+        let hash = crate::hash::digest_file(&log).unwrap();
+        fs::rename(&log, source.path().join("blobs").join(&hash)).unwrap();
+        let key = "a".repeat(64);
+        let record = serde_json::to_vec(&serde_json::json!({
+            "version": 1, "key": key, "log": hash, "artifacts": {}
+        }))
+        .unwrap();
+        let mut pack = Vec::new();
+        pack::write(
+            source.path(),
+            &record,
+            |_| Ok(pack::Placement::Inline),
+            &mut pack,
+        )
+        .unwrap();
+        let memory = Memory::default();
+        let reads = memory.reads.clone();
+        memory
+            .objects
+            .lock()
+            .unwrap()
+            .insert(format!("entries/{key}"), pack);
+        let remote = Arc::new(Remote::new(Box::new(memory), Mode::Read, None, u64::MAX));
+        let destination = cache();
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let fetched: Vec<bool> = std::thread::scope(|scope| {
+            let fetches: Vec<_> = (0..3)
+                .map(|_| {
+                    scope.spawn(|| {
+                        remote
+                            .fetch(destination.path(), &key, "app:build", &cancelled)
+                            .unwrap()
+                    })
+                })
+                .collect();
+            fetches
+                .into_iter()
+                .map(|fetch| fetch.join().unwrap())
+                .collect()
+        });
+        assert_eq!(fetched, [true, true, true]);
+        assert!(
+            destination
+                .path()
+                .join("entries")
+                .join(format!("{key}.json"))
+                .is_file()
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+    }
+}

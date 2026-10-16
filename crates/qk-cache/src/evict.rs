@@ -5,10 +5,13 @@
 //! hit. Blobs are shared between entries, so a blob is deleted only once no
 //! remaining manifest cites it. A blob no manifest cites may belong to an entry
 //! another run is still publishing, so it is kept until it is an hour old.
+//! Blobs a fetch relies on are [pinned](pin) until it publishes its record,
+//! and kept whatever their age or how many manifests cite them.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::path::Path;
+use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
@@ -76,6 +79,105 @@ pub fn max_size(configured: Option<&Value>, cache: &Path) -> Result<Option<u64>>
     Ok((limit > 0).then_some(limit))
 }
 
+/// Where pins live: under `locks/`, whose dot-named items are not lock files.
+fn pins(root: &Path) -> PathBuf {
+    root.join("locks").join(".pins")
+}
+
+/// Held shared while a pin is made, and exclusively by a prune while it
+/// deletes, so a pin made while a prune runs waits until it is done.
+fn pin_gate(root: &Path) -> Result<File> {
+    let directory = pins(root);
+    fs::create_dir_all(&directory)?;
+    Ok(File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(directory.join(".gate"))?)
+}
+
+/// Blobs kept from eviction while this is alive. Each pin is two files: one
+/// its holder keeps locked, so a prune can tell a live pin from an abandoned
+/// one, and one naming the blobs, which a prune can read even where a lock
+/// keeps other processes from reading the file it covers.
+#[derive(Debug)]
+pub(crate) struct Pin {
+    lock: Option<File>,
+    path: PathBuf,
+}
+
+/// Keeps `blobs` from being pruned until the returned [`Pin`] is dropped. A
+/// prune already deleting finishes first, so a caller that checks which blobs
+/// exist after pinning sees every deletion.
+pub(crate) fn pin(root: &Path, blobs: &BTreeSet<String>) -> Result<Pin> {
+    let gate = pin_gate(root)?;
+    gate.lock_shared()?;
+    let directory = pins(root);
+    let name = format!(
+        "{}-{}",
+        std::process::id(),
+        &blake3::hash(
+            format!("{:?}{:?}", std::thread::current().id(), SystemTime::now()).as_bytes()
+        )
+        .to_hex()[..16]
+    );
+    let path = directory.join(name);
+    let lock = File::options()
+        .create_new(true)
+        .write(true)
+        .open(path.with_extension("lock"))?;
+    lock.lock_exclusive()?;
+    let pin = Pin {
+        lock: Some(lock),
+        path,
+    };
+    let mut listing = String::new();
+    for blob in blobs {
+        listing.push_str(blob);
+        listing.push('\n');
+    }
+    let mut file = File::create(pin.path.with_extension("blobs"))?;
+    file.write_all(listing.as_bytes())?;
+    drop(gate);
+    Ok(pin)
+}
+
+impl Drop for Pin {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(self.path.with_extension("blobs"));
+        // Unlock last: a prune that finds the lock free removes what is left.
+        drop(self.lock.take());
+        let _ = fs::remove_file(self.path.with_extension("lock"));
+    }
+}
+
+/// The blobs live pins hold, removing pins whose holder is gone.
+fn pinned(root: &Path) -> BTreeSet<String> {
+    let mut held = BTreeSet::new();
+    for item in fs::read_dir(pins(root)).into_iter().flatten().flatten() {
+        let path = item.path();
+        if path.extension().is_none_or(|extension| extension != "lock") {
+            continue;
+        }
+        let Ok(lock) = File::open(&path) else {
+            continue;
+        };
+        if lock.try_lock_exclusive().is_ok() {
+            let _ = fs::remove_file(path.with_extension("blobs"));
+            let _ = fs::remove_file(&path);
+            continue;
+        }
+        if let Ok(listing) = File::open(path.with_extension("blobs")) {
+            held.extend(
+                std::io::BufReader::new(listing)
+                    .lines()
+                    .map_while(Result::ok),
+            );
+        }
+    }
+    held
+}
+
 /// Refreshes an entry's last use.
 pub(crate) fn touch(manifest: &Path) {
     if let Ok(file) = File::options().write(true).open(manifest) {
@@ -140,6 +242,9 @@ fn prune_inner(root: &Path, limit: u64, automatic: bool) -> Result<Pruned> {
     // after eviction: a concurrent publisher could have added uncounted bytes.
     let _ = fs::remove_file(root.join("locks").join(".size"));
     let _ = guard.set_modified(SystemTime::now());
+    // Held until deletion ends, so no pin is made while blobs are deleted.
+    let gate = pin_gate(root)?;
+    gate.lock_exclusive()?;
     let now = SystemTime::now();
     let age = |metadata: &fs::Metadata| {
         metadata
@@ -170,6 +275,10 @@ fn prune_inner(root: &Path, limit: u64, automatic: bool) -> Result<Pruned> {
             size: metadata.len(),
             blobs,
         });
+    }
+    // A pin is a reference no eviction removes.
+    for blob in pinned(root) {
+        *references.entry(blob).or_default() += 1;
     }
     let mut blob_sizes = BTreeMap::new();
     let mut pruned = Pruned::default();
@@ -212,6 +321,7 @@ fn prune_inner(root: &Path, limit: u64, automatic: bool) -> Result<Pruned> {
             }
         }
     }
+    drop(gate);
     // Scratch space of runs that ended without cleaning up.
     for item in fs::read_dir(root.join("tmp"))
         .into_iter()
@@ -373,6 +483,102 @@ mod tests {
         fs::write(root.path().join("blobs/a"), [0; 100]).unwrap();
         fs::write(root.path().join("locks/.prune"), []).unwrap();
         root
+    }
+
+    /// A cache whose one entry cites one blob, dated two hours ago.
+    fn cited() -> (tempfile::TempDir, String) {
+        let root = fixture();
+        let blob = "b".repeat(64);
+        fs::write(root.path().join("blobs").join(&blob), [0; 100]).unwrap();
+        fs::write(
+            root.path().join("entries/a.json"),
+            serde_json::to_vec(&serde_json::json!({"log": blob})).unwrap(),
+        )
+        .unwrap();
+        let old = SystemTime::now() - Duration::from_secs(2 * 60 * 60);
+        for path in [format!("blobs/{blob}"), "entries/a.json".into()] {
+            File::options()
+                .write(true)
+                .open(root.path().join(path))
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        (root, blob)
+    }
+
+    /// Prunes until `blob` is gone. A prune finds `.prune` held, and does
+    /// nothing, while a child another test is starting has not yet exec'd
+    /// away its copy of the lock.
+    fn prune_away(root: &Path, limit: u64, blob: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while root.join("blobs").join(blob).exists() && std::time::Instant::now() < deadline {
+            prune(root, limit).unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!root.join("blobs").join(blob).exists());
+    }
+
+    #[test]
+    fn a_pinned_blob_survives_evicting_the_last_entry_that_cites_it() {
+        let (root, blob) = cited();
+        let root = root.path();
+        let pin = pin(root, &BTreeSet::from([blob.clone()])).unwrap();
+        assert_eq!(prune(root, 0).unwrap().entries, 1);
+        assert!(root.join("blobs").join(&blob).exists());
+        drop(pin);
+        prune_away(root, 0, &blob);
+    }
+
+    #[test]
+    fn a_pinned_old_blob_no_entry_cites_survives() {
+        let (root, blob) = cited();
+        let root = root.path();
+        fs::remove_file(root.join("entries/a.json")).unwrap();
+        let pin = pin(root, &BTreeSet::from([blob.clone()])).unwrap();
+        prune(root, 1 << 30).unwrap();
+        assert!(root.join("blobs").join(&blob).exists());
+        drop(pin);
+        assert!(
+            fs::read_dir(pins(root))
+                .unwrap()
+                .all(|item| { item.unwrap().file_name() == ".gate" })
+        );
+        prune_away(root, 1 << 30, &blob);
+    }
+
+    #[test]
+    fn an_abandoned_pin_neither_keeps_blobs_nor_stays() {
+        let (root, blob) = cited();
+        let root = root.path();
+        fs::create_dir_all(pins(root)).unwrap();
+        fs::write(pins(root).join("gone.lock"), []).unwrap();
+        fs::write(pins(root).join("gone.blobs"), format!("{blob}\n")).unwrap();
+        prune(root, 0).unwrap();
+        assert!(!root.join("blobs").join(&blob).exists());
+        assert!(!pins(root).join("gone.lock").exists());
+        assert!(!pins(root).join("gone.blobs").exists());
+    }
+
+    #[test]
+    fn a_pin_waits_for_a_prune_that_is_deleting() {
+        let (root, blob) = cited();
+        let root = root.path().to_owned();
+        let gate = pin_gate(&root).unwrap();
+        gate.lock_exclusive().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let pinning = std::thread::spawn({
+            let root = root.clone();
+            move || {
+                let pin = pin(&root, &BTreeSet::from([blob])).unwrap();
+                sender.send(()).unwrap();
+                pin
+            }
+        });
+        assert!(receiver.recv_timeout(Duration::from_millis(200)).is_err());
+        drop(gate);
+        receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(pinning.join().unwrap());
     }
 
     #[test]

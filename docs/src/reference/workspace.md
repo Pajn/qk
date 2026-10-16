@@ -163,7 +163,7 @@ dotenv files rather than checked-in configuration.
 | `region` | string | Required |
 | `endpoint` | URL string | `https://s3.<region>.amazonaws.com` |
 | `forcePathStyle` | boolean | `false`; use `true` for path-style storage |
-| `cacheKeyPrefix` | string | Empty; qk appends `qk/v3/` |
+| `cacheKeyPrefix` | string | Empty; qk appends `qk/v4/` |
 | `accessKeyId` | string | Falls back to `AWS_ACCESS_KEY_ID` |
 | `secretAccessKey` | string | Falls back to `AWS_SECRET_ACCESS_KEY` |
 | `localMode` | string | `read-write` outside CI |
@@ -180,6 +180,28 @@ for detached uploads, logs and lifecycle behavior.
 `NX_DISABLE_REMOTE_CACHE=true` disable the remote store.
 `encryptionKey` and SSO profiles are unsupported. Unusable remote stores
 are reported; local caching continues. See [Remote caching](../guides/remote-cache.md).
+
+## `storeServer`
+
+An optional object sending the remote cache to a
+[store server](../guides/remote-cache.md#store-server) instead of S3. It
+cannot be set together with `s3`. The token comes from
+`QK_STORE_SERVER_TOKEN`.
+
+```jsonc
+{
+  "storeServer": { "url": "https://cache.example.com" }
+}
+```
+
+| Field | Type | Default / behavior |
+| --- | --- | --- |
+| `url` | URL string | Required; `QK_STORE_SERVER_URL` overrides it |
+| `localMode` | string | `read-write` outside CI |
+| `ciMode` | string | `read-write` in CI |
+| `uploadMode` | string | `wait`; qk can detach uploads with `background` |
+
+Modes and upload modes, and the variables that override them, are as for `s3`.
 
 ## `nx.local.json`
 
