@@ -49,8 +49,12 @@ against the merged child environment.
 | `NX_SKIP_REMOTE_CACHE=true`, `NX_DISABLE_REMOTE_CACHE=true` | Local cache only |
 | `NX_CACHE_DIRECTORY` | Override `nx.json`'s `cacheDirectory` |
 | `NX_MAX_CACHE_SIZE` | Override `nx.json`'s `maxCacheSize` |
-| `NX_POWERPACK_CACHE_MODE` | Override S3 `localMode`/`ciMode` |
-| `QK_REMOTE_UPLOAD_MODE` | Override S3 `uploadMode`: `wait` or `background` |
+| `NX_POWERPACK_CACHE_MODE` | Override the remote store's `localMode`/`ciMode` |
+| `QK_REMOTE_UPLOAD_MODE` | Override the remote store's `uploadMode`: `wait` or `background` |
+| `QK_REMOTE_BLOB_THRESHOLD` | The compressed size from which an output is stored apart, such as `256KB`, or `off`; 1 MiB by default |
+| `QK_REMOTE_PREFETCH=off` | Do not fetch entries ahead of the tasks that need them |
+| `QK_STORE_SERVER_TOKEN` | The [store server](../guides/remote-cache.md#store-server)'s token |
+| `QK_STORE_SERVER_URL` | Override `storeServer.url` |
 | `QK_PROFILE_CACHE=1` | Enable [cache phase timings](cli.md#profiling-cache-operations), as `--profile` does |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | Remote credentials |
 | `GITHUB_HEAD_REF`, `GITHUB_REF_NAME` | CI branch for remote warm state |

@@ -11,13 +11,24 @@ default), `read` (also spelled `read-only`) or `no-cache`, and
 not supported; a store that cannot be used is reported and left out, and the
 local cache carries on.
 
-Entries are stored under `<cacheKeyPrefix>qk/v3/`, so a bucket shared with Nx
+Entries are stored under `<cacheKeyPrefix>qk/v4/`, so a bucket shared with Nx
 never mixes the two. Result entries and portable warm state use streaming
 Zstandard level 3 compression with a frame checksum. Each entry is one object
-holding its manifest and outputs, so that a lookup or restore is one request however many files the
-task wrote. A local miss fetches it, keeps the outputs the local cache lacks,
-verifying each against its hash, and shows `[remote cache]`; any failure is a
-miss. After a task is saved it is uploaded in the background, and a run waits
+holding its manifest and its small outputs, so that a lookup or restore is one
+request however many files the task wrote. A local miss fetches it, keeps the
+outputs the local cache lacks, verifying each against its hash, and shows
+`[remote cache]`; any failure is a miss.
+
+An output whose compressed size reaches 1 MiB is stored apart, as
+`blobs/<hash>`, uploaded once for every entry that has it and only when the
+store lacks it. A machine fetches it only when its local cache lacks it, a few
+at a time while the rest of the entry streams, so a machine that already holds
+a build's large files receives little more than the manifest.
+`QK_REMOTE_BLOB_THRESHOLD` sets another size, such as `256KB`, or `off` to keep
+every output in its entry. Large outputs are shared between entries, so do not
+expire `blobs/` with a storage lifecycle rule: an entry whose output is gone is
+a miss, never a wrong result, but every entry citing it misses until it runs
+again. After a task is saved it is uploaded in the background, and a run waits
 for its uploads before it ends. Uploads report their failures without failing
 the run; an entry larger than 5 GiB, the most one S3 upload may hold, is not
 uploaded.
@@ -56,7 +67,7 @@ can interrupt it. Later background runs reclaim snapshots older than one
 day when no worker holds their lease, and logs older than one day. Pending
 snapshots can retain disk space outside the cache size limit until cleanup.
 
-The remote format uses a clean cutover from `qk/v2`: new clients neither fetch
+The remote format uses a clean cutover from `qk/v3`: new clients neither fetch
 nor overwrite older remote objects. Upgrading may cause one-time remote
 misses while the compressed cache fills. Existing local entries are unchanged,
 and older clients can continue using their own remote namespace. There is no
@@ -77,7 +88,7 @@ has not seen and keeps them in the local cache. If that fails, including a
 listing removed by concurrent compaction, it looks up each entry as it needs
 it. Paginated indexes also use direct lookups because pages cannot establish
 a complete snapshot during concurrent compaction. Listing payloads are bounded
-at 4 MiB each and 32 MiB across a synchronization; exceeding either limit also
+at 8 MiB each and 32 MiB across a synchronization; exceeding either limit also
 uses direct lookups without retaining an incomplete index. An entry uploaded
 after a run started is not found by that run. Once there are
 16 or more listings, a writing run merges them into its own and deletes
@@ -85,6 +96,40 @@ them, so the store's credentials need permission to delete objects. Entries
 whose timestamps have not been renewed for 30 days drop out of the index.
 Read-write local cache hits renew entries an available remote index already
 lists; unuploaded local results are not advertised.
+
+A listing also records its run: the entries it used, in the order it used
+them. Merging keeps the most recent runs, at most 32, none older than 14 days.
+A cached chain of tasks otherwise fetches one entry per level, each waiting for
+the level below. Once a task's entry is a remote hit, qk fetches the other
+entries of the recent runs that used it in the background, nearest to it
+first, so a dependent usually finds its entry already local; a task whose
+entry is still being fetched waits for that fetch. Prefetching stops when
+fewer than half of the run's entries match the runs it follows, after a
+gigabyte or 5,000 entries, or when the run ends, without waiting for it. A
+prefetched entry is shown as `[remote cache]`, and listed, only once a task
+uses it. `QK_REMOTE_PREFETCH=off` turns it off.
+
+## Store server
+
+nx.json's `storeServer` key sends the remote cache to a store server instead
+of S3, with its token in `QK_STORE_SERVER_TOKEN`:
+
+```jsonc
+{
+  "storeServer": { "url": "https://cache.example.com" }
+}
+```
+
+A store server keeps the same entries, but each run first tells it which
+outputs the local cache holds, and it leaves those out of every entry it sends.
+It keeps the index itself and commits each entry once, so runs neither write
+announcements nor merge listings. `localMode`, `ciMode`, `uploadMode` and
+`NX_POWERPACK_CACHE_MODE` apply as they do for `s3`; setting both `s3` and
+`storeServer` is an error. A read token fetches; a write token also uploads.
+`tools/store-server` in qk's repository is a reference server, a Cloudflare
+Worker over R2, and documents the protocol in its `PROTOCOL.md`.
+
+## Storage limits
 
 The cache stays under a size limit: `NX_MAX_CACHE_SIZE`, else nx.json
 `maxCacheSize`, else a tenth of the disk holding it, as in Nx. Sizes are a
@@ -94,7 +139,8 @@ qk evicts the least recently used entries until the cache fits. A hit counts
 as a use. Outputs shared between entries are stored once and deleted only
 with the last entry citing them. Stored outputs no entry cites, scratch files
 and locks of evicted entries are removed once they are an hour old, since a
-concurrent run may still be writing them. A run under the limit only sums the
+concurrent run may still be writing them; outputs a remote fetch in progress
+relies on are kept whatever their age. A run under the limit only sums the
 cache's size; the full pass runs at most hourly unless the cache is over its
 limit.
 

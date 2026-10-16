@@ -132,8 +132,15 @@ parsing `pnpm-lock.yaml` (`lockfile_parse`); each is charged to the task that
 needed it. A remote fetch also times waiting for the store's index
 (`remote_index_wait`), waiting for the store to respond (`remote_response`) and
 receiving the entry (`remote_body`). The last adds `bytes`, what was received,
-and `held_bytes`, how much of the files it carried the local cache held
-already. Runtime lines identify the command; other lines identify the task.
+`held_bytes`, how much of the files it carried the local cache held already,
+`apart_bytes`, what was received for outputs stored apart, and
+`skipped_bytes`, the outputs stored apart that were not fetched because the
+local cache held them. Fetching outputs stored apart is `remote_blobs`, with
+their count, and waiting for another fetch of the same entry is
+`remote_flight_wait`. Fetches made ahead of the tasks that need them are
+timed under the task `prefetch`, and a run that prefetched ends with
+`task=run stage=remote_prefetch`, counting the `entries` fetched ahead, those
+`claimed` by a task, and the `bytes` received. Runtime lines identify the command; other lines identify the task.
 Spans can overlap: runtime evaluation and the inventory are part of input
 resolution, restore phases are part of local restoration, and storing new warm
 files is part of saving warm state. Do not sum them as exclusive costs. Shared runtime commands are timed only when

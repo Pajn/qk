@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # Content-addressed remote store, run-grouped prefetch, and a store server
