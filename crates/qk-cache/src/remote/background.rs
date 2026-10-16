@@ -29,6 +29,10 @@ pub(super) struct Configuration {
     pub config: Value,
     /// The S3 session token, or the store server's token.
     pub token: Option<String>,
+    /// Variables the run's settings came from, beside nx.json, so the worker
+    /// resolves the same store and threshold.
+    #[serde(default)]
+    pub overrides: BTreeMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -173,6 +177,7 @@ pub(super) fn launch(
             kind: configuration.kind,
             config: configuration.config.clone(),
             token: configuration.token.clone(),
+            overrides: configuration.overrides.clone(),
         },
         snapshot: snapshot.path().to_owned(),
         jobs,
@@ -288,6 +293,9 @@ fn detach(_command: &mut Command) -> Result<()> {
 pub(crate) fn run() -> Result<()> {
     let request: Request = serde_json::from_reader(std::io::stdin().lock().take(MAX_REQUEST + 1))?;
     let mut environment = BTreeMap::new();
+    for (name, value) in &request.configuration.overrides {
+        environment.insert(name.into(), value.into());
+    }
     environment.insert("NX_POWERPACK_CACHE_MODE".into(), "read-write".into());
     let config = &request.configuration.config;
     let (s3, server, token) = match request.configuration.kind {

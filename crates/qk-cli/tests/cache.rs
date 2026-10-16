@@ -1339,6 +1339,29 @@ fn s3_and_a_store_server_together_are_refused() {
 }
 
 #[test]
+fn background_uploads_go_where_the_run_was_told_to_send_them() {
+    let server = store_server::FakeStoreServer::start();
+    let fixture = Fixture::new(target("build", json!({})));
+    // nx.json names a server that is not there; the variable overrides it.
+    fs::write(
+        fixture.root.join("nx.json"),
+        json!({"storeServer": {"url": "http://127.0.0.1:9"}}).to_string(),
+    )
+    .unwrap();
+    let output = success(server_build(
+        &fixture,
+        store_server::WRITE_TOKEN,
+        &[
+            ("QK_REMOTE_UPLOAD_MODE", "background"),
+            ("QK_STORE_SERVER_URL", &server.url),
+        ],
+    ));
+    let log = wait_for_detached_uploads(&detached_log(&output));
+    assert!(log.contains("0 failure(s)"), "{log}");
+    assert_eq!(server.state.lock().unwrap().records.len(), 1);
+}
+
+#[test]
 fn uploads_to_a_store_server_continue_in_the_background() {
     let server = store_server::FakeStoreServer::start();
     let fixture = Fixture::new(target("build", json!({})));

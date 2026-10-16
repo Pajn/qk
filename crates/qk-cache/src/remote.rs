@@ -284,10 +284,15 @@ pub fn configure(
             (Box::new(store), token)
         }
     };
-    let background = background.then(|| background::Configuration {
+    let overrides = ["QK_STORE_SERVER_URL", "QK_REMOTE_BLOB_THRESHOLD"]
+        .into_iter()
+        .filter_map(|name| Some((name.to_owned(), variable(name)?)))
+        .collect();
+    let background = background.then_some(background::Configuration {
         kind,
         config: detached,
         token,
+        overrides,
     });
     let mut remote = Remote::new(store, mode, background, threshold);
     remote.prefetching = variable("QK_REMOTE_PREFETCH").as_deref() != Some("off");
