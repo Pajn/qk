@@ -125,7 +125,11 @@ impl Cache {
         environment: &BTreeMap<std::ffi::OsString, std::ffi::OsString>,
     ) -> Self {
         let root = paths::cache_location(workspace);
-        let remote = match remote::configure(workspace.config.extra.get("s3"), environment) {
+        let remote = match remote::configure(
+            workspace.config.extra.get("s3"),
+            workspace.config.extra.get("storeServer"),
+            environment,
+        ) {
             Ok(remote) => remote.map(std::sync::Arc::new),
             Err(error) => {
                 qk_executor::status!("qk: remote cache disabled: {error:#}");

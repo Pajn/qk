@@ -82,16 +82,8 @@ impl S3 {
         match object {
             Object::Entry(key) => self.object("entries", key),
             Object::Warm { identity, branch } => {
-                let hash = |text: &str| blake3::hash(text.as_bytes()).to_hex()[..32].to_owned();
-                let identity = format!(
-                    "{identity}\0{}\0{}",
-                    std::env::consts::OS,
-                    std::env::consts::ARCH
-                );
-                self.object(
-                    "warm",
-                    &format!("{}/{}.json", hash(&identity), hash(branch)),
-                )
+                let (identity, branch) = super::store::warm_names(identity, branch);
+                self.object("warm", &format!("{identity}/{branch}.json"))
             }
             Object::Blob(hash) => self.object("blobs", hash),
         }

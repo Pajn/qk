@@ -78,6 +78,46 @@ pub(super) fn write(
     Ok(())
 }
 
+/// Writes the upload body a store server keeps for `record`: a header naming
+/// each blob it cites with its raw size, the record, then each blob `place`
+/// carries inline as its own Zstandard frame, which the server copies into
+/// the packs it sends. Its layout is in `tools/store-server/PROTOCOL.md`.
+pub(super) fn write_upload(
+    root: &Path,
+    record: &[u8],
+    place: impl Fn(&str) -> Result<Placement>,
+    output: impl Write,
+) -> Result<()> {
+    let parsed = crate::record::StoredRecord::read(record)?;
+    let mut frames = Vec::new();
+    let mut blobs = Vec::new();
+    for blob in parsed.blobs() {
+        if !crate::record::valid_hash(&blob) {
+            bail!("invalid blob name in remote record");
+        }
+        let length = std::fs::metadata(root.join("blobs").join(&blob))?.len();
+        let compressed = if place(&blob)? == Placement::Inline {
+            let frame = compress(root, &blob)?;
+            let size = frame.as_file().metadata()?.len();
+            frames.push(frame);
+            serde_json::Value::from(size)
+        } else {
+            serde_json::Value::Null
+        };
+        blobs.push(serde_json::json!([blob, length, compressed]));
+    }
+    let header = serde_json::to_vec(&serde_json::json!({"record": record.len(), "blobs": blobs}))?;
+    let mut output = io::BufWriter::new(output);
+    output.write_all(&u32::try_from(header.len())?.to_le_bytes())?;
+    output.write_all(&header)?;
+    output.write_all(record)?;
+    for frame in frames {
+        io::copy(&mut frame.reopen()?, &mut output)?;
+    }
+    output.flush()?;
+    Ok(())
+}
+
 /// What reading a pack moved: the bytes received, as compressed, how many of
 /// the inline blob bytes the local store held already, and how many bytes of
 /// blobs stored apart it did not fetch because the local store held them.

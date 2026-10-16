@@ -1185,6 +1185,177 @@ fn eviction_removes_least_recently_used_entries() {
 #[path = "support/s3.rs"]
 mod s3;
 
+#[path = "support/store_server.rs"]
+mod store_server;
+
+fn with_store_server(fixture: &Fixture, server: &store_server::FakeStoreServer) {
+    fs::write(
+        fixture.root.join("nx.json"),
+        json!({"storeServer": {"url": server.url}}).to_string(),
+    )
+    .unwrap();
+}
+
+fn server_build(fixture: &Fixture, token: &str, env: &[(&str, &str)]) -> Output {
+    let mut command = fixture.command(&fixture.root, &["run", "app:build"]);
+    command
+        .env("QK_STORE_SERVER_TOKEN", token)
+        .env_remove("CI")
+        .env_remove("NX_POWERPACK_CACHE_MODE");
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    command.output().unwrap()
+}
+
+fn cache_path(fixture: &Fixture) -> PathBuf {
+    PathBuf::from(
+        stdout(&success(fixture.qk(&fixture.root, &["cache", "path"])))
+            .trim()
+            .to_owned(),
+    )
+}
+
+#[test]
+fn a_store_server_leaves_out_the_blobs_a_client_holds() {
+    let server = store_server::FakeStoreServer::start();
+    let (fixture, _) = large_outputs(1);
+    with_store_server(&fixture, &server);
+    success(server_build(&fixture, store_server::WRITE_TOKEN, &[]));
+    assert_eq!(server.state.lock().unwrap().records.len(), 1);
+    // A machine holding the files, but not the entry, receives only the
+    // record and the table.
+    fs::remove_dir_all(cache_path(&fixture).join("entries")).unwrap();
+    fs::remove_dir_all(fixture.root.join("dist")).unwrap();
+    let output = success(server_build(&fixture, store_server::READ_TOKEN, &[]));
+    assert!(
+        stderr(&output).contains("qk: remote cache hit app:build"),
+        "{}",
+        stderr(&output)
+    );
+    let fetched = server.requests("entries/");
+    let (_, size) = fetched
+        .iter()
+        .rev()
+        .find(|(request, _)| request.starts_with("GET "))
+        .unwrap();
+    assert!(*size < 2 << 10, "the entry took {size} bytes");
+    assert!(server.requests("blobs/").is_empty());
+    assert_eq!(
+        fs::read(fixture.root.join("dist/0.bin")).unwrap(),
+        incompressible(8 << 10, 0)
+    );
+    assert_eq!(executions(&fixture), 1);
+}
+
+#[test]
+fn a_client_fetches_by_hash_what_a_store_server_wrongly_took_as_held() {
+    let server = store_server::FakeStoreServer::start();
+    let (fixture, _) = large_outputs(1);
+    with_store_server(&fixture, &server);
+    success(server_build(&fixture, store_server::WRITE_TOKEN, &[]));
+    server.state.lock().unwrap().omit_all = true;
+    clear_local_cache(&fixture);
+    fs::remove_dir_all(fixture.root.join("dist")).unwrap();
+    let output = success(server_build(&fixture, store_server::READ_TOKEN, &[]));
+    assert!(
+        stderr(&output).contains("qk: remote cache hit app:build"),
+        "{}",
+        stderr(&output)
+    );
+    // The large file, the small one and the log, each fetched once.
+    let gets = server
+        .requests("blobs/")
+        .into_iter()
+        .filter(|(request, _)| request.starts_with("GET "))
+        .count();
+    assert_eq!(gets, 3);
+    assert_eq!(
+        fs::read(fixture.root.join("dist/0.bin")).unwrap(),
+        incompressible(8 << 10, 0)
+    );
+    assert_eq!(executions(&fixture), 1);
+}
+
+#[test]
+fn a_commit_a_store_server_refuses_for_lost_blobs_is_made_again() {
+    let server = store_server::FakeStoreServer::start();
+    let (fixture, env) = large_outputs(1);
+    with_store_server(&fixture, &server);
+    server.state.lock().unwrap().fail_commit_once = true;
+    let output = success(server_build(&fixture, store_server::WRITE_TOKEN, &env));
+    assert!(
+        !stderr(&output).contains("upload failed"),
+        "{}",
+        stderr(&output)
+    );
+    let state = server.state.lock().unwrap();
+    assert_eq!(state.records.len(), 1);
+    assert_eq!(state.blobs.len(), 1);
+    let puts = state
+        .requests
+        .iter()
+        .filter(|(request, _)| request.starts_with("PUT /v4/blobs/"))
+        .count();
+    assert_eq!(puts, 2);
+}
+
+#[test]
+fn a_read_only_store_server_token_uploads_nothing() {
+    let server = store_server::FakeStoreServer::start();
+    let fixture = Fixture::new(target("build", json!({})));
+    with_store_server(&fixture, &server);
+    let output = success(server_build(&fixture, store_server::READ_TOKEN, &[]));
+    assert!(stderr(&output).contains("read-only"), "{}", stderr(&output));
+    assert!(server.state.lock().unwrap().records.is_empty());
+}
+
+#[test]
+fn s3_and_a_store_server_together_are_refused() {
+    let server = store_server::FakeStoreServer::start();
+    let fixture = Fixture::new(target("build", json!({})));
+    fs::write(
+        fixture.root.join("nx.json"),
+        json!({
+            "storeServer": {"url": server.url},
+            "s3": {"bucket": "cache", "region": "us-east-1"}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let output = success(server_build(&fixture, store_server::WRITE_TOKEN, &[]));
+    assert!(
+        stderr(&output).contains("configure s3 or storeServer, not both"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn uploads_to_a_store_server_continue_in_the_background() {
+    let server = store_server::FakeStoreServer::start();
+    let fixture = Fixture::new(target("build", json!({})));
+    with_store_server(&fixture, &server);
+    let output = success(server_build(
+        &fixture,
+        store_server::WRITE_TOKEN,
+        &[("QK_REMOTE_UPLOAD_MODE", "background")],
+    ));
+    let log = wait_for_detached_uploads(&detached_log(&output));
+    assert!(log.contains("0 failure(s)"), "{log}");
+    assert!(!log.contains(store_server::WRITE_TOKEN), "{log}");
+    let state = server.state.lock().unwrap();
+    assert_eq!(state.records.len(), 1);
+    assert!(
+        state
+            .requests
+            .iter()
+            .any(|(request, _)| request == "POST /v4/runs"),
+        "{:?}",
+        state.requests
+    );
+}
+
 /// Points the fixture at the fake S3 store and returns a command runner with
 /// credentials set.
 fn with_remote(fixture: &Fixture, server: &s3::FakeS3, extra: Value) -> Value {

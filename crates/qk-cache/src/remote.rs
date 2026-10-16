@@ -15,10 +15,12 @@
 //! entries the store holds spares the lookups it would answer with a miss.
 
 pub(crate) mod background;
+mod bloom;
 mod index;
 mod pack;
 mod prefetch;
 mod s3;
+mod server;
 mod store;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -205,11 +207,15 @@ fn agent() -> ureq::Agent {
 /// The remote store for a workspace, `Ok(None)` when none is configured or the
 /// mode turns it off, or why a configured store cannot be used.
 pub fn configure(
-    config: Option<&Value>,
+    s3: Option<&Value>,
+    server: Option<&Value>,
     environment: &BTreeMap<OsString, OsString>,
 ) -> Result<Option<Remote>> {
-    let Some(config) = config else {
-        return Ok(None);
+    let (config, kind) = match (s3, server) {
+        (None, None) => return Ok(None),
+        (Some(config), None) => (config, background::Kind::S3),
+        (None, Some(config)) => (config, background::Kind::Server),
+        (Some(_), Some(_)) => bail!("configure s3 or storeServer, not both"),
     };
     let variable = |name: &str| {
         environment
@@ -236,7 +242,6 @@ pub fn configure(
         "no-cache" => return Ok(None),
         other => bail!("unknown remote cache mode {other:?}; use read-write, read or no-cache"),
     };
-    let store = s3::configure(config, variable)?;
     let threshold = match variable("QK_REMOTE_BLOB_THRESHOLD").as_deref() {
         None => BLOB_THRESHOLD,
         Some("off") => u64::MAX,
@@ -250,21 +255,35 @@ pub fn configure(
         .or_else(|| setting("uploadMode"))
         .unwrap_or_else(|| "wait".into());
     let background = match upload_mode.as_str() {
-        "wait" => None,
-        "background" => {
-            let credentials = &store.credentials;
-            let mut config = config.clone();
-            config["accessKeyId"] = credentials.key().into();
-            config["secretAccessKey"] = credentials.secret().into();
-            config["uploadMode"] = "wait".into();
-            Some(background::Configuration {
-                config,
-                token: credentials.token().map(str::to_owned),
-            })
-        }
-        other => bail!("unknown s3 upload mode {other:?}; use wait or background"),
+        "wait" => false,
+        "background" => true,
+        other => bail!("unknown remote upload mode {other:?}; use wait or background"),
     };
-    let mut remote = Remote::new(Box::new(store), mode, background, threshold);
+    // The background worker re-enters this function with these settings, its
+    // credentials included, and waits for its own uploads.
+    let mut detached = config.clone();
+    detached["uploadMode"] = "wait".into();
+    let (store, token): (Box<dyn Store>, Option<String>) = match kind {
+        background::Kind::S3 => {
+            let store = s3::configure(config, variable)?;
+            let credentials = &store.credentials;
+            detached["accessKeyId"] = credentials.key().into();
+            detached["secretAccessKey"] = credentials.secret().into();
+            let token = credentials.token().map(str::to_owned);
+            (Box::new(store), token)
+        }
+        background::Kind::Server => {
+            let store = server::configure(config, variable)?;
+            let token = Some(store.token.clone());
+            (Box::new(store), token)
+        }
+    };
+    let background = background.then(|| background::Configuration {
+        kind,
+        config: detached,
+        token,
+    });
+    let mut remote = Remote::new(store, mode, background, threshold);
     remote.prefetching = variable("QK_REMOTE_PREFETCH").as_deref() != Some("off");
     Ok(Some(remote))
 }
@@ -301,6 +320,7 @@ impl Remote {
     /// Starts reading the store's index in the background, keeping a copy in
     /// the local cache at `root` so that later runs fetch only what is new.
     pub(crate) fn read_index(self: &Arc<Self>, root: &Path) {
+        self.store.begin(root);
         let path = root
             .join("remote")
             .join(&blake3::hash(self.store.location().as_bytes()).to_hex()[..32]);
@@ -569,7 +589,7 @@ impl Remote {
         let mut transfer = pack::Transfer::default();
         let apart = AtomicU64::new(0);
         let read = pack::read(root, body, check, &mut transfer, |missing| {
-            self.fetch_blobs(root, &missing, task, &apart)
+            self.fetch_blobs(root, object, &missing, task, &apart)
         });
         receiving.count("bytes", transfer.received);
         receiving.count("held_bytes", transfer.held);
@@ -590,6 +610,7 @@ impl Remote {
     fn fetch_blobs(
         &self,
         root: &Path,
+        owner: Object,
         blobs: &[String],
         task: &str,
         received: &AtomicU64,
@@ -605,7 +626,7 @@ impl Remote {
                 let _slot = self.blob_requests.take();
                 let body = self
                     .store
-                    .get(Object::Blob(hash), task)?
+                    .get_blob(hash, owner, task)?
                     .ok_or_else(|| MissingBlob(hash.clone()))?;
                 let bytes = pack::read_blob(root, hash, body)?;
                 received.fetch_add(bytes, Ordering::Relaxed);
@@ -697,23 +718,33 @@ impl Remote {
             let placement = self.place(root, &blob)?;
             placements.insert(blob, placement);
         }
+        let place = |blob: &str| {
+            placements
+                .get(blob)
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("blob {blob} was not placed"))
+        };
         let mut pack = tempfile::NamedTempFile::new_in(root.join("tmp"))?;
-        pack::write(
-            root,
-            record,
-            |blob| {
-                placements
-                    .get(blob)
-                    .copied()
-                    .ok_or_else(|| anyhow::anyhow!("blob {blob} was not placed"))
-            },
-            pack.as_file_mut(),
-        )?;
-        let file = pack.reopen()?;
-        if file.metadata()?.len() > LARGEST_UPLOAD {
+        match self.store.framing() {
+            store::Framing::Pack => pack::write(root, record, place, pack.as_file_mut())?,
+            store::Framing::Upload => pack::write_upload(root, record, place, pack.as_file_mut())?,
+        }
+        if pack.as_file().metadata()?.len() > LARGEST_UPLOAD {
             bail!("too large to upload as one object");
         }
-        self.store.put(object, file)
+        match self.store.put(object, pack.reopen()?) {
+            // The store lost blobs this process took it to hold: send them,
+            // and commit once more.
+            Err(error) if error.is::<store::MissingBlobs>() => {
+                let missing = error.downcast::<store::MissingBlobs>().unwrap().0;
+                for blob in &missing {
+                    self.stored.lock().unwrap().remove(blob);
+                    self.store_apart(root, blob, None)?;
+                }
+                self.store.put(object, pack.reopen()?)
+            }
+            put => put,
+        }
     }
 
     /// Decides where packs carry the blob `hash`, uploading it on its own if

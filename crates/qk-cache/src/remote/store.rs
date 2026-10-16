@@ -4,6 +4,7 @@
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::Read;
+use std::path::Path;
 
 use anyhow::Result;
 
@@ -23,7 +24,53 @@ pub(super) enum Object<'a> {
     Blob(&'a str),
 }
 
+/// How a store wants a record and the blobs it carries sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Framing {
+    /// One pack, read back as it was written.
+    Pack,
+    /// An upload body a store server composes packs from.
+    Upload,
+}
+
+/// The two names a warm record is stored under: its task's identity on this
+/// platform, and its branch, each as 32 hex digits.
+pub(super) fn warm_names(identity: &str, branch: &str) -> (String, String) {
+    let hash = |text: &str| blake3::hash(text.as_bytes()).to_hex()[..32].to_owned();
+    let identity = format!(
+        "{identity}\0{}\0{}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+    (hash(&identity), hash(branch))
+}
+
+/// A commit the store refused because it lacks these blobs stored apart.
+#[derive(Debug)]
+pub(super) struct MissingBlobs(pub Vec<String>);
+
+impl std::fmt::Display for MissingBlobs {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "the store lacks {} blobs", self.0.len())
+    }
+}
+
+impl std::error::Error for MissingBlobs {}
+
 pub(super) trait Store: Send + Sync {
+    /// How [`put`](Store::put) wants records sent.
+    fn framing(&self) -> Framing {
+        Framing::Pack
+    }
+
+    /// Starts whatever the store needs from the local cache at `root`.
+    fn begin(&self, _root: &Path) {}
+
+    /// The blob `hash`, stored apart from the record `owner` cites it in.
+    fn get_blob(&self, hash: &str, _owner: Object, task: &str) -> Result<Option<Body>> {
+        self.get(Object::Blob(hash), task)
+    }
+
     /// Names the store, so that each keeps its own local copy of its index.
     fn location(&self) -> String;
 

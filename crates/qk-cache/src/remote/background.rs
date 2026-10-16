@@ -17,9 +17,17 @@ use super::Upload;
 
 const MAX_REQUEST: u64 = 32 << 20;
 
+#[derive(Clone, Copy, Serialize, Deserialize)]
+pub(super) enum Kind {
+    S3,
+    Server,
+}
+
 #[derive(Serialize, Deserialize)]
 pub(super) struct Configuration {
+    pub kind: Kind,
     pub config: Value,
+    /// The S3 session token, or the store server's token.
     pub token: Option<String>,
 }
 
@@ -162,6 +170,7 @@ pub(super) fn launch(
     FileExt::lock_exclusive(&lease)?;
     let request = Request {
         configuration: Configuration {
+            kind: configuration.kind,
             config: configuration.config.clone(),
             token: configuration.token.clone(),
         },
@@ -280,12 +289,16 @@ pub(crate) fn run() -> Result<()> {
     let request: Request = serde_json::from_reader(std::io::stdin().lock().take(MAX_REQUEST + 1))?;
     let mut environment = BTreeMap::new();
     environment.insert("NX_POWERPACK_CACHE_MODE".into(), "read-write".into());
-    if let Some(token) = request.configuration.token {
-        environment.insert("AWS_SESSION_TOKEN".into(), token.into());
+    let config = &request.configuration.config;
+    let (s3, server, token) = match request.configuration.kind {
+        Kind::S3 => (Some(config), None, "AWS_SESSION_TOKEN"),
+        Kind::Server => (None, Some(config), "QK_STORE_SERVER_TOKEN"),
+    };
+    if let Some(value) = &request.configuration.token {
+        environment.insert(token.into(), value.into());
     }
     let remote = Arc::new(
-        super::configure(Some(&request.configuration.config), &environment)?
-            .context("worker remote cache is disabled")?,
+        super::configure(s3, server, &environment)?.context("worker remote cache is disabled")?,
     );
     // Do not adopt/delete a snapshot until the complete request is accepted.
     let cleanup = Cleanup(request.snapshot.clone());
