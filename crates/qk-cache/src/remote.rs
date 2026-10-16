@@ -454,13 +454,27 @@ impl Remote {
     /// The task's warm record saved on `branch`, with every blob it cites
     /// fetched into the local store and verified, or `None` when there is
     /// none.
+    /// A branch's warm save, or `None` when there is none or `accept` rejects
+    /// its key. The key is checked before any blob is read, so a save that
+    /// does not suit this checkout costs only its record.
     pub(crate) fn fetch_warm(
         &self,
         root: &Path,
         task: &str,
         branch: &str,
+        accept: impl Fn(&[String]) -> bool,
     ) -> Result<Option<Vec<u8>>> {
-        self.fetch_pack(root, &self.warm_object(task, branch), |_| Ok(()))
+        let fetched = self.fetch_pack(root, &self.warm_object(task, branch), |record| {
+            if accept(&record.warm_key()) {
+                Ok(())
+            } else {
+                Err(OtherWarmKey.into())
+            }
+        });
+        match fetched {
+            Err(error) if error.is::<OtherWarmKey>() => Ok(None),
+            fetched => fetched,
+        }
     }
 
     /// The record in the pack at `object`, once `check` accepts it and the
@@ -724,3 +738,15 @@ mod index_read_tests {
         assert_eq!(used.load(Ordering::Relaxed), LARGEST_INDEX);
     }
 }
+
+/// A remote warm save whose key does not suit this checkout.
+#[derive(Debug)]
+struct OtherWarmKey;
+
+impl std::fmt::Display for OtherWarmKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("remote warm state is for another key")
+    }
+}
+
+impl std::error::Error for OtherWarmKey {}

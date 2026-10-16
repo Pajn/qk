@@ -2685,6 +2685,62 @@ fn warm_state_is_shared_through_the_remote_by_branch() {
 
 #[cfg(unix)]
 #[test]
+fn a_remote_warm_save_for_another_key_is_not_downloaded() {
+    let server = s3::FakeS3::start();
+    let fixture = Fixture::new(json!({
+        "command": "if [ -f \"$TOOL_CACHE/seen\" ]; then cat \"$TOOL_CACHE/seen\"; else echo cold; fi; mkdir -p \"$TOOL_CACHE\" && echo \"$GITHUB_REF_NAME\" > \"$TOOL_CACHE/seen\"",
+        "qk:warm": {
+            "portable": true,
+            "env": {"TOOL_CACHE": "{warm}/tool"},
+            "key": ["{projectRoot}/toolchain.txt"]
+        }
+    }));
+    fs::write(fixture.root.join("toolchain.txt"), "1\n").unwrap();
+    with_remote(&fixture, &server, json!({}));
+    let on = |branch: &str| {
+        let output = success(remote_build(&fixture, &[("GITHUB_REF_NAME", branch)]));
+        stdout(&output)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    assert_eq!(on("main"), "cold");
+    let pack = server.objects("/cache/qk/v3/warm/").pop().unwrap();
+    let pack = server.state.lock().unwrap().objects[&pack].clone();
+    let pack = zstd::stream::decode_all(&pack[..]).unwrap();
+    let length = u64::from_le_bytes(pack[..8].try_into().unwrap()) as usize;
+    let record: Value = serde_json::from_slice(&pack[8..8 + length]).unwrap();
+    fn blobs(value: &Value, found: &mut Vec<String>) {
+        match value {
+            Value::Object(map) => {
+                if let Some(Value::String(blob)) = map.get("blob") {
+                    found.push(blob.clone());
+                }
+                map.values().for_each(|value| blobs(value, found));
+            }
+            Value::Array(values) => values.iter().for_each(|value| blobs(value, found)),
+            _ => {}
+        }
+    }
+    let mut saved = Vec::new();
+    blobs(&record, &mut saved);
+    assert!(!saved.is_empty(), "{record}");
+    clear_local_cache(&fixture);
+    let _ = fs::remove_dir_all(fixture.root.join(".git/qk/warm"));
+    // Another machine with another toolchain neither restores main's save nor
+    // downloads the files it holds.
+    fs::write(fixture.root.join("toolchain.txt"), "2\n").unwrap();
+    assert_eq!(on("feature"), "cold");
+    let cache = stdout(&success(fixture.qk(&fixture.root, &["cache", "path"])));
+    let local = PathBuf::from(cache.trim()).join("blobs");
+    for blob in saved {
+        assert!(!local.join(&blob).exists(), "{blob} was downloaded");
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn nonportable_warm_state_neither_reads_nor_writes_remote_saves() {
     let server = s3::FakeS3::start();
     let target = json!({

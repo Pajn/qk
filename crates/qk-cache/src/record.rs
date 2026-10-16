@@ -150,6 +150,18 @@ impl StoredRecord {
         Ok(())
     }
 
+    /// The warm key a warm record was saved under: a digest of each part.
+    pub(crate) fn warm_key(&self) -> Vec<String> {
+        self.0
+            .get("key")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect()
+    }
+
     /// Sorted, deduplicated blob names, including result logs and warm groups.
     pub(crate) fn blobs(&self) -> BTreeSet<String> {
         let mut blobs = BTreeSet::new();
