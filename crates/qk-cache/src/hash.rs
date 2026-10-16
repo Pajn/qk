@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use foldhash::{HashMap, HashMapExt, HashSet};
@@ -166,6 +166,8 @@ struct Membership {
     git_policies: BTreeSet<PathBuf>,
     ignore_contents: BTreeMap<PathBuf, String>,
     settled: bool,
+    /// When the refresh that produced this inventory began listing.
+    listed: Option<Instant>,
 }
 
 /// A candidate listing and the ignore policy captured with it. Keeping both
@@ -296,6 +298,7 @@ impl Membership {
             git_policies,
             ignore_contents,
             settled: false,
+            listed: None,
         };
         for directory in &membership.directories {
             if let Some(entries) = membership.entries(directory)? {
@@ -755,11 +758,17 @@ impl Snapshot {
     /// Content changes are checked separately by the file digest cache.
     #[cfg(test)]
     fn current_files(&self, root: &Path) -> Result<Arc<BTreeSet<String>>> {
-        Ok(self.current_files_for(root, None)?.files)
+        Ok(self.current_files_for(root, None, "test")?.files)
     }
 
     /// Refresh candidates as needed, returning their policy in the same snapshot.
-    fn current_files_for(&self, root: &Path, prefixes: Option<&[PathBuf]>) -> Result<Candidates> {
+    fn current_files_for(
+        &self,
+        root: &Path,
+        prefixes: Option<&[PathBuf]>,
+        task: &str,
+    ) -> Result<Candidates> {
+        let requested = Instant::now();
         loop {
             let previous = self.membership.lock().unwrap().clone();
             // Immutable entries let independent fingerprints validate their
@@ -771,7 +780,20 @@ impl Snapshot {
             if settled && previous.as_ref().unwrap().settled {
                 return Ok(previous.as_ref().unwrap().candidates());
             }
+            // A refresh holds this lock while it lists the workspace, so time
+            // spent here is time waiting for another task's listing.
+            let waiting = crate::profile::span(task, "inventory_wait");
             let mut cached = self.membership.lock().unwrap();
+            drop(waiting);
+            // A listing that began after this call reflects every change made
+            // before it, so it is as current as one made now. Tasks queued
+            // behind a refresh share the next one instead of each listing the
+            // workspace in turn.
+            if let Some(entry) = &*cached
+                && entry.listed.is_some_and(|listed| listed >= requested)
+            {
+                return Ok(entry.candidates());
+            }
             let current = match (&previous, &*cached) {
                 (Some(previous), Some(current)) => Arc::ptr_eq(previous, current),
                 (None, None) => true,
@@ -783,6 +805,8 @@ impl Snapshot {
                 continue;
             }
             drop(previous);
+            let _listing = crate::profile::span(task, "inventory_list");
+            let listed = Instant::now();
             // Recent listing policies may conceal edits on coarse filesystems.
             // Re-list sources while they settle, then rebuild the directory inventory
             // once before enabling reuse (including any newly created empty dirs).
@@ -830,6 +854,7 @@ impl Snapshot {
                     .all(|parent| membership.stamps.contains_key(&root.join(parent)))
             });
             membership.settled = rebuilt && covered && membership.state(None)?.1;
+            membership.listed = Some(listed);
             *cached = Some(Arc::new(membership));
             return Ok(candidates);
         }
@@ -897,7 +922,7 @@ impl Snapshot {
         Ok(())
     }
 
-    fn installed(&self, root: &Path) -> Result<Option<Arc<Installed>>> {
+    fn installed(&self, root: &Path, task: &str) -> Result<Option<Arc<Installed>>> {
         let absolute = root.join("pnpm-lock.yaml");
         let Ok(metadata) = std::fs::symlink_metadata(&absolute) else {
             return Ok(None);
@@ -912,7 +937,10 @@ impl Snapshot {
         {
             return Ok(Some(installed.clone()));
         }
-        let Some(installed) = parse_lockfile(&absolute) else {
+        let parsing = crate::profile::span(task, "lockfile_parse");
+        let parsed = parse_lockfile(&absolute);
+        drop(parsing);
+        let Some(installed) = parsed else {
             return Ok(None);
         };
         *current = Some(installed.clone());
@@ -1870,7 +1898,7 @@ fn resolve_candidates(
         );
     }
     let readable = snapshot
-        .installed(&workspace.root)?
+        .installed(&workspace.root, &task.id)?
         .is_some_and(|installed| installed.lockfile.is_some());
     // Always include workspace resolution and configuration. Dotenv files are
     // not keyed, as in Nx: they hold per-machine values and credentials, and a
@@ -1992,7 +2020,7 @@ pub fn inputs(
     cancelled: &AtomicBool,
 ) -> Result<Value> {
     let prefixes = snapshot.membership_prefixes(workspace, task)?;
-    let candidates = snapshot.current_files_for(&workspace.root, Some(&prefixes))?;
+    let candidates = snapshot.current_files_for(&workspace.root, Some(&prefixes), &task.id)?;
     let Resolved {
         files,
         mut values,
@@ -2008,7 +2036,7 @@ pub fn inputs(
         &candidates.files,
         &candidates.source_ignore,
     )?;
-    let installed = snapshot.installed(&workspace.root)?;
+    let installed = snapshot.installed(&workspace.root, &task.id)?;
     if let (Some((importers, external)), Some(installed)) = (lockfile, &installed)
         && let Some(lockfile) = &installed.lockfile
     {
@@ -2577,11 +2605,17 @@ mod tests {
         policy("alpha");
         let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
         let snapshot = Snapshot::new(&workspace, &graph, &root.path().join("cache")).unwrap();
-        let first = snapshot.current_files_for(root.path(), None).unwrap();
+        let first = snapshot
+            .current_files_for(root.path(), None, "test")
+            .unwrap();
         policy("beta");
-        let second = snapshot.current_files_for(root.path(), None).unwrap();
+        let second = snapshot
+            .current_files_for(root.path(), None, "test")
+            .unwrap();
         policy("gamma");
-        let third = snapshot.current_files_for(root.path(), None).unwrap();
+        let third = snapshot
+            .current_files_for(root.path(), None, "test")
+            .unwrap();
         // Deterministically pause two fingerprints after candidate acquisition,
         // then let another fingerprint refresh policy twice before they resolve.
         let cancelled = AtomicBool::new(false);
@@ -2645,17 +2679,17 @@ mod tests {
             .membership_prefixes(&workspace, &graph.tasks["app:build"])
             .unwrap();
         let before = snapshot
-            .current_files_for(&workspace.root, Some(&left))
+            .current_files_for(&workspace.root, Some(&left), "test")
             .unwrap();
         std::fs::write(root.path().join("right/empty/new.txt"), "right").unwrap();
         let unrelated = snapshot
-            .current_files_for(&workspace.root, Some(&left))
+            .current_files_for(&workspace.root, Some(&left), "test")
             .unwrap();
         assert!(Arc::ptr_eq(&before.files, &unrelated.files));
         assert!(!unrelated.files.contains("right/empty/new.txt"));
         assert!(
             snapshot
-                .current_files_for(&workspace.root, Some(&right))
+                .current_files_for(&workspace.root, Some(&right), "test")
                 .unwrap()
                 .files
                 .contains("right/empty/new.txt")
@@ -2664,7 +2698,7 @@ mod tests {
         std::fs::write(root.path().join("left/empty/nested/new.txt"), "left").unwrap();
         assert!(
             snapshot
-                .current_files_for(&workspace.root, Some(&left))
+                .current_files_for(&workspace.root, Some(&left), "test")
                 .unwrap()
                 .files
                 .contains("left/empty/nested/new.txt")
@@ -2672,7 +2706,7 @@ mod tests {
         std::fs::write(root.path().join("right/empty/another.txt"), "right").unwrap();
         assert!(
             snapshot
-                .current_files_for(&workspace.root, Some(&all))
+                .current_files_for(&workspace.root, Some(&all), "test")
                 .unwrap()
                 .files
                 .contains("right/empty/another.txt")
