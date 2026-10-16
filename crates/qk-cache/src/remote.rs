@@ -463,7 +463,7 @@ impl Remote {
         accept: impl Fn(&[String]) -> bool,
     ) -> Result<Option<Vec<u8>>> {
         let fetched = self.fetch_pack(root, &self.warm_object(task, branch), |record| {
-            if accept(&record.warm_key()) {
+            if record.warm_key().is_some_and(|key| accept(&key)) {
                 Ok(())
             } else {
                 Err(OtherWarmKey.into())

@@ -2734,8 +2734,32 @@ fn a_remote_warm_save_for_another_key_is_not_downloaded() {
     assert_eq!(on("feature"), "cold");
     let cache = stdout(&success(fixture.qk(&fixture.root, &["cache", "path"])));
     let local = PathBuf::from(cache.trim()).join("blobs");
-    for blob in saved {
-        assert!(!local.join(&blob).exists(), "{blob} was downloaded");
+    for blob in &saved {
+        assert!(!local.join(blob).exists(), "{blob} was downloaded");
+    }
+
+    // Nor does a save whose key holds the matching digest beside something
+    // that is not a digest.
+    let name = server.objects("/cache/qk/v3/warm/").pop().unwrap();
+    let mut malformed = record.clone();
+    let digest = record["key"][0].clone();
+    malformed["key"] = json!([digest, null]);
+    let malformed = serde_json::to_vec(&malformed).unwrap();
+    let mut bytes = (malformed.len() as u64).to_le_bytes().to_vec();
+    bytes.extend_from_slice(&malformed);
+    bytes.extend_from_slice(&pack[8 + length..]);
+    server
+        .state
+        .lock()
+        .unwrap()
+        .objects
+        .insert(name, zstd::stream::encode_all(&bytes[..], 3).unwrap());
+    clear_local_cache(&fixture);
+    let _ = fs::remove_dir_all(fixture.root.join(".git/qk/warm"));
+    fs::write(fixture.root.join("toolchain.txt"), "1\n").unwrap();
+    assert_eq!(on("feature"), "cold");
+    for blob in &saved {
+        assert!(!local.join(blob).exists(), "{blob} was downloaded");
     }
 }
 
