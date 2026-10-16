@@ -229,7 +229,7 @@ impl Remote {
         if known.is_some_and(|known| !known.keys.contains_key(key)) {
             return Ok(false);
         }
-        let Some(manifest) = self.fetch_pack(root, Object::Entry(key), task, |parsed| {
+        let Some((manifest, pin)) = self.fetch_pack(root, Object::Entry(key), task, |parsed| {
             parsed.check_key(key)
         })?
         else {
@@ -240,6 +240,8 @@ impl Remote {
             &root.join("entries").join(format!("{key}.json")),
             &manifest,
         )?;
+        // The published manifest now keeps its blobs.
+        drop(pin);
         self.confirmed.lock().unwrap().insert(key.to_owned());
         Ok(true)
     }
@@ -281,6 +283,7 @@ impl Remote {
     /// fetched into the local store and verified, or `None` when there is
     /// none or `accept` rejects its key. The key is checked before any blob is
     /// read, so a save that does not suit this checkout costs only its record.
+    /// The pin keeps the blobs until the caller has stored the record.
     pub(crate) fn fetch_warm(
         &self,
         root: &Path,
@@ -288,7 +291,7 @@ impl Remote {
         task: &str,
         branch: &str,
         accept: impl Fn(&[String]) -> bool,
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<Option<(Vec<u8>, crate::evict::Pin)>> {
         let fetched = self.fetch_pack(root, Object::Warm { identity, branch }, task, |record| {
             if record.warm_key().is_some_and(|key| accept(&key)) {
                 Ok(())
@@ -303,16 +306,16 @@ impl Remote {
     }
 
     /// The record in the pack at `object`, once `check` accepts it and the
-    /// blobs it cites that the local store lacks are kept there, or `None`
-    /// when there is no such object. `task` names the task the fetch is for
-    /// in profile timings.
+    /// blobs it cites that the local store lacks are kept there, with a pin on
+    /// all of them, or `None` when there is no such object. `task` names the
+    /// task the fetch is for in profile timings.
     fn fetch_pack(
         &self,
         root: &Path,
         object: Object,
         task: &str,
         check: impl Fn(&crate::record::StoredRecord) -> Result<()>,
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<Option<(Vec<u8>, crate::evict::Pin)>> {
         let Some(body) = self.store.get(object, task)? else {
             return Ok(None);
         };

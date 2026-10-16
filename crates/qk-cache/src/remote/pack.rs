@@ -56,12 +56,16 @@ impl<R: Read> Read for Counting<'_, R> {
     }
 }
 
+/// Reads a pack into the local store at `root`, returning its record with a
+/// pin on every blob the record cites. The pin is taken once `check` accepts
+/// the record and before any blob is checked for, so blobs it finds already
+/// held cannot be pruned before the caller publishes the record.
 pub(super) fn read(
     root: &Path,
     input: impl Read,
     check: impl Fn(&StoredRecord) -> Result<()>,
     transfer: &mut Transfer,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, crate::evict::Pin)> {
     let input = Counting {
         inner: input,
         count: &mut transfer.received,
@@ -69,12 +73,12 @@ pub(super) fn read(
     let mut input = input.take(super::LARGEST_UPLOAD + 1);
     let mut decoder = zstd::stream::read::Decoder::new(&mut input)?;
     decoder.window_log_max(WINDOW_LOG_MAX)?;
-    let record = read_parts(root, &mut decoder, check, &mut transfer.held)?;
+    let read = read_parts(root, &mut decoder, check, &mut transfer.held)?;
     drop(decoder);
     if input.limit() == 0 {
         bail!("remote pack exceeds 5 GiB");
     }
-    Ok(record)
+    Ok(read)
 }
 
 fn read_parts(
@@ -82,7 +86,7 @@ fn read_parts(
     mut body: impl Read,
     check: impl Fn(&StoredRecord) -> Result<()>,
     held: &mut u64,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, crate::evict::Pin)> {
     let mut used = 0;
     let length = part_length(&mut body)?;
     part_size(&mut used, length, LARGEST_RECORD)?;
@@ -92,6 +96,7 @@ fn read_parts(
     }
     let parsed = crate::record::StoredRecord::read(&record).context("invalid remote record")?;
     check(&parsed)?;
+    let pin = crate::evict::pin(root, &parsed.blobs())?;
     for blob in parsed.blobs() {
         if !crate::record::valid_hash(&blob) {
             bail!("invalid blob name in remote record");
@@ -122,7 +127,7 @@ fn read_parts(
     if body.read(&mut [0])? != 0 {
         bail!("remote pack holds more than its record cites");
     }
-    Ok(record)
+    Ok((record, pin))
 }
 
 fn part_length(reader: &mut impl Read) -> Result<u64> {
@@ -154,7 +159,7 @@ mod tests {
         input: impl Read,
         check: impl Fn(&StoredRecord) -> Result<()>,
     ) -> Result<Vec<u8>> {
-        super::read(root, input, check, &mut Transfer::default())
+        super::read(root, input, check, &mut Transfer::default()).map(|(record, _)| record)
     }
 
     #[test]
@@ -177,6 +182,40 @@ mod tests {
         let mut holding = Transfer::default();
         super::read(source.path(), &encoded[..], |_| Ok(()), &mut holding).unwrap();
         assert_eq!(holding.held, "contents".len() as u64);
+    }
+
+    #[test]
+    fn reading_pins_every_cited_blob_until_the_pin_is_dropped() {
+        let source = root();
+        let blob = source.path().join("blobs/a");
+        std::fs::write(&blob, "contents").unwrap();
+        let name = crate::hash::digest_file(&blob).unwrap();
+        std::fs::rename(&blob, source.path().join("blobs").join(&name)).unwrap();
+        let record = serde_json::to_vec(&serde_json::json!({
+            "artifacts": {"file": {"blob": name}}
+        }))
+        .unwrap();
+        let mut encoded = Vec::new();
+        write(source.path(), &record, &mut encoded).unwrap();
+        let pins = source.path().join("locks/.pins");
+        let listed = || -> Vec<String> {
+            std::fs::read_dir(&pins)
+                .unwrap()
+                .flatten()
+                .filter(|item| item.path().extension().is_some_and(|e| e == "blobs"))
+                .map(|item| std::fs::read_to_string(item.path()).unwrap())
+                .collect()
+        };
+        let (_, pin) = super::read(
+            source.path(),
+            &encoded[..],
+            |_| Ok(()),
+            &mut Transfer::default(),
+        )
+        .unwrap();
+        assert_eq!(listed(), [format!("{name}\n")]);
+        drop(pin);
+        assert!(listed().is_empty());
     }
 
     fn root() -> tempfile::TempDir {
