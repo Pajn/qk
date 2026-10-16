@@ -506,6 +506,18 @@ mod tests {
         (root, blob)
     }
 
+    /// Prunes until `blob` is gone. A prune finds `.prune` held, and does
+    /// nothing, while a child another test is starting has not yet exec'd
+    /// away its copy of the lock.
+    fn prune_away(root: &Path, limit: u64, blob: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while root.join("blobs").join(blob).exists() && std::time::Instant::now() < deadline {
+            prune(root, limit).unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!root.join("blobs").join(blob).exists());
+    }
+
     #[test]
     fn a_pinned_blob_survives_evicting_the_last_entry_that_cites_it() {
         let (root, blob) = cited();
@@ -514,8 +526,7 @@ mod tests {
         assert_eq!(prune(root, 0).unwrap().entries, 1);
         assert!(root.join("blobs").join(&blob).exists());
         drop(pin);
-        prune(root, 0).unwrap();
-        assert!(!root.join("blobs").join(&blob).exists());
+        prune_away(root, 0, &blob);
     }
 
     #[test]
@@ -532,8 +543,7 @@ mod tests {
                 .unwrap()
                 .all(|item| { item.unwrap().file_name() == ".gate" })
         );
-        prune(root, 1 << 30).unwrap();
-        assert!(!root.join("blobs").join(&blob).exists());
+        prune_away(root, 1 << 30, &blob);
     }
 
     #[test]
