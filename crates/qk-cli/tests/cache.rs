@@ -1216,6 +1216,8 @@ fn cache_path(fixture: &Fixture) -> PathBuf {
     )
 }
 
+// The target is a POSIX shell command.
+#[cfg(unix)]
 #[test]
 fn a_store_server_leaves_out_the_blobs_a_client_holds() {
     let server = store_server::FakeStoreServer::start();
@@ -1248,6 +1250,8 @@ fn a_store_server_leaves_out_the_blobs_a_client_holds() {
     assert_eq!(executions(&fixture), 1);
 }
 
+// The target is a POSIX shell command.
+#[cfg(unix)]
 #[test]
 fn a_client_fetches_by_hash_what_a_store_server_wrongly_took_as_held() {
     let server = store_server::FakeStoreServer::start();
@@ -1277,6 +1281,8 @@ fn a_client_fetches_by_hash_what_a_store_server_wrongly_took_as_held() {
     assert_eq!(executions(&fixture), 1);
 }
 
+// The target is a POSIX shell command.
+#[cfg(unix)]
 #[test]
 fn a_commit_a_store_server_refuses_for_lost_blobs_is_made_again() {
     let server = store_server::FakeStoreServer::start();
@@ -1587,6 +1593,7 @@ fn remote_cache_restores_what_another_machine_uploaded() {
     assert!(stderr(&success(remote_build(&fixture, &[]))).contains("qk: cache hit app:build"));
 }
 
+#[cfg(unix)]
 /// Bytes that do not compress, the same in every run.
 fn incompressible(length: usize, seed: u64) -> Vec<u8> {
     let mut state = seed
@@ -1602,12 +1609,14 @@ fn incompressible(length: usize, seed: u64) -> Vec<u8> {
         .collect()
 }
 
+#[cfg(unix)]
 /// How often the target from [`large_outputs`] ran.
 fn executions(fixture: &Fixture) -> usize {
     fs::read_to_string(fixture.root.parent().unwrap().join("executions"))
         .map_or(0, |runs| runs.lines().count())
 }
 
+#[cfg(unix)]
 /// A target that copies `large/*.bin` into `dist/` beside a small file.
 fn large_outputs(fixture_files: usize) -> (Fixture, Vec<(&'static str, &'static str)>) {
     let fixture = Fixture::new(json!({
@@ -1626,6 +1635,8 @@ fn large_outputs(fixture_files: usize) -> (Fixture, Vec<(&'static str, &'static 
     (fixture, vec![("QK_REMOTE_BLOB_THRESHOLD", "1KB")])
 }
 
+// The target is a POSIX shell command.
+#[cfg(unix)]
 #[test]
 fn large_blobs_are_stored_apart_and_fetched_only_when_missing() {
     let server = s3::FakeS3::start();
@@ -1677,6 +1688,8 @@ fn large_blobs_are_stored_apart_and_fetched_only_when_missing() {
     assert_eq!(executions(&fixture), 1);
 }
 
+// The target is a POSIX shell command.
+#[cfg(unix)]
 #[test]
 fn a_cold_machine_fetches_large_blobs_the_index_names_beside_their_entry() {
     let server = s3::FakeS3::start();
@@ -1716,6 +1729,8 @@ fn a_cold_machine_fetches_large_blobs_the_index_names_beside_their_entry() {
     );
 }
 
+// The target is a POSIX shell command.
+#[cfg(unix)]
 #[test]
 fn an_index_naming_a_blob_wrongly_costs_only_a_request() {
     let server = s3::FakeS3::start();
@@ -1739,6 +1754,8 @@ fn an_index_naming_a_blob_wrongly_costs_only_a_request() {
     assert_eq!(executions(&fixture), 1);
 }
 
+// The target is a POSIX shell command.
+#[cfg(unix)]
 #[test]
 fn a_large_blob_two_entries_share_is_uploaded_once() {
     let server = s3::FakeS3::start();
@@ -1757,6 +1774,8 @@ fn a_large_blob_two_entries_share_is_uploaded_once() {
     assert_eq!(puts, 1);
 }
 
+// The target is a POSIX shell command.
+#[cfg(unix)]
 #[test]
 fn a_blob_stored_apart_that_the_store_lost_makes_a_miss() {
     let server = s3::FakeS3::start();
@@ -1776,6 +1795,8 @@ fn a_blob_stored_apart_that_the_store_lost_makes_a_miss() {
     );
 }
 
+// The target is a POSIX shell command.
+#[cfg(unix)]
 #[test]
 fn a_corrupt_blob_stored_apart_is_rejected() {
     let server = s3::FakeS3::start();
@@ -1796,6 +1817,8 @@ fn a_corrupt_blob_stored_apart_is_rejected() {
     );
 }
 
+// The target is a POSIX shell command.
+#[cfg(unix)]
 #[test]
 fn blobs_stored_apart_are_fetched_a_few_at_a_time() {
     let server = s3::FakeS3::start();
@@ -2453,6 +2476,7 @@ fn a_run_lists_its_keys_in_the_order_it_used_them() {
     }
 }
 
+#[cfg(unix)]
 /// A chain of three cached targets, each writing its own output.
 fn chain() -> Fixture {
     let step = |name: &str, after: Option<&str>| {
@@ -2473,6 +2497,7 @@ fn chain() -> Fixture {
     }))
 }
 
+#[cfg(unix)]
 fn run_three(fixture: &Fixture, env: &[(&str, &str)]) -> Output {
     let mut command = fixture.command(&fixture.root, &["run", "app:three"]);
     command
@@ -2486,6 +2511,7 @@ fn run_three(fixture: &Fixture, env: &[(&str, &str)]) -> Output {
     success(command.output().unwrap())
 }
 
+#[cfg(unix)]
 /// Each step's entry object, by the step's name.
 fn chain_entries(fixture: &Fixture) -> std::collections::BTreeMap<String, String> {
     let cache = PathBuf::from(
@@ -2506,6 +2532,7 @@ fn chain_entries(fixture: &Fixture) -> std::collections::BTreeMap<String, String
     entries
 }
 
+#[cfg(unix)]
 /// Machine B's run of the chain machine A cached, with each request taking a
 /// while: when each step's entry was requested and answered.
 fn cold_chain(
@@ -2547,6 +2574,8 @@ fn cold_chain(
     (output, times)
 }
 
+// The target is a POSIX shell command.
+#[cfg(unix)]
 #[test]
 fn a_remote_hit_prefetches_the_entries_recent_runs_used_after_it() {
     let (_, times) = cold_chain(&[]);
@@ -2555,6 +2584,8 @@ fn a_remote_hit_prefetches_the_entries_recent_runs_used_after_it() {
     assert!(times["three"].0 < times["two"].1, "{times:?}");
 }
 
+// The target is a POSIX shell command.
+#[cfg(unix)]
 #[test]
 fn prefetching_can_be_turned_off() {
     let (_, times) = cold_chain(&[("QK_REMOTE_PREFETCH", "off")]);
