@@ -2738,6 +2738,16 @@ fn a_remote_warm_save_for_another_key_is_not_downloaded() {
         assert!(!local.join(blob).exists(), "{blob} was downloaded");
     }
 
+    // A machine with the same toolchain restores main's save. The branch is
+    // new, so main's is the only save there is for it.
+    clear_local_cache(&fixture);
+    let _ = fs::remove_dir_all(fixture.root.join(".git/qk/warm"));
+    fs::write(fixture.root.join("toolchain.txt"), "1\n").unwrap();
+    assert_eq!(on("other"), "main");
+    for blob in &saved {
+        assert!(local.join(blob).exists(), "{blob} was not downloaded");
+    }
+
     // Nor does a save whose key holds the matching digest beside something
     // that is not a digest.
     let name = server.objects("/cache/qk/v3/warm/").pop().unwrap();
