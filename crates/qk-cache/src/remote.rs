@@ -36,6 +36,8 @@ use serde_json::Value;
 const SIGNED_FOR: Duration = Duration::from_secs(15 * 60);
 /// Uploads in flight at once.
 const UPLOADERS: usize = 8;
+/// Connections kept open between requests to the store.
+const IDLE_CONNECTIONS: usize = 32;
 /// The most a single upload may hold, as S3 allows.
 const LARGEST_UPLOAD: u64 = 5 << 30;
 /// Listings fetched at once.
@@ -176,6 +178,12 @@ pub fn configure(
         .http_status_as_error(false)
         .timeout_connect(Some(Duration::from_secs(10)))
         .timeout_global(Some(Duration::from_secs(10 * 60)))
+        // Fetches run in every task slot at once, beside the uploaders, all to
+        // one host. Keeping that many connections idle lets a burst reuse
+        // them, where ureq's default of three would make most of it open a
+        // new connection and repeat the TLS handshake.
+        .max_idle_connections(IDLE_CONNECTIONS)
+        .max_idle_connections_per_host(IDLE_CONNECTIONS)
         .build()
         .into();
     Ok(Some(Remote {
