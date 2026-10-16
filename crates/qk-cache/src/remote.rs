@@ -54,7 +54,11 @@ const BLOB_FETCHERS: usize = 8;
 const BLOB_REQUESTS: usize = 24;
 /// The compressed size from which a blob is stored apart, unless
 /// `QK_REMOTE_BLOB_THRESHOLD` says otherwise. Below it, a request costs more
-/// than the bytes it would save.
+/// than the bytes it would save. In `tools/bench/remote.mjs`, at 230 ms and
+/// 200 Mbps, a cold restore with blobs from this size apart takes as long as
+/// one with every blob inline, and one with the files held a quarter less. A
+/// lower threshold restores as fast there, but that chain's large files are
+/// all 4 MiB, so it does not show what many medium blobs per entry would cost.
 const BLOB_THRESHOLD: u64 = 1 << 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
