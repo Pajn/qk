@@ -498,7 +498,7 @@ impl Cache {
         drop(local_profile);
         if let Some(remote) = &self.remote {
             let fetch_profile = profile::span(&task.id, "remote_fetch");
-            let fetched = remote.fetch(&self.root, &key);
+            let fetched = remote.fetch(&self.root, &key, &task.id);
             drop(fetch_profile);
             let fetched = fetched.and_then(|found| {
                 if !found {

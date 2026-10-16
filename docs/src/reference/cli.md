@@ -129,7 +129,11 @@ input recheck after it (`inputs_recheck`) and storing its result
 (`publish`). Input resolution also times listing the workspace's files
 (`inventory_list`), waiting for another task's listing (`inventory_wait`) and
 parsing `pnpm-lock.yaml` (`lockfile_parse`); each is charged to the task that
-needed it. Runtime lines identify the command; other lines identify the task.
+needed it. A remote fetch also times waiting for the store's index
+(`remote_index_wait`), waiting for the store to respond (`remote_response`) and
+receiving the entry (`remote_body`). The last adds `bytes`, what was received,
+and `held_bytes`, how much of the files it carried the local cache held
+already. Runtime lines identify the command; other lines identify the task.
 Spans can overlap: runtime evaluation and the inventory are part of input
 resolution, restore phases are part of local restoration, and storing new warm
 files is part of saving warm state. Do not sum them as exclusive costs. Shared runtime commands are timed only when

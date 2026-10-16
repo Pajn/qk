@@ -1428,7 +1428,7 @@ impl Cache {
             .filter(|_| warm.remote && warm.portable)?;
         for branch in branches(workspace) {
             let suits = |saved: &[String]| key_match(warm, current, saved).is_some();
-            match remote.fetch_warm(&self.root, &warm.identity, &branch, suits) {
+            match remote.fetch_warm(&self.root, &warm.identity, &task.id, &branch, suits) {
                 Ok(Some(bytes)) => {
                     let Some(record) = WarmRecord::read(&bytes, &warm.identity).ok() else {
                         continue;
