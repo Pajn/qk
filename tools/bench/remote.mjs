@@ -49,7 +49,9 @@ const largeBytes = Number(options["large-kb"]) * 1024;
 // The stand-in store: path-style objects in memory, signatures ignored.
 function store() {
   const objects = new Map();
-  const network = { latency: 0, bytesPerSecond: Infinity };
+  // One link for every response: each chunk takes the next free slot on it,
+  // so concurrent downloads share the bandwidth as they would on a network.
+  const network = { latency: 0, bytesPerSecond: Infinity, free: 0 };
   const send = (response, status, body = Buffer.alloc(0), head = false) => {
     setTimeout(() => {
       response.writeHead(status, { "Content-Length": body.length });
@@ -60,10 +62,14 @@ function store() {
         const part = body.subarray(at, at + chunk);
         at += part.length;
         const done = at >= body.length;
-        response.write(part);
-        if (done) return response.end();
-        const wait = network.bytesPerSecond === Infinity ? 0 : (part.length / network.bytesPerSecond) * 1000;
-        setTimeout(next, wait);
+        const now = performance.now();
+        const start = Math.max(now, network.free);
+        if (network.bytesPerSecond !== Infinity) network.free = start + (part.length / network.bytesPerSecond) * 1000;
+        setTimeout(() => {
+          response.write(part);
+          if (done) response.end();
+          else next();
+        }, start - now);
       };
       next();
     }, network.latency);
