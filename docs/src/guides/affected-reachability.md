@@ -113,12 +113,14 @@ is decided by its changed inputs:
 
 1. **A changed input that is not a source runs the whole task**, as do lockfile
    installs, a deleted manifest and an affected task it depends on, whose
-   outputs it may read. The task's ordinary inputs are what make this sound:
-   declare its harness, its workflow and anything else that changes how it
-   runs as inputs, outside `sources`. A dependency's `package.json` whose
-   fields dependents read are unchanged, such as one with only a new
-   `version` or `scripts`, is the exception: it does not count. A new or
-   moved dependency does.
+   outputs it may read. That holds whatever else touches the task, and for a
+   dependency the profile keeps for any reason, such as an anchor importing a
+   change; one it leaves out does not count. The task's ordinary inputs are
+   what make this sound: declare its harness, its workflow and anything else
+   that changes how it runs as inputs, outside `sources`. A dependency's
+   `package.json` whose fields dependents read are unchanged, such as one with
+   only a new `version` or `scripts`, is the exception: it does not count. A
+   new or moved dependency does.
 2. **An anchor that imports a change runs the whole task.** fallout searches
    from each anchor through the imports, at file granularity, comparing each
    changed file with its base version. A change made only of TypeScript types

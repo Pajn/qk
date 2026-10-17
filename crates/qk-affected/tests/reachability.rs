@@ -730,6 +730,146 @@ fn the_whole_task_runs_when_its_shell_or_a_non_source_input_changes() {
     );
 }
 
+/// `visual_repo` with `report` narrowed too: it reads `lib` alone, through
+/// `app`'s entry point, and depends on `visual`.
+fn report_repo() -> Repo {
+    let repo = visual_repo();
+    write(
+        &repo.root,
+        "apps/app/project.json",
+        r#"{
+            "name": "app",
+            "implicitDependencies": ["lib"],
+            "targets": {
+                "visual": {
+                    "command": "echo visual",
+                    "inputs": ["default", "^default"],
+                    "qk:reachability": {
+                        "anchors": ["{projectRoot}/visual/shell.ts"],
+                        "cases": ["{projectRoot}/visual/cases/*.ts"],
+                        "sources": ["{projectRoot}/src/**/*", "{projectRoot}/visual/**/*.ts", "{workspaceRoot}/libs/*/src/**/*"]
+                    }
+                },
+                "report": {
+                    "command": "echo report",
+                    "dependsOn": ["visual"],
+                    "inputs": ["^default"],
+                    "qk:reachability": {
+                        "anchors": ["{projectRoot}/src/main.ts"],
+                        "sources": ["{workspaceRoot}/libs/*/src/**/*"]
+                    }
+                }
+            }
+        }"#,
+    );
+    commit(&repo.root);
+    Repo {
+        base: git(&repo.root, &["rev-parse", "HEAD"]),
+        ..repo
+    }
+}
+
+#[test]
+fn a_task_touched_only_by_sources_runs_whole_while_a_dependency_runs() {
+    let repo = report_repo();
+    // `visual` runs for its harness, which is not a source; `report` is
+    // touched only by a source its anchors do not import.
+    write(
+        &repo.root,
+        "apps/app/visual/harness.json",
+        "{\"changed\": true}",
+    );
+    write(
+        &repo.root,
+        "libs/lib/src/unused.ts",
+        "export const unused = 2;\n",
+    );
+    let analysis = repo.tasks(Some("reach"));
+    assert_eq!(task_ids(&analysis), ["app:report", "app:visual"]);
+    assert!(
+        matches!(
+            &analysis.reachability["app:report"],
+            TaskDecision::Whole { why: Kept::Dependency { task } } if task == "app:visual"
+        ),
+        "{:?}",
+        analysis.reachability
+    );
+    // `visual` runs because its shell imports a change, a source.
+    write(
+        &repo.root,
+        "apps/app/visual/shell.ts",
+        "export const shell = 2;\n",
+    );
+    write(
+        &repo.root,
+        "libs/lib/src/unused.ts",
+        "export const unused = 3;\n",
+    );
+    let analysis = repo.tasks(Some("reach"));
+    assert_eq!(task_ids(&analysis), ["app:report", "app:visual"]);
+    assert!(
+        matches!(
+            &analysis.reachability["app:report"],
+            TaskDecision::Whole { why: Kept::Dependency { task } } if task == "app:visual"
+        ),
+        "{:?}",
+        analysis.reachability
+    );
+}
+
+#[test]
+fn a_task_narrowed_to_cases_runs_whole_while_a_dependency_runs() {
+    let repo = Repo::new(&[
+        (
+            "apps/app/project.json",
+            r#"{
+                "name": "app",
+                "implicitDependencies": ["lib"],
+                "targets": {
+                    "report": {"command": "echo report", "inputs": ["default"]},
+                    "visual": {
+                        "command": "echo visual",
+                        "dependsOn": ["report"],
+                        "inputs": ["{projectRoot}/visual/**/*", "^default"],
+                        "qk:reachability": {
+                            "anchors": ["{projectRoot}/visual/shell.ts"],
+                            "cases": ["{projectRoot}/visual/cases/*.ts"],
+                            "sources": ["{projectRoot}/visual/**/*.ts", "{workspaceRoot}/libs/*/src/**/*"]
+                        }
+                    }
+                }
+            }"#,
+        ),
+        ("apps/app/visual/shell.ts", "export const shell = 1;\n"),
+        (
+            "apps/app/visual/cases/first.ts",
+            "import { used } from \"../../../../libs/lib/src/used\";\nexport const first = used;\n",
+        ),
+        (
+            "apps/app/visual/cases/second.ts",
+            "export const second = 1;\n",
+        ),
+        ("apps/app/report.json", "{}"),
+    ]);
+    // `report` has no settings and runs for its own input; `visual` would
+    // otherwise be narrowed to the case importing `used`.
+    write(&repo.root, "apps/app/report.json", "{\"changed\": true}");
+    write(
+        &repo.root,
+        "libs/lib/src/used.ts",
+        "export const used = 2;\n",
+    );
+    let analysis = repo.tasks(Some("reach"));
+    assert!(
+        matches!(
+            &analysis.reachability["app:visual"],
+            TaskDecision::Whole { why: Kept::Dependency { task } } if task == "app:report"
+        ),
+        "{:?}",
+        analysis.reachability
+    );
+}
+
 #[test]
 fn task_selection_refuses_profiles_with_projections() {
     use qk_taskgraph::{Request, TaskGraph};
