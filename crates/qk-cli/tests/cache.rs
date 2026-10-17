@@ -4738,15 +4738,29 @@ fn json_inputs_key_only_the_fields_they_select() {
 }
 
 #[test]
-fn json_inputs_that_are_not_json_key_their_content_as_in_nx() {
+fn json_inputs_key_the_fields_of_yaml_files() {
     let fixture = with_lib(json!([
         {"json": "{projectRoot}/settings.yaml", "fields": ["packages"]}
     ]));
     let settings = |text: &str| fs::write(fixture.root.join("settings.yaml"), text).unwrap();
     settings("packages:\n  - apps/*\ncatalog:\n  lib: 1.0.0\n");
     assert!(!hit(&fixture, &fixture.root));
-    // The field filters do not apply, so any edit counts.
     settings("packages:\n  - apps/*\ncatalog:\n  lib: 1.1.0\n");
+    assert!(hit(&fixture, &fixture.root));
+    settings("packages:\n  - apps/*\n  - libs/*\ncatalog:\n  lib: 1.1.0\n");
+    assert!(!hit(&fixture, &fixture.root));
+}
+
+#[test]
+fn json_inputs_that_cannot_be_read_key_their_content_as_in_nx() {
+    let fixture = with_lib(json!([
+        {"json": "{projectRoot}/settings.toml", "fields": ["packages"]}
+    ]));
+    let settings = |text: &str| fs::write(fixture.root.join("settings.toml"), text).unwrap();
+    settings("packages = [\"apps/*\"]\ncatalog = \"1.0.0\"\n");
+    assert!(!hit(&fixture, &fixture.root));
+    // The field filters do not apply, so any edit counts.
+    settings("packages = [\"apps/*\"]\ncatalog = \"1.1.0\"\n");
     assert!(!hit(&fixture, &fixture.root));
     assert!(hit(&fixture, &fixture.root));
 }

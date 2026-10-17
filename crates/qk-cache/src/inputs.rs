@@ -312,7 +312,7 @@ impl InputChanges<'_> {
         };
         let read = |text: &Option<String>| {
             text.as_deref()
-                .and_then(|text| hash::json_projection(text, fields))
+                .and_then(|text| hash::json_projection(file, text, fields))
         };
         let before = read(before);
         before.is_some() && before == read(after)

@@ -38,7 +38,7 @@ Supported declarations:
 - `{"workingDirectory": "relative" | "absolute"}`, the directory qk was run
   from;
 - `{"json": "path", "fields": […], "excludeFields": […]}`, only the selected
-  dotted fields of a JSON file.
+  dotted fields of a JSON or YAML file.
 
 As in Nx, a named input cannot use `dependencies` or `projects`. With a
 package manager other than pnpm, lockfiles are always keyed by content.
@@ -108,13 +108,15 @@ qk was invoked from in the key.
 
 `{"json": "path", "fields": ["compilerOptions"], "excludeFields": ["scripts"]}`
 selects dotted fields of a JSON or JSONC file, even when source ignore rules
-exclude its path. As in Nx, a file that is neither is keyed by its whole
-content, without the field filters.
+exclude its path. A file named `.yaml` or `.yml` is read as YAML, which Nx
+does not do: Nx keys such a file by its whole content, so a key qk leaves
+unchanged can still change Nx's. As in Nx, a file qk cannot read is keyed by
+its whole content, without the field filters.
 
 Affected task selection compares the selected fields at both revisions, so a
 change to fields the input leaves out does not affect the task. A change it
-cannot compare counts, such as an added or deleted file, or one that is not
-JSON at either revision. Project selection, as in Nx, does not read `json`
+cannot compare counts, such as an added or deleted file, or one it cannot read
+at either revision. Project selection, as in Nx, does not read `json`
 inputs: a changed file touches the project that contains it, if any.
 
 ## `outputs`

@@ -1340,10 +1340,15 @@ pub fn source_files(root: &Path) -> Result<BTreeSet<String>> {
         .collect())
 }
 
-/// A JSON or JSONC text as a `json` input keys it: only `fields` when given,
-/// without `exclude`. `None` when the text is neither.
-pub(crate) fn json_projection(text: &str, fields: &JsonFields) -> Option<Value> {
-    let mut value = jsonc_parser::parse_to_serde_value(text, &Default::default()).ok()?;
+/// The text of `path` as a `json` input keys it: only `fields` when given,
+/// without `exclude`. A `.yaml` or `.yml` file is read as YAML, and any other
+/// as JSON or JSONC. `None` when it cannot be read so.
+pub(crate) fn json_projection(path: &str, text: &str, fields: &JsonFields) -> Option<Value> {
+    let mut value: Value = if path.ends_with(".yaml") || path.ends_with(".yml") {
+        serde_yaml_ng::from_str(text).ok()?
+    } else {
+        jsonc_parser::parse_to_serde_value(text, &Default::default()).ok()?
+    };
     if let Some(fields) = &fields.fields {
         let mut kept = json!({});
         for field in fields {
@@ -1777,10 +1782,11 @@ impl<'a> Resolver<'a> {
             exclude: list("excludeFields")?.unwrap_or_default(),
         };
         let value = match std::fs::read_to_string(self.workspace.root.join(&path)) {
-            Ok(text) => match json_projection(&text, &fields) {
+            Ok(text) => match json_projection(&path, &text, &fields) {
                 Some(value) => value,
-                // As in Nx, a file that is neither JSON nor JSONC is keyed by
-                // its content, without the field filters.
+                // As in Nx, a file it cannot read is keyed by its content,
+                // without the field filters. Nx reads no YAML, so it keys a
+                // YAML file whole where qk keys its fields.
                 None => {
                     self.selected.insert(path);
                     return Ok(());
