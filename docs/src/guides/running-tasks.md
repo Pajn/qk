@@ -102,13 +102,15 @@ draw as they would on one. It is the command's controlling terminal, as large
 as qk's, and both its stdout and stderr, so the output is recorded and
 replayed as one stream on stdout. Commands keep pipes for a target with
 `usePty: false`, for a command entry with a `prefix`, for several commands
-run side by side, and for every target under `NX_NATIVE_COMMAND_RUNNER=false`.
+run side by side, and for every `nx:run-commands` target under
+`NX_NATIVE_COMMAND_RUNNER=false`.
 Output qk passes straight through already reaches the terminal.
 
 Only the task a run is for reads qk's stdin, when it has a single command
 whose output is shown as it runs; other tasks read nothing. Run directly, it
-has the terminal itself. Under a pseudo-terminal, qk copies its input in and
-puts the terminal in raw input mode while the task runs, so each key arrives
+has the terminal itself. Under a pseudo-terminal, it reads input that is not
+a terminal, such as a pipe, directly; from a terminal, qk copies its input in
+and puts the terminal in raw input mode while the task runs, so each key arrives
 as typed and Ctrl-C interrupts the task; `tty: false` keeps the terminal's own
 line editing. What the task echoes of the input is part of its output.
 

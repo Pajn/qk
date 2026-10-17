@@ -9,7 +9,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
-use std::process::{Child, Command, ExitStatus};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -100,7 +100,12 @@ pub fn spawn(command: &mut Command, input: bool) -> io::Result<(Session, File)> 
     }
     let child = command.spawn()?;
     // Only the command may hold the follower, so reading the leader ends
-    // when the command and what it started have closed it.
+    // when the command and what it started have closed it: `command` keeps
+    // the copies it was given until they are replaced.
+    if input {
+        command.stdin(Stdio::null());
+    }
+    command.stdout(Stdio::null()).stderr(Stdio::null());
     drop(pty.follower);
     Ok((
         Session {
@@ -182,6 +187,13 @@ impl Read for Output {
     }
 }
 
+/// Whether the interactive command reads qk's input through its terminal:
+/// when that input is a terminal too. Other input, such as a pipe, it reads
+/// directly, so it sees where the input ends.
+pub fn forwards_input() -> bool {
+    io::IsTerminal::is_terminal(&io::stdin())
+}
+
 /// Copies qk's stdin into a pseudo-terminal while a command reads it, with
 /// qk's terminal in raw input mode when `raw`, so each key reaches the
 /// command as typed, Ctrl-C included, as Nx forwards input. Dropping it stops
@@ -200,8 +212,7 @@ impl Forwarder {
         // Not scoped: a read may be waiting on the terminal when the command
         // ends, so the thread polls and stops between reads.
         let thread = std::thread::spawn(move || {
-            let mut buffer = [0; 1024];
-            let mut stdin = io::stdin();
+            let mut buffer = [0u8; 1024];
             while !stopped.load(Ordering::SeqCst) {
                 let mut poll = libc::pollfd {
                     fd: 0,
@@ -216,10 +227,15 @@ impl Forwarder {
                     -1 => return,
                     _ => {}
                 }
-                match stdin.read(&mut buffer) {
-                    Ok(0) | Err(_) => return,
-                    Ok(count) => {
-                        if leader.write_all(&buffer[..count]).is_err() {
+                // Unbuffered, so what poll reports is what is read: std's
+                // `Stdin` would keep what it read ahead out of the next poll.
+                let count = unsafe { libc::read(0, buffer.as_mut_ptr().cast(), buffer.len()) };
+                match count {
+                    -1 if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => {}
+                    // A terminal reads no end unless it hangs up.
+                    0 | -1 => return,
+                    count => {
+                        if leader.write_all(&buffer[..count as usize]).is_err() {
                             return;
                         }
                     }

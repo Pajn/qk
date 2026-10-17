@@ -1620,10 +1620,12 @@ fn on_terminal(root: &Path, line: &str, env: &[(&str, &str)], input: &[u8]) -> S
     }
     let started = Instant::now();
     while child.try_wait().unwrap().is_none() {
-        assert!(
-            started.elapsed() < Duration::from_secs(20),
-            "qk never finished on the terminal"
-        );
+        if started.elapsed() > Duration::from_secs(20) {
+            // Its terminal's session ends with it, so a stuck run fails
+            // rather than holding the test's output open.
+            let _ = child.kill();
+            panic!("qk never finished on the terminal");
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
     let mut output = String::new();
@@ -1703,6 +1705,25 @@ fn the_task_a_run_is_for_reads_a_pseudo_terminal_on_a_cache_miss() {
     // A hit replays the log without reading any input.
     let hit = on_terminal(temp.path(), &line, &[], b"");
     assert!(hit.contains("got typed\n"), "{hit:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn piped_input_reaches_its_end_under_a_pseudo_terminal() {
+    let temp = fixture(json!({
+        "cat": {
+            "command": "if [ -t 1 ]; then echo terminal; fi; cat",
+            "cache": true,
+            "inputs": []
+        }
+    }));
+    // Output on the terminal, input from a pipe: `cat` sees where it ends.
+    let line = format!(
+        "printf 'piped\\n' | \"$qk\" --workspace '{}' run app:cat",
+        temp.path().display()
+    );
+    let output = on_terminal(temp.path(), &line, &[], b"");
+    assert!(output.contains("terminal\npiped\n"), "{output:?}");
 }
 
 #[cfg(unix)]

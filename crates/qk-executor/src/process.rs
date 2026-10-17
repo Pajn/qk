@@ -179,7 +179,7 @@ pub fn execute_captured(
                                 // One stream, as the terminal merges them.
                                 #[cfg(unix)]
                                 Some(leader) => {
-                                    if interactive {
+                                    if interactive && crate::pty::forwards_input() {
                                         forwarders.push(crate::pty::Forwarder::start(
                                             leader.try_clone()?,
                                             task.tty,
@@ -384,7 +384,8 @@ fn spawn(
             .is_none_or(|decoration| decoration.prefix.is_none())
         && std::io::IsTerminal::is_terminal(&std::io::stdout())
     {
-        let (session, leader) = crate::pty::spawn(&mut command, interactive)?;
+        let input = interactive && crate::pty::forwards_input();
+        let (session, leader) = crate::pty::spawn(&mut command, input)?;
         return Ok((Running::Session(session), Some(leader)));
     }
     #[cfg(unix)]
