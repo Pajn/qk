@@ -17,7 +17,7 @@ use qk_taskgraph::{Task, TaskGraph};
 use serde_json::{Value, json};
 
 use crate::glob::is_literal;
-use crate::inputs::{Resolved, manifest_for_dependents, workspace_without_resolution};
+use crate::inputs::{JsonFields, Resolved, manifest_for_dependents, workspace_without_resolution};
 use crate::paths::{self, Outputs, Pattern};
 
 pub fn digest_file(path: &Path) -> Result<String> {
@@ -1340,6 +1340,30 @@ pub fn source_files(root: &Path) -> Result<BTreeSet<String>> {
         .collect())
 }
 
+/// The text of `path` as a `json` input keys it: only `fields` when given,
+/// without `exclude`. A `.yaml` or `.yml` file is read as YAML, and any other
+/// as JSON or JSONC. `None` when it cannot be read so.
+pub(crate) fn json_projection(path: &str, text: &str, fields: &JsonFields) -> Option<Value> {
+    let mut value: Value = if path.ends_with(".yaml") || path.ends_with(".yml") {
+        serde_yaml_ng::from_str(text).ok()?
+    } else {
+        jsonc_parser::parse_to_serde_value(text, &Default::default()).ok()?
+    };
+    if let Some(fields) = &fields.fields {
+        let mut kept = json!({});
+        for field in fields {
+            if let Some(found) = json_path(&value, field) {
+                set_json_path(&mut kept, field, found.clone());
+            }
+        }
+        value = kept;
+    }
+    for field in &fields.exclude {
+        remove_json_path(&mut value, field);
+    }
+    Some(value)
+}
+
 fn json_path<'v>(value: &'v Value, path: &str) -> Option<&'v Value> {
     path.split('.')
         .try_fold(value, |value, part| value.get(part))
@@ -1404,6 +1428,7 @@ struct Resolver<'a> {
     selected: BTreeSet<String>,
     scopes: BTreeMap<FileScope, FileSelection>,
     values: BTreeMap<String, Value>,
+    json_fields: BTreeMap<String, JsonFields>,
     named_stack: Vec<(String, String)>,
     /// Dependency named inputs already expanded for `^` inputs.
     expanded: BTreeSet<(String, String)>,
@@ -1429,6 +1454,7 @@ impl<'a> Resolver<'a> {
             selected: BTreeSet::new(),
             scopes: BTreeMap::new(),
             values: BTreeMap::new(),
+            json_fields: BTreeMap::new(),
             named_stack: Vec::new(),
             expanded: BTreeSet::new(),
             external: BTreeSet::new(),
@@ -1751,31 +1777,26 @@ impl<'a> Resolver<'a> {
                 })
                 .transpose()
         };
-        let fields = list("fields")?;
-        let exclude = list("excludeFields")?.unwrap_or_default();
+        let fields = JsonFields {
+            fields: list("fields")?,
+            exclude: list("excludeFields")?.unwrap_or_default(),
+        };
         let value = match std::fs::read_to_string(self.workspace.root.join(&path)) {
-            Ok(text) => {
-                let mut value: Value =
-                    jsonc_parser::parse_to_serde_value(&text, &Default::default())
-                        .with_context(|| format!("cannot parse json input {path}"))?;
-                if let Some(fields) = &fields {
-                    let mut kept = json!({});
-                    for field in fields {
-                        if let Some(found) = json_path(&value, field) {
-                            set_json_path(&mut kept, field, found.clone());
-                        }
-                    }
-                    value = kept;
+            Ok(text) => match json_projection(&path, &text, &fields) {
+                Some(value) => value,
+                // As in Nx, a file it cannot read is keyed by its content,
+                // without the field filters. Nx reads no YAML, so it keys a
+                // YAML file whole where qk keys its fields.
+                None => {
+                    self.selected.insert(path);
+                    return Ok(());
                 }
-                for field in &exclude {
-                    remove_json_path(&mut value, field);
-                }
-                value
-            }
+            },
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Value::Null,
             Err(error) => return Err(error.into()),
         };
         self.values.insert(format!("json:{path}"), value);
+        self.json_fields.insert(path, fields);
         Ok(())
     }
 
@@ -2005,6 +2026,7 @@ fn resolve_candidates(
         files: resolver.selected,
         mandatory,
         values: resolver.values,
+        json_fields: resolver.json_fields,
         lockfile,
         workspace_file,
         external: resolver.external,

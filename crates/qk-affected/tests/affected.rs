@@ -447,9 +447,9 @@ fn empty_task_changes_skip_input_resolution() {
         (
             "apps/app/project.json",
             r#"{"name":"app","targets":{"build":{"command":"echo build",
-                "inputs":[{"json":"{projectRoot}/meta.json"}]}}}"#,
+                "inputs":[{"json":"{projectRoot}/meta.json","unsupported":true}]}}}"#,
         ),
-        ("apps/app/meta.json", "invalid JSON"),
+        ("apps/app/meta.json", "{}"),
     ]);
     let workspace = Workspace::load(&repo.root).unwrap();
     let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
@@ -659,8 +659,79 @@ fn a_changed_json_input_affects_the_task() {
             r#"{"name": "lib", "targets": {"build": {}, "test": {}}}"#,
         ),
     ]);
+    // A field the input does not select changes nothing it keys.
+    write(
+        &repo.root,
+        "apps/app/meta.json",
+        r#"{"version": 1, "comment": "x"}"#,
+    );
+    assert!(affected_tasks(&repo).is_empty());
     write(&repo.root, "apps/app/meta.json", r#"{"version": 2}"#);
     let tasks = affected_tasks(&repo);
+    assert_eq!(tasks.keys().collect::<Vec<_>>(), ["app:build"]);
+}
+
+#[test]
+fn a_json_input_does_not_narrow_a_file_other_inputs_select_whole() {
+    let repo = Repo::new(&[
+        (
+            "nx.json",
+            r#"{"targetDefaults": {"build": {"command": "echo build", "inputs": ["default", {"json": "{projectRoot}/meta.json", "fields": ["version"]}]}}}"#,
+        ),
+        (
+            "apps/app/project.json",
+            r#"{"name": "app", "targets": {"build": {}}}"#,
+        ),
+        ("apps/app/meta.json", r#"{"version": 1}"#),
+    ]);
+    write(
+        &repo.root,
+        "apps/app/meta.json",
+        r#"{"version": 1, "comment": "x"}"#,
+    );
+    let tasks = affected_tasks_of(&repo, &["app:build"]);
+    assert_eq!(tasks.keys().collect::<Vec<_>>(), ["app:build"]);
+}
+
+#[test]
+fn a_json_input_selects_fields_of_a_yaml_file() {
+    let repo = Repo::new(&[
+        (
+            "nx.json",
+            r#"{"targetDefaults": {"build": {"command": "echo build", "inputs": [{"json": "{projectRoot}/meta.yaml", "fields": ["version"]}]}}}"#,
+        ),
+        (
+            "apps/app/project.json",
+            r#"{"name": "app", "targets": {"build": {}}}"#,
+        ),
+        ("apps/app/meta.yaml", "version: 1\n"),
+    ]);
+    write(&repo.root, "apps/app/meta.yaml", "version: 1\ncomment: x\n");
+    assert!(affected_tasks_of(&repo, &["app:build"]).is_empty());
+    write(&repo.root, "apps/app/meta.yaml", "version: 2\ncomment: x\n");
+    let tasks = affected_tasks_of(&repo, &["app:build"]);
+    assert_eq!(tasks.keys().collect::<Vec<_>>(), ["app:build"]);
+}
+
+#[test]
+fn a_json_input_it_cannot_read_counts_any_change() {
+    let repo = Repo::new(&[
+        (
+            "nx.json",
+            r#"{"targetDefaults": {"build": {"command": "echo build", "inputs": [{"json": "{projectRoot}/meta.toml", "fields": ["version"]}]}}}"#,
+        ),
+        (
+            "apps/app/project.json",
+            r#"{"name": "app", "targets": {"build": {}}}"#,
+        ),
+        ("apps/app/meta.toml", "version = 1\n"),
+    ]);
+    write(
+        &repo.root,
+        "apps/app/meta.toml",
+        "version = 1\ncomment = \"x\"\n",
+    );
+    let tasks = affected_tasks_of(&repo, &["app:build"]);
     assert_eq!(tasks.keys().collect::<Vec<_>>(), ["app:build"]);
 }
 

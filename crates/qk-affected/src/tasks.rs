@@ -180,7 +180,24 @@ pub(crate) fn analyse(
         lockfiles.as_ref().map(|(before, after)| (before, after)),
         workspace_file_changed,
     )?
-    .with_manifests(manifests);
+    .with_manifests(manifests)
+    .with_json(
+        // Changed files JSON inputs select fields of, at both revisions.
+        changes
+            .files
+            .iter()
+            .filter(|file| {
+                resolved
+                    .values()
+                    .any(|inputs| inputs.json_fields.contains_key(*file))
+            })
+            .map(|file| {
+                let before = changes.read(file, changes.base.as_deref());
+                let after = changes.read(file, changes.head.as_deref());
+                (file.clone(), (before, after))
+            })
+            .collect(),
+    );
     for (id, inputs) in &resolved {
         let mut reasons = Vec::new();
         if let Some(file) = deleted_manifest {

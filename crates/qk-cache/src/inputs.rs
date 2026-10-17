@@ -23,6 +23,9 @@ pub struct Resolved {
     /// Env, runtime and other named values; env and runtime are evaluated only
     /// with a prepared task.
     pub values: BTreeMap<String, Value>,
+    /// The fields each JSON input selects, by file, so that a change can be
+    /// judged by them.
+    pub json_fields: BTreeMap<String, JsonFields>,
     /// With a readable pnpm lockfile: the importers whose installs count, and
     /// packages named by `externalDependencies`.
     pub lockfile: Option<(BTreeSet<String>, BTreeSet<String>)>,
@@ -31,6 +34,15 @@ pub struct Resolved {
     pub workspace_file: bool,
     /// Explicit external dependency names, even without a readable lockfile.
     pub external: BTreeSet<String>,
+}
+
+/// What a `json` input keys of its file.
+#[derive(Clone, Debug, Default)]
+pub struct JsonFields {
+    /// Only these dotted fields, or all of them.
+    pub fields: Option<Vec<String>>,
+    /// Without these dotted fields.
+    pub exclude: Vec<String>,
 }
 
 impl Resolved {
@@ -154,6 +166,8 @@ pub struct InputChanges<'a> {
     workspace_file_changed: bool,
     /// Changed manifests' base and head texts, `None` where absent.
     manifests: BTreeMap<String, (Option<String>, Option<String>)>,
+    /// Changed JSON inputs' base and head texts, `None` where absent.
+    json: BTreeMap<String, (Option<String>, Option<String>)>,
     links: BTreeMap<String, Vec<String>>,
     directory_links: BTreeMap<PathBuf, Vec<PathBuf>>,
 }
@@ -175,6 +189,7 @@ impl<'a> InputChanges<'a> {
             lockfiles,
             workspace_file_changed,
             manifests: BTreeMap::new(),
+            json: BTreeMap::new(),
             links: BTreeMap::new(),
             directory_links: BTreeMap::new(),
         })
@@ -191,6 +206,14 @@ impl<'a> InputChanges<'a> {
         self
     }
 
+    /// The base and head texts of changed files that JSON inputs select
+    /// fields of, so that such a change counts only when a selected field
+    /// changed. A changed JSON input without them counts as changed.
+    pub fn with_json(mut self, json: BTreeMap<String, (Option<String>, Option<String>)>) -> Self {
+        self.json = json;
+        self
+    }
+
     /// Sorted file reasons, then workspace metadata and installation reasons,
     /// preserving the order used in affected-task reports.
     pub fn reasons(&mut self, inputs: &Resolved) -> Result<Vec<InputChange>> {
@@ -198,7 +221,10 @@ impl<'a> InputChanges<'a> {
         let mut touched = BTreeSet::new();
         for file in inputs.file_inputs() {
             if self.changed.contains(file) {
-                touched.insert(file);
+                // A file the inputs also select whole counts by all of it.
+                if inputs.files.contains(file) || !self.json_unchanged(inputs, file) {
+                    touched.insert(file);
+                }
                 continue;
             }
             if !self.links.contains_key(file) {
@@ -273,6 +299,24 @@ impl<'a> InputChanges<'a> {
             _ => {}
         }
         Ok(reasons)
+    }
+}
+
+impl InputChanges<'_> {
+    /// Whether `file` is a JSON input whose selected fields are the same at
+    /// both revisions.
+    fn json_unchanged(&self, inputs: &Resolved, file: &str) -> bool {
+        let (Some(fields), Some((before, after))) =
+            (inputs.json_fields.get(file), self.json.get(file))
+        else {
+            return false;
+        };
+        let read = |text: &Option<String>| {
+            text.as_deref()
+                .and_then(|text| hash::json_projection(file, text, fields))
+        };
+        let before = read(before);
+        before.is_some() && before == read(after)
     }
 }
 
@@ -456,6 +500,7 @@ mod tests {
             files: BTreeSet::new(),
             mandatory: BTreeSet::from([path.to_owned()]),
             values: BTreeMap::from([(format!("manifest:{path}"), Value::Null)]),
+            json_fields: BTreeMap::new(),
             lockfile: lockfile.then(|| (BTreeSet::new(), BTreeSet::new())),
             workspace_file: false,
             external: BTreeSet::new(),
