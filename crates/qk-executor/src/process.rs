@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -16,16 +16,75 @@ pub enum Outcome {
     Cancelled,
 }
 
+/// A running command: in a process group of its own or, under a
+/// pseudo-terminal, a session of its own.
+enum Running {
+    Group(GroupChild),
+    #[cfg(unix)]
+    Session(crate::pty::Session),
+}
+
+impl Running {
+    fn id(&self) -> u32 {
+        match self {
+            Self::Group(child) => child.id(),
+            #[cfg(unix)]
+            Self::Session(child) => child.id(),
+        }
+    }
+
+    fn inner(&mut self) -> &mut std::process::Child {
+        match self {
+            Self::Group(child) => child.inner(),
+            #[cfg(unix)]
+            Self::Session(child) => child.inner(),
+        }
+    }
+
+    fn kill(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Group(child) => child.kill(),
+            #[cfg(unix)]
+            Self::Session(child) => child.kill(),
+        }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        match self {
+            Self::Group(child) => child.try_wait(),
+            #[cfg(unix)]
+            Self::Session(child) => child.try_wait(),
+        }
+    }
+
+    fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        match self {
+            Self::Group(child) => child.wait(),
+            #[cfg(unix)]
+            Self::Session(child) => child.wait(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn terminate(&self) {
+        use command_group::{Signal, UnixChildExt};
+        let _ = match self {
+            Self::Group(child) => child.signal(Signal::SIGTERM),
+            Self::Session(child) => child.signal(libc::SIGTERM),
+        };
+    }
+}
+
 /// The running commands, whose ids the task publishes while they run.
-struct Children<'a>(Vec<GroupChild>, &'a Mutex<BTreeSet<u32>>);
+struct Children<'a>(Vec<Running>, &'a Mutex<BTreeSet<u32>>);
 
 impl Children<'_> {
-    fn push(&mut self, child: GroupChild) {
+    fn push(&mut self, child: Running) {
         self.1.lock().unwrap().insert(child.id());
         self.0.push(child);
     }
 
-    fn remove(&mut self, index: usize) -> GroupChild {
+    fn remove(&mut self, index: usize) -> Running {
         let child = self.0.swap_remove(index);
         self.1.lock().unwrap().remove(&child.id());
         child
@@ -57,9 +116,8 @@ impl Children<'_> {
     fn terminate(&mut self) {
         #[cfg(unix)]
         {
-            use command_group::{Signal, UnixChildExt};
             for child in &self.0 {
-                let _ = child.signal(Signal::SIGTERM);
+                child.terminate();
             }
             let deadline = std::time::Instant::now() + GRACE;
             while std::time::Instant::now() < deadline
@@ -98,6 +156,9 @@ pub fn execute_captured(
     std::thread::scope(|scope| {
         let mut readers = Vec::new();
         let outcome = (|| {
+            // Dropped after `children`, once the interactive command is gone.
+            #[cfg(unix)]
+            let mut forwarders = Vec::new();
             let mut pending = task.commands.iter().enumerate();
             let mut children = Children(Vec::new(), &task.processes);
             let mut launched = Instant::now();
@@ -109,18 +170,47 @@ pub fn execute_captured(
                 if children.0.is_empty() || task.parallel {
                     for (index, command) in pending.by_ref() {
                         let interactive = task.interactive && task.commands.len() == 1;
-                        let mut child = spawn(task, command, index, capture.is_some(), interactive)
-                            .with_context(|| format!("cannot start command for {}", task.id))?;
+                        let (mut child, leader) =
+                            spawn(task, command, index, capture.is_some(), interactive)
+                                .with_context(|| format!("cannot start command for {}", task.id))?;
                         if let Some(capture) = capture {
-                            let stdout =
-                                child.inner().stdout.take().context("missing stdout pipe")?;
-                            let stderr =
-                                child.inner().stderr.take().context("missing stderr pipe")?;
                             let decoration = task.decorations.get(index);
-                            readers
-                                .push(scope.spawn(move || capture.copy(stdout, false, decoration)));
-                            readers
-                                .push(scope.spawn(move || capture.copy(stderr, true, decoration)));
+                            match leader {
+                                // One stream, as the terminal merges them.
+                                #[cfg(unix)]
+                                Some(leader) => {
+                                    if interactive && crate::pty::forwards_input() {
+                                        forwarders.push(crate::pty::Forwarder::start(
+                                            leader.try_clone()?,
+                                            task.tty,
+                                        ));
+                                    }
+                                    let output = crate::pty::Output(leader);
+                                    readers
+                                        .push(scope.spawn(move || {
+                                            capture.copy(output, false, decoration)
+                                        }));
+                                }
+                                _ => {
+                                    let stdout = child
+                                        .inner()
+                                        .stdout
+                                        .take()
+                                        .context("missing stdout pipe")?;
+                                    let stderr = child
+                                        .inner()
+                                        .stderr
+                                        .take()
+                                        .context("missing stderr pipe")?;
+                                    readers
+                                        .push(scope.spawn(move || {
+                                            capture.copy(stdout, false, decoration)
+                                        }));
+                                    readers.push(
+                                        scope.spawn(move || capture.copy(stderr, true, decoration)),
+                                    );
+                                }
+                            }
                         }
                         children.push(child);
                         launched = Instant::now();
@@ -209,13 +299,15 @@ pub fn shell(text: &str) -> Command {
 }
 
 /// Launch a task command with its environment, confinement and output streams.
+/// A captured command runs under a pseudo-terminal when qk's output is a
+/// terminal, as in Nx; the terminal's leader end is returned with it.
 fn spawn(
     task: &PreparedTask,
     text: &str,
     index: usize,
     capture: bool,
     interactive: bool,
-) -> Result<GroupChild> {
+) -> Result<(Running, Option<std::fs::File>)> {
     // Checked here rather than when the task is prepared: a dependency may
     // create the directory, as a native prebuild creates the project a build
     // runs in.
@@ -283,6 +375,20 @@ fn spawn(
         command.env("QK_TASK_SANDBOX", "1");
     }
     #[cfg(unix)]
+    if capture
+        && task.pseudo_terminal
+        // As in Nx, prefixed lines are not drawn on a terminal.
+        && task
+            .decorations
+            .get(index)
+            .is_none_or(|decoration| decoration.prefix.is_none())
+        && std::io::IsTerminal::is_terminal(&std::io::stdout())
+    {
+        let input = interactive && crate::pty::forwards_input();
+        let (session, leader) = crate::pty::spawn(&mut command, input)?;
+        return Ok((Running::Session(session), Some(leader)));
+    }
+    #[cfg(unix)]
     if interactive && terminal::in_foreground() {
         use std::os::unix::process::CommandExt;
         // Each command runs in its own process group, which the terminal
@@ -295,11 +401,11 @@ fn spawn(
             });
         }
     }
-    Ok(command.group_spawn()?)
+    Ok((Running::Group(command.group_spawn()?), None))
 }
 
 /// Handing the terminal to an interactive command and back.
-mod terminal {
+pub(crate) mod terminal {
     /// Whether stdin is a terminal whose foreground is qk's process group.
     #[cfg_attr(not(unix), allow(dead_code))]
     pub fn in_foreground() -> bool {

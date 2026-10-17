@@ -3,6 +3,8 @@
 mod capture;
 mod interpolate;
 mod process;
+#[cfg(unix)]
+mod pty;
 pub mod report;
 
 use std::collections::BTreeMap;
@@ -260,6 +262,13 @@ pub struct PreparedTask {
     /// The runner sets it for the one task a run is for, when that task has a
     /// single command whose output goes straight to the terminal.
     pub interactive: bool,
+    /// Whether captured commands may run under a pseudo-terminal, which they
+    /// do when qk's output is a terminal: Nx's `usePty`. Commands whose
+    /// output is hashed set it to false, so keys never depend on a terminal.
+    pub pseudo_terminal: bool,
+    /// Nx's `tty`: whether qk's terminal is in raw input mode while the
+    /// interactive task reads it through a pseudo-terminal.
+    pub tty: bool,
     /// What the commands run under, for `--sandbox`.
     pub sandbox: Option<Confinement>,
     pub recording: Option<Recording>,
@@ -526,9 +535,8 @@ pub fn prepare(
     }
     for key in options.keys() {
         let allowed = match executor {
-            // Every run-commands option is supported. `tty`, `usePty`,
-            // `streamOutput` and `verbose` have no effect: qk never gives
-            // commands a terminal, and Nx sets the others itself.
+            // Every run-commands option is supported. `streamOutput` and
+            // `verbose` have no effect: Nx sets them itself.
             "nx:run-commands" => true,
             "nx:run-script" => matches!(key.as_str(), "script" | "env" | "cwd"),
             "nx:noop" => true,
@@ -573,6 +581,17 @@ pub fn prepare(
     env.insert(path_key.clone(), path.clone());
     runtime_env.insert(path_key, path);
     let parallel = boolean(options.get("parallel"), true, "parallel")?;
+    let (mut pseudo_terminal, tty) = if executor == "nx:run-commands" {
+        (
+            boolean(options.get("usePty"), true, "usePty")?
+                && base_env
+                    .get(std::ffi::OsStr::new("NX_NATIVE_COMMAND_RUNNER"))
+                    .is_none_or(|value| value != "false"),
+            boolean(options.get("tty"), true, "tty")?,
+        )
+    } else {
+        (true, true)
+    };
     let mut decorations = Vec::new();
     let ready_when: Vec<String> = match options.get("readyWhen") {
         None | Some(Value::Null) => Vec::new(),
@@ -703,6 +722,8 @@ pub fn prepare(
         }
         _ => bail!("unsupported executor {executor:?}"),
     }
+    // As in Nx, commands run side by side share qk's output through pipes.
+    pseudo_terminal &= commands.len() == 1 || !parallel;
     Ok(PreparedTask {
         id: task.id.clone(),
         commands,
@@ -717,6 +738,8 @@ pub fn prepare(
         processes: Default::default(),
         decorations,
         interactive: false,
+        pseudo_terminal,
+        tty,
         sandbox: None,
         recording: None,
         display: Display::default(),

@@ -72,10 +72,10 @@ of the same name. An argument naming an executor option sets that option,
 for example `-- --args='--watch'`, `--cwd=dir`, `--no-parallel`, or
 `--env.NAME=value`.
 
-`tty`, `usePty`, `streamOutput`, and `verbose` are accepted without effect.
-qk does not create a pseudo-terminal. A single requested task with a single
-command and direct output can inherit stdin and the terminal foreground;
-captured commands see pipes. See [Running tasks](../guides/running-tasks.md).
+`usePty: false` runs the target's commands with pipes rather than a
+pseudo-terminal, and `tty: false` leaves the terminal out of raw mode while
+the task a run is for reads it. `streamOutput` and `verbose` are accepted
+without effect. See [Terminals and input](../guides/running-tasks.md#terminals-and-input).
 
 ## `nx:run-script`
 

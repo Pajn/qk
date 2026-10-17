@@ -171,7 +171,10 @@ they depend on.
 ## Saving and restoring results
 
 On a miss, the task runs with stdout and stderr streamed through a pipe while
-they are recorded, so child processes do not see a terminal. The entry is
+they are recorded, or, when qk's output is a terminal, through a
+[pseudo-terminal](running-tasks.md#terminals-and-input), which records them
+as one stream that replays on stdout. Runtime inputs always use pipes, so a
+key does not depend on where qk ran. The entry is
 saved only when the task succeeds and its inputs are unchanged afterwards.
 Declared dependency outputs are rechecked too. Cache keys use a new schema so
 entries saved before these artifact checks are not reused.

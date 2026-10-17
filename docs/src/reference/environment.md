@@ -39,6 +39,7 @@ against the merged child environment.
 | `NX_VERBOSE_LOGGING` | Task verbosity; `--verbose` sets it to `true` |
 | `NX_SKIP_LOG_GROUPING=true` | Disable static output groups in GitHub Actions |
 | `NO_COLOR`, `FORCE_COLOR` | Output color controls |
+| `NX_NATIVE_COMMAND_RUNNER=false` | Run `nx:run-commands` targets with pipes rather than a pseudo-terminal |
 | `CI` | CI output and remote cache mode selection |
 
 ## Cache controls

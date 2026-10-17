@@ -418,6 +418,8 @@ fn callbacks(
                 processes: Default::default(),
                 decorations: Vec::new(),
                 interactive: false,
+                pseudo_terminal: false,
+                tty: false,
                 sandbox: None,
                 recording: None,
                 display: Display::Stream,

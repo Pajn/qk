@@ -1585,6 +1585,147 @@ fn the_task_a_run_is_for_gets_the_terminal() {
     assert!(output.contains("got typed"), "{output:?}");
 }
 
+/// Runs `line` in a shell on a terminal of its own, through script(1), with
+/// `qk` naming the binary under test; types `input` once it has started, and
+/// returns what the terminal showed, with its line endings as `\n`.
+#[cfg(unix)]
+fn on_terminal(root: &Path, line: &str, env: &[(&str, &str)], input: &[u8]) -> String {
+    let line = format!("qk=\"{}\"; {line}", env!("CARGO_BIN_EXE_qk"));
+    let mut script = Command::new("script");
+    if cfg!(target_os = "macos") {
+        script.args(["-q", "/dev/null", "/bin/sh", "-c", &line]);
+    } else {
+        script.args(["-qec", &line, "/dev/null"]);
+    }
+    script
+        .current_dir(root)
+        .env_remove("NX_PARALLEL")
+        .env_remove("NX_CACHE_DIRECTORY")
+        .env_remove("CI")
+        .env_remove("GITHUB_ACTIONS")
+        .envs(env.iter().copied());
+    let mut child = script
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        let mut stdin = child.stdin.take().unwrap();
+        if !input.is_empty() {
+            std::thread::sleep(Duration::from_millis(500));
+            stdin.write_all(input).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let started = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if started.elapsed() > Duration::from_secs(20) {
+            // Its terminal's session ends with it, so a stuck run fails
+            // rather than holding the test's output open.
+            let _ = child.kill();
+            panic!("qk never finished on the terminal");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut output = String::new();
+    std::io::Read::read_to_string(&mut child.stdout.take().unwrap(), &mut output).unwrap();
+    output.replace("\r\n", "\n")
+}
+
+#[cfg(unix)]
+#[test]
+fn captured_tasks_run_under_a_pseudo_terminal_on_a_terminal() {
+    let probe = "if [ -t 1 ] && [ -t 2 ]; then echo out=terminal; else echo out=pipe; fi; \
+                 if [ -t 0 ]; then echo in=terminal; else echo in=other; fi";
+    let temp = fixture(json!({
+        "check": {"command": probe},
+        "script": {"executor": "nx:run-commands", "options": {"command": probe, "usePty": false}},
+        "side": {"executor": "nx:run-commands", "options": {"commands": [probe, "true"]}},
+        "serial": {"executor": "nx:run-commands", "options": {"commands": [probe, "true"], "parallel": false}},
+        "prefixed": {"executor": "nx:run-commands", "options": {"commands": [{"command": probe, "prefix": "p"}]}}
+    }));
+    let static_run = |target: &str, env: &[(&str, &str)]| {
+        on_terminal(
+            temp.path(),
+            &format!(
+                "\"$qk\" --workspace '{}' run-many -t {target} --output-style static",
+                temp.path().display()
+            ),
+            env,
+            b"",
+        )
+    };
+    // Only the task a run is for reads the terminal's input.
+    for target in ["check", "serial"] {
+        let output = static_run(target, &[]);
+        assert!(output.contains("out=terminal"), "{target}: {output:?}");
+        assert!(output.contains("in=other"), "{target}: {output:?}");
+    }
+    for target in ["script", "side", "prefixed"] {
+        let output = static_run(target, &[]);
+        assert!(output.contains("out=pipe"), "{target}: {output:?}");
+    }
+    let output = static_run("check", &[("NX_NATIVE_COMMAND_RUNNER", "false")]);
+    assert!(output.contains("out=pipe"), "{output:?}");
+    // Without a terminal, pipes.
+    let piped = run(
+        temp.path(),
+        &["run-many", "-t", "check", "--output-style", "static"],
+    );
+    assert!(
+        String::from_utf8(success(piped).stdout)
+            .unwrap()
+            .contains("out=pipe")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn the_task_a_run_is_for_reads_a_pseudo_terminal_on_a_cache_miss() {
+    let temp = fixture(json!({
+        "read": {
+            "command": "if [ -t 0 ] && [ -t 1 ]; then echo terminal; fi; read line; echo got $line",
+            "cache": true,
+            "inputs": []
+        }
+    }));
+    let line = format!(
+        "\"$qk\" --workspace '{}' run app:read; stty -a",
+        temp.path().display()
+    );
+    let output = on_terminal(temp.path(), &line, &[], b"typed\n");
+    assert!(output.contains("terminal\n"), "{output:?}");
+    assert!(output.contains("got typed\n"), "{output:?}");
+    // The terminal is back in canonical mode once the task ends.
+    assert!(
+        output.contains("icanon") && !output.contains("-icanon"),
+        "{output:?}"
+    );
+    // A hit replays the log without reading any input.
+    let hit = on_terminal(temp.path(), &line, &[], b"");
+    assert!(hit.contains("got typed\n"), "{hit:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn piped_input_reaches_its_end_under_a_pseudo_terminal() {
+    let temp = fixture(json!({
+        "cat": {
+            "command": "if [ -t 1 ]; then echo terminal; fi; cat",
+            "cache": true,
+            "inputs": []
+        }
+    }));
+    // Output on the terminal, input from a pipe: `cat` sees where it ends.
+    let line = format!(
+        "printf 'piped\\n' | \"$qk\" --workspace '{}' run app:cat",
+        temp.path().display()
+    );
+    let output = on_terminal(temp.path(), &line, &[], b"");
+    assert!(output.contains("terminal\npiped\n"), "{output:?}");
+}
+
 #[cfg(unix)]
 #[test]
 fn nx_run_flags_work_as_in_nx() {

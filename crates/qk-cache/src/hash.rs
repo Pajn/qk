@@ -1590,6 +1590,8 @@ impl<'a> Resolver<'a> {
                 prepared.commands = vec![command.into()];
                 prepared.cwd = self.workspace.root.clone();
                 prepared.parallel = false;
+                // Its output is hashed, so it must not depend on a terminal.
+                prepared.pseudo_terminal = false;
                 let log = tempfile::NamedTempFile::new()?;
                 let capture = Capture::new(Some(log.as_file().try_clone()?), Display::Hidden);
                 if execute_captured(&prepared, self.cancelled, Some(&capture))? != Outcome::Success
