@@ -61,9 +61,11 @@ parity claim yet. In particular:
   `npm:<name>@<version>` with peers and patch in the version, with edges from
   projects to what they install directly and between installations.
 - Nx plugins and inferred targets are outside the design's scope.
-- qk has its own live output panel and limited stdin/foreground terminal
-  support for a single requested task. It does not provide pseudo-terminals
-  or implement Nx release commands.
+- qk has its own live output panel, which takes no input, and does not
+  implement Nx release commands.
+- Pseudo-terminals are Unix only; on Windows commands see pipes, as they do
+  in Nx unless `NX_WINDOWS_PTY_SUPPORT` is set. A pseudo-terminal passes `\n`
+  through, where Nx's turns it into `\r\n`.
 
 The compatibility baseline is documented in Nx's
 [project configuration](https://nx.dev/docs/reference/project-configuration)

@@ -94,6 +94,24 @@ executed it, rather than restoring it from the cache, and the longest chain
 of tasks depending on it. A task without such runs is expected to take no
 time, so a workspace's first run starts tasks in the order of their ids.
 
+## Terminals and input
+
+As in Nx, when qk's stdout is a terminal, on Unix, a command whose output qk
+captures runs under a pseudo-terminal, so tools that check for a terminal
+draw as they would on one. It is the command's controlling terminal, as large
+as qk's, and both its stdout and stderr, so the output is recorded and
+replayed as one stream on stdout. Commands keep pipes for a target with
+`usePty: false`, for a command entry with a `prefix`, for several commands
+run side by side, and for every target under `NX_NATIVE_COMMAND_RUNNER=false`.
+Output qk passes straight through already reaches the terminal.
+
+Only the task a run is for reads qk's stdin, when it has a single command
+whose output is shown as it runs; other tasks read nothing. Run directly, it
+has the terminal itself. Under a pseudo-terminal, qk copies its input in and
+puts the terminal in raw input mode while the task runs, so each key arrives
+as typed and Ctrl-C interrupts the task; `tty: false` keeps the terminal's own
+line editing. What the task echoes of the input is part of its output.
+
 ## Waiting for memory
 
 Tasks that each fit in memory can exhaust it together, and a machine out of
