@@ -805,8 +805,17 @@ fn a_task_touched_only_by_sources_runs_whole_while_a_dependency_runs() {
         "libs/lib/src/unused.ts",
         "export const unused = 3;\n",
     );
+    write(&repo.root, "apps/app/visual/harness.json", "{}");
     let analysis = repo.tasks(Some("reach"));
     assert_eq!(task_ids(&analysis), ["app:report", "app:visual"]);
+    assert!(
+        matches!(
+            &analysis.reachability["app:visual"],
+            TaskDecision::Whole { why: Kept::Reached { anchor, .. } } if anchor == "apps/app/visual/shell.ts"
+        ),
+        "{:?}",
+        analysis.reachability
+    );
     assert!(
         matches!(
             &analysis.reachability["app:report"],
