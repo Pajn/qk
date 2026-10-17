@@ -221,7 +221,8 @@ impl<'a> InputChanges<'a> {
         let mut touched = BTreeSet::new();
         for file in inputs.file_inputs() {
             if self.changed.contains(file) {
-                if !self.json_unchanged(inputs, file) {
+                // A file the inputs also select whole counts by all of it.
+                if inputs.files.contains(file) || !self.json_unchanged(inputs, file) {
                     touched.insert(file);
                 }
                 continue;

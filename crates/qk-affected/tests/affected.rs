@@ -672,6 +672,28 @@ fn a_changed_json_input_affects_the_task() {
 }
 
 #[test]
+fn a_json_input_does_not_narrow_a_file_other_inputs_select_whole() {
+    let repo = Repo::new(&[
+        (
+            "nx.json",
+            r#"{"targetDefaults": {"build": {"command": "echo build", "inputs": ["default", {"json": "{projectRoot}/meta.json", "fields": ["version"]}]}}}"#,
+        ),
+        (
+            "apps/app/project.json",
+            r#"{"name": "app", "targets": {"build": {}}}"#,
+        ),
+        ("apps/app/meta.json", r#"{"version": 1}"#),
+    ]);
+    write(
+        &repo.root,
+        "apps/app/meta.json",
+        r#"{"version": 1, "comment": "x"}"#,
+    );
+    let tasks = affected_tasks_of(&repo, &["app:build"]);
+    assert_eq!(tasks.keys().collect::<Vec<_>>(), ["app:build"]);
+}
+
+#[test]
 fn a_json_input_selects_fields_of_a_yaml_file() {
     let repo = Repo::new(&[
         (
