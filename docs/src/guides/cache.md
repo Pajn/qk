@@ -38,7 +38,9 @@ A key has two kinds of input. What the task's `inputs` select counts as they
 say: a file by its whole content and a `json` input by its fields, whatever
 the file is. Beside them, qk adds workspace configuration and package-manager
 state to every task's key on its own, each by the rule below. Where an input
-selects a file qk would add, the input decides how it counts.
+selects a whole file qk would add, the file counts whole, as the input says. A
+`json` input on such a file adds its fields beside qk's copy rather than
+narrowing it.
 
 Root workspace files (the root `tsconfig.base.json` or
 `tsconfig.json`, `nx.json`, `.gitignore`, `.nxignore`, `pnpm-workspace.yaml`,
@@ -86,9 +88,10 @@ change. A task whose inputs select the file keys it whole, as they say. That
 includes a root project's own files and a task that reads the catalog itself,
 such as a catalog-consistency lint. A task that reads only `packages` or other
 keys outside resolution need not select it: the copy qk adds already covers
-them, while selecting it reruns the task on every catalog change. To key only
-some keys, a `json` input reads the file as YAML. Affected selection applies
-the same rules.
+them, while selecting it reruns the task on every catalog change. A task that
+reads only some resolution keys, such as `catalog`, can add them with a `json`
+input, which reads the file as YAML. Affected selection applies the same
+rules.
 
 `qk show hash <task>` prints a task's key and what it is computed from
 without running it, and `--against` compares it with another task's key or
