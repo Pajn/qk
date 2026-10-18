@@ -110,8 +110,9 @@ edges off.
 - A `targetDefaults` `filter.projects` given as a string is one pattern; Nx
   spreads it into one pattern per character.
 - Globs in project selectors, workspace package patterns, `targetDefaults`
-  keys and project target keys do not support minimatch's extended globs
-  such as `@(a|b)`: their characters match themselves.
+  keys, project target keys and `dependsOn` targets do not support
+  minimatch's extended globs such as `@(a|b)`: their characters match
+  themselves.
 - For affected-project selection, bare parenthesized extension groups such
   as `**/*.(svg|png)` select projects in qk that Nx 23.1.0 does not.
   See [Inputs and outputs](reference/inputs-outputs.md) for compatible syntax.

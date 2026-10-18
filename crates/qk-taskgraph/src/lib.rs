@@ -560,16 +560,14 @@ impl Builder<'_> {
             _ => bail!("dependency must be a string or object"),
         };
         // As in Nx, a glob stands for every target name in the workspace it
-        // matches, each then depended on as if named.
+        // matches as minimatch matches it, each then depended on as if named.
         let targets: Vec<String> = if qk_config::is_glob(&target) {
-            let matcher = globset::Glob::new(&target)
-                .with_context(|| format!("invalid dependency target {target:?}"))?
-                .compile_matcher();
+            let matcher = qk_config::minimatch::Minimatch::new(&target, false);
             self.workspace
                 .projects
                 .values()
                 .flat_map(|project| project.targets.keys())
-                .filter(|name| matcher.is_match(name.as_str()))
+                .filter(|name| matcher.is_match(name))
                 .cloned()
                 .collect::<BTreeSet<_>>()
                 .into_iter()

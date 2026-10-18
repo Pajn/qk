@@ -257,6 +257,26 @@ fn dependency_targets_may_contain_colons() {
 }
 
 #[test]
+fn dependency_target_globs_match_as_minimatch_does() {
+    let (_temp, workspace) = workspace(json!({
+        "app": {"targets":{
+            "build":{"dependsOn":["lint-*", "serve*"]},
+            "lint-js":{}, "lint-css":{}, "serve":{}, "serve/dev":{}
+        }}
+    }));
+    let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
+    // `*` does not cross a `/`, so `serve*` leaves `serve/dev` out.
+    assert_eq!(
+        graph.tasks["app:build"]
+            .dependencies
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["app:lint-css", "app:lint-js", "app:serve"]
+    );
+}
+
+#[test]
 fn named_projects_win_over_dependencies_true() {
     let (_temp, workspace) = workspace(json!({
         "app": {"implicitDependencies":["lib"], "targets":{"build":{"dependsOn":[
