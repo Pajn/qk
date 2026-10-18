@@ -130,7 +130,9 @@ parity claim yet. In particular:
   projects to what they install directly and between installations.
 - Nx plugins and inferred targets are outside the design's scope.
 - qk has its own live output panel, which takes no input, and does not
-  implement Nx release commands.
+  implement Nx release commands. Nx adds an `nx-release-publish` target to
+  each public package when `@nx/js` is installed; qk does not, as its
+  executor is a release executor qk cannot run.
 - An `externalDependencies` entry naming a package nothing installs is an
   error only with a pnpm lockfile qk can read; with any other lockfile qk
   cannot tell, and keys the lockfile whole.

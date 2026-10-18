@@ -1715,3 +1715,37 @@ fn graph_has_no_packages_when_the_lockfile_is_not_analysed() {
         .unwrap();
     assert_eq!(successful_json(output)["graph"]["externalNodes"], json!({}));
 }
+
+#[test]
+fn show_project_prints_the_graph_node_and_matches_patterns_as_nx() {
+    // The node lists implicit dependencies expanded.
+    let temp = TempDir::new().unwrap();
+    std::fs::write(temp.path().join("nx.json"), "{}").unwrap();
+    for (name, config) in [
+        (
+            "app",
+            r#"{"name": "app", "implicitDependencies": ["tag:lib", "!b"]}"#,
+        ),
+        ("a", r#"{"name": "a", "tags": ["lib"]}"#),
+        ("b", r#"{"name": "b", "tags": ["lib"]}"#),
+    ] {
+        std::fs::create_dir(temp.path().join(name)).unwrap();
+        std::fs::write(temp.path().join(name).join("project.json"), config).unwrap();
+    }
+    let output = isolated_command(env!("CARGO_BIN_EXE_qk"))
+        .args(["--workspace", temp.path().to_str().unwrap()])
+        .args(["show", "project", "app", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        successful_json(output)["implicitDependencies"],
+        json!(["a", "!b"])
+    );
+    let core = successful_json(qk(&["show", "project", "CORE", "--json"]));
+    assert_eq!(core["name"], "core");
+    let output = qk(&["show", "project", "apps/**", "--json"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Multiple projects matched"));
+    let output = qk(&["show", "project", "absent", "--json"]);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Could not find project absent"));
+}

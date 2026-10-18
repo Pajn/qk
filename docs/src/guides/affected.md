@@ -137,8 +137,8 @@ wherever Nx reads them: `--projects` and `--exclude`, `implicitDependencies`,
 - `--exclude` removes what its patterns match among the projects already
   selected.
 - Empty patterns and `nx-cloud:` references to other workspaces are skipped.
-  A selection matching nothing is empty; `show project` requires an existing
-  exact name.
+  A selection matching nothing is empty. As in Nx, `show project` takes a
+  name that is no project as a pattern, which must match exactly one.
 
 The `projects` of an input are read by Nx's native hasher, which differs:
 a first `!` pattern starts from nothing, and a plain name matches only that

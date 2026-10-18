@@ -8,7 +8,7 @@
 | `qk show projects -p 'web,tag:library' --exclude 'experimental-*'` | Matching names, globs, tags and roots, minus exclusions |
 | `qk show projects --with-target e2e --type app [--sep ,]` | Projects with one of the targets, of a type (`app`, `lib` or `e2e`, as Nx types them), joined by a separator |
 | `qk show projects --affected --affected-targets build,export` | Affected projects where a task of one of the targets is affected, as task selection decides it |
-| `qk show project <name> [--json]` | Normalized project configuration as JSON |
+| `qk show project <name> [--json]` | The project's graph node data as JSON; a name that is no project matches as a pattern, as in Nx |
 | `qk graph --file <path>` | Workspace project graph in a `{ "graph": { "nodes": ..., "dependencies": ... } }` envelope |
 | `qk graph` or `qk graph --file -` | The same graph on stdout |
 | `qk graph --external` | The graph with the packages the pnpm lockfile installs as `externalNodes` |

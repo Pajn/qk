@@ -1342,10 +1342,24 @@ fn run(mut cli: Cli) -> Result<i32> {
         Command::Show {
             command: ShowCommand::Project { name, .. },
         } => {
-            let Some(project) = workspace.projects.get(&name) else {
-                bail!("unknown project {name:?}");
+            // As Nx: a name that is no project is a pattern matching one.
+            let name = if workspace.projects.contains_key(&name) {
+                name
+            } else {
+                let matched = qk_config::find_matching_projects(
+                    &[name.as_str()],
+                    &workspace.projects,
+                    qk_config::Reader::Nx,
+                );
+                match matched.as_slice() {
+                    [one] => one.clone(),
+                    [] => bail!("Could not find project {name}"),
+                    many => bail!("Multiple projects matched:\n  {}", many.join("\n  ")),
+                }
             };
-            print_json(project)?;
+            // The graph's node, with implicit dependencies expanded.
+            let graph = ProjectGraph::build(&workspace)?;
+            print_json(&graph.nodes[&name].data)?;
         }
         Command::Graph {
             file,
