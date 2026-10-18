@@ -83,6 +83,9 @@ parity claim yet. In particular:
 - Nx plugins and inferred targets are outside the design's scope.
 - qk has its own live output panel, which takes no input, and does not
   implement Nx release commands.
+- An `externalDependencies` entry naming a package nothing installs is an
+  error only with a pnpm lockfile qk can read; with any other lockfile qk
+  cannot tell, and keys the lockfile whole.
 - Pseudo-terminals are Unix only; on Windows commands see pipes, as they do
   in Nx unless `NX_WINDOWS_PTY_SUPPORT` is set. A pseudo-terminal passes `\n`
   through, where Nx's turns it into `\r\n`.
