@@ -17,7 +17,9 @@ use qk_taskgraph::{Task, TaskGraph};
 use serde_json::{Value, json};
 
 use crate::glob::is_literal;
-use crate::inputs::{JsonFields, Resolved, manifest_for_dependents, workspace_without_resolution};
+use crate::inputs::{
+    Declared, Inferred, JsonFields, Resolved, manifest_for_dependents, workspace_without_resolution,
+};
 use crate::paths::{self, Outputs, Pattern};
 
 pub fn digest_file(path: &Path) -> Result<String> {
@@ -1920,48 +1922,70 @@ fn resolve_candidates(
                 .cloned(),
         );
     }
+    let declared = Declared {
+        files: resolver.selected,
+        values: resolver.values,
+        json_fields: resolver.json_fields,
+        external: resolver.external,
+    };
+    let inferred = infer(snapshot, workspace, task)?;
+    Ok(join(declared, inferred))
+}
+
+/// What qk adds to `task`'s key on its own, whatever its inputs declare.
+fn infer(snapshot: &Snapshot, workspace: &Workspace, task: &Task) -> Result<Inferred> {
     let readable = snapshot
         .installed(&workspace.root, &task.id)?
         .is_some_and(|installed| installed.lockfile.is_some());
-    // Always include workspace resolution and configuration. Dotenv files are
-    // not keyed, as in Nx: they hold per-machine values and credentials, and a
-    // task's `env` inputs key the variables it declares.
-    // A pnpm lockfile qk can read is keyed by what the task's projects install instead.
-    // The root tsconfig, as Nx hashes it into every task. The root package.json
-    // is not, as in Nx: what the root importer installs counts for every task
-    // through the lockfile, and the rest of it is the root project's manifest.
+    let exists = |path: &str| {
+        workspace.root.join(path).is_file() || snapshot.extra_candidates.contains(path)
+    };
+    let mut inferred = Inferred {
+        lockfile_readable: readable,
+        ..Inferred::default()
+    };
+    // Workspace resolution and configuration. Dotenv files are not keyed, as
+    // in Nx: they hold per-machine values and credentials, and a task's `env`
+    // inputs key the variables it declares. The root tsconfig, as Nx hashes it
+    // into every task. The root package.json is not, as in Nx: what the root
+    // importer installs counts for every task through the lockfile, and the
+    // rest of it is the root project's manifest.
     let tsconfig = ["tsconfig.base.json", "tsconfig.json"]
         .into_iter()
-        .find(|name| {
-            workspace.root.join(name).is_file() || snapshot.extra_candidates.contains(*name)
-        });
-    let mut mandatory = BTreeSet::new();
+        .find(|name| exists(name));
     for path in tsconfig.into_iter().chain([
         "nx.json",
         ".gitignore",
         ".nxignore",
         qk_config::LOCAL_WORKSPACE,
-        "pnpm-workspace.yaml",
-        "pnpm-lock.yaml",
         "package-lock.json",
         "yarn.lock",
         "bun.lock",
     ]) {
-        if (workspace.root.join(path).is_file() || snapshot.extra_candidates.contains(path))
-            && !(path == "pnpm-lock.yaml" && readable)
-        {
-            resolver.selected.insert(path.into());
-            mandatory.insert(path.into());
+        if exists(path) {
+            inferred.files.insert(path.into());
         }
     }
     if let Some(extended) = &workspace.extended {
-        resolver.selected.insert(extended.clone());
-        mandatory.insert(extended.clone());
+        inferred.files.insert(extended.clone());
     }
-    // The task's own manifests remain inputs even when filesets exclude them,
-    // its package scripts and dependency declarations with them. A dependency's
-    // package.json counts by what it decides for dependents, such as where
-    // their imports of it resolve; its installs count through the lockfile.
+    // A pnpm lockfile qk can read is keyed by what the task's projects
+    // install, and the workspace file without the resolution keys whose effect
+    // lands in it.
+    if exists("pnpm-workspace.yaml") {
+        if readable {
+            inferred.workspace_file = true;
+        } else {
+            inferred.files.insert("pnpm-workspace.yaml".into());
+        }
+    }
+    if exists("pnpm-lock.yaml") && !readable {
+        inferred.files.insert("pnpm-lock.yaml".into());
+    }
+    // The task's own manifests count whole, its package scripts and dependency
+    // declarations with them. A dependency's package.json counts by what it
+    // decides for dependents, such as where their imports of it resolve; its
+    // installs count through the lockfile.
     let mut packages = BTreeSet::from([task.project.clone()]);
     let mut pending = packages.clone();
     while let Some(project) = pending.pop_first() {
@@ -1986,51 +2010,66 @@ fn resolve_candidates(
                 .to_str()
                 .context("project path must be UTF-8")?
                 .replace('\\', "/");
-            mandatory.insert(path.clone());
-            // A manifest the task's inputs name counts whole, as they say.
-            if own || resolver.selected.contains(&path) {
-                resolver.selected.insert(path);
+            if own {
+                inferred.files.insert(path);
                 continue;
             }
             let text = std::fs::read_to_string(workspace.root.join(&path))
                 .with_context(|| format!("cannot read {path}"))?;
             match manifest_for_dependents(&text, readable) {
                 Some(value) => {
-                    resolver.values.insert(format!("manifest:{path}"), value);
+                    inferred.manifests.insert(path, value);
                 }
                 None => {
-                    resolver.selected.insert(path);
+                    inferred.files.insert(path);
                 }
             }
         }
     }
-    // However it was selected, the workspace file's resolution keys reach the
-    // task through the lockfile when qk can read it.
-    let workspace_file = readable && resolver.selected.remove("pnpm-workspace.yaml");
-    if workspace_file {
-        mandatory.remove("pnpm-workspace.yaml");
-    }
-    let lockfile = readable.then(|| {
+    if readable {
         // The root importer's packages resolve from every package in the
         // workspace, so they count for every task.
-        let importers = std::iter::once(".".to_owned())
-            .chain(
-                packages
-                    .iter()
-                    .map(|project| workspace.projects[project].root.clone()),
-            )
-            .collect();
-        (importers, resolver.external.clone())
+        inferred.lockfile = Some(
+            std::iter::once(".".to_owned())
+                .chain(
+                    packages
+                        .iter()
+                        .map(|project| workspace.projects[project].root.clone()),
+                )
+                .collect(),
+        );
+    }
+    Ok(inferred)
+}
+
+/// `declared` and `inferred` together. A file both select is left to the
+/// declared inputs, which count all of it.
+fn join(declared: Declared, mut inferred: Inferred) -> Resolved {
+    let mut covered = BTreeSet::new();
+    inferred.files.retain(|path| {
+        let keep = !declared.files.contains(path);
+        if !keep {
+            covered.insert(path.clone());
+        }
+        keep
     });
-    Ok(Resolved {
-        files: resolver.selected,
-        mandatory,
-        values: resolver.values,
-        json_fields: resolver.json_fields,
-        lockfile,
-        workspace_file,
-        external: resolver.external,
-    })
+    inferred.manifests.retain(|path, _| {
+        let keep = !declared.files.contains(path);
+        if !keep {
+            covered.insert(path.clone());
+        }
+        keep
+    });
+    if inferred.lockfile.is_some() && declared.files.contains("pnpm-lock.yaml") {
+        inferred.lockfile = None;
+        covered.insert("pnpm-lock.yaml".into());
+    }
+    if inferred.workspace_file && declared.files.contains("pnpm-workspace.yaml") {
+        inferred.workspace_file = false;
+        covered.insert("pnpm-workspace.yaml".into());
+    }
+    inferred.covered = covered;
+    Resolved { declared, inferred }
 }
 
 /// What a task's key is computed from, as JSON: kept by the history so a
@@ -2045,13 +2084,7 @@ pub fn inputs(
 ) -> Result<Value> {
     let prefixes = snapshot.membership_prefixes(workspace, task)?;
     let candidates = snapshot.current_files_for(&workspace.root, Some(&prefixes), &task.id)?;
-    let Resolved {
-        files,
-        mut values,
-        lockfile,
-        workspace_file,
-        ..
-    } = resolve_candidates(
+    let Resolved { declared, inferred } = resolve_candidates(
         snapshot,
         workspace,
         task,
@@ -2060,8 +2093,22 @@ pub fn inputs(
         &candidates.files,
         &candidates.source_ignore,
     )?;
+    let file_values = |paths: &BTreeSet<String>| {
+        paths
+            .iter()
+            .map(|path| {
+                let value = snapshot
+                    .file_value(&workspace.root, path)
+                    .with_context(|| format!("cannot read input {path}"))?;
+                Ok((path.clone(), value))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()
+    };
+    let files = file_values(&declared.files)?;
+    let mut values = declared.values;
+    let mut configuration = json!({ "files": file_values(&inferred.files)? });
     let installed = snapshot.installed(&workspace.root, &task.id)?;
-    if let (Some((importers, external)), Some(installed)) = (lockfile, &installed)
+    if let (Some(importers), Some(installed)) = (&inferred.lockfile, &installed)
         && let Some(lockfile) = &installed.lockfile
     {
         let importers: BTreeMap<_, _> = importers
@@ -2074,54 +2121,42 @@ pub fn inputs(
                 (importer.clone(), digest)
             })
             .collect();
-        let external: BTreeMap<_, _> = external
-            .iter()
-            .map(|name| {
-                let digest =
-                    installed.digest(&format!("package:{name}"), || lockfile.package(name));
-                (name.clone(), digest)
-            })
-            .collect();
-        values.insert(
-            "lockfile".into(),
-            json!({
-                "global": installed.digest("global", || BTreeSet::from([lockfile.global().to_string()])),
-                "importers": importers,
-                "external": external,
-            }),
-        );
-    }
-    let mut files = files
-        .iter()
-        .map(|path| {
-            let value = snapshot
-                .file_value(&workspace.root, path)
-                .with_context(|| format!("cannot read input {path}"))?;
-            Ok((path.clone(), value))
-        })
-        .collect::<Result<BTreeMap<_, _>>>()?;
-    if workspace_file {
-        match workspace_without_resolution(&workspace.root) {
-            Some(value) => {
-                values.insert("pnpm-workspace".into(), value);
-            }
-            None => {
-                files.insert(
-                    "pnpm-workspace.yaml".into(),
-                    snapshot.file_value(&workspace.root, "pnpm-workspace.yaml")?,
-                );
-            }
+        configuration["lockfile"] = json!({
+            "global": installed.digest("global", || BTreeSet::from([lockfile.global().to_string()])),
+            "importers": importers,
+        });
+        // A lockfile keyed whole already covers the packages it installs.
+        if !declared.external.is_empty() {
+            let external: BTreeMap<_, _> = declared
+                .external
+                .iter()
+                .map(|name| {
+                    let digest =
+                        installed.digest(&format!("package:{name}"), || lockfile.package(name));
+                    (name.clone(), digest)
+                })
+                .collect();
+            values.insert("externalDependencies".into(), json!(external));
         }
+    }
+    if inferred.workspace_file {
+        configuration["workspaceFile"] = match workspace_without_resolution(&workspace.root) {
+            Some(value) => value,
+            None => snapshot.file_value(&workspace.root, "pnpm-workspace.yaml")?,
+        };
+    }
+    if !inferred.manifests.is_empty() {
+        configuration["manifests"] = json!(inferred.manifests);
     }
     // Warm state configuration never changes a result.
     let mut definition = task.definition.clone();
     definition.extra.remove("qk:warm");
     definition.extra.remove("qk:threads");
     let hash = json!({
-        "schema":"qk-local-v2", "qk":env!("CARGO_PKG_VERSION"),
+        "schema":"qk-local-v3", "qk":env!("CARGO_PKG_VERSION"),
         "platform":[std::env::consts::OS, std::env::consts::ARCH], "workspace":snapshot.workspace_prefix,
         "id":task.id, "args":task.args, "definition":definition, "packageManager":workspace.package_manager,
-        "files":files, "values":values, "dependencies":dependencies,
+        "files":files, "values":values, "inferred":configuration, "dependencies":dependencies,
     });
     Ok(hash)
 }
@@ -2276,6 +2311,11 @@ fn dependency_keys_impl(
 
 #[cfg(test)]
 mod tests {
+
+    /// Every file keyed by its whole content, declared or inferred.
+    fn whole(resolved: &Resolved) -> BTreeSet<String> {
+        resolved.whole_files().map(str::to_owned).collect()
+    }
     use super::*;
     use qk_taskgraph::Request;
 
@@ -2663,7 +2703,7 @@ mod tests {
                 &candidates.source_ignore,
             )
             .unwrap();
-            assert_eq!(resolved.files, expected(name));
+            assert_eq!(whole(&resolved), expected(name));
         }
         // Inspection still uses its original candidate list and original policy.
         let inspected = resolve(
@@ -2674,7 +2714,7 @@ mod tests {
             &cancelled,
         )
         .unwrap();
-        assert_eq!(inspected.files, expected("alpha"));
+        assert_eq!(whole(&inspected), expected("alpha"));
     }
 
     #[test]
@@ -2967,7 +3007,7 @@ mod tests {
             &AtomicBool::new(false),
         )
         .unwrap();
-        assert!(resolved.files.contains("src/deleted"));
+        assert!(resolved.declared.files.contains("src/deleted"));
     }
 
     #[test]

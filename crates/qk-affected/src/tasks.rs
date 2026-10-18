@@ -189,7 +189,7 @@ pub(crate) fn analyse(
             .filter(|file| {
                 resolved
                     .values()
-                    .any(|inputs| inputs.json_fields.contains_key(*file))
+                    .any(|inputs| inputs.declared.json_fields.contains_key(*file))
             })
             .map(|file| {
                 let before = changes.read(file, changes.base.as_deref());

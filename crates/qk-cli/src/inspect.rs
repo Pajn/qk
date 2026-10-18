@@ -73,7 +73,8 @@ pub fn show(workspace: &Workspace, options: Options) -> Result<i32> {
         Some(Command::Inputs(_)) => {
             let mut resolved = qk_cache::resolve_tasks(workspace, &graph, &[])?;
             let inputs = resolved.remove(&task.id).context("target inputs missing")?;
-            data["files"] = json!(inputs.files);
+            let files: BTreeSet<String> = inputs.whole_files().map(str::to_owned).collect();
+            data["files"] = json!(files);
             for (values, category) in [
                 (
                     inputs.environment_inputs().collect::<Vec<_>>(),
@@ -93,11 +94,11 @@ pub fn show(workspace: &Workspace, options: Options) -> Result<i32> {
                     data[category] = json!(values);
                 }
             }
-            members.extend(inputs.external.iter().cloned());
-            if !inputs.external.is_empty() {
-                data["external"] = json!(inputs.external);
+            members.extend(inputs.declared.external.iter().cloned());
+            if !inputs.declared.external.is_empty() {
+                data["external"] = json!(inputs.declared.external);
             }
-            paths = inputs.files;
+            paths = files;
         }
         Some(Command::Outputs(_)) => {
             let (outputs, _) = qk_cache::resolved_outputs(workspace, task)?;

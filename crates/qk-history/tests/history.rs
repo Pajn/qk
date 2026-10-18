@@ -60,8 +60,8 @@ fn explains_what_changed_since_the_previous_key() {
             &inputs(&[(
                 "k1",
                 json!({"files": {"src/a.ts": "1", "src/gone.ts": "1"}, "values": {"env:MODE": "dev"},
-                       "dependencies": {"lib:build": "x"}, "definition": {"command": "tsc"},
-                       "lockfile": null}),
+                       "inferred": {"files": {"nx.json": "1"}},
+                       "dependencies": {"lib:build": "x"}, "definition": {"command": "tsc"}}),
             )]),
         )
         .unwrap();
@@ -72,18 +72,22 @@ fn explains_what_changed_since_the_previous_key() {
             run("two", 2_000, vec![task("app:build", Some("k2"), 2_000, 2_050, &[])]),
             &inputs(&[(
                 "k2",
-                json!({"files": {"src/a.ts": "2", "src/new.ts": "1"}, "values": {"env:MODE": "prod",
-                       "lockfile": {"global": "g", "importers": {".": "a", "apps/app": "b"}, "external": {}}},
+                json!({"files": {"src/a.ts": "2", "src/new.ts": "1"}, "values": {"env:MODE": "prod"},
+                       "inferred": {"files": {"nx.json": "2"},
+                                    "lockfile": {"global": "g", "importers": {".": "a", "apps/app": "b"}}},
                        "dependencies": {"lib:build": "y"}, "definition": {"command": "tsc"}}),
             )]),
         )
         .unwrap();
     let cause = second.tasks[0].cause.clone().unwrap();
     assert_eq!(cause.previous.unwrap().run, "one");
-    assert_eq!(cause.changed, ["dependencies", "env", "files", "lockfile"]);
+    assert_eq!(
+        cause.changed,
+        ["configuration", "dependencies", "env", "files", "lockfile"]
+    );
     assert_eq!(cause.files.added, ["src/new.ts"]);
     assert_eq!(cause.files.removed, ["src/gone.ts"]);
-    assert_eq!(cause.files.changed, ["src/a.ts"]);
+    assert_eq!(cause.files.changed, ["src/a.ts", "nx.json"]);
     assert_eq!(cause.dependencies, ["lib:build"]);
     assert!(cause.values.contains(&"env:MODE".to_owned()));
     assert!(

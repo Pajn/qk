@@ -1,5 +1,5 @@
-//! Declared task inputs shared by cache keys, revision-change selection and
-//! input analysis. Content evaluation remains in `hash`; revision loading and
+//! Task inputs shared by cache keys, revision-change selection and input
+//! analysis. Content evaluation remains in `hash`; revision loading and
 //! task dependency propagation remain with the caller.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -14,26 +14,50 @@ use serde_json::Value;
 
 use crate::{hash, paths};
 
-/// A task's selected file and non-file inputs, before cache-key evaluation.
+/// A task's inputs, before cache-key evaluation: what its declared inputs
+/// select, and what qk adds to every task on its own.
 pub struct Resolved {
+    pub declared: Declared,
+    pub inferred: Inferred,
+}
+
+/// What a task's `inputs` select, each kept as it says: files by their whole
+/// content and JSON inputs by their selected fields, whatever the file is.
+#[derive(Default)]
+pub struct Declared {
     /// Workspace-relative files whose content is part of the key.
     pub files: BTreeSet<String>,
-    /// Always-on workspace and package configuration, also useful to input analysis.
-    pub mandatory: BTreeSet<String>,
     /// Env, runtime and other named values; env and runtime are evaluated only
     /// with a prepared task.
     pub values: BTreeMap<String, Value>,
     /// The fields each JSON input selects, by file, so that a change can be
     /// judged by them.
     pub json_fields: BTreeMap<String, JsonFields>,
-    /// With a readable pnpm lockfile: the importers whose installs count, and
-    /// packages named by `externalDependencies`.
-    pub lockfile: Option<(BTreeSet<String>, BTreeSet<String>)>,
-    /// `pnpm-workspace.yaml` counts without its resolution keys, which reach
-    /// tasks through the lockfile instead.
-    pub workspace_file: bool,
-    /// Explicit external dependency names, even without a readable lockfile.
+    /// Packages named by `externalDependencies`.
     pub external: BTreeSet<String>,
+}
+
+/// What qk adds to every task's key on its own, each part by its own rule.
+/// A file the declared inputs already select is left out here, since the
+/// declared entry counts all of it.
+#[derive(Default)]
+pub struct Inferred {
+    /// Workspace configuration and the task's own manifests, by their whole
+    /// content.
+    pub files: BTreeSet<String>,
+    /// `pnpm-workspace.yaml` without its resolution keys, which reach tasks
+    /// through the lockfile instead.
+    pub workspace_file: bool,
+    /// With a readable pnpm lockfile: the importers whose installs count.
+    pub lockfile: Option<BTreeSet<String>>,
+    /// Whether qk can read the pnpm lockfile, so that what it records is left
+    /// out of manifests, and `externalDependencies` count by their installs.
+    pub lockfile_readable: bool,
+    /// Dependency manifests, each as its dependents' keys read it. See
+    /// [`manifest_for_dependents`].
+    pub manifests: BTreeMap<String, Value>,
+    /// Files qk would add that the declared inputs already select.
+    pub covered: BTreeSet<String>,
 }
 
 /// What a `json` input keys of its file.
@@ -45,27 +69,62 @@ pub struct JsonFields {
     pub exclude: Vec<String>,
 }
 
-impl Resolved {
-    /// JSON projections still name whole files for conservative change selection.
-    pub fn file_inputs(&self) -> impl Iterator<Item = &str> {
+impl Inferred {
+    /// Every file this part reads, whichever rule it counts by.
+    pub fn paths(&self) -> impl Iterator<Item = &str> {
         self.files
             .iter()
             .map(String::as_str)
-            .chain(self.json_inputs())
+            .chain(self.workspace_file.then_some("pnpm-workspace.yaml"))
+            .chain(self.lockfile.is_some().then_some("pnpm-lock.yaml"))
+            .chain(self.manifests.keys().map(String::as_str))
+    }
+
+    /// Package-manager files keyed by what they resolve to rather than by
+    /// their content.
+    pub fn is_resolution_metadata(&self, path: &str) -> bool {
+        (path == "pnpm-lock.yaml" && self.lockfile.is_some())
+            || (path == "pnpm-workspace.yaml" && self.workspace_file)
+    }
+}
+
+impl Resolved {
+    /// The files keyed by their whole content, declared or inferred.
+    pub fn whole_files(&self) -> impl Iterator<Item = &str> {
+        self.declared
+            .files
+            .iter()
+            .chain(&self.inferred.files)
+            .map(String::as_str)
+    }
+
+    /// Whether `path` is keyed by its whole content.
+    pub fn is_whole_file(&self, path: &str) -> bool {
+        self.declared.files.contains(path) || self.inferred.files.contains(path)
+    }
+
+    /// Whole files and the files of JSON inputs, for conservative change
+    /// selection.
+    pub fn file_inputs(&self) -> impl Iterator<Item = &str> {
+        self.whole_files().chain(self.json_inputs())
+    }
+
+    /// Every file qk adds on its own, including those the declared inputs
+    /// also select.
+    pub fn always_included(&self) -> BTreeSet<String> {
+        self.inferred
+            .paths()
+            .map(str::to_owned)
+            .chain(self.inferred.covered.iter().cloned())
+            .collect()
     }
 
     pub fn json_inputs(&self) -> impl Iterator<Item = &str> {
         self.value_names("json:")
     }
 
-    /// Dependency manifests keyed by what they decide for dependents, rather
-    /// than as files. See [`manifest_for_dependents`].
-    pub fn manifest_inputs(&self) -> impl Iterator<Item = &str> {
-        self.value_names("manifest:")
-    }
-
     pub fn is_json_input(&self, path: &str) -> bool {
-        self.values.contains_key(&format!("json:{path}"))
+        self.declared.values.contains_key(&format!("json:{path}"))
     }
 
     pub fn environment_inputs(&self) -> impl Iterator<Item = &str> {
@@ -78,20 +137,18 @@ impl Resolved {
 
     /// Each dependency-output pattern and whether it includes transitive tasks.
     pub fn dependency_output_inputs(&self) -> impl Iterator<Item = (&str, bool)> {
-        self.values.iter().filter_map(|(name, transitive)| {
-            name.strip_prefix("dependentTasksOutputFiles:")
-                .map(|pattern| (pattern, transitive == &Value::Bool(true)))
-        })
-    }
-
-    /// Installation-aware metadata is distinct from ordinary keyed file content.
-    pub fn is_resolution_metadata(&self, path: &str) -> bool {
-        (path == "pnpm-lock.yaml" && self.lockfile.is_some())
-            || (path == "pnpm-workspace.yaml" && self.workspace_file)
+        self.declared
+            .values
+            .iter()
+            .filter_map(|(name, transitive)| {
+                name.strip_prefix("dependentTasksOutputFiles:")
+                    .map(|pattern| (pattern, transitive == &Value::Bool(true)))
+            })
     }
 
     fn value_names<'a>(&'a self, prefix: &'a str) -> impl Iterator<Item = &'a str> {
-        self.values
+        self.declared
+            .values
             .keys()
             .filter_map(move |name| name.strip_prefix(prefix))
     }
@@ -222,7 +279,7 @@ impl<'a> InputChanges<'a> {
         for file in inputs.file_inputs() {
             if self.changed.contains(file) {
                 // A file the inputs also select whole counts by all of it.
-                if inputs.files.contains(file) || !self.json_unchanged(inputs, file) {
+                if inputs.is_whole_file(file) || !self.json_unchanged(inputs, file) {
                     touched.insert(file);
                 }
                 continue;
@@ -248,8 +305,8 @@ impl<'a> InputChanges<'a> {
                 );
             }
         }
-        let lockfile = inputs.lockfile.is_some();
-        for file in inputs.manifest_inputs() {
+        let lockfile = inputs.inferred.lockfile_readable;
+        for file in inputs.inferred.manifests.keys().map(String::as_str) {
             if !self.changed.contains(file) {
                 continue;
             }
@@ -270,11 +327,15 @@ impl<'a> InputChanges<'a> {
                 file: file.to_owned(),
             });
         }
-        if inputs.workspace_file && self.workspace_file_changed {
+        if inputs.inferred.workspace_file && self.workspace_file_changed {
             reasons.push(InputChange::WorkspaceFile);
         }
-        match (&inputs.lockfile, &self.lockfiles) {
-            (Some((importers, external)), Some((before, after))) => {
+        // A lockfile keyed whole has counted as an input above.
+        let Some(importers) = &inputs.inferred.lockfile else {
+            return Ok(reasons);
+        };
+        match &self.lockfiles {
+            Some((before, after)) => {
                 if before.global() != after.global() {
                     reasons.push(InputChange::Lockfile);
                 }
@@ -285,18 +346,18 @@ impl<'a> InputChanges<'a> {
                         });
                     }
                 }
-                for name in external {
+                for name in &inputs.declared.external {
                     if before.package(name) != after.package(name) {
                         reasons.push(InputChange::Package { name: name.clone() });
                     }
                 }
             }
-            (Some(_), None) if self.changed.contains("pnpm-lock.yaml") => {
+            None if self.changed.contains("pnpm-lock.yaml") => {
                 reasons.push(InputChange::Input {
                     file: "pnpm-lock.yaml".into(),
                 });
             }
-            _ => {}
+            None => {}
         }
         Ok(reasons)
     }
@@ -307,7 +368,7 @@ impl InputChanges<'_> {
     /// both revisions.
     fn json_unchanged(&self, inputs: &Resolved, file: &str) -> bool {
         let (Some(fields), Some((before, after))) =
-            (inputs.json_fields.get(file), self.json.get(file))
+            (inputs.declared.json_fields.get(file), self.json.get(file))
         else {
             return false;
         };
@@ -493,17 +554,55 @@ mod tests {
     }
 
     #[test]
+    fn declared_inputs_cover_the_files_qk_would_add() {
+        let (_root, loaded, graph) = workspace(
+            json!([
+                "{projectRoot}/meta.json",
+                "{workspaceRoot}/nx.json",
+                "{workspaceRoot}/pnpm-lock.yaml"
+            ]),
+            Some(&lockfile("1.0.0", "1.0.0")),
+        );
+        let resolved = resolve_tasks(&loaded, &graph, &[]).unwrap();
+        let inputs = &resolved["app:build"];
+        // What the inputs select is declared, and kept whole.
+        assert_eq!(
+            inputs.declared.files,
+            BTreeSet::from(["app/meta.json", "nx.json", "pnpm-lock.yaml"].map(String::from))
+        );
+        // qk's own copies of those files are left out, as covered.
+        assert!(!inputs.inferred.files.contains("nx.json"));
+        assert!(inputs.inferred.files.contains("app/project.json"));
+        assert_eq!(inputs.inferred.lockfile, None);
+        assert_eq!(
+            inputs.inferred.covered,
+            BTreeSet::from(["nx.json", "pnpm-lock.yaml"].map(String::from))
+        );
+        assert!(inputs.always_included().contains("nx.json"));
+        // Without an input naming it, a readable lockfile counts by installs.
+        let (_root, loaded, graph) = workspace(
+            json!(["{projectRoot}/meta.json"]),
+            Some(&lockfile("1.0.0", "1.0.0")),
+        );
+        let resolved = resolve_tasks(&loaded, &graph, &[]).unwrap();
+        let inputs = &resolved["app:build"];
+        assert!(!inputs.declared.files.contains("pnpm-lock.yaml"));
+        assert!(inputs.inferred.lockfile.is_some());
+        assert!(inputs.inferred.covered.is_empty());
+    }
+
+    #[test]
     fn dependency_manifests_change_by_what_they_decide_for_dependents() {
         let root = tempfile::tempdir().unwrap();
         let path = "lib/package.json";
         let inputs = |lockfile: bool| Resolved {
-            files: BTreeSet::new(),
-            mandatory: BTreeSet::from([path.to_owned()]),
-            values: BTreeMap::from([(format!("manifest:{path}"), Value::Null)]),
-            json_fields: BTreeMap::new(),
-            lockfile: lockfile.then(|| (BTreeSet::new(), BTreeSet::new())),
-            workspace_file: false,
-            external: BTreeSet::new(),
+            declared: Declared::default(),
+            inferred: Inferred {
+                manifests: BTreeMap::from([(path.to_owned(), Value::Null)]),
+                lockfile: lockfile.then(BTreeSet::new),
+                lockfile_readable: lockfile,
+                ..Inferred::default()
+            },
         };
         let changed = vec![path.to_owned()];
         let reasons = |before: Option<&str>, after: Option<&str>, lockfile: bool| {
@@ -579,9 +678,9 @@ mod tests {
             inputs.runtime_inputs().collect::<Vec<_>>(),
             ["echo evaluated > runtime-marker"]
         );
-        assert_eq!(inputs.values["env:PATH"], Value::Null);
+        assert_eq!(inputs.declared.values["env:PATH"], Value::Null);
         assert_eq!(
-            inputs.values["runtime:echo evaluated > runtime-marker"],
+            inputs.declared.values["runtime:echo evaluated > runtime-marker"],
             Value::Null
         );
         assert_eq!(
@@ -601,8 +700,8 @@ mod tests {
         assert!(!root.path().join("runtime-marker").exists());
         let each = resolve_each(&workspace, &graph).unwrap();
         assert_eq!(
-            each.tasks["app:build"].as_ref().unwrap().values,
-            inputs.values
+            each.tasks["app:build"].as_ref().unwrap().declared.values,
+            inputs.declared.values
         );
         assert!(!root.path().join("runtime-marker").exists());
     }
@@ -635,8 +734,12 @@ mod tests {
         );
         let resolved = resolve_tasks(&workspace, &graph, &[]).unwrap();
         let inputs = &resolved["app:build"];
-        assert!(inputs.is_resolution_metadata("pnpm-lock.yaml"));
-        assert!(inputs.is_resolution_metadata("pnpm-workspace.yaml"));
+        assert!(inputs.inferred.is_resolution_metadata("pnpm-lock.yaml"));
+        assert!(
+            inputs
+                .inferred
+                .is_resolution_metadata("pnpm-workspace.yaml")
+        );
         let before = Lockfile::parse(&before_text).unwrap();
         let unrelated = Lockfile::parse(&lockfile("1.0.0", "2.0.0")).unwrap();
         let changed = vec![

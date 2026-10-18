@@ -136,13 +136,7 @@ impl Sandbox {
         for (id, task) in &graph.tasks {
             match &resolution.tasks[id] {
                 Ok(resolved) => {
-                    let mut files = resolved.files.clone();
-                    files.extend(
-                        resolved
-                            .values
-                            .keys()
-                            .filter_map(|key| key.strip_prefix("json:").map(str::to_owned)),
-                    );
+                    let files = resolved.file_inputs().map(str::to_owned).collect();
                     plans.insert(
                         id.clone(),
                         plan(workspace, graph, task, &root, &tree, &files),
