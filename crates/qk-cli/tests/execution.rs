@@ -1375,8 +1375,10 @@ fn argument_placeholders_fall_back_like_nx_24() {
         "chained": {"command": "echo {args.first ?? args.second ?? env.FROM_ENV}", "options": {"env": {"FROM_ENV": "env"}}},
         "nested": {"command": "echo {args.host ?? {projectName}.local}"},
         "glob": {"command": "echo '{env.ts,env.d.ts}' {other}"},
-        "dead": {"command": "echo {args.a ?? fixed ?? args.b}"}
+        "dead": {"command": "echo {args.a ?? fixed ?? args.b}"},
+        "env_value": {"command": "echo $V", "options": {"envFile": "{args.file ?? env.FILE}", "env": {"V": "{args.v ?? env.FROM_FILE}"}}}
     }));
+    fs::write(temp.path().join("chosen.env"), "FROM_FILE=from-file\n").unwrap();
     let stdout = |output: Output| String::from_utf8(success(output).stdout).unwrap();
     let run_with = |args: &[&str], port: Option<&str>| {
         let mut command = command(temp.path(), args);
@@ -1425,6 +1427,12 @@ fn argument_placeholders_fall_back_like_nx_24() {
         stdout(run(temp.path(), &["run", "app:glob"])),
         "{env.ts,env.d.ts} {other}\n"
     );
+    // The envFile path reads the environment, and env values read envFile too.
+    let output = command(temp.path(), &["run", "app:env_value"])
+        .env("FILE", "chosen.env")
+        .output()
+        .unwrap();
+    assert_eq!(stdout(output), "from-file\n");
     let dead = run(temp.path(), &["run", "app:dead"]);
     assert!(
         String::from_utf8_lossy(&dead.stderr).contains("can never be used"),

@@ -491,6 +491,9 @@ pub fn prepare(
     let mut interpolation =
         interpolate::Interpolation::new(workspace, task, args, &forwarded, extra.as_deref())?;
     let (mut env, mut runtime_env) = task_environment(workspace, task, base_env)?;
+    // `env.NAME` fallbacks read the environment as built so far: dotenv files
+    // for `envFile`, and `envFile` too for `env`, then all of it for commands.
+    interpolation.set_env(&env);
     // As in Nx 24, `envFile` sets what the task's environment, dotenv files
     // included, leaves unset or empty, beneath `env`; and the task's
     // environment says whether it loads.
@@ -512,6 +515,7 @@ pub fn prepare(
             }
         }
     }
+    interpolation.set_env(&env);
     for values in [definition.extra.get("env"), options.get("env")]
         .into_iter()
         .flatten()
