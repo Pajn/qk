@@ -253,6 +253,33 @@ pub fn run(
         .collect();
     let serving: BTreeSet<_> = continuous.union(&announced).cloned().collect();
     let is_up = |id: &str| prepared[id].ready.load(Ordering::SeqCst);
+    // As in Nx 24, a task depending on a continuous task with
+    // `waitFor: "ready"` waits for the target's own readyWhen check.
+    let waiters: BTreeMap<&str, BTreeSet<&str>> = {
+        let mut waiters: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        for (id, task) in &graph.tasks {
+            for dependency in &task.dependencies {
+                if continuous.contains(dependency)
+                    && prepared[dependency].ready_check.is_some()
+                    && task.edge(dependency).wait_for == qk_taskgraph::WaitFor::Ready
+                {
+                    waiters.entry(dependency).or_default().insert(id);
+                }
+            }
+        }
+        waiters
+    };
+    let waits =
+        |id: &str, dependency: &str| waiters.get(dependency).is_some_and(|w| w.contains(id));
+    // Whether a running dependency lets `id` start: once it is up, and for a
+    // task that waits for it, once its check passed.
+    let serves = |id: &str, dependency: &str| {
+        is_up(dependency) && (!waits(id, dependency) || prepared[dependency].verdict.is_ready())
+    };
+    // Whether a dependency `id` waits for failed its check, which skips `id`.
+    let not_ready = |id: &str, dependency: &str| {
+        waits(id, dependency) && prepared[dependency].verdict.failure().is_some()
+    };
     // Running tasks holding a --parallel slot: as in Nx, one with readyWhen
     // gives its slot up once ready.
     let holding = |active: &BTreeSet<String>| {
@@ -300,6 +327,8 @@ pub fn run(
     // Stop signals for running continuous tasks, and those already asked to stop.
     let mut stops: BTreeMap<String, Arc<AtomicBool>> = BTreeMap::new();
     let mut stopping = BTreeSet::new();
+    // Tasks stopped because the readiness check something waits for failed.
+    let mut not_ready_failed: BTreeSet<String> = BTreeSet::new();
     let mut outcomes = BTreeMap::new();
     let mut fingerprints: BTreeMap<String, qk_cache::Fingerprint> = BTreeMap::new();
     let warm = graph
@@ -394,12 +423,24 @@ pub fn run(
                 let mut waiting_now = false;
                 // The tasks this pass held back for want of memory.
                 let mut short_of_memory = BTreeSet::new();
+                // A check that failed while something waits for it fails its
+                // task, as in Nx; the waiting tasks are skipped.
+                for (id, stop) in &stops {
+                    if waiters.contains_key(id.as_str())
+                        && !not_ready_failed.contains(id)
+                        && let Some(reason) = prepared[id].verdict.failure()
+                    {
+                        qk_executor::status!("qk: {reason}");
+                        not_ready_failed.insert(id.clone());
+                        stop.store(true, Ordering::SeqCst);
+                    }
+                }
                 // A task that became ready gives back its core.
                 held.retain(|id, _| !(announced.contains(id) && is_up(id)));
                 let dependencies_done = |id: &String| {
                     graph.tasks[id].dependencies.iter().all(|dependency| {
                         outcomes.get(dependency) == Some(&Outcome::Success)
-                            || (active.contains(dependency) && is_up(dependency))
+                            || (active.contains(dependency) && serves(id, dependency))
                     })
                 };
                 // The finite tasks that could start in this pass, which the
@@ -455,6 +496,7 @@ pub fn run(
                     let dependencies = &graph.tasks[&id].dependencies;
                     if dependencies.iter().any(|dependency| {
                         skipped.contains(dependency)
+                            || not_ready(&id, dependency)
                             || outcomes
                                 .get(dependency)
                                 .is_some_and(|outcome| *outcome != Outcome::Success)
@@ -468,7 +510,7 @@ pub fn run(
                     let finite_active = holding(&active);
                     if !dependencies.iter().all(|dependency| {
                         outcomes.get(dependency) == Some(&Outcome::Success)
-                            || (active.contains(dependency) && is_up(dependency))
+                            || (active.contains(dependency) && serves(&id, dependency))
                     }) {
                         continue;
                     }
@@ -504,7 +546,7 @@ pub fn run(
                                         graph.tasks[id].dependencies.iter().all(|dependency| {
                                             outcomes.get(dependency) == Some(&Outcome::Success)
                                                 || (active.contains(dependency)
-                                                    && is_up(dependency))
+                                                    && serves(id, dependency))
                                         })
                                     };
                                     let others = || {
@@ -586,10 +628,42 @@ pub fn run(
                         );
                         let stop = Arc::new(AtomicBool::new(false));
                         stops.insert(id.clone(), stop.clone());
+                        let waited = waiters.contains_key(id.as_str());
+                        // As in Nx, an invalid readyWhen fails the task only
+                        // when something in the run waits for it.
+                        let invalid = match &task.ready_check {
+                            Some(Err(reason)) if waited => Some(reason.clone()),
+                            Some(Err(reason)) => {
+                                qk_executor::status!(
+                                    "qk: {reason} Nothing in this run waits for it to be ready, \
+                                     so it runs without a readiness check."
+                                );
+                                None
+                            }
+                            Some(Ok(check)) if waited => {
+                                qk_executor::status!(
+                                    "qk: waiting for {id} to be ready ({})",
+                                    check.describe()
+                                );
+                                let (check, verdict, stop) =
+                                    (check.clone(), task.verdict.clone(), stop.clone());
+                                let (id, root) = (id.clone(), workspace.root.clone());
+                                scope.spawn(move || {
+                                    qk_executor::readiness::wait(
+                                        &id, &check, &root, &verdict, &stop,
+                                    )
+                                });
+                                None
+                            }
+                            _ => None,
+                        };
                         scope.spawn(move || {
-                            let result = execute(&task, &stop).map(|outcome| {
-                                qk_cache::TaskResult::uncached(outcome, String::new())
-                            });
+                            let result = match invalid {
+                                Some(reason) => Err(anyhow::anyhow!(reason)),
+                                None => execute(&task, &stop).map(|outcome| {
+                                    qk_cache::TaskResult::uncached(outcome, String::new())
+                                }),
+                            };
                             let _ = sender.send((id, result));
                         });
                         continue;
@@ -662,6 +736,7 @@ pub fn run(
                     let done_when_ready = announced.contains(id) && !continuous.contains(id);
                     if is_up(id)
                         && !needed
+                        && !not_ready_failed.contains(id)
                         && (done_when_ready || !graph.roots.contains(id))
                         && stopping.insert(id.clone())
                     {
@@ -689,6 +764,13 @@ pub fn run(
                         active.remove(&id);
                         stops.remove(&id);
                         held.remove(&id);
+                        // A task that ends before its check passes cannot
+                        // serve the tasks waiting for it.
+                        if waiters.contains_key(id.as_str()) {
+                            prepared[&id]
+                                .verdict
+                                .fail(format!("Task \"{id}\" exited before it became ready."));
+                        }
                         let (outcome, cache, key, warm, execution) = match result {
                             Ok(result) => {
                                 if !serving.contains(&id) {
@@ -713,6 +795,11 @@ pub fn run(
                                     None,
                                 )
                             }
+                        };
+                        let outcome = if not_ready_failed.contains(&id) {
+                            Outcome::Failed(1)
+                        } else {
+                            outcome
                         };
                         // Stopping a continuous task on purpose is its normal end.
                         let outcome = if stopping.contains(&id) && outcome == Outcome::Cancelled {

@@ -75,8 +75,8 @@ Nx 15 spellings `projects: "self"` and `projects: "dependencies"` fail.
 An object declaration naming a continuous target also accepts `inputs` and
 `waitFor`. `inputs: false` keeps the continuous task's inputs from counting
 for the dependent; see [Affected selection](../guides/affected.md#selecting-affected-tasks-by-inputs).
-`waitFor` is `"started"`, the default, or `"ready"`. qk reads it but does not
-probe readiness yet, so the dependent starts as before. When several
+`waitFor` is `"started"`, the default, or `"ready"`, which starts the
+dependent once the target's [`readyWhen`](#readywhen) check passes. When several
 declarations name the same task, `"ready"` wins, and its inputs count unless
 every declaration sets `inputs: false`. Both have no effect on a dependency
 that is not continuous.
@@ -109,10 +109,33 @@ See [Local cache](../guides/cache.md).
 ## `continuous`
 
 A boolean, default `false`. Dependents may start when this task starts,
-or when `readyWhen` is satisfied. Continuous tasks do not count towards
+or, with `waitFor: "ready"`, when its [`readyWhen`](#readywhen) check passes. Continuous tasks do not count towards
 `--parallel`; they run until exit or cancellation. A continuous task used
 only as a dependency is stopped successfully once its consumers finish.
 See [Continuous tasks](../guides/running-tasks.md#continuous-tasks-and-readiness).
+
+## `readyWhen`
+
+How a continuous target tells that it is ready, for tasks depending on it
+with `waitFor: "ready"`, as in Nx 24. It is an object with exactly one of:
+
+| Key | Ready when |
+| --- | --- |
+| `url` | An HTTP or HTTPS `GET` gets a status from 200 to 403. Redirects are not followed, and a 404 at the root path is tried again at `/index.html`. |
+| `port` | A TCP connection succeeds, to `127.0.0.1` or `::1` unless `host` names the address. |
+| `command` | The command, run through the shell at the workspace root, exits with 0. |
+| `logMatches` | Every one of a string or an array of strings has appeared in the output, terminal control sequences left out. |
+
+`timeout`, 60000 by default, is how many milliseconds the check may take, and
+`interval`, 250 by default, how long a `url`, `port` or `command` check waits
+between tries. Strings may use `{workspaceRoot}`, `{projectRoot}`,
+`{projectName}`, `{options.name}`, `{env.NAME}` and `??` fallbacks, read from
+the options, arguments and environment the task runs with. `null` turns off
+a check set by a target default. See
+[Continuous tasks](../guides/running-tasks.md#continuous-tasks-and-readiness).
+
+This is unrelated to the run-commands `readyWhen` option, which marks the
+task itself as ready.
 
 ## `parallelism`
 

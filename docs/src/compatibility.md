@@ -46,7 +46,12 @@ When a name occurs in multiple sections, precedence is `dependencies`,
   dependency carries none; its inputs count as the task's own.
 - Inputs marked `"always": true` read as without it: the flag only matters to
   a hash taken from an Nx Cloud Ultracache recording, which qk does not read.
-- `readyWhen` accepts readiness text from either stdout or stderr.
+- The run-commands `readyWhen` option accepts readiness text from either
+  stdout or stderr.
+- A target's `readyWhen` is checked only while a task in the run waits for
+  it, and its verdict is not shared with other qk processes. The `local-ip`
+  hosts resolve to the machine's outward address of their family, close to
+  but not exactly the dev servers' choice.
 - `exec --exclude-task-dependencies` runs the command in the selected
   projects; Nx's leaves every project out and runs nothing.
 - `project.local.json`, `nx.local.json`, `qk:threads`, `qk:warm`,
