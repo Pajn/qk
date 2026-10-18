@@ -792,13 +792,25 @@ pub fn run(
                         held.remove(&id);
                         // A task that ends before its check passes cannot
                         // serve the tasks waiting for it.
-                        if waiters.contains_key(id.as_str()) && !prepared[&id].verdict.is_decided()
-                        {
-                            prepared[&id]
-                                .verdict
-                                .fail(format!("Task \"{id}\" exited before it became ready."));
-                            if !stopping.contains(&id) && !cancelled.load(Ordering::SeqCst) {
-                                exited_unready.insert(id.clone());
+                        if waiters.contains_key(id.as_str()) {
+                            let verdict = &prepared[&id].verdict;
+                            if let Some(reason) = verdict.failure() {
+                                // The check failed before the pass that
+                                // reports it saw the task, which has now ended.
+                                if not_ready_failed.insert(id.clone()) {
+                                    qk_executor::status!("qk: {reason}");
+                                }
+                            } else if !verdict.is_decided() {
+                                verdict
+                                    .fail(format!("Task \"{id}\" exited before it became ready."));
+                                // Only a task that started with a valid check
+                                // exited early; an invalid one never ran.
+                                if matches!(prepared[&id].ready_check, Some(Ok(_)))
+                                    && !stopping.contains(&id)
+                                    && !cancelled.load(Ordering::SeqCst)
+                                {
+                                    exited_unready.insert(id.clone());
+                                }
                             }
                         }
                         let (outcome, cache, key, warm, execution) = match result {

@@ -930,11 +930,19 @@ fn an_invalid_check_fails_only_when_something_waits_for_it() {
     let temp = served_fixture(json!({"port": "{options.port}"}), Some("ready"));
     let output = run(temp.path(), &["run", "app:e2e"]);
     assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("has an invalid \"readyWhen\": \"{options.port}\" has no value"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+        stderr.contains("has an invalid \"readyWhen\": \"{options.port}\" has no value"),
+        "{stderr}"
+    );
+    // The server never ran, so the waiting task is skipped, not told it exited.
+    assert!(
+        stderr.contains("skipped app:e2e (dependency failed)"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("exited before it became ready"),
+        "{stderr}"
     );
     // Nothing waits: it runs unchecked, with a warning.
     let temp = fixture(json!({
