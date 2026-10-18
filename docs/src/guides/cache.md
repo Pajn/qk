@@ -115,7 +115,7 @@ warm run reads only files whose metadata changed. Without
 project's filesets select only the files it owns, leaving out those of
 projects nested in its root.
 
-Every input declaration of Nx 23 is supported:
+Every input declaration of Nx 24 is supported, `always` read as absent:
 
 - globs with `!` exclusions, and `fileset`;
 - named inputs, also as `{"input": "name"}`;

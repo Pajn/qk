@@ -1489,6 +1489,16 @@ impl<'a> Resolver<'a> {
     }
 
     fn input(&mut self, project: &str, input: &Value) -> Result<()> {
+        // Nx 24's `always` keeps an input in a hash taken from an Ultracache
+        // recording. qk hashes no recordings, so the input reads as without it.
+        if let Value::Object(object) = input
+            && let Some(always) = object.get("always")
+        {
+            always.as_bool().context("input always must be boolean")?;
+            let mut object = object.clone();
+            object.remove("always");
+            return self.input(project, &Value::Object(object));
+        }
         match input {
             // As in Nx, `^name` is `name` of every project the project depends
             // on, directly or not.

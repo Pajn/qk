@@ -1337,3 +1337,38 @@ fn an_input_selecting_projects_with_dependencies_reads_what_they_depend_on() {
         );
     }
 }
+
+#[test]
+fn inputs_marked_always_read_as_without_it() {
+    let repo = || {
+        Repo::new(&[
+            (
+                "nx.json",
+                r#"{"namedInputs": {"default": ["{projectRoot}/**/*"]},
+                    "targetDefaults": {"check": {"command": "echo check", "inputs": [
+                        {"fileset": "{projectRoot}/src/**/*", "always": true},
+                        {"json": "{projectRoot}/meta.json", "fields": ["version"], "always": true},
+                        {"input": "default", "projects": ["lib"], "always": true}
+                    ]}}}"#,
+            ),
+            (
+                "apps/app/project.json",
+                r#"{"name": "app", "targets": {"check": {}}}"#,
+            ),
+            ("apps/app/meta.json", r#"{"version": 1}"#),
+        ])
+    };
+    for (file, text) in [
+        ("apps/app/src/main.ts", "changed"),
+        ("apps/app/meta.json", r#"{"version": 2}"#),
+        ("libs/lib/src/index.ts", "changed"),
+    ] {
+        let repo = repo();
+        write(&repo.root, file, text);
+        let tasks = affected_tasks_of(&repo, &["app:check"]);
+        assert!(tasks.contains_key("app:check"), "{file}: {tasks:?}");
+    }
+    let repo = repo();
+    write(&repo.root, "apps/app/README.md", "not an input");
+    assert!(affected_tasks_of(&repo, &["app:check"]).is_empty());
+}
