@@ -185,7 +185,10 @@ without a value becomes `true`, and `--no-name` sets `name` to `false`). A
 command cannot use both `{args}` and `{args.name}`. Place argument
 tokens outside quotes: qk quotes their values as shell data. A missing named
 argument interpolates as nothing, as in Nx; quoted argument placeholders are
-errors. On Windows, forwarded
+errors. As in Nx 24, `??` lists fallbacks, and the first that is set and not
+empty applies: another `args.name`, `env.NAME` from the task's environment,
+or a final literal, which may hold path tokens, as in
+`{args.port ?? env.PORT ?? 4200}`. `0` and `false` are values. On Windows, forwarded
 values containing quotes, `%`, `!`, `^` or newlines are currently rejected;
 use target environment variables for those values. Workspace/project path
 tokens are substituted as written, so quote path tokens where your command

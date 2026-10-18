@@ -46,7 +46,8 @@ Supports workspace/project path tokens such as `{projectRoot}`.
 ### `env`, `envFile`, and `color`
 
 `env` is an object of environment variables. `envFile` is a dotenv path
-relative to the workspace root, loading only variables not already set.
+relative to the workspace root, loading only variables not already set, or
+set but empty, as in Nx 24.
 `color: true` sets `FORCE_COLOR=true`. `NX_LOAD_DOT_ENV_FILES=false` disables
 all dotenv loading, including `envFile`. See [Environment](environment.md).
 

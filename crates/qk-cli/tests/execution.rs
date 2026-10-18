@@ -1368,6 +1368,107 @@ fn env_files_color_and_the_options_nx_sets_itself() {
 
 #[cfg(unix)]
 #[test]
+fn argument_placeholders_fall_back_like_nx_24() {
+    let temp = fixture(json!({
+        "port": {"command": "echo port {args.port ?? env.PORT ?? 4200}", "options": {"env": {"FROM_ENV": "env"}}},
+        "zero": {"command": "echo {args.count ?? 1}"},
+        "chained": {"command": "echo {args.first ?? args.second ?? env.FROM_ENV}", "options": {"env": {"FROM_ENV": "env"}}},
+        "nested": {"command": "echo {args.host ?? {projectName}.local}"},
+        "glob": {"command": "echo '{env.ts,env.d.ts}' {other}"},
+        "dead": {"command": "echo {args.a ?? fixed ?? args.b}"}
+    }));
+    let stdout = |output: Output| String::from_utf8(success(output).stdout).unwrap();
+    let run_with = |args: &[&str], port: Option<&str>| {
+        let mut command = command(temp.path(), args);
+        command.env_remove("PORT");
+        if let Some(port) = port {
+            command.env("PORT", port);
+        }
+        command.output().unwrap()
+    };
+    assert_eq!(stdout(run_with(&["run", "app:port"], None)), "port 4200\n");
+    assert_eq!(
+        stdout(run_with(&["run", "app:port"], Some("5001"))),
+        "port 5001\n"
+    );
+    // An empty value is unset.
+    assert_eq!(
+        stdout(run_with(&["run", "app:port"], Some(""))),
+        "port 4200\n"
+    );
+    assert_eq!(
+        stdout(run_with(
+            &["run", "app:port", "--", "--port=3000"],
+            Some("5001")
+        )),
+        "port 3000\n"
+    );
+    // 0 and false are values.
+    assert_eq!(
+        stdout(run(temp.path(), &["run", "app:zero", "--", "--count=0"])),
+        "0\n"
+    );
+    assert_eq!(stdout(run(temp.path(), &["run", "app:chained"])), "env\n");
+    assert_eq!(
+        stdout(run(
+            temp.path(),
+            &["run", "app:chained", "--", "--second=two"]
+        )),
+        "two\n"
+    );
+    assert_eq!(
+        stdout(run(temp.path(), &["run", "app:nested"])),
+        "app.local\n"
+    );
+    // Braces that are no token stay text.
+    assert_eq!(
+        stdout(run(temp.path(), &["run", "app:glob"])),
+        "{env.ts,env.d.ts} {other}\n"
+    );
+    let dead = run(temp.path(), &["run", "app:dead"]);
+    assert!(
+        String::from_utf8_lossy(&dead.stderr).contains("can never be used"),
+        "{}",
+        String::from_utf8_lossy(&dead.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_env_file_sets_what_the_task_environment_leaves_empty_like_nx_24() {
+    let temp = fixture(json!({
+        "show": {"command": "echo [$EMPTY] [$SET]", "options": {"envFile": "app.env"}}
+    }));
+    fs::write(temp.path().join("app.env"), "EMPTY=file\nSET=file\n").unwrap();
+    let output = command(temp.path(), &["run", "app:show"])
+        .env("EMPTY", "")
+        .env("SET", "process")
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(success(output).stdout).unwrap(),
+        "[file] [process]\n"
+    );
+    // A project's dotenv file can turn the env file off, as the task's
+    // environment decides.
+    fs::write(
+        temp.path().join(".env.show"),
+        "NX_LOAD_DOT_ENV_FILES=false\n",
+    )
+    .unwrap();
+    let output = command(temp.path(), &["run", "app:show"])
+        .env_remove("EMPTY")
+        .env_remove("SET")
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(success(output).stdout).unwrap(),
+        "[] []\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn command_entries_prefix_and_colour_their_output_like_nx() {
     let temp = fixture(json!({
         "prefixed": {"executor": "nx:run-commands", "options": {"commands": [
