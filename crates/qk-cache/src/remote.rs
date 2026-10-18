@@ -241,7 +241,12 @@ pub fn configure(
     {
         return Ok(None);
     }
-    let ci = variable("CI").is_some_and(|value| value != "false" && value != "0");
+    let ci = qk_executor::is_ci_with(|name| {
+        environment
+            .get(std::ffi::OsStr::new(name))
+            .and_then(|value| value.to_str())
+            .map(str::to_owned)
+    });
     let mode = variable("NX_POWERPACK_CACHE_MODE")
         .or_else(|| setting(if ci { "ciMode" } else { "localMode" }))
         .unwrap_or_else(|| "read-write".into());

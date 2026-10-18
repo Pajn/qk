@@ -1082,13 +1082,13 @@ fn output_styles_follow_nx() {
     assert_eq!(stdout(&["run-many", "-t", "build"]), "");
     assert_eq!(
         stdout(&["run-many", "-t", "fail"]),
-        "\n✖ qk run app:fail failed\n\nbroken\n"
+        "\n✖ nx run app:fail failed\n\nbroken\n"
     );
     assert_eq!(stdout(&["run", "app:build"]), "one\ntwo\n");
     // Held output of a failing task still appears.
     assert!(
         stdout(&["run-many", "-t", "fail", "--output-style", "tui"])
-            .contains("> qk run app:fail\n\nbroken")
+            .contains("> nx run app:fail\n\nbroken")
     );
 
     // A cache hit replays its log under the same header, marked as such; with
@@ -1096,7 +1096,7 @@ fn output_styles_follow_nx() {
     stdout(&["run-many", "-t", "cached", "--output-style", "static"]);
     assert_eq!(
         stdout(&["run-many", "-t", "cached", "--output-style", "static"]),
-        "\n> qk run app:cached  [existing outputs match the cache, left as is]\n\ncached\n"
+        "\n> nx run app:cached  [existing outputs match the cache, left as is]\n\ncached\n"
     );
 
     let grouped = command(
@@ -1111,8 +1111,204 @@ fn output_styles_follow_nx() {
         .replace("\r\n", "\n")
         .replace(" \n", "\n");
     assert!(
-        grouped.starts_with("\n::group::✅ > qk run app:build\n\none\ntwo\n::endgroup::\n"),
+        grouped.starts_with("\n::group::✅ > nx run app:build\n\none\ntwo\n::endgroup::\n"),
         "{grouped}"
+    );
+}
+
+/// Runs qk outside CI, without colour, and returns its stdout and stderr.
+fn plain(root: &Path, args: &[&str], env: &[(&str, &str)]) -> (String, String, Option<i32>) {
+    let output = command(root, args)
+        .env_remove("NX_DEFAULT_OUTPUT_STYLE")
+        .env("NO_COLOR", "1")
+        .envs(env.iter().copied())
+        .output()
+        .unwrap();
+    let text = |bytes: Vec<u8>| {
+        String::from_utf8(bytes)
+            .unwrap()
+            .replace("\r\n", "\n")
+            .replace(" \n", "\n")
+    };
+    (
+        text(output.stdout),
+        text(output.stderr),
+        output.status.code(),
+    )
+}
+
+#[test]
+fn static_failures_only_collapses_what_did_not_fail_as_nx_does() {
+    let temp = fixture(json!({
+        "dep": {"command": "echo dep-output"},
+        "build": {"command": "echo built", "dependsOn": ["dep"]},
+        "fail": {"command": "echo broken && exit 3"}
+    }));
+    let (stdout, stderr, _) = plain(
+        temp.path(),
+        &[
+            "run-many",
+            "-t",
+            "dep",
+            "fail",
+            "--output-style",
+            "static-failures-only",
+        ],
+        &[],
+    );
+    assert!(stdout.contains("✔  nx run app:dep\n"), "{stdout}");
+    assert!(!stdout.contains("dep-output"), "{stdout}");
+    assert!(stdout.contains("> nx run app:fail\n\nbroken"), "{stdout}");
+    assert!(
+        stderr.contains(
+            "Output of 1 successful task was not shown. Run with --verbose or --output-style=static to see it."
+        ),
+        "{stderr}"
+    );
+    // --verbose prints every task in full, as `static` does.
+    let (stdout, _, _) = plain(
+        temp.path(),
+        &[
+            "run-many",
+            "-t",
+            "dep",
+            "--output-style",
+            "static-failures-only",
+            "--verbose",
+        ],
+        &[],
+    );
+    assert!(
+        stdout.contains("> nx run app:dep\n\ndep-output"),
+        "{stdout}"
+    );
+    // A single task shows its own project's tasks in full, and the others
+    // collapsed; NX_DEFAULT_OUTPUT_STYLE names the style too.
+    let (stdout, _, _) = plain(
+        temp.path(),
+        &["run", "app:build"],
+        &[("NX_DEFAULT_OUTPUT_STYLE", "static-failures-only")],
+    );
+    assert!(
+        stdout.contains("> nx run app:dep\n\ndep-output"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("> nx run app:build\n\nbuilt"), "{stdout}");
+}
+
+#[test]
+fn summary_prints_counts_and_where_failed_output_is() {
+    let temp = fixture(json!({
+        "ok": {"command": "echo fine"},
+        "fail": {"command": "echo broken && exit 3"},
+        "after": {"command": "echo never", "dependsOn": ["fail"]}
+    }));
+    let (stdout, stderr, _) = plain(
+        temp.path(),
+        &["run-many", "-t", "ok", "after", "--output-style=summary"],
+        &[],
+    );
+    assert!(
+        !stdout.contains("fine") && !stdout.contains("broken"),
+        "{stdout}"
+    );
+    assert!(
+        stderr.contains("3 tasks: 1 succeeded, 1 failed, 1 skipped"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("✖ nx run app:fail\n"), "{stderr}");
+    let log = stderr
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("full log: "))
+        .unwrap_or_else(|| panic!("{stderr}"));
+    assert_eq!(fs::read_to_string(log).unwrap(), "broken\n");
+    assert!(stderr.contains("Re-run with --output-style=static to inline logs."));
+}
+
+#[test]
+fn unknown_output_styles_fail_and_unknown_defaults_are_ignored() {
+    let temp = fixture(json!({"build": {"command": "echo built"}}));
+    let (_, stderr, code) = plain(
+        temp.path(),
+        &["run", "app:build", "--output-style=fancy"],
+        &[],
+    );
+    assert_eq!(code, Some(2));
+    assert!(stderr.contains("fancy"), "{stderr}");
+    let (stdout, _, code) = plain(
+        temp.path(),
+        &["run", "app:build"],
+        &[("NX_DEFAULT_OUTPUT_STYLE", "fancy")],
+    );
+    assert_eq!((stdout.as_str(), code), ("built\n", Some(0)));
+}
+
+#[test]
+fn ci_is_detected_as_nx_detects_it() {
+    let temp = fixture(json!({"build": {"command": "echo built"}}));
+    // In CI a run defaults to static, which heads each task; CI=0 is CI.
+    for env in [[("CI", "0")], [("BUILDKITE", "true")]] {
+        let (stdout, _, _) = plain(temp.path(), &["run-many", "-t", "build"], &env);
+        assert!(
+            stdout.contains("> nx run app:build\n\nbuilt"),
+            "{env:?}: {stdout}"
+        );
+    }
+    let (stdout, _, _) = plain(
+        temp.path(),
+        &["run-many", "-t", "build"],
+        &[("CI", "false")],
+    );
+    assert_eq!(stdout, "");
+}
+
+#[test]
+fn force_color_zero_keeps_qk_output_plain() {
+    let temp = fixture(json!({"fail": {"command": "exit 3"}}));
+    let output = command(
+        temp.path(),
+        &["run-many", "-t", "fail", "--output-style", "static"],
+    )
+    .env("CI", "true")
+    .env("FORCE_COLOR", "0")
+    .env_remove("NO_COLOR")
+    .output()
+    .unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("Running target fail"), "{stderr}");
+    assert!(!stderr.contains('\x1b'), "{stderr:?}");
+}
+
+#[test]
+fn long_running_targets_stream_unless_a_static_style_is_named() {
+    let temp = fixture(json!({
+        "serve": {"command": "echo serving"},
+        "build": {"command": "echo built"}
+    }));
+    // CI defaults to static without naming it, so a server's output streams.
+    let (stdout, _, _) = plain(
+        temp.path(),
+        &["run-many", "-t", "serve", "build"],
+        &[("CI", "true")],
+    );
+    assert!(stdout.contains("app: serving"), "{stdout}");
+    assert!(stdout.contains("> nx run app:build\n\nbuilt"), "{stdout}");
+    let (stdout, _, _) = plain(
+        temp.path(),
+        &["run-many", "-t", "serve", "--output-style", "static"],
+        &[],
+    );
+    assert!(stdout.contains("> nx run app:serve\n\nserving"), "{stdout}");
+    // NX_STREAM_OUTPUT decides for every task, and NX_PREFIX_OUTPUT=false
+    // drops the prefix.
+    let (stdout, _, _) = plain(
+        temp.path(),
+        &["run-many", "-t", "build", "--output-style", "static"],
+        &[("NX_STREAM_OUTPUT", "true"), ("NX_PREFIX_OUTPUT", "false")],
+    );
+    assert!(
+        stdout.contains("built") && !stdout.contains("> nx run"),
+        "{stdout}"
     );
 }
 
@@ -1153,7 +1349,7 @@ fn large_output_preserves_static_groups_quiet_failures_and_long_line_prefixes() 
     };
     let output = success(invoke("a,b", "static"));
     for id in ["a", "b"] {
-        let header = format!("::group::✅ > qk run app:{id}\n\n");
+        let header = format!("::group::✅ > nx run app:{id}\n\n");
         let start = output
             .stdout
             .windows(header.len())
@@ -1180,7 +1376,7 @@ fn large_output_preserves_static_groups_quiet_failures_and_long_line_prefixes() 
     assert!(
         failed
             .stdout
-            .starts_with("\n✖ qk run app:fail failed\n\n".as_bytes())
+            .starts_with("\n✖ nx run app:fail failed\n\n".as_bytes())
     );
     assert!(failed.stdout.ends_with(&body("fail")));
 
@@ -1222,7 +1418,7 @@ fn a_static_run_streams_its_task_between_banners_like_nx_run() {
     let (stdout, stderr) = run("app:build");
     assert_eq!(
         stdout,
-        "\n::group::✅ > qk run app:dep\n\ndep\n::endgroup::\n\n> qk run app:build\n\nbuilt\n"
+        "\n::group::✅ > nx run app:dep\n\ndep\n::endgroup::\n\n> nx run app:build\n\nbuilt\n"
     );
     assert!(
         stderr.starts_with(
@@ -1241,7 +1437,7 @@ fn a_static_run_streams_its_task_between_banners_like_nx_run() {
     let (stdout, _) = run("app:build");
     assert!(
         stdout.starts_with(
-            "\n::group::⏩ > qk run app:dep  [existing outputs match the cache, left as is]\n\n::endgroup::\n"
+            "\n::group::⏩ > nx run app:dep  [existing outputs match the cache, left as is]\n\n::endgroup::\n"
         ),
         "{stdout}"
     );
@@ -1343,7 +1539,7 @@ fn quiet_output_is_plain_text_for_agents() {
         .unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
     // Only the failure, without escape sequences.
-    assert_eq!(stdout, "\n✖ qk run app:fail failed\n\nred failure\n");
+    assert_eq!(stdout, "\n✖ nx run app:fail failed\n\nred failure\n");
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("1 of 2 tasks failed"), "{stderr}");
     assert!(!stderr.contains("qk: checking"), "{stderr}");

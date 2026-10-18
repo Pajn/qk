@@ -190,6 +190,8 @@ struct RunOptions {
     /// Stop starting tasks after the first failure; also NX_BAIL=true.
     #[arg(long)]
     nx_bail: bool,
+    #[arg(long, hide = true, overrides_with = "nx_bail")]
+    no_nx_bail: bool,
     /// Break task dependency cycles instead of failing; also NX_IGNORE_CYCLES=true.
     #[arg(long)]
     nx_ignore_cycles: bool,
@@ -200,9 +202,12 @@ struct RunOptions {
     /// `--graph=stdout`), without running anything.
     #[arg(long, num_args = 0..=1, default_missing_value = "stdout", value_name = "FILE")]
     graph: Option<String>,
-    /// Set NX_VERBOSE_LOGGING=true for tasks.
+    /// Set NX_VERBOSE_LOGGING=true for tasks; without it, tasks see
+    /// NX_VERBOSE_LOGGING=false unless it is already true.
     #[arg(long)]
     verbose: bool,
+    #[arg(long, hide = true, overrides_with = "verbose")]
+    no_verbose: bool,
     /// Run each task in macOS's sandbox: `audit` (the default) reports what it
     /// reads and writes in the workspace beyond what it declares, `enforce`
     /// refuses it. Tasks run without the cache.
@@ -391,7 +396,17 @@ impl RunOptions {
     }
 
     fn skips_cache(&self) -> bool {
-        self.skip_cache || env_flag("NX_SKIP_NX_CACHE")
+        self.skip_cache || env_flag("NX_SKIP_NX_CACHE") || env_flag("NX_DISABLE_NX_CACHE")
+    }
+
+    /// `--nx-bail`, else NX_BAIL=true, as Nx reads it.
+    fn bails(&self) -> bool {
+        self.nx_bail || (!self.no_nx_bail && env_flag("NX_BAIL"))
+    }
+
+    /// `--verbose` or `--verbose=false`, else NX_VERBOSE_LOGGING=true.
+    fn verbose(&self) -> bool {
+        self.verbose || (!self.no_verbose && env_flag("NX_VERBOSE_LOGGING"))
     }
 
     /// Tasks per run, as Nx reads `--parallel`.
@@ -478,12 +493,16 @@ enum Granularity {
     Task,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum OutputStyle {
     Tui,
     Dynamic,
     DynamicLegacy,
     Static,
+    /// As `static`, but a task that did not fail is one line.
+    StaticFailuresOnly,
+    /// Counts, then one line per failed task naming the file with its output.
+    Summary,
     Stream,
     StreamWithoutPrefixes,
     /// qk's own: only failed tasks' output, then a summary.
@@ -502,24 +521,29 @@ enum Rendered {
 
 impl OutputStyle {
     /// The style qk renders; the interactive ones need stderr to be a
-    /// terminal, and are static otherwise, as in Nx. `static` for a single
-    /// `run` streams the requested task, as `nx run` does.
-    fn rendered(self, single: bool) -> Rendered {
-        use std::io::IsTerminal;
+    /// terminal, and are static otherwise, as in Nx, which also leaves them
+    /// for `NX_TASKS_RUNNER_DYNAMIC_OUTPUT=false` and verbose logging.
+    /// `static` for a single `run` streams the requested task, as `nx run`
+    /// does, and `static-failures-only` shows every task in full under
+    /// `--verbose`, as Nx does.
+    fn rendered(self, single: bool, verbose: bool) -> Rendered {
+        use qk_executor::OutputStyle as Executor;
         let fixed = if single {
-            qk_executor::OutputStyle::RunOne
+            Executor::RunOne
         } else {
-            qk_executor::OutputStyle::Static
+            Executor::Static
         };
         match self {
-            Self::Stream => Rendered::Lines(qk_executor::OutputStyle::Stream),
-            Self::StreamWithoutPrefixes => {
-                Rendered::Lines(qk_executor::OutputStyle::StreamWithoutPrefixes)
-            }
+            Self::Stream => Rendered::Lines(Executor::Stream),
+            Self::StreamWithoutPrefixes => Rendered::Lines(Executor::StreamWithoutPrefixes),
             Self::Static => Rendered::Lines(fixed),
+            Self::StaticFailuresOnly if verbose => Rendered::Lines(fixed),
+            Self::StaticFailuresOnly if single => Rendered::Lines(Executor::RunOneFailuresOnly),
+            Self::StaticFailuresOnly => Rendered::Lines(Executor::StaticFailuresOnly),
+            Self::Summary => Rendered::Lines(Executor::Summary),
             Self::Quiet => Rendered::Quiet,
             Self::Tui | Self::Dynamic | Self::DynamicLegacy => {
-                if io::stderr().is_terminal() {
+                if dynamic_output(verbose) {
                     Rendered::Dynamic
                 } else {
                     Rendered::Lines(fixed)
@@ -529,23 +553,38 @@ impl OutputStyle {
     }
 }
 
-/// The output style when none is given: `NX_DEFAULT_OUTPUT_STYLE`, else
-/// `static` in CI, for full logs; raw for a single `run`; and for several
-/// tasks the live panel on a terminal, and `quiet` otherwise, for agents and
-/// scripts.
-fn default_output_style(single: bool) -> Rendered {
+/// Whether the live panel can be shown: on a terminal, unless
+/// `NX_TASKS_RUNNER_DYNAMIC_OUTPUT=false` or verbose logging turn it off, as
+/// they turn off Nx's dynamic output.
+fn dynamic_output(verbose: bool) -> bool {
     use std::io::IsTerminal;
-    if let Ok(name) = std::env::var("NX_DEFAULT_OUTPUT_STYLE")
-        && let Ok(style) = OutputStyle::from_str(&name, false)
-    {
-        return style.rendered(single);
-    }
-    if std::env::var_os("CI").is_some_and(|value| value != "false") {
-        OutputStyle::Static.rendered(single)
+    io::stderr().is_terminal()
+        && !verbose
+        && std::env::var_os("NX_TASKS_RUNNER_DYNAMIC_OUTPUT").is_none_or(|value| value != "false")
+}
+
+/// The style named by `--output-style`, else by `NX_DEFAULT_OUTPUT_STYLE`
+/// when that names one, as Nx reads them.
+fn specified_output_style(options: &RunOptions) -> Option<OutputStyle> {
+    options.output_style.or_else(|| {
+        std::env::var("NX_DEFAULT_OUTPUT_STYLE")
+            .ok()
+            .and_then(|name| OutputStyle::from_str(&name, false).ok())
+    })
+}
+
+/// The output style when none is given: `static` in CI, for full logs; raw
+/// for a single `run`; and for several tasks the live panel on a terminal,
+/// and `quiet` otherwise, for agents and scripts.
+fn default_output_style(single: bool, verbose: bool) -> Rendered {
+    if qk_executor::is_ci() {
+        OutputStyle::Static.rendered(single, verbose)
     } else if single {
         Rendered::Lines(qk_executor::OutputStyle::StreamWithoutPrefixes)
-    } else if io::stderr().is_terminal() {
+    } else if dynamic_output(verbose) {
         Rendered::Dynamic
+    } else if io::IsTerminal::is_terminal(&io::stderr()) {
+        OutputStyle::Static.rendered(single, verbose)
     } else {
         Rendered::Quiet
     }
@@ -1488,14 +1527,25 @@ fn execute_narrowed(
     // A sandboxed task has to run to be observed.
     let skip_cache =
         options.skips_cache() || options.sandbox.is_some() || options.input_analysis.is_some();
-    let rendered = options.output_style.map_or_else(
-        || default_output_style(single),
-        |style| style.rendered(single),
+    let verbose = options.verbose();
+    let specified = specified_output_style(options);
+    let rendered = specified.map_or_else(
+        || default_output_style(single, verbose),
+        |style| style.rendered(single, verbose),
     );
     let sink = match rendered {
-        Rendered::Lines(qk_executor::OutputStyle::Static | qk_executor::OutputStyle::RunOne) => {
+        Rendered::Lines(
+            qk_executor::OutputStyle::Static
+            | qk_executor::OutputStyle::RunOne
+            | qk_executor::OutputStyle::StaticFailuresOnly
+            | qk_executor::OutputStyle::RunOneFailuresOnly,
+        ) => {
             qk_executor::report::install(Box::new(ui::Static));
             ui::SinkKind::Static
+        }
+        Rendered::Lines(qk_executor::OutputStyle::Summary) => {
+            qk_executor::report::install(Box::new(ui::Static));
+            ui::SinkKind::Summary
         }
         Rendered::Lines(_) => ui::SinkKind::Lines,
         Rendered::Quiet => {
@@ -1560,8 +1610,12 @@ fn execute_narrowed(
             parallel,
             cores,
             skip_cache,
-            bail: options.nx_bail || env_flag("NX_BAIL"),
+            bail: options.bails(),
             style,
+            stream_long_running: !matches!(
+                specified,
+                Some(OutputStyle::Static | OutputStyle::StaticFailuresOnly | OutputStyle::Summary)
+            ),
             sandbox: options.sandbox.map(|mode| match mode {
                 SandboxMode::Audit => qk_runner::sandbox::Mode::Audit,
                 SandboxMode::Enforce => qk_runner::sandbox::Mode::Enforce,
@@ -1600,6 +1654,10 @@ fn execute_narrowed(
     if matches!(sink, ui::SinkKind::Static) {
         let summary =
             ui::static_summary(&title, &result, &report, parallel, cores, ui::Paint::log());
+        qk_executor::report::write_all(true, summary.as_bytes());
+    } else if matches!(sink, ui::SinkKind::Summary) {
+        let logs = qk_cache::worktree_state(&workspace.root).join("terminal-outputs");
+        let summary = ui::summary_style(&graph, &report, &logs, ui::Paint::log());
         qk_executor::report::write_all(true, summary.as_bytes());
     } else if !single || !matches!(sink, ui::SinkKind::Lines) {
         let summary = ui::summary(

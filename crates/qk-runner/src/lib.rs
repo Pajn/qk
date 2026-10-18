@@ -118,6 +118,9 @@ pub struct Settings<'a> {
     /// Nx's `--nx-bail`: no task starts after one has failed.
     pub bail: bool,
     pub style: OutputStyle,
+    /// Whether the static styles stream long-running tasks rather than hold
+    /// their output: as in Nx, unless the user named a static style.
+    pub stream_long_running: bool,
     /// Run each task in macOS's sandbox, auditing or enforcing what it declares.
     pub sandbox: Option<sandbox::Mode>,
     /// Execute finite tasks under an advisory file-access recorder.
@@ -143,6 +146,7 @@ pub fn run(
         skip_cache,
         bail: bails,
         style,
+        stream_long_running,
         sandbox: sandbox_mode,
         analyze_inputs,
         expected,
@@ -178,6 +182,14 @@ pub fn run(
     // files over the process environment instead.
     let environment = environment(&workspace.root)?;
     let process_environment: BTreeMap<_, _> = std::env::vars_os().collect();
+    // The project a single requested task belongs to, whose tasks Nx shows
+    // in full under `static-failures-only`.
+    let initiating = match graph.roots.iter().collect::<Vec<_>>()[..] {
+        [root] => graph.tasks.get(root).map(|task| task.project.as_str()),
+        _ => None,
+    };
+    // Where `summary` keeps the output of the tasks that fail.
+    let logs = qk_cache::worktree_state(&workspace.root).join("terminal-outputs");
     // Validate every task before the first command can have side effects.
     let mut prepared = graph
         .tasks
@@ -194,12 +206,24 @@ pub fn run(
                     } else {
                         Display::for_task(
                             style,
-                            id,
+                            &qk_executor::printable(
+                                &task.project,
+                                &task.target,
+                                task.configuration.as_deref(),
+                                &task.args,
+                            ),
                             &task.project,
                             continuous,
                             graph.roots.contains(id),
+                            initiating == Some(task.project.as_str()),
+                            streams(task, stream_long_running),
                         )
                     };
+                    if style == OutputStyle::Summary
+                        && let Display::Failures { log, .. } = &mut prepared.display
+                    {
+                        *log = Some(logs.join(log_name(id)));
+                    }
                     (id.clone(), prepared)
                 })
         })
@@ -892,6 +916,46 @@ pub fn run(
         sandbox,
         input_analysis,
     })
+}
+
+/// Whether a task's output streams rather than being held, as Nx decides
+/// it: `NX_STREAM_OUTPUT` when it says, else for a long-running task, one
+/// that is continuous, runs with `--watch` or has a server's target name.
+fn streams(task: &qk_taskgraph::Task, long_running: bool) -> bool {
+    match std::env::var("NX_STREAM_OUTPUT").as_deref() {
+        Ok("true") => return true,
+        Ok("false") => return false,
+        _ => {}
+    }
+    let watching = task.args.iter().any(|arg| {
+        arg == "--watch"
+            || arg
+                .strip_prefix("--watch=")
+                .is_some_and(|value| value != "false")
+    });
+    let target = &task.target;
+    long_running
+        && (task.definition.continuous == Some(true)
+            || watching
+            || target.ends_with(":watch")
+            || target.ends_with("-watch")
+            || matches!(target.as_str(), "serve" | "dev" | "start"))
+}
+
+/// The file `summary` keeps a failed task's output in: its id, with what a
+/// file name cannot hold replaced.
+pub fn log_name(id: &str) -> String {
+    let name: String = id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("{name}.log")
 }
 
 /// What the sampler last saw of memory, in bytes.

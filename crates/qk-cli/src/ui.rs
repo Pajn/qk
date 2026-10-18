@@ -19,18 +19,27 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 pub struct Paint(bool);
 
 impl Paint {
+    /// Colours on a terminal, or when FORCE_COLOR asks for them; never under
+    /// NO_COLOR or `FORCE_COLOR=0`.
     pub fn stderr() -> Self {
         let set = |name| std::env::var_os(name).is_some();
-        Self(!set("NO_COLOR") && (set("FORCE_COLOR") || std::io::stderr().is_terminal()))
+        let forced = qk_executor::force_colour();
+        Self(
+            !set("NO_COLOR")
+                && forced != Some(false)
+                && (forced == Some(true) || std::io::stderr().is_terminal()),
+        )
     }
 
     /// Colours for a static log, following picocolors as task output does:
     /// also in CI, whose log viewers render them.
     pub fn log() -> Self {
         let set = |name| std::env::var_os(name).is_some();
+        let forced = qk_executor::force_colour();
         Self(
             !set("NO_COLOR")
-                && (set("FORCE_COLOR")
+                && forced != Some(false)
+                && (forced == Some(true)
                     || set("CI")
                     || (std::io::stderr().is_terminal()
                         && std::env::var("TERM").is_ok_and(|term| term != "dumb"))),
@@ -90,7 +99,10 @@ pub struct Quiet {
 
 impl Default for Quiet {
     fn default() -> Self {
-        let plain = |terminal: bool| !terminal && std::env::var_os("FORCE_COLOR").is_none();
+        let plain = |terminal: bool| match qk_executor::force_colour() {
+            Some(forced) => !forced,
+            None => !terminal,
+        };
         Self {
             warnings: Warnings::default(),
             escapes: Mutex::default(),
@@ -957,6 +969,111 @@ pub fn static_summary(
         total - cached - skipped.len() - failed.len(),
     )));
     lines.extend(details(result, report, parallel, cores, &[], paint));
+    // As Nx says when `static-failures-only` left output out.
+    let collapsed = qk_executor::collapsed();
+    if collapsed > 0 {
+        lines.push(String::new());
+        lines.push(format!(
+            "{} --verbose {} --output-style=static {}",
+            paint.dim(&format!(
+                "Output of {collapsed} successful {} not shown. Run with",
+                if collapsed == 1 {
+                    "task was"
+                } else {
+                    "tasks were"
+                }
+            )),
+            paint.dim("or"),
+            paint.dim("to see it.")
+        ));
+    }
+    text.push_str(&lines.join("\n"));
+    text.push('\n');
+    text
+}
+
+/// Nx's `summary` style: the counts, then each failed task with the file
+/// holding its output, and how to see the logs inline.
+pub fn summary_style(
+    graph: &qk_taskgraph::TaskGraph,
+    report: &RunReport,
+    logs: &std::path::Path,
+    paint: Paint,
+) -> String {
+    let with = |status: &'static str| {
+        report
+            .tasks
+            .iter()
+            .filter(move |task| task.status == status)
+            .collect::<Vec<_>>()
+    };
+    let failed = with("failure");
+    let stopped = with("cancelled");
+    let skipped = with("skipped").len();
+    let succeeded = report.tasks.len() - failed.len() - stopped.len() - skipped;
+    let cached = report
+        .tasks
+        .iter()
+        .filter(|task| matches!(task.cache.as_deref(), Some("local-hit" | "remote-hit")))
+        .count();
+    let total = report.tasks.len();
+    let mut parts = vec![format!("{succeeded} succeeded")];
+    if cached > 0 {
+        parts.push(format!("{cached} cached"));
+    }
+    if !failed.is_empty() {
+        parts.push(format!("{} failed", failed.len()));
+    }
+    if !stopped.is_empty() {
+        parts.push(format!("{} stopped", stopped.len()));
+    }
+    if skipped > 0 {
+        parts.push(format!("{skipped} skipped"));
+    }
+    let title = format!(
+        "{total} {}: {}",
+        if total == 1 { "task" } else { "tasks" },
+        parts.join(", ")
+    );
+    let printable = |id: &str| {
+        graph.tasks.get(id).map_or_else(
+            || id.to_owned(),
+            |task| {
+                qk_executor::printable(
+                    &task.project,
+                    &task.target,
+                    task.configuration.as_deref(),
+                    &task.args,
+                )
+            },
+        )
+    };
+    let mut lines = Vec::new();
+    for task in &failed {
+        lines.push(String::new());
+        lines.push(format!("{} nx run {}", paint.red("✖"), printable(&task.id)));
+        let log = logs.join(qk_runner::log_name(&task.id));
+        if std::fs::metadata(&log).is_ok_and(|metadata| metadata.len() > 0) {
+            lines.push(paint.dim(&format!("  full log: {}", log.display())));
+        }
+    }
+    if !stopped.is_empty() {
+        lines.push(String::new());
+        lines.push(paint.dim("Stopped before finishing:"));
+        lines.extend(
+            stopped
+                .iter()
+                .map(|task| format!("{} {}", paint.dim("-"), task.id)),
+        );
+    }
+    lines.push(String::new());
+    lines.push(paint.dim("Re-run with --output-style=static to inline logs."));
+    let colour = if failed.is_empty() && stopped.is_empty() {
+        "32"
+    } else {
+        "31"
+    };
+    let mut text = banner(paint, colour, &title);
     text.push_str(&lines.join("\n"));
     text.push('\n');
     text
@@ -965,7 +1082,7 @@ pub fn static_summary(
 /// The warnings a sink kept for the summary.
 pub fn warnings(sink: &SinkKind) -> Vec<String> {
     match sink {
-        SinkKind::Lines | SinkKind::Static => Vec::new(),
+        SinkKind::Lines | SinkKind::Static | SinkKind::Summary => Vec::new(),
         SinkKind::Quiet(quiet) => quiet.warnings.0.lock().unwrap().clone(),
         SinkKind::Dynamic(dynamic) => dynamic.warnings.0.lock().unwrap().clone(),
     }
@@ -975,6 +1092,8 @@ pub fn warnings(sink: &SinkKind) -> Vec<String> {
 pub enum SinkKind {
     Lines,
     Static,
+    /// Nx's `summary`: counts and the failed tasks, after the run.
+    Summary,
     Quiet(Arc<Quiet>),
     Dynamic(Arc<Dynamic>),
 }

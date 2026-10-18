@@ -1,6 +1,7 @@
 //! Prepare finite tasks, then execute shell commands in managed process groups.
 
 mod capture;
+mod env_flags;
 mod interpolate;
 mod process;
 #[cfg(unix)]
@@ -19,9 +20,10 @@ use qk_taskgraph::Task;
 use serde_json::{Map, Value};
 
 pub use capture::{
-    Capture, Decoration, Display, MAX_LOG_BYTES, OutputStyle, RecordedLog, Shown, read_capture,
-    replay,
+    Capture, Decoration, Display, MAX_LOG_BYTES, OutputStyle, RecordedLog, Shown, collapsed,
+    printable, read_capture, replay,
 };
+pub use env_flags::{force_colour, is_ci, is_ci_with};
 pub use process::{Outcome, execute, execute_captured, shell};
 
 #[derive(Debug)]
