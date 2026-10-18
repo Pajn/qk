@@ -690,5 +690,56 @@ pub(crate) fn decide_tasks(
         };
         decisions.insert(id, decision);
     }
+    run_dependents_whole(graph, tasks, &mut decisions);
     Ok(decisions)
+}
+
+/// Runs the whole of each narrowed task that depends on a task still
+/// affected, whose outputs it may read, although its own inputs are only
+/// sources its imports do not reach.
+///
+/// A task's cause names its own changes when it has any, so this is decided
+/// from the graph rather than the cause. A task stays affected when a change
+/// touches it and the profile does not leave it out, and so does every task
+/// depending on one, since that one is then run whole itself.
+fn run_dependents_whole(
+    graph: &TaskGraph,
+    tasks: &BTreeMap<String, TaskCause>,
+    decisions: &mut BTreeMap<String, TaskDecision>,
+) {
+    let mut dependents: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (id, task) in &graph.tasks {
+        for dependency in &task.dependencies {
+            dependents.entry(dependency).or_default().push(id);
+        }
+    }
+    let mut pending: Vec<&str> = tasks
+        .iter()
+        .filter(|(id, cause)| {
+            matches!(cause, TaskCause::Touched { .. })
+                && !matches!(decisions.get(*id), Some(TaskDecision::LeftOut { .. }))
+        })
+        .map(|(id, _)| id.as_str())
+        .collect();
+    let mut kept: BTreeSet<&str> = pending.iter().copied().collect();
+    while let Some(id) = pending.pop() {
+        for &dependent in dependents.get(id).into_iter().flatten() {
+            if !tasks.contains_key(dependent) {
+                continue;
+            }
+            // A task narrowed to its cases is kept already, but runs whole too.
+            if let Some(decision @ (TaskDecision::LeftOut { .. } | TaskDecision::Cases { .. })) =
+                decisions.get_mut(dependent)
+            {
+                *decision = TaskDecision::Whole {
+                    why: Kept::Dependency {
+                        task: id.to_owned(),
+                    },
+                };
+            }
+            if kept.insert(dependent) {
+                pending.push(dependent);
+            }
+        }
+    }
 }
