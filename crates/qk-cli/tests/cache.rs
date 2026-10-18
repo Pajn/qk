@@ -1210,9 +1210,11 @@ fn eviction_removes_least_recently_used_entries() {
     assert!(stderr(&success(fixture.build(&fixture.root, &[]))).contains("cache hit"));
     assert_eq!(fixture.runs(), 2);
 
+    // Over the limit, eviction goes on to 90% of it, as in Nx: one entry
+    // fits that, two do not.
     let output = success(fixture.qk(
         &fixture.root,
-        &["cache", "prune", "--max-size", &one.to_string()],
+        &["cache", "prune", "--max-size", &(one * 3 / 2).to_string()],
     ));
     assert!(
         stdout(&output).starts_with("Evicted 1 entries"),

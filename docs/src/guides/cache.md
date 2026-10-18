@@ -249,4 +249,6 @@ already holds are stamped again when a dependency's outputs changed in the
 run, so they stay the newer. Symbolic links and directories keep their
 times.
 
-See [remote caching](remote-cache.md) for size limits and cache directory overrides.
+Entries unused for a week are evicted after each run, as in Nx, and the
+cache stays under a size limit. See [remote caching](remote-cache.md#storage-limits)
+for size limits and cache directory overrides.

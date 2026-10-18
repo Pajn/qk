@@ -134,11 +134,14 @@ Worker over R2, and documents the protocol in its `PROTOCOL.md`.
 ## Storage limits
 
 The cache stays under a size limit: `NX_MAX_CACHE_SIZE`, else nx.json
-`maxCacheSize`, else a tenth of the disk holding it, as in Nx. Sizes are a
-number of bytes with an optional `KB`, `MB` or `GB`, in powers of 1024; `0`
-means unlimited. After each run, and on `qk cache prune [--max-size <size>]`,
-qk evicts the least recently used entries until the cache fits. A hit counts
-as a use. Outputs shared between entries are stored once and deleted only
+`maxCacheSize`, else a tenth of the disk holding it (100GB when the disk's
+size cannot be read), as in Nx's code; its documentation's 10GB cap is not
+in the code. Sizes are a number of bytes with an optional `KB`, `MB` or `GB`,
+in powers of 1024; `0` means unlimited. After each run, and on
+`qk cache prune [--max-size <size>]`, qk evicts the entries unused for a
+week, whatever the limit, and when the cache is over the limit the least
+recently used entries until it holds at most 90% of it, as Nx does. A hit
+counts as a use. Outputs shared between entries are stored once and deleted only
 with the last entry citing them. Stored outputs no entry cites, scratch files
 and locks of evicted entries are removed once they are an hour old, since a
 concurrent run may still be writing them; outputs a remote fetch in progress

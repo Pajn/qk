@@ -29,7 +29,7 @@
 | `qk show task <project:target>` | A task's recent runs and why its cache key changed |
 | `qk show hash <project:target> [--against <task\|run>]` | A task's cache key and what it covers, or where it differs from another key, without running the task |
 | `qk cache path` | Print the local cache directory without creating it |
-| `qk cache prune [--max-size 1GB]` | Evict least recently used entries until the cache fits |
+| `qk cache prune [--max-size 1GB]` | Evict entries unused for a week, then least recently used entries until the cache fits |
 | `qk warm suggest <project:target>` | Run a task in the sandbox and list directories it wrote outside its outputs, as candidate warm paths (macOS) |
 | `qk reset [--only-cache \| --only-workspace-data]` | Remove the cache and this worktree's state, as `nx reset` does |
 

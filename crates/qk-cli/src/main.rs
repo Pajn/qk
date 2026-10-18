@@ -1571,14 +1571,12 @@ fn execute_narrowed(
     );
     if !skip_cache {
         let cache = qk_cache::cache_location(workspace);
+        // Entries unused for a week go even without a size limit, as in Nx.
         let pruned = qk_cache::max_size(workspace.config.extra.get("maxCacheSize"), &cache)
-            .and_then(|limit| match limit {
-                Some(limit) => qk_cache::prune_automatic(&cache, limit).map(Some),
-                None => Ok(None),
-            });
+            .and_then(|limit| qk_cache::prune_automatic(&cache, limit.unwrap_or(u64::MAX)));
         match pruned {
-            Ok(Some(pruned)) if pruned.entries > 0 => qk_executor::status!(
-                "qk: evicted {} cache entries to stay under the cache size limit",
+            Ok(pruned) if pruned.entries > 0 => qk_executor::status!(
+                "qk: evicted {} cache entries unused for a week or over the cache size limit",
                 pruned.entries
             ),
             Ok(_) => {}

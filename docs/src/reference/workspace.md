@@ -171,7 +171,8 @@ Nx nor qk: Nx's own `parallel` setting replaces it.
 
 A byte count or size such as `"2GB"`. Units `KB`, `MB` and `GB` use powers of
 1024; `0` means unlimited. `NX_MAX_CACHE_SIZE` takes precedence. The default
-is a tenth of the disk holding the cache. See [Storage limits](../guides/remote-cache.md).
+is a tenth of the disk holding the cache. Entries unused for a week are
+evicted whatever the limit. See [Storage limits](../guides/remote-cache.md).
 
 ## `s3`
 
