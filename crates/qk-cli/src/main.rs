@@ -1406,6 +1406,18 @@ fn execute_narrowed(
     single: bool,
     cases: &std::collections::BTreeMap<String, Vec<String>>,
 ) -> Result<i32> {
+    // As Nx's getRunner: a runner other than `default` must be configured.
+    if let Some(runner) = options.ignored.runner.as_deref()
+        && runner != "default"
+        && workspace
+            .config
+            .extra
+            .get("tasksRunnerOptions")
+            .and_then(|runners| runners.get(runner))
+            .is_none_or(serde_json::Value::is_null)
+    {
+        bail!("Could not find runner configuration for {runner}");
+    }
     if options.profile {
         qk_cache::profile::enable();
     }

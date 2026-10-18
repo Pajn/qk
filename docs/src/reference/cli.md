@@ -209,6 +209,8 @@ effect.
 `--runner`, `--batch`, `--skip-sync`, `--cloud`, `--no-cloud`, `--dte`,
 `--no-dte`, `--agents`, `--tui`, `--no-tui`, and `--tui-auto-exit` are accepted without
 effect. They do not enable Nx plugins, distributed execution or Nx Cloud.
+As in Nx, `--runner` must name `default` or a runner in nx.json
+`tasksRunnerOptions`.
 
 ## Target inspection
 

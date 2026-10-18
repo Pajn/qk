@@ -99,7 +99,9 @@ pub fn clear_worktree_state(root: &Path) -> Result<()> {
 }
 
 /// Where the cache is: as in Nx, `NX_CACHE_DIRECTORY`, then nx.json
-/// `cacheDirectory`, relative to the workspace root, with qk's entries in
+/// `cacheDirectory`, then the default runner's
+/// `tasksRunnerOptions.default.options.cacheDirectory`, relative to the
+/// workspace root, with qk's entries in
 /// `qk/v1` inside so they never mix with Nx's; otherwise
 /// [`cache_directory`], shared by the repository's worktrees.
 pub fn cache_location(workspace: &Workspace) -> PathBuf {
@@ -107,11 +109,16 @@ pub fn cache_location(workspace: &Workspace) -> PathBuf {
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .or_else(|| {
-            workspace
-                .config
-                .extra
+            let extra = &workspace.config.extra;
+            extra
                 .get("cacheDirectory")
+                .or_else(|| {
+                    extra
+                        .get("tasksRunnerOptions")?
+                        .pointer("/default/options/cacheDirectory")
+                })
                 .and_then(serde_json::Value::as_str)
+                .filter(|directory| !directory.is_empty())
                 .map(PathBuf::from)
         });
     match configured {

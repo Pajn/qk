@@ -150,13 +150,22 @@ The settings Nx's JavaScript support reads, which qk reads too:
 ## `cacheDirectory`
 
 A path relative to the workspace root, or an absolute path, overriding the
-default cache location. `NX_CACHE_DIRECTORY` takes precedence. qk stores its
+default cache location. `NX_CACHE_DIRECTORY` takes precedence; without either,
+`tasksRunnerOptions.default.options.cacheDirectory` is read, as in Nx. qk stores its
 entries in `qk/v1` beneath this directory so it can coexist with Nx.
 History and worktree state keep their default locations. A relative override
 gives each worktree its own cache.
 
 Without an override, the cache lives in `<git common dir>/qk/cache/v1`, or
 `.qk/cache/v1` outside Git. Use `qk cache path` to inspect it.
+
+## `tasksRunnerOptions`
+
+Nx's task runners. qk runs tasks itself, so it reads only what Nx's default
+runner reads from here: `default.options.cacheDirectory`, under
+[`cacheDirectory`](#cachedirectory). As in Nx, `--runner` must name a runner
+configured here, or `default`. A runner's `parallel` option counts in neither
+Nx nor qk: Nx's own `parallel` setting replaces it.
 
 ## `maxCacheSize`
 
