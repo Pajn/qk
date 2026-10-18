@@ -369,11 +369,15 @@ pub fn run(
         .tasks
         .values()
         .any(|task| task.definition.cache == Some(true));
-    let cache = if skip_cache {
-        (sandbox.is_none() && !analyze_inputs && cacheable)
-            .then(|| qk_cache::Cache::for_observation(workspace))
+    // As in Nx, every task is hashed, and sees its hash as NX_TASK_HASH,
+    // whether or not anything can be cached; a run that cannot use the
+    // cache only observes. A sandboxed or recorded task runs as it is.
+    let cache = if sandbox.is_some() || analyze_inputs {
+        None
+    } else if skip_cache || !(warm || cacheable) {
+        Some(qk_cache::Cache::for_observation(workspace))
     } else {
-        (warm || cacheable).then(|| qk_cache::Cache::for_workspace(workspace, &environment))
+        Some(qk_cache::Cache::for_workspace(workspace, &environment))
     };
     let mut skipped = BTreeSet::new();
     let mut exit_code = 0;

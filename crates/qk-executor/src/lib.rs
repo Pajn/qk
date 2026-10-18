@@ -1,6 +1,7 @@
 //! Prepare finite tasks, then execute shell commands in managed process groups.
 
 mod capture;
+pub mod dotenv;
 mod env_flags;
 mod interpolate;
 mod process;
@@ -289,14 +290,26 @@ pub struct PreparedTask {
 /// project root, then the workspace root, for the target and configuration
 /// (`.env.<target>.<configuration>`, `.env.<configuration>`, `.env.<target>`),
 /// then `.env.local`, `.local.env` and `.env`, each also in its `.local` and
-/// `.<name>.env` spellings.
-fn dotenv_files(project_root: &str, target: &str, configuration: Option<&str>) -> Vec<String> {
+/// `.<name>.env` spellings. An atomized target also reads the files of the
+/// target it was split from, after its own of the same kind.
+fn dotenv_files(
+    project_root: &str,
+    target: &str,
+    configuration: Option<&str>,
+    non_atomized: Option<&str>,
+) -> Vec<String> {
     let mut identifiers = Vec::new();
     if let Some(configuration) = configuration {
         identifiers.push(format!("{target}.{configuration}"));
+        if let Some(non_atomized) = non_atomized {
+            identifiers.push(format!("{non_atomized}.{configuration}"));
+        }
         identifiers.push(configuration.to_owned());
     }
     identifiers.push(target.to_owned());
+    if let Some(non_atomized) = non_atomized {
+        identifiers.push(non_atomized.to_owned());
+    }
     identifiers.push(String::new());
     let variants = |identifier: &str, root: &str| -> Vec<String> {
         let prefix = if root.is_empty() || root == "." {
@@ -337,28 +350,113 @@ fn dotenv_files(project_root: &str, target: &str, configuration: Option<&str>) -
     files
 }
 
-/// A task's environment as Nx builds it: the process environment, then each
-/// of the task's dotenv files without overriding what is already set, then
-/// the variables Nx sets for every task. A target's `env` applies on top.
+/// The target whose dotenv files a task reads, and the target it was
+/// atomized from, as Nx's getOwnerTargetForTask finds them: through the
+/// project's `metadata.targetGroups`, a target of the task's group that
+/// names a `metadata.nonAtomizedTarget`.
+fn owner_target<'a>(
+    project: &'a qk_config::Project,
+    target: &'a str,
+) -> (&'a str, Option<&'a str>) {
+    let groups = project
+        .extra
+        .get("metadata")
+        .and_then(|metadata| metadata.get("targetGroups"))
+        .and_then(Value::as_object);
+    for group in groups.into_iter().flat_map(|groups| groups.values()) {
+        let members: Vec<&str> = group
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        if !members.contains(&target) {
+            continue;
+        }
+        for member in members {
+            if let Some((name, definition)) = project.targets.get_key_value(member)
+                && let Some(non_atomized) = definition
+                    .extra
+                    .get("metadata")
+                    .and_then(|metadata| metadata.get("nonAtomizedTarget"))
+                    .and_then(Value::as_str)
+            {
+                return (name, Some(non_atomized));
+            }
+        }
+    }
+    (target, None)
+}
+
+/// The variable naming the tasks a task runs inside, one invocation a line.
+pub const INVOCATIONS: &str = "QK_TASK_INVOCATIONS";
+
+/// A task as an invocation: its id and arguments, which a task running inside
+/// it repeats only by recursing, as Nx's task invocation tracker tells it.
+pub fn invocation(task: &Task) -> String {
+    let mut text = task.id.clone();
+    for arg in &task.args {
+        text.push('\u{1f}');
+        text.push_str(arg);
+    }
+    text.replace('\n', " ")
+}
+
+/// The tasks this process runs inside, from [`INVOCATIONS`].
+pub fn enclosing_invocations() -> Vec<String> {
+    std::env::var(INVOCATIONS)
+        .map(|chain| chain.lines().map(str::to_owned).collect())
+        .unwrap_or_default()
+}
+
+/// The root dotenv files Nx loads into its own process at startup, in the
+/// order they take precedence.
+pub const ROOT_DOTENV_FILES: [&str; 3] = [".local.env", ".env.local", ".env"];
+
+/// A task's environment as Nx builds it: the process environment, without
+/// what the root dotenv files set in it at startup, then the task's dotenv
+/// files, loaded and expanded together, then the variables Nx sets for
+/// every task. A target's `env` applies on top.
 fn task_environment(
     workspace: &Workspace,
     task: &Task,
     base_env: &BTreeMap<OsString, OsString>,
 ) -> Result<(BTreeMap<OsString, OsString>, BTreeMap<OsString, OsString>)> {
     let mut env = base_env.clone();
-    let root = &workspace.projects[&task.project].root;
-    let files = if loads_dotenv(base_env) {
-        dotenv_files(root, &task.target, task.configuration.as_deref())
-    } else {
-        Vec::new()
-    };
-    for file in files {
-        for (name, value) in read_dotenv(&workspace.root.join(file))? {
-            let name = environment_key(&env, name);
-            env.entry(name).or_insert(value);
+    // As Nx's unloadDotEnvFiles: a variable whose value is a root file's
+    // goes, so the task's own files decide it.
+    for file in [".env", ".local.env", ".env.local"] {
+        for (name, value) in dotenv::read_alone(&workspace.root.join(file))? {
+            if env.get(&name) == Some(&value) {
+                env.remove(&name);
+            }
         }
     }
+    let project = &workspace.projects[&task.project];
+    if loads_dotenv(base_env) {
+        let (target, non_atomized) = owner_target(project, &task.target);
+        let files: Vec<PathBuf> = dotenv_files(
+            &project.root,
+            target,
+            task.configuration.as_deref(),
+            non_atomized,
+        )
+        .into_iter()
+        .map(|file| workspace.root.join(file))
+        .collect();
+        dotenv::load(&files, &mut env)?;
+    }
     let runtime_env = env.clone();
+    // Nx's own variables from an enclosing run, which describe that run.
+    for name in [
+        "NX_SET_CLI",
+        "NX_ORIGINAL_FORCE_COLOR",
+        "NX_TERMINAL_OUTPUT_PATH",
+        "NX_STREAM_OUTPUT",
+        "NX_PREFIX_OUTPUT",
+    ] {
+        env.remove(std::ffi::OsStr::new(name));
+    }
     let mut set = |name: &str, value: OsString| {
         env.insert(name.into(), value);
     };
@@ -367,6 +465,28 @@ fn task_environment(
     set("NX_TASK_TARGET_TARGET", task.target.clone().into());
     set("LERNA_PACKAGE_NAME", task.project.clone().into());
     set("NX_TUI", "false".into());
+    // The qk and Nx processes this task runs inside, outermost first.
+    let ancestors = match base_env.get(std::ffi::OsStr::new("NX_INVOCATION_ANCESTOR_PIDS")) {
+        Some(inherited) if !inherited.is_empty() => {
+            format!("{},{}", inherited.to_string_lossy(), std::process::id())
+        }
+        _ => std::process::id().to_string(),
+    };
+    set("NX_INVOCATION_ANCESTOR_PIDS", ancestors.into());
+    // The tasks this one runs inside, outermost first, so a run it starts can
+    // tell when it would run one of them again.
+    let mut chain = base_env
+        .get(std::ffi::OsStr::new(INVOCATIONS))
+        .map(|chain| chain.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if !chain.is_empty() {
+        chain.push('\n');
+    }
+    chain.push_str(&invocation(task));
+    set(INVOCATIONS, chain.into());
+    if task.target == "test" {
+        set("NX_TERMINAL_CAPTURE_STDERR", "true".into());
+    }
     match &task.configuration {
         Some(configuration) => set("NX_TASK_TARGET_CONFIGURATION", configuration.clone().into()),
         None => {
@@ -383,53 +503,18 @@ fn loads_dotenv(env: &BTreeMap<OsString, OsString>) -> bool {
         .is_none_or(|value| value != "false")
 }
 
-/// A dotenv file's entries, or none when it does not exist.
-fn read_dotenv(path: &Path) -> Result<Vec<(OsString, OsString)>> {
-    let file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
-    };
-    dotenvy::from_read_iter(file)
-        .enumerate()
-        .map(|(index, entry)| {
-            // Dotenv parser errors can contain secret values; report only location.
-            let (name, value) = entry.map_err(|_| {
-                anyhow::anyhow!("invalid dotenv entry {} in {}", index + 1, path.display())
-            })?;
-            Ok((name.into(), value.into()))
-        })
-        .collect()
-}
-
-/// Read dotenv files into a child environment without changing process globals.
-/// Existing process variables win over .env.local, which wins over .env.
+/// The process environment with the root dotenv files loaded into it, as
+/// Nx loads them into its own process at startup, unless
+/// `NX_LOAD_DOT_ENV_FILES=false`. Variables already set win.
 pub fn environment(workspace: &Path) -> Result<BTreeMap<OsString, OsString>> {
-    let mut values = BTreeMap::new();
-    let process: BTreeMap<OsString, OsString> = std::env::vars_os().collect();
-    let names: &[&str] = if loads_dotenv(&process) {
-        &[".env", ".env.local"]
-    } else {
-        &[]
-    };
-    for name in names {
-        let path = workspace.join(name);
-        let file = match std::fs::File::open(&path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(error).with_context(|| format!("cannot read {}", path.display()));
-            }
-        };
-        for (index, entry) in dotenvy::from_read_iter(file).enumerate() {
-            // Dotenv parser errors can contain secret values; report only location.
-            let (name, value) = entry.map_err(|_| {
-                anyhow::anyhow!("invalid dotenv entry {} in {}", index + 1, path.display())
-            })?;
-            values.insert(name.into(), value.into());
-        }
+    let mut values: BTreeMap<OsString, OsString> = std::env::vars_os().collect();
+    if loads_dotenv(&values) {
+        let files: Vec<PathBuf> = ROOT_DOTENV_FILES
+            .iter()
+            .map(|file| workspace.join(file))
+            .collect();
+        dotenv::load(&files, &mut values)?;
     }
-    values.extend(std::env::vars_os());
     Ok(values)
 }
 
@@ -472,15 +557,8 @@ pub fn prepare(
             if !path.is_file() {
                 bail!("envFile {file} does not exist");
             }
-            for (name, value) in read_dotenv(&path)? {
-                let name = environment_key(&env, name);
-                for env in [&mut runtime_env, &mut env] {
-                    let entry = env.entry(name.clone()).or_default();
-                    if entry.is_empty() {
-                        *entry = value.clone();
-                    }
-                }
-            }
+            dotenv::load(std::slice::from_ref(&path), &mut runtime_env)?;
+            dotenv::load(std::slice::from_ref(&path), &mut env)?;
         }
     }
     // A target-level `env` is a qk extension, for every executor.
@@ -907,7 +985,7 @@ fn package_manager(workspace: &Workspace) -> Result<&'static str> {
 mod dotenv_tests {
     #[test]
     fn colon_targets_keep_configuration_and_generic_dotenv_files() {
-        let files = super::dotenv_files("app", "test:unit:watch", Some("ci"));
+        let files = super::dotenv_files("app", "test:unit:watch", Some("ci"), None);
         assert!(files.iter().all(|file| !file.contains(':')));
         assert!(files.contains(&"app/.env.ci".to_owned()));
         assert!(files.contains(&"app/.env".to_owned()));

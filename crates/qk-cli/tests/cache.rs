@@ -4941,6 +4941,28 @@ fn tasks_see_their_hash() {
     .unwrap();
     assert_eq!(run["tasks"][0]["key"], json!(printed));
     assert!(!printed.is_empty());
+    // As in Nx, the task is hashed when the cache is skipped too.
+    let output = success(fixture.build(
+        &fixture.root,
+        &["--output-style", "static", "--skip-nx-cache"],
+    ));
+    assert!(stdout(&output).contains(&format!("hash={printed}")));
+}
+
+#[test]
+fn nx_disable_nx_cache_skips_the_cache_as_in_nx() {
+    let fixture = Fixture::new(json!({"command": "echo built", "cache": true}));
+    let build = |env: &[(&str, &str)]| {
+        let mut command = fixture.command(
+            &fixture.root,
+            &["run", "app:build", "--output-style", "static"],
+        );
+        command.envs(env.iter().copied());
+        success(command.output().unwrap())
+    };
+    build(&[]);
+    assert!(cached(&build(&[])));
+    assert!(!cached(&build(&[("NX_DISABLE_NX_CACHE", "true")])));
 }
 
 #[test]

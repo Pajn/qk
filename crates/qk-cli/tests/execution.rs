@@ -611,19 +611,24 @@ fn missing_scripts_fail_at_execution_without_running_dependencies() {
     assert!(!temp.path().join("must-not-exist").exists());
 }
 
+#[cfg(unix)]
 #[test]
-fn malformed_dotenv_does_not_expose_secret_values() {
-    let temp = fixture(json!({"test":{"executor":"nx:noop"}}));
+fn dotenv_files_are_read_as_npm_dotenv_reads_them() {
+    let temp = fixture(
+        json!({"show": {"command": "printf '%s|' \"$UNCLOSED\" \"$QUOTED\" \"$EXPANDED\" \"$MULTI\""}}),
+    );
+    // A line it cannot read as quoted is read unquoted, as npm's dotenv does;
+    // single quotes do not stop expansion, as dotenv-expand has it.
     fs::write(
         temp.path().join(".env"),
-        "QK_TEST_SECRET='secret-without-closing-quote",
+        "UNCLOSED='no closing quote\nQUOTED='$UNCLOSED'\nEXPANDED=${MISSING:-default}\nMULTI=\"one\ntwo\"\nnot a variable\n",
     )
     .unwrap();
-    let output = run(temp.path(), &["run", "app:test"]);
-    assert!(!output.status.success());
-    let error = String::from_utf8_lossy(&output.stderr);
-    assert!(error.contains("invalid dotenv"));
-    assert!(!error.contains("secret-without-closing-quote"));
+    let output = success(run(temp.path(), &["run", "app:show"]));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "'no closing quote|'no closing quote|default|one\ntwo|"
+    );
 }
 
 #[cfg(unix)]
@@ -1522,6 +1527,105 @@ fn tasks_load_their_dotenv_files_and_nx_variables_like_nx() {
         String::from_utf8(success(output).stdout).unwrap(),
         "root project show process target app:show true\n"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_task_s_dotenv_files_expand_across_each_other_as_in_nx() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    fs::write(root.join("nx.json"), "{}").unwrap();
+    fs::create_dir_all(root.join("app")).unwrap();
+    fs::write(
+        root.join("app/project.json"),
+        json!({"name": "app", "targets": {"show": {"command": "echo $URL $FROM_ROOT"}}})
+            .to_string(),
+    )
+    .unwrap();
+    // The project's file names what only the root's defines.
+    fs::write(root.join("app/.env.show"), "URL=http://${HOST}:${PORT}\n").unwrap();
+    fs::write(
+        root.join(".env"),
+        "HOST=localhost\nPORT=8080\nFROM_ROOT=$HOST\n",
+    )
+    .unwrap();
+    let output = success(command(root, &["run", "app:show"]).output().unwrap());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "http://localhost:8080 localhost\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn root_dotenv_files_set_run_controls_as_in_nx() {
+    let temp = fixture(json!({"build": {"command": "echo built"}}));
+    // The root dotenv files load into qk's own environment, `.local.env`
+    // first.
+    fs::write(
+        temp.path().join(".local.env"),
+        "NX_DEFAULT_OUTPUT_STYLE=static\n",
+    )
+    .unwrap();
+    fs::write(temp.path().join(".env"), "NX_DEFAULT_OUTPUT_STYLE=stream\n").unwrap();
+    let output = command(temp.path(), &["run-many", "-t", "build"])
+        .env_remove("NX_DEFAULT_OUTPUT_STYLE")
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("> nx run app:build"), "{stdout}");
+    // NX_LOAD_DOT_ENV_FILES=false leaves them out.
+    let output = command(temp.path(), &["run-many", "-t", "build"])
+        .env_remove("NX_DEFAULT_OUTPUT_STYLE")
+        .env("NX_LOAD_DOT_ENV_FILES", "false")
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
+}
+
+#[cfg(unix)]
+#[test]
+fn tasks_see_the_variables_nx_sets_and_not_those_of_an_enclosing_run() {
+    let temp = fixture(json!({
+        "test": {"command": "echo verbose=$NX_VERBOSE_LOGGING capture=$NX_TERMINAL_CAPTURE_STDERR cli=$NX_SET_CLI stream=$NX_STREAM_OUTPUT hash=${NX_TASK_HASH:+set} pids=$NX_INVOCATION_ANCESTOR_PIDS"}
+    }));
+    let output = command(temp.path(), &["run", "app:test"])
+        .env_remove("NX_VERBOSE_LOGGING")
+        .env("NX_SET_CLI", "true")
+        .env("NX_STREAM_OUTPUT", "true")
+        .env("NX_INVOCATION_ANCESTOR_PIDS", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(success(output).stdout).unwrap();
+    let pids = stdout.trim().rsplit_once("pids=").unwrap().1.to_owned();
+    assert!(pids.starts_with("1,") && pids.len() > 2, "{stdout}");
+    assert!(
+        stdout.starts_with("verbose=false capture=true cli= stream= hash=set "),
+        "{stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_task_running_itself_again_is_refused_as_in_nx() {
+    let qk = env!("CARGO_BIN_EXE_qk");
+    let temp = fixture(json!({
+        "loop": {"command": format!("'{qk}' run app:loop")},
+        "outer": {"command": format!("'{qk}' run app:inner")},
+        "inner": {"command": "echo inner"}
+    }));
+    let output = run(temp.path(), &["run", "app:loop"]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Recursive task invocation detected")
+            && stderr.contains("app:loop -> app:loop"),
+        "{stderr}"
+    );
+    // Running another task from a task is fine.
+    let output = success(run(temp.path(), &["run", "app:outer"]));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("inner"));
 }
 
 #[cfg(unix)]

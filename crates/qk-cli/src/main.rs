@@ -475,9 +475,9 @@ impl RunOptions {
             // Only this thread exists yet.
             unsafe { std::env::set_var(name, "true") }
         };
-        if self.verbose {
-            set("NX_VERBOSE_LOGGING");
-        }
+        // As in Nx, always `true` or `false`.
+        // Only this thread exists yet.
+        unsafe { std::env::set_var("NX_VERBOSE_LOGGING", self.verbose().to_string()) }
         if self.skips_cache() {
             set("NX_SKIP_NX_CACHE");
         }
@@ -776,7 +776,9 @@ enum ShowCommand {
 
 fn main() {
     use clap::CommandFactory;
-    let args = match shorthand(std::env::args_os().collect()) {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    load_root_dotenv(&args);
+    let args = match shorthand(args) {
         Ok(args) => args,
         Err(error) => {
             eprintln!("qk: {error:#}");
@@ -795,6 +797,35 @@ fn main() {
             }
             eprintln!("qk: {error:#}");
             std::process::exit(1);
+        }
+    }
+}
+
+/// Loads the workspace's root dotenv files into qk's own environment, as Nx
+/// loads them into its process at startup, so that the run controls they set,
+/// such as NX_DEFAULT_OUTPUT_STYLE or NX_PARALLEL, apply. Variables already
+/// set win. Without a workspace there is nothing to load; a file that cannot
+/// be read is reported when the run reads it again.
+fn load_root_dotenv(args: &[std::ffi::OsString]) {
+    let named = args.iter().enumerate().find_map(|(index, arg)| {
+        if arg == "--workspace" {
+            args.get(index + 1).map(PathBuf::from)
+        } else {
+            arg.to_str()?
+                .strip_prefix("--workspace=")
+                .map(PathBuf::from)
+        }
+    });
+    let Some(root) = named.or_else(|| find_workspace(&std::env::current_dir().ok()?).ok()) else {
+        return;
+    };
+    let Ok(environment) = qk_executor::environment(&root) else {
+        return;
+    };
+    for (name, value) in environment {
+        if std::env::var_os(&name).as_ref() != Some(&value) {
+            // Only this thread exists yet.
+            unsafe { std::env::set_var(name, value) }
         }
     }
 }
@@ -1553,6 +1584,26 @@ fn execute_narrowed(
         }
         print_json(&graph)?;
         return Ok(0);
+    }
+    // As Nx does, refuse to run a task this run was started from.
+    let enclosing = qk_executor::enclosing_invocations();
+    if let Some(task) = graph
+        .tasks
+        .values()
+        .find(|task| enclosing.contains(&qk_executor::invocation(task)))
+    {
+        let mut chain: Vec<&str> = enclosing
+            .iter()
+            .map(|invocation| invocation.split('\u{1f}').next().unwrap_or_default())
+            .collect();
+        chain.push(&task.id);
+        bail!(
+            "Recursive task invocation detected:\n\n  {}\n\nTask \"{}\" was already invoked by a parent qk or Nx process in this chain. This typically happens when a task's command (e.g., \"nx {} {}\") triggers a chain of tasks that eventually re-invokes itself.",
+            chain.join(" -> "),
+            task.id,
+            task.target,
+            task.project
+        );
     }
     let cancelled = Arc::new(AtomicBool::new(false));
     signals::install(cancelled.clone())?;
