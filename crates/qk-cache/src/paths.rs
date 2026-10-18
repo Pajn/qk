@@ -1352,13 +1352,8 @@ mod tests {
             .unwrap(),
             ["dist/lib/libs/lib", "lib"]
         );
-        assert!(
-            outputs(
-                json!(["{options.bad}"]),
-                json!({"bad": "x/{workspaceRoot}"})
-            )
-            .is_err()
-        );
+        // `{workspaceRoot}` elsewhere in an option fails when the workspace
+        // loads, as in Nx; see qk-config's workspace tests.
         // Arguments override options and are taken as they are given.
         assert_eq!(
             outputs_of(
