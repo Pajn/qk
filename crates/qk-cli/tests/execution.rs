@@ -855,10 +855,10 @@ fn dependents_leaving_out_a_continuous_task_s_inputs_are_cached() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(!stderr.contains("cache bypassed"), "{stderr}");
     }
-    assert_eq!(
-        fs::read_to_string(temp.path().join("runs.log")).unwrap(),
-        "ran\n"
-    );
+    // The second run is a cache hit, so the command ran once. On Windows,
+    // cmd writes `ran \r\n`.
+    let runs = fs::read_to_string(temp.path().join("runs.log")).unwrap();
+    assert_eq!(runs.lines().count(), 1, "{runs:?}");
 }
 
 #[test]
