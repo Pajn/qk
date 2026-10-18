@@ -29,32 +29,48 @@ impl Pattern {
     /// Compiles a glob without its leading `!`; `negated` says whether one was
     /// there. Nx expands every negated pattern, and every glob it expands to
     /// then excludes, so a negated pattern matches what any of them matches.
+    /// As in Nx, `\` escapes the character after it on every platform.
     pub fn new(pattern: &str, negated: bool) -> Result<Self> {
-        let globs = if negated
-            || ["|", "(", "{,", "!"]
-                .iter()
-                .any(|token| pattern.contains(token))
-        {
-            expand(pattern)?
-        } else {
-            vec![(pattern.to_owned(), false)]
-        };
+        Self::from_globs(&[pattern], negated)
+    }
+
+    /// A fileset entry: as in Nx 24, a path with no glob pattern names that
+    /// file, or that directory and everything under it.
+    pub fn fileset(pattern: &str, negated: bool) -> Result<Self> {
+        if pattern.is_empty() || pattern.ends_with('/') || !names_a_path(pattern) {
+            return Self::new(pattern, negated);
+        }
+        Self::from_globs(&[pattern, &format!("{pattern}/**")], negated)
+    }
+
+    fn from_globs(patterns: &[&str], negated: bool) -> Result<Self> {
         let mut included = GlobSetBuilder::new();
         let mut excluded = GlobSetBuilder::new();
-        for (glob, excludes) in globs {
-            let glob = if glob.ends_with('/') {
-                format!("{glob}**")
+        for pattern in patterns {
+            let globs = if negated
+                || ["|", "(", "{,", "!"]
+                    .iter()
+                    .any(|token| unescaped(pattern).contains(token))
+            {
+                expand(pattern)?
             } else {
-                glob
+                vec![((*pattern).to_owned(), false)]
             };
-            let glob = GlobBuilder::new(&glob)
-                .literal_separator(true)
-                .backslash_escape(false)
-                .build()?;
-            if excludes && !negated {
-                excluded.add(glob);
-            } else {
-                included.add(glob);
+            for (glob, excludes) in globs {
+                let glob = if glob.ends_with('/') {
+                    format!("{glob}**")
+                } else {
+                    glob
+                };
+                let glob = GlobBuilder::new(&glob)
+                    .literal_separator(true)
+                    .backslash_escape(true)
+                    .build()?;
+                if excludes && !negated {
+                    excluded.add(glob);
+                } else {
+                    included.add(glob);
+                }
             }
         }
         Ok(Self {
@@ -76,10 +92,32 @@ impl Pattern {
     }
 }
 
+/// `pattern` with every escaped character, and its `\`, left out, so what
+/// remains is the syntax the pattern uses.
+fn unescaped(pattern: &str) -> String {
+    let mut result = String::new();
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            chars.next();
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// Whether `pattern` names a path rather than matching, as Nx 24 reads it:
+/// nothing in it is glob syntax once its escapes are read. `@` and `+` start
+/// a pattern only with a group after them, so `@types` and `c++` are names.
+pub fn names_a_path(pattern: &str) -> bool {
+    !unescaped(pattern).contains(['*', '?', '[', ']', '{', '}', '(', ')', '!'])
+}
+
 /// Whether a path segment needs matching rather than being a literal directory.
 pub fn is_literal(segment: &str) -> bool {
     !segment.contains([
-        '!', '?', '@', '+', '*', '|', ',', '{', '}', '[', ']', '(', ')',
+        '!', '?', '@', '+', '*', '|', ',', '{', '}', '[', ']', '(', ')', '\\',
     ])
 }
 
@@ -206,10 +244,9 @@ fn parse_segment(segment: &str) -> Result<Vec<Group>> {
             rest = remaining;
             continue;
         }
-        // A literal runs to the next `{,` or, without one, to the next special character.
-        let end = rest
-            .find("{,")
-            .unwrap_or_else(|| rest.find(['?', '+', '@', '!', '(']).unwrap_or(rest.len()));
+        // A literal runs to the next `{,` or, without one, to the next special
+        // character, and an escaped character is always literal.
+        let end = literal_end(rest);
         if end == 0 {
             bail!("unsupported glob syntax at {rest:?}");
         }
@@ -217,6 +254,25 @@ fn parse_segment(segment: &str) -> Result<Vec<Group>> {
         rest = &rest[end..];
     }
     Ok(groups)
+}
+
+/// Where a literal starting `rest` ends: at the next unescaped `{,`, or
+/// without one at the next unescaped `?`, `+`, `@`, `!` or `(`.
+fn literal_end(rest: &str) -> usize {
+    let mut brace = None;
+    let mut special = None;
+    let mut chars = rest.char_indices();
+    while let Some((index, c)) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            '{' if brace.is_none() && rest[index + 1..].starts_with(',') => brace = Some(index),
+            '?' | '+' | '@' | '!' | '(' if special.is_none() => special = Some(index),
+            _ => {}
+        }
+    }
+    brace.or(special).unwrap_or(rest.len())
 }
 
 fn display(items: &str) -> String {
@@ -412,6 +468,46 @@ mod tests {
         }
         let plain = Pattern::new("src/*.ts", false).unwrap();
         assert!(plain.is_match("src/a.ts") && !plain.is_match("src/a/b.ts"));
+    }
+
+    // Nx 24's `a_backslash_escapes_the_next_character` and the inputs
+    // reference: an escaped character matches itself on every platform.
+    #[test]
+    fn a_backslash_escapes_the_next_character() {
+        let route = Pattern::new(r"app/\(marketing\)/**/*", false).unwrap();
+        assert!(route.is_match("app/(marketing)/page.tsx"));
+        assert!(!route.is_match("app/marketing/page.tsx"));
+        let id = Pattern::new(r"src/\[id\].ts", false).unwrap();
+        assert!(id.is_match("src/[id].ts") && !id.is_match("src/i.ts"));
+        let mixed = Pattern::new(r"app/\(a\)/?(*.)+(spec|test).ts", false).unwrap();
+        assert!(mixed.is_match("app/(a)/x.spec.ts") && !mixed.is_match("app/a/x.spec.ts"));
+        // A Windows-style separator is an escape too, so this matches nothing
+        // under `src`.
+        assert!(!Pattern::new(r"src\**", false).unwrap().is_match("src/a.ts"));
+    }
+
+    // Nx 24's `path_or_everything_under`.
+    #[test]
+    fn a_fileset_path_with_no_pattern_names_a_file_or_a_directory() {
+        for pattern in ["src", "src/"] {
+            let fileset = Pattern::fileset(pattern, false).unwrap();
+            assert!(fileset.is_match("src/a.ts") && fileset.is_match("src/deep/b.ts"));
+            assert!(!fileset.is_match("srcs/a.ts"));
+        }
+        assert!(
+            Pattern::fileset("package.json", false)
+                .unwrap()
+                .is_match("package.json")
+        );
+        for named in ["@types", "c++", r"\(group\)"] {
+            let fileset = Pattern::fileset(named, false).unwrap();
+            let unescaped = named.replace('\\', "");
+            assert!(fileset.is_match(format!("{unescaped}/x")), "{named}");
+        }
+        // A pattern keeps matching only what it matches.
+        let glob = Pattern::fileset("src/*.ts", false).unwrap();
+        assert!(glob.is_match("src/a.ts") && !glob.is_match("src/a.ts/b"));
+        assert!(!Pattern::new("src", false).unwrap().is_match("src/a.ts"));
     }
 
     // What Nx 23.1's own glob sets select from the same files.
