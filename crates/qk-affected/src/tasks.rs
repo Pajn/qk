@@ -413,6 +413,7 @@ mod tests {
                             args: Vec::new(),
                             definition: Target::default(),
                             dependencies: dependencies.iter().map(|id| (*id).to_owned()).collect(),
+                            edges: BTreeMap::new(),
                         },
                     )
                 })

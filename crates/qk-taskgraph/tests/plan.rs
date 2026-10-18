@@ -1,5 +1,5 @@
 use qk_config::Workspace;
-use qk_taskgraph::{Request, TaskGraph};
+use qk_taskgraph::{Edge, Request, TaskGraph, WaitFor};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -114,9 +114,9 @@ fn configuration_environment_replaces_base_environment() {
 }
 
 #[test]
-fn object_selectors_forward_arguments_and_exclude_self() {
+fn object_selectors_forward_arguments_and_exclude_projects() {
     let (_temp, workspace) = workspace(json!({
-        "app": {"targets":{"build":{"dependsOn":[{"target":"build", "projects":["*", "!self"], "params":"forward"}]}}},
+        "app": {"targets":{"build":{"dependsOn":[{"target":"build", "projects":["*", "!app"], "params":"forward"}]}}},
         "lib": {"targets":{"build":{}}}
     }));
     let mut request = Request::parse("app:build").unwrap();
@@ -183,4 +183,105 @@ fn reaches_through_dependencies_without_the_target_like_nx() {
             .collect::<Vec<_>>(),
         ["base:codegen", "base:tsc"]
     );
+}
+
+#[test]
+fn continuous_dependencies_record_how_they_are_depended_on() {
+    let (_temp, workspace) = workspace(json!({
+        "app": {"targets":{"serve":{"continuous":true}}},
+        "app-e2e": {"targets":{
+            "e2e":{"dependsOn":[{"projects":["app"], "target":"serve", "inputs":false, "waitFor":"ready"}]},
+            "smoke":{"dependsOn":["app:serve"]}
+        }}
+    }));
+    let graph = TaskGraph::build(&workspace, &[Request::parse("app-e2e:e2e").unwrap()]).unwrap();
+    let e2e = &graph.tasks["app-e2e:e2e"];
+    assert_eq!(
+        e2e.edge("app:serve"),
+        Edge {
+            inputs: false,
+            wait_for: WaitFor::Ready
+        }
+    );
+    let graph = TaskGraph::build(&workspace, &[Request::parse("app-e2e:smoke").unwrap()]).unwrap();
+    assert_eq!(
+        graph.tasks["app-e2e:smoke"].edge("app:serve"),
+        Edge::default()
+    );
+    assert!(graph.tasks["app-e2e:smoke"].edges.is_empty());
+}
+
+#[test]
+fn entries_naming_one_dependency_merge_as_nx_merges_them() {
+    let (_temp, workspace) = workspace(json!({
+        "app": {"targets":{"serve":{"continuous":true}}},
+        "app-e2e": {"targets":{
+            "opted":{"dependsOn":[
+                {"projects":"app", "target":"serve", "inputs":false},
+                {"projects":"app", "target":"serve", "waitFor":"ready"}
+            ]},
+            "both":{"dependsOn":[
+                {"projects":"app", "target":"serve", "inputs":false, "waitFor":"started"},
+                {"projects":["tag:none", "app"], "target":"serve", "inputs":false}
+            ]}
+        }}
+    }));
+    let graph = TaskGraph::build(&workspace, &[Request::parse("app-e2e:opted").unwrap()]).unwrap();
+    assert_eq!(
+        graph.tasks["app-e2e:opted"].edge("app:serve"),
+        Edge {
+            inputs: true,
+            wait_for: WaitFor::Ready
+        }
+    );
+    let graph = TaskGraph::build(&workspace, &[Request::parse("app-e2e:both").unwrap()]).unwrap();
+    assert_eq!(
+        graph.tasks["app-e2e:both"].edge("app:serve"),
+        Edge {
+            inputs: false,
+            wait_for: WaitFor::Started
+        }
+    );
+}
+
+#[test]
+fn dependency_edge_fields_are_validated() {
+    for (entry, message) in [
+        (
+            json!({"target":"serve", "inputs":"no"}),
+            "inputs must be boolean",
+        ),
+        (
+            json!({"target":"serve", "waitFor":"up"}),
+            "waitFor must be started or ready",
+        ),
+    ] {
+        let (_temp, workspace) = workspace(json!({
+            "app": {"targets":{"serve":{"continuous":true}, "e2e":{"dependsOn":[entry]}}}
+        }));
+        let error =
+            TaskGraph::build(&workspace, &[Request::parse("app:e2e").unwrap()]).unwrap_err();
+        assert!(format!("{error:#}").contains(message), "{error:#}");
+    }
+}
+
+#[test]
+fn nx_15_project_spellings_fail_unless_a_project_has_the_name() {
+    for spelling in ["self", "dependencies"] {
+        let (_temp, workspace) = workspace(json!({
+            "app": {"targets":{"lint":{}, "build":{"dependsOn":[{"target":"lint", "projects":spelling}]}}}
+        }));
+        let error =
+            TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("no longer supported"),
+            "{error:#}"
+        );
+    }
+    let (_temp, workspace) = workspace(json!({
+        "app": {"targets":{"build":{"dependsOn":[{"target":"lint", "projects":"self"}]}}},
+        "self": {"targets":{"lint":{}}}
+    }));
+    let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
+    assert!(graph.tasks["app:build"].dependencies.contains("self:lint"));
 }

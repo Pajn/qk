@@ -69,8 +69,17 @@ task dependencies. Shared dependencies run once.
 Object declarations also accept `params: "forward"` and `options: "forward"`;
 the default is not to forward. `params` passes task arguments; `options`
 passes scalar options as `--name=value` and object fields such as
-`--env.NAME=value`. Lists cannot be forwarded this way. Project selectors
-also accept `self` and `!self`.
+`--env.NAME=value`. Lists cannot be forwarded this way. As in Nx 24, the
+Nx 15 spellings `projects: "self"` and `projects: "dependencies"` fail.
+
+An object declaration naming a continuous target also accepts `inputs` and
+`waitFor`. `inputs: false` keeps the continuous task's inputs from counting
+for the dependent; see [Affected selection](../guides/affected.md#selecting-affected-tasks-by-inputs).
+`waitFor` is `"started"`, the default, or `"ready"`. qk reads it but does not
+probe readiness yet, so the dependent starts as before. When several
+declarations name the same task, `"ready"` wins, and its inputs count unless
+every declaration sets `inputs: false`. Both have no effect on a dependency
+that is not continuous.
 
 Other missing dependency targets are skipped. Unknown explicit projects
 and task cycles fail unless `--nx-ignore-cycles` is used. A shared task

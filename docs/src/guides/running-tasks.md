@@ -145,7 +145,9 @@ arguments (`--env.NAME=value` for an object's fields; lists cannot be passed
 this way), before any arguments `params: "forward"` passes. As in Nx that
 includes a run-commands target's own `command`, so it suits targets of the
 same executor. Project selectors accept names,
-globs, tags, `self` and `!self`. As in Nx, a project dependency without the
+globs, tags and `!` exclusions. As in Nx 24, `projects: "self"` and
+`projects: "dependencies"` fail: leave `projects` out for the task's own
+project, or set `dependencies: true`. As in Nx, a project dependency without the
 target is looked through: the task's `dependsOn` applies again from that
 project, so `^tsc` reaches the nearest dependencies that have `tsc`. Other
 missing dependency targets are skipped; unknown explicit projects and task cycles fail.
