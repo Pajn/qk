@@ -794,21 +794,33 @@ pub fn diff(before: &Value, after: &Value) -> Cause {
             .unwrap_or_default()
     };
     let mut files = Files::default();
-    let (old, new) = (object(before, "files"), object(after, "files"));
-    for (path, value) in &new {
-        match old.get(path) {
-            None => files.added.push(path.clone()),
-            Some(previous) if previous != value => files.changed.push(path.clone()),
-            Some(_) => {}
+    // Declared files, then the files qk adds on its own, as configuration.
+    let inferred = |value: &Value| value.get("inferred").cloned().unwrap_or_default();
+    let (inferred_before, inferred_after) = (inferred(before), inferred(after));
+    for (group, old, new) in [
+        ("files", object(before, "files"), object(after, "files")),
+        (
+            "configuration",
+            object(&inferred_before, "files"),
+            object(&inferred_after, "files"),
+        ),
+    ] {
+        let mut differs = false;
+        for (path, value) in &new {
+            match old.get(path) {
+                None => files.added.push(path.clone()),
+                Some(previous) if previous != value => files.changed.push(path.clone()),
+                Some(_) => continue,
+            }
+            differs = true;
         }
-    }
-    files.removed = old
-        .keys()
-        .filter(|path| !new.contains_key(*path))
-        .cloned()
-        .collect();
-    if !files.is_empty() {
-        changed.insert("files".to_owned());
+        for path in old.keys().filter(|path| !new.contains_key(*path)) {
+            files.removed.push(path.clone());
+            differs = true;
+        }
+        if differs {
+            changed.insert(group.to_owned());
+        }
     }
     let mut values = Vec::new();
     let (old, new) = (object(before, "values"), object(after, "values"));
@@ -821,16 +833,37 @@ pub fn diff(before: &Value, after: &Value) -> Cause {
             "env"
         } else if name.starts_with("runtime:") {
             "runtime"
-        } else if name == "lockfile" {
+        } else if name == "externalDependencies" {
             "lockfile"
         } else {
             "inputs"
         };
         changed.insert(group.to_owned());
-        if name == "lockfile" {
-            values.extend(lockfile_changes(was, is));
+        if name == "externalDependencies" {
+            values.extend(external_changes(was, is));
         } else {
             values.push(name.clone());
+        }
+    }
+    if inferred_before.get("lockfile") != inferred_after.get("lockfile") {
+        changed.insert("lockfile".to_owned());
+        values.extend(lockfile_changes(
+            inferred_before.get("lockfile"),
+            inferred_after.get("lockfile"),
+        ));
+    }
+    if inferred_before.get("workspaceFile") != inferred_after.get("workspaceFile") {
+        changed.insert("configuration".to_owned());
+        values.push("pnpm-workspace.yaml outside its resolution keys".to_owned());
+    }
+    let (old, new) = (
+        object(&inferred_before, "manifests"),
+        object(&inferred_after, "manifests"),
+    );
+    for path in old.keys().chain(new.keys()).collect::<BTreeSet<_>>() {
+        if old.get(path) != new.get(path) {
+            changed.insert("configuration".to_owned());
+            values.push(format!("{path} as dependents read it"));
         }
     }
     let (old, new) = (
@@ -923,8 +956,8 @@ fn brief(value: Option<&Value>) -> String {
     }
 }
 
-/// The parts of the lockfile value that differ: the global part, importers
-/// and external packages, by name.
+/// The parts of the lockfile value that differ: the global part and
+/// importers, by name.
 fn lockfile_changes(before: Option<&Value>, after: Option<&Value>) -> Vec<String> {
     let empty = Value::Null;
     let (before, after) = (before.unwrap_or(&empty), after.unwrap_or(&empty));
@@ -932,24 +965,37 @@ fn lockfile_changes(before: Option<&Value>, after: Option<&Value>) -> Vec<String
     if before.get("global") != after.get("global") {
         changes.push("lockfile: version, settings or package manager".to_owned());
     }
-    for (part, label) in [("importers", "importer"), ("external", "package")] {
-        let names = |value: &Value| {
-            value
-                .get(part)
-                .and_then(Value::as_object)
-                .map(|object| object.keys().cloned().collect::<BTreeSet<_>>())
-                .unwrap_or_default()
-        };
-        for name in names(before).union(&names(after)) {
-            if before.get(part).and_then(|value| value.get(name))
-                != after.get(part).and_then(|value| value.get(name))
-            {
-                changes.push(format!("lockfile: {label} {name}"));
-            }
-        }
-    }
+    changes.extend(
+        named_changes(before.get("importers"), after.get("importers"))
+            .map(|name| format!("lockfile: importer {name}")),
+    );
     if changes.is_empty() {
         changes.push("lockfile".to_owned());
     }
     changes
+}
+
+/// The `externalDependencies` packages installed differently, by name.
+fn external_changes(before: Option<&Value>, after: Option<&Value>) -> Vec<String> {
+    named_changes(before, after)
+        .map(|name| format!("lockfile: package {name}"))
+        .collect()
+}
+
+/// The names whose entries differ between two objects.
+fn named_changes(before: Option<&Value>, after: Option<&Value>) -> impl Iterator<Item = String> {
+    let entries = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let (before, after) = (entries(before), entries(after));
+    before
+        .keys()
+        .chain(after.keys())
+        .filter(|name| before.get(*name) != after.get(*name))
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
 }

@@ -225,7 +225,7 @@ impl Recorder {
             let mut coverage = self.coverage();
             coverage.diagnostics = diagnostics.remove(id).unwrap_or_default();
             let declared = match &self.declared.tasks[id] {
-                Ok(resolved) => resolved.files.clone(),
+                Ok(resolved) => resolved.whole_files().map(str::to_owned).collect(),
                 Err(error) => {
                     coverage
                         .diagnostics
@@ -325,7 +325,7 @@ impl Recorder {
                     Category::Generated
                 } else if self.declared.tasks[id]
                     .as_ref()
-                    .is_ok_and(|resolved| resolved.is_resolution_metadata(&event.path))
+                    .is_ok_and(|resolved| resolved.inferred.is_resolution_metadata(&event.path))
                 {
                     Category::ResolutionMetadata
                 } else {
@@ -357,7 +357,7 @@ impl Recorder {
                 "qkVersion": env!("CARGO_PKG_VERSION"),
                 "platform": [std::env::consts::OS, std::env::consts::ARCH],
                 "warmState": "existing on disk; restoration and publication disabled",
-                "nonFileInputs": self.declared.tasks[id].as_ref().ok().map(|resolved| resolved.values.keys().collect::<Vec<_>>()),
+                "nonFileInputs": self.declared.tasks[id].as_ref().ok().map(|resolved| resolved.declared.values.keys().collect::<Vec<_>>()),
             });
             let mut analysis = TaskAnalysis {
                 context,
@@ -366,7 +366,7 @@ impl Recorder {
                 declared_files: declared,
                 mandatory_files: self.declared.tasks[id]
                     .as_ref()
-                    .map(|resolved| resolved.mandatory.clone())
+                    .map(qk_cache::Resolved::always_included)
                     .unwrap_or_default(),
                 accesses,
                 observed_inputs: BTreeSet::new(),
