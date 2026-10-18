@@ -3,7 +3,7 @@
 Inspect the normalized project before running it:
 
 ```sh
-qk show project web --json
+qk show project web
 qk run web:build --dry-run
 qk run web:build
 qk run-many -t build,test -p 'web,tag:library' --parallel 4
@@ -28,8 +28,8 @@ requested targets and errors when nothing matches. `run`, `run-many` and
   (`--disable-remote-cache`, `NX_SKIP_REMOTE_CACHE=true` or
   `NX_DISABLE_REMOTE_CACHE=true`) to keep to the local cache. Tasks see
   `NX_SKIP_NX_CACHE=true` when the cache is skipped.
-- `--nx-bail` (or `NX_BAIL=true`): after a task fails, nothing else starts;
-  what is running finishes.
+- `--nx-bail` (or `NX_BAIL=true`, which `--nx-bail=false` overrides): after a
+  task fails, nothing else starts; what is running finishes.
 - `--exclude-task-dependencies`: only the requested tasks run.
 - `--nx-ignore-cycles` (or `NX_IGNORE_CYCLES=true`): a task dependency cycle
   is broken, as Nx does, by dropping the dependency that closes it, with a
@@ -38,8 +38,11 @@ requested targets and errors when nothing matches. `run`, `run-many` and
   opens its viewer): writes the project graph and the task graph in the
   shape Nx's `--graph` writes, without running anything. Nx's `taskPlans`,
   its hashing plan, is left out.
-- `--verbose` sets `NX_VERBOSE_LOGGING=true` for tasks.
+- `--verbose` sets `NX_VERBOSE_LOGGING=true` for tasks; without it they see
+  `NX_VERBOSE_LOGGING=false`, unless it is already `true`.
 - `--output-style` and `--dry-run`, which prints qk's own task graph.
+- Any other option, as in Nx, is forwarded to the requested tasks; see
+  [Forwarding arguments](#forwarding-arguments).
 - Nx's own options (`--runner`, `--batch`, `--skip-sync`, `--cloud`,
   `--dte`, `--agents`, `--tui`, `--tui-auto-exit`) are accepted and have no
   effect.
@@ -49,31 +52,49 @@ requested targets and errors when nothing matches. `run`, `run-many` and
 - `dynamic`, `tui` and `dynamic-legacy` show a live panel on stderr: how many
   tasks are done, cached, running, queued and failed, and each running task
   with its time. Successful tasks' output stays hidden; a failed task's
-  output is printed above the panel. Without a terminal they fall back to
-  `static`, as in Nx.
+  output is printed above the panel. Without a terminal, under
+  `NX_TASKS_RUNNER_DYNAMIC_OUTPUT=false` or with verbose logging they fall
+  back to `static`, as in Nx.
 - `quiet` prints nothing while tasks run except a failed task's output,
-  under `✖ qk run <task> failed`, with escape sequences removed when the
+  under `✖ nx run <task> failed`, with escape sequences removed when the
   output is not a terminal and `FORCE_COLOR` is not set. It is meant for
   agents and scripts.
 - `stream` prefixes each non-empty line with the task's project, in Nx's
   colour for it; `stream-without-prefixes` passes output through untouched.
 - `static` holds each task's output until it ends and prints it under
-  `> qk run <task>`, marked `[local cache]` for a hit, and in GitHub Actions
-  folds each task into a log group unless `NX_SKIP_LOG_GROUPING=true`. As
-  in Nx, the run opens with a banner naming what it runs and ends with one
-  saying whether it succeeded, listing failed tasks and those not run
-  because of them. For `run`, `static` follows `nx run`: the requested task
-  streams under its header as it runs, and its dependencies are held, with
-  only the header shown for a cache hit.
+  `> nx run <task>`, as Nx does, with the target in quotes when its name has
+  a colon and the task's arguments after it, marked `[local cache]` for a
+  hit, and in GitHub Actions folds each task into a log group unless
+  `NX_SKIP_LOG_GROUPING=true`. As in Nx, the run opens with a banner naming
+  what it runs and ends with one saying whether it succeeded, listing failed
+  tasks and those not run because of them. For `run`, `static` follows
+  `nx run`: the requested task streams under its header as it runs, and its
+  dependencies are held, with only the header shown for a cache hit.
+- `static-failures-only` is `static`, except that a task that did not fail
+  is one line, `✔  nx run <task>`, and the run ends saying how many tasks'
+  output was left out. For `run`, the tasks of the requested task's project
+  still print in full. With `--verbose`, every task prints in full, as in Nx.
+- `summary` prints no task output. The run ends with how many tasks
+  succeeded, came from the cache, failed and were skipped, then each failed
+  task with the file holding its output, kept in the worktree's state
+  directory until `qk reset`, and how to see the logs inline.
 
-Without the option, `NX_DEFAULT_OUTPUT_STYLE` applies; otherwise every
-command uses `static` in CI; `run` passes output through, and `run-many` and
-`affected` use the live panel on a terminal and `quiet` otherwise. `stream`
-and `stream-without-prefixes` print `qk:` status lines on stderr; `static`
-shows each task's status in its header instead, and the panel and `quiet`
-collect warnings for the summary. Continuous tasks stream with prefixes under `static` and
-`stream`, since their output would otherwise never appear. Colour follows
-picocolors: off with `NO_COLOR`, on with `FORCE_COLOR`, in CI or on a
+Without the option, `NX_DEFAULT_OUTPUT_STYLE` applies when it names a style;
+otherwise every command uses `static` in CI; `run` passes output through,
+and `run-many` and `affected` use the live panel on a terminal, `static` on
+a terminal where the panel is turned off, and `quiet` otherwise. These
+defaults are qk's; Nx's is `static-failures-only` where it does not use its
+terminal UI. `stream` and `stream-without-prefixes` print `qk:` status lines
+on stderr; `static` shows each task's status in its header instead, and the
+panel and `quiet` collect warnings for the summary. Continuous tasks stream
+with prefixes under the static styles and `stream`, since their output would
+otherwise never appear. As in Nx, when no static style was named, as with
+the CI default, a long-running task streams too: one that runs with
+`--watch`, or whose target is `serve`, `dev`, `start` or ends in `-watch`
+or `:watch`. `NX_STREAM_OUTPUT=true` streams every task and
+`NX_STREAM_OUTPUT=false` none but continuous ones; streamed output carries
+the prefix unless `NX_PREFIX_OUTPUT=false`. Colour follows picocolors: off
+with `NO_COLOR` or `FORCE_COLOR=0`, on with `FORCE_COLOR`, in CI or on a
 terminal.
 
 Runs of several tasks, and any run under `static`, the panel or `quiet`,
@@ -173,12 +194,18 @@ loading and task variables.
 
 ## Forwarding arguments
 
-Forward task arguments after `--`:
+Forward task arguments after `--`, or, as in Nx, give options qk does not
+know directly:
 
 ```sh
 qk run app:build -- --mode=production 'two words'
 qk run app:package -c release -- --arch=arm64
+qk test app --coverage --max-workers 2
 ```
+
+The options qk and Nx know, such as `--configuration` or `--nx-bail`, are
+read as theirs; everything else, and any positional after the task, reaches
+the requested tasks in the order given, before what follows `--`.
 
 A run-commands command, as Nx's, puts the task's arguments in one of three
 ways:
@@ -210,15 +237,23 @@ receive no arguments unless their dependency object sets
 
 All selected tasks are prepared before any command starts, so unsupported
 executors and options fail before dependencies run. A failed task skips its
-dependents while independent tasks continue. The CLI returns the first
-observed failing task's exit code. Ctrl-C and, on Unix, SIGTERM cancel the
-run and return `130`. Cancelled commands receive SIGTERM on Unix and are
-killed with their process group if they have not exited within five seconds;
-on Windows they are killed directly. Parallel commands within a failed task
-are terminated immediately, and as in Nx the task then fails with exit code
-1; commands run in sequence stop at the first failure and keep its code. Commands must
-not detach themselves into separate sessions or launch external services;
-those processes are outside the managed group.
+dependents while independent tasks continue. As in Nx, the CLI exits with 1
+when any task failed or was skipped, whatever the task's own exit code.
+Ctrl-C and, on Unix, SIGTERM and SIGHUP cancel the run, which exits with 128
+plus the signal's number, as Nx does: 130, 143 or 129. Cancelled commands
+receive SIGTERM on Unix and are killed with their process group if they
+have not exited within `NX_PROCESS_KILL_GRACE_PERIOD` milliseconds, five
+seconds by default; on Windows they are killed directly. Parallel commands
+within a failed task are terminated immediately, and as in Nx the task then
+fails with exit code 1; commands run in sequence stop at the first failure.
+Under `--nx-bail`, a run that left tasks unstarted exits with 1, where Nx
+exits with 130 as if interrupted. Commands must not detach themselves into
+separate sessions or launch external services; those processes are outside
+the managed group.
+
+As Nx does, a run refuses to run a task that one of the runs it was started
+from is running with the same arguments, such as a task whose command runs
+`qk run` for itself, and names the chain of tasks.
 
 ## Continuous tasks and readiness
 

@@ -129,7 +129,8 @@ input evaluation. Raw Linux trace files are temporary and removed after collecti
 Read/write buffers and exec argument/environment arrays are excluded from tracing.
 
 `--dry-run`, `--graph`, `--sandbox`, continuous tasks and tasks with `readyWhen`
-are not supported by analysis. Normal task failures preserve their exit code and
-still write a report. Cancellation preserves qk's exit code 130. Collection
+are not supported by analysis. A run with a failed task exits with 1, as any
+run does, and still writes a report. A cancelled run exits as the signal that
+cancelled it, 130 for Ctrl-C. Collection
 issues appear in the report and prevent that execution contributing narrowing
 evidence. Windows has no recorder backend.

@@ -10,23 +10,50 @@ project root and then the workspace root, `.env.<target>.<configuration>`,
 `.env.<configuration>`, `.env.<target>`, then `.env.local`, `.local.env` and
 `.env`, each also as `.env.<name>.local`, `.<name>.local.env` and
 `.<name>.env`, then `envFile`. `color`, `env` and `envFile` are
-run-commands options; run-script reads none of them. A dotenv file never overrides a variable an
-earlier source set. As in Nx 24, `envFile` also sets a variable that is set
-but empty. The
+run-commands options; run-script reads none of them. A target that a plugin
+atomized, named in its project's `metadata.targetGroups` with a
+`metadata.nonAtomizedTarget`, also reads the files of the target it was split
+from, after its own. The
 task variables are `NX_TASK_TARGET_PROJECT`, `NX_TASK_TARGET_TARGET`,
 `NX_TASK_TARGET_CONFIGURATION`, `NX_WORKSPACE_ROOT`, `LERNA_PACKAGE_NAME`,
-`NX_TUI=false` and `FORCE_COLOR`, which is `true` unless already set, and
-`NX_TASK_HASH`, the task's cache key, whenever the run computes one: for
-every task that goes through the cache, cacheable or not, but not under
-`--skip-cache` or in a run without a cacheable target.
-Dotenv is loaded into child environments without mutating qk's process
-environment; qk's own environment, where remote cache credentials arrive,
-includes the root `.env.local` and `.env`. `NX_LOAD_DOT_ENV_FILES=false`
-turns every dotenv file off, `envFile` included, as in Nx. For `envFile`,
-the task's environment decides, so a task's dotenv file can turn it off. Dotenv interpolation uses
-dotenvy's per-file semantics; it does not provide cross-file interpolation
-against the merged child environment.
+`NX_TUI=false`, `NX_INVOCATION_ANCESTOR_PIDS`, `NX_TERMINAL_CAPTURE_STDERR=true`
+for a `test` target, `FORCE_COLOR`, which is `true` unless already set, and
+`NX_TASK_HASH`, the task's cache key, which every task is given, as in Nx,
+whether or not the run uses the cache, except under `--sandbox` and input
+analysis.
 
+## Dotenv files
+
+Dotenv files are read as Nx reads them, with npm's `dotenv` and
+`dotenv-expand`. A task's files are read together: the first to set a
+variable wins, a variable the environment already holds keeps its value
+unless it is empty, and then every value is expanded once, across all the
+files: `$NAME`, `${NAME}`, `${NAME:-default}`, `${NAME-default}`,
+`${NAME:+alternate}` and `${NAME+alternate}` read the environment, then the
+values the files set before. A reference preceded by `\` is left as `$`, and
+a value that refers back to itself expands to its default. Values in single
+quotes expand too, as dotenv-expand does not know about quotes. Lines are
+read as dotenv reads them: `export` is allowed, `KEY: value` works, quoted
+values may span lines, `\n` and `\r` are line breaks inside double quotes,
+an unquoted value ends at `#`, and a line dotenv cannot read is skipped
+rather than failing the run. `envFile` is read the same way, and so fills a
+variable set but empty, as in Nx 24.
+
+As Nx does at startup, qk loads the workspace's root `.local.env`,
+`.env.local` and `.env`, in that order of precedence, into its own
+environment before it reads its command line, so the run controls below can
+be set there; remote cache credentials arrive the same way. For each task,
+a variable whose value is one of those files' is then removed again, so the
+task's own files decide it, as in Nx. `NX_LOAD_DOT_ENV_FILES=false` turns
+every dotenv file off, `envFile` included, as in Nx. For `envFile`, the
+task's environment decides, so a task's dotenv file can turn it off.
+
+A task does not see `NX_SET_CLI`, `NX_ORIGINAL_FORCE_COLOR`,
+`NX_TERMINAL_OUTPUT_PATH`, `NX_STREAM_OUTPUT` or `NX_PREFIX_OUTPUT` from an
+enclosing run, as in Nx. It sees `QK_TASK_INVOCATIONS`, the tasks it runs
+inside, which a run it starts reads to refuse running one of them again.
+dotenv-expand's use of JavaScript's `String.replace`, which reads `$&` and
+similar patterns in a value it substitutes, is not reproduced.
 
 ## Run controls
 
@@ -38,21 +65,26 @@ against the merged child environment.
 | `NX_BASE`, `NX_HEAD` | Affected comparison revisions; CLI overrides them |
 | `NX_PARALLEL` | Task concurrency, overridden by `--parallel` |
 | `QK_CORES` | Core budget, overridden by `--cores` |
-| `NX_BAIL=true` | Stop starting tasks after a failure |
+| `NX_BAIL=true` | Stop starting tasks after a failure, unless `--nx-bail=false` |
 | `NX_IGNORE_CYCLES=true` | Break dependency cycles with a warning |
-| `NX_DEFAULT_OUTPUT_STYLE` | Default output style, overridden by `--output-style` |
+| `NX_DEFAULT_OUTPUT_STYLE` | Default output style, overridden by `--output-style`; an unknown name is ignored, as in Nx |
+| `NX_TASKS_RUNNER_DYNAMIC_OUTPUT=false` | No live panel; `static` instead |
+| `NX_STREAM_OUTPUT` | `true` streams every task's output rather than holding it; `false` streams none but continuous tasks |
+| `NX_PREFIX_OUTPUT=false` | Under the static styles, streamed output goes without the project prefix |
+| `NX_PROCESS_KILL_GRACE_PERIOD` | Milliseconds a cancelled or stopped command has to exit after SIGTERM before it is killed; 5000 by default |
+| `NX_LOAD_DOT_ENV_FILES=false` | Load no dotenv file |
 | `NX_RUN_REPORT` | JSON report path, overridden by `--report` |
-| `NX_VERBOSE_LOGGING` | Task verbosity; `--verbose` sets it to `true` |
+| `NX_VERBOSE_LOGGING` | Task verbosity; tasks see `true` or `false`, and `--verbose` or `--verbose=false` sets it; `true` also turns the live panel off |
 | `NX_SKIP_LOG_GROUPING=true` | Disable static output groups in GitHub Actions |
-| `NO_COLOR`, `FORCE_COLOR` | Output color controls |
+| `NO_COLOR`, `FORCE_COLOR` | Output color controls; `FORCE_COLOR=0` or `false` keeps qk's own output plain, and tasks receive it as set |
 | `NX_NATIVE_COMMAND_RUNNER=false` | Run `nx:run-commands` targets with pipes rather than a pseudo-terminal |
-| `CI` | CI output and remote cache mode selection |
+| `CI` | CI output and remote cache mode selection; as Nx's `isCI`, any value but `false` (`0` included), or a CI provider's variable such as `GITHUB_ACTIONS=true`, `GITLAB_CI`, `BUILDKITE=true` or `JENKINS_URL` |
 
 ## Cache controls
 
 | Variable | Behavior |
 | --- | --- |
-| `NX_SKIP_NX_CACHE=true` | Bypass cache reads, writes and warm state |
+| `NX_SKIP_NX_CACHE=true`, `NX_DISABLE_NX_CACHE=true` | Bypass cache reads, writes and warm state |
 | `NX_SKIP_REMOTE_CACHE=true`, `NX_DISABLE_REMOTE_CACHE=true` | Local cache only |
 | `NX_CACHE_DIRECTORY` | Override `nx.json`'s `cacheDirectory` |
 | `NX_MAX_CACHE_SIZE` | Override `nx.json`'s `maxCacheSize` |
@@ -74,7 +106,10 @@ See [Workspace configuration](workspace.md) for defaults and
 `NX_TASK_TARGET_PROJECT`, `NX_TASK_TARGET_TARGET`,
 `NX_TASK_TARGET_CONFIGURATION`, `NX_WORKSPACE_ROOT`, `LERNA_PACKAGE_NAME`,
 `NX_TUI=false`, and `FORCE_COLOR` describe the running task.
-`NX_TASK_HASH` is available when a cache key was computed.
+`NX_TASK_HASH` holds its cache key. `NX_VERBOSE_LOGGING` is `true` or
+`false`, `NX_INVOCATION_ANCESTOR_PIDS` lists the qk and Nx processes it runs
+inside, outermost first, and a `test` target sees
+`NX_TERMINAL_CAPTURE_STDERR=true`, as in Nx.
 Targets using `qk:threads` additionally receive `QK_THREADS` and their
 configured thread variables. Targets using `qk:warm` receive their expanded
 warm environment when warm state is enabled. A task an affected profile with

@@ -53,6 +53,26 @@ edges off.
   but not exactly the dev servers' choice.
 - `exec --exclude-task-dependencies` runs the command in the selected
   projects; Nx's leaves every project out and runs nothing.
+- From a package script, `exec` runs the script's target with the run
+  options it was given, and passes the arguments beyond the script's own to
+  the task. Nx runs `nx run` for it without the options, and reads those
+  arguments as its own options.
+- When a command that runs tasks is given both options it does not know and
+  arguments after `--`, qk forwards both, the unknown options first. Nx
+  forwards only what follows `--` and drops the others.
+- `qk run <name> --target <target>` runs the target on project `<name>`;
+  Nx ignores the positional and uses the current directory's project.
+- Under `--nx-bail`, a run that failed and left tasks unstarted exits with 1.
+  Nx counts it as interrupted and exits with 130.
+- qk's default output styles are its own: `static` in CI, the live panel on
+  a terminal and `quiet` otherwise for several tasks, and raw output for one.
+  Nx defaults to `static-failures-only` where it does not use its terminal UI,
+  and to `summary` when driven by an AI agent. Streamed output under the
+  static styles carries the project prefix unless `NX_PREFIX_OUTPUT=false`,
+  where Nx's carries it only under `NX_PREFIX_OUTPUT=true`.
+- `--output-style=summary` writes the output of failed tasks only, to the
+  worktree's state directory; Nx writes every task's output to its cache
+  directory.
 - `project.local.json`, `nx.local.json`, `qk:threads`, `qk:warm`,
   `qk:affectedProfiles`, `qk:reachability` and a target-level `env` are qk
   extensions. Nx does not apply them.
@@ -126,7 +146,8 @@ This is a subset of the design's compatibility surface. There is no Nx
 parity claim yet. In particular:
 
 - The graph includes **workspace projects only**, as `nx graph --file`
-  does. `--external` adds a node per installation in the pnpm lockfile,
+  does, and is written as JSON only: qk has no HTML graph viewer, so
+  `graph --file <name>.html` fails. `--external` adds a node per installation in the pnpm lockfile,
   `npm:<name>@<version>` with peers and patch in the version, with edges from
   projects to what they install directly and between installations.
 - Nx plugins and inferred targets are outside the design's scope.
