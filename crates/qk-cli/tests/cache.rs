@@ -1138,6 +1138,26 @@ fn external_dependency_inputs_track_packages_any_importer_installs() {
     assert_eq!(fixture.runs(), 2);
 }
 
+#[test]
+fn external_dependency_inputs_name_installed_packages() {
+    let fixture = Fixture::new(target(
+        "build",
+        json!({"inputs": ["{projectRoot}/src/**/*", {"externalDependencies": ["missing"]}]}),
+    ));
+    fs::write(
+        fixture.root.join("pnpm-lock.yaml"),
+        pnpm_lock("1.0.0", "1.0.0"),
+    )
+    .unwrap();
+    // As in Nx, a package nothing installs is an error.
+    let output = fixture.build(&fixture.root, &[]);
+    let text = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        text.contains("the externalDependency \"missing\" of app:build could not be found"),
+        "{text}"
+    );
+}
+
 fn cache_size(fixture: &Fixture) -> u64 {
     let output = success(fixture.qk(&fixture.root, &["cache", "prune", "--max-size", "1000GB"]));
     let text = stdout(&output);
@@ -4737,7 +4757,7 @@ fn filesets_of_dependencies() {
 fn json_inputs_key_only_the_fields_they_select() {
     let fixture = with_lib(json!([
         {"json": "{projectRoot}/meta.json", "fields": ["version", "build.target"]},
-        {"json": "libs/lib/config.json", "excludeFields": ["comment"]}
+        {"json": "{workspaceRoot}/libs/lib/config.json", "excludeFields": ["comment"]}
     ]));
     let meta = |text: &str| fs::write(fixture.root.join("meta.json"), text).unwrap();
     meta(r#"{"version": 1, "name": "a", "build": {"target": "es2022", "debug": false}}"#);

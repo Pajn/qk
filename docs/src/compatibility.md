@@ -58,6 +58,9 @@ When a name occurs in multiple sections, precedence is `dependencies`,
 - An output that does not start with a token, such as `dist`, is read as a
   workspace path, as `nx repair` would rewrite it. Nx 24 rejects it; qk keeps
   reading workspaces written before outputs took tokens.
+- A `json` input naming one file reads it even when source ignore rules
+  exclude it; Nx reads only the files a fileset could select, so qk can key
+  a file Nx leaves out.
 - For affected-project selection, bare parenthesized extension groups such
   as `**/*.(svg|png)` select projects in qk that Nx 23.1.0 does not.
   See [Inputs and outputs](reference/inputs-outputs.md) for compatible syntax.

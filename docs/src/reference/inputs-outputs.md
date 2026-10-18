@@ -23,13 +23,12 @@ Unless overridden by a named input, `default` means `{projectRoot}/**/*`.
 
 Supported declarations:
 
-
-- globs with `!` exclusions, and `fileset`;
+- filesets, as strings or `{"fileset": "…"}`, with `!` exclusions;
 - named inputs, also as `{"input": "name"}`;
 - `^name` and `{"input": "name", "dependencies": true}` (or `"projects":
   "dependencies"`), which as in Nx cover every project the project depends
-  on, directly or not, and `{"fileset": "…", "dependencies": true}`, a
-  fileset of each of them;
+  on, directly or not, and `^{projectRoot}/…`, `^{workspaceRoot}/…` or
+  `{"fileset": "…", "dependencies": true}`, a fileset of each of them;
 - `{"input": "name", "projects": […]}`, the named input of the projects the
   names, globs or `tag:` patterns select, and with `"dependencies": true`
   their `^name` instead, as in Nx 24: every project they depend on, but not
@@ -40,9 +39,25 @@ Supported declarations:
 - `{"workingDirectory": "relative" | "absolute"}`, the directory qk was run
   from;
 - `{"json": "path", "fields": […], "excludeFields": […]}`, only the selected
-  dotted fields of a JSON or YAML file.
+  dotted fields of a JSON or YAML file, or of each file a glob selects.
 
-As in Nx, a named input cannot use `dependencies` or `projects`. With a
+As in Nx, a string names a named input when one of that name exists, and is
+a fileset otherwise. A fileset, like a `json` path, starts from
+`{projectRoot}` or `{workspaceRoot}`. `{projectRoot}` and `{projectName}`
+are replaced anywhere in it; `{workspaceRoot}` only at the start, and
+anywhere else it is glob text, as in Nx. A fileset starting from
+`{projectRoot}/` selects the project's files, and one from
+`{workspaceRoot}/` the workspace's. Write globs with `/` on every platform:
+`\` escapes the character after it, so `{projectRoot}/app/\\(marketing\\)/**/*`
+in JSON selects the `app/(marketing)` directory. A path with no glob
+pattern names that file, or that directory and everything under it, so
+`{projectRoot}/src`, `{projectRoot}/src/` and `{projectRoot}/src/**/*`
+select the same files.
+
+As in Nx, a named input cannot use `dependencies` or `projects`, an input
+with `"always": true` and a `projects` pattern that matches no project is an
+error, and so is an `externalDependencies` entry naming a workspace project
+or, with a pnpm lockfile qk can read, a package nothing installs. With a
 package manager other than pnpm, lockfiles are always keyed by content.
 The [runtime input environment](../guides/cache.md) determines which tasks can
 share a runtime evaluation.
@@ -110,8 +125,10 @@ qk was invoked from in the key.
 ### `json`
 
 `{"json": "path", "fields": ["compilerOptions"], "excludeFields": ["scripts"]}`
-selects dotted fields of a JSON or JSONC file, even when source ignore rules
-exclude its path. A file named `.yaml` or `.yml` is read as YAML, which Nx
+selects dotted fields of a JSON or JSONC file. A path with no glob pattern is
+read even when source ignore rules exclude it, which Nx does not do. A glob
+selects, as in Nx, among the files a fileset from the same root would: the
+project's own, or the workspace's from `{workspaceRoot}/`. A file named `.yaml` or `.yml` is read as YAML, which Nx
 does not do: Nx keys such a file by its whole content, so a key qk leaves
 unchanged can still change Nx's. As in Nx, a file qk cannot read is keyed by
 its whole content, without the field filters.

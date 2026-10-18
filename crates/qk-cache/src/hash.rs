@@ -135,7 +135,7 @@ pub struct Snapshot {
     source_ignore: Arc<SourceIgnore>,
     canonical_root: PathBuf,
     workspace_prefix: Option<PathBuf>,
-    patterns: Mutex<HashMap<(String, bool), Arc<Pattern>>>,
+    patterns: Mutex<HashMap<(String, bool, bool), Arc<Pattern>>>,
     digests: Mutex<HashMap<String, (Stamp, String)>>,
     /// Whether `digests` gained entries worth saving.
     digests_changed: std::sync::atomic::AtomicBool,
@@ -970,11 +970,24 @@ impl Snapshot {
     }
 
     fn pattern(&self, pattern: &str, negated: bool) -> Result<Arc<Pattern>> {
-        let key = (pattern.to_owned(), negated);
+        self.compiled(pattern, negated, false)
+    }
+
+    /// A fileset's pattern, see [`Pattern::fileset`].
+    fn fileset_pattern(&self, pattern: &str, negated: bool) -> Result<Arc<Pattern>> {
+        self.compiled(pattern, negated, true)
+    }
+
+    fn compiled(&self, pattern: &str, negated: bool, fileset: bool) -> Result<Arc<Pattern>> {
+        let key = (pattern.to_owned(), negated, fileset);
         if let Some(pattern) = self.patterns.lock().unwrap().get(&key) {
             return Ok(pattern.clone());
         }
-        let compiled = Arc::new(Pattern::new(pattern, negated)?);
+        let compiled = Arc::new(if fileset {
+            Pattern::fileset(pattern, negated)?
+        } else {
+            Pattern::new(pattern, negated)?
+        });
         self.patterns.lock().unwrap().insert(key, compiled.clone());
         Ok(compiled)
     }
@@ -1494,14 +1507,47 @@ impl<'a> Resolver<'a> {
         if let Value::Object(object) = input
             && let Some(always) = object.get("always")
         {
-            always.as_bool().context("input always must be boolean")?;
+            // As in Nx, `always` keeps an input on purpose, so a project
+            // pattern it selects nothing with is a mistake.
+            if always.as_bool().context("input always must be boolean")?
+                && let Some(Value::String(name)) = object.get("input")
+                && let Some(projects) = object.get("projects")
+            {
+                let patterns: Vec<String> = match projects {
+                    Value::String(pattern) => vec![pattern.clone()],
+                    other => serde_json::from_value(other.clone())
+                        .context("input projects must be a string or an array")?,
+                };
+                for pattern in patterns.iter().filter(|pattern| {
+                    !pattern.starts_with('!')
+                        && !matches!(pattern.as_str(), "self" | "dependencies")
+                }) {
+                    if qk_graph::select_projects(
+                        &self.workspace.projects,
+                        std::slice::from_ref(pattern),
+                        &[],
+                    )?
+                    .is_empty()
+                    {
+                        bail!(
+                            "the input {{\"input\": \"{name}\", \"projects\"}} with \"always\": true selects \"{pattern}\", which matches no project"
+                        );
+                    }
+                }
+            }
             let mut object = object.clone();
             object.remove("always");
             return self.input(project, &Value::Object(object));
         }
         match input {
-            // As in Nx, `^name` is `name` of every project the project depends
-            // on, directly or not.
+            // As in Nx, `^{projectRoot}/…` and `^{workspaceRoot}/…` are a
+            // fileset of every project the project depends on, directly or
+            // not, and `^name` is `name` of each of them.
+            Value::String(name)
+                if name.starts_with("^{projectRoot}") || name.starts_with("^{workspaceRoot}") =>
+            {
+                self.dependency_fileset(project, &name[1..])?;
+            }
             Value::String(name) if name.starts_with('^') => {
                 self.dependencies_named(project, &name[1..])?;
             }
@@ -1548,16 +1594,11 @@ impl<'a> Resolver<'a> {
                 if object.contains_key("fileset")
                     && object.get("dependencies") == Some(&json!(true)) =>
             {
-                if !self.named_stack.is_empty() {
-                    bail!("named inputs can only refer to named inputs of their own project");
-                }
                 let pattern = object["fileset"]
                     .as_str()
                     .context("fileset input must be a glob")?
                     .to_owned();
-                for dependency in self.dependency_closure(project) {
-                    self.fileset(&dependency, &pattern)?;
-                }
+                self.dependency_fileset(project, &pattern)?;
             }
             Value::Object(object)
                 if object.len() == 1 && object.contains_key("workingDirectory") =>
@@ -1580,18 +1621,20 @@ impl<'a> Resolver<'a> {
             Value::Object(object) if object.contains_key("json") => {
                 self.json(project, object)?;
             }
-            Value::String(name)
-                if !name.contains("{projectRoot}") && !name.contains("{workspaceRoot}") =>
-            {
-                self.named(project, name)?
-            }
+            // As in Nx, a string names a named input when there is one, and is
+            // a fileset otherwise.
+            Value::String(name) if self.has_named(project, name) => self.named(project, name)?,
             Value::Object(object) if object.len() == 1 && object.contains_key("fileset") => {
                 let pattern = object["fileset"]
                     .as_str()
                     .context("fileset input must be a glob")?;
+                validate_fileset(pattern)?;
                 self.fileset(project, pattern)?;
             }
-            Value::String(pattern) => self.fileset(project, pattern)?,
+            Value::String(pattern) => {
+                validate_fileset(pattern)?;
+                self.fileset(project, pattern)?
+            }
             Value::Object(object) if object.len() == 1 && object.contains_key("env") => {
                 let name = object["env"]
                     .as_str()
@@ -1704,6 +1747,23 @@ impl<'a> Resolver<'a> {
             {
                 let names: Vec<String> =
                     serde_json::from_value(object["externalDependencies"].clone())?;
+                // As in Nx, a workspace project is no external dependency.
+                if let Some(name) = names
+                    .iter()
+                    .find(|name| self.workspace.projects.contains_key(*name))
+                {
+                    if self.snapshot.projects.dependencies[project]
+                        .iter()
+                        .any(|edge| edge.target == *name)
+                    {
+                        bail!(
+                            "the externalDependency {name:?} of {project} is not an external node and is already a dependency; remove it from the externalDependencies inputs"
+                        );
+                    }
+                    bail!(
+                        "the externalDependency {name:?} of {project} is not an external node; if it is a dependency, add it to the project's implicitDependencies"
+                    );
+                }
                 self.external.extend(names);
             }
             _ => bail!("unsupported task input declaration"),
@@ -1718,18 +1778,23 @@ impl<'a> Resolver<'a> {
             .unwrap_or((false, pattern));
         // Nx hashes workspace files and each project's files in separate
         // scopes, a project's being only the files it owns: those of a project
-        // nested in its root are that project's.
-        let (scope, owner) = if pattern.contains("{workspaceRoot}") {
-            (FileScope::Workspace, None)
-        } else {
+        // nested in its root are that project's. A fileset is the project's
+        // when it starts from `{projectRoot}/`, and the workspace's otherwise,
+        // where only one starting from `{workspaceRoot}/` selects anything.
+        let (scope, owner) = if pattern.starts_with("{projectRoot}/") {
             (
                 FileScope::Project(project.to_owned()),
                 Some(project.to_owned()),
             )
+        } else if pattern.starts_with("{workspaceRoot}/") {
+            (FileScope::Workspace, None)
+        } else {
+            return Ok(());
         };
         let pattern = paths::expand(self.workspace, project, pattern)?;
-        let matcher = self.snapshot.pattern(&pattern, exclude)?;
+        let matcher = self.snapshot.fileset_pattern(&pattern, exclude)?;
         let prefix = pattern
+            .trim_end_matches('/')
             .split('/')
             .take_while(|part| is_literal(part))
             .collect::<Vec<_>>()
@@ -1761,6 +1826,25 @@ impl<'a> Resolver<'a> {
         Ok(())
     }
 
+    /// A fileset of every project `project` depends on, directly or not.
+    fn dependency_fileset(&mut self, project: &str, pattern: &str) -> Result<()> {
+        if !self.named_stack.is_empty() {
+            bail!("named inputs can only refer to named inputs of their own project");
+        }
+        for dependency in self.dependency_closure(project) {
+            self.fileset(&dependency, pattern)?;
+        }
+        Ok(())
+    }
+
+    /// Whether `name` names one of `project`'s named inputs.
+    fn has_named(&self, project: &str, name: &str) -> bool {
+        name == "default"
+            || self.workspace.projects[project]
+                .named_inputs
+                .contains_key(name)
+    }
+
     /// Every project `project` depends on, directly or not.
     fn dependency_closure(&self, project: &str) -> BTreeSet<String> {
         let mut closure = BTreeSet::new();
@@ -1785,20 +1869,20 @@ impl<'a> Resolver<'a> {
         Ok(())
     }
 
-    /// A JSON input: the fields of one JSON file, rather than all of it.
-    /// `fields` keeps only the named dotted paths; `excludeFields` removes
-    /// them.
+    /// A JSON input: the fields of a JSON file, rather than all of it, or of
+    /// each file a glob selects. `fields` keeps only the named dotted paths;
+    /// `excludeFields` removes them.
     fn json(&mut self, project: &str, object: &serde_json::Map<String, Value>) -> Result<()> {
         for key in object.keys() {
             if !matches!(key.as_str(), "json" | "fields" | "excludeFields") {
                 bail!("unsupported json input field {key:?}");
             }
         }
-        let path = object["json"]
+        let declared = object["json"]
             .as_str()
             .context("json input must name a file")?;
-        let path = paths::expand(self.workspace, project, path)?;
-        paths::validate_path(&path)?;
+        validate_fileset(declared)?;
+        let path = paths::expand(self.workspace, project, declared)?;
         let list = |name: &str| -> Result<Option<Vec<String>>> {
             object
                 .get(name)
@@ -1812,8 +1896,38 @@ impl<'a> Resolver<'a> {
             fields: list("fields")?,
             exclude: list("excludeFields")?.unwrap_or_default(),
         };
+        if crate::glob::names_a_path(&path) {
+            paths::validate_path(&path)?;
+            return self.json_file(path, &fields);
+        }
+        // As in Nx, a glob selects the files a fileset from the same root
+        // would: the project's own, or the workspace's.
+        let owner = if declared.starts_with("{projectRoot}") {
+            Some(project)
+        } else if declared.starts_with("{workspaceRoot}/") {
+            None
+        } else {
+            return Ok(());
+        };
+        let matcher = self.snapshot.pattern(&path, false)?;
+        let snapshot = self.snapshot;
+        let matched: Vec<String> = self
+            .candidates
+            .iter()
+            .filter(|file| matcher.is_match(file))
+            .filter(|file| owner.is_none() || snapshot.owner(file) == owner)
+            .cloned()
+            .collect();
+        for file in matched {
+            self.json_file(file, &fields)?;
+        }
+        Ok(())
+    }
+
+    /// One file a `json` input selects, keyed by its fields.
+    fn json_file(&mut self, path: String, fields: &JsonFields) -> Result<()> {
         let value = match std::fs::read_to_string(self.workspace.root.join(&path)) {
-            Ok(text) => match json_projection(&path, &text, &fields) {
+            Ok(text) => match json_projection(&path, &text, fields) {
                 Some(value) => value,
                 // As in Nx, a file it cannot read is keyed by its content,
                 // without the field filters. Nx reads no YAML, so it keys a
@@ -1827,7 +1941,7 @@ impl<'a> Resolver<'a> {
             Err(error) => return Err(error.into()),
         };
         self.values.insert(format!("json:{path}"), value);
-        self.json_fields.insert(path, fields);
+        self.json_fields.insert(path, fields.clone());
         Ok(())
     }
 
@@ -1849,6 +1963,18 @@ impl<'a> Resolver<'a> {
         self.named_stack.pop();
         Ok(())
     }
+}
+
+/// As Nx's `validate_file_set`: a fileset starts from `{projectRoot}` or
+/// `{workspaceRoot}`, after its `!`.
+fn validate_fileset(fileset: &str) -> Result<()> {
+    let body = fileset.strip_prefix('!').unwrap_or(fileset);
+    if !body.starts_with("{projectRoot}") && !body.starts_with("{workspaceRoot}") {
+        bail!(
+            "{fileset:?} is an invalid fileset: filesets have to start with either {{workspaceRoot}} or {{projectRoot}}, and a named input must be defined"
+        );
+    }
+    Ok(())
 }
 
 /// A task's declared inputs, or Nx's default when it declares none.
@@ -2222,9 +2348,16 @@ pub fn inputs(
                 .map(|name| {
                     let digest =
                         installed.digest(&format!("package:{name}"), || lockfile.package(name));
-                    (name.clone(), digest)
+                    // As in Nx, a package nothing installs is an error.
+                    if digest == blake3::hash(b"").to_hex().as_str() {
+                        bail!(
+                            "the externalDependency {name:?} of {} could not be found",
+                            task.id
+                        );
+                    }
+                    Ok((name.clone(), digest))
                 })
-                .collect();
+                .collect::<Result<_>>()?;
             values.insert("externalDependencies".into(), json!(external));
         }
     }

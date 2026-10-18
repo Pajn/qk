@@ -557,6 +557,170 @@ mod tests {
         (root, workspace, graph)
     }
 
+    /// The files `app:build` declares with `inputs`, in a workspace where
+    /// `app` depends on `lib` and both hold a few files.
+    fn declared(inputs: Value) -> Result<BTreeSet<String>> {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("nx.json"), "{}").unwrap();
+        for (path, text) in [
+            (
+                "app/project.json",
+                json!({"name": "app", "implicitDependencies": ["lib"],
+                    "namedInputs": {"production": ["{projectRoot}/src/**/*"]},
+                    "targets": {"build": {"command": "true", "inputs": inputs}}})
+                .to_string(),
+            ),
+            ("lib/project.json", json!({"name": "lib"}).to_string()),
+            ("app/src/main.ts", String::new()),
+            ("app/src/app/(group)/page.ts", String::new()),
+            ("app/src/app/group/page.ts", String::new()),
+            ("app/app/notes.md", String::new()),
+            ("app/workspaceRoot/x.ts", String::new()),
+            ("lib/src/index.ts", String::new()),
+            ("lib/lib.ts", String::new()),
+            ("tools/gen.ts", String::new()),
+        ] {
+            let path = root.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let workspace = Workspace::load(root.path()).unwrap();
+        let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
+        let mut resolved = resolve_tasks(&workspace, &graph, &[])?;
+        Ok(resolved.remove("app:build").unwrap().declared.files)
+    }
+
+    fn files(paths: &[&str]) -> BTreeSet<String> {
+        paths.iter().map(|path| (*path).to_owned()).collect()
+    }
+
+    #[test]
+    fn dependency_filesets_are_written_with_a_caret() {
+        assert_eq!(
+            declared(json!([
+                "^{projectRoot}/src/**/*",
+                "^{workspaceRoot}/tools/**/*"
+            ]))
+            .unwrap(),
+            files(&["lib/src/index.ts", "tools/gen.ts"])
+        );
+        // Only the string spelling takes the caret.
+        assert!(declared(json!([{"fileset": "^{projectRoot}/src/**/*"}])).is_err());
+    }
+
+    #[test]
+    fn filesets_read_the_project_name_and_workspace_root_only_at_the_start() {
+        assert_eq!(
+            declared(json!(["{workspaceRoot}/{projectName}/src/main.ts"])).unwrap(),
+            files(&["app/src/main.ts"])
+        );
+        // Elsewhere `{workspaceRoot}` is glob text: a group of one name.
+        assert_eq!(
+            declared(json!(["{projectRoot}/{workspaceRoot}/x.ts"])).unwrap(),
+            files(&["app/workspaceRoot/x.ts"])
+        );
+        // A string that is no named input must be a fileset from a root.
+        assert!(declared(json!(["src/**/*"])).is_err());
+        assert_eq!(declared(json!(["production"])).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_fileset_naming_a_directory_selects_everything_under_it() {
+        let src = files(&[
+            "app/src/main.ts",
+            "app/src/app/(group)/page.ts",
+            "app/src/app/group/page.ts",
+        ]);
+        for fileset in [
+            "{projectRoot}/src",
+            "{projectRoot}/src/",
+            "{projectRoot}/src/**/*",
+        ] {
+            assert_eq!(declared(json!([fileset])).unwrap(), src, "{fileset}");
+        }
+        assert_eq!(
+            declared(json!(["{projectRoot}/**/*", "!{projectRoot}/src"])).unwrap(),
+            files(&[
+                "app/app/notes.md",
+                "app/project.json",
+                "app/workspaceRoot/x.ts"
+            ])
+        );
+    }
+
+    #[test]
+    fn a_backslash_escapes_a_fileset_character() {
+        assert_eq!(
+            declared(json!([r"{projectRoot}/src/app/\(group\)/**/*"])).unwrap(),
+            files(&["app/src/app/(group)/page.ts"])
+        );
+        assert_eq!(
+            declared(json!([r"{projectRoot}/src/app/\(group\)"])).unwrap(),
+            files(&["app/src/app/(group)/page.ts"])
+        );
+    }
+
+    #[test]
+    fn json_inputs_can_select_several_files() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("nx.json"), "{}").unwrap();
+        for (path, text) in [
+            (
+                "app/project.json",
+                json!({"name": "app", "targets": {"build": {"command": "true",
+                    "inputs": [{"json": "{projectRoot}/config/*.json", "fields": ["a"]},
+                        {"json": "{workspaceRoot}/shared/**/*.json"}]}}})
+                .to_string(),
+            ),
+            ("app/config/one.json", r#"{"a": 1, "b": 2}"#.to_owned()),
+            ("app/config/two.json", r#"{"a": 3}"#.to_owned()),
+            ("app/config/notes.txt", String::new()),
+            (
+                "app/config/nested/project.json",
+                json!({"name": "nested"}).to_string(),
+            ),
+            ("app/config/nested/x.json", "{}".to_owned()),
+            ("shared/deep/s.json", r#"{"s": true}"#.to_owned()),
+        ] {
+            let path = root.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let workspace = Workspace::load(root.path()).unwrap();
+        let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
+        let resolved = resolve_tasks(&workspace, &graph, &[]).unwrap();
+        let declared = &resolved["app:build"].declared;
+        assert_eq!(
+            declared.values,
+            BTreeMap::from([
+                ("json:app/config/one.json".to_owned(), json!({"a": 1})),
+                ("json:app/config/two.json".to_owned(), json!({"a": 3})),
+                ("json:shared/deep/s.json".to_owned(), json!({"s": true})),
+            ])
+        );
+    }
+
+    #[test]
+    fn always_inputs_must_select_a_project() {
+        let error =
+            declared(json!([{"input": "default", "projects": ["lib", "missing"], "always": true}]))
+                .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("\"missing\", which matches no project"),
+            "{error:#}"
+        );
+        assert!(declared(json!([{"input": "default", "projects": ["missing"]}])).is_ok());
+    }
+
+    #[test]
+    fn external_dependencies_cannot_name_a_project() {
+        let error = declared(json!([{"externalDependencies": ["lib"]}])).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("already a dependency"),
+            "{error:#}"
+        );
+    }
+
     #[test]
     fn declared_inputs_cover_the_files_qk_would_add() {
         let (_root, loaded, graph) = workspace(

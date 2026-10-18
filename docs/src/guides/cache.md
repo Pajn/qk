@@ -120,12 +120,14 @@ projects nested in its root.
 
 Every input declaration of Nx 24 is supported, `always` read as absent:
 
-- globs with `!` exclusions, and `fileset`;
+- filesets, as strings or `{"fileset": "…"}`, with `!` exclusions; a path
+  with no glob pattern names a file or a whole directory, and `\` escapes a
+  glob character;
 - named inputs, also as `{"input": "name"}`;
 - `^name` and `{"input": "name", "dependencies": true}` (or `"projects":
   "dependencies"`), which as in Nx cover every project the project depends
-  on, directly or not, and `{"fileset": "…", "dependencies": true}`, a
-  fileset of each of them;
+  on, directly or not, and `^{projectRoot}/…`, `^{workspaceRoot}/…` or
+  `{"fileset": "…", "dependencies": true}`, a fileset of each of them;
 - `{"input": "name", "projects": […]}`, the named input of the projects the
   names, globs or `tag:` patterns select;
 - `env`, `runtime`, `dependentTasksOutputFiles` with `transitive`, and
@@ -134,8 +136,9 @@ Every input declaration of Nx 24 is supported, `always` read as absent:
 - `{"workingDirectory": "relative" | "absolute"}`, the directory qk was run
   from;
 - `{"json": "path", "fields": […], "excludeFields": […]}`, only the selected
-  dotted fields of a JSON file. Affected selection counts any change to the
-  file, even when source ignore rules exclude its path.
+  dotted fields of a JSON file, or of each file a glob selects. Affected
+  selection counts any change to the file, even when source ignore rules
+  exclude its path.
 
 As in Nx, a named input cannot use `dependencies` or `projects`. With a
 package manager other than pnpm, lockfiles are always keyed by content.

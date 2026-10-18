@@ -186,6 +186,10 @@ pub fn safe_parents(root: &Path, path: &str) -> Result<()> {
 
 pub use crate::glob::Pattern;
 
+/// A fileset path with its tokens replaced, as Nx resolves an input's:
+/// `{projectRoot}` and `{projectName}` anywhere, and `{workspaceRoot}` only
+/// at the start. Anywhere else `{workspaceRoot}` is glob text, as it is in
+/// Nx, and so is any other brace group.
 pub fn expand(workspace: &Workspace, project: &str, text: &str) -> Result<String> {
     let project_root = &workspace.projects[project].root;
     let prefix = if project_root == "." {
@@ -193,14 +197,17 @@ pub fn expand(workspace: &Workspace, project: &str, text: &str) -> Result<String
     } else {
         format!("{project_root}/")
     };
+    let text = match text.strip_prefix("{workspaceRoot}") {
+        Some(rest) => rest.strip_prefix('/').unwrap_or(match rest {
+            "" => ".",
+            rest => rest,
+        }),
+        None => text,
+    };
     let result = text
-        .replace("{workspaceRoot}/", "")
         .replace("{projectRoot}/", &prefix)
         .replace("{projectRoot}", project_root)
-        .replace("{workspaceRoot}", ".");
-    if result.contains("{options.") || result.contains("{args.") {
-        bail!("dynamic cache paths are not supported yet");
-    }
+        .replace("{projectName}", project);
     normalize(&result)
 }
 
