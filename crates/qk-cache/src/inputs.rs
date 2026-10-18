@@ -38,6 +38,11 @@ pub struct Declared {
     pub json_fields: BTreeMap<String, JsonFields>,
     /// Packages named by `externalDependencies`.
     pub external: BTreeSet<String>,
+    /// The projects whose configuration and root tsconfig paths Nx hashes
+    /// into the task: its own, and each project whose inputs it reads, such
+    /// as a dependency through `^production` or a project a continuous task
+    /// serving it belongs to.
+    pub projects: BTreeSet<String>,
     /// The tasks whose declared outputs these inputs read, through
     /// `dependentTasksOutputFiles` or a fileset selecting them. As in Nx, a
     /// change carries from such a task to this one, and from no other.
@@ -63,6 +68,10 @@ pub struct Inferred {
     /// Dependency manifests, each as its dependents' keys read it. See
     /// [`manifest_for_dependents`].
     pub manifests: BTreeMap<String, Value>,
+    /// The root tsconfig, keyed as Nx hashes it: without
+    /// `compilerOptions.paths`, and with `selectivelyHashTsConfig` the paths
+    /// entries pointing into the task's [`Declared::projects`].
+    pub tsconfig: Option<String>,
     /// Files qk would add that the declared inputs already select.
     pub covered: BTreeSet<String>,
 }
@@ -85,6 +94,7 @@ impl Inferred {
             .chain(self.workspace_file.then_some("pnpm-workspace.yaml"))
             .chain(self.lockfile.is_some().then_some("pnpm-lock.yaml"))
             .chain(self.manifests.keys().map(String::as_str))
+            .chain(self.tsconfig.as_deref())
     }
 
     /// Package-manager files keyed by what they resolve to rather than by
@@ -92,6 +102,71 @@ impl Inferred {
     pub fn is_resolution_metadata(&self, path: &str) -> bool {
         (path == "pnpm-lock.yaml" && self.lockfile.is_some())
             || (path == "pnpm-workspace.yaml" && self.workspace_file)
+    }
+}
+
+/// The root tsconfig files, in the order Nx picks one.
+pub const ROOT_TSCONFIG_FILES: [&str; 2] = ["tsconfig.base.json", "tsconfig.json"];
+
+/// Whether nx.json's runner options set `selectivelyHashTsConfig`, which Nx
+/// reads from the runner `NX_TASKS_RUNNER` names when nx.json configures it,
+/// or else from `default`.
+pub fn selectively_hash_tsconfig(workspace: &Workspace) -> bool {
+    let runners = workspace.config.extra.get("tasksRunnerOptions");
+    let runner = std::env::var("NX_TASKS_RUNNER")
+        .ok()
+        .filter(|runner| runners.is_some_and(|runners| runners.get(runner).is_some()))
+        .unwrap_or_else(|| "default".into());
+    runners
+        .and_then(|runners| runners.get(&runner))
+        .and_then(|runner| runner.get("options"))
+        .and_then(|options| options.get("selectivelyHashTsConfig"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// A root tsconfig split as Nx hashes it: everything but
+/// `compilerOptions.paths`, and the paths apart. `None` when it cannot be
+/// read as JSON or JSONC, or a paths entry is not a list of strings.
+pub struct TsConfig {
+    pub rest: Value,
+    pub paths: BTreeMap<String, Vec<String>>,
+}
+
+impl TsConfig {
+    pub fn parse(text: &str) -> Option<Self> {
+        let mut rest: Value = jsonc_parser::parse_to_serde_value(text, &Default::default()).ok()?;
+        let mut paths = BTreeMap::new();
+        if let Some(options) = rest
+            .as_object_mut()?
+            .get_mut("compilerOptions")
+            .and_then(Value::as_object_mut)
+            && let Some(removed) = options.remove("paths")
+        {
+            paths = serde_json::from_value(removed).ok()?;
+        }
+        Some(Self { rest, paths })
+    }
+
+    /// The paths entries Nx's `hash_tsconfig_selectively` keeps for
+    /// `projects`: each key with its targets that one of them owns, `owner`
+    /// telling a target's project.
+    pub fn paths_of<'a>(
+        &self,
+        projects: &BTreeSet<String>,
+        owner: impl Fn(&str) -> Option<&'a str>,
+    ) -> BTreeMap<String, Vec<String>> {
+        self.paths
+            .iter()
+            .filter_map(|(key, targets)| {
+                let owned: Vec<String> = targets
+                    .iter()
+                    .filter(|target| owner(target).is_some_and(|owner| projects.contains(owner)))
+                    .cloned()
+                    .collect();
+                (!owned.is_empty()).then(|| (key.clone(), owned))
+            })
+            .collect()
     }
 }
 

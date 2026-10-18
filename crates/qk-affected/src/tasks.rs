@@ -64,6 +64,10 @@ pub enum TaskReason {
     WorkspaceFile,
     /// A project manifest was deleted, which touches every task.
     DeletedManifest { file: String },
+    /// The root tsconfig changed outside `compilerOptions.paths`, or, with
+    /// `selectivelyHashTsConfig`, in path mappings into a project the task
+    /// reads.
+    Tsconfig { file: String },
 }
 
 impl std::fmt::Display for TaskReason {
@@ -81,6 +85,10 @@ impl std::fmt::Display for TaskReason {
                 write!(f, "pnpm-workspace.yaml changed outside its resolution keys")
             }
             Self::DeletedManifest { file } => write!(f, "{file} was deleted"),
+            Self::Tsconfig { file } => write!(
+                f,
+                "{file} changed outside compilerOptions.paths, or in path mappings this task reads"
+            ),
         }
     }
 }
@@ -135,6 +143,8 @@ pub(crate) fn analyse(
             && !ignore.matches(file)
             && !workspace.root.join(file).exists()
     });
+    let roots = crate::ProjectRoots::new(workspace);
+    let tsconfig = tsconfig_touch(workspace, &changes, &roots);
     let resolved = qk_cache::resolve_tasks(workspace, graph, &changes.files)?;
     // The lockfile at both revisions, when it changed and both can be read.
     let lockfiles = if changes.files.iter().any(|file| file == "pnpm-lock.yaml") {
@@ -219,6 +229,16 @@ pub(crate) fn analyse(
                     qk_cache::InputChange::WorkspaceFile => TaskReason::WorkspaceFile,
                 }),
         );
+        if let Some((file, touch)) = &tsconfig
+            && match touch {
+                TsconfigTouch::All => true,
+                TsconfigTouch::Projects(projects) => {
+                    !projects.is_disjoint(&inputs.declared.projects)
+                }
+            }
+        {
+            reasons.push(TaskReason::Tsconfig { file: file.clone() });
+        }
         if let Some(file) = relinked.get(&graph.tasks[id].project) {
             reasons.push(TaskReason::Relinked { file: file.clone() });
         }
@@ -263,6 +283,80 @@ pub(crate) fn analyse(
         tasks,
         reachability: decisions,
     })
+}
+
+/// Which tasks' `TsConfiguration` a root tsconfig change reaches, as Nx's
+/// `ChangedContents` decides it.
+enum TsconfigTouch {
+    All,
+    /// The projects whose own paths entries changed, under
+    /// `selectivelyHashTsConfig`; none without it.
+    Projects(BTreeSet<String>),
+}
+
+/// The root tsconfig that changed and the tasks it reaches, or `None` when
+/// neither root tsconfig changed. Nx strips `compilerOptions.paths` from the
+/// hash, so a change only there reaches no task, unless
+/// `selectivelyHashTsConfig` keys each project's own entries. A change
+/// elsewhere, one it cannot compare, or a change to the root tsconfig it does
+/// not read, which may have switched which file is the root, reaches all.
+fn tsconfig_touch(
+    workspace: &Workspace,
+    changes: &Changes,
+    roots: &crate::ProjectRoots,
+) -> Option<(String, TsconfigTouch)> {
+    let file = changes
+        .files
+        .iter()
+        .find(|file| qk_cache::ROOT_TSCONFIG_FILES.contains(&file.as_str()))?;
+    let root = qk_cache::ROOT_TSCONFIG_FILES
+        .into_iter()
+        .find(|name| workspace.root.join(name).exists())
+        .unwrap_or(qk_cache::ROOT_TSCONFIG_FILES[1]);
+    let switched = changes
+        .files
+        .iter()
+        .any(|file| qk_cache::ROOT_TSCONFIG_FILES.contains(&file.as_str()) && file != root);
+    let read = |revision: Option<&str>| {
+        changes
+            .read(root, revision)
+            .and_then(|text| qk_cache::TsConfig::parse(&text))
+    };
+    let compared = if switched || changes.whole {
+        None
+    } else {
+        read(changes.base.as_deref()).zip(read(changes.head.as_deref()))
+    };
+    let touch = match compared {
+        Some((before, after)) if before.rest == after.rest => {
+            let mut projects = BTreeSet::new();
+            if qk_cache::selectively_hash_tsconfig(workspace) {
+                let keys: BTreeSet<&String> =
+                    before.paths.keys().chain(after.paths.keys()).collect();
+                for key in keys {
+                    // Each owner's targets in their order, as the hash keeps them.
+                    let owned = |paths: &BTreeMap<String, Vec<String>>| {
+                        let mut owned: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+                        for target in paths.get(key).into_iter().flatten() {
+                            if let Some(owner) = roots.owner(target) {
+                                owned.entry(owner).or_default().push(target.clone());
+                            }
+                        }
+                        owned
+                    };
+                    let (old, new) = (owned(&before.paths), owned(&after.paths));
+                    for owner in old.keys().chain(new.keys()) {
+                        if old.get(owner) != new.get(owner) {
+                            projects.insert((*owner).to_owned());
+                        }
+                    }
+                }
+            }
+            TsconfigTouch::Projects(projects)
+        }
+        _ => TsconfigTouch::All,
+    };
+    Some((file.clone(), touch))
 }
 
 /// Each task's producers: the tasks whose declared outputs it reads.

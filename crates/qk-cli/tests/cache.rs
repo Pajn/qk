@@ -2836,6 +2836,70 @@ fn dependency_inputs_cover_transitive_dependencies_like_nx() {
     assert!(check().contains("cache miss"));
 }
 
+/// As in Nx, the root tsconfig keys every task without its path mappings,
+/// and with `selectivelyHashTsConfig` with the mappings into the projects
+/// whose inputs the task reads.
+#[test]
+fn the_root_tsconfig_keys_path_mappings_as_nx_does() {
+    for selective in [false, true] {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let write = |path: &str, text: &str| {
+            let path = root.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        };
+        write(
+            "nx.json",
+            &json!({"tasksRunnerOptions": {"default": {"options": {"selectivelyHashTsConfig": selective}}}})
+                .to_string(),
+        );
+        write(
+            "app/project.json",
+            r#"{"name":"app","implicitDependencies":["lib"],
+                "targets":{"check":{"command":"echo checked","cache":true,"inputs":["default","^default"]}}}"#,
+        );
+        write("lib/project.json", r#"{"name":"lib"}"#);
+        write("other/project.json", r#"{"name":"other"}"#);
+        let tsconfig = |lib: &str, other: &str, strict: bool| {
+            json!({"compilerOptions": {"strict": strict, "paths": {"@lib": [lib], "@other": [other]}}})
+                .to_string()
+        };
+        write(
+            "tsconfig.base.json",
+            &tsconfig("lib/a.ts", "other/a.ts", true),
+        );
+        let check = || {
+            let output = Command::new(env!("CARGO_BIN_EXE_qk"))
+                .args(["--workspace", root.to_str().unwrap(), "run", "app:check"])
+                .env_remove("CI")
+                .env_remove("NX_TASKS_RUNNER")
+                .output()
+                .unwrap();
+            stderr(&success(output))
+        };
+        assert!(check().contains("cache miss"));
+        // A mapping into a project the task does not read never counts.
+        write(
+            "tsconfig.base.json",
+            &tsconfig("lib/a.ts", "other/b.ts", true),
+        );
+        assert!(check().contains("cache hit"), "selective={selective}");
+        // One into a dependency counts only when hashed selectively.
+        write(
+            "tsconfig.base.json",
+            &tsconfig("lib/b.ts", "other/b.ts", true),
+        );
+        let expected = if selective { "cache miss" } else { "cache hit" };
+        assert!(check().contains(expected), "selective={selective}");
+        write(
+            "tsconfig.base.json",
+            &tsconfig("lib/b.ts", "other/b.ts", false),
+        );
+        assert!(check().contains("cache miss"), "selective={selective}");
+    }
+}
+
 #[test]
 fn dependency_manifests_count_by_what_they_decide_for_dependents() {
     let temp = TempDir::new().unwrap();

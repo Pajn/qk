@@ -35,6 +35,9 @@ edges off.
   every change, which reads as a bug, since its task selection checks.
 - A change to the file nx.json `extends` affects every project, as a change to
   nx.json does; Nx does not look at it.
+- The root tsconfig is keyed without the version of the installed
+  `typescript` package Nx hashes beside it; qk keys what the task's importers
+  install instead.
 - The `pnpm-workspace.yaml` qk adds to every key leaves out its resolution
   keys, which reach tasks through the lockfile. A task whose inputs select the
   file keys it whole, as in Nx.

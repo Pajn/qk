@@ -18,7 +18,8 @@ use serde_json::{Value, json};
 
 use crate::ignored::Group;
 use crate::inputs::{
-    Declared, Inferred, JsonFields, Resolved, manifest_for_dependents, workspace_without_resolution,
+    Declared, Inferred, JsonFields, Resolved, TsConfig, manifest_for_dependents,
+    workspace_without_resolution,
 };
 use crate::paths::{self, Outputs, Pattern};
 
@@ -1493,6 +1494,9 @@ struct Resolver<'a> {
     /// whether they came with `dependencies: true`: each is one group, whose
     /// negations filter all of its positives.
     ignored: BTreeMap<(String, bool), Vec<String>>,
+    /// Every project whose inputs were read, as Nx hashes each one's
+    /// configuration.
+    projects: BTreeSet<String>,
     /// `None` resolves which inputs a task has without evaluating env or
     /// runtime inputs.
     prepared: Option<&'a PreparedTask>,
@@ -1520,12 +1524,14 @@ impl<'a> Resolver<'a> {
             expanded: BTreeSet::new(),
             external: BTreeSet::new(),
             ignored: BTreeMap::new(),
+            projects: BTreeSet::new(),
             prepared,
             cancelled,
         }
     }
 
     fn task_inputs(&mut self, task: &Task) -> Result<()> {
+        self.projects.insert(task.project.clone());
         for input in declared_inputs(task) {
             self.input(&task.project, &input)?;
         }
@@ -1542,6 +1548,7 @@ impl<'a> Resolver<'a> {
     }
 
     fn input(&mut self, project: &str, input: &Value) -> Result<()> {
+        self.projects.insert(project.to_owned());
         // Nx 24's `always` keeps an input in a hash taken from an Ultracache
         // recording. qk hashes no recordings, so the input reads as without it.
         if let Value::Object(object) = input
@@ -1839,6 +1846,7 @@ impl<'a> Resolver<'a> {
     }
 
     fn fileset(&mut self, project: &str, pattern: &str) -> Result<()> {
+        self.projects.insert(project.to_owned());
         let (exclude, pattern) = pattern
             .strip_prefix('!')
             .map(|pattern| (true, pattern))
@@ -2271,6 +2279,7 @@ fn resolve_candidates(
         values: resolver.values,
         json_fields: resolver.json_fields,
         external: resolver.external,
+        projects: resolver.projects,
         producers,
     };
     // `dependentTasksOutputFiles` reads its direct dependencies' declared
@@ -2345,10 +2354,11 @@ fn infer(snapshot: &Snapshot, workspace: &Workspace, task: &Task) -> Result<Infe
     // into every task. The root package.json is not, as in Nx: what the root
     // importer installs counts for every task through the lockfile, and the
     // rest of it is the root project's manifest.
-    let tsconfig = ["tsconfig.base.json", "tsconfig.json"]
+    inferred.tsconfig = crate::inputs::ROOT_TSCONFIG_FILES
         .into_iter()
-        .find(|name| exists(name));
-    for path in tsconfig.into_iter().chain([
+        .find(|name| exists(name))
+        .map(str::to_owned);
+    for path in [
         "nx.json",
         ".gitignore",
         ".nxignore",
@@ -2356,7 +2366,7 @@ fn infer(snapshot: &Snapshot, workspace: &Workspace, task: &Task) -> Result<Infe
         "package-lock.json",
         "yarn.lock",
         "bun.lock",
-    ]) {
+    ] {
         if exists(path) {
             inferred.files.insert(path.into());
         }
@@ -2463,6 +2473,12 @@ fn join(declared: Declared, mut inferred: Inferred) -> Resolved {
         inferred.workspace_file = false;
         covered.insert("pnpm-workspace.yaml".into());
     }
+    if let Some(tsconfig) = inferred
+        .tsconfig
+        .take_if(|path| declared.files.contains(path))
+    {
+        covered.insert(tsconfig);
+    }
     inferred.covered = covered;
     Resolved { declared, inferred }
 }
@@ -2557,6 +2573,19 @@ pub fn inputs(
     }
     if !inferred.manifests.is_empty() {
         configuration["manifests"] = json!(inferred.manifests);
+    }
+    if let Some(path) = &inferred.tsconfig {
+        let parsed = std::fs::read_to_string(workspace.root.join(path))
+            .ok()
+            .and_then(|text| TsConfig::parse(&text));
+        configuration["tsconfig"] = match parsed {
+            Some(tsconfig) if crate::inputs::selectively_hash_tsconfig(workspace) => json!({
+                "rest": tsconfig.rest,
+                "paths": tsconfig.paths_of(&declared.projects, |target| snapshot.owner(target)),
+            }),
+            Some(tsconfig) => json!({ "rest": tsconfig.rest }),
+            None => snapshot.file_value(&workspace.root, path)?,
+        };
     }
     // Warm state configuration never changes a result, and as in Nx a
     // target's metadata, such as the run command shown for a script, is

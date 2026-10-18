@@ -45,11 +45,18 @@ selects a whole file qk would add, the file counts whole, as the input says. A
 `json` input on such a file adds its fields beside qk's copy rather than
 narrowing it.
 
-Root workspace files (the root `tsconfig.base.json` or
-`tsconfig.json`, `nx.json`, `.gitignore`, `.nxignore`, `pnpm-workspace.yaml`,
-lockfiles) and the manifests of the task's project (`project.json`,
-`project.local.json` and `package.json`) are always included, its scripts and
-dependency declarations with them. The root `package.json` is not, as in Nx:
+Root workspace files (`nx.json`, `.gitignore`, `.nxignore`,
+`pnpm-workspace.yaml`, lockfiles) and the manifests of the task's project
+(`project.json`, `project.local.json` and `package.json`) are always included,
+its scripts and dependency declarations with them. The root tsconfig
+(`tsconfig.base.json`, or else `tsconfig.json`) is included as Nx hashes it:
+without `compilerOptions.paths`, so adding or moving a path mapping leaves
+every key as it was. With `selectivelyHashTsConfig: true` in the options of
+nx.json's `tasksRunnerOptions` runner (`default`, or the one `NX_TASKS_RUNNER`
+names), the key also holds the mappings whose targets lie in the projects
+whose inputs the task reads: its own, and those its `^` and `projects` inputs
+or a continuous task serving it reach. A root tsconfig that cannot be read as
+JSON with comments is keyed whole. The root `package.json` is not, as in Nx:
 what the root importer installs counts for every task through the lockfile, as
 below, and the rest of it is the root project's own manifest, so editing a root
 script misses only the root project's tasks. Dotenv files are not, as in Nx: they hold

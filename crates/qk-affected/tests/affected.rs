@@ -1231,7 +1231,7 @@ fn deleted_mandatory_workspace_files_affect_tasks_with_narrow_inputs() {
             ["app:build", "app:test", "lib:build", "lib:test"],
             "{file}"
         );
-        assert!(tasks.values().all(|cause| matches!(cause, qk_affected::TaskCause::Touched {reasons} if reasons.iter().any(|reason| matches!(reason,qk_affected::TaskReason::Input {file:changed} if changed==file)))));
+        assert!(tasks.values().all(|cause| matches!(cause, qk_affected::TaskCause::Touched {reasons} if reasons.iter().any(|reason| matches!(reason,qk_affected::TaskReason::Input {file:changed} | qk_affected::TaskReason::Tsconfig {file:changed} if changed==file)))));
     }
 }
 
@@ -1781,4 +1781,69 @@ fn root_package_overrides_and_global_packages_follow_nx() {
         &manifest("").replace("\"1.0.0\"", "\"1.0.1\""),
     );
     assert_eq!(repo.committed(), names(&["app", "lib", "tool"]));
+}
+
+/// Two projects whose builds read their own sources and their dependencies'
+/// through `^sources`, and tests that read only their own sources.
+fn narrow_task_repo(nx_json_extra: &str, extra: &[(&str, &str)]) -> Repo {
+    let nx_json = format!(
+        r#"{{"namedInputs": {{"sources": ["{{projectRoot}}/src/**/*"]}},
+            "targetDefaults": {{"build": {{"command": "echo build", "inputs": ["sources", "^sources"]}},
+                               "test": {{"command": "echo test", "inputs": ["sources", {{"externalDependencies": []}}]}}}}{nx_json_extra}}}"#
+    );
+    let mut files = vec![
+        ("nx.json", nx_json.as_str()),
+        (
+            "apps/app/project.json",
+            r#"{"name": "app", "implicitDependencies": ["lib"], "targets": {"build": {}, "test": {}}}"#,
+        ),
+        (
+            "libs/lib/project.json",
+            r#"{"name": "lib", "targets": {"build": {}, "test": {}}}"#,
+        ),
+    ];
+    files.extend_from_slice(extra);
+    Repo::new(&files)
+}
+
+/// As in Nx, the root tsconfig's path mappings are not part of a task's
+/// key unless `selectivelyHashTsConfig` keys each project's own; any other
+/// change reaches every task.
+#[test]
+fn root_tsconfig_paths_reach_tasks_only_when_hashed_selectively() {
+    let tsconfig = |target: &str, strict: bool| {
+        format!(
+            r#"{{"compilerOptions": {{"strict": {strict}, "paths": {{"@lib": ["{target}"], "@app": ["apps/app/src/main.ts"]}}}}}}"#
+        )
+    };
+    let selective =
+        r#", "tasksRunnerOptions": {"default": {"options": {"selectivelyHashTsConfig": true}}}"#;
+    for (extra, expected) in [
+        ("", &[][..]),
+        (selective, &["app:build", "lib:build", "lib:test"]),
+    ] {
+        let repo = narrow_task_repo(
+            extra,
+            &[("tsconfig.base.json", &tsconfig("libs/lib/src/a.ts", true))],
+        );
+        write(
+            &repo.root,
+            "tsconfig.base.json",
+            &tsconfig("libs/lib/src/b.ts", true),
+        );
+        assert_eq!(
+            affected_tasks(&repo)
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            expected,
+            "{extra}"
+        );
+        write(
+            &repo.root,
+            "tsconfig.base.json",
+            &tsconfig("libs/lib/src/b.ts", false),
+        );
+        assert_eq!(affected_tasks(&repo).len(), 4, "{extra}");
+    }
 }
