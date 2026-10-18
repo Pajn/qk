@@ -5,7 +5,7 @@
 | --- | --- |
 | `qk inputs analyze <task> [--report <path>] [--previous <path>] [--suggestions <path>]` | Execute tasks without caching, record file accesses and review input coverage; macOS or Linux with strace. See [Recording task inputs](../guides/input-analysis.md) |
 | `qk show projects [--json]` | Project names in Nx graph order, one per line or as a compact JSON array |
-| `qk show projects -p 'web,tag:library' --exclude 'experimental-*'` | Union of matching names, globs and tags, minus exclusions |
+| `qk show projects -p 'web,tag:library' --exclude 'experimental-*'` | Matching names, globs, tags and roots, minus exclusions |
 | `qk show projects --with-target e2e --type app [--sep ,]` | Projects with one of the targets, of a type (`app`, `lib` or `e2e`, as Nx types them), joined by a separator |
 | `qk show projects --affected --affected-targets build,export` | Affected projects where a task of one of the targets is affected, as task selection decides it |
 | `qk show project <name> [--json]` | Normalized project configuration as JSON |
@@ -46,8 +46,8 @@ subcommands, and Nx commands qk does not implement such as `format` and
 with one of those names.
 
 As in `nx graph`, `--focus` keeps the project and every project connected to
-it through dependencies in either direction, and `--exclude` takes names, globs
-and tags. The kept projects' edges are unchanged, so they can name projects
+it through dependencies in either direction, and `--exclude` takes
+[project selectors](../guides/affected.md#project-selectors). The kept projects' edges are unchanged, so they can name projects
 left out. `--print` and `--file stdout` write to stdout. qk has no browser
 view, so `nx graph`'s `--affected`, `--view` and server options do not apply;
 for a task graph, use `qk run-many -t <targets> --graph`.

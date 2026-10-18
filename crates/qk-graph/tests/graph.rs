@@ -81,7 +81,7 @@ fn every_dependency_section_works_independently() {
 }
 
 #[test]
-fn selectors_union_names_and_tags_then_apply_exclusions() {
+fn selectors_apply_in_order_then_exclusions_among_the_selected() {
     let workspace = example();
     let selected = select_projects(
         &workspace.projects,
@@ -90,6 +90,25 @@ fn selectors_union_names_and_tags_then_apply_exclusions() {
     )
     .unwrap();
     assert_eq!(selected, set(&["web"]));
+    // A later pattern adds back what an earlier one removed.
+    assert_eq!(
+        select_projects(&workspace.projects, &names(&["!core", "core"]), &[]).unwrap(),
+        set(&["codegen", "core", "web", "worker"])
+    );
+    // Labels, and a plain pattern falling back to the project root.
+    assert_eq!(
+        select_projects(&workspace.projects, &names(&["apps/web/*"]), &[]).unwrap(),
+        set(&["worker"])
+    );
+    assert_eq!(
+        select_projects(&workspace.projects, &names(&["directory:apps/**"]), &[]).unwrap(),
+        set(&["web", "worker"])
+    );
+    // A plain name that is no project matches as a word, ignoring case.
+    assert_eq!(
+        select_projects(&workspace.projects, &names(&["WEB"]), &[]).unwrap(),
+        set(&["web"])
+    );
     assert_eq!(
         select_projects(&workspace.projects, &names(&["!tag:scope:*"]), &[]).unwrap(),
         set(&["codegen", "worker"])
@@ -98,7 +117,12 @@ fn selectors_union_names_and_tags_then_apply_exclusions() {
         select_projects(&workspace.projects, &names(&["absent"]), &[]).unwrap(),
         BTreeSet::new()
     );
-    assert!(select_projects(&workspace.projects, &names(&["["]), &[]).is_err());
+    // As in minimatch, an unclosed class is literal text.
+    assert!(
+        select_projects(&workspace.projects, &names(&["["]), &[])
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -117,6 +141,15 @@ fn implicit_globs_exclude_self_and_negations_remove_manifest_edges() {
             .collect::<Vec<_>>(),
         ["codegen", "worker"]
     );
+    // As in Nx, the node holds the expanded list, exclusions as `!` names.
+    assert_eq!(
+        graph.nodes["web"].data.implicit_dependencies,
+        names(&["codegen", "worker", "!core"])
+    );
+    assert_eq!(
+        workspace.projects["web"].implicit_dependencies,
+        names(&["!core", "*"])
+    );
 }
 
 #[test]
@@ -126,13 +159,14 @@ fn graph_rejects_dangling_implicit_edges_and_duplicate_package_names() {
         .projects
         .get_mut("web")
         .unwrap()
-        .implicit_dependencies = names(&["missing"]);
+        .implicit_dependencies = names(&["missing", "tag:none", "!absent", "nx-cloud:other"]);
+    let error = ProjectGraph::build(&workspace).unwrap_err().to_string();
     assert!(
-        ProjectGraph::build(&workspace)
-            .unwrap_err()
-            .to_string()
-            .contains("unknown implicit dependency")
+        error.contains("implicitDependencies point to non-existent project(s):\n  web\n    missing\n    tag:none"),
+        "{error}"
     );
+    // `!absent` starts from every project, so it matches some.
+    assert!(!error.contains("!absent"), "{error}");
     workspace
         .projects
         .get_mut("web")

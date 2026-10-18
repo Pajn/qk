@@ -129,26 +129,6 @@ pub(crate) fn project(
     } else {
         value.shift_remove("targets");
     }
-    // Which of Nx's plugins created each target, for `filter.plugin` in
-    // target defaults: package.json's, unless project.json gives the target
-    // its executor or command or adds it.
-    let from_package: std::collections::BTreeSet<String> = layers
-        .first()
-        .map(|targets| targets.keys().cloned().collect())
-        .unwrap_or_default();
-    let mut from_project = std::collections::BTreeSet::new();
-    for file in [&project_json, &local] {
-        if let Some(Value::Object(incoming)) = file.as_ref().and_then(|file| file.get("targets")) {
-            for (name, target) in incoming {
-                if !from_package.contains(name)
-                    || target.get("executor").is_some()
-                    || target.get("command").is_some()
-                {
-                    from_project.insert(name.clone());
-                }
-            }
-        }
-    }
     if let Some(Value::Object(project)) = project_json {
         layers.push(overlay(&mut value, project)?);
     }
@@ -194,6 +174,11 @@ pub(crate) fn project(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
+    let project_root = value
+        .get("root")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
     let project_tags: Vec<String> = value
         .get("tags")
         .and_then(Value::as_array)
@@ -214,15 +199,10 @@ pub(crate) fn project(
     let mut defaults: Vec<(String, usize, Map<String, Value>)> = Vec::new();
     for (name, target) in &staged {
         let target = merge::desugar(object_ref(target, "target")?, &relative)?;
-        let plugin = if from_project.contains(name) || !from_package.contains(name) {
-            "nx/core/project-json"
-        } else {
-            "nx/core/package-json"
-        };
         let context = Filtered {
             project: &project_name,
+            root: &project_root,
             tags: &project_tags,
-            plugin,
         };
         let Some((key, entries)) = target_default(config, name, &target, &context)
             .with_context(|| format!("invalid targetDefaults for {name:?}"))?
@@ -508,11 +488,9 @@ fn merge_layer(
 }
 
 /// Whether a glob target key, in target defaults or a project, matches a
-/// target name.
+/// target name, as minimatch matches it.
 fn glob_matches(pattern: &str, name: &str) -> bool {
-    globset::Glob::new(pattern)
-        .map(|glob| glob.compile_matcher().is_match(name))
-        .unwrap_or(false)
+    crate::minimatch::is_match(pattern, name, false)
 }
 
 /// Merges one configuration file over the project so far, as Nx merges
@@ -631,8 +609,18 @@ fn object_ref<'a>(value: &'a Value, field: &str) -> Result<&'a Map<String, Value
 /// What a target default's `filter` is matched against.
 struct Filtered<'a> {
     project: &'a str,
+    root: &'a str,
     tags: &'a [String],
-    plugin: &'a str,
+}
+
+impl crate::Matchable for Filtered<'_> {
+    fn root(&self) -> &str {
+        self.root
+    }
+
+    fn tags(&self) -> &[String] {
+        self.tags
+    }
 }
 
 /// A target default entry, with its position in its key's array.
@@ -640,10 +628,10 @@ type Entry = (usize, Map<String, Value>);
 
 /// The target defaults for a target, as Nx 24 resolves them. Keys are tried
 /// in order: the target's executor, its name, then glob keys matching the
-/// name, longest first. A key's value is a default or an array of them, each
-/// with an optional `filter` on `projects`, `plugin` and `executor`; the first
-/// key with an entry whose filter matches wins, with its matching entries in
-/// order, each with its position.
+/// name as minimatch matches it, longest first. A key's value is a default or
+/// an array of them, each with an optional `filter` on `projects`, `plugin`
+/// and `executor`; the first key with an entry whose filter matches wins,
+/// with its matching entries in order, each with its position.
 fn target_default(
     config: &WorkspaceConfig,
     name: &str,
@@ -689,78 +677,50 @@ fn target_default(
 
 /// Nx's `isGlobPattern`, for target default keys and dependency targets.
 pub fn is_glob(key: &str) -> bool {
-    key.contains(['*', '?', '[', '{']) || ["!(", "+(", "@("].iter().any(|group| key.contains(group))
+    crate::is_glob_pattern(key)
 }
 
+/// Whether an entry's `filter` takes in the target. Every criterion given
+/// must hold; other keys are ignored, as in Nx. `plugin` names the plugin
+/// from nx.json `plugins` that wrote the target's executor or command, and
+/// qk runs none: targets from project.json and package.json have no plugin,
+/// so a `plugin` filter never matches.
 fn filter_matches(
     filter: Option<&Value>,
     executor: Option<&str>,
     context: &Filtered,
 ) -> Result<bool> {
-    let Some(filter) = filter else {
+    let Some(filter) = filter.filter(|filter| !filter.is_null()) else {
         return Ok(true);
     };
     let filter = filter.as_object().context("filter must be an object")?;
-    for key in filter.keys() {
-        if !matches!(key.as_str(), "projects" | "plugin" | "executor") {
-            bail!("unknown target default filter {key:?}");
-        }
-    }
-    if let Some(projects) = filter.get("projects") {
+    // JavaScript truthiness: Nx skips a criterion given as `""` or `null`.
+    let given = |key: &str| {
+        filter.get(key).filter(|value| {
+            !matches!(value, Value::Null | Value::Bool(false))
+                && value.as_str() != Some("")
+                && value.as_f64() != Some(0.0)
+        })
+    };
+    if let Some(projects) = given("projects") {
+        // Nx spreads a string into its characters; qk takes it as one pattern.
         let patterns: Vec<String> = match projects {
             Value::String(pattern) => vec![pattern.clone()],
             other => serde_json::from_value(other.clone())
-                .context("filter.projects must be a string or an array")?,
+                .context("filter.projects must be an array of project patterns")?,
         };
-        if !project_matches(&patterns, context)? {
+        let project = std::collections::BTreeMap::from([(context.project.to_owned(), context)]);
+        if crate::find_matching_projects(&patterns, &project, crate::Reader::Nx).is_empty() {
             return Ok(false);
         }
     }
-    if let Some(plugin) = filter.get("plugin")
-        && plugin.as_str() != Some(context.plugin)
-    {
+    if given("plugin").is_some() {
         return Ok(false);
     }
-    if let Some(wanted) = filter.get("executor")
+    if let Some(wanted) = given("executor")
         && wanted.as_str() != executor
     {
         return Ok(false);
     }
     Ok(true)
-}
-
-/// Whether Nx's project patterns select this project: names and globs,
-/// `tag:` globs, and `!` exclusions, starting from every project when the
-/// first pattern excludes.
-fn project_matches(patterns: &[String], context: &Filtered) -> Result<bool> {
-    let matches = |pattern: &str| -> Result<bool> {
-        let (tag, glob) = match pattern.strip_prefix("tag:") {
-            Some(tag) => (true, tag),
-            None => (false, pattern),
-        };
-        let glob = globset::Glob::new(glob)
-            .with_context(|| format!("invalid project pattern {pattern:?}"))?
-            .compile_matcher();
-        Ok(if tag {
-            context.tags.iter().any(|tag| glob.is_match(tag))
-        } else {
-            glob.is_match(context.project)
-        })
-    };
-    let mut selected = patterns.first().is_some_and(|first| first.starts_with('!'));
-    for pattern in patterns {
-        match pattern.strip_prefix('!') {
-            Some(excluded) => {
-                if matches(excluded)? {
-                    selected = false;
-                }
-            }
-            None => {
-                if matches(pattern)? {
-                    selected = true;
-                }
-            }
-        }
-    }
-    Ok(selected)
 }

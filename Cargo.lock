@@ -1808,7 +1808,6 @@ name = "qk-graph"
 version = "0.7.0"
 dependencies = [
  "anyhow",
- "globset",
  "qk-config",
  "serde",
  "serde_json",

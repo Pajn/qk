@@ -78,9 +78,12 @@ Packages also gain `npm:private` or `npm:public` and `npm:<keyword>` tags.
 
 ## `implicitDependencies`
 
-An array of project selectors, empty by default. Names, globs and tags add
-graph edges; negations remove matching edges. An unknown exact dependency
-name is an error. Package dependency sections also create graph edges when
+An array of [project selectors](../guides/affected.md#project-selectors),
+empty by default. What the selectors match, less the project itself, gains an
+implicit graph edge; a `!` selector removes every edge to the projects it
+matches, package dependencies included. As in Nx, a selector matching no
+project is an error, and the graph's node lists the expanded names, each
+exclusion as `!name`. Package dependency sections also create graph edges when
 the range identifies a workspace package; see [Nx compatibility](../compatibility.md).
 
 ## `namedInputs`

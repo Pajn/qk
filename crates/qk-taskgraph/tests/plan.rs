@@ -137,6 +137,23 @@ fn object_selectors_forward_arguments_and_exclude_projects() {
 }
 
 #[test]
+fn dependency_projects_are_read_as_nx_reads_them() {
+    let (_temp, workspace) = workspace(json!({
+        "app": {"targets":{"build":{"dependsOn":[
+            {"target":"build", "projects":[]},
+            {"target":"lint", "projects":["!tag:skip", "app"]}
+        ]}, "lint":{}}},
+        "lib": {"tags":["skip"], "targets":{"build":{}, "lint":{}}},
+        "other": {"targets":{"build":{}, "lint":{}}}
+    }));
+    let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
+    // No patterns select no project, and patterns apply in order.
+    let mut tasks: Vec<&str> = graph.tasks.keys().map(String::as_str).collect();
+    tasks.sort();
+    assert_eq!(tasks, ["app:build", "app:lint", "other:lint"]);
+}
+
+#[test]
 fn object_dependencies_select_project_edges_and_ignore_arguments_by_default() {
     let (_temp, workspace) = workspace(json!({
         "app": {"implicitDependencies":["lib"], "targets":{"build":{"dependsOn":[{"target":"build", "dependencies":true}]}}},

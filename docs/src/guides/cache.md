@@ -131,7 +131,7 @@ Every input declaration of Nx 24 is supported, `always` read as absent:
   on, directly or not, and `^{projectRoot}/…`, `^{workspaceRoot}/…` or
   `{"fileset": "…", "dependencies": true}`, a fileset of each of them;
 - `{"input": "name", "projects": […]}`, the named input of the projects the
-  names, globs or `tag:` patterns select;
+  [project selectors](affected.md#project-selectors) select;
 - `env`, `runtime`, `dependentTasksOutputFiles` with `transitive`, and
   `externalDependencies`, which adds every installation of the named
   packages in the pnpm lockfile, whichever importer installs them;

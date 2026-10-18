@@ -1613,9 +1613,13 @@ impl<'a> Resolver<'a> {
                         other => serde_json::from_value(other.clone())
                             .context("input projects must be a string or an array")?,
                     };
-                    for selected in
-                        qk_graph::select_projects(&self.workspace.projects, &patterns, &[])?
-                    {
+                    // Nx's native hasher reads these patterns, not the
+                    // `findMatchingProjects` the rest of Nx uses.
+                    for selected in qk_config::find_matching_projects(
+                        &patterns,
+                        &self.workspace.projects,
+                        qk_config::Reader::Native,
+                    ) {
                         // As in Nx 24, `dependencies: true` beside `projects`
                         // is each selected project's `^name`, not its own.
                         if dependencies {

@@ -49,16 +49,21 @@ A named input cannot itself declare `dependencies` or `projects`.
 
 An object of target defaults; defaults to empty. Matching keys are tried in
 this order: executor, target name, then matching target-name globs, longest
-first. The first key with a matching entry wins; keys do not all accumulate.
-As in Nx 24, the selected defaults lie beneath the project's files, which
-merge over them as described in [Merging](targets.md#merging), spreads
-included. Beneath a default there is only the earlier matching entries of
-its key, so a spread in the first adds nothing.
+first. A key is a glob when it holds one of `*`, `|`, `{`, `}`, `(`, `)` or
+`[`, and it matches as minimatch matches: `*` does not cross a `/`. The first
+key with a matching entry wins; keys do not all accumulate. As in Nx 24, the
+selected defaults lie beneath the project's files, which merge over them as
+described in [Merging](targets.md#merging), spreads included. Beneath a
+default there is only the earlier matching entries of its key, so a spread in
+the first adds nothing.
 
 Each value may be a target object or an array of target objects. Array entries
-may have `filter.projects` (names, globs, `tag:` and `!` selectors),
-`filter.plugin` (`nx/core/project-json` or `nx/core/package-json`), and
-`filter.executor`. Matching entries merge in array order, later ones winning.
+may have `filter.projects`, an array of
+[project selectors](../guides/affected.md#project-selectors), and
+`filter.executor`, and other filter keys are ignored. `filter.plugin` names
+the plugin in nx.json `plugins` that wrote the target; targets from
+project.json and package.json have none, so an entry with `filter.plugin`
+never applies. Matching entries merge in array order, later ones winning.
 An entry naming an executor different from the target's own is left out,
 although its key still wins.
 

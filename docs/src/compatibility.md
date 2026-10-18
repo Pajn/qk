@@ -83,6 +83,17 @@ When a name occurs in multiple sections, precedence is `dependencies`,
   root in the outputs a target without `outputs` takes. Nx inserts them as
   they are, which turns such a root into a pattern that misses the project's
   files.
+- Project selectors read `tag:*` and `directory:*` as globs, where Nx takes
+  them for every project, tagged or not. A pattern with an unknown label, such
+  as `scope:shared`, is matched whole; Nx drops the label and would select a
+  project named `shared`. A plain name matches as a word by its characters;
+  Nx puts it unescaped into a regular expression, so `.` there matches any
+  character.
+- A `targetDefaults` `filter.projects` given as a string is one pattern; Nx
+  spreads it into one pattern per character.
+- Globs in project selectors, workspace package patterns, `targetDefaults`
+  keys and project target keys do not support minimatch's extended globs
+  such as `@(a|b)`: their characters match themselves.
 - For affected-project selection, bare parenthesized extension groups such
   as `**/*.(svg|png)` select projects in qk that Nx 23.1.0 does not.
   See [Inputs and outputs](reference/inputs-outputs.md) for compatible syntax.

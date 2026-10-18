@@ -3,8 +3,10 @@
 mod discovery;
 mod extends;
 mod merge;
+pub mod minimatch;
 mod normalize;
 mod overrides;
+mod selector;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -15,6 +17,7 @@ use serde_json::{Map, Value};
 
 pub use discovery::find_workspace;
 pub use overrides::interpolate_override;
+pub use selector::{Matchable, Reader, find_matching_projects, is_glob_pattern};
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]

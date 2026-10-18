@@ -46,7 +46,8 @@ a whole number, such as `"1"`: Nx cannot tell where it was written.
 
 A target key that is a glob, such as `"e2e-ci--*"`, merges onto every target
 defined beneath it whose name it matches, and is a target of its own when it
-matches none.
+matches none. Keys are globs and match as `targetDefaults` keys do (see
+[Workspace](workspace.md#targetdefaults)): `*` does not cross a `/`.
 
 ## `executor`
 

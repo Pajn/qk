@@ -485,11 +485,13 @@ fn target_defaults_resolve_like_nx_23() {
         "nx.json",
         r#"{"targetDefaults": {
             "test-*": {"cache": true},
+            "*": {"options": {"star": true}},
             "test-e2e*": {"options": {"shard": 1}},
             "build": [
                 {"cache": true},
                 {"filter": {"projects": ["tag:web"]}, "options": {"mode": "web"}},
                 {"filter": {"projects": "lib"}, "options": {"mode": "lib"}},
+                {"filter": {"projects": ["libs/*"], "unknown": true}, "outputs": ["out"]},
                 {"filter": {"executor": "nx:run-script"}, "options": {"script": "never"}}
             ],
             "lint": [{"filter": {"plugin": "nx/core/package-json"}, "cache": true}],
@@ -507,7 +509,9 @@ fn target_defaults_resolve_like_nx_23() {
             "test-unit": {"command": "vitest"},
             "test-e2e-ci": {"command": "playwright test"},
             "deploy": {"command": "wrangler deploy"},
-            "lint": {"command": "oxlint"}
+            "lint": {"command": "oxlint"},
+            "serve": {"command": "vite"},
+            "serve/dev": {"command": "vite --mode dev"}
         }}"#,
     );
     write(
@@ -531,6 +535,9 @@ fn target_defaults_resolve_like_nx_23() {
     assert_eq!(web["test-unit"].cache, Some(true));
     assert_eq!(web["test-e2e-ci"].cache, None);
     assert_eq!(web["test-e2e-ci"].options["shard"], 1);
+    // A glob key's `*` does not cross a `/` in a target name.
+    assert_eq!(web["serve/dev"].options.get("star"), None);
+    assert_eq!(web["serve"].options["star"], true);
     // The executor key's only entry is filtered out, so the name key applies,
     // and its matching entries merge in order; the glob key does not add.
     assert_eq!(web["build"].cache, Some(true));
@@ -544,8 +551,10 @@ fn target_defaults_resolve_like_nx_23() {
     );
     // An entry for another executor is left out, but its key still wins.
     assert_eq!(web["deploy"].cache, None);
-    // filter.plugin tells package.json scripts from project.json targets.
-    assert_eq!(workspace.projects["pkg"].targets["lint"].cache, Some(true));
+    // Project patterns read roots, and unknown filter keys are ignored.
+    assert_eq!(lib.outputs, Some(vec!["out".to_owned()]));
+    // No target comes from a plugin in nx.json, so filter.plugin never matches.
+    assert_eq!(workspace.projects["pkg"].targets["lint"].cache, None);
     assert_eq!(web["lint"].cache, None);
 }
 

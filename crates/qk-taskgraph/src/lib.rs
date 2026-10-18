@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, bail};
 use qk_config::{Target, Workspace};
-use qk_graph::{ProjectGraph, select_projects};
+use qk_graph::ProjectGraph;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
@@ -544,9 +544,11 @@ impl Builder<'_> {
                         value => serde_json::from_value(value.clone())
                             .context("dependency projects must be a string or string array")?,
                     };
-                    select_projects(&self.workspace.projects, &selectors, &[])?
-                        .into_iter()
-                        .collect()
+                    qk_config::find_matching_projects(
+                        &selectors,
+                        &self.workspace.projects,
+                        qk_config::Reader::Nx,
+                    )
                 } else if dependencies {
                     self.project_dependencies(derive_from)
                 } else {

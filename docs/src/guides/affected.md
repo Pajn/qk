@@ -116,10 +116,34 @@ removed or changed.
 
 ## Project selectors
 
-Project selectors support `*`, `?`, character classes and `tag:<glob>`.
-Repeat `--projects` or use commas to combine selectors. Prefix a selector
-with `!` to exclude it; exclusions win regardless of order. With only
-exclusions, selection starts with all projects. A selector matching nothing
-returns an empty list; `show project` requires an existing exact name.
+Project selectors are read as Nx's `findMatchingProjects` reads them,
+wherever Nx reads them: `--projects` and `--exclude`, `implicitDependencies`,
+`dependsOn` and `inputs` `projects`, `targetDefaults` `filter.projects` and a
+`projectsAffectedByDependencyUpdates` array.
+
+- A project name selects that project. A glob selects the names it matches;
+  globs are minimatch globs, so `*` and `?` do not cross a `/`
+  (`@scope/*`, not `@scope*`, selects `@scope/ui`) and `**` does.
+- `tag:<pattern>` selects by tag, `directory:<glob>` by project root and
+  `name:<pattern>` by name only. A pattern without a label is tried as a
+  name, then as a root when no name matched, so `libs/*` selects the projects
+  directly under `libs`.
+- A plain pattern that is no project name and no glob selects the names
+  containing it as a word, ignoring case: `ui` selects `ui`, `@scope/ui` and
+  `ui_kit`, but not `ui-e2e`, as `-` and `@` join words.
+- Patterns apply in order, each adding what it matches or, prefixed with `!`,
+  removing it: `'!tag:e2e,app-e2e'` keeps `app-e2e`. When the first pattern
+  excludes, selection starts with every project.
+- `--exclude` removes what its patterns match among the projects already
+  selected.
+- Empty patterns and `nx-cloud:` references to other workspaces are skipped.
+  A selection matching nothing is empty; `show project` requires an existing
+  exact name.
+
+The `projects` of an input are read by Nx's native hasher, which differs:
+a first `!` pattern starts from nothing, and a plain name matches only that
+name.
+
 Quote globs so the shell does not expand them. Commas delimit CLI selectors,
 so brace globs containing commas are not supported on the command line.
+
