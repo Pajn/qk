@@ -329,6 +329,8 @@ pub fn run(
     let mut stopping = BTreeSet::new();
     // Tasks stopped because the readiness check something waits for failed.
     let mut not_ready_failed: BTreeSet<String> = BTreeSet::new();
+    // Tasks that exited before the check something waits for passed.
+    let mut exited_unready: BTreeSet<String> = BTreeSet::new();
     let mut outcomes = BTreeMap::new();
     let mut fingerprints: BTreeMap<String, qk_cache::Fingerprint> = BTreeMap::new();
     let warm = graph
@@ -494,6 +496,26 @@ pub fn run(
                     .collect::<Vec<_>>()
                 {
                     let dependencies = &graph.tasks[&id].dependencies;
+                    // As in Nx, a task waiting for a server that exited
+                    // before its check passed fails, naming the server.
+                    if let Some(server) = dependencies.iter().find(|dependency| {
+                        waits(&id, dependency) && exited_unready.contains(*dependency)
+                    }) {
+                        let reason = format!("Task \"{server}\" exited before it became ready.");
+                        pending.remove(&id);
+                        active.insert(id.clone());
+                        ready.entry(id.clone()).or_insert_with(SystemTime::now);
+                        started.insert(id.clone(), SystemTime::now());
+                        report::event(Event::Started {
+                            id: id.clone(),
+                            checking: false,
+                        });
+                        let sender = sender.clone();
+                        scope.spawn(move || {
+                            let _ = sender.send((id, Err(anyhow::anyhow!(reason))));
+                        });
+                        continue;
+                    }
                     if dependencies.iter().any(|dependency| {
                         skipped.contains(dependency)
                             // Once its failure has been reported: a check can
@@ -770,10 +792,14 @@ pub fn run(
                         held.remove(&id);
                         // A task that ends before its check passes cannot
                         // serve the tasks waiting for it.
-                        if waiters.contains_key(id.as_str()) {
+                        if waiters.contains_key(id.as_str()) && !prepared[&id].verdict.is_decided()
+                        {
                             prepared[&id]
                                 .verdict
                                 .fail(format!("Task \"{id}\" exited before it became ready."));
+                            if !stopping.contains(&id) && !cancelled.load(Ordering::SeqCst) {
+                                exited_unready.insert(id.clone());
+                            }
                         }
                         let (outcome, cache, key, warm, execution) = match result {
                             Ok(result) => {

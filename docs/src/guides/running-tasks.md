@@ -244,8 +244,9 @@ an object, is a check for the tasks that depend on it with
 `waitFor: "ready"`, as in Nx 24: they start once a url answers, a port
 accepts a connection, a command succeeds or text appears in the output.
 Waiting holds no `--parallel` slot. qk checks only while a task in the run
-waits. A check that times out, or a task that exits before its check passes,
-fails the task, and the tasks waiting for it are skipped. An invalid check
+waits. A check that times out fails the task, and the tasks waiting for it
+are skipped. A task that exits before its check passes keeps its own status,
+and the tasks waiting for it fail, naming it, as in Nx. An invalid check
 fails the task only when something waits for it; otherwise qk warns and runs
 it unchecked. A `port` of `0` or `auto` is one the server picks, so there is
 nothing to check and the task is ready once started. A request to this

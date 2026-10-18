@@ -948,16 +948,43 @@ fn an_invalid_check_fails_only_when_something_waits_for_it() {
 #[cfg(unix)]
 #[test]
 fn a_null_ready_when_turns_off_a_target_default() {
+    let defaults = json!({"targetDefaults": {"serve": {"readyWhen": {"logMatches": "never", "timeout": 100}}}});
+    // Without the null, the default's check applies and times out.
+    let control = fixture(json!({
+        "serve": {"continuous": true, "command": "sleep 30"},
+        "e2e": {"command": "true", "dependsOn": [{"target": "serve", "waitFor": "ready"}]}
+    }));
+    fs::write(control.path().join("nx.json"), defaults.to_string()).unwrap();
+    let output = run(control.path(), &["run", "app:e2e"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("did not become ready within 100ms"),
+        "{stderr}"
+    );
     let temp = served_fixture(Value::Null, Some("ready"));
-    fs::write(
-        temp.path().join("nx.json"),
-        json!({"targetDefaults": {"serve": {"readyWhen": {"logMatches": "never", "timeout": 100}}}}).to_string(),
-    )
-    .unwrap();
+    fs::write(temp.path().join("nx.json"), defaults.to_string()).unwrap();
     // Unchecked, a waiting task starts once the server has started.
     let output = run(temp.path(), &["run", "app:e2e"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains("did not become ready"), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn tasks_waiting_for_a_server_that_exits_before_it_is_ready_fail() {
+    let temp = fixture(json!({
+        "serve": {"continuous": true, "readyWhen": {"logMatches": "never"}, "command": "exit 0"},
+        "e2e": {"command": "echo e2e-ran", "dependsOn": [{"target": "serve", "waitFor": "ready"}]}
+    }));
+    let output = run(temp.path(), &["run", "app:e2e"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // As in Nx, the server keeps its own status and the waiting task fails.
+    assert!(
+        stderr.contains("qk: app:e2e: Task \"app:serve\" exited before it became ready."),
+        "{stderr}"
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("e2e-ran"));
 }
 
 #[test]
