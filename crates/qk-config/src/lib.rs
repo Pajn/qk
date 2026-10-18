@@ -4,6 +4,7 @@ mod discovery;
 mod extends;
 mod merge;
 mod normalize;
+mod overrides;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -13,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 pub use discovery::find_workspace;
+pub use overrides::interpolate_override;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]

@@ -458,37 +458,95 @@ fn parallel_command_list_starts_both_commands() {
 
 #[cfg(unix)]
 #[test]
-fn argument_tokens_and_forwarding_preserve_data_without_shell_execution() {
+fn arguments_go_into_commands_as_nx_puts_them() {
     let temp = fixture(json!({
-        "named":{"command":"printf '%s' {args.value} > result.txt"},
-        "all":{"command":"printf '%s\\n'"},
-        "quoted":{"command":"echo \"{args.value}\""}
+        "named":{"command":"printf '%s|' {args.value} > result.txt"},
+        "quoted":{"command":"printf '%s|' \"{args.value}\" > result.txt"},
+        "all":{"command":"printf '%s\\n'"}
     }));
-    let payload = "a 'quoted' $(touch injected) ; {projectName}";
+    // A value goes in as it is, for the shell to read.
     success(run(
         temp.path(),
-        &["run", "app:named", "--", "--value", payload],
+        &["run", "app:named", "--", "--value", "one two"],
     ));
     assert_eq!(
         fs::read_to_string(temp.path().join("result.txt")).unwrap(),
-        payload
+        "one|two|"
     );
-    assert!(!temp.path().join("injected").exists());
+    success(run(
+        temp.path(),
+        &["run", "app:quoted", "--", "--value", "one two"],
+    ));
+    assert_eq!(
+        fs::read_to_string(temp.path().join("result.txt")).unwrap(),
+        "one two|"
+    );
+    // Appended arguments are double-quoted when the shell would split them.
     let output = success(run(
         temp.path(),
-        &["run", "app:all", "--", payload, "two words"],
+        &[
+            "run",
+            "app:all",
+            "--",
+            "two words",
+            "--name=a b",
+            "plain",
+            "'{\"a\":",
+            "1}'",
+        ],
     ));
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        format!("{payload}\ntwo words\n")
+        "two words\n--name=a b\nplain\n{\"a\": 1}\n"
     );
-    assert!(
-        !run(
-            temp.path(),
-            &["run", "app:quoted", "--", "--value", payload]
-        )
-        .status
-        .success()
+}
+
+#[cfg(unix)]
+#[test]
+fn script_executor_reads_only_its_script_like_nx() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("nx.json"), "{}").unwrap();
+    fs::write(temp.path().join("package-lock.json"), "{}").unwrap();
+    fs::write(
+        temp.path().join("package.json"),
+        r#"{"workspaces": ["app"]}"#,
+    )
+    .unwrap();
+    let project = temp.path().join("app");
+    fs::create_dir_all(project.join("other")).unwrap();
+    fs::write(
+        project.join("package.json"),
+        json!({"name": "app", "scripts": {"test": "ignored by fake manager"}}).to_string(),
+    )
+    .unwrap();
+    fs::write(
+        project.join("project.json"),
+        json!({"name": "app", "targets": {"test": {"options": {
+            "cwd": "app/other", "env": {"FROM_OPTION": "set"}, "parallel": "not a boolean", "anything": 1
+        }, "env": {"FROM_TARGET": "set"}}}})
+        .to_string(),
+    )
+    .unwrap();
+    let bin = temp.path().join("node_modules/.bin");
+    fs::create_dir_all(&bin).unwrap();
+    let path = bin.join("npm");
+    fs::write(
+        &path,
+        "#!/bin/sh\npwd > ../manager-cwd\necho \"[$FROM_OPTION] [$FROM_TARGET]\" > ../manager-env\n",
+    )
+    .unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    success(run(temp.path(), &["run", "app:test"]));
+    let cwd = fs::read_to_string(temp.path().join("manager-cwd")).unwrap();
+    assert_eq!(
+        Path::new(cwd.trim()).canonicalize().unwrap(),
+        project.canonicalize().unwrap()
+    );
+    // Its options' env is not read; the target-level env is qk's own.
+    assert_eq!(
+        fs::read_to_string(temp.path().join("manager-env")).unwrap(),
+        "[] [set]\n"
     );
 }
 
@@ -1329,7 +1387,10 @@ fn the_args_option_is_forwarded_and_readable_like_nx() {
     );
     let both = run(temp.path(), &["run", "app:both"]);
     assert!(!both.status.success());
-    assert!(String::from_utf8_lossy(&both.stderr).contains("cannot use both {args} and {args.*}"));
+    assert!(
+        String::from_utf8_lossy(&both.stderr)
+            .contains("should not contain both {args} and {args.*} values")
+    );
 }
 
 #[cfg(unix)]
@@ -1344,6 +1405,18 @@ fn arguments_naming_run_commands_options_set_them() {
         &["run", "app:where", "--", "--cwd=sub", "--env.MODE=cli"],
     ));
     assert_eq!(String::from_utf8(output.stdout).unwrap(), "sub cli\n");
+    // As in Nx, their tokens resolve for the task's project.
+    let output = success(run(
+        temp.path(),
+        &[
+            "run",
+            "app:where",
+            "--",
+            "--cwd={workspaceRoot}/{projectRoot}/sub",
+            "--env.MODE={projectName}",
+        ],
+    ));
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "sub app\n");
 }
 
 #[cfg(unix)]
@@ -1504,9 +1577,8 @@ fn argument_placeholders_fall_back_like_nx_24() {
         "nested": {"command": "echo {args.host ?? {projectName}.local}"},
         "glob": {"command": "echo '{env.ts,env.d.ts}' {other}"},
         "dead": {"command": "echo {args.a ?? fixed ?? args.b}"},
-        "env_value": {"command": "echo $V", "options": {"envFile": "{args.file ?? env.FILE}", "env": {"V": "{args.v ?? env.FROM_FILE}"}}}
+        "env_value": {"command": "echo \"$V\"", "options": {"env": {"V": "{args.v ?? env.FILE}"}}}
     }));
-    fs::write(temp.path().join("chosen.env"), "FROM_FILE=from-file\n").unwrap();
     let stdout = |output: Output| String::from_utf8(success(output).stdout).unwrap();
     let run_with = |args: &[&str], port: Option<&str>| {
         let mut command = command(temp.path(), args);
@@ -1555,12 +1627,12 @@ fn argument_placeholders_fall_back_like_nx_24() {
         stdout(run(temp.path(), &["run", "app:glob"])),
         "{env.ts,env.d.ts} {other}\n"
     );
-    // The envFile path reads the environment, and env values read envFile too.
-    let output = command(temp.path(), &["run", "app:env_value"])
+    // As in Nx, only commands take placeholders; an env value is as written.
+    let output = command(temp.path(), &["run", "app:env_value", "--", "--v=x"])
         .env("FILE", "chosen.env")
         .output()
         .unwrap();
-    assert_eq!(stdout(output), "from-file\n");
+    assert_eq!(stdout(output), "{args.v ?? env.FILE} --v=x\n");
     let dead = run(temp.path(), &["run", "app:dead"]);
     assert!(
         String::from_utf8_lossy(&dead.stderr).contains("can never be used"),

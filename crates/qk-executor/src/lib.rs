@@ -441,72 +441,31 @@ pub fn prepare(
         .executor
         .as_deref()
         .context("target has no executor or command")?;
-    let (options, args) = if executor == "nx:run-commands" {
-        run_commands_overrides(&definition.options, &task.args)
+    let project = &workspace.projects[&task.project];
+    let run_commands = executor == "nx:run-commands";
+    if !matches!(executor, "nx:run-commands" | "nx:run-script" | "nx:noop") {
+        bail!("unsupported executor {executor:?}");
+    }
+    // As in Nx, run-script reads only `script`, and noop nothing.
+    let options = if run_commands {
+        run_commands_overrides(&definition.options, &task.args, project)?
     } else {
-        (definition.options.clone(), task.args.clone())
+        definition.options.clone()
     };
     let options = &options;
-    // Options Nx's run-commands knows; any other scalar option is forwarded to
-    // the command as `--name=value`, and object values are ignored, as in Nx.
-    const RUN_COMMANDS: &[&str] = &[
-        "command",
-        "commands",
-        "color",
-        "no-color",
-        "parallel",
-        "no-parallel",
-        "readyWhen",
-        "cwd",
-        "args",
-        "envFile",
-        "__unparsed__",
-        "env",
-        "usePty",
-        "streamOutput",
-        "verbose",
-        "forwardAllArgs",
-        "tty",
-    ];
-    let mut forwarded = BTreeMap::new();
-    if executor == "nx:run-commands" {
-        for (key, value) in options {
-            if RUN_COMMANDS.contains(&key.as_str()) {
-                continue;
-            }
-            let value = match value {
-                Value::String(text) => text.clone(),
-                Value::Number(number) => number.to_string(),
-                Value::Bool(flag) => flag.to_string(),
-                _ => continue,
-            };
-            forwarded.insert(key.clone(), value);
-        }
-    }
-    let extra = match options.get("args") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(text)) => Some(text.clone()),
-        Some(Value::Array(words)) => Some(
-            words
-                .iter()
-                .map(|word| word.as_str().context("args entries must be strings"))
-                .collect::<Result<Vec<_>>>()?
-                .join(" "),
-        ),
-        Some(_) => bail!("args must be a string or an array of strings"),
+    let empty = Map::new();
+    let mut interpolation = if run_commands {
+        interpolate::Interpolation::new(&task.args, options)?
+    } else {
+        interpolate::Interpolation::new(&[], &empty)?
     };
-    let mut interpolation =
-        interpolate::Interpolation::new(workspace, task, args, &forwarded, extra.as_deref())?;
     let (mut env, mut runtime_env) = task_environment(workspace, task, base_env)?;
-    // `env.NAME` fallbacks read the environment as built so far: dotenv files
-    // for `envFile`, and `envFile` too for `env`, then all of it for commands.
-    interpolation.set_env(&env);
     // As in Nx 24, `envFile` sets what the task's environment, dotenv files
     // included, leaves unset or empty, beneath `env`; and the task's
     // environment says whether it loads.
-    if let Some(file) = options.get("envFile") {
-        let file = interpolation.text(file.as_str().context("envFile must be a string")?)?;
-        let path = workspace.root.join(&file);
+    if let Some(file) = options.get("envFile").filter(|_| run_commands) {
+        let file = file.as_str().context("envFile must be a string")?;
+        let path = workspace.root.join(file);
         if loads_dotenv(&runtime_env) {
             if !path.is_file() {
                 bail!("envFile {file} does not exist");
@@ -522,8 +481,9 @@ pub fn prepare(
             }
         }
     }
-    interpolation.set_env(&env);
-    for values in [definition.extra.get("env"), options.get("env")]
+    // A target-level `env` is a qk extension, for every executor.
+    let option_env = options.get("env").filter(|_| run_commands);
+    for values in [definition.extra.get("env"), option_env]
         .into_iter()
         .flatten()
     {
@@ -531,10 +491,10 @@ pub fn prepare(
             if name.is_empty() || name.contains(['=', '\0']) {
                 bail!("invalid environment variable name");
             }
-            let value = value
+            let value: OsString = value
                 .as_str()
-                .context("environment values must be strings")?;
-            let value: OsString = interpolation.text(value)?.into();
+                .context("environment values must be strings")?
+                .into();
             let name = environment_key(&env, name.into());
             runtime_env.insert(name.clone(), value.clone());
             env.insert(name, value);
@@ -548,33 +508,17 @@ pub fn prepare(
             .cloned()
             .unwrap_or_else(|| "true".into()),
     );
-    if executor == "nx:run-commands" && boolean(options.get("color"), false, "color")? {
+    if run_commands && boolean(options.get("color"), false, "color")? {
         execution.insert("FORCE_COLOR".into(), "true".into());
     }
-    for key in options.keys() {
-        let allowed = match executor {
-            // Every run-commands option is supported. `streamOutput` and
-            // `verbose` have no effect: Nx sets them itself.
-            "nx:run-commands" => true,
-            "nx:run-script" => matches!(key.as_str(), "script" | "env" | "cwd"),
-            "nx:noop" => true,
-            _ => bail!("unsupported executor {executor:?}"),
-        };
-        if !allowed {
-            bail!("unsupported {executor} option {key:?}");
-        }
-    }
-    let default_cwd = if executor == "nx:run-script" {
-        &workspace.projects[&task.project].root
-    } else {
-        "."
+    // run-commands runs where `cwd` says, the workspace root by default, and
+    // run-script in the project root.
+    let cwd = match options.get("cwd").filter(|_| run_commands) {
+        Some(cwd) => cwd.as_str().context("cwd must be a string")?,
+        None if run_commands => ".",
+        None => &project.root,
     };
-    let cwd = options
-        .get("cwd")
-        .map(|value| value.as_str().context("cwd must be a string"))
-        .transpose()?
-        .unwrap_or(default_cwd);
-    let cwd = workspace.root.join(interpolation.text(cwd)?);
+    let cwd = workspace.root.join(cwd);
     let mut resolved = PathBuf::new();
     for part in cwd.components() {
         match part {
@@ -598,8 +542,22 @@ pub fn prepare(
     let path = std::env::join_paths(paths).context("cannot construct task PATH")?;
     env.insert(path_key.clone(), path.clone());
     runtime_env.insert(path_key, path);
-    let parallel = boolean(options.get("parallel"), true, "parallel")?;
-    let (mut pseudo_terminal, tty) = if executor == "nx:run-commands" {
+    let ready_when: Vec<String> = match options.get("readyWhen").filter(|_| run_commands) {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::String(text)) => vec![text.clone()],
+        Some(value) => serde_json::from_value(value.clone())
+            .context("readyWhen must be a string or an array of strings")?,
+    };
+    // As in Nx, a single `command` runs in parallel exactly when it has
+    // `readyWhen`, whatever `parallel` says.
+    let parallel = if run_commands && options.get("command").is_some_and(merge_truthy) {
+        !ready_when.is_empty()
+    } else if run_commands {
+        boolean(options.get("parallel"), true, "parallel")?
+    } else {
+        true
+    };
+    let (mut pseudo_terminal, tty) = if run_commands {
         (
             boolean(options.get("usePty"), true, "usePty")?
                 && base_env
@@ -611,13 +569,7 @@ pub fn prepare(
         (true, true)
     };
     let mut decorations = Vec::new();
-    let ready_when: Vec<String> = match options.get("readyWhen") {
-        None | Some(Value::Null) => Vec::new(),
-        Some(Value::String(text)) => vec![text.clone()],
-        Some(value) => serde_json::from_value(value.clone())
-            .context("readyWhen must be a string or an array of strings")?,
-    };
-    if !ready_when.is_empty() && options.contains_key("commands") && !parallel {
+    if !ready_when.is_empty() && !parallel {
         bail!("readyWhen can only be used when parallel is true");
     }
     let mut commands = Vec::new();
@@ -636,7 +588,9 @@ pub fn prepare(
                 bail!("package.json has no script {script:?}");
             }
             let manager = package_manager(workspace)?;
-            let args = interpolation.arguments()?;
+            // Nx joins the arguments as they are; qk quotes each, so that
+            // one with a space or a shell character stays one argument.
+            let args = interpolate::quoted_arguments(&task.args)?;
             let script = interpolate::quote(script)?;
             // Nx's `run` for each: npm and bun need `--` before arguments,
             // and yarn runs a script by name.
@@ -654,11 +608,12 @@ pub fn prepare(
             commands.push(command);
         }
         "nx:run-commands" => {
-            if options.contains_key("command") && options.contains_key("commands") {
-                bail!("specify command or commands, not both");
-            }
             let forward = boolean(options.get("forwardAllArgs"), true, "forwardAllArgs")?;
-            if let Some(command) = options.get("command") {
+            // As in Nx, `command` wins over `commands`.
+            if let Some(command) = options
+                .get("command")
+                .filter(|command| merge_truthy(command))
+            {
                 // Nx also takes an array, joined with spaces.
                 let command = match command {
                     Value::String(command) => command.clone(),
@@ -785,11 +740,20 @@ fn ready_check(
         return Ok(None);
     };
     let mut options = options.clone();
-    for (key, value) in interpolate::flags(&task.args) {
-        if key.contains('-') {
-            options.insert(interpolate::camel_case(&key), Value::String(value.clone()));
+    let project = &workspace.projects[&task.project];
+    for (key, value) in interpolate::yargs(&task.args, false, false) {
+        if key == "_" {
+            continue;
         }
-        options.insert(key, Value::String(value));
+        // As in Nx, an argument's tokens resolve for the task's project.
+        let value = match value {
+            Value::String(text) => Value::String(qk_config::interpolate_override(&text, project)?),
+            value => value,
+        };
+        if key.contains('-') {
+            options.insert(interpolate::camel_case(&key), value.clone());
+        }
+        options.insert(key, value);
     }
     let env: BTreeMap<String, String> = env
         .iter()
@@ -830,13 +794,13 @@ const OPTION_FLAGS: &[&str] = &[
 ];
 
 /// The target's options with the task's arguments that name a run-commands
-/// option applied, and the arguments left for the command. As in Nx,
-/// `--cwd=dir`, `--no-parallel` or `--env.NAME=value` set the option instead
-/// of reaching the command.
+/// option applied. As in Nx, `--cwd=dir`, `--no-parallel` or
+/// `--env.NAME=value` set the option rather than reaching the command.
 fn run_commands_overrides(
     options: &serde_json::Map<String, Value>,
     args: &[String],
-) -> (serde_json::Map<String, Value>, Vec<String>) {
+    project: &qk_config::Project,
+) -> Result<serde_json::Map<String, Value>> {
     const BOOLEAN: &[&str] = &[
         "color",
         "parallel",
@@ -847,12 +811,10 @@ fn run_commands_overrides(
         "tty",
     ];
     let mut options = options.clone();
-    let mut rest = Vec::new();
     let mut ready = Vec::new();
     let mut args = args.iter().peekable();
     while let Some(arg) = args.next() {
         let Some(flag) = arg.strip_prefix("--") else {
-            rest.push(arg.clone());
             continue;
         };
         let (key, value) = match flag.split_once('=') {
@@ -868,7 +830,6 @@ fn run_commands_overrides(
             None => (key, None),
         };
         if !OPTION_FLAGS.contains(&base) {
-            rest.push(arg.clone());
             continue;
         }
         let boolean = BOOLEAN.contains(&base);
@@ -883,7 +844,8 @@ fn run_commands_overrides(
         let value = if boolean {
             Value::Bool(value != "false")
         } else {
-            Value::String(value)
+            // As in Nx, an argument's tokens resolve for the task's project.
+            Value::String(qk_config::interpolate_override(&value, project)?)
         };
         match (base, field) {
             ("env", Some(name)) => {
@@ -910,7 +872,18 @@ fn run_commands_overrides(
         };
         options.insert("readyWhen".into(), ready);
     }
-    (options, rest)
+    Ok(options)
+}
+
+/// JavaScript truthiness, which decides what Nx reads as set.
+fn merge_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(flag) => *flag,
+        Value::Number(number) => number.as_f64().is_some_and(|number| number != 0.0),
+        Value::String(text) => !text.is_empty(),
+        Value::Array(_) | Value::Object(_) => true,
+    }
 }
 
 fn boolean(value: Option<&Value>, default: bool, name: &str) -> Result<bool> {
