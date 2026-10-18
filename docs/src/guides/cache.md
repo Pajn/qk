@@ -111,7 +111,9 @@ with the task's key in a recorded run; see
 ## Inputs
 
 Candidate input files are tracked and untracked-but-not-ignored files, minus
-planned tasks' declared outputs. Source filesets also select other tasks' declared
+planned tasks' declared outputs. Nx keys a tracked declared output like any
+other file; qk leaves it out, so that a task regenerating a tracked file does
+not change keys, its own included. Source filesets also select other tasks' declared
 outputs after dependencies complete, including newly generated files, while
 respecting source ignore rules and excluding the consumer's own outputs. These
 files are keyed independently of selective `dependentTasksOutputFiles` inputs.

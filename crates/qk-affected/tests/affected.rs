@@ -1081,9 +1081,10 @@ fn nested_projects_files_affect_only_their_own_tasks() {
     );
 }
 
-/// Changed output candidates remain inputs of consumers, never of their producer.
+/// As in Nx, a changed declared output counts like any changed file: for
+/// every task whose filesets select it, its producer included.
 #[test]
-fn changed_declared_outputs_only_affect_tasks_that_consume_them() {
+fn changed_declared_outputs_affect_every_task_selecting_them() {
     let repo = Repo::new(&[
         (
             "nx.json",
@@ -1102,10 +1103,10 @@ fn changed_declared_outputs_only_affect_tasks_that_consume_them() {
     ]);
     write(&repo.root, "apps/app/src/generated.txt", "after");
     let tasks = affected_tasks(&repo);
-    assert_eq!(tasks.keys().collect::<Vec<_>>(), ["app:test"]);
+    assert_eq!(tasks.keys().collect::<Vec<_>>(), ["app:build", "app:test"]);
     std::fs::remove_file(repo.root.join("apps/app/src/generated.txt")).unwrap();
     let tasks = affected_tasks(&repo);
-    assert_eq!(tasks.keys().collect::<Vec<_>>(), ["app:test"]);
+    assert_eq!(tasks.keys().collect::<Vec<_>>(), ["app:build", "app:test"]);
 }
 
 /// Ignore matching consistently prunes excluded parents and honors Nx negations.
@@ -1806,6 +1807,30 @@ fn narrow_task_repo(nx_json_extra: &str, extra: &[(&str, &str)]) -> Repo {
     Repo::new(&files)
 }
 
+/// As in Nx, a changed project configuration reaches the tasks reading that
+/// project's inputs, its dependents' through `^` inputs included, whether or
+/// not their filesets select the file.
+#[test]
+fn a_changed_project_configuration_affects_the_tasks_reading_that_project() {
+    use qk_affected::{TaskCause, TaskReason};
+    let repo = narrow_task_repo("", &[]);
+    write(
+        &repo.root,
+        "libs/lib/project.json",
+        r#"{"name": "lib", "tags": ["scope:shared"], "targets": {"build": {}, "test": {}}}"#,
+    );
+    let tasks = affected_tasks(&repo);
+    assert_eq!(
+        tasks.keys().collect::<Vec<_>>(),
+        ["app:build", "lib:build", "lib:test"]
+    );
+    assert!(matches!(
+        &tasks["app:build"],
+        TaskCause::Touched { reasons }
+            if matches!(&reasons[..], [TaskReason::ProjectConfiguration { file }] if file == "libs/lib/project.json")
+    ));
+}
+
 /// As in Nx, the root tsconfig's path mappings are not part of a task's
 /// key unless `selectivelyHashTsConfig` keys each project's own; any other
 /// change reaches every task.
@@ -1846,4 +1871,118 @@ fn root_tsconfig_paths_reach_tasks_only_when_hashed_selectively() {
         );
         assert_eq!(affected_tasks(&repo).len(), 4, "{extra}");
     }
+}
+
+/// Under Nx's default `projectsAffectedByDependencyUpdates: "all"`, a
+/// lockfile change reaches every task hashing installed packages: those not
+/// declaring `externalDependencies`. A list of projects reaches theirs.
+#[test]
+fn lockfile_changes_reach_the_tasks_hashing_installed_packages() {
+    use qk_affected::{TaskCause, TaskReason};
+    for (extra, expected) in [
+        ("", &["app:build", "lib:build"][..]),
+        (
+            r#", "pluginsConfig": {"@nx/js": {"projectsAffectedByDependencyUpdates": ["lib"]}}"#,
+            &["lib:build", "lib:test"],
+        ),
+        (
+            r#", "pluginsConfig": {"@nx/js": {"projectsAffectedByDependencyUpdates": "auto"}}"#,
+            &[],
+        ),
+    ] {
+        let repo = narrow_task_repo(extra, &[("pnpm-lock.yaml", &lockfile("19.0.0", "19.0.0"))]);
+        // Only the tool, which has no tasks here, installs something new.
+        write(&repo.root, "pnpm-lock.yaml", &lockfile("19.0.0", "19.1.0"));
+        let tasks = affected_tasks(&repo);
+        assert_eq!(
+            tasks.keys().map(String::as_str).collect::<Vec<_>>(),
+            expected,
+            "{extra}"
+        );
+        assert!(tasks.values().all(|cause| matches!(
+            cause,
+            TaskCause::Touched { reasons }
+                if matches!(&reasons[..], [TaskReason::DependencyUpdates { file, .. }] if file == "pnpm-lock.yaml")
+        )));
+    }
+}
+
+/// As in Nx, the root `package.json` moving an installed package reaches the
+/// tasks hashing it, and naming a workspace project reaches that project's.
+#[test]
+fn root_package_dependencies_reach_the_tasks_hashing_them() {
+    let manifest = |react: &str, lib: &str| {
+        format!(r#"{{"name": "root", "devDependencies": {{"react": "{react}", "lib": "{lib}"}}}}"#)
+    };
+    let repo = narrow_task_repo(
+        r#", "pluginsConfig": {"@nx/js": {"projectsAffectedByDependencyUpdates": "auto"}}"#,
+        &[
+            ("package.json", &manifest("^19.0.0", "1.0.0")),
+            ("pnpm-lock.yaml", &lockfile("19.0.0", "19.0.0")),
+        ],
+    );
+    write(&repo.root, "package.json", &manifest("^19.0.1", "1.0.0"));
+    assert_eq!(
+        affected_tasks(&repo)
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["app:build", "lib:build"]
+    );
+    write(&repo.root, "package.json", &manifest("^19.0.0", "1.0.1"));
+    assert_eq!(
+        affected_tasks(&repo)
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["lib:build", "lib:test"]
+    );
+}
+
+/// As in Nx, a JSON input named with `--files` counts as changed whole.
+#[test]
+fn named_json_inputs_count_as_changed_whole() {
+    let repo = Repo::new(&[
+        (
+            "nx.json",
+            r#"{"targetDefaults": {"build": {"command": "echo build", "inputs": [{"json": "{projectRoot}/meta.json", "fields": ["version"]}]}}}"#,
+        ),
+        (
+            "apps/app/project.json",
+            r#"{"name": "app", "targets": {"build": {}}}"#,
+        ),
+        ("apps/app/meta.json", r#"{"version": 1, "notes": "a"}"#),
+    ]);
+    write(
+        &repo.root,
+        "apps/app/meta.json",
+        r#"{"version": 1, "notes": "b"}"#,
+    );
+    let workspace = Workspace::load(&repo.root).unwrap();
+    let graph = qk_taskgraph::TaskGraph::build(
+        &workspace,
+        &[qk_taskgraph::Request::parse("app:build").unwrap()],
+    )
+    .unwrap();
+    let tasks = |options: Options| {
+        qk_affected::affected_tasks(&workspace, &graph, &options)
+            .unwrap()
+            .tasks
+            .into_keys()
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        tasks(Options {
+            uncommitted: true,
+            ..Options::default()
+        })
+        .is_empty()
+    );
+    assert_eq!(
+        tasks(Options {
+            files: vec!["apps/app/meta.json".into()],
+            ..Options::default()
+        }),
+        ["app:build"]
+    );
 }

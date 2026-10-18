@@ -1494,6 +1494,7 @@ struct Resolver<'a> {
     /// whether they came with `dependencies: true`: each is one group, whose
     /// negations filter all of its positives.
     ignored: BTreeMap<(String, bool), Vec<String>>,
+    external_declared: bool,
     /// Every project whose inputs were read, as Nx hashes each one's
     /// configuration.
     projects: BTreeSet<String>,
@@ -1524,6 +1525,7 @@ impl<'a> Resolver<'a> {
             expanded: BTreeSet::new(),
             external: BTreeSet::new(),
             ignored: BTreeMap::new(),
+            external_declared: false,
             projects: BTreeSet::new(),
             prepared,
             cancelled,
@@ -1839,6 +1841,7 @@ impl<'a> Resolver<'a> {
                     );
                 }
                 self.external.extend(names);
+                self.external_declared = true;
             }
             _ => bail!("unsupported task input declaration"),
         }
@@ -2226,12 +2229,17 @@ fn resolve_candidates(
             resolver.json_file(path, &fields)?;
         }
     }
+    // A changed file affected selection adds counts whatever produces it, as
+    // in Nx, where a declared output is a file like any other.
     for selection in resolver.scopes.values() {
         resolver.selected.extend(
             selection
                 .included
                 .difference(&selection.excluded)
-                .filter(|path| own_outputs.as_ref().is_none_or(|own| !own.matches(path)))
+                .filter(|path| {
+                    snapshot.extra_candidates.contains(*path)
+                        || own_outputs.as_ref().is_none_or(|own| !own.matches(path))
+                })
                 .cloned(),
         );
     }
@@ -2279,6 +2287,7 @@ fn resolve_candidates(
         values: resolver.values,
         json_fields: resolver.json_fields,
         external: resolver.external,
+        external_declared: resolver.external_declared,
         projects: resolver.projects,
         producers,
     };

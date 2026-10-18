@@ -38,6 +38,9 @@ pub struct Declared {
     pub json_fields: BTreeMap<String, JsonFields>,
     /// Packages named by `externalDependencies`.
     pub external: BTreeSet<String>,
+    /// Whether any `externalDependencies` input is declared, even an empty
+    /// one. Without one, Nx hashes every installed package into the task.
+    pub external_declared: bool,
     /// The projects whose configuration and root tsconfig paths Nx hashes
     /// into the task: its own, and each project whose inputs it reads, such
     /// as a dependency through `^production` or a project a continuous task

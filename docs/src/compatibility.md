@@ -29,12 +29,20 @@ edges off.
 
 - A pnpm lockfile change under `projectsAffectedByDependencyUpdates: "auto"`
   follows installed sets, avoiding projects whose installations are unchanged
-  and including transitive installation changes Nx can miss.
+  and including transitive installation changes Nx can miss. Task selection
+  judges such a change by the same installed sets.
 - `projectsAffectedByDependencyUpdates` as a list of selectors touches its
   projects only when a lockfile changed; Nx's project selection touches them on
   every change, which reads as a bug, since its task selection checks.
-- A change to the file nx.json `extends` affects every project, as a change to
-  nx.json does; Nx does not look at it.
+- A change to the file nx.json `extends` affects every project and task, as a
+  change to nx.json does; Nx does not look at it.
+- Task selection adds to what Nx selects every task whose qk key changed, by
+  the parts of the key Nx does not hash (see below). Nx selects some tasks
+  whose qk key is unchanged, such as for a changed tracked output or a
+  lockfile change under `"all"`; qk selects them too, and they are cache hits.
+- Cache keys leave every planned task's declared outputs out of source
+  filesets, unless a task reads them from a dependency. Nx hashes a tracked
+  output like any file, so a task regenerating one changes its own key.
 - The root tsconfig is keyed without the version of the installed
   `typescript` package Nx hashes beside it; qk keys what the task's importers
   install instead.

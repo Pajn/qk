@@ -109,22 +109,43 @@ ui is touched:
 
 ## Selecting affected tasks by inputs
 
-With `--granularity task`, `qk affected` selects tasks instead of projects: a
-task is affected when a changed file is one of its resolved inputs, when what
-its lockfile importers or `externalDependencies` install changed, when
-`pnpm-workspace.yaml` changed outside its resolution keys, when a dependency
-project's `package.json` changed in a field its key reads or its version moved
-into or out of the range the task's project declares for it, when a project
-manifest was deleted, or when it reads the declared outputs of an affected
+With `--granularity task`, `qk affected` selects tasks instead of projects. A
+task is affected when Nx 24 would select it, or when its cache key changed.
+As in Nx, that is when:
+
+- a changed file is one of its resolved inputs, a declared output included:
+  a tracked output is a file like any other;
+- a file projects are created from changed in a project whose inputs it
+  reads, its own or one its `^` and `projects` inputs reach, or such a file
+  was deleted, which affects every task;
+- the root tsconfig changed outside `compilerOptions.paths`, or, with
+  `selectivelyHashTsConfig`, in path mappings into a project whose inputs it
+  reads (see [What changes the key](cache.md#what-changes-the-key));
+- the root lockfile changed and `projectsAffectedByDependencyUpdates` is
+  `"all"`, Nx's default, and the task hashes installed packages: it declares
+  no `externalDependencies`, or names some. Under a list of selectors, the
+  tasks of the projects it names are affected;
+- the root `package.json` moved an installed package the task hashes, by
+  the rules above, or named the task's project as a dependency.
+
+Beyond those, qk's key also reads what its lockfile importers or
+`externalDependencies` install, `pnpm-workspace.yaml` outside its resolution
+keys, and each dependency project's `package.json` in the fields its key
+reads, so a task is affected when any of these changed, or a dependency's
+version moved into or out of the range the task's project declares for it.
+Under `"auto"`, these installed sets are what a lockfile change is judged by.
+
+A task is also affected when it reads the declared outputs of an affected
 task, through `dependentTasksOutputFiles` or a fileset that selects them. As
 in Nx, depending on a task without reading its outputs carries nothing, so
 a task ordered after a build but reading only sources is not affected by the
-build's changes. A file the
-task's inputs select counts by any change to it, as in its key. These are the
-same inputs its cache key reads, so an unaffected task would be a cache hit,
-except that env and runtime inputs count as unchanged, since the base
-revision's environment is unknowable. A test-only change then reaches the
-test tasks and not the builds whose `production` inputs exclude tests.
+build's changes. A file the task's inputs select counts by any change to it,
+as in its key. An unaffected task would therefore be a cache hit, except that
+env and runtime inputs count as unchanged, since the base revision's
+environment is unknowable. An affected one can still be a hit where Nx
+selects more than qk keys, such as for a changed declared output or a
+lockfile change under `"all"`. A test-only change then reaches the test tasks
+and not the builds whose `production` inputs exclude tests.
 A continuous task a task depends on, such as the dev server an e2e task runs
 against, counts its inputs as the task's own instead, and so do those of
 the continuous tasks it depends on in turn. A `dependsOn` entry with

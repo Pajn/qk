@@ -112,7 +112,9 @@ Under the profile, a task with settings that ordinary task selection affects
 is decided by its changed inputs:
 
 1. **A changed input that is not a source runs the whole task**, as do lockfile
-   installs, a deleted manifest and an affected task whose outputs it reads. A continuous task it depends on is not one of these:
+   installs, a lockfile or root `package.json` change Nx selects the task for,
+   a changed root tsconfig, a deleted manifest and an affected task whose
+   outputs it reads. A continuous task it depends on is not one of these:
    its inputs count as the task's own, so the profile decides them by imports
    like any other changed input. That holds whatever else touches the task, and for a
    dependency the profile keeps for any reason, such as an anchor importing a
@@ -120,8 +122,9 @@ is decided by its changed inputs:
    what make this sound: declare its harness, its workflow and anything else
    that changes how it runs as inputs, outside `sources`. A dependency's
    `package.json` whose fields dependents read are unchanged, such as one with
-   only a new `version` or `scripts`, is the exception: it does not count. A
-   new or moved dependency does.
+   only a new `version` or `scripts`, is the exception: it does not count,
+   though it changes a project configuration Nx reads. A new or moved
+   dependency does.
 2. **An anchor that imports a change runs the whole task.** fallout searches
    from each anchor through the imports, at file granularity, comparing each
    changed file with its base version. A change made only of TypeScript types
