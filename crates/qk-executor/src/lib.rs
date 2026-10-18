@@ -5,7 +5,9 @@ mod interpolate;
 mod process;
 #[cfg(unix)]
 mod pty;
+pub mod readiness;
 pub mod report;
+mod tokens;
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -14,7 +16,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use qk_config::Workspace;
 use qk_taskgraph::Task;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 pub use capture::{
     Capture, Decoration, Display, MAX_LOG_BYTES, OutputStyle, RecordedLog, Shown, read_capture,
@@ -253,6 +255,11 @@ pub struct PreparedTask {
     pub ready_when: Vec<String>,
     /// Set once all of `ready_when` has appeared.
     pub ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// A continuous target's own `readyWhen`, which tasks depending on it
+    /// with `waitFor: "ready"` wait for, or why it is invalid.
+    pub ready_check: Option<std::result::Result<readiness::ReadyCheck, String>>,
+    /// What `ready_check` concluded.
+    pub verdict: std::sync::Arc<readiness::Verdict>,
     /// The process ids of its commands while they run, from which the runner
     /// measures the memory the task uses.
     pub processes: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<u32>>>,
@@ -735,6 +742,7 @@ pub fn prepare(
     }
     // As in Nx, commands run side by side share qk's output through pipes.
     pseudo_terminal &= commands.len() == 1 || !parallel;
+    let ready_check = ready_check(workspace, task, options, &env)?;
     Ok(PreparedTask {
         id: task.id.clone(),
         commands,
@@ -746,6 +754,8 @@ pub fn prepare(
         execution,
         ready_when,
         ready: Default::default(),
+        ready_check,
+        verdict: Default::default(),
         processes: Default::default(),
         decorations,
         interactive: false,
@@ -755,6 +765,49 @@ pub fn prepare(
         recording: None,
         display: Display::default(),
     })
+}
+
+/// A continuous target's `readyWhen`, resolved against the options and the
+/// environment the task runs with, as Nx 24 resolves it. `null` turns off one
+/// a target default sets. A target that is not continuous has none.
+fn ready_check(
+    workspace: &Workspace,
+    task: &Task,
+    options: &Map<String, Value>,
+    env: &BTreeMap<OsString, OsString>,
+) -> Result<Option<std::result::Result<readiness::ReadyCheck, String>>> {
+    let Some(ready_when) = task
+        .definition
+        .extra
+        .get("readyWhen")
+        .filter(|value| !value.is_null() && task.definition.continuous == Some(true))
+    else {
+        return Ok(None);
+    };
+    let mut options = options.clone();
+    for (key, value) in interpolate::flags(&task.args) {
+        if key.contains('-') {
+            options.insert(interpolate::camel_case(&key), Value::String(value.clone()));
+        }
+        options.insert(key, Value::String(value));
+    }
+    let env: BTreeMap<String, String> = env
+        .iter()
+        .filter_map(|(name, value)| Some((name.to_str()?.to_owned(), value.to_str()?.to_owned())))
+        .collect();
+    let scope = readiness::Scope {
+        workspace_root: workspace
+            .root
+            .to_str()
+            .context("workspace path must be UTF-8")?,
+        project_root: &workspace.projects[&task.project].root,
+        project_name: &task.project,
+        options: &options,
+        env: &env,
+    };
+    Ok(readiness::resolve(&task.id, ready_when, &scope)
+        .map_err(|error| format!("{error:#}"))
+        .transpose())
 }
 
 /// The run-commands options Nx reads, which a task's arguments may set too.

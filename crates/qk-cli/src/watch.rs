@@ -416,6 +416,8 @@ fn callbacks(
                 parallel: false,
                 ready_when: Vec::new(),
                 ready: Default::default(),
+                ready_check: None,
+                verdict: Default::default(),
                 processes: Default::default(),
                 decorations: Vec::new(),
                 interactive: false,
