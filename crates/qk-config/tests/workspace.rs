@@ -30,7 +30,8 @@ fn example_discovers_nested_projects_and_merges_script_targets() {
         Some("nx:run-commands")
     );
     assert_eq!(web.targets["build"].cache, Some(true));
-    assert_eq!(web.targets["build"].options["cwd"], "{projectRoot}");
+    // Tokens in options resolve as the workspace loads.
+    assert_eq!(web.targets["build"].options["cwd"], "apps/web");
     assert!(!web.targets["build"].options.contains_key("script"));
     assert_eq!(
         web.targets["test"].executor.as_deref(),
@@ -353,15 +354,16 @@ fn skips_target_defaults_incompatible_with_the_target() {
     );
     let workspace = Workspace::load(temp.path()).unwrap();
     let targets = &workspace.projects["app"].targets;
-    // A run-commands default does not apply to a package script. Defaults for
-    // the same executor apply even with a different command or script, and a
-    // default without an executor applies to anything.
+    // A run-commands default does not apply to a package script, nor a
+    // run-script default naming another script. A command default applies
+    // beneath another command, which replaces its own, and a default without
+    // an executor applies to anything.
     assert_eq!(targets["test"].executor.as_deref(), Some("nx:run-script"));
     assert_eq!(targets["test"].cache, None);
     assert_eq!(targets["lint"].options["command"], "eslint");
     assert_eq!(targets["lint"].cache, Some(true));
     assert_eq!(targets["build"].options["script"], "build");
-    assert_eq!(targets["build"].cache, Some(true));
+    assert_eq!(targets["build"].cache, None);
     assert_eq!(targets["e2e"].cache, Some(true));
 }
 
@@ -410,7 +412,7 @@ fn local_overrides_merge_over_the_checked_in_project() {
     let build = &app.targets["build"];
     assert_eq!(build.options["command"], "vite build");
     assert_eq!(build.options["mode"], "development");
-    assert_eq!(build.options["cwd"], "{projectRoot}");
+    assert_eq!(build.options["cwd"], "apps/app");
     // Target defaults still apply beneath both files.
     assert_eq!(build.cache, Some(true));
     assert!(app.targets.contains_key("test"));
@@ -470,7 +472,7 @@ fn a_local_workspace_file_merges_over_nx_json() {
     let app = &workspace.projects["app"];
     assert_eq!(app.targets["build"].cache, Some(true));
     assert_eq!(app.targets["build"].options["mode"], "development");
-    assert_eq!(app.targets["build"].options["cwd"], "{projectRoot}");
+    assert_eq!(app.targets["build"].options["cwd"], ".");
     assert_eq!(app.targets["lint"].cache, Some(false));
     assert_eq!(workspace.local_overrides, ["nx.local.json"]);
 }
@@ -728,5 +730,363 @@ fn nx_json_extends_a_linked_package_by_its_real_path() {
     assert_eq!(
         workspace.extended.as_deref(),
         Some("node_modules/.pnpm/linked@1.0.0/node_modules/linked/preset.json")
+    );
+}
+
+fn load(files: &[(&str, serde_json::Value)]) -> anyhow::Result<Workspace> {
+    let temp = TempDir::new().unwrap();
+    for (path, value) in files {
+        write(temp.path(), path, &value.to_string());
+    }
+    Workspace::load(temp.path())
+}
+
+#[test]
+fn spreads_merge_project_targets_over_package_targets_and_defaults() {
+    let workspace = load(&[
+        (
+            "nx.json",
+            json!({"targetDefaults": {"build": {
+                "inputs": ["default"], "dependsOn": ["^build"], "cache": true,
+                "options": {"env": {"FROM": "defaults", "SHARED": "defaults"}}
+            }}}),
+        ),
+        (
+            "package.json",
+            json!({"name": "app", "scripts": {"build": "tsc"}, "nx": {"targets": {"build": {
+                "inputs": ["...", "{projectRoot}/package.json"],
+                "configurations": {"prod": {"minify": true}, "dev": {}}
+            }}}}),
+        ),
+        (
+            "project.json",
+            json!({"name": "app", "targets": {"build": {
+                "cache": false, "...": true, "parallelism": false,
+                "inputs": ["mine", "..."],
+                "dependsOn": ["...", "lint"],
+                "options": {"env": {"SHARED": "project", "...": true, "OWN": "project"}},
+                "configurations": {"dev": {"x": 1}, "...": true, "prod": {"...": true, "sourceMap": false}}
+            }}}),
+        ),
+    ])
+    .unwrap();
+    let build = &workspace.projects["app"].targets["build"];
+    assert_eq!(build.executor.as_deref(), Some("nx:run-script"));
+    assert_eq!(
+        build.inputs,
+        Some(vec![
+            json!("mine"),
+            json!("default"),
+            json!("{projectRoot}/package.json")
+        ])
+    );
+    assert_eq!(build.depends_on, Some(vec![json!("^build"), json!("lint")]));
+    // Written before the spread, `cache` yields to the defaults'.
+    assert_eq!(build.cache, Some(true));
+    assert_eq!(build.parallelism, Some(false));
+    assert_eq!(
+        build.options["env"],
+        json!({"SHARED": "defaults", "FROM": "defaults", "OWN": "project"})
+    );
+    assert_eq!(
+        serde_json::to_value(&build.configurations).unwrap(),
+        // `dev` is written before the spread, so the base's wins whole.
+        json!({"prod": {"minify": true, "sourceMap": false}, "dev": {}})
+    );
+}
+
+#[test]
+fn spreads_with_nothing_beneath_expand_to_nothing() {
+    let workspace = load(&[(
+        "project.json",
+        json!({"name": "app", "targets": {"build": {
+            "command": "tsc", "...": true, "outputs": ["...", "dist"],
+            "options": {"...": true, "cwd": "src"}
+        }}}),
+    )])
+    .unwrap();
+    let build = &workspace.projects["app"].targets["build"];
+    assert_eq!(build.outputs, Some(vec!["dist".to_owned()]));
+    assert_eq!(build.options["cwd"], "src");
+    assert!(!build.options.contains_key("..."));
+    assert!(!build.extra.contains_key("..."));
+}
+
+#[test]
+fn integer_like_keys_beside_a_spread_are_an_error() {
+    let error = format!(
+        "{:#}",
+        load(&[(
+            "project.json",
+            json!({"name": "app", "targets": {"build": {
+                "command": "tsc", "options": {"env": {"...": true, "1": "x"}}
+            }}}),
+        )])
+        .unwrap_err()
+    );
+    assert!(error.contains("integer-like key (\"1\")"), "{error}");
+}
+
+#[test]
+fn a_target_running_differently_drops_everything_beneath() {
+    let workspace = load(&[
+        (
+            "package.json",
+            json!({"name": "app", "nx": {"targets": {
+                "build": {"command": "tsc", "cache": true, "dependsOn": ["^build"],
+                          "options": {"cwd": "src"}, "configurations": {"prod": {}}},
+                "lint": {"command": "eslint", "cache": true}
+            }}}),
+        ),
+        (
+            "project.json",
+            json!({"name": "app", "targets": {
+                "build": {"command": "vite build"},
+                "lint": {"command": "eslint", "outputs": []}
+            }}),
+        ),
+    ])
+    .unwrap();
+    let targets = &workspace.projects["app"].targets;
+    let build = &targets["build"];
+    assert_eq!(build.options["command"], "vite build");
+    assert_eq!(
+        (
+            build.cache,
+            &build.depends_on,
+            build.options.get("cwd"),
+            build.configurations.len()
+        ),
+        (None, &None, None, 0)
+    );
+    // The same command merges.
+    assert_eq!(targets["lint"].cache, Some(true));
+    assert_eq!(targets["lint"].outputs, Some(vec![]));
+}
+
+#[test]
+fn package_targets_saying_how_they_run_replace_the_script() {
+    let workspace = load(&[(
+        "package.json",
+        json!({"name": "app", "scripts": {"build": "tsc", "test": "vitest", "lint": "eslint"},
+        "nx": {"targets": {
+            "build": {"command": "vite build", "metadata": {"own": true}},
+            "test": {"cache": true},
+            "lint": {"executor": "nx:run-script", "options": {"script": "lint"}, "cache": true}
+        }}}),
+    )])
+    .unwrap();
+    let targets = &workspace.projects["app"].targets;
+    assert_eq!(targets["build"].options["command"], "vite build");
+    assert!(!targets["build"].options.contains_key("script"));
+    assert_eq!(targets["test"].options["script"], "test");
+    assert_eq!(targets["test"].cache, Some(true));
+    assert_eq!(targets["lint"].cache, Some(true));
+}
+
+#[test]
+fn a_project_json_target_running_differently_removes_the_script() {
+    // The script's target is gone rather than replaced, so package.json's
+    // own fields for the target stay beneath project.json's command.
+    let workspace = load(&[
+        (
+            "package.json",
+            json!({"name": "app", "scripts": {"build": "tsc", "check": "tsc --noEmit"},
+                   "nx": {"targets": {"build": {"dependsOn": ["^build"]}}}}),
+        ),
+        (
+            "project.json",
+            json!({"name": "app", "targets": {
+                "build": {"command": "vite build"},
+                "check": {"executor": "nx:run-script", "options": {"script": "check"}, "cache": true}
+            }}),
+        ),
+    ])
+    .unwrap();
+    let targets = &workspace.projects["app"].targets;
+    assert_eq!(targets["build"].options["command"], "vite build");
+    assert_eq!(targets["build"].depends_on, Some(vec![json!("^build")]));
+    assert_eq!(targets["check"].cache, Some(true));
+}
+
+#[test]
+fn target_defaults_stay_beneath_a_target_the_files_replace() {
+    // `includedScripts` keeps the script target, which project.json's
+    // command replaces; Nx drops the target default with it, qk does not.
+    let workspace = load(&[
+        (
+            "nx.json",
+            json!({"targetDefaults": {"build": {"cache": true}}}),
+        ),
+        (
+            "package.json",
+            json!({"name": "app", "scripts": {"build": "tsc"}, "nx": {"includedScripts": ["build"]}}),
+        ),
+        (
+            "project.json",
+            json!({"name": "app", "targets": {"build": {"command": "vite build"}}}),
+        ),
+    ])
+    .unwrap();
+    let build = &workspace.projects["app"].targets["build"];
+    assert_eq!(build.options["command"], "vite build");
+    assert_eq!(build.cache, Some(true));
+}
+
+#[test]
+fn glob_target_keys_merge_onto_every_matching_target() {
+    let workspace = load(&[
+        (
+            "package.json",
+            json!({"name": "app", "scripts": {"e2e-ci--a": "x", "e2e-ci--b": "y", "lint": "z"}}),
+        ),
+        (
+            "project.json",
+            json!({"name": "app", "targets": {
+                "e2e-ci--*": {"dependsOn": ["build"], "cache": true},
+                "nothing-*": {"command": "echo"}
+            }}),
+        ),
+    ])
+    .unwrap();
+    let targets = &workspace.projects["app"].targets;
+    for name in ["e2e-ci--a", "e2e-ci--b"] {
+        assert_eq!(targets[name].cache, Some(true), "{name}");
+        assert_eq!(targets[name].depends_on, Some(vec![json!("build")]));
+    }
+    assert_eq!(targets["lint"].cache, None);
+    assert!(!targets.contains_key("e2e-ci--*"));
+    // A key matching nothing is a target of its own.
+    assert!(targets.contains_key("nothing-*"));
+}
+
+#[test]
+fn targets_that_run_nothing_are_no_ops_or_left_out() {
+    let workspace = load(&[(
+        "project.json",
+        json!({"name": "app", "targets": {
+            "all": {"dependsOn": ["build"]},
+            "empty": {"cache": true},
+            "none": {"dependsOn": []},
+            "build": {"command": "tsc"}
+        }}),
+    )])
+    .unwrap();
+    let targets = &workspace.projects["app"].targets;
+    assert_eq!(targets["all"].executor.as_deref(), Some("nx:noop"));
+    assert!(!targets.contains_key("empty"));
+    assert!(!targets.contains_key("none"));
+}
+
+#[test]
+fn invalid_target_combinations_are_errors() {
+    for (target, expected) in [
+        (
+            json!({"executor": "nx:run-commands", "command": "tsc"}),
+            "should not have executor and command both configured",
+        ),
+        (
+            json!({"command": "vite", "cache": true, "continuous": true}),
+            "has both \"cache\" and \"continuous\" set to true",
+        ),
+    ] {
+        let error = format!(
+            "{:#}",
+            load(&[(
+                "project.json",
+                json!({"name": "app", "targets": {"serve": target}})
+            )])
+            .unwrap_err()
+        );
+        assert!(error.contains(expected), "{error}");
+    }
+}
+
+#[test]
+fn tokens_resolve_in_every_option_as_the_workspace_loads() {
+    let workspace = load(&[
+        ("nx.json", json!({})),
+        (
+            "libs/ui/project.json",
+            json!({"name": "ui", "targets": {"build": {
+                "executor": "nx:run-script",
+                "options": {
+                    "script": "build-{projectName}",
+                    "cwd": "{workspaceRoot}/{projectRoot}",
+                    "root": "{workspaceRoot}",
+                    "nested": {"list": ["{projectRoot}/a", {"deep": "{workspaceRoot}/b"}]}
+                },
+                "configurations": {"prod": {"out": "{workspaceRoot}/dist/{projectName}"}},
+                "outputs": ["{workspaceRoot}/dist/{projectRoot}"]
+            }}}),
+        ),
+    ])
+    .unwrap();
+    let build = &workspace.projects["ui"].targets["build"];
+    assert_eq!(
+        serde_json::Value::Object(build.options.clone()),
+        json!({
+            "script": "build-ui", "cwd": "libs/ui", "root": "",
+            "nested": {"list": ["libs/ui/a", {"deep": "b"}]}
+        })
+    );
+    assert_eq!(build.configurations["prod"]["out"], "dist/ui");
+    // Outputs keep their tokens until a task resolves them.
+    assert_eq!(
+        build.outputs,
+        Some(vec!["{workspaceRoot}/dist/{projectRoot}".to_owned()])
+    );
+    let error = format!(
+        "{:#}",
+        load(&[(
+            "project.json",
+            json!({"name": "app", "targets": {"build": {
+                "command": "tsc", "options": {"env": {"A": "x/{workspaceRoot}"}}
+            }}}),
+        )])
+        .unwrap_err()
+    );
+    assert!(
+        error.contains("{workspaceRoot} token is only valid at the beginning of an option"),
+        "{error}"
+    );
+}
+
+#[test]
+fn metadata_and_generators_merge_across_files() {
+    let workspace = load(&[
+        (
+            "package.json",
+            json!({"name": "app", "nx": {
+                "metadata": {"technologies": ["node"], "owner": "a"},
+                "generators": {"@nx/js:lib": {"bundler": "tsc", "unitTestRunner": "jest"}},
+                "targets": {"build": {"command": "tsc", "metadata": {"technologies": ["tsc"], "help": {"a": 1}}}}
+            }}),
+        ),
+        (
+            "project.json",
+            json!({"name": "app",
+                "metadata": {"technologies": ["react"]},
+                "generators": {"@nx/js:lib": {"bundler": "vite"}, "@nx/react:component": {"style": "css"}},
+                "targets": {"build": {"metadata": {"technologies": ["vite"], "help": {"b": 2}}}}
+            }),
+        ),
+    ])
+    .unwrap();
+    let app = &workspace.projects["app"];
+    assert_eq!(
+        app.extra["metadata"],
+        json!({"technologies": ["node", "react"], "owner": "a"})
+    );
+    assert_eq!(
+        app.extra["generators"],
+        json!({
+            "@nx/js:lib": {"bundler": "vite", "unitTestRunner": "jest"},
+            "@nx/react:component": {"style": "css"}
+        })
+    );
+    assert_eq!(
+        app.targets["build"].extra["metadata"],
+        json!({"technologies": ["tsc", "vite"], "help": {"a": 1, "b": 2}})
     );
 }

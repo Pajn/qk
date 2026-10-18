@@ -29,7 +29,7 @@ impl Repo {
             (
                 "apps/app/project.json",
                 r#"{"name": "app", "implicitDependencies": ["lib"],
-                    "targets": {"tsc": {"inputs": ["default", "shared"]}}}"#,
+                    "targets": {"tsc": {"executor": "nx:noop", "inputs": ["default", "shared"]}}}"#,
             ),
             ("apps/app/src/main.ts", "app"),
             ("libs/lib/project.json", r#"{"name": "lib"}"#),
@@ -253,7 +253,7 @@ fn an_input_naming_pnpm_workspace_touches_its_project_on_any_change() {
         ("pnpm-workspace.yaml", workspace_file),
         (
             "libs/lib/project.json",
-            r#"{"name": "lib", "targets": {"lint": {"inputs": ["{workspaceRoot}/pnpm-workspace.yaml"]}}}"#,
+            r#"{"name": "lib", "targets": {"lint": {"executor": "nx:noop", "inputs": ["{workspaceRoot}/pnpm-workspace.yaml"]}}}"#,
         ),
     ]);
     write(

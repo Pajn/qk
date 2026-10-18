@@ -11,6 +11,14 @@ fn workspace(projects: Value) -> (TempDir, Workspace) {
         std::fs::create_dir(&directory).unwrap();
         let mut project = project.clone();
         project["name"] = json!(name);
+        // A target that runs nothing is left out, so each runs nx:noop.
+        if let Some(Value::Object(targets)) = project.get_mut("targets") {
+            for target in targets.values_mut() {
+                if target.get("executor").is_none() && target.get("command").is_none() {
+                    target["executor"] = json!("nx:noop");
+                }
+            }
+        }
         std::fs::write(directory.join("project.json"), project.to_string()).unwrap();
     }
     let loaded = Workspace::load(temp.path()).unwrap();

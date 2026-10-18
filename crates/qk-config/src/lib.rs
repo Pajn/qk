@@ -2,6 +2,7 @@
 
 mod discovery;
 mod extends;
+mod merge;
 mod normalize;
 
 use std::collections::BTreeMap;
