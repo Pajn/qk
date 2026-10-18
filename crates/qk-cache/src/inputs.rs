@@ -27,6 +27,9 @@ pub struct Resolved {
 pub struct Declared {
     /// Workspace-relative files whose content is part of the key.
     pub files: BTreeSet<String>,
+    /// The files among them an `includeIgnored` fileset read from disk, keyed
+    /// by the content they point to, wherever that is, as Nx keys them.
+    pub ignored: BTreeSet<String>,
     /// Env, runtime and other named values; env and runtime are evaluated only
     /// with a prepared task.
     pub values: BTreeMap<String, Value>,
@@ -560,7 +563,17 @@ mod tests {
     /// The files `app:build` declares with `inputs`, in a workspace where
     /// `app` depends on `lib` and both hold a few files.
     fn declared(inputs: Value) -> Result<BTreeSet<String>> {
+        declared_with(inputs, &[])
+    }
+
+    fn declared_with(inputs: Value, extra: &[&str]) -> Result<BTreeSet<String>> {
         let root = tempfile::tempdir().unwrap();
+        for file in extra {
+            let path = root.path().join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+        std::fs::write(root.path().join(".gitignore"), "dist/\n").unwrap();
         std::fs::write(root.path().join("nx.json"), "{}").unwrap();
         for (path, text) in [
             (
@@ -697,6 +710,47 @@ mod tests {
                 ("json:app/config/two.json".to_owned(), json!({"a": 3})),
                 ("json:shared/deep/s.json".to_owned(), json!({"s": true})),
             ])
+        );
+    }
+
+    #[test]
+    fn include_ignored_groups_filter_their_own_positives() {
+        let dist = [
+            "lib/dist/index.js",
+            "lib/dist/index.js.map",
+            "app/dist/main.js",
+        ];
+        let dependencies = |fileset: &str| json!({"fileset": fileset, "includeIgnored": true, "dependencies": true});
+        assert_eq!(
+            declared_with(
+                json!([
+                    dependencies("{projectRoot}/dist/**"),
+                    dependencies("!{projectRoot}/dist/**/*.map"),
+                    {"fileset": "{projectRoot}/dist", "includeIgnored": true},
+                ]),
+                &dist
+            )
+            .unwrap(),
+            files(&["app/dist/main.js", "lib/dist/index.js"])
+        );
+        // A negation filters only the group it is resolved with.
+        let error = declared_with(
+            json!([
+                dependencies("{projectRoot}/dist/**"),
+                {"fileset": "!{projectRoot}/dist/**/*.map", "includeIgnored": true},
+            ]),
+            &dist,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("no positive includeIgnored fileset"),
+            "{error:#}"
+        );
+        // Without the flag, the ignored directory selects nothing.
+        assert!(
+            declared_with(json!(["{projectRoot}/dist/**"]), &dist)
+                .unwrap()
+                .is_empty()
         );
     }
 

@@ -1415,3 +1415,93 @@ fn a_task_is_affected_through_a_dependency_only_when_it_reads_its_outputs() {
         }
     }
 }
+
+/// As in Nx, an `includeIgnored` fileset matches a changed path whether
+/// ignore rules leave it out or not, and whether or not it is still there.
+#[test]
+fn include_ignored_filesets_match_ignored_changes() {
+    let repo = Repo::new(&[
+        (
+            "nx.json",
+            r#"{"targetDefaults": {"build": {"command": "echo build", "inputs": [{"fileset": "{projectRoot}/generated/**/*", "includeIgnored": true}, {"fileset": "!{projectRoot}/generated/**/*.local.json", "includeIgnored": true}]},
+                                   "test": {"command": "echo test", "inputs": ["{projectRoot}/**/*"]}}}"#,
+        ),
+        (".nxignore", "apps/app/generated/\n"),
+        (
+            "apps/app/project.json",
+            r#"{"name": "app", "targets": {"build": {}, "test": {}}}"#,
+        ),
+        ("apps/app/generated/schema.json", "before"),
+        ("apps/app/generated/dev.local.json", "before"),
+        (
+            "libs/lib/project.json",
+            r#"{"name": "lib", "targets": {"build": {}, "test": {}}}"#,
+        ),
+    ]);
+    write(&repo.root, "apps/app/generated/dev.local.json", "after");
+    assert!(affected_tasks_of(&repo, &["app:build", "app:test"]).is_empty());
+    write(&repo.root, "apps/app/generated/schema.json", "after");
+    assert_eq!(
+        affected_tasks_of(&repo, &["app:build", "app:test"])
+            .keys()
+            .collect::<Vec<_>>(),
+        ["app:build"]
+    );
+    // A path named explicitly counts even when it is gone.
+    use qk_taskgraph::{Request, TaskGraph};
+    let workspace = Workspace::load(&repo.root).unwrap();
+    let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
+    let tasks = qk_affected::affected_tasks(
+        &workspace,
+        &graph,
+        &Options {
+            files: vec!["apps/app/generated/removed.json".into()],
+            explicit_files: true,
+            ..Options::default()
+        },
+    )
+    .unwrap()
+    .tasks;
+    assert_eq!(tasks.keys().collect::<Vec<_>>(), ["app:build"]);
+}
+
+/// As in Nx, an `includeIgnored` fileset reading a dependency's declared
+/// outputs carries a change of that dependency to the task.
+#[test]
+fn include_ignored_filesets_read_their_producers_outputs() {
+    let repo = |extension: &str| {
+        Repo::new(&[
+            (
+                "nx.json",
+                r#"{"targetDefaults": {"build": {"command": "echo build", "inputs": ["{projectRoot}/src/**/*"], "outputs": ["{workspaceRoot}/dist/{projectRoot}/**/*.js"]}}}"#,
+            ),
+            (
+                "apps/app/project.json",
+                &format!(
+                    r#"{{"name": "app", "implicitDependencies": ["lib"], "targets": {{"build": {{"dependsOn": ["^build"],
+                        "inputs": [{{"fileset": "{{workspaceRoot}}/dist/libs/lib/**/*.{extension}", "includeIgnored": true}}]}}}}}}"#
+                ),
+            ),
+            (
+                "libs/lib/project.json",
+                r#"{"name": "lib", "targets": {"build": {}}}"#,
+            ),
+        ])
+    };
+    let reading = repo("js");
+    write(&reading.root, "libs/lib/src/index.ts", "changed");
+    let tasks = affected_tasks_of(&reading, &["app:build"]);
+    assert_eq!(tasks.keys().collect::<Vec<_>>(), ["app:build", "lib:build"]);
+    assert!(
+        matches!(&tasks["app:build"], qk_affected::TaskCause::Reads { task } if task == "lib:build")
+    );
+    // Files with another extension than any output's are none of them.
+    let other = repo("css");
+    write(&other.root, "libs/lib/src/index.ts", "changed");
+    assert_eq!(
+        affected_tasks_of(&other, &["app:build"])
+            .keys()
+            .collect::<Vec<_>>(),
+        ["lib:build"]
+    );
+}

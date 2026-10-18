@@ -1139,6 +1139,34 @@ fn external_dependency_inputs_track_packages_any_importer_installs() {
 }
 
 #[test]
+fn include_ignored_filesets_key_ignored_files_on_disk() {
+    let fixture = Fixture::new(target(
+        "build",
+        json!({"inputs": [
+            "{projectRoot}/src/**/*",
+            {"fileset": "{projectRoot}/generated/**/*", "includeIgnored": true},
+            {"fileset": "!{projectRoot}/generated/**/*.local.json", "includeIgnored": true},
+            {"fileset": "{workspaceRoot}/schema.json", "includeIgnored": true}
+        ]}),
+    ));
+    fs::write(fixture.root.join(".gitignore"), "generated/\nschema.json\n").unwrap();
+    fs::create_dir_all(fixture.root.join("generated")).unwrap();
+    fs::write(fixture.root.join("generated/client.ts"), "one").unwrap();
+    fs::write(fixture.root.join("generated/dev.local.json"), "one").unwrap();
+    assert!(!hit(&fixture, &fixture.root));
+    assert!(hit(&fixture, &fixture.root));
+    fs::write(fixture.root.join("generated/client.ts"), "two").unwrap();
+    assert!(!hit(&fixture, &fixture.root));
+    // A negation filters every includeIgnored fileset of the project.
+    fs::write(fixture.root.join("generated/dev.local.json"), "two").unwrap();
+    assert!(hit(&fixture, &fixture.root));
+    // A path that names a missing file changes the key when it appears.
+    fs::write(fixture.root.join("schema.json"), "{}").unwrap();
+    assert!(!hit(&fixture, &fixture.root));
+    assert!(hit(&fixture, &fixture.root));
+}
+
+#[test]
 fn external_dependency_inputs_name_installed_packages() {
     let fixture = Fixture::new(target(
         "build",

@@ -23,7 +23,9 @@ Unless overridden by a named input, `default` means `{projectRoot}/**/*`.
 
 Supported declarations:
 
-- filesets, as strings or `{"fileset": "…"}`, with `!` exclusions;
+- filesets, as strings or `{"fileset": "…"}`, with `!` exclusions, and
+  `{"fileset": "…", "includeIgnored": true}`, which reads files on disk that
+  ignore rules leave out;
 - named inputs, also as `{"input": "name"}`;
 - `^name` and `{"input": "name", "dependencies": true}` (or `"projects":
   "dependencies"`), which as in Nx cover every project the project depends
@@ -92,6 +94,46 @@ while Nx 23.1.0's affected-project matcher treats that group as literal text.
 Nx's native cache hasher does expand the group. Use `**/*.{svg,png}` for
 consistent hashing and affected selection in both tools.
 
+
+### `includeIgnored`
+
+A fileset only sees files that `.gitignore` and `.nxignore` do not exclude.
+With `"includeIgnored": true` it reads the disk instead, whether Git tracks a
+file or not, as in Nx 24:
+
+```jsonc
+{
+  "inputs": [
+    { "fileset": "{projectRoot}/generated/**/*.json", "includeIgnored": true },
+    { "fileset": "!{projectRoot}/generated/**/*.local.json", "includeIgnored": true },
+    { "fileset": "{workspaceRoot}/openapi.generated.json", "includeIgnored": true }
+  ]
+}
+```
+
+Each glob starts from `{projectRoot}` or `{workspaceRoot}`; one that climbs
+out with `..`, has a `.` segment or names an absolute path is an error. A
+glob is read from its leading directory: with no pattern after it, it names
+that file, or that directory and everything under it, and a path that names
+a missing file changes the key when the file appears. A glob read from
+inside a project matches only that project's files, not those of a project
+nested below it, and one read from outside every project matches all it
+names. A walk does not enter `node_modules`, `.git`, `.nx/cache`,
+`.nx/workspace-data`, `.yarn/cache` or `.qk` unless it starts inside one,
+skips the timestamp files Vite and Vitest write beside their config, and
+does not enter a linked directory it meets. A linked file, or a directory
+named exactly, is read wherever it points.
+
+A `!` negation with `includeIgnored` filters every `includeIgnored` glob
+resolved with it: the project's own, or, with `"dependencies": true`, the
+globs carrying that flag, applied together to each project the project
+depends on, directly or not. A negation with nothing to filter is an error.
+
+Such a fileset reading another task's declared outputs makes that task's
+changes carry to this one in affected selection, as `dependentTasksOutputFiles`
+does. Affected selection matches a changed path against the globs, so a
+deleted file counts. Unlike Nx, the task's own declared outputs stay out of
+these inputs, as they do for every fileset.
 
 ### `env` and `runtime`
 

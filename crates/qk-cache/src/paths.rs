@@ -378,6 +378,11 @@ impl Outputs {
         self.explicit && !self.patterns.is_empty()
     }
 
+    /// The patterns as written, without the negated ones.
+    pub(crate) fn globs(&self) -> &[String] {
+        &self.globs
+    }
+
     /// Fixed directory prefixes; every matching path lies below one of them.
     pub fn anchors(&self) -> impl Iterator<Item = &str> {
         self.anchors.iter().map(String::as_str)

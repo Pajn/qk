@@ -3,6 +3,7 @@
 mod evict;
 mod glob;
 mod hash;
+mod ignored;
 mod inputs;
 mod paths;
 pub mod profile;

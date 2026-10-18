@@ -122,7 +122,9 @@ Every input declaration of Nx 24 is supported, `always` read as absent:
 
 - filesets, as strings or `{"fileset": "…"}`, with `!` exclusions; a path
   with no glob pattern names a file or a whole directory, and `\` escapes a
-  glob character;
+  glob character. With `"includeIgnored": true` a fileset reads the disk,
+  gitignored files included, and a file it reads is keyed by the content it
+  points to, wherever that is;
 - named inputs, also as `{"input": "name"}`;
 - `^name` and `{"input": "name", "dependencies": true}` (or `"projects":
   "dependencies"`), which as in Nx cover every project the project depends

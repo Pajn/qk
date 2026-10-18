@@ -61,6 +61,9 @@ When a name occurs in multiple sections, precedence is `dependencies`,
 - A `json` input naming one file reads it even when source ignore rules
   exclude it; Nx reads only the files a fileset could select, so qk can key
   a file Nx leaves out.
+- An `includeIgnored` fileset leaves out the task's own declared outputs, as
+  every qk fileset does, so a task that writes into what it reads can still
+  be cached. Nx keys them.
 - For affected-project selection, bare parenthesized extension groups such
   as `**/*.(svg|png)` select projects in qk that Nx 23.1.0 does not.
   See [Inputs and outputs](reference/inputs-outputs.md) for compatible syntax.

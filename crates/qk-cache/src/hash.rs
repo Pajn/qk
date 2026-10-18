@@ -17,6 +17,7 @@ use qk_taskgraph::{Task, TaskGraph};
 use serde_json::{Value, json};
 
 use crate::glob::is_literal;
+use crate::ignored::Group;
 use crate::inputs::{
     Declared, Inferred, JsonFields, Resolved, manifest_for_dependents, workspace_without_resolution,
 };
@@ -1083,6 +1084,22 @@ impl Snapshot {
         });
     }
 
+    /// A file an `includeIgnored` fileset read, by the content it points to
+    /// wherever that is, as Nx reads it; `None` when it is gone.
+    fn ignored_value(&self, root: &Path, path: &str) -> Result<Option<Value>> {
+        let absolute = root.join(path);
+        let metadata = match std::fs::metadata(&absolute) {
+            Ok(metadata) if metadata.is_file() => metadata,
+            Ok(_) => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let mode = crate::store::mode(&metadata) & 0o111 != 0;
+        Ok(Some(
+            json!({"content":self.digest(path, &absolute, &metadata)?, "mode":mode}),
+        ))
+    }
+
     fn file_value(&self, root: &Path, path: &str) -> Result<Value> {
         self.file_value_with_links(root, path, &mut BTreeSet::new())
     }
@@ -1455,6 +1472,10 @@ struct Resolver<'a> {
     /// Dependency named inputs already expanded for `^` inputs.
     expanded: BTreeSet<(String, String)>,
     external: BTreeSet<String>,
+    /// `includeIgnored` globs, resolved, by the project that reads them and
+    /// whether they came with `dependencies: true`: each is one group, whose
+    /// negations filter all of its positives.
+    ignored: BTreeMap<(String, bool), Vec<String>>,
     /// `None` resolves which inputs a task has without evaluating env or
     /// runtime inputs.
     prepared: Option<&'a PreparedTask>,
@@ -1480,6 +1501,7 @@ impl<'a> Resolver<'a> {
             named_stack: Vec::new(),
             expanded: BTreeSet::new(),
             external: BTreeSet::new(),
+            ignored: BTreeMap::new(),
             prepared,
             cancelled,
         }
@@ -1590,15 +1612,45 @@ impl<'a> Resolver<'a> {
                     self.named(project, name)?;
                 }
             }
-            Value::Object(object)
-                if object.contains_key("fileset")
-                    && object.get("dependencies") == Some(&json!(true)) =>
-            {
+            Value::Object(object) if object.contains_key("fileset") => {
+                if let Some(key) = object.keys().find(|key| {
+                    !matches!(key.as_str(), "fileset" | "dependencies" | "includeIgnored")
+                }) {
+                    bail!("unsupported fileset input field {key:?}");
+                }
+                let flag = |name: &str| {
+                    object
+                        .get(name)
+                        .map(|value| {
+                            value
+                                .as_bool()
+                                .with_context(|| format!("{name} must be boolean"))
+                        })
+                        .transpose()
+                        .map(Option::unwrap_or_default)
+                };
+                let (dependencies, include_ignored) =
+                    (flag("dependencies")?, flag("includeIgnored")?);
                 let pattern = object["fileset"]
                     .as_str()
                     .context("fileset input must be a glob")?
                     .to_owned();
-                self.dependency_fileset(project, &pattern)?;
+                validate_fileset(&pattern)?;
+                match (dependencies, include_ignored) {
+                    (false, false) => self.fileset(project, &pattern)?,
+                    (true, false) => self.dependency_fileset(project, &pattern)?,
+                    (false, true) => self.ignored_fileset(project, &pattern, false),
+                    (true, true) => {
+                        if !self.named_stack.is_empty() {
+                            bail!(
+                                "named inputs can only refer to named inputs of their own project"
+                            );
+                        }
+                        for dependency in self.dependency_closure(project) {
+                            self.ignored_fileset(&dependency, &pattern, true);
+                        }
+                    }
+                }
             }
             Value::Object(object)
                 if object.len() == 1 && object.contains_key("workingDirectory") =>
@@ -1624,13 +1676,6 @@ impl<'a> Resolver<'a> {
             // As in Nx, a string names a named input when there is one, and is
             // a fileset otherwise.
             Value::String(name) if self.has_named(project, name) => self.named(project, name)?,
-            Value::Object(object) if object.len() == 1 && object.contains_key("fileset") => {
-                let pattern = object["fileset"]
-                    .as_str()
-                    .context("fileset input must be a glob")?;
-                validate_fileset(pattern)?;
-                self.fileset(project, pattern)?;
-            }
             Value::String(pattern) => {
                 validate_fileset(pattern)?;
                 self.fileset(project, pattern)?
@@ -1824,6 +1869,29 @@ impl<'a> Resolver<'a> {
             owner,
         });
         Ok(())
+    }
+
+    /// An `includeIgnored` glob of `project`, with its tokens resolved as
+    /// Nx's `resolve_files_glob` resolves them, to read from disk later.
+    fn ignored_fileset(&mut self, project: &str, pattern: &str, dependencies: bool) {
+        let root = &self.workspace.projects[project].root;
+        let resolved = if root == "." {
+            pattern.replace("{projectRoot}/", "")
+        } else {
+            pattern.replace("{projectRoot}", root)
+        }
+        .replace("{projectName}", project);
+        let resolved = match resolved.strip_prefix("!{workspaceRoot}/") {
+            Some(rest) => format!("!{rest}"),
+            None => resolved
+                .strip_prefix("{workspaceRoot}/")
+                .map(str::to_owned)
+                .unwrap_or(resolved),
+        };
+        self.ignored
+            .entry((project.to_owned(), dependencies))
+            .or_default()
+            .push(resolved);
     }
 
     /// A fileset of every project `project` depends on, directly or not.
@@ -2115,8 +2183,47 @@ fn resolve_candidates(
                 .cloned(),
         );
     }
+    // `includeIgnored` groups read the disk, gitignored files included, and
+    // a changed path they name counts whether or not it is there. As in Nx,
+    // one reading another task's declared outputs makes that task a producer.
+    let mut ignored = BTreeSet::new();
+    for ((project, _), globs) in &resolver.ignored {
+        let group = Group::new(
+            project,
+            globs,
+            workspace
+                .projects
+                .values()
+                .map(|project| project.root.as_str()),
+        )?;
+        let found = group.expand(&workspace.root)?;
+        ignored.extend(
+            found
+                .into_iter()
+                .chain(
+                    snapshot
+                        .extra_candidates
+                        .iter()
+                        .filter(|path| group.matches(path))
+                        .cloned(),
+                )
+                // A task's own outputs are no input of it, as for any fileset.
+                .filter(|path| own_outputs.as_ref().is_none_or(|own| !own.matches(path))),
+        );
+        for (producer, declared) in &snapshot.generated_tasks {
+            if producer.id != task.id
+                && upstream.contains(&producer.id)
+                && declared.declared()
+                && reads_outputs(&group, declared)
+            {
+                producers.insert(producer.id.clone());
+            }
+        }
+    }
+    resolver.selected.extend(ignored.iter().cloned());
     let mut declared = Declared {
         files: resolver.selected,
+        ignored,
         values: resolver.values,
         json_fields: resolver.json_fields,
         external: resolver.external,
@@ -2145,6 +2252,35 @@ fn resolve_candidates(
     }
     let inferred = infer(snapshot, workspace, task)?;
     Ok(join(declared, inferred))
+}
+
+/// Whether an `includeIgnored` group may read files `outputs` declares, as
+/// Nx's `GlobShape::may_read` judges it from the globs alone: a positive's
+/// directory and an output's meet, the one holding the other, unless the
+/// output lies in a project the positive does not reach, and their
+/// extensions, where both have one, agree.
+fn reads_outputs(group: &Group, outputs: &Outputs) -> bool {
+    let holds = |outer: &str, inner: &str| {
+        outer.is_empty()
+            || inner == outer
+            || inner
+                .strip_prefix(outer)
+                .is_some_and(|rest| rest.starts_with('/'))
+    };
+    group.reads().any(|(root, extension)| {
+        outputs.globs().iter().any(|output| {
+            let (prefix, _) = crate::ignored::partition(output);
+            (holds(root, &prefix) || holds(&prefix, root))
+                && !group
+                    .skipped_below(root)
+                    .iter()
+                    .any(|project| holds(project, &prefix))
+                && match (extension, crate::ignored::extension(output)) {
+                    (Some(read), Some(written)) => read == written,
+                    _ => true,
+                }
+        })
+    })
 }
 
 /// What qk adds to `task`'s key on its own, whatever its inputs declare.
@@ -2319,7 +2455,15 @@ pub fn inputs(
             })
             .collect::<Result<BTreeMap<_, _>>>()
     };
-    let files = file_values(&declared.files)?;
+    let mut files = file_values(&(&declared.files - &declared.ignored))?;
+    for path in &declared.ignored {
+        if let Some(value) = snapshot
+            .ignored_value(&workspace.root, path)
+            .with_context(|| format!("cannot read input {path}"))?
+        {
+            files.insert(path.clone(), value);
+        }
+    }
     let mut values = declared.values;
     let mut configuration = json!({ "files": file_values(&inferred.files)? });
     let installed = snapshot.installed(&workspace.root, &task.id)?;
