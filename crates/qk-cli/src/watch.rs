@@ -124,6 +124,7 @@ impl View {
                     args: Vec::new(),
                     definition: definition.clone(),
                     dependencies: BTreeSet::new(),
+                    edges: BTreeMap::new(),
                 };
                 let mut variants = vec![task.clone()];
                 for configuration in definition.configurations.values() {

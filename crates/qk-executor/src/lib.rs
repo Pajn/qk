@@ -488,24 +488,34 @@ pub fn prepare(
         ),
         Some(_) => bail!("args must be a string or an array of strings"),
     };
-    let interpolation =
+    let mut interpolation =
         interpolate::Interpolation::new(workspace, task, args, &forwarded, extra.as_deref())?;
     let (mut env, mut runtime_env) = task_environment(workspace, task, base_env)?;
-    // As in Nx, `envFile` sets what is not set yet, beneath `env`.
+    // `env.NAME` fallbacks read the environment as built so far: dotenv files
+    // for `envFile`, and `envFile` too for `env`, then all of it for commands.
+    interpolation.set_env(&env);
+    // As in Nx 24, `envFile` sets what the task's environment, dotenv files
+    // included, leaves unset or empty, beneath `env`; and the task's
+    // environment says whether it loads.
     if let Some(file) = options.get("envFile") {
         let file = interpolation.text(file.as_str().context("envFile must be a string")?)?;
         let path = workspace.root.join(&file);
-        if loads_dotenv(base_env) {
+        if loads_dotenv(&runtime_env) {
             if !path.is_file() {
                 bail!("envFile {file} does not exist");
             }
             for (name, value) in read_dotenv(&path)? {
                 let name = environment_key(&env, name);
-                runtime_env.entry(name.clone()).or_insert(value.clone());
-                env.entry(name).or_insert(value);
+                for env in [&mut runtime_env, &mut env] {
+                    let entry = env.entry(name.clone()).or_default();
+                    if entry.is_empty() {
+                        *entry = value.clone();
+                    }
+                }
             }
         }
     }
+    interpolation.set_env(&env);
     for values in [definition.extra.get("env"), options.get("env")]
         .into_iter()
         .flatten()
@@ -523,6 +533,7 @@ pub fn prepare(
             env.insert(name, value);
         }
     }
+    interpolation.set_env(&env);
     let mut execution = BTreeMap::new();
     execution.insert(
         "FORCE_COLOR".into(),

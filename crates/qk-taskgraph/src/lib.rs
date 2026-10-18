@@ -74,6 +74,81 @@ pub struct Task {
     pub args: Vec<String>,
     pub definition: Target,
     pub dependencies: BTreeSet<String>,
+    /// The `inputs` and `waitFor` of the `dependsOn` entries that named each
+    /// dependency, where they differ from the defaults. They only matter for
+    /// a continuous dependency.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub edges: BTreeMap<String, Edge>,
+}
+
+impl Task {
+    /// How this task depends on `dependency`.
+    pub fn edge(&self, dependency: &str) -> Edge {
+        self.edges.get(dependency).copied().unwrap_or_default()
+    }
+}
+
+/// How a task depends on a continuous task, from its `dependsOn` entries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Edge {
+    /// Whether the continuous task's inputs count for this task. Nx adds them
+    /// to the dependent's hash and affected selection unless the entry sets
+    /// `inputs: false`.
+    pub inputs: bool,
+    pub wait_for: WaitFor,
+}
+
+impl Default for Edge {
+    fn default() -> Self {
+        Self {
+            inputs: true,
+            wait_for: WaitFor::Started,
+        }
+    }
+}
+
+impl Edge {
+    /// Two entries naming one dependency, as Nx merges them: waiting for
+    /// readiness wins, and the inputs count unless every entry leaves them out.
+    fn merge(self, other: Self) -> Self {
+        Self {
+            inputs: self.inputs || other.inputs,
+            wait_for: self.wait_for.max(other.wait_for),
+        }
+    }
+}
+
+/// When a task depending on a continuous task starts: once that task has
+/// started, or once its target-level `readyWhen` check has passed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WaitFor {
+    #[default]
+    Started,
+    Ready,
+}
+
+/// The dependencies `dependsOn` resolves to, with how each is depended on.
+#[derive(Default)]
+struct Dependencies {
+    ids: BTreeSet<String>,
+    edges: BTreeMap<String, Edge>,
+}
+
+impl Dependencies {
+    fn insert(&mut self, id: String, edge: Edge) {
+        let edge = if self.ids.insert(id.clone()) {
+            edge
+        } else {
+            self.edges.get(&id).copied().unwrap_or_default().merge(edge)
+        };
+        if edge == Edge::default() {
+            self.edges.remove(&id);
+        } else {
+            self.edges.insert(id, edge);
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -141,9 +216,34 @@ impl TaskGraph {
             graph.tasks.retain(|id, _| roots.contains(id));
             for task in graph.tasks.values_mut() {
                 task.dependencies.retain(|id| roots.contains(id));
+                task.edges.retain(|id, _| roots.contains(id));
             }
         }
         Ok(graph)
+    }
+
+    /// The dependencies of a task whose outputs it may read: all but the
+    /// continuous ones, which serve it from their own process instead. Their
+    /// inputs count as the task's own, unless declared with `inputs: false`.
+    pub fn producers<'a>(&'a self, id: &str) -> impl Iterator<Item = &'a String> + 'a {
+        self.tasks[id].dependencies.iter().filter(|dependency| {
+            self.tasks
+                .get(*dependency)
+                .is_none_or(|task| task.definition.continuous != Some(true))
+        })
+    }
+
+    /// The dependencies whose results key a task: all but the continuous ones
+    /// declared with `inputs: false`, which Nx leaves out of its hash.
+    pub fn keyed_dependencies<'a>(&'a self, id: &str) -> impl Iterator<Item = &'a String> + 'a {
+        let task = &self.tasks[id];
+        task.dependencies.iter().filter(move |dependency| {
+            task.edge(dependency).inputs
+                || self
+                    .tasks
+                    .get(*dependency)
+                    .is_none_or(|server| server.definition.continuous != Some(true))
+        })
     }
 
     /// Nx's `makeAcyclic`: from each task, depth first, a dependency on a
@@ -161,7 +261,9 @@ impl TaskGraph {
             let dependencies: Vec<String> = graph[id].dependencies.iter().cloned().collect();
             for dependency in dependencies {
                 if path.contains(&dependency) {
-                    graph.get_mut(id).unwrap().dependencies.remove(&dependency);
+                    let task = graph.get_mut(id).unwrap();
+                    task.dependencies.remove(&dependency);
+                    task.edges.remove(&dependency);
                 } else {
                     path.push(dependency.clone());
                     visit(graph, &dependency, visited, path);
@@ -275,12 +377,16 @@ impl Builder<'_> {
             args: request.args,
             definition,
             dependencies: BTreeSet::new(),
+            edges: BTreeMap::new(),
         };
         self.visiting.push(id.clone());
         let mut dependencies = self
             .tasks
             .get(&id)
-            .map(|task| task.dependencies.clone())
+            .map(|task| Dependencies {
+                ids: task.dependencies.clone(),
+                edges: task.edges.clone(),
+            })
             .unwrap_or_default();
         self.collect(
             &task,
@@ -294,7 +400,8 @@ impl Builder<'_> {
         self.tasks.insert(
             id.clone(),
             Task {
-                dependencies,
+                dependencies: dependencies.ids,
+                edges: dependencies.edges,
                 ..task
             },
         );
@@ -310,14 +417,14 @@ impl Builder<'_> {
         task: &Task,
         derive_from: &str,
         requested_configuration: Option<&str>,
-        dependencies: &mut BTreeSet<String>,
+        dependencies: &mut Dependencies,
         seen: &mut BTreeSet<String>,
     ) -> Result<()> {
         if !seen.insert(derive_from.to_owned()) {
             return Ok(());
         }
         for dependency in task.definition.depends_on.as_deref().unwrap_or_default() {
-            let (requests, derived) = self
+            let (requests, derived, edge) = self
                 .dependencies(task, derive_from, requested_configuration, dependency)
                 .with_context(|| format!("dependsOn of {}", task.id))?;
             for request in requests {
@@ -331,23 +438,25 @@ impl Builder<'_> {
                     // Reached back to itself through a dependency cycle.
                     continue;
                 } else if let Some(id) = self.visit(request, false)? {
-                    dependencies.insert(id);
+                    dependencies.insert(id, edge);
                 }
             }
         }
         Ok(())
     }
 
-    /// The requests one `dependsOn` entry makes, and whether its projects are
-    /// `derive_from`'s dependencies rather than named ones.
+    /// The requests one `dependsOn` entry makes, whether its projects are
+    /// `derive_from`'s dependencies rather than named ones, and how it
+    /// depends on them.
     fn dependencies(
         &self,
         task: &Task,
         derive_from: &str,
         requested_configuration: Option<&str>,
         value: &Value,
-    ) -> Result<(Vec<Request>, bool)> {
+    ) -> Result<(Vec<Request>, bool, Edge)> {
         let mut forward_options = false;
+        let mut edge = Edge::default();
         let (target, projects, forward, derived) = match value {
             Value::String(value) => {
                 if let Some(target) = value.strip_prefix('^') {
@@ -383,11 +492,28 @@ impl Builder<'_> {
                 for key in object.keys() {
                     if !matches!(
                         key.as_str(),
-                        "target" | "projects" | "dependencies" | "params" | "options"
+                        "target"
+                            | "projects"
+                            | "dependencies"
+                            | "params"
+                            | "options"
+                            | "inputs"
+                            | "waitFor"
                     ) {
                         bail!("unsupported dependency field {key:?}");
                     }
                 }
+                if let Some(inputs) = object.get("inputs") {
+                    edge.inputs = inputs
+                        .as_bool()
+                        .context("dependency inputs must be boolean")?;
+                }
+                edge.wait_for = match object.get("waitFor").and_then(Value::as_str) {
+                    None if !object.contains_key("waitFor") => WaitFor::Started,
+                    Some("started") => WaitFor::Started,
+                    Some("ready") => WaitFor::Ready,
+                    _ => bail!("dependency waitFor must be started or ready"),
+                };
                 let dependencies = match object.get("dependencies") {
                     Some(value) => value
                         .as_bool()
@@ -400,18 +526,22 @@ impl Builder<'_> {
                 let projects = if dependencies {
                     self.project_dependencies(derive_from)
                 } else if let Some(selectors) = object.get("projects") {
-                    let mut selectors: Vec<String> = match selectors {
+                    let selectors: Vec<String> = match selectors {
+                        // Nx 24 dropped the Nx 15 spellings: a task's own
+                        // project is no `projects`, its dependencies `^target`.
+                        Value::String(selector)
+                            if matches!(selector.as_str(), "self" | "dependencies")
+                                && !self.workspace.projects.contains_key(selector) =>
+                        {
+                            bail!(
+                                "projects: {selector:?} is no longer supported; leave projects \
+                                 out for the task's own project, or use dependencies: true"
+                            )
+                        }
                         Value::String(selector) => vec![selector.clone()],
                         value => serde_json::from_value(value.clone())
                             .context("dependency projects must be a string or string array")?,
                     };
-                    for selector in &mut selectors {
-                        if selector == "self" {
-                            *selector = task.project.clone();
-                        } else if selector == "!self" {
-                            *selector = format!("!{}", task.project);
-                        }
-                    }
                     select_projects(&self.workspace.projects, &selectors, &[])?
                         .into_iter()
                         .collect()
@@ -467,7 +597,7 @@ impl Builder<'_> {
                 })
             })
             .collect();
-        Ok((requests, derived))
+        Ok((requests, derived, edge))
     }
 
     fn project_dependencies(&self, project: &str) -> Vec<String> {

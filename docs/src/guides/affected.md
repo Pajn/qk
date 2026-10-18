@@ -13,7 +13,7 @@ qk affected -t build,test --base main
 qk affected -t build,test --granularity task --base main
 ```
 
-As in Nx 23, changed files are those between the merge base of `--base` and
+As in Nx, changed files are those between the merge base of `--base` and
 `--head`, or with no head, between the merge base and the working tree,
 including uncommitted and untracked files. The base defaults to `NX_BASE`,
 then nx.json `defaultBase`, then `main`; the head to `NX_HEAD`. `--files`,
@@ -96,7 +96,14 @@ same inputs its cache key reads, so an unaffected task would be a cache hit,
 except that env and runtime inputs count as unchanged, since the base
 revision's environment is unknowable. A test-only change then reaches the
 test tasks and not the builds whose `production` inputs exclude tests.
-`project` stays the default, as in Nx. `qk show tasks -t <targets> --affected`
+As in Nx, a continuous task a task depends on, such as the dev server an e2e
+task runs against, does not affect it as a dependency: it has no outputs the
+task reads. Its inputs count as the task's own instead, and so do those of
+the continuous tasks it depends on in turn. A `dependsOn` entry with
+`inputs: false` leaves them out, unless another entry names the same task
+without it.
+`project` stays the default, where Nx 24 selects tasks; see
+[Nx compatibility](../compatibility.md). `qk show tasks -t <targets> --affected`
 lists the affected tasks with their first reason, or the whole analysis with
 `--json`.
 

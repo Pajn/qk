@@ -4,12 +4,14 @@
 
 Environment precedence, highest first: `FORCE_COLOR` from `color: true`,
 configuration `env`, `options.env`, target-level `env`, the variables Nx sets
-for every task, the inherited process environment, `envFile`, then the
-task's dotenv files in Nx's order: in the
+for every task, the inherited process environment, the task's dotenv files
+in Nx's order: in the
 project root and then the workspace root, `.env.<target>.<configuration>`,
 `.env.<configuration>`, `.env.<target>`, then `.env.local`, `.local.env` and
 `.env`, each also as `.env.<name>.local`, `.<name>.local.env` and
-`.<name>.env`. A file never overrides a variable an earlier source set. The
+`.<name>.env`, then `envFile`. A dotenv file never overrides a variable an
+earlier source set. As in Nx 24, `envFile` also sets a variable that is set
+but empty. The
 task variables are `NX_TASK_TARGET_PROJECT`, `NX_TASK_TARGET_TARGET`,
 `NX_TASK_TARGET_CONFIGURATION`, `NX_WORKSPACE_ROOT`, `LERNA_PACKAGE_NAME`,
 `NX_TUI=false` and `FORCE_COLOR`, which is `true` unless already set, and
@@ -19,7 +21,8 @@ every task that goes through the cache, cacheable or not, but not under
 Dotenv is loaded into child environments without mutating qk's process
 environment; qk's own environment, where remote cache credentials arrive,
 includes the root `.env.local` and `.env`. `NX_LOAD_DOT_ENV_FILES=false`
-turns every dotenv file off, `envFile` included, as in Nx. Dotenv interpolation uses
+turns every dotenv file off, `envFile` included, as in Nx. For `envFile`,
+the task's environment decides, so a task's dotenv file can turn it off. Dotenv interpolation uses
 dotenvy's per-file semantics; it does not provide cross-file interpolation
 against the merged child environment.
 

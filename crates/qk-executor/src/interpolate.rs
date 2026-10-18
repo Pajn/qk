@@ -16,6 +16,8 @@ pub(super) struct Interpolation<'a> {
     options: Vec<String>,
     /// The `args` option: shell text, forwarded as it is.
     extra: Option<String>,
+    /// The task's environment, which `{env.NAME}` fallbacks read, once built.
+    env: BTreeMap<String, String>,
 }
 
 impl<'a> Interpolation<'a> {
@@ -33,6 +35,7 @@ impl<'a> Interpolation<'a> {
             named: BTreeMap::new(),
             options: Vec::new(),
             extra: None,
+            env: BTreeMap::new(),
         };
         let options: BTreeMap<String, String> = options
             .iter()
@@ -136,57 +139,167 @@ impl<'a> Interpolation<'a> {
         Ok(command)
     }
 
+    /// Gives `{env.NAME}` fallbacks the task's environment.
+    pub fn set_env(&mut self, env: &BTreeMap<std::ffi::OsString, std::ffi::OsString>) {
+        self.env = env
+            .iter()
+            .filter_map(|(name, value)| {
+                Some((name.to_str()?.to_owned(), value.to_str()?.to_owned()))
+            })
+            .collect();
+    }
+
     fn expand(&self, text: &str, shell: bool) -> Result<String> {
-        // One pass: user-provided values must never be interpreted as more tokens.
+        // One pass: user-provided values must never be interpreted as more
+        // tokens. As in Nx, braces that are not a token stay as text, and the
+        // scan goes on inside them.
         let mut result = String::new();
-        let mut rest = text;
-        while let Some(start) = rest.find('{') {
-            result.push_str(&rest[..start]);
-            rest = &rest[start..];
-            let Some(end) = rest.find('}') else {
-                break;
+        let mut index = 0;
+        while let Some(offset) = text[index..].find('{') {
+            let open = index + offset;
+            let value = match closing_brace(text, open) {
+                Some(close) => self
+                    .token(&text[open + 1..close], &text[..open], shell)?
+                    .map(|value| (value, close)),
+                None => None,
             };
-            let token = &rest[1..end];
-            if shell && (token == "args" || token.starts_with("args.")) {
-                let prefix = &text[..text.len() - rest.len()];
-                if quoted_or_escaped(prefix) {
+            match value {
+                Some((value, close)) => {
+                    result.push_str(&text[index..open]);
+                    result.push_str(&value);
+                    index = close + 1;
+                }
+                None => {
+                    result.push_str(&text[index..=open]);
+                    index = open + 1;
+                }
+            }
+        }
+        result.push_str(&text[index..]);
+        Ok(result)
+    }
+
+    /// The value of the token between a pair of braces, or `None` when it is
+    /// not one.
+    fn token(&self, token: &str, prefix: &str, shell: bool) -> Result<Option<String>> {
+        let value = match token {
+            "workspaceRoot" => self
+                .workspace
+                .root
+                .to_str()
+                .context("workspace path must be UTF-8")?
+                .to_owned(),
+            "projectRoot" => self.workspace.projects[&self.task.project].root.clone(),
+            "projectName" => self.task.project.clone(),
+            "args" => {
+                if shell && quoted_or_escaped(prefix) {
                     bail!(
                         "argument placeholders must be unquoted and unescaped; qk quotes their values"
                     );
                 }
+                self.all(shell)?
             }
-            let value = match token {
-                "workspaceRoot" => Some(
-                    self.workspace
-                        .root
-                        .to_str()
-                        .context("workspace path must be UTF-8")?
-                        .to_owned(),
-                ),
-                "projectRoot" => Some(self.workspace.projects[&self.task.project].root.clone()),
-                "projectName" => Some(self.task.project.clone()),
-                "args" => Some(self.all(shell)?),
-                _ if token.starts_with("args.") => {
-                    // As in Nx, an argument that was not given interpolates as nothing.
-                    let value = self.named.get(&token[5..]).map_or("", String::as_str);
-                    Some(if shell && !value.is_empty() {
-                        quote(value)?
-                    } else {
-                        value.to_owned()
-                    })
+            _ => {
+                let sources = fallbacks(token);
+                if !sources[0].starts_with("args.") {
+                    return Ok(None);
                 }
-                _ => None,
-            };
-            if let Some(value) = value {
-                result.push_str(&value);
-            } else {
-                result.push_str(&rest[..=end]);
+                if shell && quoted_or_escaped(prefix) {
+                    bail!(
+                        "argument placeholders must be unquoted and unescaped; qk quotes their values"
+                    );
+                }
+                // As in Nx 24, the first value that is set and not empty, and
+                // nothing when none is: an argument, `env.NAME` of the task's
+                // environment, or a final literal.
+                let mut value = String::new();
+                for (index, source) in sources.iter().enumerate() {
+                    let found = if let Some(name) = source.strip_prefix("args.") {
+                        self.named.get(name).cloned()
+                    } else if let Some(name) = source.strip_prefix("env.").filter(|name| {
+                        !name.is_empty()
+                            && name
+                                .chars()
+                                .all(|c| c.is_alphanumeric() || "_.()-".contains(c))
+                    }) {
+                        self.env_value(name)
+                    } else if index + 1 == sources.len() {
+                        Some(self.expand(source, false)?)
+                    } else {
+                        bail!(
+                            "{{{token}}} has a fallback after the literal {source:?} that can never be used"
+                        );
+                    };
+                    if let Some(found) = found.filter(|found| !found.is_empty()) {
+                        value = found;
+                        break;
+                    }
+                }
+                if shell && !value.is_empty() {
+                    quote(&value)?
+                } else {
+                    value
+                }
             }
-            rest = &rest[end + 1..];
-        }
-        result.push_str(rest);
-        Ok(result)
+        };
+        Ok(Some(value))
     }
+
+    /// A variable of the task's environment; on Windows names ignore case.
+    fn env_value(&self, name: &str) -> Option<String> {
+        if let Some(value) = self.env.get(name) {
+            return Some(value.clone());
+        }
+        if !cfg!(windows) {
+            return None;
+        }
+        self.env
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.clone())
+    }
+}
+
+/// Where the brace opening at `open` closes, counting nested pairs.
+fn closing_brace(text: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, c) in text[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(open + index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// A token's `??` alternatives, trimmed, outside any nested braces.
+fn fallbacks(token: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0;
+    let bytes = token.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'{' => depth += 1,
+            b'}' => depth -= 1,
+            b'?' if depth == 0 && bytes.get(index + 1) == Some(&b'?') => {
+                parts.push(token[start..index].trim());
+                start = index + 2;
+                index += 1;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    parts.push(token[start..].trim());
+    parts
 }
 
 /// Flags as yargs reads them: `--name=value`, `--name value`, `--name` for

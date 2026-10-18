@@ -1097,3 +1097,77 @@ fn target_defaults_can_name_a_config() {
     );
     assert!(analysis.projects.contains_key("other"));
 }
+
+/// `app:serve` is continuous, and `app-e2e:e2e` runs cases through it. Its
+/// own inputs are only its cases; the server's inputs count as its own.
+fn served_repo() -> Repo {
+    Repo::new(&[
+        (
+            "apps/app/project.json",
+            r#"{
+                "name": "app",
+                "implicitDependencies": ["lib"],
+                "targets": {"serve": {"command": "echo serve", "continuous": true, "inputs": ["default"]}}
+            }"#,
+        ),
+        ("apps/app/src/other.ts", "export const other = 1;\n"),
+        (
+            "apps/app-e2e/project.json",
+            r#"{
+                "name": "app-e2e",
+                "targets": {
+                    "e2e": {
+                        "command": "echo e2e",
+                        "inputs": ["default"],
+                        "dependsOn": [{"projects": ["app"], "target": "serve"}],
+                        "qk:reachability": {
+                            "anchors": ["{projectRoot}/shell.ts"],
+                            "cases": ["{projectRoot}/cases/*.ts"],
+                            "sources": ["{projectRoot}/**/*.ts", "{workspaceRoot}/apps/app/src/**/*"]
+                        }
+                    }
+                }
+            }"#,
+        ),
+        ("apps/app-e2e/shell.ts", "export const shell = 1;\n"),
+        (
+            "apps/app-e2e/cases/main.ts",
+            "import { app } from \"../../app/src/main\";\nexport const first = app;\n",
+        ),
+        ("apps/app-e2e/cases/other.ts", "export const second = 1;\n"),
+    ])
+}
+
+#[test]
+fn a_served_task_is_narrowed_by_its_server_s_changes_rather_than_run_whole() {
+    use qk_taskgraph::{Request, TaskGraph};
+    let repo = served_repo();
+    write(
+        &repo.root,
+        "apps/app/src/main.ts",
+        "export const app = 2;\n",
+    );
+    let head = commit(&repo.root);
+    let workspace = Workspace::load(&repo.root).unwrap();
+    let graph = TaskGraph::build(&workspace, &[Request::parse("app-e2e:e2e").unwrap()]).unwrap();
+    let analysis = qk_affected::affected_tasks(
+        &workspace,
+        &graph,
+        &Options {
+            affected_profile: Some("reach".into()),
+            base: Some(repo.base.clone()),
+            head: Some(head),
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    // The server runs, and serves only the case importing what changed.
+    let TaskDecision::Cases { cases, of } = &analysis.reachability["app-e2e:e2e"] else {
+        panic!("{:?}", analysis.reachability);
+    };
+    assert_eq!(*of, 2);
+    assert_eq!(
+        cases.keys().collect::<Vec<_>>(),
+        ["apps/app-e2e/cases/main.ts"]
+    );
+}

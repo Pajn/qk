@@ -1,4 +1,4 @@
-//! Which projects a set of changed files affects, following Nx 23's
+//! Which projects a set of changed files affects, following Nx's
 //! `filterAffected`: files are attributed to projects by the locators below,
 //! then every project depending on a touched one is affected too.
 //!

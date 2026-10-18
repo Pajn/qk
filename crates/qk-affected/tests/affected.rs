@@ -1231,3 +1231,144 @@ fn ignored_deleted_manifests_only_affect_explicit_consumers() {
         }
     }
 }
+
+/// `app:serve` is continuous and builds `lib` first. `e2e` lives in its own
+/// project, with only its own files as inputs, and is served by `app:serve`
+/// as `dependsOn` declares it.
+fn served_repo(serve_dependency: &str) -> Repo {
+    let e2e = format!(
+        r#"{{"name": "app-e2e", "targets": {{"e2e": {{"command": "echo e2e", "inputs": ["default"], "dependsOn": [{serve_dependency}]}}}}}}"#
+    );
+    Repo::new(&[
+        (
+            "nx.json",
+            r#"{"namedInputs": {"default": ["{projectRoot}/**/*"]},
+                "targetDefaults": {"build": {"command": "echo build", "inputs": ["default"], "outputs": ["{projectRoot}/dist"]}}}"#,
+        ),
+        (
+            "apps/app/project.json",
+            r#"{"name": "app", "implicitDependencies": ["lib"], "targets": {"serve": {"command": "echo serve", "continuous": true, "inputs": ["default"], "dependsOn": ["^build"]}}}"#,
+        ),
+        (
+            "libs/lib/project.json",
+            r#"{"name": "lib", "targets": {"build": {}}}"#,
+        ),
+        ("apps/app-e2e/project.json", &e2e),
+        ("apps/app-e2e/src/app.spec.ts", "a test"),
+    ])
+}
+
+#[test]
+fn a_continuous_dependency_counts_its_inputs_as_the_dependent_s_own() {
+    use qk_affected::{TaskCause, TaskReason};
+    let repo = served_repo(r#"{"projects": ["app"], "target": "serve"}"#);
+    write(&repo.root, "apps/app/src/main.ts", "changed");
+    let tasks = affected_tasks_of(&repo, &["app-e2e:e2e"]);
+    assert!(matches!(
+        &tasks["app-e2e:e2e"],
+        TaskCause::Touched { reasons }
+            if reasons.iter().any(|reason| matches!(reason, TaskReason::Input { file } if file == "apps/app/src/main.ts"))
+    ));
+
+    // A build the server depends on does not carry over: its outputs are the
+    // server's to read, not the e2e task's.
+    let repo = served_repo(r#"{"projects": ["app"], "target": "serve"}"#);
+    write(&repo.root, "libs/lib/src/index.ts", "changed");
+    let tasks = affected_tasks_of(&repo, &["app-e2e:e2e"]);
+    assert!(tasks.contains_key("lib:build"));
+    assert!(!tasks.contains_key("app-e2e:e2e"), "{tasks:?}");
+}
+
+#[test]
+fn a_continuous_dependency_declared_without_inputs_counts_nothing() {
+    let repo = served_repo(r#"{"projects": ["app"], "target": "serve", "inputs": false}"#);
+    write(&repo.root, "apps/app/src/main.ts", "changed");
+    let tasks = affected_tasks_of(&repo, &["app-e2e:e2e"]);
+    assert!(!tasks.contains_key("app-e2e:e2e"), "{tasks:?}");
+
+    // Another entry naming the server with its inputs keeps them.
+    let repo = served_repo(
+        r#"{"projects": ["app"], "target": "serve", "inputs": false}, {"projects": ["app"], "target": "serve"}"#,
+    );
+    write(&repo.root, "apps/app/src/main.ts", "changed");
+    let tasks = affected_tasks_of(&repo, &["app-e2e:e2e"]);
+    assert!(tasks.contains_key("app-e2e:e2e"), "{tasks:?}");
+}
+
+/// `check` selects `feature` with `dependencies: true`. `feature` depends on
+/// `util`, and `app`, whose task it is, on `feature` and `extra`.
+fn selected_dependencies_repo() -> Repo {
+    Repo::new(&[
+        (
+            "nx.json",
+            r#"{"namedInputs": {"default": ["{projectRoot}/**/*"]}}"#,
+        ),
+        (
+            "apps/app/project.json",
+            r#"{"name": "app", "implicitDependencies": ["feature", "extra"], "targets": {"check": {"command": "echo check",
+                "inputs": [{"input": "default", "projects": ["feature"], "dependencies": true}]}}}"#,
+        ),
+        (
+            "libs/feature/project.json",
+            r#"{"name": "feature", "implicitDependencies": ["util"]}"#,
+        ),
+        ("libs/feature/src/index.ts", "feature"),
+        ("libs/util/project.json", r#"{"name": "util"}"#),
+        ("libs/util/src/index.ts", "util"),
+        ("libs/extra/project.json", r#"{"name": "extra"}"#),
+        ("libs/extra/src/index.ts", "extra"),
+    ])
+}
+
+#[test]
+fn an_input_selecting_projects_with_dependencies_reads_what_they_depend_on() {
+    for (file, affected) in [
+        ("libs/util/src/index.ts", true),
+        ("libs/feature/src/index.ts", false),
+        ("libs/extra/src/index.ts", false),
+    ] {
+        let repo = selected_dependencies_repo();
+        write(&repo.root, file, "changed");
+        let tasks = affected_tasks_of(&repo, &["app:check"]);
+        assert_eq!(
+            tasks.contains_key("app:check"),
+            affected,
+            "{file}: {tasks:?}"
+        );
+    }
+}
+
+#[test]
+fn inputs_marked_always_read_as_without_it() {
+    let repo = || {
+        Repo::new(&[
+            (
+                "nx.json",
+                r#"{"namedInputs": {"default": ["{projectRoot}/**/*"]},
+                    "targetDefaults": {"check": {"command": "echo check", "inputs": [
+                        {"fileset": "{projectRoot}/src/**/*", "always": true},
+                        {"json": "{projectRoot}/meta.json", "fields": ["version"], "always": true},
+                        {"input": "default", "projects": ["lib"], "always": true}
+                    ]}}}"#,
+            ),
+            (
+                "apps/app/project.json",
+                r#"{"name": "app", "targets": {"check": {}}}"#,
+            ),
+            ("apps/app/meta.json", r#"{"version": 1}"#),
+        ])
+    };
+    for (file, text) in [
+        ("apps/app/src/main.ts", "changed"),
+        ("apps/app/meta.json", r#"{"version": 2}"#),
+        ("libs/lib/src/index.ts", "changed"),
+    ] {
+        let repo = repo();
+        write(&repo.root, file, text);
+        let tasks = affected_tasks_of(&repo, &["app:check"]);
+        assert!(tasks.contains_key("app:check"), "{file}: {tasks:?}");
+    }
+    let repo = repo();
+    write(&repo.root, "apps/app/README.md", "not an input");
+    assert!(affected_tasks_of(&repo, &["app:check"]).is_empty());
+}

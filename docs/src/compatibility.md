@@ -1,6 +1,6 @@
 # Nx compatibility
 
-qk reads a bounded subset of Nx 23 configuration. It runs without invoking
+qk reads a bounded subset of Nx 24 configuration. It runs without invoking
 Nx or loading Nx plugins. The implementation, fixtures and parity tests
 establish supported behavior; preserving unknown metadata during inspection
 does not mean qk executes it.
@@ -38,6 +38,14 @@ When a name occurs in multiple sections, precedence is `dependencies`,
   [What changes the key](guides/cache.md#what-changes-the-key).
 - A tracked upstream can adjust the affected base to avoid counting changes
   already landed upstream.
+- `qk affected` selects projects unless given `--granularity task`. Nx 24
+  selects tasks unless nx.json sets `affected.legacy: true`.
+- In task selection, a task depending on an affected task is affected, since
+  its key holds its dependencies' outputs. Nx only carries affectedness to a
+  task whose inputs read the dependency's outputs. As in Nx, a continuous
+  dependency carries none; its inputs count as the task's own.
+- Inputs marked `"always": true` read as without it: the flag only matters to
+  a hash taken from an Nx Cloud Ultracache recording, which qk does not read.
 - `readyWhen` accepts readiness text from either stdout or stderr.
 - `exec --exclude-task-dependencies` runs the command in the selected
   projects; Nx's leaves every project out and runs nothing.

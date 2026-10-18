@@ -145,7 +145,9 @@ arguments (`--env.NAME=value` for an object's fields; lists cannot be passed
 this way), before any arguments `params: "forward"` passes. As in Nx that
 includes a run-commands target's own `command`, so it suits targets of the
 same executor. Project selectors accept names,
-globs, tags, `self` and `!self`. As in Nx, a project dependency without the
+globs, tags and `!` exclusions. As in Nx 24, `projects: "self"` and
+`projects: "dependencies"` fail: leave `projects` out for the task's own
+project, or set `dependencies: true`. As in Nx, a project dependency without the
 target is looked through: the task's `dependsOn` applies again from that
 project, so `^tsc` reaches the nearest dependencies that have `tsc`. Other
 missing dependency targets are skipped; unknown explicit projects and task cycles fail.
@@ -183,7 +185,10 @@ without a value becomes `true`, and `--no-name` sets `name` to `false`). A
 command cannot use both `{args}` and `{args.name}`. Place argument
 tokens outside quotes: qk quotes their values as shell data. A missing named
 argument interpolates as nothing, as in Nx; quoted argument placeholders are
-errors. On Windows, forwarded
+errors. As in Nx 24, `??` lists fallbacks, and the first that is set and not
+empty applies: another `args.name`, `env.NAME` from the task's environment,
+or a final literal, which may hold path tokens, as in
+`{args.port ?? env.PORT ?? 4200}`. `0` and `false` are values. On Windows, forwarded
 values containing quotes, `%`, `!`, `^` or newlines are currently rejected;
 use target environment variables for those values. Workspace/project path
 tokens are substituted as written, so quote path tokens where your command
@@ -219,7 +224,8 @@ cancelled. A continuous task that only other tasks depend on is stopped, like
 a cancelled command, once all of them have finished; that stop counts as
 success. A continuous task that exits by itself reports its exit status as
 usual. Continuous tasks are never cached, and cacheable tasks depending on one
-run uncached.
+run uncached, unless every `dependsOn` entry naming it sets `inputs: false`:
+as in Nx, the task is then keyed without it.
 
 With `readyWhen`, a string or an array of strings, a task is ready once every
 string has appeared in its output, on stdout or stderr. Its dependents start
