@@ -104,15 +104,18 @@ impl Verdict {
             .compare_exchange(PENDING, READY, Ordering::SeqCst, Ordering::SeqCst);
     }
 
-    pub fn fail(&self, reason: String) {
+    /// Records a failure unless the check was decided already, and says
+    /// whether this call decided it.
+    pub fn fail(&self, reason: String) -> bool {
         let mut stored = self.reason.lock().unwrap();
-        if self
+        let decided = self
             .state
             .compare_exchange(PENDING, FAILED, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
+            .is_ok();
+        if decided {
             *stored = Some(reason);
         }
+        decided
     }
 }
 

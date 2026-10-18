@@ -794,15 +794,11 @@ pub fn run(
                         // serve the tasks waiting for it.
                         if waiters.contains_key(id.as_str()) {
                             let verdict = &prepared[&id].verdict;
-                            if let Some(reason) = verdict.failure() {
-                                // The check failed before the pass that
-                                // reports it saw the task, which has now ended.
-                                if not_ready_failed.insert(id.clone()) {
-                                    qk_executor::status!("qk: {reason}");
-                                }
-                            } else if !verdict.is_decided() {
-                                verdict
-                                    .fail(format!("Task \"{id}\" exited before it became ready."));
+                            // One step decides whether the task ended before
+                            // its check did, so a check that fails meanwhile
+                            // cannot slip between two reads.
+                            if verdict.fail(format!("Task \"{id}\" exited before it became ready."))
+                            {
                                 // Only a task that started with a valid check
                                 // exited early; an invalid one never ran.
                                 if matches!(prepared[&id].ready_check, Some(Ok(_)))
@@ -810,6 +806,12 @@ pub fn run(
                                     && !cancelled.load(Ordering::SeqCst)
                                 {
                                     exited_unready.insert(id.clone());
+                                }
+                            } else if let Some(reason) = verdict.failure() {
+                                // The check failed before the pass that
+                                // reports it saw the task, which has now ended.
+                                if not_ready_failed.insert(id.clone()) {
+                                    qk_executor::status!("qk: {reason}");
                                 }
                             }
                         }
