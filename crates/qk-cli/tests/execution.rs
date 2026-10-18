@@ -840,6 +840,28 @@ fn dependents_of_continuous_tasks_run_uncached_and_say_why() {
 }
 
 #[test]
+fn dependents_leaving_out_a_continuous_task_s_inputs_are_cached() {
+    let temp = fixture(json!({
+        "serve": continuous_target("serve", "serve"),
+        "bench": {
+            "cache": true,
+            "inputs": [],
+            "dependsOn": [{"target": "serve", "inputs": false}],
+            "command": "echo ran >> runs.log",
+        },
+    }));
+    for _ in 0..2 {
+        let output = success(run(temp.path(), &["run", "app:bench"]));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("cache bypassed"), "{stderr}");
+    }
+    assert_eq!(
+        fs::read_to_string(temp.path().join("runs.log")).unwrap(),
+        "ran\n"
+    );
+}
+
+#[test]
 fn output_styles_follow_nx() {
     let temp = fixture(json!({
         "build": {"command": "echo one && echo two"},

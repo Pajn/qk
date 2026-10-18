@@ -842,9 +842,8 @@ fn key_now(
     fingerprints: &BTreeMap<String, Fingerprint>,
     cancelled: &AtomicBool,
 ) -> Keyed {
-    let dependencies = task
-        .dependencies
-        .iter()
+    let dependencies = graph
+        .keyed_dependencies(&task.id)
         .map(|id| fingerprints[id].clone().map(|key| (id.clone(), key)))
         .collect::<std::result::Result<BTreeMap<_, _>, _>>()?;
     let failed = |error: anyhow::Error| format!("{}: {error:#}", task.id);

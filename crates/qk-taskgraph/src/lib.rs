@@ -233,6 +233,19 @@ impl TaskGraph {
         })
     }
 
+    /// The dependencies whose results key a task: all but the continuous ones
+    /// declared with `inputs: false`, which Nx leaves out of its hash.
+    pub fn keyed_dependencies<'a>(&'a self, id: &str) -> impl Iterator<Item = &'a String> + 'a {
+        let task = &self.tasks[id];
+        task.dependencies.iter().filter(move |dependency| {
+            task.edge(dependency).inputs
+                || self
+                    .tasks
+                    .get(*dependency)
+                    .is_none_or(|server| server.definition.continuous != Some(true))
+        })
+    }
+
     /// Nx's `makeAcyclic`: from each task, depth first, a dependency on a
     /// task already on the path is dropped.
     fn make_acyclic(&mut self) {

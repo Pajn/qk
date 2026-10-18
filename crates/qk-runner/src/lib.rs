@@ -607,8 +607,8 @@ pub fn run(
                         task.execution
                             .insert("QK_AFFECTED_CASES".into(), path.as_os_str().to_owned());
                     }
-                    let dependency_keys = dependencies
-                        .iter()
+                    let dependency_keys = graph
+                        .keyed_dependencies(&id)
                         .map(|id| (id.clone(), fingerprints[id].clone()))
                         .collect::<BTreeMap<_, _>>();
                     let cache = cache.as_ref().filter(|_| narrowed.is_none());

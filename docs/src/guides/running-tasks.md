@@ -221,7 +221,8 @@ cancelled. A continuous task that only other tasks depend on is stopped, like
 a cancelled command, once all of them have finished; that stop counts as
 success. A continuous task that exits by itself reports its exit status as
 usual. Continuous tasks are never cached, and cacheable tasks depending on one
-run uncached.
+run uncached, unless every `dependsOn` entry naming it sets `inputs: false`:
+as in Nx, the task is then keyed without it.
 
 With `readyWhen`, a string or an array of strings, a task is ready once every
 string has appeared in its output, on stdout or stderr. Its dependents start
