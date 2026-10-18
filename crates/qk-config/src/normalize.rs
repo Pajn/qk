@@ -317,7 +317,7 @@ struct Filtered<'a> {
     plugin: &'a str,
 }
 
-/// The target default for a target, as Nx 23 resolves it. Keys are tried in
+/// The target default for a target, as Nx 24 resolves it. Keys are tried in
 /// order: the target's executor, its name, then glob keys matching the name,
 /// longest first. A key's value is a default or an array of them, each with
 /// an optional `filter` on `projects`, `plugin` and `executor`; the first key
