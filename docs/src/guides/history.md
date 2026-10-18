@@ -15,7 +15,8 @@ differs from the previous key recorded for the task, grouped as `files` (with
 the paths added, removed and changed), `configuration` (the files qk keys for
 every task, such as `nx.json` and the task's own manifests, listed with
 `files`, and dependency manifests and `pnpm-workspace.yaml` as dependents read
-them), `env`, `runtime`, `dependencies` (with the dependency tasks),
+them), `env`, `runtime`, `dependencies` (the dependency outputs
+`dependentTasksOutputFiles` reads, by task and pattern),
 `lockfile` (with the importers and packages), `inputs`, `definition` (with each field that differs and both of its
 values), `args` and `tooling`, or `first`, `unchanged` and
 `unknown` when the previous inputs are no longer kept. For targets with warm

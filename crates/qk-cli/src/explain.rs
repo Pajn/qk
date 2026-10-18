@@ -421,7 +421,7 @@ pub fn tasks(
                 };
                 format!("{}{more}", reasons[0])
             }
-            qk_affected::TaskCause::DependsOn { task } => format!("depends on {task}"),
+            qk_affected::TaskCause::Reads { task } => format!("reads the outputs of {task}"),
         };
         match analysis.reachability.get(id) {
             Some(decision) => writeln!(out, "{id:width$}  {summary}; {decision}")?,

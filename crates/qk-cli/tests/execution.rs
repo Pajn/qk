@@ -823,42 +823,36 @@ fn continuous_thread_settings_do_not_reduce_finite_thread_shares() {
 }
 
 #[test]
-fn dependents_of_continuous_tasks_run_uncached_and_say_why() {
-    let temp = fixture(json!({
-        "serve": continuous_target("serve", "serve"),
-        "bench": {
-            "cache": true,
-            "dependsOn": ["serve"],
-            "executor": "nx:run-commands",
-            "options": helper_target("client", "bench")["options"].clone(),
-        },
-    }));
-    let output = success(run(temp.path(), &["run", "app:bench"]));
-    assert!(String::from_utf8_lossy(&output.stderr).contains(
-        "qk: app:bench: cache bypassed (depends on app:serve: continuous tasks are not fingerprinted)"
-    ));
-}
-
-#[test]
-fn dependents_leaving_out_a_continuous_task_s_inputs_are_cached() {
-    let temp = fixture(json!({
-        "serve": continuous_target("serve", "serve"),
-        "bench": {
-            "cache": true,
-            "inputs": [],
-            "dependsOn": [{"target": "serve", "inputs": false}],
-            "command": "echo ran >> runs.log",
-        },
-    }));
-    for _ in 0..2 {
-        let output = success(run(temp.path(), &["run", "app:bench"]));
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(!stderr.contains("cache bypassed"), "{stderr}");
+fn dependents_of_continuous_tasks_are_keyed_with_their_server_s_inputs() {
+    for (dependency, server_counts) in [
+        (json!("serve"), true),
+        (json!({"target": "serve", "inputs": false}), false),
+    ] {
+        let mut serve = continuous_target("serve", "serve");
+        serve["inputs"] = json!(["{projectRoot}/server.txt"]);
+        let temp = fixture(json!({
+            "serve": serve,
+            "bench": {
+                "cache": true,
+                "inputs": [],
+                "dependsOn": [dependency],
+                "command": "echo ran >> runs.log",
+            },
+        }));
+        fs::write(temp.path().join("server.txt"), "one").unwrap();
+        for _ in 0..2 {
+            let output = success(run(temp.path(), &["run", "app:bench"]));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!stderr.contains("cache bypassed"), "{stderr}");
+        }
+        // As in Nx, the server's inputs count as the task's own, unless its
+        // dependsOn entry leaves them out. On Windows, cmd writes `ran \r\n`.
+        fs::write(temp.path().join("server.txt"), "two").unwrap();
+        success(run(temp.path(), &["run", "app:bench"]));
+        let runs = fs::read_to_string(temp.path().join("runs.log")).unwrap();
+        let expected = if server_counts { 2 } else { 1 };
+        assert_eq!(runs.lines().count(), expected, "{dependency}: {runs:?}");
     }
-    // The second run is a cache hit, so the command ran once. On Windows,
-    // cmd writes `ran \r\n`.
-    let runs = fs::read_to_string(temp.path().join("runs.log")).unwrap();
-    assert_eq!(runs.lines().count(), 1, "{runs:?}");
 }
 
 /// `serve` creates `marker` after a pause and then announces it, and `e2e`

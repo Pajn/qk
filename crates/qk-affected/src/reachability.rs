@@ -267,7 +267,7 @@ pub enum Kept {
     },
     /// The task is affected by a change imports do not carry.
     Input { reason: TaskReason },
-    /// The task depends on an affected task, whose outputs it may read.
+    /// The task reads the declared outputs of an affected task.
     Dependency { task: String },
     /// The imports could not be followed.
     Unanswered { detail: String },
@@ -554,6 +554,7 @@ impl std::fmt::Display for TaskDecision {
 pub(crate) fn decide_tasks(
     workspace: &Workspace,
     graph: &TaskGraph,
+    producers: &crate::tasks::Producers,
     changes: &Changes,
     tasks: &BTreeMap<String, TaskCause>,
     configs: &Configs,
@@ -573,7 +574,7 @@ pub(crate) fn decide_tasks(
             continue;
         };
         let reasons = match cause {
-            TaskCause::DependsOn { task } => {
+            TaskCause::Reads { task } => {
                 let why = Kept::Dependency { task: task.clone() };
                 decisions.insert(id.clone(), TaskDecision::Whole { why });
                 continue;
@@ -690,28 +691,27 @@ pub(crate) fn decide_tasks(
         };
         decisions.insert(id, decision);
     }
-    run_dependents_whole(graph, tasks, &mut decisions);
+    run_dependents_whole(producers, tasks, &mut decisions);
     Ok(decisions)
 }
 
-/// Runs the whole of each narrowed task that depends on a task still
-/// affected, whose outputs it may read, although its own inputs are only
-/// sources its imports do not reach. A continuous task it depends on has no
-/// outputs it reads; its inputs are the task's own, which imports may narrow.
+/// Runs the whole of each narrowed task that reads the outputs of a task
+/// still affected, although its own inputs are only sources its imports do
+/// not reach.
 ///
 /// A task's cause names its own changes when it has any, so this is decided
-/// from the graph rather than the cause. A task stays affected when a change
-/// touches it and the profile does not leave it out, and so does every task
-/// depending on one, since that one is then run whole itself.
+/// from what each task reads rather than the cause. A task stays affected when
+/// a change touches it and the profile does not leave it out, and so does
+/// every task reading its outputs, since that one is then run whole itself.
 fn run_dependents_whole(
-    graph: &TaskGraph,
+    producers: &crate::tasks::Producers,
     tasks: &BTreeMap<String, TaskCause>,
     decisions: &mut BTreeMap<String, TaskDecision>,
 ) {
     let mut dependents: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    for id in graph.tasks.keys() {
-        for dependency in graph.producers(id) {
-            dependents.entry(dependency).or_default().push(id);
+    for (id, reads) in producers {
+        for producer in reads {
+            dependents.entry(producer).or_default().push(id);
         }
     }
     let mut pending: Vec<&str> = tasks

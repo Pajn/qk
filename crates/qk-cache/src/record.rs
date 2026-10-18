@@ -10,8 +10,6 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{combine_outputs, directory_output, file_output, link_output};
-
 #[derive(Serialize, Deserialize)]
 pub(super) struct ResultRecord {
     version: u32,
@@ -26,25 +24,6 @@ pub(crate) enum Artifact {
     File { blob: String, mode: u32 },
     Directory { mode: u32 },
     Symlink { target: String, directory: bool },
-}
-
-impl ResultRecord {
-    /// The output fingerprint of the stored artifacts, without reading any file.
-    pub(super) fn output_fingerprint(&self, declared: bool) -> Result<String> {
-        let files = self
-            .artifacts
-            .iter()
-            .map(|(path, artifact)| {
-                let value = match artifact {
-                    Artifact::File { blob, mode } => file_output(blob, *mode),
-                    Artifact::Directory { .. } => directory_output(),
-                    Artifact::Symlink { target, .. } => link_output(target),
-                };
-                (path.clone(), value)
-            })
-            .collect();
-        combine_outputs(&self.key, &files, declared)
-    }
 }
 
 /// One group's saved files, relative to its base directory.

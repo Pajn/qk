@@ -112,8 +112,7 @@ Under the profile, a task with settings that ordinary task selection affects
 is decided by its changed inputs:
 
 1. **A changed input that is not a source runs the whole task**, as do lockfile
-   installs, a deleted manifest and an affected task it depends on, whose
-   outputs it may read. A continuous task it depends on is not one of these:
+   installs, a deleted manifest and an affected task whose outputs it reads. A continuous task it depends on is not one of these:
    its inputs count as the task's own, so the profile decides them by imports
    like any other changed input. That holds whatever else touches the task, and for a
    dependency the profile keeps for any reason, such as an anchor importing a
@@ -205,8 +204,7 @@ fi
 ```
 
 Such a task runs without the cache, reads and writes both: its result covers
-the selected cases alone, so it must not stand for a run of every case, and
-tasks depending on it run uncached too. A suite's own rules, such as running
+the selected cases alone, so it must not stand for a run of every case. A suite's own rules, such as running
 the cases that show translated copy when a translation catalogue changes, stay
 in the suite, which can add cases to the list but should not drop them.
 

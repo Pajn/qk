@@ -35,6 +35,10 @@ pub struct Declared {
     pub json_fields: BTreeMap<String, JsonFields>,
     /// Packages named by `externalDependencies`.
     pub external: BTreeSet<String>,
+    /// The tasks whose declared outputs these inputs read, through
+    /// `dependentTasksOutputFiles` or a fileset selecting them. As in Nx, a
+    /// change carries from such a task to this one, and from no other.
+    pub producers: BTreeSet<String>,
 }
 
 /// What qk adds to every task's key on its own, each part by its own rule.

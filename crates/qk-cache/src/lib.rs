@@ -12,15 +12,15 @@ mod store;
 pub mod warm;
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use qk_config::Workspace;
 use qk_executor::{Capture, Outcome, PreparedTask, execute, execute_captured};
 use qk_taskgraph::{Task, TaskGraph};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 pub use evict::{Pruned, max_size, parse_size, prune, prune_automatic};
 pub use glob::Pattern;
@@ -50,10 +50,6 @@ pub struct Cache {
     cleanup: std::sync::Mutex<Option<store::Cleanup>>,
 }
 
-/// A task's output fingerprint for its dependents' keys, or why it has none:
-/// `"<task id>: <reason>"` for the task where fingerprinting first failed.
-pub type Fingerprint = std::result::Result<String, String>;
-
 /// Where a task's result came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -73,7 +69,6 @@ pub struct Execution {
 
 pub struct TaskResult {
     pub outcome: Outcome,
-    pub fingerprint: Fingerprint,
     pub cache: CacheStatus,
     /// The task's key and what it was computed from, when it has one.
     pub key: Option<(String, Value)>,
@@ -83,10 +78,9 @@ pub struct TaskResult {
 }
 
 impl TaskResult {
-    pub fn uncached(outcome: Outcome, reason: String) -> Self {
+    pub fn uncached(outcome: Outcome) -> Self {
         Self {
             outcome,
-            fingerprint: Err(reason),
             cache: CacheStatus::Uncached,
             key: None,
             warm: None,
@@ -188,10 +182,9 @@ impl Cache {
         graph: &TaskGraph,
         task: &Task,
         prepared: &PreparedTask,
-        dependencies: &BTreeMap<String, Fingerprint>,
         cancelled: &AtomicBool,
     ) -> Result<TaskResult> {
-        let result = self.run_task(workspace, graph, task, prepared, dependencies, cancelled);
+        let result = self.run_task(workspace, graph, task, prepared, cancelled);
         if let Some(Ok(snapshot)) = self.snapshot.get() {
             snapshot.outputs_written(workspace, task);
         }
@@ -204,7 +197,6 @@ impl Cache {
         graph: &TaskGraph,
         task: &Task,
         prepared: &PreparedTask,
-        dependencies: &BTreeMap<String, Fingerprint>,
         cancelled: &AtomicBool,
     ) -> Result<TaskResult> {
         let cacheable = task.definition.cache == Some(true);
@@ -291,42 +283,24 @@ impl Cache {
                 background,
             })
         };
-        let fallback = |reason: String| {
-            let _profile = profile::span(&task.id, "execute");
-            execute(prepared, cancelled).map(|outcome| TaskResult::uncached(outcome, reason))
-        };
-        // Reports why this task runs uncached, attributing the reason to this task.
+        // Reports why this task runs uncached.
         let bypass = |reason: String| {
             if cacheable {
                 qk_executor::status!("qk: {}: cache bypassed ({reason})", task.id);
             }
-            fallback(format!("{}: {reason}", task.id))
-        };
-        let dependencies = match dependencies
-            .iter()
-            .map(|(id, key)| key.clone().map(|key| (id.clone(), key)))
-            .collect::<std::result::Result<BTreeMap<_, _>, _>>()
-        {
-            Ok(dependencies) => dependencies,
-            Err(root) => {
-                // Keep the original task and reason so chains stay readable.
-                if cacheable {
-                    qk_executor::status!("qk: {}: cache bypassed (depends on {root})", task.id);
-                }
-                return fallback(root);
-            }
+            let _profile = profile::span(&task.id, "execute");
+            execute(prepared, cancelled).map(TaskResult::uncached)
         };
         let snapshot = match self.snapshot(workspace, graph) {
             Ok(snapshot) => snapshot,
             Err(reason) => return bypass(reason),
         };
         let dependency_profile = profile::span(&task.id, "dependency_inputs");
-        let dependencies =
-            match hash::dependency_keys(snapshot, workspace, graph, task, &dependencies, cancelled)
-            {
-                Ok(dependencies) => dependencies,
-                Err(error) => return bypass(format!("{error:#}")),
-            };
+        let dependencies = match hash::dependency_keys(snapshot, workspace, graph, task, cancelled)
+        {
+            Ok(dependencies) => dependencies,
+            Err(error) => return bypass(format!("{error:#}")),
+        };
         drop(dependency_profile);
         let input_profile = profile::span(&task.id, "inputs");
         let (key, inputs) = match hash::inputs(
@@ -353,43 +327,14 @@ impl Cache {
             Ok(outputs) => outputs,
             Err(error) => return bypass(format!("{error:#}")),
         };
-        // Only dependents read a fingerprint. Hashing the outputs of a task none
-        // depends on, after it ran, can mean reading gigabytes for nothing.
-        let depended_on = graph
-            .tasks
-            .values()
-            .any(|other| other.dependencies.contains(&task.id));
-        let fingerprint_outputs = |key: &str| {
-            if depended_on {
-                outputs_fingerprint(task, &workspace.root, &outputs, key)
-            } else {
-                Err(format!("{}: no task depends on it", task.id))
-            }
-        };
         if !cacheable {
             let restored = before(running);
             let executing = profile::span(&task.id, "execute");
             let outcome = execute(running, cancelled)?;
             drop(executing);
             let warm_report = after(outcome, restored, running);
-            let fingerprint = if self.unchanged(
-                snapshot,
-                workspace,
-                graph,
-                task,
-                prepared,
-                &dependencies,
-                &key,
-                outcome,
-                cancelled,
-            ) {
-                fingerprint_outputs(&key)
-            } else {
-                Err(format!("{}: did not complete unchanged", task.id))
-            };
             return Ok(TaskResult {
                 outcome,
-                fingerprint,
                 cache: CacheStatus::Uncached,
                 key: keyed,
                 warm: warm_report,
@@ -401,24 +346,10 @@ impl Cache {
             let executing = profile::span(&task.id, "execute");
             let outcome = execute_captured(running, cancelled, Some(&capture))?;
             drop(executing);
-            let inputs_unchanged = self.inputs_match(
-                snapshot,
-                workspace,
-                graph,
-                task,
-                prepared,
-                &dependencies,
-                &key,
-                cancelled,
-            );
-            let fingerprint = if outcome == Outcome::Success && inputs_unchanged {
-                fingerprint_outputs(&key)
-            } else {
-                Err(format!("{}: did not complete unchanged", task.id))
-            };
+            let inputs_unchanged =
+                self.inputs_match(snapshot, workspace, graph, task, prepared, &key, cancelled);
             return Ok(TaskResult {
                 outcome,
-                fingerprint,
                 cache: CacheStatus::Uncached,
                 key: keyed,
                 warm: None,
@@ -434,35 +365,25 @@ impl Cache {
         let (_lock, waited) = match self.lock(&key, cancelled) {
             Ok(Some(lock)) => lock,
             Ok(None) => {
-                return Ok(TaskResult::uncached(
-                    Outcome::Cancelled,
-                    format!("{}: cancelled", task.id),
-                ));
+                return Ok(TaskResult::uncached(Outcome::Cancelled));
             }
             Err(error) => return bypass(format!("cache lock unavailable: {error}")),
         };
         // Inputs may have changed while another worktree held this key's lock.
         if waited
-            && hash::recheck_dependency_keys(
-                snapshot,
-                workspace,
-                graph,
-                task,
-                &dependencies,
-                cancelled,
-            )
-            .and_then(|dependencies| {
-                hash::fingerprint(
-                    snapshot,
-                    workspace,
-                    task,
-                    prepared,
-                    &dependencies,
-                    cancelled,
-                )
-            })
-            .ok()
-            .as_ref()
+            && hash::recheck_dependency_keys(snapshot, workspace, graph, task, cancelled)
+                .and_then(|dependencies| {
+                    hash::fingerprint(
+                        snapshot,
+                        workspace,
+                        task,
+                        prepared,
+                        &dependencies,
+                        cancelled,
+                    )
+                })
+                .ok()
+                .as_ref()
                 != Some(&key)
         {
             return bypass("inputs changed while waiting for another run".into());
@@ -487,7 +408,7 @@ impl Cache {
                 qk_executor::Shown::LocalCache
             },
         ) {
-            Ok(Some(fingerprint)) => {
+            Ok(true) => {
                 let claimed = match &self.remote {
                     Some(remote) if prefetched && remote.claim(&key) => true,
                     Some(remote) => {
@@ -506,7 +427,6 @@ impl Cache {
                 });
                 return Ok(TaskResult {
                     outcome: Outcome::Success,
-                    fingerprint: Ok(fingerprint),
                     cache: if claimed {
                         CacheStatus::RemoteHit
                     } else {
@@ -517,7 +437,7 @@ impl Cache {
                     execution: None,
                 });
             }
-            Ok(None) => {}
+            Ok(false) => {}
             Err(error) => {
                 qk_executor::status!("qk: {}: ignoring unusable cache entry ({error})", task.id)
             }
@@ -529,7 +449,7 @@ impl Cache {
             drop(fetch_profile);
             let fetched = fetched.and_then(|found| {
                 if !found {
-                    return Ok(None);
+                    return Ok(false);
                 }
                 self.restore(
                     &workspace.root,
@@ -542,21 +462,20 @@ impl Cache {
                 )
             });
             match fetched {
-                Ok(Some(fingerprint)) => {
+                Ok(true) => {
                     qk_executor::report::event(qk_executor::report::Event::Cache {
                         id: task.id.clone(),
                         cached: qk_executor::report::Cached::RemoteHit,
                     });
                     return Ok(TaskResult {
                         outcome: Outcome::Success,
-                        fingerprint: Ok(fingerprint),
                         cache: CacheStatus::RemoteHit,
                         key: keyed,
                         warm: None,
                         execution: None,
                     });
                 }
-                Ok(None) => {}
+                Ok(false) => {}
                 Err(error) => {
                     qk_executor::status!("qk: {}: remote cache unavailable ({error:#})", task.id)
                 }
@@ -577,80 +496,35 @@ impl Cache {
         let outcome = execute_captured(running, cancelled, Some(&capture))?;
         drop(executing);
         let warm_report = after(outcome, restored, running);
-        let inputs_unchanged = self.inputs_match(
-            snapshot,
-            workspace,
-            graph,
-            task,
-            prepared,
-            &dependencies,
-            &key,
-            cancelled,
-        );
+        let inputs_unchanged =
+            self.inputs_match(snapshot, workspace, graph, task, prepared, &key, cancelled);
         let execution = capture.take_log().map(|log| Execution {
             log,
             inputs_unchanged,
         });
-        let fingerprint = if outcome != Outcome::Success || !inputs_unchanged {
-            Err(format!("{}: did not complete unchanged", task.id))
-        } else if !capture.healthy() {
-            fingerprint_outputs(&key)
-        } else {
-            // The saved manifest already hashes every output; reuse it.
+        if outcome == Outcome::Success && inputs_unchanged && capture.healthy() {
             let publishing = profile::span(&task.id, "publish");
             let published = self.publish(&workspace.root, &key, &outputs, log.path());
             drop(publishing);
             match published {
-                Ok(fingerprint) => {
+                Ok(()) => {
                     store::record_outputs(&workspace.root, &task.id, &key, &outputs);
                     if let Some(remote) = &self.remote {
                         remote.upload(&self.root, &key);
                     }
-                    Ok(fingerprint)
                 }
                 Err(error) => {
                     qk_executor::status!("qk: {}: could not save cache entry ({error})", task.id);
-                    fingerprint_outputs(&key)
                 }
             }
-        };
+        }
         Ok(TaskResult {
             outcome,
-            fingerprint,
             cache: CacheStatus::Miss,
             key: keyed,
             warm: warm_report,
             execution,
         })
-    }
-
-    /// Whether a successful task's inputs still match the key it ran under.
-    #[allow(clippy::too_many_arguments)]
-    fn unchanged(
-        &self,
-        snapshot: &hash::Snapshot,
-        workspace: &Workspace,
-        graph: &TaskGraph,
-        task: &Task,
-        prepared: &PreparedTask,
-        dependencies: &BTreeMap<String, String>,
-        before: &str,
-        outcome: Outcome,
-        cancelled: &AtomicBool,
-    ) -> bool {
-        if outcome != Outcome::Success || cancelled.load(Ordering::SeqCst) {
-            return false;
-        }
-        self.inputs_match(
-            snapshot,
-            workspace,
-            graph,
-            task,
-            prepared,
-            dependencies,
-            before,
-            cancelled,
-        )
     }
 
     /// Rechecks declared inputs for successful and failed executions alike.
@@ -662,7 +536,6 @@ impl Cache {
         graph: &TaskGraph,
         task: &Task,
         prepared: &PreparedTask,
-        dependencies: &BTreeMap<String, String>,
         before: &str,
         cancelled: &AtomicBool,
     ) -> bool {
@@ -670,24 +543,17 @@ impl Cache {
             return false;
         }
         let _profile = profile::span(&task.id, "inputs_recheck");
-        let after = hash::recheck_dependency_keys(
-            snapshot,
-            workspace,
-            graph,
-            task,
-            dependencies,
-            cancelled,
-        )
-        .and_then(|dependencies| {
-            hash::fingerprint(
-                snapshot,
-                workspace,
-                task,
-                prepared,
-                &dependencies,
-                cancelled,
-            )
-        });
+        let after = hash::recheck_dependency_keys(snapshot, workspace, graph, task, cancelled)
+            .and_then(|dependencies| {
+                hash::fingerprint(
+                    snapshot,
+                    workspace,
+                    task,
+                    prepared,
+                    &dependencies,
+                    cancelled,
+                )
+            });
         if after.as_deref().ok() != Some(before) {
             if task.definition.cache == Some(true) {
                 if self.reuse {
@@ -708,75 +574,12 @@ impl Cache {
     }
 }
 
-/// Per-output values for dependents' keys. Disk and manifest must agree exactly,
-/// so a dependent's key is the same whether this task was restored or executed.
-pub(crate) fn file_output(content: &str, mode: u32) -> Value {
-    json!({"content": content, "mode": mode})
-}
-
-pub(crate) fn link_output(target: &str) -> Value {
-    json!({"link": target})
-}
-
-pub(crate) fn directory_output() -> Value {
-    json!("directory")
-}
-
-/// What a task's dependents are keyed on. A task that declares outputs is
-/// known to them only through those outputs, so a run that reproduces them
-/// leaves its dependents cached however its own inputs changed. A task
-/// without declared outputs may affect its dependents in ways qk cannot see,
-/// so they are keyed on its inputs.
-pub(crate) fn combine_outputs(
-    input: &str,
-    files: &BTreeMap<String, Value>,
-    declared: bool,
-) -> Result<String> {
-    let identity = if declared { "declared outputs" } else { input };
-    Ok(blake3::hash(&serde_json::to_vec(&(identity, files))?)
-        .to_hex()
-        .to_string())
-}
-
-fn outputs_fingerprint(
-    task: &Task,
-    root: &Path,
-    outputs: &paths::Outputs,
-    input: &str,
-) -> Fingerprint {
-    output_fingerprint(root, outputs, input)
-        .map_err(|error| format!("{}: cannot fingerprint outputs: {error:#}", task.id))
-}
-
-fn output_fingerprint(root: &Path, outputs: &paths::Outputs, input: &str) -> Result<String> {
-    let mut files = BTreeMap::new();
-    for entry in outputs.entries(root)? {
-        let (path, metadata) = entry?;
-        paths::safe_parents(root, &path)?;
-        let absolute = root.join(&path);
-        let value = if metadata.file_type().is_symlink() {
-            link_output(
-                std::fs::read_link(absolute)?
-                    .to_str()
-                    .context("symlink target must be UTF-8")?,
-            )
-        } else if metadata.is_file() {
-            file_output(&hash::digest_file(&absolute)?, store::mode(&metadata))
-        } else {
-            directory_output()
-        };
-        files.insert(path, value);
-    }
-    combine_outputs(input, &files, outputs.declared())
-}
-
 /// A task's key, and the inputs it is computed from, or why it has none.
 pub type Keyed = std::result::Result<(String, Value), String>;
 
 /// The key each task in `graph` would be cached under if it ran now, and what
-/// it is computed from, without running a task. Runtime inputs are executed.
-/// A dependency counts as having succeeded, fingerprinted by its outputs as
-/// they are on disk.
+/// it is computed from, without running a task. Runtime inputs are executed,
+/// and the dependency outputs a task reads are taken as they are on disk.
 pub fn keys(
     workspace: &Workspace,
     graph: &TaskGraph,
@@ -784,53 +587,14 @@ pub fn keys(
     cancelled: &AtomicBool,
 ) -> Result<BTreeMap<String, Keyed>> {
     let snapshot = hash::Snapshot::new(workspace, graph, &paths::cache_location(workspace))?;
-    let mut keys = BTreeMap::new();
-    let mut fingerprints: BTreeMap<String, Fingerprint> = BTreeMap::new();
-    let mut pending: Vec<&Task> = graph.tasks.values().collect();
-    // Dependencies first, as the runner keys them.
-    while !pending.is_empty() {
-        let waiting = pending.len();
-        pending.retain(|task| {
-            if !task
-                .dependencies
-                .iter()
-                .all(|id| fingerprints.contains_key(id))
-            {
-                return true;
-            }
-            let keyed = key_now(
-                &snapshot,
-                workspace,
-                graph,
-                task,
-                prepared,
-                &fingerprints,
-                cancelled,
-            );
-            let fingerprint = if task.definition.continuous == Some(true) {
-                Err(format!(
-                    "{}: continuous tasks are not fingerprinted",
-                    task.id
-                ))
-            } else if !prepared[&task.id].ready_when.is_empty() {
-                Err(format!(
-                    "{}: tasks with readyWhen are not fingerprinted",
-                    task.id
-                ))
-            } else {
-                keyed.clone().and_then(|(key, _)| {
-                    let outputs = paths::Outputs::new(workspace, task)
-                        .map_err(|error| format!("{}: {error:#}", task.id))?;
-                    outputs_fingerprint(task, &workspace.root, &outputs, &key)
-                })
-            };
-            fingerprints.insert(task.id.clone(), fingerprint);
-            keys.insert(task.id.clone(), keyed);
-            false
-        });
-        anyhow::ensure!(pending.len() < waiting, "the task graph has a cycle");
-    }
-    Ok(keys)
+    Ok(graph
+        .tasks
+        .values()
+        .map(|task| {
+            let keyed = key_now(&snapshot, workspace, graph, task, prepared, cancelled);
+            (task.id.clone(), keyed)
+        })
+        .collect())
 }
 
 fn key_now(
@@ -839,17 +603,11 @@ fn key_now(
     graph: &TaskGraph,
     task: &Task,
     prepared: &BTreeMap<String, PreparedTask>,
-    fingerprints: &BTreeMap<String, Fingerprint>,
     cancelled: &AtomicBool,
 ) -> Keyed {
-    let dependencies = graph
-        .keyed_dependencies(&task.id)
-        .map(|id| fingerprints[id].clone().map(|key| (id.clone(), key)))
-        .collect::<std::result::Result<BTreeMap<_, _>, _>>()?;
     let failed = |error: anyhow::Error| format!("{}: {error:#}", task.id);
     let dependencies =
-        hash::dependency_keys(snapshot, workspace, graph, task, &dependencies, cancelled)
-            .map_err(failed)?;
+        hash::dependency_keys(snapshot, workspace, graph, task, cancelled).map_err(failed)?;
     let inputs = hash::inputs(
         snapshot,
         workspace,
@@ -947,10 +705,10 @@ mod tests {
         );
     }
 
-    /// Complete-directory restore preserves contents, links, modes, timestamps
-    /// and fingerprints, and the subsequent hit keeps restored files in place.
+    /// Complete-directory restore preserves contents, links, modes and
+    /// timestamps, and the subsequent hit keeps restored files in place.
     #[test]
-    fn manifest_and_disk_output_fingerprints_agree() {
+    fn complete_directory_restores_preserve_outputs() {
         let workspace = tempfile::tempdir().unwrap();
         let root = workspace.path();
         std::fs::create_dir_all(root.join("dist/nested/empty")).unwrap();
@@ -983,8 +741,7 @@ mod tests {
         cache.initialize().unwrap();
         let outputs = paths::Outputs::from_patterns(&["dist", "bundle"]);
         let key = "0".repeat(64);
-        let saved = cache.publish(root, &key, &outputs, &log).unwrap();
-        assert_eq!(saved, output_fingerprint(root, &outputs, &key).unwrap());
+        cache.publish(root, &key, &outputs, &log).unwrap();
 
         #[cfg(unix)]
         {
@@ -1011,8 +768,7 @@ mod tests {
                 qk_executor::Shown::LocalCache,
             )
             .unwrap();
-        assert_eq!(restored, Some(saved.clone()));
-        assert_eq!(saved, output_fingerprint(root, &outputs, &key).unwrap());
+        assert!(restored);
         assert!(root.join("dist/nested/empty").is_dir());
         assert!(root.join("bundle/empty").is_dir());
         assert_eq!(
@@ -1023,7 +779,7 @@ mod tests {
         {
             assert_eq!(
                 std::fs::read_link(root.join("dist/link")).unwrap(),
-                Path::new("nested/a.txt")
+                std::path::Path::new("nested/a.txt")
             );
             assert_eq!(
                 store::mode(&std::fs::metadata(root.join("dist/run.sh")).unwrap()),
@@ -1052,7 +808,7 @@ mod tests {
                 qk_executor::Shown::LocalCache,
             )
             .unwrap();
-        assert_eq!(kept, Some(saved));
+        assert!(kept);
         assert_eq!(
             std::fs::metadata(&path).unwrap().modified().unwrap(),
             modified

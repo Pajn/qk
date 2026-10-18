@@ -332,7 +332,6 @@ pub fn run(
     // Tasks that exited before the check something waits for passed.
     let mut exited_unready: BTreeSet<String> = BTreeSet::new();
     let mut outcomes = BTreeMap::new();
-    let mut fingerprints: BTreeMap<String, qk_cache::Fingerprint> = BTreeMap::new();
     let warm = graph
         .tasks
         .values()
@@ -643,15 +642,6 @@ pub fn run(
                         if !announced.contains(&id) {
                             prepared[&id].ready.store(true, Ordering::SeqCst);
                         }
-                        // Dependents start while it runs, and its live state cannot be keyed.
-                        fingerprints.insert(
-                            id.clone(),
-                            Err(if is_continuous {
-                                format!("{id}: continuous tasks are not fingerprinted")
-                            } else {
-                                format!("{id}: tasks with readyWhen are not fingerprinted")
-                            }),
-                        );
                         let stop = Arc::new(AtomicBool::new(false));
                         stops.insert(id.clone(), stop.clone());
                         let waited = waiters.contains_key(id.as_str());
@@ -686,9 +676,7 @@ pub fn run(
                         scope.spawn(move || {
                             let result = match invalid {
                                 Some(reason) => Err(anyhow::anyhow!(reason)),
-                                None => execute(&task, &stop).map(|outcome| {
-                                    qk_cache::TaskResult::uncached(outcome, String::new())
-                                }),
+                                None => execute(&task, &stop).map(qk_cache::TaskResult::uncached),
                             };
                             let _ = sender.send((id, result));
                         });
@@ -707,31 +695,13 @@ pub fn run(
                         task.execution
                             .insert("QK_AFFECTED_CASES".into(), path.as_os_str().to_owned());
                     }
-                    let dependency_keys = graph
-                        .keyed_dependencies(&id)
-                        .map(|id| (id.clone(), fingerprints[id].clone()))
-                        .collect::<BTreeMap<_, _>>();
                     let cache = cache.as_ref().filter(|_| narrowed.is_none());
-                    let uncached = if narrowed.is_some() {
-                        "runs only the cases a change reaches"
-                    } else {
-                        "cache disabled"
-                    };
                     let cancelled = cancelled.clone();
                     scope.spawn(move || {
                         let result = if let Some(cache) = cache {
-                            cache.run(
-                                workspace,
-                                graph,
-                                definition,
-                                &task,
-                                &dependency_keys,
-                                &cancelled,
-                            )
+                            cache.run(workspace, graph, definition, &task, &cancelled)
                         } else {
-                            execute(&task, &cancelled).map(|outcome| {
-                                qk_cache::TaskResult::uncached(outcome, uncached.into())
-                            })
+                            execute(&task, &cancelled).map(qk_cache::TaskResult::uncached)
                         };
                         let _ = sender.send((id, result));
                     });
@@ -816,20 +786,14 @@ pub fn run(
                             }
                         }
                         let (outcome, cache, key, warm, execution) = match result {
-                            Ok(result) => {
-                                if !serving.contains(&id) {
-                                    fingerprints.insert(id.clone(), result.fingerprint);
-                                }
-                                (
-                                    result.outcome,
-                                    result.cache,
-                                    result.key,
-                                    result.warm,
-                                    result.execution,
-                                )
-                            }
+                            Ok(result) => (
+                                result.outcome,
+                                result.cache,
+                                result.key,
+                                result.warm,
+                                result.execution,
+                            ),
                             Err(error) => {
-                                fingerprints.insert(id.clone(), Err(format!("{id}: {error:#}")));
                                 qk_executor::status!("qk: {id}: {error:#}");
                                 (
                                     Outcome::Failed(1),
