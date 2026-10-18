@@ -116,11 +116,44 @@ fn discovers_workspace_from_nested_project_and_shows_normalized_configuration() 
 }
 
 #[test]
-fn graph_file_matches_stdout_and_is_relative_to_invocation_directory() {
+fn show_project_defaults_to_the_current_directory_s_project_as_in_nx() {
+    let show = |directory: &str, args: &[&str]| {
+        let output = qk_in(directory, args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    // `--json` is one line, as Nx prints it.
+    let json = show("apps/web/worker", &["show", "project", "--json"]);
+    assert_eq!(json.lines().count(), 1);
+    assert_eq!(
+        serde_json::from_str::<Value>(&json).unwrap()["name"],
+        "worker"
+    );
+    // A pattern matching one project names it.
+    let json = show(".", &["show", "project", "we*", "--json"]);
+    assert_eq!(serde_json::from_str::<Value>(&json).unwrap()["name"], "web");
+    // Without `--json`, Nx's summary.
+    let summary = show("apps/web", &["show", "project"]);
+    assert!(
+        summary.starts_with("Name: web\nRoot: apps/web\n"),
+        "{summary}"
+    );
+    assert!(summary.contains("- build:  echo build web"), "{summary}");
+}
+
+#[test]
+fn graph_file_matches_stdout_and_is_relative_to_the_workspace_root() {
     let temp = TempDir::new().unwrap();
+    let file = temp.path().join("graph.json");
     let output = isolated_command(env!("CARGO_BIN_EXE_qk"))
         .current_dir(temp.path())
-        .args(["graph", "--file", "graph.json", "--workspace"])
+        .arg("graph")
+        .arg(format!("--file={}", file.display()))
+        .arg("--workspace")
         .arg(fixture())
         .output()
         .unwrap();
@@ -130,10 +163,39 @@ fn graph_file_matches_stdout_and_is_relative_to_invocation_directory() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(output.stdout.is_empty());
-    let file: Value =
-        serde_json::from_slice(&std::fs::read(temp.path().join("graph.json")).unwrap()).unwrap();
+    let file: Value = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
     assert_eq!(file, successful_json(qk(&["graph"])));
     assert_eq!(file["graph"]["nodes"]["web"]["data"]["root"], "apps/web");
+    assert_eq!(file, successful_json(qk(&["graph", "--file", "stdout"])));
+
+    // As in Nx, a relative path is the workspace root's, and its directories
+    // are created.
+    let workspace = TempDir::new().unwrap();
+    std::fs::write(workspace.path().join("nx.json"), "{}").unwrap();
+    std::fs::create_dir_all(workspace.path().join("app")).unwrap();
+    std::fs::write(
+        workspace.path().join("app/project.json"),
+        r#"{"name":"app"}"#,
+    )
+    .unwrap();
+    let graph = |file: &str| {
+        isolated_command(env!("CARGO_BIN_EXE_qk"))
+            .current_dir(workspace.path().join("app"))
+            .args(["graph", "--file", file])
+            .output()
+            .unwrap()
+    };
+    assert!(graph("out/nested/graph.json").status.success());
+    assert!(workspace.path().join("out/nested/graph.json").is_file());
+    for file in ["graph.html", "graph.txt"] {
+        let output = graph(file);
+        assert_eq!(output.status.code(), Some(1), "{file}");
+        assert!(!workspace.path().join(file).exists());
+    }
+    assert!(
+        String::from_utf8_lossy(&graph("graph.txt").stderr)
+            .contains("Please specify a filename with either .json or .html extension.")
+    );
 }
 
 #[test]

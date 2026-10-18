@@ -25,6 +25,10 @@ pub struct Options {
     all: bool,
     #[arg(short = 'd', long)]
     include_dependencies: bool,
+    /// Also react to files that belong to no project, such as root
+    /// configuration, as Nx's hidden `--includeGlobalWorkspaceFiles`.
+    #[arg(short = 'g', long)]
+    include_global_workspace_files: bool,
     #[arg(short = 'i', long)]
     initial_run: bool,
     #[arg(long)]
@@ -190,6 +194,15 @@ impl View {
             || self.outputs.iter().any(|outputs| outputs.matches(path))
     }
 
+    /// Whether a file belongs to no project at all.
+    fn global(&self, path: &str) -> bool {
+        !self
+            .workspace
+            .projects
+            .values()
+            .any(|project| project.root == "." || Path::new(path).starts_with(&project.root))
+    }
+
     /// A file belongs to the project whose root contains it most specifically.
     fn owner(&self, path: &str) -> Option<String> {
         self.workspace
@@ -215,9 +228,15 @@ pub fn run(workspace: &Workspace, options: Options) -> Result<i32> {
     if options.command.is_empty() {
         bail!("watch needs a command after --");
     }
+    let command = options.command.join(" ");
+    // As in Nx: a global file has no project to name.
+    if options.include_global_workspace_files && command.contains("NX_PROJECT_NAME") {
+        bail!(
+            "The command you provided has a replacement for projects ($NX_PROJECT_NAME), but you are also including global workspace files. You cannot use a replacement for projects when including global workspace files because there will be scenarios where there are file changes not associated with a project."
+        );
+    }
     let root = workspace.root.canonicalize()?;
     let cwd = std::env::current_dir()?;
-    let command = options.command.join(" ");
     let cancelled = Arc::new(AtomicBool::new(false));
     let signal = cancelled.clone();
     ctrlc::set_handler(move || signal.store(true, Ordering::SeqCst))
@@ -278,8 +297,9 @@ pub fn run(workspace: &Workspace, options: Options) -> Result<i32> {
                 Err(mpsc::RecvTimeoutError::Disconnected) => bail!("filesystem watcher stopped"),
             }
         }
+        let global = options.include_global_workspace_files;
         if !reload && view.reusable_for(&paths) {
-            let files = changed_files(&view, &view, &paths);
+            let files = changed_files(&view, &view, &paths, global);
             let projects = files.iter().filter_map(|file| view.owner(file)).collect();
             if !files.is_empty() {
                 callbacks(&command, &cwd, &projects, &files, &options, &cancelled)?;
@@ -296,21 +316,27 @@ pub fn run(workspace: &Workspace, options: Options) -> Result<i32> {
                 continue;
             }
         };
-        let files = changed_files(&view, &next, &paths);
+        let files = changed_files(&view, &next, &paths, global);
         let projects: BTreeSet<_> = files
             .iter()
             .filter_map(|file| next.owner(file).or_else(|| view.owner(file)))
             .collect();
         view = next;
-        if !projects.is_empty() {
+        if !projects.is_empty() || (global && !files.is_empty()) {
             callbacks(&command, &cwd, &projects, &files, &options, &cancelled)?;
         }
     }
     Ok(130)
 }
 
-/// Select changed sources using current policy, preserving deleted-file ownership.
-fn changed_files(previous: &View, next: &View, paths: &BTreeSet<String>) -> BTreeSet<String> {
+/// Select changed sources using current policy, preserving deleted-file
+/// ownership; with `global`, also files of no project.
+fn changed_files(
+    previous: &View,
+    next: &View,
+    paths: &BTreeSet<String>,
+    global: bool,
+) -> BTreeSet<String> {
     previous
         .files
         .union(&next.files)
@@ -322,7 +348,9 @@ fn changed_files(previous: &View, next: &View, paths: &BTreeSet<String>) -> BTre
                 && (next.files.contains(*file)
                     || std::fs::symlink_metadata(next.workspace.root.join(file))
                         .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound))
-                && (previous.owner(file).is_some() || next.owner(file).is_some())
+                && (previous.owner(file).is_some()
+                    || next.owner(file).is_some()
+                    || (global && next.global(file)))
         })
         .cloned()
         .collect()
@@ -466,6 +494,7 @@ mod tests {
             projects: Vec::new(),
             all: true,
             include_dependencies: false,
+            include_global_workspace_files: false,
             initial_run: false,
             verbose: false,
             command: vec!["echo changed".into()],
@@ -552,6 +581,7 @@ mod tests {
             projects: Vec::new(),
             all: true,
             include_dependencies: false,
+            include_global_workspace_files: false,
             initial_run: false,
             verbose: false,
             command: vec!["echo changed".into()],
@@ -567,9 +597,37 @@ mod tests {
             &before,
             &mut paths,
         );
-        let files = changed_files(&before, &after, &paths);
+        let files = changed_files(&before, &after, &paths, false);
         assert!(!files.contains("app/source.txt"));
         assert!(files.contains("app/deleted.txt"));
+    }
+
+    /// As Nx's `--includeGlobalWorkspaceFiles`, files of no project count.
+    #[test]
+    fn global_workspace_files_count_only_when_asked_for() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir(root.join("app")).unwrap();
+        for (path, text) in [
+            ("nx.json", "{}"),
+            ("tsconfig.base.json", "{}"),
+            ("app/project.json", r#"{"name":"app"}"#),
+        ] {
+            std::fs::write(root.join(path), text).unwrap();
+        }
+        let options = Options {
+            projects: Vec::new(),
+            all: true,
+            include_dependencies: false,
+            include_global_workspace_files: true,
+            initial_run: false,
+            verbose: false,
+            command: vec!["echo changed".into()],
+        };
+        let view = View::load(root, &options).unwrap();
+        let paths = BTreeSet::from(["tsconfig.base.json".to_owned()]);
+        assert!(changed_files(&view, &view, &paths, false).is_empty());
+        assert!(changed_files(&view, &view, &paths, true).contains("tsconfig.base.json"));
     }
 
     /// Replacing a logical preset symlink reloads even when the backend says Any.
@@ -586,6 +644,7 @@ mod tests {
             projects: Vec::new(),
             all: true,
             include_dependencies: false,
+            include_global_workspace_files: false,
             initial_run: false,
             verbose: false,
             command: vec!["echo changed".into()],
@@ -630,6 +689,7 @@ mod tests {
             projects: Vec::new(),
             all: true,
             include_dependencies: false,
+            include_global_workspace_files: false,
             initial_run: false,
             verbose: false,
             command: vec!["echo changed".into()],
@@ -669,6 +729,7 @@ mod tests {
             projects: Vec::new(),
             all: true,
             include_dependencies: false,
+            include_global_workspace_files: false,
             initial_run: false,
             verbose: false,
             command: vec!["echo changed".into()],
@@ -707,6 +768,7 @@ mod tests {
             projects: Vec::new(),
             all: true,
             include_dependencies: false,
+            include_global_workspace_files: false,
             initial_run: false,
             verbose: false,
             command: vec!["echo changed".into()],
@@ -738,7 +800,7 @@ mod tests {
         let reloaded = View::load(root, &options).unwrap();
         assert!(reloaded.files.contains("app/ignored.txt"));
         assert!(paths.contains(""));
-        assert!(changed_files(&view, &reloaded, &paths).contains("app/ignored.txt"));
+        assert!(changed_files(&view, &reloaded, &paths, false).contains("app/ignored.txt"));
         paths.clear();
         add_event(
             Event::new(EventKind::Any).add_path(root.join("app/ignored.txt")),
@@ -759,6 +821,7 @@ mod tests {
             projects: Vec::new(),
             all: true,
             include_dependencies: false,
+            include_global_workspace_files: false,
             initial_run: false,
             verbose: false,
             command: vec!["echo changed".into()],

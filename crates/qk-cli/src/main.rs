@@ -152,8 +152,8 @@ enum Command {
     },
     /// Export the workspace project graph as JSON.
     Graph {
-        /// Output file; use - or stdout for stdout. Paths are relative to the
-        /// current directory.
+        /// A `.json` file to write, as in Nx relative to the workspace root;
+        /// `stdout`, or qk's `-`, for stdout.
         #[arg(long, value_name = "PATH", default_value = "-")]
         file: PathBuf,
         /// Write to stdout, as `--file -`.
@@ -687,6 +687,9 @@ enum ShowCommand {
         /// Separate names with this instead of a line each.
         #[arg(long)]
         sep: Option<String>,
+        /// Nx's `--verbose`, which only changes how its errors print.
+        #[arg(long, hide = true)]
+        verbose: bool,
     },
     /// Explain which projects are affected and why; with a project, the path
     /// from it to the change that affects it.
@@ -765,10 +768,20 @@ enum ShowCommand {
     },
     /// Replay retained stdout and stderr from one actual cacheable execution.
     Log { run: String, task: String },
-    /// Show a project's normalized configuration.
+    /// Show a project's normalized configuration: by default the project
+    /// containing the current directory, or a pattern matching one project.
     Project {
-        name: String,
-        /// Emit JSON (currently the default and only format).
+        #[arg(value_name = "PROJECT")]
+        name: Option<String>,
+        #[arg(
+            short = 'p',
+            long = "project-name",
+            hide = true,
+            conflicts_with = "name"
+        )]
+        project_name: Option<String>,
+        /// Emit the configuration as one line of JSON, as Nx does; without
+        /// it, a summary.
         #[arg(long)]
         json: bool,
     },
@@ -1285,6 +1298,7 @@ fn run(mut cli: Cli) -> Result<i32> {
                     kind,
                     json,
                     sep,
+                    ..
                 },
         } => {
             let mut selected = select_projects(&workspace.projects, &projects, &exclude)?;
@@ -1446,8 +1460,21 @@ fn run(mut cli: Cli) -> Result<i32> {
             command: ShowCommand::Log { run, task },
         } => history::show_log(&workspace, &run, &task)?,
         Command::Show {
-            command: ShowCommand::Project { name, .. },
+            command:
+                ShowCommand::Project {
+                    name,
+                    project_name,
+                    json,
+                },
         } => {
+            let name = match name.or(project_name) {
+                Some(name) => name,
+                None => current_project(&workspace).map_err(|_| {
+                    anyhow::anyhow!(
+                        "Could not find a project in the current working directory; name one as `qk show project <project-name>`"
+                    )
+                })?,
+            };
             // As Nx: a name that is no project is a pattern matching one.
             let name = if workspace.projects.contains_key(&name) {
                 name
@@ -1465,7 +1492,14 @@ fn run(mut cli: Cli) -> Result<i32> {
             };
             // The graph's node, with implicit dependencies expanded.
             let graph = ProjectGraph::build(&workspace)?;
-            print_json(&graph.nodes[&name].data)?;
+            let project = &graph.nodes[&name].data;
+            let mut stdout = io::stdout().lock();
+            if json {
+                serde_json::to_writer(&mut stdout, project)?;
+                writeln!(stdout)?;
+            } else {
+                write!(stdout, "{}", project_summary(&workspace, project))?;
+            }
         }
         Command::Graph {
             file,
@@ -1495,8 +1529,27 @@ fn run(mut cli: Cli) -> Result<i32> {
             if print || file.as_os_str() == "-" || file.as_os_str() == "stdout" {
                 io::stdout().lock().write_all(&bytes)?;
             } else {
-                std::fs::write(&file, bytes)
-                    .with_context(|| format!("cannot write graph to {}", file.display()))?;
+                // As in Nx: relative to the workspace root, with its
+                // directories created, and only JSON.
+                let path = workspace.root.join(&file);
+                match path.extension().and_then(|extension| extension.to_str()) {
+                    Some("json") => {}
+                    Some("html") => bail!(
+                        "qk writes the graph as JSON only; the HTML graph viewer is Nx's. You provided --file={}",
+                        file.display()
+                    ),
+                    _ => bail!(
+                        "Please specify a filename with either .json or .html extension. You provided --file={}",
+                        file.display()
+                    ),
+                }
+                if let Some(directory) = path.parent() {
+                    std::fs::create_dir_all(directory)
+                        .with_context(|| format!("cannot create {}", directory.display()))?;
+                }
+                std::fs::write(&path, bytes)
+                    .with_context(|| format!("cannot write graph to {}", path.display()))?;
+                eprintln!("qk: JSON output created in {}", path.display());
             }
         }
     }
@@ -2130,6 +2183,69 @@ fn nx_task_graph(workspace: &Workspace, graph: &TaskGraph) -> Result<serde_json:
             "continuousDependencies": continuous_dependencies,
         },
     }))
+}
+
+/// A project as `nx show project` prints it without `--json`: its name,
+/// root, source root, tags and implicit dependencies, then each target with
+/// its command, script or executor, and its configurations.
+fn project_summary(workspace: &Workspace, project: &qk_config::Project) -> String {
+    let paint = ui::Paint::stdout();
+    let mut text = String::new();
+    let mut field = |label: &str, value: Option<String>| {
+        if let Some(value) = value.filter(|value| !value.is_empty()) {
+            text.push_str(&format!("{}: {value}\n", paint.bold(label)));
+        }
+    };
+    field("Name", Some(project.name.clone()));
+    field("Root", Some(project.root.clone()));
+    field("Source Root", project.source_root.clone());
+    field("Tags", Some(project.tags.join(",")));
+    field(
+        "Implicit Dependencies",
+        Some(project.implicit_dependencies.join(",")),
+    );
+    if project.targets.is_empty() {
+        return text;
+    }
+    let name_width = project.targets.keys().map(String::len).max().unwrap_or(0);
+    let executor_width = project
+        .targets
+        .values()
+        .map(|target| target.executor.as_deref().map_or(0, str::len))
+        .max()
+        .unwrap_or(0);
+    text.push_str(&format!("{}: \n", paint.bold("Targets")));
+    for (name, target) in &project.targets {
+        let option = |key: &str| target.options.get(key).and_then(serde_json::Value::as_str);
+        // A package script's content stands in for its executor, as Nx's
+        // metadata.scriptContent does.
+        let script = (target.executor.as_deref() == Some("nx:run-script"))
+            .then(|| option("script"))
+            .flatten()
+            .and_then(|script| workspace.packages.get(&project.name)?.scripts.get(script));
+        let commands = target
+            .options
+            .get("commands")
+            .and_then(serde_json::Value::as_array);
+        let command = script
+            .map(String::as_str)
+            .or_else(|| option("command"))
+            .or_else(|| match commands.map(Vec::as_slice) {
+                Some([command]) => command.as_str(),
+                _ => None,
+            })
+            .or(target.executor.as_deref())
+            .unwrap_or("");
+        let configurations: Vec<&str> = target.configurations.keys().map(String::as_str).collect();
+        let label = format!("{name}:");
+        text.push_str(&format!(
+            "- {} {command:width$} {}\n",
+            paint.bold(&format!("{label:width$}", width = name_width + 2)),
+            paint.dim(&configurations.join(", ")),
+            width = executor_width + 2,
+        ));
+    }
+    text
 }
 
 fn print_json(value: &impl serde::Serialize) -> Result<()> {

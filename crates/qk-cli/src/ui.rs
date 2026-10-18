@@ -31,6 +31,17 @@ impl Paint {
         )
     }
 
+    /// Colours for stdout on a terminal, as `stderr` decides for stderr.
+    pub fn stdout() -> Self {
+        let set = |name| std::env::var_os(name).is_some();
+        let forced = qk_executor::force_colour();
+        Self(
+            !set("NO_COLOR")
+                && forced != Some(false)
+                && (forced == Some(true) || std::io::stdout().is_terminal()),
+        )
+    }
+
     /// Colours for a static log, following picocolors as task output does:
     /// also in CI, whose log viewers render them.
     pub fn log() -> Self {
@@ -54,10 +65,10 @@ impl Paint {
         }
     }
 
-    fn bold(self, text: &str) -> String {
+    pub fn bold(self, text: &str) -> String {
         self.wrap("1", text)
     }
-    fn dim(self, text: &str) -> String {
+    pub fn dim(self, text: &str) -> String {
         self.wrap("2", text)
     }
     fn red(self, text: &str) -> String {
