@@ -83,6 +83,12 @@ When a name occurs in multiple sections, precedence is `dependencies`,
   root in the outputs a target without `outputs` takes. Nx inserts them as
   they are, which turns such a root into a pattern that misses the project's
   files.
+- `pnpm-workspace.yaml` and `lerna.json` name workspace packages in a
+  workspace without a root `package.json` too; Nx then reads no workspace
+  patterns.
+- Project discovery ignores the machine's global Git excludes, and the
+  `.gitignore` files above a workspace that is not in a Git repository;
+  Nx reads both, so what they hide depends on the machine.
 - An unnamed project at the workspace root is named after the workspace
   directory; Nx names it `.`. Two configurations giving the same `root` are
   an error, where Nx merges them into one project, and a `root` outside the

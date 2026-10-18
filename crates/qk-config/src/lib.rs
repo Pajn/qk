@@ -283,7 +283,9 @@ impl Workspace {
         // A wrong `cli.packageManager` fails only what runs scripts.
         let package_manager = workspace.package_manager_name().unwrap_or("npm");
         let mut roots = BTreeMap::new();
-        for (directory, in_workspaces) in discovery::project_directories(&root)? {
+        for (directory, in_workspaces) in
+            discovery::project_directories(&root, &mut workspace.warnings)?
+        {
             let project_json = read_optional_json(&directory.join("project.json"))?;
             let local = read_optional_json(&directory.join(LOCAL_OVERRIDES))?;
             let package: Option<Package> = read_optional_json(&directory.join("package.json"))?

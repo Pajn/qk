@@ -1651,3 +1651,29 @@ exec "$QK_TEST_REAL_GIT" "$@"
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("apps/stray/generated/runtime.js"));
 }
+
+#[test]
+fn every_package_json_is_a_project_when_nx_is_told_to_infer_them_all() {
+    let temp = TempDir::new().unwrap();
+    std::fs::write(temp.path().join("nx.json"), "{}").unwrap();
+    std::fs::create_dir_all(temp.path().join("tools/script")).unwrap();
+    std::fs::write(
+        temp.path().join("tools/script/package.json"),
+        r#"{"name": "script"}"#,
+    )
+    .unwrap();
+    let projects = |infer: &str| {
+        let output = isolated_command(env!("CARGO_BIN_EXE_qk"))
+            .current_dir(temp.path())
+            .env("NX_INFER_ALL_PACKAGE_JSONS", infer)
+            .args(["show", "projects", "--json"])
+            .output()
+            .unwrap();
+        successful_json(output)
+    };
+    assert_eq!(projects("false"), json!([]));
+    assert_eq!(projects("true"), json!(["script"]));
+    // Nx reads the variable only without a root package.json.
+    std::fs::write(temp.path().join("package.json"), r#"{"name": "root"}"#).unwrap();
+    assert_eq!(projects("true"), json!([]));
+}

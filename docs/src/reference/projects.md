@@ -8,16 +8,31 @@ with an `nx` object, also works when no parent workspace marker exists.
 ## Workspace membership
 
 qk discovers `project.json` files, including nested projects, and package
-manifests selected by pnpm workspace globs or `package.json` workspaces.
-pnpm patterns take precedence; exclusion globs win. An explicit
-`project.json` remains a project outside package globs.
-The root package is a project when it has an `nx` object or adjacent
-`project.json`.
+manifests the package manager's workspaces take in, as Nx's package.json
+plugin does. The workspace patterns are those of the root `package.json`
+`workspaces` (an array, or an object's `packages`), `pnpm-workspace.yaml`
+`packages` and `lerna.json` `packages` together; a `lerna.json` without
+`packages` means `packages/*`. A pattern names directories, or package.json
+files when it ends in `/package.json`. Patterns are minimatch globs without
+the `dot` option, so `*` and `**` pass over directories starting with `.`.
+`!` patterns exclude, and with exclusions alone every package.json not
+excluded is taken in. An unreadable `pnpm-workspace.yaml` or `lerna.json` warns and
+adds none.
 
-Discovery respects workspace ignore files, skips symlink directories, and
-excludes `node_modules`, `.git`, `.nx`, `.qk`, `.pnpm-store`, and the root
-Cargo `target` directory. Parent and global Git ignore rules do not affect
-it. Other hidden project directories remain discoverable.
+A `package.json` beside a `project.json` is part of that project whether the
+workspaces take it in or not. The root package is a project when it has an
+`nx` object or an adjacent `project.json`. With
+`NX_INFER_ALL_PACKAGE_JSONS=true`, a workspace without a root `package.json`
+takes in every package.json, as in Nx.
+
+Discovery reads `.gitignore` and `.nxignore` files with Git's rules, in the
+workspace and, when the workspace is inside a Git repository, the
+repository's `.gitignore` files above it, as Nx does. It does not follow
+symbolic links, and leaves out `node_modules`, `.git`, `.nx/cache`,
+`.nx/workspace-data`, `.yarn/cache` and qk's `.qk` wherever they are. Other
+hidden directories remain discoverable. Unlike Nx, qk does not read the
+machine's global Git excludes, or `.gitignore` files above a workspace that is
+not in a Git repository.
 
 ## Configuration precedence
 

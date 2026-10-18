@@ -139,11 +139,15 @@ fn ignores_generated_and_gitignored_directories_without_requiring_git() {
     let temp = TempDir::new().unwrap();
     write(temp.path(), "nx.json", "{}");
     write(temp.path(), ".gitignore", "ignored/\n");
+    // ripgrep's `.ignore` files are not Nx's.
+    write(temp.path(), ".ignore", "hidden-by-ignore/\n");
     for directory in [
         "node_modules/foo",
-        "target",
+        "a/node_modules/foo",
         ".git",
-        ".nx",
+        ".nx/cache",
+        ".nx/workspace-data",
+        ".yarn/cache",
         ".qk",
         "ignored",
     ] {
@@ -153,12 +157,36 @@ fn ignores_generated_and_gitignored_directories_without_requiring_git() {
             "invalid JSON",
         );
     }
-    write(temp.path(), ".hidden/project.json", r#"{"name":"visible"}"#);
+    for (directory, name) in [
+        (".hidden", "visible"),
+        ("target", "target"),
+        (".nx/tools", "nx-tools"),
+        ("hidden-by-ignore", "ignore-file"),
+    ] {
+        write(
+            temp.path(),
+            &format!("{directory}/project.json"),
+            &format!(r#"{{"name":"{name}"}}"#),
+        );
+    }
     let workspace = Workspace::load(temp.path()).unwrap();
     assert_eq!(
         workspace.projects.keys().collect::<Vec<_>>(),
-        vec!["visible"]
+        vec!["ignore-file", "nx-tools", "target", "visible"]
     );
+}
+
+#[test]
+fn reads_the_repository_gitignores_above_a_nested_workspace() {
+    let temp = TempDir::new().unwrap();
+    std::fs::create_dir(temp.path().join(".git")).unwrap();
+    write(temp.path(), ".gitignore", "generated/\n");
+    let root = temp.path().join("workspace");
+    write(&root, "nx.json", "{}");
+    write(&root, "generated/project.json", "invalid JSON");
+    write(&root, "app/project.json", r#"{"name":"app"}"#);
+    let workspace = Workspace::load(&root).unwrap();
+    assert_eq!(workspace.projects.keys().collect::<Vec<_>>(), vec!["app"]);
 }
 
 #[test]
@@ -1249,5 +1277,86 @@ fn implicit_dependencies_must_be_strings() {
     assert!(
         error.contains("implicitDependencies should be an array of strings"),
         "{error}"
+    );
+}
+
+#[test]
+fn workspace_patterns_come_from_every_package_manager_file() {
+    let temp = TempDir::new().unwrap();
+    write(
+        temp.path(),
+        "package.json",
+        r#"{"name": "root", "workspaces": ["./apps/*/", "tools/cli/package.json"]}"#,
+    );
+    write(
+        temp.path(),
+        "pnpm-workspace.yaml",
+        "packages:\n  - libs/**\n  - '!libs/skip'\n",
+    );
+    write(temp.path(), "lerna.json", r#"{"version": "1.0.0"}"#);
+    for (directory, name) in [
+        ("apps/web", "web"),
+        ("tools/cli", "cli"),
+        ("libs/a/b", "deep"),
+        ("libs/skip", "skip"),
+        ("libs/.hidden", "hidden"),
+        ("packages/lerna", "lerna"),
+        ("other", "other"),
+    ] {
+        write(
+            temp.path(),
+            &format!("{directory}/package.json"),
+            &format!(r#"{{"name": "{name}"}}"#),
+        );
+    }
+    let workspace = Workspace::load(temp.path()).unwrap();
+    // All three files' patterns count; minimatch's `*` and `**` skip dot
+    // directories, and an exclusion wins.
+    assert_eq!(
+        workspace
+            .projects
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["cli", "deep", "lerna", "web"]
+    );
+}
+
+#[test]
+fn exclusions_alone_take_every_package_json_and_bad_pnpm_files_warn() {
+    let temp = TempDir::new().unwrap();
+    write(
+        temp.path(),
+        "package.json",
+        r#"{"name": "root", "workspaces": ["!skipped"], "nx": {}}"#,
+    );
+    write(temp.path(), "pnpm-workspace.yaml", "packages: [unclosed\n");
+    write(temp.path(), "a/b/package.json", r#"{"name": "b"}"#);
+    write(
+        temp.path(),
+        "skipped/package.json",
+        r#"{"name": "skipped"}"#,
+    );
+    let workspace = Workspace::load(temp.path()).unwrap();
+    assert_eq!(
+        workspace
+            .projects
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["b", "root"]
+    );
+    assert!(
+        workspace.warnings[0].contains("cannot parse pnpm-workspace.yaml"),
+        "{:?}",
+        workspace.warnings
+    );
+    // A package.json beside a project.json is a project outside the
+    // workspaces, and says so in its metadata.
+    write(temp.path(), "skipped/project.json", "{}");
+    let workspace = Workspace::load(temp.path()).unwrap();
+    assert_eq!(
+        workspace.projects["skipped"].extra["metadata"]["js"]["isInPackageManagerWorkspaces"],
+        false
     );
 }
