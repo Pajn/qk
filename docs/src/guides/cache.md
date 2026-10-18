@@ -168,16 +168,33 @@ extension groups.
 
 ## Outputs
 
-Outputs resolve as in Nx. `{options.name}` reads the target's options, with
-the task's `--name=value` arguments applied, and `{projectName}`,
-`{project.name}` and `{project.root}` work too; an output naming anything
-without a value is left out. `!` negates an output: what it matches is
-neither cached nor removed when an entry is restored. A target without
-`outputs` takes `options.outputPath`, and a `build` or `prepare` target
-`dist/<root>`, `<root>/dist`, `<root>/build` and `<root>/public`. Those
-defaults are cached and restored, but because they are guesses they are
-not declared outputs: they stay source files that other tasks' filesets can
-select, and `dependentTasksOutputFiles` selects none of them.
+Outputs resolve as in Nx 24. `{projectRoot}` and `{projectName}` name the
+project, `{options.name}` reads the target's options, with the task's
+`--name=value` arguments applied, and the legacy `{project.<path>}` reads
+the project's configuration, such as `{project.sourceRoot}`. A placeholder
+can fall back, left to right, to others and finally to a literal:
+`{options.outputPath ?? options.outDir ?? {projectRoot}/dist}`. A value is
+written as JavaScript writes it, so `false` is `false`, `0` is `0` and an
+array is its items joined with `,`; only a missing option, `null` and `""`
+have no value. Option values have `{projectRoot}`, `{projectName}` and a
+leading `{workspaceRoot}` resolved first, as Nx does when it builds the
+project graph. Braces that do not start with a token are glob text, so
+`{projectRoot}/dist/**/*.{js,map}` is one output, and so is `{env.NAME}`:
+environment variables are no placeholder in outputs.
+
+An output whose `{options.…}` placeholder, or a `{projectRoot}` or
+`{workspaceRoot}` left as text, has no value is left out. `{workspaceRoot}`
+may only start an output, and an output from it must name a directory
+before any pattern: `{workspaceRoot}/dist/**`, not `{workspaceRoot}/**`. An
+absolute output, written so or from an option, is read relative to the
+workspace, and one outside the workspace is an error. `!` negates an output:
+what it matches is neither cached nor removed when an entry is restored. A
+target without `outputs` takes `options.outputPath`, and a `build` or
+`prepare` target `dist/<root>`, `<root>/dist`, `<root>/build` and
+`<root>/public`. Those defaults are cached and restored, but because they are
+guesses they are not declared outputs: they stay source files that other
+tasks' filesets can select, and `dependentTasksOutputFiles` selects none of
+them.
 
 A negated group such as `src/**/!(*.test).ts` or `dist/!(cache)/**` expands
 as Nx expands it, into a glob with the group widened and one naming the
