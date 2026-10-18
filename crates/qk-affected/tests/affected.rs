@@ -1627,3 +1627,158 @@ fn json_globs_read_their_producers_outputs() {
         matches!(&tasks["app:build"], qk_affected::TaskCause::Reads { task } if task == "lib:build")
     );
 }
+
+/// As in Nx, files named with `--files` count as changed whole: their
+/// revisions are not compared, so a path mapping change touches everything.
+#[test]
+fn named_files_count_as_changed_whole() {
+    let paths =
+        |target: &str| format!(r#"{{"compilerOptions": {{"paths": {{"@tool": ["{target}"]}}}}}}"#);
+    let repo = Repo::new(&[("tsconfig.base.json", &paths("tools/tool/a.ts"))]);
+    write(&repo.root, "tsconfig.base.json", &paths("tools/tool/b.ts"));
+    assert_eq!(
+        repo.affected(Options {
+            uncommitted: true,
+            ..Options::default()
+        }),
+        names(&["app", "tool"])
+    );
+    assert_eq!(
+        repo.affected(Options {
+            files: vec!["tsconfig.base.json".into()],
+            ..Options::default()
+        }),
+        names(&["app", "lib", "tool"])
+    );
+}
+
+/// A deleted lockfile is project configuration to Nx's js plugin, so it
+/// affects every project whatever `projectsAffectedByDependencyUpdates` says.
+#[test]
+fn deleting_a_root_lockfile_affects_every_project() {
+    let repo = Repo::new(&[
+        (
+            "nx.json",
+            r#"{"pluginsConfig": {"@nx/js": {"projectsAffectedByDependencyUpdates": ["tool"]}}}"#,
+        ),
+        ("yarn.lock", "# yarn lockfile v1\n"),
+    ]);
+    write(&repo.root, "yarn.lock", "# yarn lockfile v1\n\n");
+    assert_eq!(repo.committed(), names(&["tool"]));
+    std::fs::remove_file(repo.root.join("yarn.lock")).unwrap();
+    assert_eq!(repo.committed(), names(&["app", "lib", "tool"]));
+}
+
+/// Every lockfile Nx recognizes counts as a dependency update.
+#[test]
+fn every_lockfile_nx_recognizes_is_a_dependency_update() {
+    for file in ["bun.lockb", "pnpm-lock.yml"] {
+        let repo = Repo::new(&[("nx.json", "{}"), (file, "before")]);
+        write(&repo.root, file, "after");
+        assert_eq!(repo.committed(), names(&["app", "lib", "tool"]), "{file}");
+    }
+}
+
+/// As in Nx, a `{workspaceRoot}` input without glob syntax names that file or
+/// everything under it, read with repeated slashes collapsed.
+#[test]
+fn literal_workspace_inputs_cover_everything_under_them() {
+    for (file, expected) in [
+        ("generated/api.ts", &["tool"][..]),
+        ("config/dev.json", &["tool"]),
+        ("generated-other/api.ts", &[]),
+    ] {
+        let repo = Repo::new(&[(
+            "tools/tool/project.json",
+            r#"{"name": "tool", "targets": {"gen": {"command": "echo gen", "inputs": ["{workspaceRoot}/generated", "{workspaceRoot}/config//dev.json"]}}}"#,
+        )]);
+        write(&repo.root, file, "{}");
+        assert_eq!(repo.committed(), names(expected), "{file}");
+    }
+}
+
+/// As in Nx, a revision git would read as an option is refused.
+#[test]
+fn revisions_shaped_like_options_are_refused() {
+    let repo = Repo::new(&[]);
+    let workspace = Workspace::load(&repo.root).unwrap();
+    let graph = ProjectGraph::build(&workspace).unwrap();
+    for options in [
+        Options {
+            base: Some("--output=leak".into()),
+            ..Options::default()
+        },
+        Options {
+            base: Some("main".into()),
+            head: Some("-p".into()),
+            ..Options::default()
+        },
+    ] {
+        let error = affected_projects(&workspace, &graph, &options).unwrap_err();
+        assert!(
+            error.to_string().contains("cannot start with \"-\""),
+            "{error}"
+        );
+    }
+}
+
+/// Root `package.json` dependencies and overrides move the packages they
+/// name as Nx reads them; global packages, those nx.json loads as plugins
+/// included, move everything.
+#[test]
+fn root_package_overrides_and_global_packages_follow_nx() {
+    let manifest = |extra: &str| {
+        format!(
+            r#"{{"name": "root", "devDependencies": {{"react": "^19.0.0", "@acme/nx-plugin": "1.0.0"}}{extra}}}"#
+        )
+    };
+    let lockfile = lockfile("19.0.0", "19.0.0").replace(
+        "packages:\n",
+        "  .:\n    devDependencies:\n      '@acme/nx-plugin':\n        specifier: 1.0.0\n        version: 1.0.0\npackages:\n  '@acme/nx-plugin@1.0.0':\n    resolution: {integrity: sha512-c}\n",
+    ).replace("snapshots:\n", "snapshots:\n  '@acme/nx-plugin@1.0.0': {}\n");
+    let repo = Repo::new(&[
+        (
+            "nx.json",
+            r#"{"plugins": [{"plugin": "@acme/nx-plugin/infer"}],
+                "pluginsConfig": {"@nx/js": {"projectsAffectedByDependencyUpdates": "auto"}}}"#,
+        ),
+        ("package.json", &manifest("")),
+        ("pnpm-lock.yaml", &lockfile),
+    ]);
+    for (extra, expected) in [
+        // A range, nested npm overrides and `.` name the package installed.
+        (
+            r#", "overrides": {"react@^19.0.0": "19.0.1"}"#,
+            &["app", "tool"][..],
+        ),
+        (
+            r#", "overrides": {"other": {"react": "19.0.1"}}"#,
+            &["app", "tool"],
+        ),
+        (
+            r#", "overrides": {"react": {".": "19.0.1"}}"#,
+            &["app", "tool"],
+        ),
+        // A pnpm parent selector names the child.
+        (
+            r#", "pnpm": {"overrides": {"other@1>react": "19.0.1"}}"#,
+            &["app", "tool"],
+        ),
+        // An override naming nothing installed may reach anything.
+        (
+            r#", "resolutions": {"left-pad": "1.0.0"}"#,
+            &["app", "lib", "tool"],
+        ),
+    ] {
+        write(&repo.root, "package.json", &manifest(extra));
+        assert_eq!(repo.committed(), names(expected), "{extra}");
+        write(&repo.root, "package.json", &manifest(""));
+        commit(&repo.root);
+    }
+    write(
+        &repo.root,
+        "package.json",
+        &manifest("").replace("\"1.0.0\"", "\"1.0.1\""),
+    );
+    assert_eq!(repo.committed(), names(&["app", "lib", "tool"]));
+}

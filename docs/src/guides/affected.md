@@ -17,15 +17,14 @@ As in Nx, changed files are those between the merge base of `--base` and
 `--head`, or with no head, between the merge base and the working tree,
 including uncommitted and untracked files. The base defaults to `NX_BASE`,
 then nx.json `defaultBase`, then `main`; the head to `NX_HEAD`. `--files`,
-`--uncommitted` and `--untracked` replace the comparison. Files matching the
-root `.gitignore` or `.nxignore` are left out. Untracked files are those Git
-lists as untracked and not ignored, so an `.nxignore` negation does not bring
-back one `.gitignore` excludes, though it does for a file named with
-`--files`.
-
-Unlike Nx, a changed or untracked file whose name is outside ASCII counts:
-Nx reads the names Git quotes, such as `"caf\303\251.ts"` for `café.ts`,
-and finds no project for them.
+`--uncommitted` and `--untracked` replace the comparison. A file named with
+`--files` counts as changed whole: its revisions are not compared, so a JSON
+or lockfile change is not narrowed to what changed inside it. Files matching
+the root `.gitignore` or `.nxignore` are left out. Untracked files are those
+Git lists as untracked and not ignored, so an `.nxignore` negation does not
+bring back one `.gitignore` excludes, though it does for a file named with
+`--files`. As in Nx, a base or head starting with `-` is refused, since git
+would read it as an option.
 
 Unlike Nx, when the base is a branch with an upstream, such as `main`
 following `origin/main`, and the head left the upstream later than the local
@@ -39,20 +38,46 @@ the range is its own history, and nothing is flagged.
 ## How changes reach projects
 
 A changed file touches the project whose root most specifically contains it.
-`nx.json` touches every project; a file named by a `{workspaceRoot}` input
-touches the projects declaring it; a deleted `project.json` or
-`package.json` touches every project. Dependencies changed in the root
-`package.json` touch the projects installing the package, and path mappings
-changed in the root tsconfig touch the projects they point into. Every
-project depending on a touched project is affected too.
+`nx.json` touches every project. A file named by a `{workspaceRoot}` input
+touches the projects declaring it; an input without glob syntax, such as
+`{workspaceRoot}/generated`, names that file or everything under it. A deleted
+file that Nx's default plugins create projects from, any `project.json` or
+`package.json` or a root lockfile, touches every project, since what depended
+on a removed project is unknown. Path mappings changed in the root tsconfig
+touch the projects they point into, and any other change to it every project.
 
-One rule deliberately differs from Nx: under
-`projectsAffectedByDependencyUpdates: "auto"`, a `pnpm-lock.yaml` change
-touches the projects whose importer installs something different, by the same
-installed sets the cache keys use. This leaves out projects that install
-exactly what they did before, which Nx reports, and catches transitive changes
-such as a dependency's dependency moving version, which Nx can miss. Other
-modes behave as in Nx.
+A change to the root lockfile (`pnpm-lock.yaml`, `pnpm-lock.yml`,
+`package-lock.json`, `yarn.lock`, `bun.lock` or `bun.lockb`) touches projects
+by nx.json's `pluginsConfig["@nx/js"].projectsAffectedByDependencyUpdates`:
+every project under `"all"`, Nx's default, or the projects a list of
+selectors names. Under `"auto"`, a `pnpm-lock.yaml` change touches the
+projects whose importer installs something different, by the same installed
+sets the cache keys use; another lockfile, or one qk cannot compare, touches
+every project.
+
+In the root `package.json`, a changed dependency touches the projects
+installing that package, or the workspace project it names, and an
+`@types/` package also the package it types. A changed override, under
+`overrides`, `resolutions` or `pnpm.overrides`, touches the projects
+installing the package its selector names: the last key, past a pnpm
+`parent>` and without a `@range`. A removed dependency, a change to a global
+package (`nx` and the plugins nx.json loads), an override naming no installed
+package, or a file that cannot be compared touches every project. Installed
+packages are read from `pnpm-lock.yaml`; without it, a changed dependency
+touches every project. Every project depending on a touched project is
+affected too.
+
+Some rules deliberately differ from Nx:
+
+- Under `"auto"`, the installed sets leave out projects that install exactly
+  what they did before, which Nx reports, and catch transitive changes such as
+  a dependency's dependency moving version, which Nx can miss.
+- A list of selectors touches its projects only when a lockfile changed. Nx
+  touches them on every change, lockfile or not, which reads as a bug; its
+  task selection checks for a lockfile change, as qk does.
+- A change to the file nx.json `extends` touches every project, as a change to
+  nx.json does. Nx does not look at that file, although it configures the
+  workspace as much as nx.json does.
 
 `show projects --affected` prints projects in graph order; Nx prints its
 traversal order, so compare the two as sets.
