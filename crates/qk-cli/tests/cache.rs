@@ -612,7 +612,7 @@ fn skipped_cache_runs_record_flakes_without_using_local_or_remote_entries() {
             .output()
             .unwrap()
     };
-    assert_eq!(forced("--skip-nx-cache").status.code(), Some(4));
+    assert_eq!(forced("--skip-nx-cache").status.code(), Some(1));
     let latest = || -> Value {
         serde_json::from_slice(
             &success(fixture.qk(&fixture.root, &["show", "run", "--json"])).stdout,
@@ -629,7 +629,7 @@ fn skipped_cache_runs_record_flakes_without_using_local_or_remote_entries() {
         .env("AWS_SECRET_ACCESS_KEY", "secret")
         .output()
         .unwrap();
-    assert_eq!(environment_run.status.code(), Some(4));
+    assert_eq!(environment_run.status.code(), Some(1));
     let environment_failed = latest();
     assert_eq!(failed["tasks"][0]["cache"], "uncached");
     assert_eq!(passed["tasks"][0]["cache"], "uncached");
@@ -665,7 +665,7 @@ fn forced_failure_pairs_with_a_real_success_and_preserves_its_cache_entry() {
         "flaky",
         json!({"inputs": ["{projectRoot}/src/**/*"]}),
     ));
-    assert_eq!(fixture.build(&fixture.root, &[]).status.code(), Some(4));
+    assert_eq!(fixture.build(&fixture.root, &[]).status.code(), Some(1));
     success(fixture.build(&fixture.root, &[]));
     let manifests = || {
         let cache = stdout(&success(fixture.qk(&fixture.root, &["cache", "path"])));
@@ -683,7 +683,7 @@ fn forced_failure_pairs_with_a_real_success_and_preserves_its_cache_entry() {
             .build(&fixture.root, &["--skip-nx-cache"])
             .status
             .code(),
-        Some(4)
+        Some(1)
     );
     assert_eq!(manifests(), entry);
     let hit = success(fixture.build(&fixture.root, &[]));
@@ -748,8 +748,8 @@ fn forced_runs_key_the_outputs_of_uncacheable_dependencies_without_retaining_the
 #[test]
 fn failures_are_not_cached() {
     let fixture = Fixture::new(target("fail", json!({})));
-    assert_eq!(fixture.build(&fixture.root, &[]).status.code(), Some(4));
-    assert_eq!(fixture.build(&fixture.root, &[]).status.code(), Some(4));
+    assert_eq!(fixture.build(&fixture.root, &[]).status.code(), Some(1));
+    assert_eq!(fixture.build(&fixture.root, &[]).status.code(), Some(1));
     assert_eq!(fixture.runs(), 2);
 }
 
@@ -5319,7 +5319,7 @@ fn flaky_history_keeps_failed_logs_and_excludes_cache_replays() {
         json!({"inputs": ["{projectRoot}/src/**/*"]}),
     ));
     let first = fixture.build(&fixture.root, &[]);
-    assert_eq!(first.status.code(), Some(4));
+    assert_eq!(first.status.code(), Some(1));
     let latest = || -> Value {
         serde_json::from_slice(
             &success(fixture.qk(&fixture.root, &["show", "run", "--json"])).stdout,
@@ -5373,7 +5373,7 @@ fn input_changes_during_failure_do_not_report_flakiness() {
             "flaky-mutating",
             json!({"inputs": ["{projectRoot}/src/**/*"]}),
         ));
-        assert_eq!(fixture.build(&fixture.root, flags).status.code(), Some(4));
+        assert_eq!(fixture.build(&fixture.root, flags).status.code(), Some(1));
         fs::write(fixture.root.join("src/input.txt"), "one\n").unwrap();
         success(fixture.build(&fixture.root, flags));
         let groups: Value = serde_json::from_slice(

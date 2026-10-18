@@ -38,6 +38,8 @@ use threads::Threads;
 pub struct RunResult {
     pub outcomes: BTreeMap<String, Outcome>,
     pub skipped: BTreeSet<String>,
+    /// As Nx's: 0 when every task succeeded, 130 when the run was
+    /// cancelled, and 1 when a task failed or was skipped.
     pub exit_code: i32,
     /// What happened to each task that started.
     pub tasks: BTreeMap<String, TaskRecord>,
@@ -844,9 +846,11 @@ pub fn run(
                             });
                             match outcome {
                                 Outcome::Success => {}
-                                Outcome::Failed(code) => {
+                                Outcome::Failed(_) => {
+                                    // As in Nx, a failure fails the run with 1,
+                                    // whatever the task's own code.
                                     if exit_code == 0 {
-                                        exit_code = code;
+                                        exit_code = 1;
                                     }
                                     bailed |= bails;
                                 }
@@ -891,6 +895,9 @@ pub fn run(
     }
     if cancelled.load(Ordering::SeqCst) {
         exit_code = 130;
+    } else if !skipped.is_empty() {
+        // A skipped task fails the run too, as in Nx.
+        exit_code = exit_code.max(1);
     }
     let sandbox = sandbox
         .map(|sandbox| -> Result<SandboxResult> {

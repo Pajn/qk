@@ -281,7 +281,7 @@ fn dependency_diamond_runs_once_before_dependents_and_streams_raw_output() {
 }
 
 #[test]
-fn failure_preserves_exit_code_skips_dependents_and_runs_independent_roots() {
+fn failure_exits_with_1_skips_dependents_and_runs_independent_roots() {
     let temp = fixture(json!({
         "build":{"command":"echo wrong> must-not-exist", "dependsOn":["fail"]},
         "fail":{"command":"exit 7"},
@@ -291,7 +291,7 @@ fn failure_preserves_exit_code_skips_dependents_and_runs_independent_roots() {
         temp.path(),
         &["run-many", "-t", "build,independent", "--parallel", "1"],
     );
-    assert_eq!(output.status.code(), Some(7));
+    assert_eq!(output.status.code(), Some(1));
     assert!(!temp.path().join("must-not-exist").exists());
     assert!(temp.path().join("independent").exists());
     // Quiet, the default off a terminal, names both in its summary.
@@ -441,7 +441,7 @@ fn command_lists_support_sequential_order_and_stop_on_failure() {
         "commands":["echo first> order.txt", "exit 9", "echo wrong> must-not-exist"], "parallel":false
     }}}));
     let output = run(temp.path(), &["run", "app:build"]);
-    assert_eq!(output.status.code(), Some(9));
+    assert_eq!(output.status.code(), Some(1));
     assert!(temp.path().join("order.txt").exists());
     assert!(!temp.path().join("must-not-exist").exists());
 }
@@ -643,8 +643,9 @@ fn failed_parallel_command_terminates_its_running_sibling() {
 
 #[cfg(unix)]
 #[test]
-fn cancellation_terminates_descendants_and_returns_130() {
-    for signal in ["-INT", "-TERM"] {
+fn cancellation_terminates_descendants_and_exits_as_the_signal() {
+    // As Nx's signalToCode: 128 plus the signal's number.
+    for (signal, code) in [("-INT", 130), ("-TERM", 143), ("-HUP", 129)] {
         let temp = fixture(json!({"long":helper_target("tree", "tree")}));
         let mut child = command(temp.path(), &["run", "app:long"])
             .stdout(Stdio::null())
@@ -672,7 +673,7 @@ fn cancellation_terminates_descendants_and_returns_130() {
             }
             std::thread::sleep(Duration::from_millis(10));
         };
-        assert_eq!(status.code(), Some(130));
+        assert_eq!(status.code(), Some(code), "{signal}");
         let before = fs::read(temp.path().join("heartbeat")).unwrap();
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(
@@ -681,6 +682,39 @@ fn cancellation_terminates_descendants_and_returns_130() {
             "descendant survived {signal}"
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_command_ignoring_sigterm_is_killed_after_the_grace_period() {
+    let temp = fixture(json!({"stubborn": {"command": "trap '' TERM; touch started; sleep 30"}}));
+    let mut child = command(temp.path(), &["run", "app:stubborn"])
+        .env("NX_PROCESS_KILL_GRACE_PERIOD", "200")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for(&temp.path().join("started"));
+    let sent = Instant::now();
+    assert!(
+        Command::new("/bin/kill")
+            .arg("-INT")
+            .arg(child.id().to_string())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if sent.elapsed() > Duration::from_secs(4) {
+            let _ = child.kill();
+            panic!("the grace period was not applied");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(status.code(), Some(130));
 }
 
 fn continuous_target(mode: &str, id: &str) -> Value {
@@ -813,7 +847,7 @@ fn continuous_roots_run_until_cancelled() {
 fn continuous_task_exiting_on_its_own_reports_its_exit_code() {
     let temp = fixture(json!({"serve": continuous_target("exit-3", "serve")}));
     let output = run(temp.path(), &["run", "app:serve"]);
-    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(output.status.code(), Some(1));
 }
 
 fn threaded_helper(id: &str, continuous: bool) -> Value {
@@ -1700,7 +1734,7 @@ fn ready_when_starts_dependents_once_the_output_appears() {
         temp.path(),
         &["run", "app:after", "--output-style", "static"],
     );
-    assert_eq!(crashed.status.code(), Some(3));
+    assert_eq!(crashed.status.code(), Some(1));
     assert!(!String::from_utf8_lossy(&crashed.stdout).contains("after\n"));
     let serial = run(temp.path(), &["run", "app:serial"]);
     assert!(
@@ -1941,11 +1975,11 @@ fn command_shapes_and_exit_codes_follow_nx() {
     assert!(started.elapsed() < Duration::from_secs(4));
     assert_eq!(
         run(temp.path(), &["run", "app:serial"]).status.code(),
-        Some(4)
+        Some(1)
     );
     assert_eq!(
         run(temp.path(), &["run", "app:single"]).status.code(),
-        Some(4)
+        Some(1)
     );
 }
 
@@ -2316,8 +2350,25 @@ fn nx_run_flags_work_as_in_nx() {
         "--output-style",
         "static",
     ]);
-    assert!(!bailed.status.success());
+    // It fails with 1, where Nx exits with 130 as if interrupted.
+    assert_eq!(bailed.status.code(), Some(1));
     assert!(!String::from_utf8_lossy(&bailed.stdout).contains("zlast\n"));
+    // NX_BAIL does the same, unless --nx-bail=false says otherwise.
+    let mut command = command(
+        temp.path(),
+        &[
+            "run-many",
+            "-t",
+            "fail,zlast",
+            "--parallel=1",
+            "--output-style",
+            "static",
+        ],
+    );
+    let bailed = command.env("NX_BAIL", "true").output().unwrap();
+    assert!(!String::from_utf8_lossy(&bailed.stdout).contains("zlast\n"));
+    let continued = command.arg("--nxBail=false").output().unwrap();
+    assert!(String::from_utf8_lossy(&continued.stdout).contains("zlast\n"));
     let continued = output(&[
         "run-many",
         "-t",
@@ -3657,7 +3708,7 @@ fn input_analysis_records_descendants_outputs_and_uncovered_inputs_without_cache
         temp.path(),
         &["inputs", "analyze", "app:fail", "--report", "failed.json"],
     );
-    assert_eq!(failed.status.code(), Some(7));
+    assert_eq!(failed.status.code(), Some(1));
     let failed: Value =
         serde_json::from_slice(&fs::read(temp.path().join("failed.json")).unwrap()).unwrap();
     assert_eq!(failed["tasks"]["app:fail"]["outcome"], "failed:7");

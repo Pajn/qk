@@ -1754,6 +1754,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ctrlc",
+ "libc",
  "notify",
  "qk-affected",
  "qk-cache",

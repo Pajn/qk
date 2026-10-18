@@ -5,6 +5,7 @@ mod hash;
 mod history;
 mod inputs;
 mod inspect;
+mod signals;
 mod ui;
 mod warm_suggest;
 mod watch;
@@ -17,10 +18,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use qk_config::{Workspace, find_workspace};
 use qk_graph::{GraphReport, ProjectGraph, graph_order, select_projects};
 use qk_taskgraph::{Request, TaskGraph};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Arc, atomic::AtomicBool};
 
 #[derive(Parser)]
 #[command(
@@ -1557,11 +1555,7 @@ fn execute_narrowed(
         return Ok(0);
     }
     let cancelled = Arc::new(AtomicBool::new(false));
-    let signal = cancelled.clone();
-    ctrlc::set_handler(move || {
-        signal.store(true, Ordering::SeqCst);
-    })
-    .context("cannot register cancellation handler")?;
+    signals::install(cancelled.clone())?;
     // A sandboxed task has to run to be observed.
     let skip_cache =
         options.skips_cache() || options.sandbox.is_some() || options.input_analysis.is_some();
@@ -1727,6 +1721,10 @@ fn execute_narrowed(
         options.input_analysis.as_ref(),
     ) {
         inputs::present(analysis.clone(), options)?;
+    }
+    // A cancelled run exits as the signal that cancelled it, as in Nx.
+    if result.exit_code == 130 {
+        return Ok(signals::exit_code());
     }
     Ok(result.exit_code)
 }
