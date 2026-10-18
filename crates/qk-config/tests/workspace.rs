@@ -1360,3 +1360,42 @@ fn exclusions_alone_take_every_package_json_and_bad_pnpm_files_warn() {
         false
     );
 }
+
+#[test]
+fn finds_the_workspace_root_as_nx_does() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    write(&root, "nx.json", "{}");
+    write(&root, "packages/app/pnpm-workspace.yaml", "packages: []\n");
+    write(&root, "packages/app/src/index.js", "");
+    // A nearer package manager workspace does not shadow an Nx root.
+    assert_eq!(
+        find_workspace(&root.join("packages/app/src")).unwrap(),
+        root
+    );
+
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    write(&root, "repo/nx", "#!/bin/sh\n");
+    write(
+        &root,
+        "repo/libs/a/package.json",
+        r#"{"name": "a", "nx": {}}"#,
+    );
+    // The Nx wrapper script marks a root too.
+    assert_eq!(
+        find_workspace(&root.join("repo/libs/a")).unwrap(),
+        root.join("repo")
+    );
+
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    write(&root, "repo/node_modules/nx/package.json", "{}");
+    write(&root, "repo/libs/a/node_modules/nx/package.json", "{}");
+    write(&root, "repo/libs/a/project.json", r#"{"name": "a"}"#);
+    // Without a marker, the topmost directory with Nx installed.
+    assert_eq!(
+        find_workspace(&root.join("repo/libs/a")).unwrap(),
+        root.join("repo")
+    );
+}

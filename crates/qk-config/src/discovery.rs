@@ -9,14 +9,41 @@ use serde_json::Value;
 use crate::minimatch::Minimatch;
 use crate::{read_optional_json, relative_path};
 
-/// Find the nearest workspace marker, including when invoked inside a project.
+/// Find the workspace containing `start`, as Nx's `workspaceRoot` does
+/// first: `NX_WORKSPACE_ROOT_PATH`, else the nearest directory with an
+/// `nx.json` or an `nx` or `nx.bat` wrapper, else the topmost directory with
+/// Nx installed in `node_modules`. A workspace Nx would not find, qk finds by
+/// the nearest `pnpm-workspace.yaml` or `package.json` with `workspaces`,
+/// then by the nearest package with an `nx` object or `project.json`.
 pub fn find_workspace(start: &Path) -> Result<PathBuf> {
+    if let Some(root) = std::env::var_os("NX_WORKSPACE_ROOT_PATH").filter(|root| !root.is_empty()) {
+        return Ok(start.join(root));
+    }
     let start = start
         .canonicalize()
         .with_context(|| format!("cannot open {}", start.display()))?;
+    // Nx never looks at the filesystem root itself.
+    let ancestors = || {
+        start
+            .ancestors()
+            .filter(|directory| directory.parent().is_some())
+    };
+    if let Some(root) = ancestors().find(|directory| {
+        ["nx.json", "nx", "nx.bat"]
+            .iter()
+            .any(|file| directory.join(file).is_file())
+    }) {
+        return Ok(root.to_owned());
+    }
+    if let Some(root) = ancestors()
+        .filter(|directory| directory.join("node_modules/nx/package.json").is_file())
+        .last()
+    {
+        return Ok(root.to_owned());
+    }
     let mut single_package = None;
     for directory in start.ancestors() {
-        if directory.join("nx.json").is_file() || directory.join("pnpm-workspace.yaml").is_file() {
+        if directory.join("pnpm-workspace.yaml").is_file() {
             return Ok(directory.to_owned());
         }
         if let Some(package) = read_optional_json(&directory.join("package.json"))? {

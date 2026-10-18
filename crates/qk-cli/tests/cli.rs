@@ -12,7 +12,8 @@ fn isolated_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
             "GIT_CONFIG_GLOBAL",
             if cfg!(windows) { "NUL" } else { "/dev/null" },
         )
-        .env("GIT_CONFIG_NOSYSTEM", "1");
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("NX_WORKSPACE_ROOT_PATH");
     for name in [
         "GIT_ALTERNATE_OBJECT_DIRECTORIES",
         "GIT_CONFIG",
@@ -1676,4 +1677,19 @@ fn every_package_json_is_a_project_when_nx_is_told_to_infer_them_all() {
     // Nx reads the variable only without a root package.json.
     std::fs::write(temp.path().join("package.json"), r#"{"name": "root"}"#).unwrap();
     assert_eq!(projects("true"), json!([]));
+}
+
+#[test]
+fn the_workspace_root_can_be_set_as_in_nx() {
+    let temp = TempDir::new().unwrap();
+    let elsewhere = TempDir::new().unwrap();
+    std::fs::write(temp.path().join("nx.json"), "{}").unwrap();
+    std::fs::write(temp.path().join("project.json"), r#"{"name": "app"}"#).unwrap();
+    let output = isolated_command(env!("CARGO_BIN_EXE_qk"))
+        .current_dir(elsewhere.path())
+        .env("NX_WORKSPACE_ROOT_PATH", temp.path())
+        .args(["show", "projects", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(successful_json(output), json!(["app"]));
 }

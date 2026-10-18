@@ -1,9 +1,12 @@
 # Projects and discovery
 
-qk searches ancestors for `nx.json`, `pnpm-workspace.yaml`, or a root
-`package.json` with `workspaces`. A standalone `project.json`, or package
-with an `nx` object, also works when no parent workspace marker exists.
-`--workspace <path>` selects a root explicitly.
+qk finds the workspace root as Nx does: `NX_WORKSPACE_ROOT_PATH` when set,
+else the nearest ancestor with an `nx.json` or an `nx` or `nx.bat` wrapper
+script, else the topmost ancestor with Nx installed in `node_modules`. For a
+workspace without Nx, it takes the nearest ancestor with
+`pnpm-workspace.yaml` or a `package.json` with `workspaces`; a standalone
+`project.json`, or package with an `nx` object, also works when no parent
+workspace marker exists. `--workspace <path>` selects a root explicitly.
 
 ## Workspace membership
 

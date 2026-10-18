@@ -33,6 +33,8 @@ against the merged child environment.
 | Variable | Behavior |
 | --- | --- |
 | `NX_DEFAULT_PROJECT` | Fallback project for shorthand commands |
+| `NX_WORKSPACE_ROOT_PATH` | Workspace root, unless `--workspace` names one |
+| `NX_INFER_ALL_PACKAGE_JSONS=true` | Every package.json is a project, in a workspace without a root package.json |
 | `NX_BASE`, `NX_HEAD` | Affected comparison revisions; CLI overrides them |
 | `NX_PARALLEL` | Task concurrency, overridden by `--parallel` |
 | `QK_CORES` | Core budget, overridden by `--cores` |
