@@ -428,6 +428,11 @@ pub struct Capture {
     printer: Printer,
     healthy: AtomicBool,
     readiness: Option<Readiness>,
+    /// A continuous target's `logMatches` check, which the output decides.
+    log_matches: Option<(
+        Mutex<crate::readiness::LogMatcher>,
+        std::sync::Arc<crate::readiness::Verdict>,
+    )>,
 }
 
 /// Maximum framed bytes retained for an execution, independent of result caching.
@@ -501,6 +506,7 @@ impl Capture {
             printer,
             healthy: AtomicBool::new(true),
             readiness: None,
+            log_matches: None,
         }
     }
 
@@ -524,6 +530,20 @@ impl Capture {
                 ready,
             });
         }
+        self
+    }
+
+    /// Decides `verdict` once every one of `patterns` has appeared in the
+    /// output, control sequences left out.
+    pub fn log_matches(
+        mut self,
+        patterns: &[String],
+        verdict: std::sync::Arc<crate::readiness::Verdict>,
+    ) -> Self {
+        self.log_matches = Some((
+            Mutex::new(crate::readiness::LogMatcher::new(patterns.to_vec())),
+            verdict,
+        ));
         self
     }
 
@@ -599,6 +619,12 @@ impl Capture {
                 }
             }
             self.printer.write(stderr, frame)?;
+            if let Some((matcher, verdict)) = &self.log_matches
+                && !verdict.is_decided()
+                && matcher.lock().unwrap().feed(stderr, frame)
+            {
+                verdict.set_ready();
+            }
             if let Some(readiness) = &self.readiness {
                 readiness.see(stderr, frame);
             }

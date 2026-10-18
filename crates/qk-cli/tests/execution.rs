@@ -861,6 +861,140 @@ fn dependents_leaving_out_a_continuous_task_s_inputs_are_cached() {
     assert_eq!(runs.lines().count(), 1, "{runs:?}");
 }
 
+/// `serve` creates `marker` after a pause and then announces it, and `e2e`
+/// fails unless `marker` exists when it starts.
+#[cfg(unix)]
+fn served_fixture(ready_when: Value, wait_for: Option<&str>) -> TempDir {
+    let mut dependency = json!({"target": "serve"});
+    if let Some(wait_for) = wait_for {
+        dependency["waitFor"] = json!(wait_for);
+    }
+    fixture(json!({
+        "serve": {
+            "continuous": true,
+            "readyWhen": ready_when,
+            "command": "sleep 0.5; touch marker; echo listening; sleep 30"
+        },
+        "e2e": {"command": "test -f marker", "dependsOn": [dependency]}
+    }))
+}
+
+#[cfg(unix)]
+#[test]
+fn tasks_waiting_for_ready_start_once_the_check_passes() {
+    for ready_when in [
+        json!({"logMatches": "listening"}),
+        json!({"command": "test -f marker", "interval": 50}),
+    ] {
+        let temp = served_fixture(ready_when.clone(), Some("ready"));
+        let output = run(temp.path(), &["run", "app:e2e"]);
+        assert!(
+            output.status.success(),
+            "{ready_when}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("waiting for app:serve to be ready")
+        );
+    }
+    // Without waitFor, the task starts as soon as the server has.
+    let temp = served_fixture(json!({"logMatches": "listening"}), None);
+    assert!(!run(temp.path(), &["run", "app:e2e"]).status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_check_fails_the_server_and_skips_the_tasks_waiting_for_it() {
+    let temp = served_fixture(
+        json!({"logMatches": "never", "timeout": 200}),
+        Some("ready"),
+    );
+    let output = run(temp.path(), &["run", "app:e2e"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "Task \"app:serve\" did not become ready within 200ms (readyWhen: logMatches \"never\")"
+        ),
+        "{stderr}"
+    );
+    let reason = stderr.find("did not become ready").unwrap();
+    let skipped = stderr.find("skipped app:e2e (dependency failed)").unwrap();
+    assert!(reason < skipped, "{stderr}");
+    assert!(stderr.contains("failed app:serve (exit 1)"), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_invalid_check_fails_only_when_something_waits_for_it() {
+    let temp = served_fixture(json!({"port": "{options.port}"}), Some("ready"));
+    let output = run(temp.path(), &["run", "app:e2e"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("has an invalid \"readyWhen\": \"{options.port}\" has no value"),
+        "{stderr}"
+    );
+    // The server never ran, so the waiting task is skipped, not told it exited.
+    assert!(
+        stderr.contains("skipped app:e2e (dependency failed)"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("exited before it became ready"),
+        "{stderr}"
+    );
+    // Nothing waits: it runs unchecked, with a warning.
+    let temp = fixture(json!({
+        "serve": {"continuous": true, "readyWhen": {"port": "{options.port}"}, "command": "touch marker; sleep 30"},
+        "e2e": {"command": "sleep 0.5; test -f marker", "dependsOn": ["serve"]}
+    }));
+    let output = success(run(temp.path(), &["run", "app:e2e"]));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("runs without a readiness check"));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_null_ready_when_turns_off_a_target_default() {
+    let defaults = json!({"targetDefaults": {"serve": {"readyWhen": {"logMatches": "never", "timeout": 100}}}});
+    // Without the null, the default's check applies and times out.
+    let control = fixture(json!({
+        "serve": {"continuous": true, "command": "sleep 30"},
+        "e2e": {"command": "true", "dependsOn": [{"target": "serve", "waitFor": "ready"}]}
+    }));
+    fs::write(control.path().join("nx.json"), defaults.to_string()).unwrap();
+    let output = run(control.path(), &["run", "app:e2e"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("did not become ready within 100ms"),
+        "{stderr}"
+    );
+    let temp = served_fixture(Value::Null, Some("ready"));
+    fs::write(temp.path().join("nx.json"), defaults.to_string()).unwrap();
+    // Unchecked, a waiting task starts once the server has started.
+    let output = run(temp.path(), &["run", "app:e2e"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("did not become ready"), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn tasks_waiting_for_a_server_that_exits_before_it_is_ready_fail() {
+    let temp = fixture(json!({
+        "serve": {"continuous": true, "readyWhen": {"logMatches": "never"}, "command": "exit 0"},
+        "e2e": {"command": "echo e2e-ran", "dependsOn": [{"target": "serve", "waitFor": "ready"}]}
+    }));
+    let output = run(temp.path(), &["run", "app:e2e"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // As in Nx, the server keeps its own status and the waiting task fails.
+    assert!(
+        stderr.contains("qk: app:e2e: Task \"app:serve\" exited before it became ready."),
+        "{stderr}"
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("e2e-ran"));
+}
+
 #[test]
 fn output_styles_follow_nx() {
     let temp = fixture(json!({

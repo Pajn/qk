@@ -217,8 +217,8 @@ those processes are outside the managed group.
 
 Targets with `continuous: true`, such as dev servers and watchers, run until
 they exit or are stopped. A task that depends on a continuous task starts as
-soon as that task has started, not when it finishes, so a client must wait for
-the server's readiness itself. Continuous tasks do not count towards
+soon as that task has started, not when it finishes, unless its `dependsOn`
+entry sets `waitFor: "ready"`. Continuous tasks do not count towards
 `--parallel`. A requested continuous task runs until it exits or the run is
 cancelled. A continuous task that only other tasks depend on is stopped, like
 a cancelled command, once all of them have finished; that stop counts as
@@ -238,6 +238,20 @@ ready ends with their status. With `commands`, `readyWhen` requires
 `parallel`. These tasks are not cached, since their commands outlive any
 result. Unlike Nx, which counts text on stderr as a failure, either stream
 makes a task ready.
+
+A continuous target's own [`readyWhen`](../reference/targets.md#readywhen),
+an object, is a check for the tasks that depend on it with
+`waitFor: "ready"`, as in Nx 24: they start once a url answers, a port
+accepts a connection, a command succeeds or text appears in the output.
+Waiting holds no `--parallel` slot. qk checks only while a task in the run
+waits. A check that times out fails the task, and the tasks waiting for it
+are skipped. A task that exits before its check passes keeps its own status,
+and the tasks waiting for it fail, naming it, as in Nx. An invalid check
+fails the task only when something waits for it; otherwise qk warns and runs
+it unchecked. A `port` of `0` or `auto` is one the server picks, so there is
+nothing to check and the task is ready once started. A request to this
+machine skips proxies and accepts a self-signed certificate; other hosts use
+the proxy environment and verify certificates.
 
 A target with `parallelism: false` runs alone, as in Nx: it waits until no
 other task runs, continuous ones included, and nothing starts while it runs.

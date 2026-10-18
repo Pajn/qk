@@ -4,6 +4,8 @@ use anyhow::{Context, Result, bail};
 use qk_config::Workspace;
 use qk_taskgraph::Task;
 
+use crate::tokens::{closing_brace, env_name, fallbacks};
+
 pub(super) struct Interpolation<'a> {
     workspace: &'a Workspace,
     task: &'a Task,
@@ -216,12 +218,7 @@ impl<'a> Interpolation<'a> {
                 for (index, source) in sources.iter().enumerate() {
                     let found = if let Some(name) = source.strip_prefix("args.") {
                         self.named.get(name).cloned()
-                    } else if let Some(name) = source.strip_prefix("env.").filter(|name| {
-                        !name.is_empty()
-                            && name
-                                .chars()
-                                .all(|c| c.is_alphanumeric() || "_.()-".contains(c))
-                    }) {
+                    } else if let Some(name) = env_name(source) {
                         self.env_value(name)
                     } else if index + 1 == sources.len() {
                         Some(self.expand(source, false)?)
@@ -260,48 +257,6 @@ impl<'a> Interpolation<'a> {
     }
 }
 
-/// Where the brace opening at `open` closes, counting nested pairs.
-fn closing_brace(text: &str, open: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    for (index, c) in text[open..].char_indices() {
-        match c {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(open + index);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// A token's `??` alternatives, trimmed, outside any nested braces.
-fn fallbacks(token: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut depth = 0i32;
-    let mut start = 0;
-    let bytes = token.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'{' => depth += 1,
-            b'}' => depth -= 1,
-            b'?' if depth == 0 && bytes.get(index + 1) == Some(&b'?') => {
-                parts.push(token[start..index].trim());
-                start = index + 2;
-                index += 1;
-            }
-            _ => {}
-        }
-        index += 1;
-    }
-    parts.push(token[start..].trim());
-    parts
-}
-
 /// Flags as yargs reads them: `--name=value`, `--name value`, `--name` for
 /// true and `--no-name` for false.
 pub(super) fn flags(words: &[String]) -> BTreeMap<String, String> {
@@ -327,7 +282,7 @@ pub(super) fn flags(words: &[String]) -> BTreeMap<String, String> {
     named
 }
 
-fn camel_case(key: &str) -> String {
+pub(super) fn camel_case(key: &str) -> String {
     let mut result = String::new();
     let mut upper = false;
     for ch in key.chars() {

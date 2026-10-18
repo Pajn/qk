@@ -133,15 +133,26 @@ impl Children<'_> {
 }
 
 pub fn execute(task: &PreparedTask, cancelled: &AtomicBool) -> Result<Outcome> {
+    let log_matches = match &task.ready_check {
+        Some(Ok(crate::readiness::ReadyCheck {
+            probe: crate::readiness::Probe::LogMatches(patterns),
+            ..
+        })) => Some(patterns),
+        _ => None,
+    };
     if task.display == Display::Stream
         && task.ready_when.is_empty()
+        && log_matches.is_none()
         && task.decorations.iter().all(Decoration::is_empty)
     {
         // Straight through: the task writes to the terminal itself.
         return execute_captured(task, cancelled, None);
     }
-    let capture =
+    let mut capture =
         Capture::new(None, task.display.clone()).ready_when(&task.ready_when, task.ready.clone());
+    if let Some(patterns) = log_matches {
+        capture = capture.log_matches(patterns, task.verdict.clone());
+    }
     execute_captured(task, cancelled, Some(&capture))
 }
 
