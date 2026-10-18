@@ -159,6 +159,23 @@ pub fn validate_path(path: &str) -> Result<()> {
     Ok(())
 }
 
+/// [`validate_path`] for an output pattern, whose `\` escapes the character
+/// after it, as in Nx: the paths it can match must be safe.
+fn validate_pattern(pattern: &str) -> Result<()> {
+    let mut path = String::new();
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        path.push(if c == '\\' {
+            chars
+                .next()
+                .with_context(|| format!("unsafe cache artifact path {pattern:?}"))?
+        } else {
+            c
+        });
+    }
+    validate_path(&path)
+}
+
 pub fn safe_parents(root: &Path, path: &str) -> Result<()> {
     validate_path(path)?;
     let mut current = root.to_owned();
@@ -260,11 +277,11 @@ impl Outputs {
         let mut complete = BTreeSet::new();
         for pattern in patterns {
             if let Some(excluded) = pattern.strip_prefix('!') {
-                validate_path(excluded)?;
+                validate_pattern(excluded)?;
                 negations.push(Pattern::new(excluded, false)?);
                 continue;
             }
-            validate_path(pattern)?;
+            validate_pattern(pattern)?;
             let anchor = pattern
                 .split('/')
                 .take_while(|part| crate::glob::is_literal(part))
@@ -329,7 +346,7 @@ impl Outputs {
                 Some(rest) => (true, rest.to_owned()),
                 None => (false, output),
             };
-            validate_path(&pattern)?;
+            validate_pattern(&pattern)?;
             if negated {
                 negations.push(Pattern::new(&pattern, false)?);
                 continue;
@@ -1480,6 +1497,37 @@ mod tests {
         std::os::unix::fs::symlink(root.join("outside"), root.join("dist/link")).unwrap();
         let outputs = Outputs::from_paths(&["dist".into(), "dist/link/nested".into()]).unwrap();
         assert!(outputs.entries(root).is_err());
+    }
+
+    #[test]
+    fn output_patterns_escape_glob_characters() {
+        let workspace = tempfile::tempdir().unwrap();
+        for file in [
+            "app/(group)/page.js",
+            "app/group/page.js",
+            "dist/[id].js",
+            "dist/i.js",
+        ] {
+            let path = workspace.path().join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+        let outputs =
+            Outputs::from_paths(&[r"app/\(group\)".into(), r"dist/\[id\].js".into()]).unwrap();
+        assert_eq!(
+            outputs
+                .paths(workspace.path())
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            ["app/(group)", "app/(group)/page.js", "dist/[id].js"]
+        );
+        for unsafe_pattern in [r"dist/\.\./x", r"dist\"] {
+            assert!(
+                Outputs::from_paths(&[unsafe_pattern.into()]).is_err(),
+                "{unsafe_pattern}"
+            );
+        }
     }
 
     #[test]

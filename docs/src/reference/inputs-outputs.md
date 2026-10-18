@@ -195,7 +195,9 @@ have no value. Option values have `{projectRoot}`, `{projectName}` and a
 leading `{workspaceRoot}` resolved first, as Nx does when it builds the
 project graph. Braces that do not start with a token are glob text, so
 `{projectRoot}/dist/**/*.{js,map}` is one output, and so is `{env.NAME}`:
-environment variables are no placeholder in outputs.
+environment variables are no placeholder in outputs. As in inputs, `\`
+escapes a glob character, so `{projectRoot}/app/\\(group\\)` in JSON names
+the `app/(group)` directory.
 
 An output whose `{options.…}` placeholder, or a `{projectRoot}` or
 `{workspaceRoot}` left as text, has no value is left out. `{workspaceRoot}`
