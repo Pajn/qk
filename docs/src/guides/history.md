@@ -54,7 +54,7 @@ web:build, most recent first:
   run 1790687500772-75771  2 min ago  success  miss  4.1s
       key changed since run 1790687500464-74260: dependencies, files
         changed packages/ui/src/index.ts
-        dependency ui:build
+        dependency ui:build:**/*.d.ts
       used 2.1 GB of memory at most
 ```
 

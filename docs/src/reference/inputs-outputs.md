@@ -131,9 +131,9 @@ without a value is left out. `!` negates an output: what it matches is
 neither cached nor removed when an entry is restored. A target without
 `outputs` takes `options.outputPath`, and a `build` or `prepare` target
 `dist/<root>`, `<root>/dist`, `<root>/build` and `<root>/public`. Those
-defaults are cached and restored, but because they are guesses they stay
-inputs of other tasks, and dependents are keyed by the task's key rather
-than by those files alone.
+defaults are cached and restored, but because they are guesses they are
+not declared outputs: they stay source files that other tasks' filesets can
+select, and `dependentTasksOutputFiles` selects none of them.
 
 A negated group such as `src/**/!(*.test).ts` or `dist/!(cache)/**` expands
 as Nx expands it, into a glob with the group widened and one naming the
