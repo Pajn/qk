@@ -314,11 +314,18 @@ fn takes_a_given_root_as_written_inside_the_workspace() {
     write(
         temp.path(),
         "tools/app/project.json",
-        r#"{"name":"app","root":"apps/app"}"#,
+        r#"{"name":"app","root":"apps/app","targets":{"build":{
+            "command":"tsc","options":{"out":"{projectRoot}/dist"}
+        }}}"#,
     );
     write(temp.path(), "project.json", r#"{"name":"top","root":""}"#);
     let workspace = Workspace::load(temp.path()).unwrap();
     assert_eq!(workspace.projects["app"].root, "apps/app");
+    // Option tokens resolve to that root, not the configuration's directory.
+    assert_eq!(
+        workspace.projects["app"].targets["build"].options["out"],
+        "apps/app/dist"
+    );
     assert_eq!(workspace.projects["top"].root, ".");
     write(
         temp.path(),
