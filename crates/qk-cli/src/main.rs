@@ -1901,6 +1901,11 @@ fn requests(
 /// importer installs directly, and edges between installations.
 fn external_nodes(workspace: &Workspace, graph: &mut serde_json::Value) -> Result<()> {
     use serde_json::json;
+    // As in Nx, `analyzeLockfile: false` leaves the graph without them.
+    if !workspace.analyzes_lockfile() {
+        graph["externalNodes"] = json!({});
+        return Ok(());
+    }
     let text = std::fs::read_to_string(workspace.root.join("pnpm-lock.yaml"))
         .context("--external needs a pnpm-lock.yaml")?;
     let lockfile = qk_lockfile::Lockfile::parse(&text)?;

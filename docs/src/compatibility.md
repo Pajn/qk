@@ -19,7 +19,10 @@ Ranges such as `catalog:`, npm aliases, or ranges outside the workspace
 version do not create an edge. Names are looked up by dependency key, so
 `"ui": "workspace:@scope/ui@*"` does not link to `@scope/ui`.
 When a name occurs in multiple sections, precedence is `dependencies`,
-`devDependencies`, `peerDependencies`, then `optionalDependencies`.
+`devDependencies`, `peerDependencies`, then `optionalDependencies`. When two
+packages share a name, the name means the one whose package.json path sorts
+last, as in Nx. `pluginsConfig["@nx/js"].analyzePackageJson` turns these
+edges off.
 `implicitDependencies` adds selected project edges.
 
 ## Deliberate differences
@@ -84,8 +87,13 @@ When a name occurs in multiple sections, precedence is `dependencies`,
   they are, which turns such a root into a pattern that misses the project's
   files.
 - `pnpm-workspace.yaml` and `lerna.json` name workspace packages in a
-  workspace without a root `package.json` too; Nx then reads no workspace
-  patterns.
+  workspace without a root `package.json` too, and package.json dependencies
+  make edges there; Nx then reads no workspace patterns and analyses no
+  package.json.
+- With `analyzeLockfile: false`, a lockfile change under
+  `projectsAffectedByDependencyUpdates: "auto"` affects every project even
+  when no package changed, where Nx affects none; cache keys and
+  `externalDependencies` inputs still read the lockfile.
 - Project discovery ignores the machine's global Git excludes, and the
   `.gitignore` files above a workspace that is not in a Git repository;
   Nx reads both, so what they hide depends on the machine.

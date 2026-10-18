@@ -133,6 +133,20 @@ An object with `appsDir` and `libsDir` string prefixes used to infer package
 project types. Matching is by plain string prefix. Explicit `project.json`
 configuration can override the inferred type.
 
+## `pluginsConfig["@nx/js"]`
+
+The settings Nx's JavaScript support reads, which qk reads too:
+
+- `analyzePackageJson`: anything but `true` stops package.json dependencies
+  making graph edges.
+- `analyzeLockfile`: `false` leaves the installed packages out of the graph,
+  so `graph --external` adds none and a lockfile change under
+  `projectsAffectedByDependencyUpdates: "auto"` affects every project, as in
+  Nx. It defaults to on, unless a `lerna.json` stands without an `nx.json`.
+  Cache keys and `externalDependencies` inputs read the lockfile either way.
+- `projectsAffectedByDependencyUpdates`: see
+  [Affected selection](../guides/affected.md).
+
 ## `cacheDirectory`
 
 A path relative to the workspace root, or an absolute path, overriding the

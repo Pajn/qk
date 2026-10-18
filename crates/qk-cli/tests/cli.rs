@@ -1693,3 +1693,25 @@ fn the_workspace_root_can_be_set_as_in_nx() {
         .unwrap();
     assert_eq!(successful_json(output), json!(["app"]));
 }
+
+#[test]
+fn graph_has_no_packages_when_the_lockfile_is_not_analysed() {
+    let temp = TempDir::new().unwrap();
+    std::fs::write(
+        temp.path().join("nx.json"),
+        r#"{"pluginsConfig": {"@nx/js": {"analyzeLockfile": false}}}"#,
+    )
+    .unwrap();
+    std::fs::write(temp.path().join("project.json"), r#"{"name": "app"}"#).unwrap();
+    std::fs::write(temp.path().join("pnpm-lock.yaml"), "not: [a lockfile").unwrap();
+    let output = isolated_command(env!("CARGO_BIN_EXE_qk"))
+        .args([
+            "--workspace",
+            temp.path().to_str().unwrap(),
+            "graph",
+            "--external",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(successful_json(output)["graph"]["externalNodes"], json!({}));
+}

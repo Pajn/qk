@@ -84,14 +84,26 @@ pub struct GraphReport<'a> {
 
 impl ProjectGraph {
     pub fn build(workspace: &Workspace) -> Result<Self> {
+        // As in Nx, a package name two projects share means the later one,
+        // in the order of their package.json paths.
+        let mut packages: Vec<(String, &String)> = workspace
+            .packages
+            .keys()
+            .map(|name| {
+                let manifest = match workspace.projects[name].root.as_str() {
+                    "." => "package.json".to_owned(),
+                    root => format!("{root}/package.json"),
+                };
+                (manifest, name)
+            })
+            .collect();
+        packages.sort();
         let mut package_names = BTreeMap::new();
-        for (project_name, package) in &workspace.packages {
-            if let Some(name) = &package.name
-                && let Some(previous) = package_names.insert(name, project_name)
-            {
-                bail!(
-                    "duplicate workspace package name {name:?} in projects {previous:?} and {project_name:?}"
-                );
+        if workspace.analyzes_package_json() {
+            for (_, project_name) in packages {
+                if let Some(name) = &workspace.packages[project_name].name {
+                    package_names.insert(name, project_name);
+                }
             }
         }
         check_implicit_dependencies(&workspace.projects)?;

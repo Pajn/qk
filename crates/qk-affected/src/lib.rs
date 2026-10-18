@@ -949,7 +949,9 @@ fn touched_by_lockfile(
         setting: setting.clone(),
     };
     match &setting {
-        Value::String(mode) if mode == "auto" => {}
+        // Without the lockfile's packages in the graph, Nx's `auto` finds no
+        // package that changed and takes every project.
+        Value::String(mode) if mode == "auto" && workspace.analyzes_lockfile() => {}
         Value::Array(selectors) => {
             let selectors: Vec<String> = serde_json::from_value(Value::Array(selectors.clone()))
                 .context("projectsAffectedByDependencyUpdates must list project selectors")?;

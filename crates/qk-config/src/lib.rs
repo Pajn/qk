@@ -341,6 +341,41 @@ impl Workspace {
 }
 
 impl Workspace {
+    /// nx.json `pluginsConfig["@nx/js"]`, which Nx's own plugins read.
+    fn js_plugin_config(&self) -> Option<&Value> {
+        self.config
+            .extra
+            .get("pluginsConfig")
+            .and_then(|config| config.get("@nx/js"))
+    }
+
+    /// Whether package.json dependencies make graph edges: unless
+    /// `analyzePackageJson` is set to anything but `true`, as Nx reads it.
+    /// Nx also turns it off in a workspace without a root package.json; qk,
+    /// which reads such workspaces' pnpm-workspace.yaml, does not.
+    pub fn analyzes_package_json(&self) -> bool {
+        self.js_plugin_config()
+            .and_then(|config| config.get("analyzePackageJson"))
+            .is_none_or(|analyze| *analyze == Value::Bool(true))
+    }
+
+    /// Whether the lockfile describes the installed packages:
+    /// `analyzeLockfile`, by default on unless a `lerna.json` stands without
+    /// an nx.json, as Nx reads it.
+    pub fn analyzes_lockfile(&self) -> bool {
+        match self
+            .js_plugin_config()
+            .and_then(|config| config.get("analyzeLockfile"))
+        {
+            Some(analyze) => {
+                !matches!(analyze, Value::Null | Value::Bool(false))
+                    && analyze.as_str() != Some("")
+                    && analyze.as_f64() != Some(0.0)
+            }
+            None => !self.root.join("lerna.json").is_file() || self.root.join("nx.json").is_file(),
+        }
+    }
+
     /// The package manager, as Nx detects it: nx.json `cli.packageManager`,
     /// then the lockfile, then the package manager qk was invoked through. qk
     /// also reads the root `packageManager` and `pnpm-workspace.yaml` before

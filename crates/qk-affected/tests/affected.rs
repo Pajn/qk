@@ -308,6 +308,20 @@ fn lockfile_changes_affect_every_project_outside_auto_mode() {
 }
 
 #[test]
+fn auto_mode_without_the_lockfile_analysed_affects_every_project() {
+    let repo = Repo::new(&[
+        (
+            "nx.json",
+            r#"{"pluginsConfig": {"@nx/js": {"projectsAffectedByDependencyUpdates": "auto",
+                "analyzeLockfile": false}}}"#,
+        ),
+        ("pnpm-lock.yaml", &lockfile("19.0.0", "19.0.0")),
+    ]);
+    write(&repo.root, "pnpm-lock.yaml", &lockfile("19.0.0", "19.1.0"));
+    assert_eq!(repo.committed(), names(&["app", "lib", "tool"]));
+}
+
+#[test]
 fn root_package_dependencies_affect_the_projects_installing_them() {
     let repo = Repo::new(&[
         (

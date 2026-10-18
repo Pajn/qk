@@ -153,7 +153,7 @@ fn implicit_globs_exclude_self_and_negations_remove_manifest_edges() {
 }
 
 #[test]
-fn graph_rejects_dangling_implicit_edges_and_duplicate_package_names() {
+fn graph_rejects_dangling_implicit_edges() {
     let mut workspace = example();
     workspace
         .projects
@@ -167,18 +167,34 @@ fn graph_rejects_dangling_implicit_edges_and_duplicate_package_names() {
     );
     // `!absent` starts from every project, so it matches some.
     assert!(!error.contains("!absent"), "{error}");
-    workspace
-        .projects
-        .get_mut("web")
-        .unwrap()
-        .implicit_dependencies
-        .clear();
+}
+
+#[test]
+fn a_shared_package_name_means_the_later_package_as_in_nx() {
+    let mut workspace = example();
+    // `packages/core/package.json` sorts after `apps/web/package.json`, so
+    // the name means `core`, and web's dependency on it still links.
     workspace.packages.get_mut("web").unwrap().name = Some("@example/core".into());
+    let graph = ProjectGraph::build(&workspace).unwrap();
     assert!(
-        ProjectGraph::build(&workspace)
-            .unwrap_err()
-            .to_string()
-            .contains("duplicate workspace package name")
+        graph.dependencies["web"]
+            .iter()
+            .any(|edge| (edge.target.as_str(), edge.kind.as_str()) == ("core", "static"))
+    );
+}
+
+#[test]
+fn package_json_edges_can_be_turned_off_as_in_nx() {
+    let mut workspace = example();
+    workspace.config.extra.insert(
+        "pluginsConfig".into(),
+        json!({"@nx/js": {"analyzePackageJson": false}}),
+    );
+    let graph = ProjectGraph::build(&workspace).unwrap();
+    assert!(
+        graph.dependencies["web"]
+            .iter()
+            .all(|edge| edge.kind == "implicit")
     );
 }
 
