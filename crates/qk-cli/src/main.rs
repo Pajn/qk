@@ -1,3 +1,4 @@
+mod args;
 mod doctor;
 mod explain;
 mod hash;
@@ -64,28 +65,42 @@ enum Command {
         #[command(subcommand)]
         command: WarmCommand,
     },
-    /// Execute a task and its dependencies. Forward arguments after --.
+    /// Execute a task and its dependencies. Options qk does not know, and
+    /// arguments after --, are forwarded to the task.
     Run {
-        /// project:target[:configuration], or a target of the current directory's project.
-        task: String,
+        /// project:target[:configuration], a target of the current directory's
+        /// project, or a project with a `run` target.
+        task: Option<String>,
+        /// The project, by name or a pattern matching one project.
+        #[arg(short = 'p', long)]
+        project: Option<String>,
+        /// The target, for one whose name has a colon.
+        #[arg(short = 't', long)]
+        target: Option<String>,
         #[command(flatten)]
         options: RunOptions,
     },
     /// Execute targets on selected projects and their dependencies.
     RunMany {
         // Like Nx, lists take commas, spaces or repeated flags.
-        #[arg(short = 't', long, required = true, value_delimiter = ',', num_args = 1..)]
+        #[arg(short = 't', long, alias = "target", required = true, value_delimiter = ',', num_args = 1..)]
         targets: Vec<String>,
         #[arg(short = 'p', long, value_delimiter = ',', num_args = 1..)]
         projects: Vec<String>,
         #[arg(long, value_delimiter = ',', num_args = 1..)]
         exclude: Vec<String>,
+        /// Nx's deprecated `--all`, the default; `--all=false` without
+        /// projects selects none.
+        #[arg(long, hide = true)]
+        all: bool,
+        #[arg(long, hide = true)]
+        no_all: bool,
         #[command(flatten)]
         options: RunOptions,
     },
     /// Execute targets on the projects affected by changes, and their dependencies.
     Affected {
-        #[arg(short = 't', long, required = true, value_delimiter = ',', num_args = 1..)]
+        #[arg(short = 't', long, alias = "target", required = true, value_delimiter = ',', num_args = 1..)]
         targets: Vec<String>,
         #[arg(short = 'p', long, value_delimiter = ',', num_args = 1..)]
         projects: Vec<String>,
@@ -247,7 +262,9 @@ enum ProjectionFallbackPolicy {
 }
 
 /// What counts as changed, as in Nx. Without `--head`, the working tree is
-/// compared, including uncommitted and untracked files.
+/// compared, including uncommitted and untracked files. As in Nx, `--head`
+/// needs `--base`, and the explicit file sources exclude the revisions and
+/// each other, except that `--stdin` adds to `--files`.
 #[derive(Args)]
 struct ChangeOptions {
     /// Affected profile from nx.json: change projections, import reachability or both.
@@ -261,34 +278,37 @@ struct ChangeOptions {
     #[arg(long)]
     base: Option<String>,
     /// Head revision; defaults to NX_HEAD.
-    #[arg(long)]
+    #[arg(long, requires = "base")]
     head: Option<String>,
     /// Treat exactly these workspace-relative files as changed.
-    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    #[arg(long, value_delimiter = ',', num_args = 1.., conflicts_with_all = ["uncommitted", "untracked", "base", "head"])]
     files: Vec<String>,
     /// Read changed workspace-relative paths from stdin, one per line.
-    #[arg(long, conflicts_with_all = ["files", "uncommitted", "untracked"])]
+    #[arg(long, conflicts_with_all = ["uncommitted", "untracked", "base", "head"])]
     stdin: bool,
     /// Only uncommitted changes.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["untracked", "base", "head"])]
     uncommitted: bool,
     /// Only untracked files.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["base", "head"])]
     untracked: bool,
 }
 
 impl ChangeOptions {
     /// Read the explicit file list once, preserving spaces in paths and empty lists.
+    /// As in Nx, the paths from stdin come before those `--files` names.
     fn read_stdin(&mut self) -> Result<()> {
         if self.stdin {
             use std::io::BufRead;
-            self.files = io::stdin()
+            let mut files: Vec<String> = io::stdin()
                 .lock()
                 .lines()
                 .collect::<std::io::Result<Vec<_>>>()?
                 .into_iter()
                 .filter(|line| !line.is_empty())
                 .collect();
+            files.append(&mut self.files);
+            self.files = files;
         }
         Ok(())
     }
@@ -757,9 +777,15 @@ enum ShowCommand {
 }
 
 fn main() {
-    match run(Cli::parse_from(shorthand(kebab_flags(
-        std::env::args_os().collect(),
-    )))) {
+    use clap::CommandFactory;
+    let args = match shorthand(std::env::args_os().collect()) {
+        Ok(args) => args,
+        Err(error) => {
+            eprintln!("qk: {error:#}");
+            std::process::exit(1);
+        }
+    };
+    match run(Cli::parse_from(args::normalize(args, &Cli::command()))) {
         Ok(0) => {}
         Ok(code) => std::process::exit(code),
         Err(error) => {
@@ -799,47 +825,36 @@ const NX_COMMANDS: &[&str] = &[
     "view-logs",
 ];
 
-/// Spells camelCase long flags in kebab-case, since Nx accepts both and qk
-/// defines only the kebab-case one: `--outputStyle=static` becomes
-/// `--output-style=static`. Arguments after `--` are forwarded untouched.
-fn kebab_flags(args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
-    let mut forwarded = false;
-    args.into_iter()
-        .map(|arg| {
-            forwarded |= arg == "--";
-            let Some(text) = arg.to_str().filter(|_| !forwarded) else {
-                return arg;
-            };
-            let Some(flag) = text.strip_prefix("--") else {
-                return arg;
-            };
-            let (name, value) = match flag.split_once('=') {
-                Some((name, value)) => (name, Some(value)),
-                None => (flag, None),
-            };
-            if !name.bytes().any(|byte| byte.is_ascii_uppercase()) {
-                return arg;
-            }
-            let mut kebab = String::from("--");
-            for character in name.chars() {
-                if character.is_ascii_uppercase() {
-                    kebab.push('-');
-                }
-                kebab.push(character.to_ascii_lowercase());
-            }
-            if let Some(value) = value {
-                kebab.push('=');
-                kebab.push_str(value);
-            }
-            kebab.into()
-        })
-        .collect()
-}
+/// Nx's hidden `affected:<target>` commands, which run `affected` for one target.
+const AFFECTED_TARGETS: &[&str] = &[
+    "affected:build",
+    "affected:e2e",
+    "affected:lint",
+    "affected:test",
+];
+
+/// Commands Nx removed but still recognises, with the message it fails with.
+const REMOVED_COMMANDS: &[(&str, &str)] = &[
+    (
+        "affected:graph",
+        "Use `nx graph --affected`, or `nx affected --graph` instead depending on which best suits your use case. The `affected:graph` command has been removed in Nx 19.",
+    ),
+    (
+        "affected:dep-graph",
+        "Use `nx graph --affected`, or `nx affected --graph` instead depending on which best suits your use case. The `affected:graph` command has been removed in Nx 19.",
+    ),
+    (
+        "print-affected",
+        "Use `nx show projects --affected`, `nx affected --graph -t build` or `nx graph --affected` depending on which best suits your use case. The `print-affected` command has been removed in Nx 19.",
+    ),
+];
 
 /// Rewrites Nx's shorthand into `run`: `<target> <project>` and `<project>:<target>`
 /// become `run <project>:<target>`, and a bare `<target>` becomes `run <target>`.
 /// Anything that starts with one of qk's own subcommands is left alone.
-fn shorthand(mut args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+/// `affected:<target>` becomes `affected --targets <target>`, and the commands
+/// Nx removed fail with its message.
+fn shorthand(mut args: Vec<std::ffi::OsString>) -> Result<Vec<std::ffi::OsString>> {
     use clap::CommandFactory;
     let command = Cli::command();
     let mut index = 1;
@@ -856,8 +871,19 @@ fn shorthand(mut args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
         .and_then(|arg| arg.to_str())
         .map(str::to_owned)
     else {
-        return args;
+        return Ok(args);
     };
+    if let Some((_, message)) = REMOVED_COMMANDS.iter().find(|(name, _)| *name == first) {
+        bail!("{message}");
+    }
+    if AFFECTED_TARGETS.contains(&first.as_str()) {
+        let target = first.trim_start_matches("affected:").to_owned();
+        args.splice(
+            index..=index,
+            ["affected".into(), "--targets".into(), target.into()],
+        );
+        return Ok(args);
+    }
     let known = first == "help"
         || NX_COMMANDS.contains(&first.as_str())
         || command.get_subcommands().any(|subcommand| {
@@ -865,7 +891,7 @@ fn shorthand(mut args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
                 || subcommand.get_all_aliases().any(|alias| alias == first)
         });
     if first.starts_with('-') || known {
-        return args;
+        return Ok(args);
     }
     let project = args
         .get(index + 1)
@@ -881,7 +907,7 @@ fn shorthand(mut args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
         }
         None => args.insert(index, "run".into()),
     }
-    args
+    Ok(args)
 }
 
 /// The project whose root most specifically contains the current directory.
@@ -1108,16 +1134,28 @@ fn run(mut cli: Cli) -> Result<i32> {
             }
             return Ok(code);
         }
-        Command::Run { task, options } => {
-            return run_task(&workspace, task, &options);
+        Command::Run {
+            task,
+            project,
+            target,
+            options,
+        } => {
+            let request = run_one_request(&workspace, task, project, target)?;
+            return run_request(&workspace, request, &options);
         }
         Command::RunMany {
             targets,
             projects,
             exclude,
+            no_all,
             options,
+            ..
         } => {
-            let selected = select_projects(&workspace.projects, &projects, &exclude)?;
+            let selected = if no_all && projects.is_empty() {
+                std::collections::BTreeSet::new()
+            } else {
+                select_projects(&workspace.projects, &projects, &exclude)?
+            };
             let requests = requests(
                 &workspace,
                 selected,
@@ -1705,8 +1743,99 @@ fn task_request(workspace: &Workspace, task: String) -> Result<Request> {
     Request::parse_in(workspace, &task)
 }
 
+/// Nx's short names for common targets, which `nx run` and `nx <target>` take.
+const TARGET_ALIASES: &[(&str, &str)] = &[
+    ("b", "build"),
+    ("e", "e2e"),
+    ("l", "lint"),
+    ("s", "serve"),
+    ("t", "test"),
+];
+
+/// The task `qk run` is asked for, as Nx's run-one reads it: a
+/// `project:target[:configuration]`, else `--target`, else a project with a
+/// `run` target, else a target; `--project` names the project, else the
+/// current directory's. The project can be a pattern matching one project,
+/// and the target one of Nx's short names.
+fn run_one_request(
+    workspace: &Workspace,
+    task: Option<String>,
+    project: Option<String>,
+    target: Option<String>,
+) -> Result<Request> {
+    let mut request = match (task, target) {
+        (Some(task), _) if task.rfind(':').is_some_and(|index| index > 0) => {
+            Request::parse_in(workspace, &task)?
+        }
+        (task, Some(target)) => {
+            // A positional beside --target names the project.
+            if task.is_some() && project.is_some() {
+                bail!("give the project once, as --project or before --target");
+            }
+            Request {
+                project: task.unwrap_or_default(),
+                target,
+                configuration: None,
+                requested_configuration: None,
+                args: Vec::new(),
+            }
+        }
+        (Some(task), None) => {
+            let has_run = workspace
+                .projects
+                .get(&task)
+                .is_some_and(|project| project.targets.contains_key("run"));
+            let (project, target) = if has_run {
+                (task, "run".to_owned())
+            } else {
+                (String::new(), task)
+            };
+            Request {
+                project,
+                target,
+                configuration: None,
+                requested_configuration: None,
+                args: Vec::new(),
+            }
+        }
+        (None, None) => bail!("Both project and target have to be specified"),
+    };
+    if let Some(project) = project {
+        request.project = project;
+    }
+    if request.project.is_empty() {
+        request.project = current_project(workspace)?;
+    }
+    if !workspace.projects.contains_key(&request.project) {
+        let matched = select_projects(
+            &workspace.projects,
+            std::slice::from_ref(&request.project),
+            &[],
+        )
+        .unwrap_or_default();
+        match matched.len() {
+            1 => request.project = matched.into_iter().next().unwrap(),
+            0 => bail!("Cannot find project '{}'", request.project),
+            _ => bail!(
+                "Multiple projects matched:\n{}",
+                matched.into_iter().collect::<Vec<_>>().join("\n")
+            ),
+        }
+    }
+    if let Some((_, target)) = TARGET_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == request.target)
+    {
+        request.target = (*target).to_owned();
+    }
+    Ok(request)
+}
+
 fn run_task(workspace: &Workspace, task: String, options: &RunOptions) -> Result<i32> {
-    let mut request = task_request(workspace, task)?;
+    run_request(workspace, task_request(workspace, task)?, options)
+}
+
+fn run_request(workspace: &Workspace, mut request: Request, options: &RunOptions) -> Result<i32> {
     if let Some(configuration) = &options.configuration() {
         if request
             .configuration

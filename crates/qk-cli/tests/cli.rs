@@ -289,6 +289,174 @@ fn camel_case_flags_mean_their_kebab_case_spelling_like_nx() {
     assert!(plan.contains("\"--outputStyle\""), "{plan}");
 }
 
+/// Each planned task's forwarded arguments.
+fn planned_args(output: Output) -> Value {
+    let graph = successful_json(output);
+    graph["tasks"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(id, task)| (id.clone(), task["args"].clone()))
+        .collect()
+}
+
+#[test]
+fn unknown_options_and_extra_positionals_reach_the_task_as_in_nx() {
+    for args in [
+        vec![
+            "test",
+            "web",
+            "--coverage",
+            "--max-workers",
+            "2",
+            "--dry-run",
+        ],
+        vec![
+            "run",
+            "web:test",
+            "--coverage",
+            "--max-workers=2",
+            "--dry-run",
+        ],
+        vec![
+            "web:test",
+            "--dry-run",
+            "--coverage",
+            "--",
+            "--max-workers",
+            "2",
+        ],
+    ] {
+        let tasks = planned_args(qk(&args));
+        let forwarded = tasks["web:test"].as_array().unwrap();
+        assert_eq!(forwarded[0], "--coverage", "{args:?}");
+        assert!(forwarded.len() >= 2, "{args:?}: {forwarded:?}");
+    }
+    // Unknown options keep their spelling; Nx's own take theirs.
+    assert_eq!(
+        planned_args(qk(&[
+            "test",
+            "web",
+            "--fooBar=1",
+            "--no-thing",
+            "x",
+            "--dryRun"
+        ]))["web:test"],
+        json!(["--fooBar=1", "--no-thing", "x"])
+    );
+    let tasks = planned_args(qk(&["run-many", "-t", "test", "--coverage", "--dry-run"]));
+    assert_eq!(tasks["web:test"], json!(["--coverage"]));
+    let tasks = planned_args(qk(&[
+        "affected:test",
+        "--files=apps/web/project.json",
+        "--watch",
+        "--dry-run",
+    ]));
+    assert_eq!(tasks["web:test"], json!(["--watch"]));
+}
+
+#[test]
+fn boolean_options_take_values_as_yargs_does() {
+    for args in [
+        vec!["--nxBail=true", "--skip-nx-cache=false"],
+        vec!["--nx-bail", "false", "--skipNxCache", "true"],
+        vec!["--no-nx-bail", "--no-skip-nx-cache", "--verbose=false"],
+    ] {
+        let mut command = vec!["run-many", "-t", "build"];
+        command.extend(&args);
+        command.push("--dry-run");
+        let output = qk(&command);
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // None of them is an override.
+        assert!(
+            planned_args(output)
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|args| args == &json!([])),
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
+fn run_takes_projects_and_targets_as_nx_run_does() {
+    // -p/--project and -t/--target, a pattern matching one project, and the
+    // short target names.
+    for args in [
+        vec!["run", "-p", "web", "-t", "build", "--dry-run"],
+        vec!["run", "--project=we*", "--target", "build", "--dry-run"],
+        vec!["run", "we*:b", "--dry-run"],
+        vec!["b", "web", "--dry-run"],
+    ] {
+        assert!(
+            planned(qk(&args)).contains(&"web:build".to_owned()),
+            "{args:?}"
+        );
+    }
+    assert_eq!(planned(qk(&["t", "web", "--dry-run"])), ["web:test"]);
+    let output = qk(&["run", "w*:build", "--dry-run"]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Multiple projects matched"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The removed commands fail with Nx's message.
+    let output = qk(&["print-affected"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("nx show projects --affected"));
+}
+
+#[test]
+fn a_project_with_a_run_target_runs_it_by_name() {
+    let temp = TempDir::new().unwrap();
+    std::fs::write(temp.path().join("nx.json"), "{}").unwrap();
+    std::fs::write(
+        temp.path().join("project.json"),
+        json!({"name": "tool", "targets": {"run": {"command": "echo ran"}}}).to_string(),
+    )
+    .unwrap();
+    let qk = |args: &[&str]| {
+        isolated_command(env!("CARGO_BIN_EXE_qk"))
+            .current_dir(temp.path())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    assert_eq!(planned(qk(&["tool", "--dry-run"])), ["tool:run"]);
+    assert_eq!(planned(qk(&["run", "tool", "--dry-run"])), ["tool:run"]);
+}
+
+#[test]
+fn run_many_takes_the_deprecated_all_and_target() {
+    let all = planned(qk(&["run-many", "--target", "build", "--all", "--dry-run"]));
+    assert!(all.contains(&"web:build".to_owned()));
+    let none = qk(&["run-many", "--target", "build", "--all=false", "--graph"]);
+    let graph = successful_json(none);
+    assert_eq!(graph["tasks"]["tasks"], json!({}));
+}
+
+#[test]
+fn change_options_conflict_as_in_nx() {
+    for args in [
+        vec!["--head", "HEAD"],
+        vec!["--files", "a", "--base", "main"],
+        vec!["--uncommitted", "--untracked"],
+        vec!["--untracked", "--head", "HEAD", "--base", "main"],
+        vec!["--stdin", "--base", "main"],
+    ] {
+        let mut command = vec!["show", "projects", "--affected"];
+        command.extend(&args);
+        let output = qk(&command);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+    }
+}
+
 #[test]
 fn camel_case_spellings_of_nx_options_are_accepted() {
     for flag in [
@@ -780,19 +948,23 @@ fn affected_reads_changed_paths_from_stdin() {
         .status
         .success()
     );
-    assert!(
-        !run(
+    // As in Nx, `--files` adds to what stdin names.
+    assert_eq!(
+        successful_json(run(
             &[
                 "show",
                 "projects",
                 "--stdin",
                 "--files",
-                "app/src/a file.ts"
+                "app/src/a file.ts",
+                "--json"
             ],
             ""
-        )
-        .status
-        .success()
+        )),
+        successful_json(run(
+            &["show", "projects", "--stdin", "--json"],
+            "app/src/a file.ts\n"
+        ))
     );
 }
 
@@ -1315,12 +1487,11 @@ fn affected_profile_lists_projects_explains_projection_and_rejects_task_selectio
             "--json",
             "--affected-profile",
             "runtime",
-            "--base",
-            "HEAD^",
             "--fail-on-projection-fallback=adapter",
         ];
-        if !selection.is_empty() {
-            args.extend(["--head", "HEAD"]);
+        // As in Nx, explicit files exclude the revisions.
+        if selection.is_empty() {
+            args.extend(["--base", "HEAD^"]);
         }
         args.extend(selection);
         let output = run(&args);
