@@ -496,7 +496,11 @@ pub fn run(
                     let dependencies = &graph.tasks[&id].dependencies;
                     if dependencies.iter().any(|dependency| {
                         skipped.contains(dependency)
-                            || not_ready(&id, dependency)
+                            // Once its failure has been reported: a check can
+                            // fail at any moment, and the reason comes first.
+                            || (not_ready(&id, dependency)
+                                && (not_ready_failed.contains(dependency)
+                                    || !active.contains(dependency)))
                             || outcomes
                                 .get(dependency)
                                 .is_some_and(|outcome| *outcome != Outcome::Success)
