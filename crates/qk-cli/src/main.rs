@@ -911,6 +911,9 @@ fn run(mut cli: Cli) -> Result<i32> {
         None => find_workspace(&std::env::current_dir().context("cannot read current directory")?)?,
     };
     let workspace = Workspace::load(&root)?;
+    for warning in &workspace.warnings {
+        eprintln!("qk: warning: {warning}");
+    }
     match cli.command {
         Command::UploadWorker => unreachable!("handled before workspace discovery"),
         Command::Inputs {

@@ -1083,9 +1083,15 @@ fn metadata_and_generators_merge_across_files() {
     ])
     .unwrap();
     let app = &workspace.projects["app"];
+    // Nx replaces a package's own metadata with what it reads from the
+    // package, and project.json's merges over that.
     assert_eq!(
         app.extra["metadata"],
-        json!({"technologies": ["node", "react"], "owner": "a"})
+        json!({
+            "targetGroups": {},
+            "js": {"packageName": "app", "isInPackageManagerWorkspaces": true},
+            "technologies": ["react"]
+        })
     );
     assert_eq!(
         app.extra["generators"],
@@ -1097,5 +1103,107 @@ fn metadata_and_generators_merge_across_files() {
     assert_eq!(
         app.targets["build"].extra["metadata"],
         json!({"technologies": ["tsc", "vite"], "help": {"a": 1, "b": 2}})
+    );
+}
+
+#[test]
+fn project_json_merges_over_package_json_as_in_nx() {
+    let temp = TempDir::new().unwrap();
+    write(temp.path(), "nx.json", "{}");
+    write(
+        temp.path(),
+        "package.json",
+        r#"{"name": "root", "workspaces": ["libs/*"], "packageManager": "pnpm@9.0.0"}"#,
+    );
+    write(
+        temp.path(),
+        "libs/lib/package.json",
+        r#"{"name": "@scope/lib", "version": "1.0.0", "description": "A library",
+            "main": "index.js", "scripts": {"build": "tsc", "test": "vitest", "lint": "eslint"},
+            "nx": {"implicitDependencies": ["other"],
+                   "generators": {"@nx/js:lib": {"a": 1, "b": 1}, "kept": {"x": 1}},
+                   "metadata": {"ignored": true},
+                   "targets": {"test": {"command": "vitest run"}}}}"#,
+    );
+    write(
+        temp.path(),
+        "libs/lib/project.json",
+        r#"{"implicitDependencies": "third",
+            "generators": {"@nx/js:lib": {"b": 2}},
+            "metadata": {"targetGroups": {"NPM Scripts": ["extra"], "Mine": ["a"]}, "owner": "me"},
+            "targets": {"lint": {"command": "oxlint"}}}"#,
+    );
+    write(
+        temp.path(),
+        "libs/other/project.json",
+        r#"{"name": "other"}"#,
+    );
+    write(
+        temp.path(),
+        "libs/third/project.json",
+        r#"{"name": "third"}"#,
+    );
+    let workspace = Workspace::load(temp.path()).unwrap();
+    let lib = &workspace.projects["@scope/lib"];
+    // Implicit dependencies concatenate; a single string is one entry.
+    assert_eq!(lib.implicit_dependencies, ["other", "third"]);
+    // Generators merge by generator and option.
+    assert_eq!(
+        lib.extra["generators"],
+        json!({"@nx/js:lib": {"a": 1, "b": 2}, "kept": {"x": 1}})
+    );
+    // Nx replaces the package's metadata with its own, then merges
+    // project.json's over it, arrays concatenating.
+    assert_eq!(
+        lib.extra["metadata"],
+        json!({
+            "targetGroups": {"NPM Scripts": ["build", "test", "extra"], "Mine": ["a"]},
+            "description": "A library",
+            "js": {
+                "packageName": "@scope/lib",
+                "packageVersion": "1.0.0",
+                "packageMain": "index.js",
+                "isInPackageManagerWorkspaces": true
+            },
+            "owner": "me"
+        })
+    );
+    // A script project.json runs another way is no package target.
+    assert_eq!(lib.targets["lint"].extra.get("metadata"), None);
+    assert_eq!(
+        lib.targets["build"].extra["metadata"],
+        json!({"scriptContent": "tsc", "runCommand": "pnpm run build"})
+    );
+    // A package.json target saying how it runs replaces the script's target.
+    assert_eq!(lib.targets["test"].extra.get("metadata"), None);
+    assert_eq!(lib.targets["test"].options["command"], "vitest run");
+    // A project.json project gains no package metadata.
+    assert!(!workspace.projects["other"].extra.contains_key("metadata"));
+}
+
+#[test]
+fn implicit_dependencies_must_be_strings() {
+    let temp = TempDir::new().unwrap();
+    write(
+        temp.path(),
+        "nx.json",
+        r#"{"implicitDependencies": {"package.json": "*"}}"#,
+    );
+    write(temp.path(), "a/project.json", r#"{"name": "a"}"#);
+    let workspace = Workspace::load(temp.path()).unwrap();
+    assert!(
+        workspace.warnings[0].contains("implicitDependencies is no longer supported"),
+        "{:?}",
+        workspace.warnings
+    );
+    write(
+        temp.path(),
+        "a/project.json",
+        r#"{"name": "a", "implicitDependencies": {"b": true}}"#,
+    );
+    let error = format!("{:#}", Workspace::load(temp.path()).unwrap_err());
+    assert!(
+        error.contains("implicitDependencies should be an array of strings"),
+        "{error}"
     );
 }

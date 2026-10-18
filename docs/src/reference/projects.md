@@ -21,15 +21,24 @@ it. Other hidden project directories remain discoverable.
 
 ## Configuration precedence
 
-Package scripts become `nx:run-script` targets, except a script that
-`project.json` gives another way to run: a command, or an executor other
-than run-script running it. Package `nx` configuration is merged over
-these; a target there with an executor or command replaces the script's.
-Adjacent `project.json` merges over that, then `project.local.json`.
-Workspace `targetDefaults` lie beneath them all. Targets merge as described
-in [Merging](targets.md#merging). Tags merge as an ordered union, named
-inputs by name, `generators` by generator and `metadata` one level deep with
-lists concatenated; other project fields are replaced.
+Package scripts become `nx:run-script` targets, except a script that an
+adjacent `project.json` runs another way: with a `command`, another
+executor, or run-script running another script. Package `nx` configuration
+is merged over these; a target there with an `executor` or `command`
+replaces the script's. Adjacent `project.json` merges over that, then
+`project.local.json`. Workspace `targetDefaults` lie beneath them all.
+Targets merge as described in [Merging](targets.md#merging). As in Nx, tags
+merge as an ordered union, `implicitDependencies` concatenate, named inputs
+merge by name, `generators` merge by generator and then option, and
+`metadata` merges by field, arrays concatenating one level down; other
+project fields are replaced.
+
+A package's `metadata` is what Nx reads from it, replacing any in its `nx`
+object: `targetGroups` listing its script targets under `NPM Scripts`, its
+`description`, and under `js` its `name`, `version`, `exports` and `main` and
+whether the package manager's workspaces take it in. Each script target's
+`metadata` holds the script and the package manager's command for it. Neither
+is part of a cache key.
 
 ```jsonc
 {

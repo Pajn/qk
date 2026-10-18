@@ -8,14 +8,29 @@ use serde_json::{Map, Value, json};
 use crate::merge;
 use crate::{Package, Project, Target, WorkspaceConfig, relative_path};
 
+/// Where a project's configuration comes from, besides its files.
+pub(crate) struct Origin<'a> {
+    pub root: &'a Path,
+    pub directory: &'a Path,
+    pub config: &'a WorkspaceConfig,
+    /// Whether the package manager's workspaces take in its package.json.
+    pub in_workspaces: bool,
+    /// The package manager whose `run` command scripts are shown with.
+    pub package_manager: &'a str,
+}
+
 pub(crate) fn project(
-    root: &Path,
-    directory: &Path,
-    config: &WorkspaceConfig,
+    origin: &Origin,
     project_json: Option<Value>,
     local: Option<Value>,
     package: Option<&Package>,
 ) -> Result<Project> {
+    let Origin {
+        root,
+        directory,
+        config,
+        ..
+    } = *origin;
     let relative = relative_path(root, directory)?;
     let mut value = match package.and_then(|p| p.nx.as_ref()) {
         Some(Value::Object(nx)) => nx.clone(),
@@ -23,7 +38,8 @@ pub(crate) fn project(
         None => Map::new(),
     };
     let included_scripts: Option<Vec<String>> = value
-        .shift_remove("includedScripts")
+        .get("includedScripts")
+        .cloned()
         .map(serde_json::from_value)
         .transpose()
         .context("includedScripts must be an array of script names")?;
@@ -31,43 +47,81 @@ pub(crate) fn project(
     // package.json plugin, then its project.json plugin, then qk's local file.
     let mut layers: Vec<Map<String, Value>> = Vec::new();
     if let Some(package) = package {
-        // As in Nx, a script is no target when project.json gives the target
-        // another way to run: a command, or an executor other than
-        // run-script running that script.
-        let replaced = |script: &str| {
-            let Some(target) = project_json
-                .as_ref()
-                .and_then(|project| project.get("targets")?.get(script))
-            else {
-                return false;
-            };
-            let set = |key: &str| target.get(key).is_some_and(merge::truthy);
-            set("command")
-                || (set("executor")
-                    && (target["executor"] != "nx:run-script"
-                        || target
-                            .get("options")
-                            .and_then(|options| options.get("script"))
-                            != Some(&Value::String(script.into()))))
-        };
-        let scripts = included_scripts.unwrap_or_else(|| {
-            package
-                .scripts
-                .keys()
-                .filter(|script| !replaced(script))
-                .cloned()
-                .collect()
-        });
+        // As Nx's package.json plugin, leave out the scripts that project.json
+        // runs differently: with a command, another executor, or another script.
+        let mut scripts = package.scripts.clone();
+        if let Some(Value::Object(overrides)) = project_json.as_ref().and_then(|p| p.get("targets"))
+        {
+            for (name, target) in overrides {
+                let executor = target.get("executor").and_then(Value::as_str);
+                let script = target.pointer("/options/script").and_then(Value::as_str);
+                if target.get("command").is_some_and(merge::truthy)
+                    || executor.is_some_and(|executor| {
+                        !executor.is_empty()
+                            && (executor != "nx:run-script" || script != Some(name.as_str()))
+                    })
+                {
+                    scripts.remove(name);
+                }
+            }
+        }
+        let included = included_scripts
+            .clone()
+            .unwrap_or_else(|| scripts.keys().cloned().collect());
         let mut targets = Map::new();
-        for script in scripts {
-            // Nx creates these targets even when the script is absent.
+        for script in &included {
+            // Nx creates these targets even when the script is absent. Explicit
+            // targets in package.json or project.json can replace them below.
+            let mut metadata = Map::new();
+            if let Some(content) = scripts.get(script) {
+                metadata.insert("scriptContent".into(), json!(content));
+            }
+            metadata.insert(
+                "runCommand".into(),
+                json!(run_command(origin.package_manager, script)),
+            );
             targets.insert(
                 script.clone(),
                 json!({
-                    "executor": "nx:run-script", "options": { "script": script }
+                    "executor": "nx:run-script",
+                    "options": { "script": script },
+                    "metadata": metadata,
                 }),
             );
         }
+        // Nx replaces the package's own metadata with what it reads.
+        let mut js = Map::new();
+        for (key, field) in [
+            ("packageName", package.name.as_ref().map(|name| json!(name))),
+            (
+                "packageVersion",
+                package.version.as_ref().map(|version| json!(version)),
+            ),
+            ("packageExports", package.exports.clone()),
+            ("packageMain", package.main.clone()),
+        ] {
+            if let Some(field) = field {
+                js.insert(key.into(), field);
+            }
+        }
+        js.insert(
+            "isInPackageManagerWorkspaces".into(),
+            json!(origin.in_workspaces),
+        );
+        let mut metadata = Map::new();
+        metadata.insert(
+            "targetGroups".into(),
+            if included.is_empty() {
+                json!({})
+            } else {
+                json!({ "NPM Scripts": included })
+            },
+        );
+        if let Some(description) = &package.description {
+            metadata.insert("description".into(), description.clone());
+        }
+        metadata.insert("js".into(), Value::Object(js));
+        value.insert("metadata".into(), Value::Object(metadata));
         if let Some(explicit) = value.shift_remove("targets") {
             for (name, target) in object(explicit, "targets")? {
                 let target = object(target, "target")?;
@@ -276,6 +330,8 @@ pub(crate) fn project(
         );
     }
     value.insert("targets".into(), Value::Object(normalized_targets));
+    let dependencies = implicit_dependencies(value.shift_remove("implicitDependencies"))?;
+    value.insert("implicitDependencies".into(), Value::Array(dependencies));
     let project: Project = serde_json::from_value(Value::Object(value))?;
     if project.name.trim().is_empty() {
         bail!("project name must not be empty");
@@ -493,11 +549,12 @@ fn glob_matches(pattern: &str, name: &str) -> bool {
     crate::minimatch::is_match(pattern, name, false)
 }
 
-/// Merges one configuration file over the project so far, as Nx merges
-/// project.json over package.json: tags as an ordered union, named inputs
-/// by name, generators by generator, metadata through [`merge::metadata`],
-/// and every other field replaced. Returns the file's targets, which merge
-/// separately.
+/// Merges one configuration file over the project so far, as Nx's
+/// `mergeProjectConfigurationIntoRootMap` merges project.json over
+/// package.json: tags as an ordered union, implicit dependencies
+/// concatenated, named inputs by name, generators by generator and option,
+/// metadata through [`merge::metadata`], and every other field replaced.
+/// Returns the file's targets, which merge separately.
 fn overlay(
     value: &mut Map<String, Value>,
     mut project: Map<String, Value>,
@@ -513,6 +570,11 @@ fn overlay(
             }
         }
         value.insert("tags".into(), Value::Array(tags));
+    }
+    if let Some(incoming) = project.shift_remove("implicitDependencies") {
+        let mut dependencies = implicit_dependencies(value.shift_remove("implicitDependencies"))?;
+        dependencies.extend(implicit_dependencies(Some(incoming))?);
+        value.insert("implicitDependencies".into(), Value::Array(dependencies));
     }
     let targets = match project.shift_remove("targets") {
         Some(targets) => object(targets, "targets")?,
@@ -547,6 +609,28 @@ fn overlay(
     }
     value.extend(project);
     Ok(targets)
+}
+
+/// An implicitDependencies value as a list. As in Nx's merge, a single
+/// string is one entry.
+fn implicit_dependencies(value: Option<Value>) -> Result<Vec<Value>> {
+    match value {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::String(dependency)) => Ok(vec![Value::String(dependency)]),
+        Some(Value::Array(dependencies)) if dependencies.iter().all(Value::is_string) => {
+            Ok(dependencies)
+        }
+        Some(_) => bail!("implicitDependencies should be an array of strings"),
+    }
+}
+
+/// How the package manager runs a script, as Nx shows it in a target's
+/// `runCommand`.
+fn run_command(package_manager: &str, script: &str) -> String {
+    match package_manager {
+        "yarn" => format!("yarn {script}"),
+        other => format!("{other} run {script}"),
+    }
 }
 
 /// nx.json with `local` merged over it: target defaults as targets merge,
@@ -694,14 +778,8 @@ fn filter_matches(
         return Ok(true);
     };
     let filter = filter.as_object().context("filter must be an object")?;
-    // JavaScript truthiness: Nx skips a criterion given as `""` or `null`.
-    let given = |key: &str| {
-        filter.get(key).filter(|value| {
-            !matches!(value, Value::Null | Value::Bool(false))
-                && value.as_str() != Some("")
-                && value.as_f64() != Some(0.0)
-        })
-    };
+    // Nx skips a criterion given as `""` or `null`.
+    let given = |key: &str| filter.get(key).filter(|value| merge::truthy(value));
     if let Some(projects) = given("projects") {
         // Nx spreads a string into its characters; qk takes it as one pattern.
         let patterns: Vec<String> = match projects {

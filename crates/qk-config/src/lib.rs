@@ -87,6 +87,7 @@ pub struct WorkspaceConfig {
 pub struct Package {
     pub name: Option<String>,
     pub version: Option<String>,
+    pub description: Option<Value>,
     #[serde(default)]
     pub scripts: BTreeMap<String, String>,
     #[serde(default)]
@@ -157,6 +158,8 @@ pub struct Workspace {
     /// The `nx.local.json` and `project.local.json` files merged in,
     /// workspace-relative.
     pub local_overrides: Vec<String>,
+    /// What Nx would warn about while reading the workspace.
+    pub warnings: Vec<String>,
 }
 
 pub use normalize::is_glob;
@@ -263,8 +266,23 @@ impl Workspace {
             } else {
                 Vec::new()
             },
+            warnings: Vec::new(),
         };
-        for directory in discovery::project_directories(&root)? {
+        if workspace
+            .config
+            .extra
+            .get("implicitDependencies")
+            .is_some_and(|value| !matches!(value, Value::Null | Value::Bool(false)))
+        {
+            workspace.warnings.push(
+                "nx.json implicitDependencies is no longer supported and is ignored; \
+                 use namedInputs instead"
+                    .to_owned(),
+            );
+        }
+        // A wrong `cli.packageManager` fails only what runs scripts.
+        let package_manager = workspace.package_manager_name().unwrap_or("npm");
+        for (directory, in_workspaces) in discovery::project_directories(&root)? {
             let project_json = read_optional_json(&directory.join("project.json"))?;
             let local = read_optional_json(&directory.join(LOCAL_OVERRIDES))?;
             let package: Option<Package> = read_optional_json(&directory.join("package.json"))?
@@ -272,9 +290,13 @@ impl Workspace {
                 .transpose()
                 .with_context(|| format!("invalid {}", directory.join("package.json").display()))?;
             let project = normalize::project(
-                &root,
-                &directory,
-                &workspace.config,
+                &normalize::Origin {
+                    root: &root,
+                    directory: &directory,
+                    config: &workspace.config,
+                    in_workspaces,
+                    package_manager,
+                },
                 project_json,
                 local.clone(),
                 package.as_ref(),
@@ -304,6 +326,58 @@ impl Workspace {
             workspace.projects.insert(project.name.clone(), project);
         }
         Ok(workspace)
+    }
+}
+
+impl Workspace {
+    /// The package manager, as Nx detects it: nx.json `cli.packageManager`,
+    /// then the lockfile, then the package manager qk was invoked through. qk
+    /// also reads the root `packageManager` and `pnpm-workspace.yaml` before
+    /// that last step.
+    pub fn package_manager_name(&self) -> Result<&'static str> {
+        let known = |name: &str| -> Result<&'static str> {
+            Ok(match name {
+                "npm" => "npm",
+                "pnpm" => "pnpm",
+                "yarn" => "yarn",
+                "bun" => "bun",
+                other => bail!("unknown package manager {other:?}"),
+            })
+        };
+        if let Some(name) = self
+            .config
+            .extra
+            .get("cli")
+            .and_then(|cli| cli.get("packageManager"))
+            .and_then(Value::as_str)
+        {
+            return known(name);
+        }
+        let root = &self.root;
+        for (file, manager) in [
+            ("bun.lockb", "bun"),
+            ("bun.lock", "bun"),
+            ("yarn.lock", "yarn"),
+            ("pnpm-lock.yaml", "pnpm"),
+            ("package-lock.json", "npm"),
+        ] {
+            if root.join(file).is_file() {
+                return Ok(manager);
+            }
+        }
+        if let Some(declared) = &self.package_manager {
+            return known(declared.split('@').next().unwrap_or(declared));
+        }
+        if root.join("pnpm-workspace.yaml").is_file() {
+            return Ok("pnpm");
+        }
+        let agent = std::env::var("npm_config_user_agent").unwrap_or_default();
+        for manager in ["pnpm", "yarn", "bun"] {
+            if agent.starts_with(&format!("{manager}/")) {
+                return Ok(manager);
+            }
+        }
+        Ok("npm")
     }
 }
 

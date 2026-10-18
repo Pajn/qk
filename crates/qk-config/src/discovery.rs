@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -45,7 +45,9 @@ struct PnpmWorkspace {
     packages: Vec<String>,
 }
 
-pub(crate) fn project_directories(root: &Path) -> Result<BTreeSet<PathBuf>> {
+/// Each directory holding a project, and whether the package manager's
+/// workspaces take in its package.json.
+pub(crate) fn project_directories(root: &Path) -> Result<BTreeMap<PathBuf, bool>> {
     let package = read_optional_json(&root.join("package.json"))?;
     let pnpm_path = root.join("pnpm-workspace.yaml");
     let patterns: Vec<String> = if pnpm_path.is_file() {
@@ -92,9 +94,9 @@ pub(crate) fn project_directories(root: &Path) -> Result<BTreeSet<PathBuf>> {
         })
         .collect::<Result<Vec<(bool, GlobMatcher)>>>()?;
 
-    let mut directories = BTreeSet::new();
+    let mut directories = BTreeMap::new();
     if package.as_ref().is_some_and(|p| p.get("nx").is_some()) {
-        directories.insert(root.to_owned());
+        directories.insert(root.to_owned(), true);
     }
     let build_directory = root.join("target");
     let walker = WalkBuilder::new(root)
@@ -119,7 +121,7 @@ pub(crate) fn project_directories(root: &Path) -> Result<BTreeSet<PathBuf>> {
     let directories = std::sync::Mutex::new(Ok(directories));
     walker.run(|| {
         Box::new(|entry| {
-            let visit = || -> Result<Option<PathBuf>> {
+            let visit = || -> Result<Option<(PathBuf, bool)>> {
                 let entry = entry.context("cannot walk workspace")?;
                 if !entry.file_type().is_some_and(|kind| kind.is_file()) {
                     return Ok(None);
@@ -130,7 +132,7 @@ pub(crate) fn project_directories(root: &Path) -> Result<BTreeSet<PathBuf>> {
                     .context("configuration has no parent directory")?;
                 match entry.file_name().to_str() {
                     Some("project.json") => {
-                        return Ok(Some(directory.to_owned()));
+                        return Ok(Some((directory.to_owned(), false)));
                     }
                     Some("package.json") => {
                         let relative = relative_path(root, directory)?;
@@ -141,7 +143,7 @@ pub(crate) fn project_directories(root: &Path) -> Result<BTreeSet<PathBuf>> {
                             .iter()
                             .any(|(exclude, glob)| *exclude && glob.is_match(&relative));
                         if included && !excluded {
-                            return Ok(Some(directory.to_owned()));
+                            return Ok(Some((directory.to_owned(), true)));
                         }
                     }
                     _ => {}
@@ -149,9 +151,10 @@ pub(crate) fn project_directories(root: &Path) -> Result<BTreeSet<PathBuf>> {
                 Ok(None)
             };
             match visit() {
-                Ok(Some(directory)) => {
+                Ok(Some((directory, in_workspaces))) => {
                     if let Ok(directories) = &mut *directories.lock().unwrap() {
-                        directories.insert(directory);
+                        let entry = directories.entry(directory).or_insert(false);
+                        *entry |= in_workspaces;
                     }
                 }
                 Ok(None) => {}
