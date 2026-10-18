@@ -46,17 +46,13 @@ touches the projects declaring it; a deleted `project.json` or
 changed in the root tsconfig touch the projects they point into. Every
 project depending on a touched project is affected too.
 
-Two rules deliberately differ from Nx:
-
-- A `pnpm-workspace.yaml` change confined to resolution keys (`catalog`,
-  `catalogs`, `overrides`, `patchedDependencies` and the like) reaches
-  projects only through the lockfile.
-- Under `projectsAffectedByDependencyUpdates: "auto"`, a `pnpm-lock.yaml`
-  change touches the projects whose importer installs something different,
-  by the same installed sets the cache keys use. This leaves out projects
-  that install exactly what they did before, which Nx reports, and catches
-  transitive changes such as a dependency's dependency moving version,
-  which Nx can miss. Other modes behave as in Nx.
+One rule deliberately differs from Nx: under
+`projectsAffectedByDependencyUpdates: "auto"`, a `pnpm-lock.yaml` change
+touches the projects whose importer installs something different, by the same
+installed sets the cache keys use. This leaves out projects that install
+exactly what they did before, which Nx reports, and catches transitive changes
+such as a dependency's dependency moving version, which Nx can miss. Other
+modes behave as in Nx.
 
 `show projects --affected` prints projects in graph order; Nx prints its
 traversal order, so compare the two as sets.
@@ -94,7 +90,8 @@ its lockfile importers or `externalDependencies` install changed, when
 `pnpm-workspace.yaml` changed outside its resolution keys, when a dependency
 project's `package.json` changed in a field its key reads or its version moved
 into or out of the range the task's project declares for it, when a project
-manifest was deleted, or when it depends on an affected task. These are the
+manifest was deleted, or when it depends on an affected task. A file the
+task's inputs select counts by any change to it, as in its key. These are the
 same inputs its cache key reads, so an unaffected task would be a cache hit,
 except that env and runtime inputs count as unchanged, since the base
 revision's environment is unknowable. A test-only change then reaches the

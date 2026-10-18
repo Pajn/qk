@@ -32,7 +32,15 @@ reproduces them leaves its dependents cached however its own inputs changed;
 one without declared outputs is fingerprinted by its key. Files are keyed
 by workspace-relative path, content and mode. Branch names and checkout
 locations are not part of the key, so identical sources in two worktrees
-share entries. Root workspace files (the root `tsconfig.base.json` or
+share entries.
+
+A key has two kinds of input. What the task's `inputs` select counts as they
+say: a file by its whole content and a `json` input by its fields, whatever
+the file is. Beside them, qk adds workspace configuration and package-manager
+state to every task's key on its own, each by the rule below. Where an input
+selects a file qk would add, the input decides how it counts.
+
+Root workspace files (the root `tsconfig.base.json` or
 `tsconfig.json`, `nx.json`, `.gitignore`, `.nxignore`, `pnpm-workspace.yaml`,
 lockfiles) and the manifests of the task's project (`project.json`,
 `project.local.json` and `package.json`) are always included, its scripts and
@@ -54,8 +62,9 @@ the package adds or removes that dependency instead, which changes the
 dependent's key through what it depends on. With a pnpm lockfile qk can read,
 its `dependencies`, `devDependencies`, `peerDependencies`,
 `peerDependenciesMeta`, `optionalDependencies` and `dependenciesMeta` are left
-out too: what they install is keyed through the lockfile, as below. A manifest the task's inputs select, as
-`^default` selects every file of each dependency, counts whole. A dependency
+out too: what they install is keyed through the lockfile, as below. A manifest
+the task's inputs select, as `^default` selects every file of each dependency,
+counts whole. A dependency
 releasing a new version within its dependents' ranges therefore leaves them
 cached, while a change to its `exports` reaches them.
 
@@ -67,14 +76,19 @@ root importer counts for every task because its packages resolve from every
 package. A lockfile change therefore invalidates only the tasks whose
 projects install something that changed, plus every task when the lockfile
 version, pnpm's `settings` or the lock of pnpm itself changes. A lockfile qk
-cannot read is keyed by its whole content, and qk says so.
+cannot read, or one the task's inputs select, is keyed by its whole content.
 
 With such a lockfile, `pnpm-workspace.yaml` is keyed without the keys that
 configure resolution (`catalog`, `catalogs`, `overrides`,
-`patchedDependencies`, `peerDependencyRules` and the like), whether it is
-always included or named by an input: their effect lands in the lockfile, so
-a catalog bump invalidates only the tasks whose installs change. This is the
-same rule affected selection applies.
+`patchedDependencies`, `peerDependencyRules` and the like): their effect lands
+in the lockfile, so a catalog bump invalidates only the tasks whose installs
+change. A task whose inputs select the file keys it whole, as they say. That
+includes a root project's own files and a task that reads the catalog itself,
+such as a catalog-consistency lint. A task that reads only `packages` or other
+keys outside resolution need not select it: the copy qk adds already covers
+them, while selecting it reruns the task on every catalog change. To key only
+some keys, a `json` input reads the file as YAML. Affected selection applies
+the same rules.
 
 `qk show hash <task>` prints a task's key and what it is computed from
 without running it, and `--against` compares it with another task's key or

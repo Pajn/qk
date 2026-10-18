@@ -2044,7 +2044,7 @@ fn infer(snapshot: &Snapshot, workspace: &Workspace, task: &Task) -> Result<Infe
 
 /// `declared` and `inferred` together. A file both select is left to the
 /// declared inputs, which count all of it.
-fn join(mut declared: Declared, mut inferred: Inferred) -> Resolved {
+fn join(declared: Declared, mut inferred: Inferred) -> Resolved {
     let mut covered = BTreeSet::new();
     inferred.files.retain(|path| {
         let keep = !declared.files.contains(path);
@@ -2064,10 +2064,9 @@ fn join(mut declared: Declared, mut inferred: Inferred) -> Resolved {
         inferred.lockfile = None;
         covered.insert("pnpm-lock.yaml".into());
     }
-    // The one place a declared input yields: the workspace file counts
-    // without its resolution keys even where an input selects it.
-    if inferred.workspace_file {
-        declared.files.remove("pnpm-workspace.yaml");
+    if inferred.workspace_file && declared.files.contains("pnpm-workspace.yaml") {
+        inferred.workspace_file = false;
+        covered.insert("pnpm-workspace.yaml".into());
     }
     inferred.covered = covered;
     Resolved { declared, inferred }

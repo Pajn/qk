@@ -27,7 +27,9 @@ When a name occurs in multiple sections, precedence is `dependencies`,
 - A pnpm lockfile change under `projectsAffectedByDependencyUpdates: "auto"`
   follows installed sets, avoiding projects whose installations are unchanged
   and including transitive installation changes Nx can miss.
-- Resolution-only pnpm workspace changes reach tasks through the lockfile.
+- The `pnpm-workspace.yaml` qk adds to every key leaves out its resolution
+  keys, which reach tasks through the lockfile. A task whose inputs select the
+  file keys it whole, as in Nx.
 - Cache keys always include the task's project manifests, and each dependency
   project's `package.json` without its version, scripts and other metadata,
   even when the task's inputs leave them out. Nx keys these files only through

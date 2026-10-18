@@ -860,15 +860,9 @@ fn touched_implicitly(
             }
         }
     }
-    let mut workspace_file_reaches_tasks = None;
     for (pattern, declarations) in patterns {
         let matcher = Pattern::new(&pattern, false)?;
-        let Some(file) = changes.files.iter().find(|file| {
-            matcher.is_match(file)
-                && (*file != "pnpm-workspace.yaml"
-                    || *workspace_file_reaches_tasks
-                        .get_or_insert_with(|| pnpm_workspace_change_reaches_tasks(changes)))
-        }) else {
+        let Some(file) = changes.files.iter().find(|file| matcher.is_match(file)) else {
             continue;
         };
         for (project, target) in declarations {
@@ -913,15 +907,6 @@ fn workspace_inputs(
         if let Some(glob) = glob.strip_prefix("{workspaceRoot}/") {
             globs.push(glob.to_owned());
         }
-    }
-}
-
-fn pnpm_workspace_change_reaches_tasks(changes: &Changes) -> bool {
-    match changes.change("pnpm-workspace.yaml") {
-        FileChange::Json(changes) => changes
-            .iter()
-            .any(|change| !qk_lockfile::RESOLUTION_KEYS.contains(&change.path[0].as_str())),
-        _ => true,
     }
 }
 

@@ -173,7 +173,81 @@ fn without_a_head_the_working_tree_counts() {
 }
 
 #[test]
-fn pnpm_workspace_resolution_keys_reach_tasks_only_through_the_lockfile() {
+fn pnpm_workspace_resolution_keys_reach_tasks_through_the_lockfile_unless_an_input_selects_it() {
+    use qk_affected::{TaskCause, TaskReason};
+    let workspace_file = "packages:\n  - apps/*\n  - libs/*\ncatalog:\n  react: 19.0.0\n";
+    let repo = Repo::new(&[
+        ("pnpm-workspace.yaml", workspace_file),
+        ("pnpm-lock.yaml", &lockfile("19.0.0", "19.0.0")),
+        (
+            "project.json",
+            r#"{"name": "root", "targets": {"lint": {"command": "echo lint", "inputs": ["default"]}}}"#,
+        ),
+        (
+            "tools/tool/project.json",
+            r#"{"name": "tool", "targets": {"build": {"command": "echo build", "inputs": ["default"]}}}"#,
+        ),
+        (
+            "libs/lib/project.json",
+            r#"{"name": "lib", "targets": {
+                "build": {"command": "echo build", "inputs": ["default"]},
+                "lint": {"command": "echo lint", "inputs": ["default", "{workspaceRoot}/pnpm-workspace.yaml"]}
+            }}"#,
+        ),
+    ]);
+    // A catalog bump reaches a task through the lockfile, unless an input
+    // selects the workspace file, which then counts whole: a root project's
+    // own files do.
+    write(
+        &repo.root,
+        "pnpm-workspace.yaml",
+        &workspace_file.replace("19.0.0", "19.1.0"),
+    );
+    let tasks = affected_tasks_of(&repo, &["lib:build", "lib:lint", "root:lint"]);
+    assert_eq!(tasks.keys().collect::<Vec<_>>(), ["lib:lint", "root:lint"]);
+    assert!(
+        matches!(
+            &tasks["lib:lint"],
+            TaskCause::Touched { reasons }
+                if matches!(&reasons[..], [TaskReason::Input { file }] if file == "pnpm-workspace.yaml")
+        ),
+        "{tasks:?}"
+    );
+    // When the bump changes what a project installs, its tasks are affected
+    // through its importer.
+    write(&repo.root, "pnpm-lock.yaml", &lockfile("19.0.0", "19.1.0"));
+    let tasks = affected_tasks_of(&repo, &["lib:build", "lib:lint", "tool:build"]);
+    assert_eq!(
+        tasks.keys().collect::<Vec<_>>(),
+        ["lib:lint", "tool:build"],
+        "{tasks:?}"
+    );
+    assert!(
+        matches!(
+            &tasks["tool:build"],
+            TaskCause::Touched { reasons }
+                if matches!(&reasons[..], [TaskReason::Installs { importer }] if importer == "tools/tool")
+        ),
+        "{tasks:?}"
+    );
+    // Keys outside resolution reach every task.
+    write(
+        &repo.root,
+        "pnpm-workspace.yaml",
+        "packages:\n  - apps/*\ncatalog:\n  react: 19.1.0\n",
+    );
+    let tasks = affected_tasks_of(&repo, &["lib:build", "lib:lint"]);
+    assert!(
+        matches!(
+            &tasks["lib:build"],
+            TaskCause::Touched { reasons } if matches!(&reasons[..], [TaskReason::WorkspaceFile])
+        ),
+        "{tasks:?}"
+    );
+}
+
+#[test]
+fn an_input_naming_pnpm_workspace_touches_its_project_on_any_change() {
     let workspace_file = "packages:\n  - apps/*\ncatalog:\n  react: 19.0.0\n";
     let repo = Repo::new(&[
         ("pnpm-workspace.yaml", workspace_file),
@@ -186,12 +260,6 @@ fn pnpm_workspace_resolution_keys_reach_tasks_only_through_the_lockfile() {
         &repo.root,
         "pnpm-workspace.yaml",
         &workspace_file.replace("19.0.0", "19.1.0"),
-    );
-    assert_eq!(repo.committed(), Vec::<String>::new());
-    write(
-        &repo.root,
-        "pnpm-workspace.yaml",
-        "packages:\n  - apps/*\n  - libs/*\ncatalog:\n  react: 19.1.0\n",
     );
     assert_eq!(repo.committed(), names(&["app", "lib"]));
 }
