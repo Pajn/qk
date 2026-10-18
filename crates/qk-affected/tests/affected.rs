@@ -1294,3 +1294,46 @@ fn a_continuous_dependency_declared_without_inputs_counts_nothing() {
     let tasks = affected_tasks_of(&repo, &["app-e2e:e2e"]);
     assert!(tasks.contains_key("app-e2e:e2e"), "{tasks:?}");
 }
+
+/// `check` selects `feature` with `dependencies: true`. `feature` depends on
+/// `util`, and `app`, whose task it is, on `feature` and `extra`.
+fn selected_dependencies_repo() -> Repo {
+    Repo::new(&[
+        (
+            "nx.json",
+            r#"{"namedInputs": {"default": ["{projectRoot}/**/*"]}}"#,
+        ),
+        (
+            "apps/app/project.json",
+            r#"{"name": "app", "implicitDependencies": ["feature", "extra"], "targets": {"check": {"command": "echo check",
+                "inputs": [{"input": "default", "projects": ["feature"], "dependencies": true}]}}}"#,
+        ),
+        (
+            "libs/feature/project.json",
+            r#"{"name": "feature", "implicitDependencies": ["util"]}"#,
+        ),
+        ("libs/feature/src/index.ts", "feature"),
+        ("libs/util/project.json", r#"{"name": "util"}"#),
+        ("libs/util/src/index.ts", "util"),
+        ("libs/extra/project.json", r#"{"name": "extra"}"#),
+        ("libs/extra/src/index.ts", "extra"),
+    ])
+}
+
+#[test]
+fn an_input_selecting_projects_with_dependencies_reads_what_they_depend_on() {
+    for (file, affected) in [
+        ("libs/util/src/index.ts", true),
+        ("libs/feature/src/index.ts", false),
+        ("libs/extra/src/index.ts", false),
+    ] {
+        let repo = selected_dependencies_repo();
+        write(&repo.root, file, "changed");
+        let tasks = affected_tasks_of(&repo, &["app:check"]);
+        assert_eq!(
+            tasks.contains_key("app:check"),
+            affected,
+            "{file}: {tasks:?}"
+        );
+    }
+}

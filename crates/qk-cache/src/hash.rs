@@ -1511,9 +1511,7 @@ impl<'a> Resolver<'a> {
                 if (dependencies || listed.is_some()) && !self.named_stack.is_empty() {
                     bail!("named inputs can only refer to named inputs of their own project");
                 }
-                if dependencies {
-                    self.dependencies_named(project, name)?;
-                } else if let Some(listed) = listed {
+                if let Some(listed) = listed {
                     let patterns: Vec<String> = match listed {
                         Value::String(pattern) => vec![pattern.clone()],
                         other => serde_json::from_value(other.clone())
@@ -1522,10 +1520,16 @@ impl<'a> Resolver<'a> {
                     for selected in
                         qk_graph::select_projects(&self.workspace.projects, &patterns, &[])?
                     {
-                        if self.expanded.insert((selected.clone(), name.to_owned())) {
+                        // As in Nx 24, `dependencies: true` beside `projects`
+                        // is each selected project's `^name`, not its own.
+                        if dependencies {
+                            self.dependencies_named(&selected, name)?;
+                        } else if self.expanded.insert((selected.clone(), name.to_owned())) {
                             self.named(&selected, name)?;
                         }
                     }
+                } else if dependencies {
+                    self.dependencies_named(project, name)?;
                 } else {
                     self.named(project, name)?;
                 }

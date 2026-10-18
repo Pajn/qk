@@ -31,7 +31,9 @@ Supported declarations:
   on, directly or not, and `{"fileset": "…", "dependencies": true}`, a
   fileset of each of them;
 - `{"input": "name", "projects": […]}`, the named input of the projects the
-  names, globs or `tag:` patterns select;
+  names, globs or `tag:` patterns select, and with `"dependencies": true`
+  their `^name` instead, as in Nx 24: every project they depend on, but not
+  themselves;
 - `env`, `runtime`, `dependentTasksOutputFiles` with `transitive`, and
   `externalDependencies`, which adds every installation of the named
   packages in the pnpm lockfile, whichever importer installs them;
