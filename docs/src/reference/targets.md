@@ -19,16 +19,48 @@ The example uses explicit command execution and output declarations:
 }
 ```
 
+## Merging
+
+A target can be defined in several places: target defaults, package.json
+and project.json (see [Configuration precedence](projects.md#configuration-precedence)).
+As in Nx 24, each definition merges over the one beneath it field by field:
+a field it sets replaces the one beneath, except that `options` merge by
+option name and `configurations` by configuration name and then by option
+name. Arrays and nested option values are replaced.
+
+A definition that runs the target differently replaces the one beneath it
+whole, every field included: it names another executor, or for
+`nx:run-commands` another command, or for `nx:run-script` another script.
+A definition without an executor, command or script merges over any.
+
+The spread token `"..."` merges instead of replacing. In an array, such as
+`inputs`, `outputs` or `dependsOn`, the item `"..."` stands for the items
+beneath it, in its place: `"inputs": ["mine", "..."]`. In an object, the
+key `"...": true` stands for the fields beneath it: a field written after
+it wins over the one beneath, and one written before it yields to it. It
+works on the target itself, on `options` and each option's value, on
+`configurations`, on each configuration and each of its options' values.
+Beneath that, a spread is an ordinary value. With nothing beneath it, a
+spread adds nothing. An object with `"..."` cannot also have a key that is
+a whole number, such as `"1"`: Nx cannot tell where it was written.
+
+A target key that is a glob, such as `"e2e-ci--*"`, merges onto every target
+defined beneath it whose name it matches, and is a target of its own when it
+matches none.
+
 ## `executor`
 
 A string naming `nx:run-commands`, `nx:run-script`, or `nx:noop`.
 Unsupported names remain inspectable but fail execution preflight.
-See [Executors](executors.md) for their options.
+See [Executors](executors.md) for their options. A target with neither an
+executor nor a command runs `nx:noop` when it has `dependsOn`, and is left
+out otherwise, as in Nx.
 
 ## `command`
 
 A shorthand command normalized into `nx:run-commands` options. Prefer an
-explicit executor with `options.commands` for multiple commands.
+explicit executor with `options.commands` for multiple commands. A target
+cannot have both `command` and `executor`.
 
 ## `options`
 
@@ -38,13 +70,22 @@ overrides. Nested objects, including `env`, are replaced rather than recursively
 merged. A configuration with `env: {}` removes the base option's overrides;
 process and dotenv values still apply.
 
+As in Nx, the tokens `{projectRoot}` and `{projectName}` are replaced in
+every string of the options and configurations, nested ones included, as the
+workspace loads, and `qk show project` shows the result. `{workspaceRoot}`
+may only start a string, and is removed with the slash after it, leaving a
+path relative to the workspace root: `"{workspaceRoot}/dist"` becomes
+`"dist"`. Anywhere else it is an error.
+
 ## `configurations`
 
 An object mapping configuration names to option objects, empty by default.
 Select with `-c release` or `project:target:release`. `--prod` selects
 `production`. Requested configuration names propagate through dependencies.
 A dependency without that configuration uses its own default, while its
-dependencies still receive the requested name.
+dependencies still receive the requested name. A configuration's keys are
+all options: `outputs` in a configuration is an option named `outputs`, not
+the target's outputs, as in Nx.
 
 ## `defaultConfiguration`
 
@@ -66,11 +107,18 @@ task dependencies. Shared dependencies run once.
 | `{ "target": "build", "projects": ["tag:library"] }` | Target on selected projects |
 | `{ "target": "build", "dependencies": true }` | Target on project dependencies |
 
+Target names may contain colons. As in Nx, `"a:b"` names target `b` of
+project `a` when `a` is a project with that target, and otherwise target
+`a:b` of the same project; `"^a:b"` and `{ "target": "a:b" }` name target
+`a:b`.
+
 Object declarations also accept `params: "forward"` and `options: "forward"`;
-the default is not to forward. `params` passes task arguments; `options`
-passes scalar options as `--name=value` and object fields such as
-`--env.NAME=value`. Lists cannot be forwarded this way. As in Nx 24, the
-Nx 15 spellings `projects: "self"` and `projects: "dependencies"` fail.
+any other value, or none, does not forward. `params` passes the run's own
+arguments; `options` passes the target's options, its configuration's
+included, as the dependency's options, overriding its own, lists and
+objects included. With both `projects` and `dependencies: true`, `projects`
+applies. Other fields are ignored, as in Nx. As in Nx 24, the Nx 15
+spellings `projects: "self"` and `projects: "dependencies"` fail.
 
 An object declaration naming a continuous target also accepts `inputs` and
 `waitFor`. `inputs: false` keeps the continuous task's inputs from counting
@@ -83,7 +131,8 @@ that is not continuous.
 
 Other missing dependency targets are skipped. Unknown explicit projects
 and task cycles fail unless `--nx-ignore-cycles` is used. A shared task
-reached with different forwarded arguments is rejected as ambiguous.
+reached with different forwarded arguments or options keeps those it was
+first reached with, as in Nx.
 See [Running tasks](../guides/running-tasks.md#dependencies-and-configurations).
 
 ## `inputs`
@@ -103,7 +152,8 @@ key. See [Inputs and outputs](inputs-outputs.md#outputs).
 
 A boolean; absent or `false` means the target does not opt in to result
 caching. `true` enables caching when supported by the task's inputs and
-outputs. Continuous and readiness tasks run uncached.
+outputs. Continuous and readiness tasks run uncached. As in Nx, a target
+with both `cache` and `continuous` set to `true` is an error.
 See [Local cache](../guides/cache.md).
 
 ## `continuous`
@@ -145,8 +195,9 @@ Graphs requiring it to overlap a continuous dependency are rejected.
 
 ## `env`
 
-A target-level object of environment variables. Executor `options.env`
-and selected configuration `env` can override it. See
+A target-level object of environment variables, for every executor. This is
+a qk extension; Nx ignores it. Executor `options.env` and selected
+configuration `env` can override it. See
 [Environment precedence](environment.md#environment-precedence).
 
 ## `qk:threads`
