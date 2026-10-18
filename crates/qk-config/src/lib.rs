@@ -282,6 +282,7 @@ impl Workspace {
         }
         // A wrong `cli.packageManager` fails only what runs scripts.
         let package_manager = workspace.package_manager_name().unwrap_or("npm");
+        let mut roots = BTreeMap::new();
         for (directory, in_workspaces) in discovery::project_directories(&root)? {
             let project_json = read_optional_json(&directory.join("project.json"))?;
             let local = read_optional_json(&directory.join(LOCAL_OVERRIDES))?;
@@ -310,14 +311,22 @@ impl Workspace {
                     project.root
                 );
             }
+            // Nx merges every configuration naming one root into one
+            // project; qk reads one directory per project.
+            if let Some(previous) = roots.insert(project.root.clone(), project.name.clone()) {
+                bail!(
+                    "projects {previous:?} and {:?} both have root {:?}",
+                    project.name,
+                    project.root
+                );
+            }
             if let Some(package) = package {
                 workspace.packages.insert(project.name.clone(), package);
             }
             if local.is_some() {
-                let root = if project.root == "." {
-                    String::new()
-                } else {
-                    format!("{}/", project.root)
+                let root = match relative_path(&root, &directory)?.as_str() {
+                    "." => String::new(),
+                    directory => format!("{directory}/"),
                 };
                 workspace
                     .local_overrides

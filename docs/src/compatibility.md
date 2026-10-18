@@ -83,6 +83,10 @@ When a name occurs in multiple sections, precedence is `dependencies`,
   root in the outputs a target without `outputs` takes. Nx inserts them as
   they are, which turns such a root into a pattern that misses the project's
   files.
+- An unnamed project at the workspace root is named after the workspace
+  directory; Nx names it `.`. Two configurations giving the same `root` are
+  an error, where Nx merges them into one project, and a `root` outside the
+  workspace is refused.
 - Project selectors read `tag:*` and `directory:*` as globs, where Nx takes
   them for every project, tagged or not. A pattern with an unknown label, such
   as `scope:shared`, is matched whole; Nx drops the label and would select a

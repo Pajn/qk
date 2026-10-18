@@ -58,16 +58,20 @@ is part of a cache key.
 
 ## `name`
 
-A nonempty string. An explicit name wins over the package name; otherwise
-qk uses the relative directory with `/` replaced by `-`. For the workspace
-root it uses the directory's name. Duplicate names fail with both roots in
-the error. Use the normalized name in CLI selectors.
+A string. An explicit name wins over the package name; otherwise, as in Nx,
+a project is named after its directory, in lower case: `libs/data/Access`
+is `access`. For the workspace root qk uses the workspace directory's name.
+An unnamed root `package.json` cannot be a project, as in Nx: name it, or
+name the project in its `nx` object. Duplicate names fail with both roots in
+the error.
 
 ## `root`
 
-The workspace-relative configuration directory, normalized with forward
-slashes (`.` for the workspace root). An explicit root must agree with that
-directory; an empty string is also accepted for the workspace root.
+The workspace-relative project directory, with forward slashes (`.` for the
+workspace root). It defaults to the configuration's directory; as in Nx, a
+`root` given in project.json or the package's `nx` object is used as written,
+an empty string meaning the workspace root. It must stay inside the
+workspace, and two projects cannot share a root.
 
 ## `sourceRoot`
 

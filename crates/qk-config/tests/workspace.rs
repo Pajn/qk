@@ -281,16 +281,60 @@ fn explicit_targets_replace_missing_included_scripts() {
 }
 
 #[test]
-fn rejects_root_outside_configuration_directory() {
+fn takes_a_given_root_as_written_inside_the_workspace() {
     let temp = TempDir::new().unwrap();
     write(
         temp.path(),
-        "project.json",
-        r#"{"name":"bad","root":"../outside"}"#,
+        "tools/app/project.json",
+        r#"{"name":"app","root":"apps/app"}"#,
+    );
+    write(temp.path(), "project.json", r#"{"name":"top","root":""}"#);
+    let workspace = Workspace::load(temp.path()).unwrap();
+    assert_eq!(workspace.projects["app"].root, "apps/app");
+    assert_eq!(workspace.projects["top"].root, ".");
+    write(
+        temp.path(),
+        "tools/app/project.json",
+        r#"{"name":"app","root":"../outside"}"#,
     );
     let error = format!("{:#}", Workspace::load(temp.path()).unwrap_err());
     assert!(
-        error.contains("does not match configuration directory"),
+        error.contains("must be a path inside the workspace"),
+        "{error}"
+    );
+}
+
+#[test]
+fn names_unnamed_projects_as_nx_does() {
+    let temp = TempDir::new().unwrap();
+    write(temp.path(), "nx.json", "{}");
+    write(
+        temp.path(),
+        "package.json",
+        r#"{"name": "root", "workspaces": ["packages/*"]}"#,
+    );
+    write(temp.path(), "libs/Data/Access/project.json", "{}");
+    write(temp.path(), "packages/Unnamed/package.json", "{}");
+    write(
+        temp.path(),
+        "packages/named/package.json",
+        r#"{"name": "@scope/named"}"#,
+    );
+    write(temp.path(), "packages/named/project.json", "{}");
+    let workspace = Workspace::load(temp.path()).unwrap();
+    assert_eq!(
+        workspace
+            .projects
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["@scope/named", "access", "unnamed"]
+    );
+    // An unnamed root package is no project.
+    write(temp.path(), "package.json", r#"{"nx": {}}"#);
+    let error = format!("{:#}", Workspace::load(temp.path()).unwrap_err());
+    assert!(
+        error.contains("root package.json must specify a name"),
         "{error}"
     );
 }

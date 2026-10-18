@@ -195,25 +195,56 @@ pub(crate) fn project(
                 .with_context(|| format!("invalid {}", crate::LOCAL_OVERRIDES))?,
         );
     }
-    let inferred_name = package.and_then(|p| p.name.clone()).unwrap_or_else(|| {
-        if relative == "." {
-            directory
+    // Nx's package.json plugin refuses an unnamed root package as a project,
+    // whatever names it elsewhere.
+    if let Some(package) = package
+        && relative == "."
+        && package.name.is_none()
+        && !package
+            .nx
+            .as_ref()
+            .and_then(|nx| nx.get("name"))
+            .is_some_and(merge::truthy)
+    {
+        bail!(
+            "the root package.json must specify a name when it is used as a project, as Nx requires"
+        );
+    }
+    if !value.get("name").is_some_and(merge::truthy) {
+        // As in Nx: the package's name, else the directory's name in lower
+        // case. Nx names an unnamed root project `.`; qk uses the
+        // workspace directory's name.
+        let name = match package.and_then(|package| package.name.clone()) {
+            Some(name) => name,
+            None if relative == "." => directory
                 .file_name()
                 .unwrap_or_default()
                 .to_string_lossy()
-                .into_owned()
-        } else {
-            relative.replace('/', "-")
-        }
-    });
-    value.entry("name").or_insert(Value::String(inferred_name));
-    if let Some(configured_root) = value.get("root") {
-        let configured = configured_root.as_str().context("root must be a string")?;
-        if configured != relative && !(relative == "." && configured.is_empty()) {
-            bail!("root {configured:?} does not match configuration directory {relative:?}");
-        }
+                .to_lowercase(),
+            None => relative
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_lowercase(),
+        };
+        value.insert("name".into(), Value::String(name));
     }
-    value.insert("root".into(), Value::String(relative.clone()));
+    // As in Nx, a `root` given is the project's root, wherever its
+    // configuration is.
+    let root = match value.get("root") {
+        None | Some(Value::Null) => relative,
+        Some(root) => match root.as_str().context("root must be a string")? {
+            "" => ".".to_owned(),
+            root if root.starts_with('/')
+                || root.contains('\\')
+                || root.split('/').any(|part| part == "..") =>
+            {
+                bail!("root {root:?} must be a path inside the workspace")
+            }
+            root => root.to_owned(),
+        },
+    };
+    value.insert("root".into(), Value::String(root));
     let mut named_inputs = serde_json::to_value(&config.named_inputs)?
         .as_object()
         .cloned()
@@ -248,11 +279,11 @@ pub(crate) fn project(
     // files merge over it rather than replacing it.
     let mut staged = Map::new();
     for layer in &layers {
-        merge_layer(&mut staged, layer, true, &relative, None)?;
+        merge_layer(&mut staged, layer, true, &project_root, None)?;
     }
     let mut defaults: Vec<(String, usize, Map<String, Value>)> = Vec::new();
     for (name, target) in &staged {
-        let target = merge::desugar(object_ref(target, "target")?, &relative)?;
+        let target = merge::desugar(object_ref(target, "target")?, &project_root)?;
         let context = Filtered {
             project: &project_name,
             root: &project_root,
@@ -264,7 +295,7 @@ pub(crate) fn project(
             continue;
         };
         for (index, entry) in entries {
-            if let Some(entry) = synthetic_default(entry, &target, &relative)
+            if let Some(entry) = synthetic_default(entry, &target, &project_root)
                 .with_context(|| format!("invalid targetDefaults for {name:?}"))?
             {
                 let mut layer = Map::new();
@@ -283,17 +314,22 @@ pub(crate) fn project(
     defaults.sort_by_key(|(key, index, _)| (order.iter().position(|k| k == key), *index));
     let mut beneath = Map::new();
     for (_, _, layer) in &defaults {
-        merge_layer(&mut beneath, layer, false, &relative, None)?;
+        merge_layer(&mut beneath, layer, false, &project_root, None)?;
     }
     let mut targets = beneath.clone();
     for layer in &layers {
-        merge_layer(&mut targets, layer, false, &relative, Some(&beneath))?;
+        merge_layer(&mut targets, layer, false, &project_root, Some(&beneath))?;
     }
     let mut normalized_targets = Map::new();
     let mut errors = Vec::new();
     for (name, target) in targets {
-        let target = normalize_target(object(target, "target")?, &relative, &project_name, &name)
-            .with_context(|| format!("invalid target {name:?}"))?;
+        let target = normalize_target(
+            object(target, "target")?,
+            &project_root,
+            &project_name,
+            &name,
+        )
+        .with_context(|| format!("invalid target {name:?}"))?;
         if target.get("cache").is_some_and(merge::truthy)
             && target.get("continuous").is_some_and(merge::truthy)
         {
