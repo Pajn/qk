@@ -222,6 +222,17 @@ impl TaskGraph {
         Ok(graph)
     }
 
+    /// The dependencies of a task whose outputs it may read: all but the
+    /// continuous ones, which serve it from their own process instead. Their
+    /// inputs count as the task's own, unless declared with `inputs: false`.
+    pub fn producers<'a>(&'a self, id: &str) -> impl Iterator<Item = &'a String> + 'a {
+        self.tasks[id].dependencies.iter().filter(|dependency| {
+            self.tasks
+                .get(*dependency)
+                .is_none_or(|task| task.definition.continuous != Some(true))
+        })
+    }
+
     /// Nx's `makeAcyclic`: from each task, depth first, a dependency on a
     /// task already on the path is dropped.
     fn make_acyclic(&mut self) {

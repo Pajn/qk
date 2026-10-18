@@ -1231,3 +1231,66 @@ fn ignored_deleted_manifests_only_affect_explicit_consumers() {
         }
     }
 }
+
+/// `app:serve` is continuous and builds `lib` first. `e2e` lives in its own
+/// project, with only its own files as inputs, and is served by `app:serve`
+/// as `dependsOn` declares it.
+fn served_repo(serve_dependency: &str) -> Repo {
+    let e2e = format!(
+        r#"{{"name": "app-e2e", "targets": {{"e2e": {{"command": "echo e2e", "inputs": ["default"], "dependsOn": [{serve_dependency}]}}}}}}"#
+    );
+    Repo::new(&[
+        (
+            "nx.json",
+            r#"{"namedInputs": {"default": ["{projectRoot}/**/*"]},
+                "targetDefaults": {"build": {"command": "echo build", "inputs": ["default"], "outputs": ["{projectRoot}/dist"]}}}"#,
+        ),
+        (
+            "apps/app/project.json",
+            r#"{"name": "app", "implicitDependencies": ["lib"], "targets": {"serve": {"command": "echo serve", "continuous": true, "inputs": ["default"], "dependsOn": ["^build"]}}}"#,
+        ),
+        (
+            "libs/lib/project.json",
+            r#"{"name": "lib", "targets": {"build": {}}}"#,
+        ),
+        ("apps/app-e2e/project.json", &e2e),
+        ("apps/app-e2e/src/app.spec.ts", "a test"),
+    ])
+}
+
+#[test]
+fn a_continuous_dependency_counts_its_inputs_as_the_dependent_s_own() {
+    use qk_affected::{TaskCause, TaskReason};
+    let repo = served_repo(r#"{"projects": ["app"], "target": "serve"}"#);
+    write(&repo.root, "apps/app/src/main.ts", "changed");
+    let tasks = affected_tasks_of(&repo, &["app-e2e:e2e"]);
+    assert!(matches!(
+        &tasks["app-e2e:e2e"],
+        TaskCause::Touched { reasons }
+            if reasons.iter().any(|reason| matches!(reason, TaskReason::Input { file } if file == "apps/app/src/main.ts"))
+    ));
+
+    // A build the server depends on does not carry over: its outputs are the
+    // server's to read, not the e2e task's.
+    let repo = served_repo(r#"{"projects": ["app"], "target": "serve"}"#);
+    write(&repo.root, "libs/lib/src/index.ts", "changed");
+    let tasks = affected_tasks_of(&repo, &["app-e2e:e2e"]);
+    assert!(tasks.contains_key("lib:build"));
+    assert!(!tasks.contains_key("app-e2e:e2e"), "{tasks:?}");
+}
+
+#[test]
+fn a_continuous_dependency_declared_without_inputs_counts_nothing() {
+    let repo = served_repo(r#"{"projects": ["app"], "target": "serve", "inputs": false}"#);
+    write(&repo.root, "apps/app/src/main.ts", "changed");
+    let tasks = affected_tasks_of(&repo, &["app-e2e:e2e"]);
+    assert!(!tasks.contains_key("app-e2e:e2e"), "{tasks:?}");
+
+    // Another entry naming the server with its inputs keeps them.
+    let repo = served_repo(
+        r#"{"projects": ["app"], "target": "serve", "inputs": false}, {"projects": ["app"], "target": "serve"}"#,
+    );
+    write(&repo.root, "apps/app/src/main.ts", "changed");
+    let tasks = affected_tasks_of(&repo, &["app-e2e:e2e"]);
+    assert!(tasks.contains_key("app-e2e:e2e"), "{tasks:?}");
+}

@@ -258,7 +258,8 @@ pub(crate) fn analyse(
 }
 
 /// The touched tasks and, in dependency order, every task depending on an
-/// affected one, except `skipped`.
+/// affected one, except `skipped`. A continuous dependency does not carry it:
+/// its inputs count as the dependent's own instead.
 fn propagate(
     graph: &TaskGraph,
     touched: &BTreeMap<String, Vec<TaskReason>>,
@@ -292,7 +293,7 @@ fn propagate(
             scheduled[index] = true;
             continue;
         }
-        for dependency in &graph.tasks[*id].dependencies {
+        for dependency in graph.producers(id) {
             if let Some(&dependency_index) = indices.get(dependency.as_str()) {
                 dependents[dependency_index].push(index);
             }
@@ -310,9 +311,8 @@ fn propagate(
     // Each task is queued once and each reverse edge is visited once.
     while let Some(Reverse((pass, index))) = pending.pop() {
         let id = ids[index];
-        let dependency = graph.tasks[id]
-            .dependencies
-            .iter()
+        let dependency = graph
+            .producers(id)
             .find(|dependency| tasks.contains_key(dependency.as_str()))
             .expect("a queued task has an affected dependency");
         tasks.insert(
@@ -463,9 +463,8 @@ mod tests {
                 if tasks.contains_key(*id) {
                     return false;
                 }
-                if let Some(dependency) = graph.tasks[*id]
-                    .dependencies
-                    .iter()
+                if let Some(dependency) = graph
+                    .producers(id)
                     .find(|dependency| tasks.contains_key(*dependency))
                 {
                     tasks.insert(

@@ -696,7 +696,8 @@ pub(crate) fn decide_tasks(
 
 /// Runs the whole of each narrowed task that depends on a task still
 /// affected, whose outputs it may read, although its own inputs are only
-/// sources its imports do not reach.
+/// sources its imports do not reach. A continuous task it depends on has no
+/// outputs it reads; its inputs are the task's own, which imports may narrow.
 ///
 /// A task's cause names its own changes when it has any, so this is decided
 /// from the graph rather than the cause. A task stays affected when a change
@@ -708,8 +709,8 @@ fn run_dependents_whole(
     decisions: &mut BTreeMap<String, TaskDecision>,
 ) {
     let mut dependents: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    for (id, task) in &graph.tasks {
-        for dependency in &task.dependencies {
+    for id in graph.tasks.keys() {
+        for dependency in graph.producers(id) {
             dependents.entry(dependency).or_default().push(id);
         }
     }

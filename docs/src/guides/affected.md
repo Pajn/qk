@@ -96,6 +96,12 @@ same inputs its cache key reads, so an unaffected task would be a cache hit,
 except that env and runtime inputs count as unchanged, since the base
 revision's environment is unknowable. A test-only change then reaches the
 test tasks and not the builds whose `production` inputs exclude tests.
+As in Nx, a continuous task a task depends on, such as the dev server an e2e
+task runs against, does not affect it as a dependency: it has no outputs the
+task reads. Its inputs count as the task's own instead, and so do those of
+the continuous tasks it depends on in turn. A `dependsOn` entry with
+`inputs: false` leaves them out, unless another entry names the same task
+without it.
 `project` stays the default, as in Nx. `qk show tasks -t <targets> --affected`
 lists the affected tasks with their first reason, or the whole analysis with
 `--json`.

@@ -113,7 +113,9 @@ is decided by its changed inputs:
 
 1. **A changed input that is not a source runs the whole task**, as do lockfile
    installs, a deleted manifest and an affected task it depends on, whose
-   outputs it may read. That holds whatever else touches the task, and for a
+   outputs it may read. A continuous task it depends on is not one of these:
+   its inputs count as the task's own, so the profile decides them by imports
+   like any other changed input. That holds whatever else touches the task, and for a
    dependency the profile keeps for any reason, such as an anchor importing a
    change; one it leaves out does not count. The task's ordinary inputs are
    what make this sound: declare its harness, its workflow and anything else

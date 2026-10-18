@@ -130,6 +130,8 @@ pub struct Snapshot {
     roots: BTreeMap<String, String>,
     generated_tasks: Vec<(Task, Outputs)>,
     task_dependencies: BTreeMap<String, BTreeSet<String>>,
+    /// Each task's servers, by project and declared inputs: see [`servers`].
+    servers: BTreeMap<String, Vec<(String, Vec<Value>)>>,
     source_ignore: Arc<SourceIgnore>,
     canonical_root: PathBuf,
     workspace_prefix: Option<PathBuf>,
@@ -719,6 +721,11 @@ impl Snapshot {
                 .tasks
                 .iter()
                 .map(|(id, task)| (id.clone(), task.dependencies.clone()))
+                .collect(),
+            servers: graph
+                .tasks
+                .keys()
+                .map(|id| (id.clone(), servers(graph, id)))
                 .collect(),
             canonical_root,
             workspace_prefix,
@@ -1466,9 +1473,17 @@ impl<'a> Resolver<'a> {
     }
 
     fn task_inputs(&mut self, task: &Task) -> Result<()> {
-        let default = vec![json!("default"), json!("^default")];
-        for input in task.definition.inputs.as_ref().unwrap_or(&default) {
-            self.input(&task.project, input)?;
+        for input in declared_inputs(task) {
+            self.input(&task.project, &input)?;
+        }
+        // As in Nx, a continuous task serving this one counts its own inputs
+        // here.
+        let snapshot = self.snapshot;
+        for (project, inputs) in snapshot.servers.get(&task.id).into_iter().flatten() {
+            for input in inputs {
+                self.input(project, input)
+                    .with_context(|| format!("inputs of {project}, which serves this task"))?;
+            }
         }
         Ok(())
     }
@@ -1820,6 +1835,42 @@ impl<'a> Resolver<'a> {
         self.named_stack.pop();
         Ok(())
     }
+}
+
+/// A task's declared inputs, or Nx's default when it declares none.
+fn declared_inputs(task: &Task) -> Vec<Value> {
+    task.definition
+        .inputs
+        .clone()
+        .unwrap_or_else(|| vec![json!("default"), json!("^default")])
+}
+
+/// The continuous tasks serving a task, whose inputs count as its own, as Nx
+/// hashes them: its continuous dependencies, theirs in turn, and so on, each
+/// by its project and declared inputs. A dependency declared with
+/// `inputs: false` is not followed, though a server it leads to still counts
+/// when another way reaches it.
+fn servers(graph: &TaskGraph, id: &str) -> Vec<(String, Vec<Value>)> {
+    let mut servers = Vec::new();
+    let mut visited = BTreeSet::from([id]);
+    let mut pending = std::collections::VecDeque::from([id]);
+    while let Some(current) = pending.pop_front() {
+        let task = &graph.tasks[current];
+        for dependency in &task.dependencies {
+            let Some(server) = graph.tasks.get(dependency) else {
+                continue;
+            };
+            if server.definition.continuous != Some(true)
+                || !task.edge(dependency).inputs
+                || !visited.insert(dependency)
+            {
+                continue;
+            }
+            servers.push((server.project.clone(), declared_inputs(server)));
+            pending.push_back(dependency);
+        }
+    }
+    servers
 }
 
 pub fn resolve(
