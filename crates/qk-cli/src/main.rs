@@ -481,6 +481,12 @@ impl RunOptions {
         if self.skips_cache() {
             set("NX_SKIP_NX_CACHE");
         }
+        // As Nx's normalizeNxArgsRunner, `--runner` wins over the variable;
+        // the cache reads runner options such as selectivelyHashTsConfig.
+        if let Some(runner) = &self.ignored.runner {
+            // Only this thread exists yet.
+            unsafe { std::env::set_var("NX_TASKS_RUNNER", runner) }
+        }
         if self.skip_remote_cache {
             set("NX_SKIP_REMOTE_CACHE");
         }

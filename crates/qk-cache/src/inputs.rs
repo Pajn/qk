@@ -112,8 +112,8 @@ impl Inferred {
 pub const ROOT_TSCONFIG_FILES: [&str; 2] = ["tsconfig.base.json", "tsconfig.json"];
 
 /// Whether nx.json's runner options set `selectivelyHashTsConfig`, which Nx
-/// reads from the runner `NX_TASKS_RUNNER` names when nx.json configures it,
-/// or else from `default`.
+/// reads from the runner `--runner` or `NX_TASKS_RUNNER` names when nx.json
+/// configures it, or else from `default`.
 pub fn selectively_hash_tsconfig(workspace: &Workspace) -> bool {
     let runners = workspace.config.extra.get("tasksRunnerOptions");
     let runner = std::env::var("NX_TASKS_RUNNER")
