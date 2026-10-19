@@ -259,10 +259,23 @@ impl Transport for Restart {
     }
 
     fn await_input(&mut self, timeout: NextTimeout) -> std::result::Result<bool, ureq::Error> {
+        let started = std::time::Instant::now();
+        let mut next = timeout;
         loop {
-            match self.0.await_input(timeout) {
-                // Nothing was read, so reading again loses nothing.
-                Err(ureq::Error::Io(error)) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            match self.0.await_input(next) {
+                // Nothing was read, so reading again loses nothing, within
+                // what is left of the read's time.
+                Err(ureq::Error::Io(error)) if error.kind() == std::io::ErrorKind::Interrupted => {
+                    if let ureq::unversioned::transport::time::Duration::Exact(after) =
+                        timeout.after
+                    {
+                        let left = after.saturating_sub(started.elapsed());
+                        if left.is_zero() {
+                            return Err(ureq::Error::Timeout(timeout.reason));
+                        }
+                        next.after = ureq::unversioned::transport::time::Duration::Exact(left);
+                    }
+                }
                 read => return read,
             }
         }
@@ -1190,6 +1203,7 @@ mod agent_tests {
     use std::os::unix::thread::JoinHandleExt;
     use std::sync::mpsc::channel;
     use std::time::Duration;
+    use ureq::unversioned::transport::Connector;
 
     extern "C" fn interrupt(_: libc::c_int) {}
 
@@ -1242,6 +1256,49 @@ mod agent_tests {
         release.send(()).unwrap();
         assert_eq!(client.join().unwrap(), Ok(200));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn signals_do_not_keep_a_stalled_request_waiting_past_its_timeout() {
+        // SAFETY: as above; installing the same handler again is harmless.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = interrupt as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            libc::sigemptyset(&mut action.sa_mask);
+            assert_eq!(
+                libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()),
+                0
+            );
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        // The server takes the request and never answers.
+        let server = std::thread::spawn(move || listener.accept().unwrap());
+        let client = std::thread::spawn(move || {
+            let config = ureq::Agent::config_builder()
+                .timeout_global(Some(Duration::from_millis(300)))
+                .build();
+            let connector =
+                ureq::unversioned::transport::DefaultConnector::default().chain(super::Restarting);
+            let agent = ureq::Agent::with_parts(
+                config,
+                connector,
+                ureq::unversioned::resolver::DefaultResolver::default(),
+            );
+            let started = std::time::Instant::now();
+            let result = agent.get(url).call().map(|_| ());
+            (started.elapsed(), result.map_err(|error| error.to_string()))
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !client.is_finished() && std::time::Instant::now() < deadline {
+            // SAFETY: the thread is not joined yet, so its handle is valid.
+            unsafe { libc::pthread_kill(client.as_pthread_t(), libc::SIGUSR1) };
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let (elapsed, result) = client.join().unwrap();
+        assert!(result.unwrap_err().contains("timeout"));
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+        drop(server.join());
     }
 }
 
