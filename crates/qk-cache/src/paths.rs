@@ -208,7 +208,24 @@ pub use crate::glob::Pattern;
 /// at the start. Anywhere else `{workspaceRoot}` is glob text, as it is in
 /// Nx, and so is any other brace group.
 pub fn expand(workspace: &Workspace, project: &str, text: &str) -> Result<String> {
-    let project_root = &workspace.projects[project].root;
+    let root = &workspace.projects[project].root;
+    expand_with(text, root, project)
+}
+
+/// [`expand`] for a glob: the project root and name go in with their glob
+/// characters escaped, so a root such as `apps/(marketing)` names that
+/// directory rather than a pattern. Nx inserts them as they are.
+pub fn expand_glob(workspace: &Workspace, project: &str, text: &str) -> Result<String> {
+    let root = &workspace.projects[project].root;
+    let root = if root == "." {
+        root.clone()
+    } else {
+        crate::glob::escape(root)
+    };
+    expand_with(text, &root, &crate::glob::escape(project))
+}
+
+fn expand_with(text: &str, project_root: &str, project_name: &str) -> Result<String> {
     let prefix = if project_root == "." {
         String::new()
     } else {
@@ -224,7 +241,7 @@ pub fn expand(workspace: &Workspace, project: &str, text: &str) -> Result<String
     let result = text
         .replace("{projectRoot}/", &prefix)
         .replace("{projectRoot}", project_root)
-        .replace("{projectName}", project);
+        .replace("{projectName}", project_name);
     normalize(&result)
 }
 

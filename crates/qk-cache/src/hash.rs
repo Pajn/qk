@@ -1842,7 +1842,7 @@ impl<'a> Resolver<'a> {
         } else {
             return Ok(());
         };
-        let pattern = paths::expand(self.workspace, project, pattern)?;
+        let pattern = paths::expand_glob(self.workspace, project, pattern)?;
         let matcher = self.snapshot.fileset_pattern(&pattern, exclude)?;
         let prefix = pattern
             .trim_end_matches('/')
@@ -1880,13 +1880,15 @@ impl<'a> Resolver<'a> {
     /// An `includeIgnored` glob of `project`, with its tokens resolved as
     /// Nx's `resolve_files_glob` resolves them, to read from disk later.
     fn ignored_fileset(&mut self, project: &str, pattern: &str, dependencies: bool) {
+        // The root and name go in escaped, as for every fileset; Nx inserts
+        // them as they are.
         let root = &self.workspace.projects[project].root;
         let resolved = if root == "." {
             pattern.replace("{projectRoot}/", "")
         } else {
-            pattern.replace("{projectRoot}", root)
+            pattern.replace("{projectRoot}", &crate::glob::escape(root))
         }
-        .replace("{projectName}", project);
+        .replace("{projectName}", &crate::glob::escape(project));
         let resolved = match resolved.strip_prefix("!{workspaceRoot}/") {
             Some(rest) => format!("!{rest}"),
             None => resolved
@@ -1956,7 +1958,7 @@ impl<'a> Resolver<'a> {
             .as_str()
             .context("json input must name a file")?;
         validate_fileset(declared)?;
-        let path = paths::expand(self.workspace, project, declared)?;
+        let path = paths::expand_glob(self.workspace, project, declared)?;
         let list = |name: &str| -> Result<Option<Vec<String>>> {
             object
                 .get(name)

@@ -1535,3 +1535,34 @@ fn include_ignored_filesets_read_their_producers_outputs() {
         ["lib:build"]
     );
 }
+
+/// A project root with glob characters, as a route group gives one, names
+/// its directory in filesets, json inputs and includeIgnored filesets.
+#[test]
+fn a_project_root_with_glob_characters_is_a_directory_in_inputs() {
+    for (inputs, file, text) in [
+        (r#"["{projectRoot}/src/**/*"]"#, "src/page.ts", "changed"),
+        (
+            r#"[{"json": "{projectRoot}/meta.json", "fields": ["version"]}]"#,
+            "meta.json",
+            r#"{"version": 2}"#,
+        ),
+        (
+            r#"[{"fileset": "{projectRoot}/src/**/*", "includeIgnored": true}]"#,
+            "src/page.ts",
+            "changed",
+        ),
+    ] {
+        let project = format!(
+            r#"{{"name": "marketing", "targets": {{"build": {{"command": "echo build", "inputs": {inputs}}}}}}}"#
+        );
+        let repo = Repo::new(&[
+            ("apps/(marketing)/project.json", &project),
+            ("apps/(marketing)/src/page.ts", "page"),
+            ("apps/(marketing)/meta.json", r#"{"version": 1}"#),
+        ]);
+        write(&repo.root, &format!("apps/(marketing)/{file}"), text);
+        let tasks = affected_tasks_of(&repo, &["marketing:build"]);
+        assert!(tasks.contains_key("marketing:build"), "{inputs}: {tasks:?}");
+    }
+}

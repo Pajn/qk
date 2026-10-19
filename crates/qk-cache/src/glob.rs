@@ -107,6 +107,22 @@ fn unescaped(pattern: &str) -> String {
     result
 }
 
+/// `path` with every character a pattern reads as syntax escaped, so that as
+/// a pattern it names exactly that path.
+pub fn escape(path: &str) -> String {
+    let mut escaped = String::with_capacity(path.len());
+    for c in path.chars() {
+        if matches!(
+            c,
+            '*' | '?' | '[' | ']' | '{' | '}' | '(' | ')' | '!' | '@' | '+' | ',' | '|' | '\\'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
+}
+
 /// The path a pattern that [`names_a_path`] names: each `\` escape replaced
 /// by the character it escapes.
 pub fn literal_path(pattern: &str) -> String {
