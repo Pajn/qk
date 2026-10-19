@@ -1255,6 +1255,7 @@ fn server_build(fixture: &Fixture, token: &str, env: &[(&str, &str)]) -> Output 
     command
         .env("QK_STORE_SERVER_TOKEN", token)
         .env_remove("CI")
+        .env_remove("GITHUB_ACTIONS")
         .env_remove("NX_POWERPACK_CACHE_MODE");
     for (name, value) in env {
         command.env(name, value);
@@ -1464,6 +1465,7 @@ fn remote_build(fixture: &Fixture, env: &[(&str, &str)]) -> Output {
         .env("AWS_ACCESS_KEY_ID", "key")
         .env("AWS_SECRET_ACCESS_KEY", "secret")
         .env_remove("CI")
+        .env_remove("GITHUB_ACTIONS")
         .env_remove("NX_POWERPACK_CACHE_MODE");
     for (name, value) in env {
         command.env(name, value);
@@ -2206,6 +2208,7 @@ fn a_run_replaces_its_entry_announcements_with_one_listing_and_one_cleanup() {
         .env("AWS_ACCESS_KEY_ID", "key")
         .env("AWS_SECRET_ACCESS_KEY", "secret")
         .env_remove("CI")
+        .env_remove("GITHUB_ACTIONS")
         .env_remove("NX_POWERPACK_CACHE_MODE")
         .output()
         .unwrap();
@@ -2524,6 +2527,7 @@ fn a_run_lists_its_keys_in_the_order_it_used_them() {
             .env("AWS_ACCESS_KEY_ID", "key")
             .env("AWS_SECRET_ACCESS_KEY", "secret")
             .env_remove("CI")
+            .env_remove("GITHUB_ACTIONS")
             .env_remove("NX_POWERPACK_CACHE_MODE");
         success(command.output().unwrap())
     };
@@ -2582,6 +2586,7 @@ fn run_three(fixture: &Fixture, env: &[(&str, &str)]) -> Output {
         .env("AWS_ACCESS_KEY_ID", "key")
         .env("AWS_SECRET_ACCESS_KEY", "secret")
         .env_remove("CI")
+        .env_remove("GITHUB_ACTIONS")
         .env_remove("NX_POWERPACK_CACHE_MODE");
     for (name, value) in env {
         command.env(name, value);
@@ -2816,6 +2821,7 @@ fn dependency_inputs_cover_transitive_dependencies_like_nx() {
         let output = Command::new(env!("CARGO_BIN_EXE_qk"))
             .args(["--workspace", root.to_str().unwrap(), "run", "app:check"])
             .env_remove("CI")
+            .env_remove("GITHUB_ACTIONS")
             .output()
             .unwrap();
         stderr(&success(output))
@@ -2867,6 +2873,7 @@ fn dependency_manifests_count_by_what_they_decide_for_dependents() {
         let output = Command::new(env!("CARGO_BIN_EXE_qk"))
             .args(["--workspace", root.to_str().unwrap(), "run", "app:check"])
             .env_remove("CI")
+            .env_remove("GITHUB_ACTIONS")
             .output()
             .unwrap();
         stderr(&success(output))
@@ -2968,6 +2975,7 @@ fn versions_crossing_a_dependents_range_change_its_key() {
         let output = Command::new(env!("CARGO_BIN_EXE_qk"))
             .args(["--workspace", root.to_str().unwrap(), "run", "app:check"])
             .env_remove("CI")
+            .env_remove("GITHUB_ACTIONS")
             .output()
             .unwrap();
         stderr(&success(output))
@@ -3037,6 +3045,7 @@ snapshots:
         let output = Command::new(env!("CARGO_BIN_EXE_qk"))
             .args(["--workspace", root.to_str().unwrap(), "run", task])
             .env_remove("CI")
+            .env_remove("GITHUB_ACTIONS")
             .output()
             .unwrap();
         stderr(&success(output))
@@ -3082,6 +3091,7 @@ fn project_filesets_leave_out_nested_projects_files() {
         let output = Command::new(env!("CARGO_BIN_EXE_qk"))
             .args(["--workspace", root.to_str().unwrap(), "run", task])
             .env_remove("CI")
+            .env_remove("GITHUB_ACTIONS")
             .output()
             .unwrap();
         stderr(&success(output))
@@ -3126,6 +3136,7 @@ fn dependency_manifests_named_by_inputs_count_whole() {
         let output = Command::new(env!("CARGO_BIN_EXE_qk"))
             .args(["--workspace", root.to_str().unwrap(), "run", "app:check"])
             .env_remove("CI")
+            .env_remove("GITHUB_ACTIONS")
             .output()
             .unwrap();
         stderr(&success(output))
@@ -4986,7 +4997,8 @@ fn skipping_the_remote_cache_keeps_to_the_local_one() {
     command
         .env("AWS_ACCESS_KEY_ID", "key")
         .env("AWS_SECRET_ACCESS_KEY", "secret")
-        .env_remove("CI");
+        .env_remove("CI")
+        .env_remove("GITHUB_ACTIONS");
     let output = success(command.output().unwrap());
     assert!(cached(&output), "{}", stdout(&output));
     assert_eq!(server.writes(), 0);

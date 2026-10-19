@@ -1098,6 +1098,7 @@ fn output_styles_follow_nx() {
             .env_remove("NX_DEFAULT_OUTPUT_STYLE")
             .env_remove("GITHUB_ACTIONS")
             .env_remove("CI")
+            .env_remove("GITHUB_ACTIONS")
             .env("NO_COLOR", "1")
             .output()
             .unwrap();
@@ -1673,6 +1674,7 @@ fn quiet_output_is_plain_text_for_agents() {
         .env_remove("FORCE_COLOR")
         .env_remove("NX_DEFAULT_OUTPUT_STYLE")
         .env_remove("CI")
+        .env_remove("GITHUB_ACTIONS")
         .output()
         .unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
