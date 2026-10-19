@@ -1875,7 +1875,9 @@ fn root_tsconfig_paths_reach_tasks_only_when_hashed_selectively() {
 
 /// Under Nx's default `projectsAffectedByDependencyUpdates: "all"`, a
 /// lockfile change reaches every task hashing installed packages: those not
-/// declaring `externalDependencies`. A list of projects reaches theirs.
+/// declaring `externalDependencies`. A list of project selectors reaches
+/// the tasks of the projects it matches, as it selects projects, and `auto`
+/// without the lockfile analysed reaches what `all` does.
 #[test]
 fn lockfile_changes_reach_the_tasks_hashing_installed_packages() {
     use qk_affected::{TaskCause, TaskReason};
@@ -1886,8 +1888,16 @@ fn lockfile_changes_reach_the_tasks_hashing_installed_packages() {
             &["lib:build", "lib:test"],
         ),
         (
+            r#", "pluginsConfig": {"@nx/js": {"projectsAffectedByDependencyUpdates": []}}"#,
+            &[],
+        ),
+        (
             r#", "pluginsConfig": {"@nx/js": {"projectsAffectedByDependencyUpdates": "auto"}}"#,
             &[],
+        ),
+        (
+            r#", "pluginsConfig": {"@nx/js": {"projectsAffectedByDependencyUpdates": "auto", "analyzeLockfile": false}}"#,
+            &["app:build", "lib:build"],
         ),
     ] {
         let repo = narrow_task_repo(extra, &[("pnpm-lock.yaml", &lockfile("19.0.0", "19.0.0"))]);
