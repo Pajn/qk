@@ -300,6 +300,21 @@ impl Lockfile {
             .collect()
     }
 
+    /// The names of every package an installation of `name` reaches, `name`
+    /// included when it is installed.
+    pub fn reached_packages(&self, name: &str) -> BTreeSet<String> {
+        let keys = self
+            .snapshots
+            .keys()
+            .filter(|key| package_name(key) == name)
+            .cloned()
+            .collect();
+        self.reach(keys)
+            .iter()
+            .map(|key| package_name(key).to_owned())
+            .collect()
+    }
+
     /// An importer's dependencies as installed names and snapshot keys.
     fn direct(&self, importer: &str) -> Option<Vec<(&str, String)>> {
         let dependencies = self.importers.get(importer)?;

@@ -469,7 +469,8 @@ impl RunOptions {
     }
 
     /// Sets what Nx sets in its own environment for these options, so tasks
-    /// and the remote cache see it. Called before any thread starts.
+    /// and the remote cache see it. Called before any thread starts, and
+    /// safe to call again.
     fn export(&self) {
         let set = |name: &str| {
             // Only this thread exists yet.
@@ -480,6 +481,12 @@ impl RunOptions {
         unsafe { std::env::set_var("NX_VERBOSE_LOGGING", self.verbose().to_string()) }
         if self.skips_cache() {
             set("NX_SKIP_NX_CACHE");
+        }
+        // As Nx's normalizeNxArgsRunner, `--runner` wins over the variable;
+        // the cache reads runner options such as selectivelyHashTsConfig.
+        if let Some(runner) = &self.ignored.runner {
+            // Only this thread exists yet.
+            unsafe { std::env::set_var("NX_TASKS_RUNNER", runner) }
         }
         if self.skip_remote_cache {
             set("NX_SKIP_REMOTE_CACHE");
@@ -1226,6 +1233,9 @@ fn run(mut cli: Cli) -> Result<i32> {
             if candidates.is_empty() && options.graph_target().is_some() {
                 return execute_tasks(&workspace, candidates, &options, false);
             }
+            // The runner `--runner` names decides how keys are computed, here
+            // as in the run.
+            options.export();
             let graph = TaskGraph::build(&workspace, &candidates)?;
             let analysis = qk_affected::affected_tasks(&workspace, &graph, &changes.options())?;
             warn_landed(analysis.range.as_ref());

@@ -47,13 +47,42 @@ pub struct Options {
     pub untracked: bool,
 }
 
+/// The lockfiles Nx reads at both revisions rather than diffing as JSON or
+/// YAML, by name; at the workspace root, a change to one is a dependency
+/// update (Nx's `AUTO_AFFECTED_LOCK_FILES`).
 const LOCKFILES: &[&str] = &[
     "pnpm-lock.yaml",
+    "pnpm-lock.yml",
     "package-lock.json",
     "yarn.lock",
     "bun.lock",
     "bun.lockb",
 ];
+
+/// The root lockfiles the js plugin's `createNodes` glob picks up, which a
+/// deletion therefore treats as project configuration.
+const PLUGIN_LOCKFILES: &[&str] = &[
+    "yarn.lock",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "bun.lockb",
+    "bun.lock",
+];
+
+/// Whether `file` is what Nx's default plugins create projects from: any
+/// `project.json` or `package.json` by their `createNodes` globs, whether or
+/// not package discovery then applies to it, or a root lockfile.
+pub(crate) fn is_project_config(file: &str) -> bool {
+    is_manifest(file) || PLUGIN_LOCKFILES.contains(&file)
+}
+
+/// Whether `file` is a `project.json` or `package.json`.
+pub(crate) fn is_manifest(file: &str) -> bool {
+    matches!(
+        file.rsplit('/').next().unwrap_or(file),
+        "project.json" | "package.json"
+    )
+}
 
 pub fn affected_projects(
     workspace: &Workspace,
@@ -122,7 +151,8 @@ pub enum Reason {
         target: String,
         input: String,
     },
-    /// A project manifest was deleted, which touches every project.
+    /// A file projects are created from was deleted, which touches every
+    /// project.
     DeletedManifest { file: String },
     /// The lockfile changed under a `projectsAffectedByDependencyUpdates`
     /// setting that does not look inside it.
@@ -143,8 +173,8 @@ pub enum Reason {
         /// Snapshot keys whose integrity or dependencies changed.
         changed: Vec<String>,
     },
-    /// A dependency in the root `package.json` changed, and the project
-    /// installs that package or is it.
+    /// A dependency or override in the root `package.json` changed, and the
+    /// project installs that package or is it.
     RootDependency { name: String, path: String },
     /// A root `package.json` change that touches every project.
     RootPackage { detail: String },
@@ -428,6 +458,9 @@ struct Changes<'a> {
     before_lockfile: OnceCell<std::result::Result<Lockfile, String>>,
     after_lockfile: OnceCell<std::result::Result<Lockfile, String>>,
     files: Vec<String>,
+    /// The files were named rather than compared, as with `--files`: each
+    /// counts as changed whole, as in Nx.
+    whole: bool,
     base: Option<String>,
     /// `None` reads the working tree.
     head: Option<String>,
@@ -504,6 +537,13 @@ impl<'a> Changes<'a> {
             .clone()
             .or_else(|| non_empty_env("NX_BASE"))
             .unwrap_or_else(|| default_base.clone());
+        // As Nx's `assertValidGitRevision`: git would read one as an option.
+        for revision in std::iter::once(&requested).chain(&head) {
+            ensure!(
+                !revision.starts_with('-'),
+                "invalid git revision {revision:?}: git revisions cannot start with \"-\""
+            );
+        }
         let head_revision = head.as_deref().unwrap_or("HEAD");
         let (merged, upstream) = merge_base(root, &requested, head_revision);
         let range = (options.files.is_empty()
@@ -511,11 +551,17 @@ impl<'a> Changes<'a> {
             && !options.uncommitted
             && !options.untracked)
             .then(|| {
-                let default_branch = upstream_of(root, &default_base).or_else(|| {
-                    git_lines(root, &["rev-parse", "--verify", "--quiet", &default_base])
-                        .ok()
-                        .map(|_| default_base.clone())
-                });
+                // The default branch only qualifies the range, so one shaped
+                // like an option is not looked up rather than refused.
+                let default_branch = (!default_base.starts_with('-'))
+                    .then(|| {
+                        upstream_of(root, &default_base).or_else(|| {
+                            git_lines(root, &["rev-parse", "--verify", "--quiet", &default_base])
+                                .ok()
+                                .map(|_| default_base.clone())
+                        })
+                    })
+                    .flatten();
                 Range {
                     commits: count(root, &merged, head_revision),
                     landed: default_branch
@@ -527,7 +573,8 @@ impl<'a> Changes<'a> {
                 }
             });
         let base = Some(merged);
-        let files = if options.explicit_files || !options.files.is_empty() {
+        let whole = options.explicit_files || !options.files.is_empty();
+        let files = if whole {
             options.files.clone()
         } else if options.uncommitted {
             uncommitted(root)?
@@ -571,6 +618,7 @@ impl<'a> Changes<'a> {
             before_lockfile: OnceCell::new(),
             after_lockfile: OnceCell::new(),
             files,
+            whole,
             base,
             head,
             range,
@@ -585,6 +633,9 @@ impl<'a> Changes<'a> {
     fn change(&self, file: &str) -> FileChange {
         if !self.workspace.root.join(file).exists() {
             return FileChange::Deleted;
+        }
+        if self.whole {
+            return FileChange::Whole;
         }
         let read = || -> Option<(String, String)> {
             Some((
@@ -752,9 +803,8 @@ fn untracked(root: &Path) -> Result<Vec<String>> {
     git_paths(root, &["ls-files", "--others", "--exclude-standard"])
 }
 
-/// The paths a Git command lists, read NUL-separated so that Git does not
-/// quote names outside ASCII. Nx reads them line by line, quoted, and so
-/// misses a change to such a file.
+/// The paths a Git command lists, read NUL-separated, as Nx 24 reads them,
+/// so that Git does not quote names outside ASCII.
 fn git_paths(root: &Path, args: &[&str]) -> Result<Vec<String>> {
     let (command, rest) = args.split_first().context("a git command")?;
     let mut arguments = vec![*command, "-z"];
@@ -801,25 +851,42 @@ fn git_lines(root: &Path, args: &[&str]) -> Result<Vec<String>> {
         .collect())
 }
 
-/// Each file touches the project whose root most specifically contains it.
-fn touched_by_path(workspace: &Workspace, changes: &Changes, touches: &mut Touches) -> Result<()> {
-    let roots: BTreeMap<&str, &str> = workspace
-        .projects
-        .values()
-        .map(|project| (project.root.as_str(), project.name.as_str()))
-        .collect();
-    for file in &changes.files {
-        let mut path = file.as_str();
+/// Each project by its root, to find the project owning a path.
+pub(crate) struct ProjectRoots<'w>(BTreeMap<&'w str, &'w str>);
+
+impl<'w> ProjectRoots<'w> {
+    pub(crate) fn new(workspace: &'w Workspace) -> Self {
+        Self(
+            workspace
+                .projects
+                .values()
+                .map(|project| (project.root.as_str(), project.name.as_str()))
+                .collect(),
+        )
+    }
+
+    /// The project whose root most specifically contains `path`.
+    pub(crate) fn owner(&self, path: &str) -> Option<&'w str> {
+        let mut path = path;
         loop {
-            if let Some(project) = roots.get(path) {
-                touches.touch(project, Reason::File { file: file.clone() });
-                break;
+            if let Some(project) = self.0.get(path) {
+                return Some(project);
             }
             match path.rfind('/') {
                 Some(slash) => path = &path[..slash],
                 None if path != "." => path = ".",
-                None => break,
+                None => return None,
             }
+        }
+    }
+}
+
+/// Each file touches the project whose root most specifically contains it.
+fn touched_by_path(workspace: &Workspace, changes: &Changes, touches: &mut Touches) -> Result<()> {
+    let roots = ProjectRoots::new(workspace);
+    for file in &changes.files {
+        if let Some(project) = roots.owner(file) {
+            touches.touch(project, Reason::File { file: file.clone() });
         }
     }
     Ok(())
@@ -827,6 +894,9 @@ fn touched_by_path(workspace: &Workspace, changes: &Changes, touches: &mut Touch
 
 /// `nx.json`, or the file it extends, touches every project; a file named by
 /// a `{workspaceRoot}` input touches the projects declaring it.
+///
+/// Nx 24 leaves out the file `nx.json` extends, although what it holds is
+/// as much the workspace's configuration as `nx.json` itself; qk counts it.
 fn touched_implicitly(
     workspace: &Workspace,
     changes: &Changes,
@@ -861,8 +931,11 @@ fn touched_implicitly(
         }
     }
     for (pattern, declarations) in patterns {
-        let matcher = Pattern::new(&pattern, false)?;
-        let Some(file) = changes.files.iter().find(|file| matcher.is_match(file)) else {
+        let Some(file) = changes
+            .files
+            .iter()
+            .find(|file| implicit_match(&pattern, file))
+        else {
             continue;
         };
         for (project, target) in declarations {
@@ -877,6 +950,36 @@ fn touched_implicitly(
         }
     }
     Ok(())
+}
+
+/// Whether a changed file matches a `{workspaceRoot}` input, as Nx's
+/// `implicitly_touched_projects` reads it: repeated and trailing slashes
+/// collapsed, and a path without glob syntax naming that file or everything
+/// under it. A glob that cannot be compiled is taken literally.
+fn implicit_match(pattern: &str, file: &str) -> bool {
+    let mut normalized = String::with_capacity(pattern.len());
+    for c in pattern.chars() {
+        if !(c == '/' && normalized.ends_with('/')) {
+            normalized.push(c);
+        }
+    }
+    while normalized.len() > 1 && normalized.ends_with('/') {
+        normalized.pop();
+    }
+    let literal = |path: &str| {
+        file == path
+            || file
+                .strip_prefix(path)
+                .is_some_and(|rest| rest.starts_with('/'))
+    };
+    // `@` and `+` are syntax only before a group, so `@types` is a name.
+    if !normalized.contains(['*', '?', '[', ']', '{', '}', '(', ')', '\\']) {
+        return literal(&normalized);
+    }
+    match Pattern::new(&normalized, false) {
+        Ok(matcher) => matcher.is_match(file),
+        Err(_) => literal(&normalized),
+    }
 }
 
 /// Nx's `extractFilesFromInputs`: named inputs are followed, and plain or
@@ -910,17 +1013,17 @@ fn workspace_inputs(
     }
 }
 
-/// A deleted project manifest may have removed a project, which leaves Nx no
-/// way of knowing what depended on it.
+/// A deleted file that projects are created from may have removed a project,
+/// which leaves Nx no way of knowing what depended on it.
 fn touched_by_deleted_manifests(
     workspace: &Workspace,
     changes: &Changes,
     touches: &mut Touches,
 ) -> Result<()> {
-    let deleted = changes.files.iter().find(|file| {
-        let name = file.rsplit('/').next().unwrap_or(file);
-        matches!(name, "project.json" | "package.json") && !workspace.root.join(file).exists()
-    });
+    let deleted = changes
+        .files
+        .iter()
+        .find(|file| is_project_config(file) && !workspace.root.join(file).exists());
     if let Some(file) = deleted {
         touches.all(workspace, Reason::DeletedManifest { file: file.clone() });
     }
@@ -932,15 +1035,7 @@ fn touched_by_lockfile(
     changes: &Changes,
     touches: &mut Touches,
 ) -> Result<()> {
-    let Some(file) = changes.files.iter().find(|file| {
-        [
-            "pnpm-lock.yaml",
-            "package-lock.json",
-            "yarn.lock",
-            "bun.lock",
-        ]
-        .contains(&file.as_str())
-    }) else {
+    let Some(file) = changed_lockfile(changes) else {
         return Ok(());
     };
     let setting = projects_affected_by_dependency_updates(workspace);
@@ -948,23 +1043,15 @@ fn touched_by_lockfile(
         file: file.clone(),
         setting: setting.clone(),
     };
-    match &setting {
-        // Without the lockfile's packages in the graph, Nx's `auto` finds no
-        // package that changed and takes every project.
-        Value::String(mode) if mode == "auto" && workspace.analyzes_lockfile() => {}
-        Value::Array(selectors) => {
-            let selectors: Vec<String> = serde_json::from_value(Value::Array(selectors.clone()))
-                .context("projectsAffectedByDependencyUpdates must list project selectors")?;
-            for project in qk_config::find_matching_projects(
-                &selectors,
-                &workspace.projects,
-                qk_config::Reader::Nx,
-            ) {
+    match DependencyUpdates::read(workspace)? {
+        DependencyUpdates::Auto => {}
+        DependencyUpdates::Projects(projects) => {
+            for project in projects {
                 touches.touch(&project, reason.clone());
             }
             return Ok(());
         }
-        _ => {
+        DependencyUpdates::All => {
             touches.all(workspace, reason);
             return Ok(());
         }
@@ -973,6 +1060,13 @@ fn touched_by_lockfile(
         file: file.clone(),
         detail: detail.to_owned(),
     };
+    if changes.whole {
+        touches.all(
+            workspace,
+            unreadable("its revisions are not compared for --files"),
+        );
+        return Ok(());
+    }
     if file != "pnpm-lock.yaml" {
         let detail = match changes.change(file) {
             FileChange::Lockfile { .. } => "qk reads pnpm lockfiles only",
@@ -1052,9 +1146,51 @@ fn touched_by_lockfile(
     Ok(())
 }
 
+/// The changed root lockfile, as Nx finds it.
+pub(crate) fn changed_lockfile<'c>(changes: &'c Changes) -> Option<&'c String> {
+    changes
+        .files
+        .iter()
+        .find(|file| LOCKFILES.contains(&file.as_str()))
+}
+
+/// What `projectsAffectedByDependencyUpdates` makes of a lockfile change.
+pub(crate) enum DependencyUpdates {
+    /// Compare what changed in it.
+    Auto,
+    /// These projects, whatever changed.
+    Projects(BTreeSet<String>),
+    /// Every project, or every task hashing installed packages: Nx's default.
+    All,
+}
+
+impl DependencyUpdates {
+    fn read(workspace: &Workspace) -> Result<Self> {
+        Ok(match projects_affected_by_dependency_updates(workspace) {
+            // Without the lockfile's packages in the graph, Nx's `auto` finds
+            // no package that changed and takes every project.
+            Value::String(mode) if mode == "auto" && workspace.analyzes_lockfile() => Self::Auto,
+            Value::Array(selectors) => {
+                let selectors: Vec<String> = serde_json::from_value(Value::Array(selectors))
+                    .context("projectsAffectedByDependencyUpdates must list project selectors")?;
+                Self::Projects(
+                    qk_config::find_matching_projects(
+                        &selectors,
+                        &workspace.projects,
+                        qk_config::Reader::Nx,
+                    )
+                    .into_iter()
+                    .collect(),
+                )
+            }
+            _ => Self::All,
+        })
+    }
+}
+
 /// `pluginsConfig["@nx/js"].projectsAffectedByDependencyUpdates`, which Nx
 /// defaults to `"all"`.
-fn projects_affected_by_dependency_updates(workspace: &Workspace) -> Value {
+pub(crate) fn projects_affected_by_dependency_updates(workspace: &Workspace) -> Value {
     workspace
         .config
         .extra
@@ -1065,6 +1201,207 @@ fn projects_affected_by_dependency_updates(workspace: &Workspace) -> Value {
         .unwrap_or_else(|| Value::String("all".into()))
 }
 
+/// What a root `package.json` change moves, as Nx's `touchedNpmPackages`
+/// names it.
+pub(crate) enum NpmChanges {
+    /// It cannot be pinned to packages, which moves every one.
+    Everything { detail: String },
+    Named {
+        /// Each installed package it moved, with the path that moved it.
+        packages: BTreeMap<String, String>,
+        /// The workspace projects it names as dependencies, each with its path.
+        projects: BTreeMap<String, String>,
+        /// The file changed whole, which moves every installed package.
+        all_packages: bool,
+    },
+}
+
+/// What a root `package.json` change moves, or `None` when it did not
+/// change. Nx diffs its dependencies and overrides: a removed dependency, a
+/// global package (`nx` or a plugin nx.json loads), or an override naming
+/// nothing installed moves everything; another dependency or override moves
+/// the package it names, `@types/x` also moving `x`, and a dependency on a
+/// workspace project names that project. Installed packages are those of the
+/// head revision of `pnpm-lock.yaml`; without one qk can read, any name that
+/// is not a workspace project counts as installed.
+pub(crate) fn root_package_changes(workspace: &Workspace, changes: &Changes) -> Option<NpmChanges> {
+    if !changes.changed("package.json") {
+        return None;
+    }
+    let mut packages = BTreeMap::new();
+    let mut projects = BTreeMap::new();
+    let diff = match changes.change("package.json") {
+        FileChange::Json(diff) => diff,
+        // A deleted manifest says nothing about packages; the deletion counts.
+        FileChange::Deleted => Vec::new(),
+        _ => {
+            return Some(NpmChanges::Named {
+                packages,
+                projects,
+                all_packages: true,
+            });
+        }
+    };
+    let externals: Option<BTreeSet<String>> = changes.lockfile(false).ok().map(|lockfile| {
+        lockfile
+            .installations()
+            .map(|installed| installed.name.to_owned())
+            .collect()
+    });
+    let installed = |name: &str| {
+        externals
+            .as_ref()
+            .map_or(!workspace.projects.contains_key(name), |set| {
+                set.contains(name)
+            })
+    };
+    let globals = global_packages(workspace);
+    let everything = |detail: String| Some(NpmChanges::Everything { detail });
+    for change in diff {
+        let path: Vec<&str> = change.path.iter().map(String::as_str).collect();
+        let dotted = path.join(".");
+        match path.as_slice() {
+            ["dependencies" | "devDependencies", name] => {
+                if change.kind == Kind::Deleted {
+                    return everything(format!("removed {dotted}"));
+                }
+                if installed(name) {
+                    if globals.contains(*name) {
+                        return everything(format!("changed {dotted}, which Nx treats as global"));
+                    }
+                    packages.insert((*name).to_owned(), dotted.clone());
+                    if let Some(implementation) = name.strip_prefix("@types/")
+                        && externals
+                            .as_ref()
+                            .is_some_and(|set| set.contains(implementation))
+                    {
+                        packages.insert(implementation.to_owned(), dotted.clone());
+                    }
+                } else if workspace.projects.contains_key(*name) {
+                    projects.insert((*name).to_owned(), dotted.clone());
+                }
+                // Otherwise nothing installs it, and Nx moves nothing.
+            }
+            ["overrides" | "resolutions", ..] | ["pnpm", "overrides", ..] => {
+                let pnpm = path[0] == "pnpm";
+                let Some(selector) = override_selector(&change, pnpm) else {
+                    continue;
+                };
+                let name = selector_package(selector, pnpm).filter(|name| installed(name));
+                let Some(name) = name else {
+                    return everything(format!(
+                        "changed {dotted}, which may override a package nothing names directly"
+                    ));
+                };
+                if globals.contains(name) {
+                    return everything(format!("changed {dotted}, which Nx treats as global"));
+                }
+                packages.insert(name.to_owned(), dotted.clone());
+            }
+            _ => {}
+        }
+    }
+    Some(NpmChanges::Named {
+        packages,
+        projects,
+        all_packages: false,
+    })
+}
+
+/// The packages Nx treats as global: `nx` and every plugin nx.json loads, by
+/// package name.
+fn global_packages(workspace: &Workspace) -> BTreeSet<String> {
+    let plugins = workspace
+        .config
+        .extra
+        .get("plugins")
+        .and_then(Value::as_array);
+    plugins
+        .into_iter()
+        .flatten()
+        .filter_map(|plugin| match plugin {
+            Value::String(plugin) => Some(plugin.as_str()),
+            Value::Object(plugin) => plugin.get("plugin").and_then(Value::as_str),
+            _ => None,
+        })
+        .map(|path| {
+            // An import path's package: `@scope/name` or `name`.
+            let parts = if path.starts_with('@') { 2 } else { 1 };
+            path.splitn(parts + 1, '/')
+                .take(parts)
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .chain(["nx".to_owned()])
+        .collect()
+}
+
+/// The selector an override change names, as Nx's `getPackageSelector`: the
+/// key under `pnpm.overrides`, or otherwise the last key, a `.` standing for
+/// its parent. Only a change to a version string names one.
+fn override_selector(change: &Change, pnpm: bool) -> Option<&str> {
+    let string = |value: &Option<Value>| value.as_ref().is_some_and(Value::is_string);
+    if !string(&change.before) && !string(&change.after) {
+        return None;
+    }
+    let index = if pnpm {
+        2
+    } else {
+        change.path.len().checked_sub(1)?
+    };
+    let selector = change.path.get(index)?;
+    if selector == "." {
+        return change.path.get(index.checked_sub(1)?).map(String::as_str);
+    }
+    Some(selector)
+}
+
+/// The package an override selector names, as Nx's `findPackagesForSelector`
+/// reads it: past a pnpm `parent>` prefix, the trailing `name` or
+/// `@scope/name` without its `@range`.
+fn selector_package(selector: &str, pnpm: bool) -> Option<&str> {
+    let mut selector = selector;
+    if pnpm {
+        // A `>` starting a range is not a parent delimiter.
+        let bytes = selector.as_bytes();
+        if let Some(index) = (0..bytes.len().saturating_sub(1))
+            .find(|&i| !matches!(bytes[i], b' ' | b'|' | b'@') && bytes[i + 1] == b'>')
+        {
+            selector = &selector[index + 2..];
+        }
+    }
+    let part = |text: &str| {
+        text.find(|c: char| matches!(c, '/' | '@' | '>') || c.is_whitespace())
+            .unwrap_or(text.len())
+    };
+    // What follows the name: nothing, or a range without a `/`.
+    let ends = |rest: &str| rest.is_empty() || (rest.starts_with('@') && !rest.contains('/'));
+    let starts = std::iter::once(0).chain(
+        selector
+            .char_indices()
+            .filter(|(_, c)| *c == '/')
+            .map(|(index, _)| index + 1),
+    );
+    for start in starts {
+        let text = &selector[start..];
+        if let Some(scoped) = text.strip_prefix('@') {
+            let scope = part(scoped);
+            if scope > 0 && scoped[scope..].starts_with('/') {
+                let name = &scoped[scope + 1..];
+                let length = part(name);
+                if length > 0 && ends(&name[length..]) {
+                    return Some(&text[..1 + scope + 1 + length]);
+                }
+            }
+        }
+        let length = part(text);
+        if length > 0 && ends(&text[length..]) {
+            return Some(&text[..length]);
+        }
+    }
+    None
+}
+
 /// Nx's `getTouchedNpmPackages`: a dependency changed in the root
 /// `package.json` touches the projects installing that package.
 fn touched_by_root_package(
@@ -1072,20 +1409,22 @@ fn touched_by_root_package(
     changes: &Changes,
     touches: &mut Touches,
 ) -> Result<()> {
-    if !changes.changed("package.json") {
+    let Some(npm) = root_package_changes(workspace, changes) else {
         return Ok(());
-    }
-    let installed = installed_packages(workspace, changes);
-    let installing = |name: &str| -> Option<BTreeSet<String>> {
-        let installed = installed.as_ref()?;
-        let projects: BTreeSet<String> = installed
-            .iter()
-            .filter(|(_, packages)| packages.contains(name))
-            .map(|(project, _)| project.clone())
-            .collect();
-        (!projects.is_empty()).then_some(projects)
     };
-    let FileChange::Json(diff) = changes.change("package.json") else {
+    let (packages, projects, all_packages) = match npm {
+        NpmChanges::Everything { detail } => {
+            touches.all(workspace, Reason::RootPackage { detail });
+            return Ok(());
+        }
+        NpmChanges::Named {
+            packages,
+            projects,
+            all_packages,
+        } => (packages, projects, all_packages),
+    };
+    let installed = installed_packages(workspace, changes);
+    if all_packages {
         // Every package is touched, so every project installing one is.
         let reason = Reason::RootPackage {
             detail: "could not be compared".into(),
@@ -1101,79 +1440,38 @@ fn touched_by_root_package(
             None => touches.all(workspace, reason),
         }
         return Ok(());
-    };
-    for change in diff {
-        let path: Vec<&str> = change.path.iter().map(String::as_str).collect();
-        let dotted = path.join(".");
-        let everything = |detail: String, touches: &mut Touches| {
-            touches.all(workspace, Reason::RootPackage { detail });
+    }
+    for (name, path) in packages {
+        let reason = Reason::RootDependency {
+            name: name.clone(),
+            path: path.clone(),
         };
-        match path.as_slice() {
-            ["dependencies" | "devDependencies", name] => {
-                if change.kind == Kind::Deleted {
-                    everything(format!("removed {dotted}"), touches);
-                    return Ok(());
-                }
-                if *name == "nx" {
-                    everything(
-                        format!("changed {dotted}, which Nx treats as global"),
-                        touches,
-                    );
-                    return Ok(());
-                }
-                let mut touch = |projects: BTreeSet<String>, name: &str| {
-                    for project in projects {
-                        touches.touch(
-                            &project,
-                            Reason::RootDependency {
-                                name: name.to_owned(),
-                                path: dotted.clone(),
-                            },
-                        );
-                    }
-                };
-                if let Some(projects) = installing(name) {
-                    touch(projects, name);
-                    if let Some(implementation) = name.strip_prefix("@types/")
-                        && let Some(projects) = installing(implementation)
-                    {
-                        touch(projects, implementation);
-                    }
-                } else if workspace.projects.contains_key(*name) {
-                    touch(BTreeSet::from([(*name).to_owned()]), name);
-                }
-            }
-            ["overrides" | "resolutions", name, ..] | ["pnpm", "overrides", name, ..] => {
-                if *name == "nx" {
-                    everything(
-                        format!("changed {dotted}, which Nx treats as global"),
-                        touches,
-                    );
-                    return Ok(());
-                }
-                match installing(name) {
-                    Some(projects) => {
-                        for project in projects {
-                            touches.touch(
-                                &project,
-                                Reason::RootDependency {
-                                    name: (*name).to_owned(),
-                                    path: dotted.clone(),
-                                },
-                            );
-                        }
-                    }
-                    None => {
-                        everything(
-                            format!("changed {dotted} for a package nothing installs"),
-                            touches,
-                        );
-                        return Ok(());
+        match &installed {
+            Some(installed) => {
+                for (project, packages) in installed {
+                    if packages.contains(&name) {
+                        touches.touch(project, reason.clone());
                     }
                 }
             }
-            _ => {}
+            None => touches.all(
+                workspace,
+                Reason::RootPackage {
+                    detail: format!(
+                        "changed {path}, and qk cannot read which projects install {name}"
+                    ),
+                },
+            ),
         }
+    }
+    for (name, path) in projects {
+        touches.touch(
+            &name,
+            Reason::RootDependency {
+                name: name.clone(),
+                path,
+            },
+        );
     }
     Ok(())
 }

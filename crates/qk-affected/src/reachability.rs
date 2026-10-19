@@ -581,10 +581,11 @@ pub(crate) fn decide_tasks(
             }
             TaskCause::Touched { reasons } => reasons,
         };
+        // A dependency's configuration changing counts as its file would.
         let carried = |reason: &&TaskReason| {
             matches!(
                 reason,
-                TaskReason::Input { file }
+                TaskReason::Input { file } | TaskReason::ProjectConfiguration { file }
                     if settings.is_source(file) || manifest_unchanged(changes, file)
             )
         };
@@ -598,7 +599,9 @@ pub(crate) fn decide_tasks(
         let changed = reasons
             .iter()
             .filter_map(|reason| match reason {
-                TaskReason::Input { file } => Some(file.clone()),
+                TaskReason::Input { file } | TaskReason::ProjectConfiguration { file } => {
+                    Some(file.clone())
+                }
                 _ => None,
             })
             .collect();

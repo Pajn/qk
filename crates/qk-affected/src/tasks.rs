@@ -1,10 +1,15 @@
-//! Task-level affectedness: a task is affected when what its cache key reads
-//! changed. That is its resolved input files, the lockfile installs of its
-//! importers and `externalDependencies`, and `pnpm-workspace.yaml` outside its
-//! resolution keys, or the declared outputs of an affected task it reads. As
-//! in Nx, depending on a task without reading its outputs carries nothing.
-//! Env and runtime inputs count as unchanged, since the base revision's
-//! environment is unknowable.
+//! Task-level affectedness: a task is affected when Nx 24 would select it, or
+//! when what its cache key reads changed. Nx matches the change against the
+//! task's hash plan: its filesets, the configuration of each project whose
+//! inputs it reads, the root tsconfig without other projects' path mappings,
+//! and the installed packages it hashes, which a lockfile change moves under
+//! `projectsAffectedByDependencyUpdates: "all"`. qk's key adds the lockfile
+//! installs of its importers and `externalDependencies`, `pnpm-workspace.yaml`
+//! outside its resolution keys and dependency manifests. A task reading the
+//! declared outputs of an affected task is affected too; as in Nx, depending
+//! on a task without reading its outputs carries nothing. Env and runtime
+//! inputs count as unchanged, since the base revision's environment is
+//! unknowable.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
@@ -62,8 +67,28 @@ pub enum TaskReason {
     Lockfile,
     /// `pnpm-workspace.yaml` changed outside its resolution keys.
     WorkspaceFile,
-    /// A project manifest was deleted, which touches every task.
+    /// A file projects are created from was deleted, which touches every task.
     DeletedManifest { file: String },
+    /// A file projects are created from changed, in a project whose
+    /// configuration the task reads.
+    ProjectConfiguration { file: String },
+    /// The root tsconfig changed outside `compilerOptions.paths`, or, with
+    /// `selectivelyHashTsConfig`, in path mappings into a project the task
+    /// reads.
+    Tsconfig { file: String },
+    /// The lockfile changed, and under this `projectsAffectedByDependencyUpdates`
+    /// setting that moves the installed packages the task hashes, or names
+    /// its project.
+    DependencyUpdates {
+        file: String,
+        setting: serde_json::Value,
+    },
+    /// The root `package.json` moved an installed package the task hashes,
+    /// or named its project as a dependency.
+    RootDependency { name: String, path: String },
+    /// The root `package.json` changed in a way that moves every installed
+    /// package.
+    RootPackage { detail: String },
 }
 
 impl std::fmt::Display for TaskReason {
@@ -81,6 +106,24 @@ impl std::fmt::Display for TaskReason {
                 write!(f, "pnpm-workspace.yaml changed outside its resolution keys")
             }
             Self::DeletedManifest { file } => write!(f, "{file} was deleted"),
+            Self::ProjectConfiguration { file } => {
+                write!(
+                    f,
+                    "{file} changed, which configures a project this task reads"
+                )
+            }
+            Self::Tsconfig { file } => write!(
+                f,
+                "{file} changed outside compilerOptions.paths, or in path mappings this task reads"
+            ),
+            Self::DependencyUpdates { file, setting } => write!(
+                f,
+                "{file} changed, and projectsAffectedByDependencyUpdates is {setting}"
+            ),
+            Self::RootDependency { name, path } => {
+                write!(f, "package.json changed {path}, which moves {name}")
+            }
+            Self::RootPackage { detail } => write!(f, "package.json {detail}"),
         }
     }
 }
@@ -129,12 +172,35 @@ pub(crate) fn analyse(
         });
     }
     let ignore = qk_cache::SourceIgnore::new(&workspace.root)?;
-    let deleted_manifest = changes.files.iter().find(|file| {
-        let name = file.rsplit('/').next().unwrap_or(file);
-        matches!(name, "project.json" | "package.json")
-            && !ignore.matches(file)
-            && !workspace.root.join(file).exists()
-    });
+    // Changed files projects are created from, by whether they still exist:
+    // a deleted one touches every task, a changed project.json or
+    // package.json the configuration of the project owning it. A changed
+    // lockfile configures no project; dependency updates decide what it
+    // affects.
+    let roots = crate::ProjectRoots::new(workspace);
+    let mut deleted_manifest = None;
+    let mut reconfigured: BTreeMap<&str, &String> = BTreeMap::new();
+    for file in &changes.files {
+        if !crate::is_project_config(file) || ignore.matches(file) {
+            continue;
+        }
+        if !workspace.root.join(file).exists() {
+            deleted_manifest.get_or_insert(file);
+        } else if crate::is_manifest(file)
+            && let Some(project) = roots.owner(file)
+        {
+            reconfigured.entry(project).or_insert(file);
+        }
+    }
+    let tsconfig = tsconfig_touch(workspace, &changes, &roots);
+    let dependency_updates = crate::changed_lockfile(&changes)
+        .filter(|file| !ignore.matches(file))
+        .map(|file| -> Result<_> {
+            let setting = crate::projects_affected_by_dependency_updates(workspace);
+            Ok((file, setting, crate::DependencyUpdates::read(workspace)?))
+        })
+        .transpose()?;
+    let npm = crate::root_package_changes(workspace, &changes);
     let resolved = qk_cache::resolve_tasks(workspace, graph, &changes.files)?;
     // The lockfile at both revisions, when it changed and both can be read.
     let lockfiles = if changes.files.iter().any(|file| file == "pnpm-lock.yaml") {
@@ -151,7 +217,7 @@ pub(crate) fn analyse(
         .files
         .iter()
         .any(|file| file == "pnpm-workspace.yaml")
-        && {
+        && (changes.whole || {
             let read = |revision: Option<&str>| {
                 changes
                     .read("pnpm-workspace.yaml", revision)
@@ -161,13 +227,16 @@ pub(crate) fn analyse(
                 (Some(before), Some(after)) => before != after,
                 _ => true,
             }
-        };
+        });
+    // Named files are not compared, so each counts whole.
+    let compared = |_: &&String| !changes.whole;
     let mut touched = BTreeMap::new();
     // Changed manifests at both revisions: a dependency's counts for its
     // dependents by what it decides for them.
     let manifests: BTreeMap<String, (Option<String>, Option<String>)> = changes
         .files
         .iter()
+        .filter(compared)
         .filter(|file| file.rsplit('/').next() == Some("package.json"))
         .map(|file| {
             let before = changes.read(file, changes.base.as_deref());
@@ -188,6 +257,7 @@ pub(crate) fn analyse(
         changes
             .files
             .iter()
+            .filter(compared)
             .filter(|file| {
                 resolved
                     .values()
@@ -200,7 +270,10 @@ pub(crate) fn analyse(
             })
             .collect(),
     );
+    // The head lockfile, to tell which packages a declared external reaches.
+    let head_lockfile = changes.lockfile(false).ok();
     for (id, inputs) in &resolved {
+        let task = &graph.tasks[id];
         let mut reasons = Vec::new();
         if let Some(file) = deleted_manifest {
             reasons.push(TaskReason::DeletedManifest { file: file.clone() });
@@ -219,7 +292,92 @@ pub(crate) fn analyse(
                     qk_cache::InputChange::WorkspaceFile => TaskReason::WorkspaceFile,
                 }),
         );
-        if let Some(file) = relinked.get(&graph.tasks[id].project) {
+        // A configuration file the task reads as an input already says so.
+        for project in &inputs.declared.projects {
+            if let Some(file) = reconfigured.get(project.as_str())
+                && !reasons.iter().any(
+                    |reason| matches!(reason, TaskReason::Input { file: input } if input == *file),
+                )
+            {
+                reasons.push(TaskReason::ProjectConfiguration {
+                    file: (*file).clone(),
+                });
+            }
+        }
+        if let Some((file, touch)) = &tsconfig
+            && match touch {
+                TsconfigTouch::All => true,
+                TsconfigTouch::Projects(projects) => {
+                    !projects.is_disjoint(&inputs.declared.projects)
+                }
+            }
+        {
+            reasons.push(TaskReason::Tsconfig { file: file.clone() });
+        }
+        // Nx hashes an `@nx/` executor's packages, and every installed
+        // package into a task declaring no `externalDependencies`.
+        let executor = task.definition.executor.as_deref().unwrap_or_default();
+        let nx_executor = executor.starts_with("@nx/") || executor.starts_with("@nrwl/");
+        let hashes_externals = nx_executor
+            || !inputs.declared.external_declared
+            || !inputs.declared.external.is_empty();
+        let hashes = |package: &str| {
+            nx_executor
+                || !inputs.declared.external_declared
+                || inputs
+                    .declared
+                    .external
+                    .iter()
+                    .any(|name| match head_lockfile {
+                        Some(lockfile) => lockfile.reached_packages(name).contains(package),
+                        None => name == package,
+                    })
+        };
+        if let Some((file, setting, updates)) = &dependency_updates {
+            let touched = match updates {
+                crate::DependencyUpdates::All => hashes_externals,
+                crate::DependencyUpdates::Projects(projects) => projects.contains(&task.project),
+                crate::DependencyUpdates::Auto => false,
+            };
+            if touched {
+                reasons.push(TaskReason::DependencyUpdates {
+                    file: (*file).clone(),
+                    setting: setting.clone(),
+                });
+            }
+        }
+        match &npm {
+            Some(crate::NpmChanges::Everything { detail }) if hashes_externals => {
+                reasons.push(TaskReason::RootPackage {
+                    detail: detail.clone(),
+                });
+            }
+            Some(crate::NpmChanges::Named {
+                packages,
+                projects,
+                all_packages,
+            }) => {
+                if *all_packages && hashes_externals {
+                    reasons.push(TaskReason::RootPackage {
+                        detail: "could not be compared".into(),
+                    });
+                }
+                if let Some((name, path)) = packages.iter().find(|(name, _)| hashes(name)) {
+                    reasons.push(TaskReason::RootDependency {
+                        name: name.clone(),
+                        path: path.clone(),
+                    });
+                }
+                if let Some(path) = projects.get(&task.project) {
+                    reasons.push(TaskReason::RootDependency {
+                        name: task.project.clone(),
+                        path: path.clone(),
+                    });
+                }
+            }
+            _ => {}
+        }
+        if let Some(file) = relinked.get(&task.project) {
             reasons.push(TaskReason::Relinked { file: file.clone() });
         }
         if !reasons.is_empty() {
@@ -263,6 +421,80 @@ pub(crate) fn analyse(
         tasks,
         reachability: decisions,
     })
+}
+
+/// Which tasks' `TsConfiguration` a root tsconfig change reaches, as Nx's
+/// `ChangedContents` decides it.
+enum TsconfigTouch {
+    All,
+    /// The projects whose own paths entries changed, under
+    /// `selectivelyHashTsConfig`; none without it.
+    Projects(BTreeSet<String>),
+}
+
+/// The root tsconfig that changed and the tasks it reaches, or `None` when
+/// neither root tsconfig changed. Nx strips `compilerOptions.paths` from the
+/// hash, so a change only there reaches no task, unless
+/// `selectivelyHashTsConfig` keys each project's own entries. A change
+/// elsewhere, one it cannot compare, or a change to the root tsconfig it does
+/// not read, which may have switched which file is the root, reaches all.
+fn tsconfig_touch(
+    workspace: &Workspace,
+    changes: &Changes,
+    roots: &crate::ProjectRoots,
+) -> Option<(String, TsconfigTouch)> {
+    let file = changes
+        .files
+        .iter()
+        .find(|file| qk_cache::ROOT_TSCONFIG_FILES.contains(&file.as_str()))?;
+    let root = qk_cache::ROOT_TSCONFIG_FILES
+        .into_iter()
+        .find(|name| workspace.root.join(name).exists())
+        .unwrap_or(qk_cache::ROOT_TSCONFIG_FILES[1]);
+    let switched = changes
+        .files
+        .iter()
+        .any(|file| qk_cache::ROOT_TSCONFIG_FILES.contains(&file.as_str()) && file != root);
+    let read = |revision: Option<&str>| {
+        changes
+            .read(root, revision)
+            .and_then(|text| qk_cache::TsConfig::parse(&text))
+    };
+    let compared = if switched || changes.whole {
+        None
+    } else {
+        read(changes.base.as_deref()).zip(read(changes.head.as_deref()))
+    };
+    let touch = match compared {
+        Some((before, after)) if before.rest == after.rest => {
+            let mut projects = BTreeSet::new();
+            if qk_cache::selectively_hash_tsconfig(workspace) {
+                let keys: BTreeSet<&String> =
+                    before.paths.keys().chain(after.paths.keys()).collect();
+                for key in keys {
+                    // Each owner's targets in their order, as the hash keeps them.
+                    let owned = |paths: &BTreeMap<String, Vec<String>>| {
+                        let mut owned: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+                        for target in paths.get(key).into_iter().flatten() {
+                            if let Some(owner) = roots.owner(target) {
+                                owned.entry(owner).or_default().push(target.clone());
+                            }
+                        }
+                        owned
+                    };
+                    let (old, new) = (owned(&before.paths), owned(&after.paths));
+                    for owner in old.keys().chain(new.keys()) {
+                        if old.get(owner) != new.get(owner) {
+                            projects.insert((*owner).to_owned());
+                        }
+                    }
+                }
+            }
+            TsconfigTouch::Projects(projects)
+        }
+        _ => TsconfigTouch::All,
+    };
+    Some((file.clone(), touch))
 }
 
 /// Each task's producers: the tasks whose declared outputs it reads.

@@ -45,11 +45,18 @@ selects a whole file qk would add, the file counts whole, as the input says. A
 `json` input on such a file adds its fields beside qk's copy rather than
 narrowing it.
 
-Root workspace files (the root `tsconfig.base.json` or
-`tsconfig.json`, `nx.json`, `.gitignore`, `.nxignore`, `pnpm-workspace.yaml`,
-lockfiles) and the manifests of the task's project (`project.json`,
-`project.local.json` and `package.json`) are always included, its scripts and
-dependency declarations with them. The root `package.json` is not, as in Nx:
+Root workspace files (`nx.json`, `.gitignore`, `.nxignore`,
+`pnpm-workspace.yaml`, lockfiles) and the manifests of the task's project
+(`project.json`, `project.local.json` and `package.json`) are always included,
+its scripts and dependency declarations with them. The root tsconfig
+(`tsconfig.base.json`, or else `tsconfig.json`) is included as Nx hashes it:
+without `compilerOptions.paths`, so adding or moving a path mapping leaves
+every key as it was. With `selectivelyHashTsConfig: true` in the options of
+nx.json's `tasksRunnerOptions` runner (the one `--runner` names, else the one
+`NX_TASKS_RUNNER` names, else `default`), the key also holds the mappings whose targets lie in the projects
+whose inputs the task reads: its own, and those its `^` and `projects` inputs
+or a continuous task serving it reach. A root tsconfig that cannot be read as
+JSON with comments is keyed whole. The root `package.json` is not, as in Nx:
 what the root importer installs counts for every task through the lockfile, as
 below, and the rest of it is the root project's own manifest, so editing a root
 script misses only the root project's tasks. Dotenv files are not, as in Nx: they hold
@@ -104,7 +111,9 @@ with the task's key in a recorded run; see
 ## Inputs
 
 Candidate input files are tracked and untracked-but-not-ignored files, minus
-planned tasks' declared outputs. Source filesets also select other tasks' declared
+planned tasks' declared outputs. Nx keys a tracked declared output like any
+other file; qk leaves it out, so that a task regenerating a tracked file does
+not change keys, its own included. Source filesets also select other tasks' declared
 outputs after dependencies complete, including newly generated files, while
 respecting source ignore rules and excluding the consumer's own outputs. These
 files are keyed independently of selective `dependentTasksOutputFiles` inputs.
