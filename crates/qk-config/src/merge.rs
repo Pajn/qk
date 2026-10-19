@@ -1,7 +1,9 @@
 //! Merging one layer of configuration over another, as Nx 24 merges targets:
 //! the `"..."` spread token, target compatibility and metadata.
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
+use std::fmt;
 
 use anyhow::{Result, bail};
 use serde_json::{Map, Value};
@@ -18,6 +20,16 @@ fn spreads(value: &Value) -> bool {
 /// The value at `key` of `value` when it is an object.
 fn field<'a>(value: Option<&'a Value>, key: &str) -> Option<&'a Value> {
     value.and_then(|value| value.as_object()?.get(key))
+}
+
+/// Where in the configuration a merge or a token is, for its errors: a
+/// parent's path and a key, joined only when an error is written.
+pub(crate) struct Path<'a>(pub &'a dyn fmt::Display, pub &'a dyn fmt::Display);
+
+impl fmt::Display for Path<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}", self.0, self.1)
+    }
 }
 
 /// Nx's `INTEGER_LIKE_KEY_PATTERN`.
@@ -75,7 +87,7 @@ pub(crate) fn value(
     base: Option<&Value>,
     new: Option<&Value>,
     defer: bool,
-    context: &str,
+    context: &dyn fmt::Display,
 ) -> Result<Option<Value>> {
     Ok(match new {
         None => base.cloned(),
@@ -106,9 +118,9 @@ fn spread_object(
     base: Option<&Value>,
     new: &Map<String, Value>,
     defer: bool,
-    context: &str,
+    context: &dyn fmt::Display,
 ) -> Result<Map<String, Value>> {
-    check_integer_keys(new, &format!("Object at {context:?}"))?;
+    check_integer_keys(new, &format!("Object at {:?}", context.to_string()))?;
     let mut result = Map::new();
     for (key, value) in new {
         if key != SPREAD {
@@ -135,7 +147,12 @@ fn object_or_absent<'a>(value: Option<&'a Value>, name: &str) -> Result<Option<&
 
 /// Nx's `mergeOptions`, and its `mergeConfigurationValue`: key by key through
 /// [`value`], or as one spread object when the new one spreads.
-fn keys(new: Option<&Value>, base: Option<&Value>, defer: bool, context: &str) -> Result<Value> {
+fn keys(
+    new: Option<&Value>,
+    base: Option<&Value>,
+    defer: bool,
+    context: &dyn fmt::Display,
+) -> Result<Value> {
     if let Some(Value::Object(object)) = new
         && spreads(new.unwrap())
     {
@@ -148,7 +165,7 @@ fn keys(new: Option<&Value>, base: Option<&Value>, defer: bool, context: &str) -
             field(base, name),
             field(new, name),
             defer,
-            &format!("{context}.{name}"),
+            &Path(context, name),
         )?;
         if let Some(merged) = merged {
             result.insert(name.clone(), merged);
@@ -197,14 +214,15 @@ fn configurations(
     }
     let preserve = spread.is_some() && defer && base.is_none();
     let mut result = Map::new();
+    let parent = Path(&target, &"configurations");
     let process = |name: &String, result: &mut Map<String, Value>| -> Result<()> {
-        let context = format!("{target}.configurations.{name}");
+        let context = Path(&parent, name);
         let new = object_or_absent(new_map.get(name), "configuration")?;
         let base = base_map.and_then(|base| base.get(name));
         let merged = if before.contains(name) {
             match base {
                 Some(base) => {
-                    check_dropped(new, &format!("Object at {context:?}"))?;
+                    check_dropped(new, &format!("Object at {:?}", context.to_string()))?;
                     base.clone()
                 }
                 None => keys(new, None, defer, &context)?,
@@ -258,7 +276,7 @@ fn ultracache(
     new: Option<&Value>,
     base: Option<&Value>,
     defer: bool,
-    context: &str,
+    context: &dyn fmt::Display,
 ) -> Result<Option<Value>> {
     let Some(new) = new else {
         return Ok(base.cloned());
@@ -285,7 +303,7 @@ fn ultracache(
             field(base, &key),
             authored.get(&key),
             defer,
-            &format!("{context}.{key}"),
+            &Path(context, &key),
         )? {
             resolved.insert(key, merged);
         }
@@ -307,14 +325,13 @@ pub(crate) fn target(
     let base_target = base.unwrap_or(&empty);
     let compatible = compatible(base_target, target);
     let own = |key: &str| matches!(key, "options" | "configurations" | "ultracache" | SPREAD);
-    let merge_base: Map<String, Value> = if compatible {
-        base_target
-            .iter()
-            .filter(|(key, _)| !matches!(key.as_str(), "options" | "configurations"))
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect()
-    } else {
-        Map::new()
+    // The base's fields a compatible target merges over; options and
+    // configurations merge separately.
+    let merge_base = if compatible { base_target } else { &empty };
+    let from_base = |key: &str| {
+        merge_base
+            .get(key)
+            .filter(|_| !matches!(key, "options" | "configurations"))
     };
     let names: Vec<&String> = target.keys().collect();
     let spread = names.iter().position(|name| *name == SPREAD);
@@ -332,17 +349,20 @@ pub(crate) fn target(
         if own(key) {
             return Ok(());
         }
-        let context = format!("{id}.{key}");
+        let context = Path(&id, key);
         let merged = if before.contains(key) {
-            check_dropped(target.get(key), &format!("Object at {context:?}"))?;
-            match merge_base.get(key) {
+            check_dropped(
+                target.get(key),
+                &format!("Object at {:?}", context.to_string()),
+            )?;
+            match from_base(key) {
                 Some(base) => Some(base.clone()),
                 None => value(None, target.get(key), defer, &context)?,
             }
         } else if target.contains_key(key) {
-            value(merge_base.get(key), target.get(key), defer, &context)?
+            value(from_base(key), target.get(key), defer, &context)?
         } else {
-            merge_base.get(key).cloned()
+            from_base(key).cloned()
         };
         if let Some(merged) = merged {
             result.insert(key.clone(), merged);
@@ -353,7 +373,7 @@ pub(crate) fn target(
         // The base's own fields stand where the spread does.
         let only_base: Vec<&String> = merge_base
             .keys()
-            .filter(|key| !own(key) && !target.contains_key(*key))
+            .filter(|key| from_base(key).is_some() && !own(key) && !target.contains_key(*key))
             .collect();
         for name in &names {
             if *name == SPREAD {
@@ -368,7 +388,10 @@ pub(crate) fn target(
             }
         }
     } else if compatible {
-        let base_keys: Vec<&String> = merge_base.keys().collect();
+        let base_keys: Vec<&String> = merge_base
+            .keys()
+            .filter(|key| from_base(key).is_some())
+            .collect();
         let mut seen = BTreeSet::new();
         for key in base_keys.into_iter().chain(names.iter().copied()) {
             if seen.insert(key) {
@@ -386,7 +409,7 @@ pub(crate) fn target(
         let base_options = base_options.filter(|_| compatible);
         result.insert(
             "options".into(),
-            keys(options, base_options, defer, &format!("{id}.options"))?,
+            keys(options, base_options, defer, &Path(&id, &"options"))?,
         );
     }
     let configurations_value = object_or_absent(target.get("configurations"), "configurations")?;
@@ -405,7 +428,7 @@ pub(crate) fn target(
             target.get("ultracache"),
             base_ultracache,
             defer,
-            &format!("{id}.ultracache"),
+            &Path(&id, &"ultracache"),
         )? {
             result.insert("ultracache".into(), merged);
         }
@@ -526,10 +549,14 @@ pub(crate) fn metadata(new: &Value, existing: Option<&Value>) -> Value {
 }
 
 /// Nx's `resolveCommandSyntacticSugar`: `command` as run-commands'
-/// `options.command`. A target cannot set both it and an executor.
-pub(crate) fn desugar(target: &Map<String, Value>, root: &str) -> Result<Map<String, Value>> {
+/// `options.command`. A target cannot set both it and an executor. A target
+/// without the shorthand is returned as it is.
+pub(crate) fn desugar<'a>(
+    target: &'a Map<String, Value>,
+    root: &str,
+) -> Result<Cow<'a, Map<String, Value>>> {
     let Some(command) = target.get("command").filter(|command| truthy(command)) else {
-        return Ok(target.clone());
+        return Ok(Cow::Borrowed(target));
     };
     if target.get("executor").is_some_and(truthy) {
         bail!("Project at {root} should not have executor and command both configured.");
@@ -545,7 +572,7 @@ pub(crate) fn desugar(target: &Map<String, Value>, root: &str) -> Result<Map<Str
     };
     options.insert("command".into(), command);
     result.insert("options".into(), Value::Object(options));
-    Ok(result)
+    Ok(Cow::Owned(result))
 }
 
 #[cfg(test)]
@@ -701,7 +728,11 @@ mod tests {
         assert!(error.contains("executor and command both"), "{error}");
         let target = json!({"command": "x", "options": {"cwd": "a"}});
         assert_eq!(
-            Value::Object(desugar(target.as_object().unwrap(), "app").unwrap()),
+            Value::Object(
+                desugar(target.as_object().unwrap(), "app")
+                    .unwrap()
+                    .into_owned()
+            ),
             json!({"options": {"cwd": "a", "command": "x"}, "executor": "nx:run-commands"})
         );
     }

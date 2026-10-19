@@ -1,6 +1,8 @@
+use std::fmt;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::merge;
@@ -307,8 +309,7 @@ fn insert_target(
     target: Map<String, Value>,
 ) -> Result<()> {
     let target = Value::Object(target);
-    let _: Target = serde_json::from_value(target.clone())
-        .with_context(|| format!("invalid target {name:?}"))?;
+    Target::deserialize(&target).with_context(|| format!("invalid target {name:?}"))?;
     targets.insert(name, target);
     Ok(())
 }
@@ -322,26 +323,25 @@ fn normalize_target(
     name: &str,
     target_name: &str,
 ) -> Result<Map<String, Value>> {
-    let mut target = merge::desugar(&target, root)?;
-    let key = format!("{root}:{target_name}");
-    let options = match target.get("options") {
-        Some(Value::Object(options)) => options.clone(),
-        _ => Map::new(),
+    let desugared = match merge::desugar(&target, root)? {
+        std::borrow::Cow::Owned(desugared) => Some(desugared),
+        std::borrow::Cow::Borrowed(_) => None,
     };
-    if !options.is_empty() || target.contains_key("options") {
-        target.insert(
-            "options".into(),
-            Value::Object(resolve_tokens(&options, root, name, &key)?),
-        );
+    let mut target = desugared.unwrap_or(target);
+    let key = format_args!("{root}:{target_name}");
+    match target.get_mut("options") {
+        Some(Value::Object(options)) => resolve_tokens(options, root, name, &key)?,
+        Some(options) => *options = Value::Object(Map::new()),
+        None => {}
     }
     if let Some(Value::Object(configurations)) = target.get_mut("configurations") {
         for (configuration, options) in configurations.iter_mut() {
             if let Value::Object(fields) = options {
-                *fields = resolve_tokens(
+                resolve_tokens(
                     fields,
                     root,
                     name,
-                    &format!("{root}:{target_name}:{configuration}"),
+                    &format_args!("{root}:{target_name}:{configuration}"),
                 )?;
             }
         }
@@ -353,65 +353,57 @@ fn normalize_target(
 /// `{projectRoot}` and `{projectName}` anywhere, and `{workspaceRoot}` only
 /// at the start, where it is removed, leaving a workspace-relative path.
 fn resolve_tokens(
-    object: &Map<String, Value>,
+    object: &mut Map<String, Value>,
     root: &str,
     name: &str,
-    key: &str,
-) -> Result<Map<String, Value>> {
-    object
-        .iter()
-        .map(|(option, value)| {
-            Ok((
-                option.clone(),
-                resolve_token_value(value, root, name, key, option)?,
-            ))
-        })
-        .collect()
+    key: &dyn fmt::Display,
+) -> Result<()> {
+    for (option, value) in object.iter_mut() {
+        resolve_token_value(value, root, name, key, option)?;
+    }
+    Ok(())
 }
 
 fn resolve_token_value(
-    value: &Value,
+    value: &mut Value,
     root: &str,
     name: &str,
-    key: &str,
-    option: &str,
-) -> Result<Value> {
-    Ok(match value {
+    key: &dyn fmt::Display,
+    option: &dyn fmt::Display,
+) -> Result<()> {
+    match value {
         Value::String(text) => {
-            let text = match text.strip_prefix("{workspaceRoot}") {
+            if !text.contains('{') {
+                return Ok(());
+            }
+            let rest = match text.strip_prefix("{workspaceRoot}") {
                 Some(rest) => rest.strip_prefix('/').unwrap_or(rest),
                 None => text,
             };
-            if text.contains("{workspaceRoot}") {
+            if rest.contains("{workspaceRoot}") {
                 bail!(
                     "The {{workspaceRoot}} token is only valid at the beginning of an option. ({key})"
                 );
             }
-            Value::String(
-                text.replace("{projectRoot}", root)
-                    .replace("{projectName}", name),
-            )
+            *text = rest
+                .replace("{projectRoot}", root)
+                .replace("{projectName}", name);
         }
-        Value::Object(fields) => Value::Object(resolve_tokens(
-            fields,
-            root,
-            name,
-            &format!("{key}.{option}"),
-        )?),
+        Value::Object(fields) => {
+            let key = merge::Path(key, option);
+            for (field, value) in fields.iter_mut() {
+                resolve_token_value(value, root, name, &key, field)?;
+            }
+        }
         Value::Array(items) => {
-            let key = format!("{key}.{option}");
-            Value::Array(
-                items
-                    .iter()
-                    .enumerate()
-                    .map(|(index, item)| {
-                        resolve_token_value(item, root, name, &key, &index.to_string())
-                    })
-                    .collect::<Result<_>>()?,
-            )
+            let key = merge::Path(key, option);
+            for (index, item) in items.iter_mut().enumerate() {
+                resolve_token_value(item, root, name, &key, &index)?;
+            }
         }
-        other => other.clone(),
-    })
+        _ => {}
+    }
+    Ok(())
 }
 
 /// A target default as Nx lays it beneath a target: it takes the target's
@@ -423,7 +415,7 @@ fn synthetic_default(
     root: &str,
 ) -> Result<Option<Map<String, Value>>> {
     let authored_executor = entry.contains_key("executor");
-    let mut synthetic = merge::desugar(&entry, root)?;
+    let mut synthetic = merge::desugar(&entry, root)?.into_owned();
     let executor = target.get("executor");
     let mut shape = Map::new();
     if let Some(executor) = executor {
