@@ -3424,12 +3424,12 @@ mod tests {
         std::fs::write(root.path().join("generated/schema.json"), "{}").unwrap();
         // Digests are only saved for files old enough to have settled.
         let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
-        for path in ["generated/schema.json", "generated"] {
-            std::fs::File::open(root.path().join(path))
-                .unwrap()
-                .set_times(std::fs::FileTimes::new().set_modified(old))
-                .unwrap();
-        }
+        std::fs::File::options()
+            .write(true)
+            .open(root.path().join("generated/schema.json"))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
         let git = |args: &[&str]| {
             assert!(
                 std::process::Command::new("git")
