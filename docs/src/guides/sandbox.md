@@ -62,7 +62,9 @@ stay allowed.
 - A sandboxed run skips the cache, since a task has to run to be watched.
 - `--sandbox-report <path>` writes every finding as JSON.
 - qk reads the sandbox's reports from the system log while the run lasts;
-  each report is tagged with its task.
+  each report is tagged with its task. The log can drop reports when many
+  arrive at once, so audit lists what was reported rather than proving
+  nothing else happened.
 - A task whose inputs cannot be resolved, or whose profile the sandbox
   rejects, runs unsandboxed and is listed with the reason.
 - On Windows, qk has no sandbox.
