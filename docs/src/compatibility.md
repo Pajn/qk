@@ -55,9 +55,6 @@ When a name occurs in multiple sections, precedence is `dependencies`,
   apply them.
 - Input negated-group exclusions apply to the pattern they came from in qk;
   Nx applies them across a project's patterns. qk can include extra inputs.
-- An output that does not start with a token, such as `dist`, is read as a
-  workspace path, as `nx repair` would rewrite it. Nx 24 rejects it; qk keeps
-  reading workspaces written before outputs took tokens.
 - A `json` input naming one file reads it even when source ignore rules
   exclude it; Nx reads only the files a fileset could select, so qk can key
   a file Nx leaves out.

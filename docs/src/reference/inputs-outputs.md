@@ -204,12 +204,15 @@ paths they are, so `{projectRoot}/dist` of a project at `apps/(group)` names
 `apps/(group)/dist`, which Nx does not do; an option's value goes in as
 written, a pattern if it holds one.
 
-An output whose `{options.…}` placeholder, or a `{projectRoot}` or
+As in Nx 24, every output starts with a token, after its `!` if negated:
+`{projectRoot}/dist` or `{workspaceRoot}/dist`, not `dist`, which `nx repair`
+rewrites. An output whose `{options.…}` placeholder, or a `{projectRoot}` or
 `{workspaceRoot}` left as text, has no value is left out. `{workspaceRoot}`
 may only start an output, and an output from it must name a directory
-before any pattern: `{workspaceRoot}/dist/**`, not `{workspaceRoot}/**`. An
-absolute output, written so or from an option, is read relative to the
-workspace, and one outside the workspace is an error. `!` negates an output:
+before any pattern: `{workspaceRoot}/dist/**`, not `{workspaceRoot}/**`.
+Building the task graph fails on an output that breaks either rule. An
+absolute output from an option is read relative to the workspace, and one
+outside the workspace is an error. `!` negates an output:
 what it matches is neither cached nor removed when an entry is restored. A
 target without `outputs` takes `options.outputPath`, and a `build` or
 `prepare` target `dist/<root>`, `<root>/dist`, `<root>/build` and

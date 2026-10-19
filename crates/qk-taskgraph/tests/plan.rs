@@ -91,7 +91,7 @@ fn configuration_environment_replaces_base_environment() {
             "defaultConfiguration":"prod",
             "options":{"command":"base", "env":{"BASE":"base", "BOTH":"base"}},
             "configurations":{
-                "prod":{"command":"prod", "env":{"CONFIG":"prod", "BOTH":"prod"}, "outputs":["out"]},
+                "prod":{"command":"prod", "env":{"CONFIG":"prod", "BOTH":"prod"}, "outputs":["{projectRoot}/out"]},
                 "empty":{"env":{}},
                 "unchanged":{}
             }
@@ -108,7 +108,10 @@ fn configuration_environment_replaces_base_environment() {
         assert_eq!(task.definition.options["env"], expected);
         if task.configuration.as_deref() == Some("prod") {
             assert_eq!(task.definition.options["command"], "prod");
-            assert_eq!(task.definition.outputs, Some(vec!["out".into()]));
+            assert_eq!(
+                task.definition.outputs,
+                Some(vec!["{projectRoot}/out".into()])
+            );
         }
     }
 }
@@ -284,4 +287,36 @@ fn nx_15_project_spellings_fail_unless_a_project_has_the_name() {
     }));
     let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
     assert!(graph.tasks["app:build"].dependencies.contains("self:lint"));
+}
+
+/// As in Nx 24, a task's outputs start with a token, and building the task
+/// graph refuses one that does not, with Nx's message.
+#[test]
+fn outputs_must_start_with_a_token() {
+    let (_temp, workspace) = workspace(json!({
+        "app": {"targets":{
+            "bare":{"outputs":["dist", "!dist/keep", "{projectRoot}/out"]},
+            "glob":{"outputs":["{workspaceRoot}/**/*.js"]},
+            "tokens":{"outputs":["{options.out}", "!{projectRoot}/out/keep", "{workspaceRoot}/dist"]},
+            "defaults":{"options":{"outputPath":"dist/app"}},
+            "build":{"dependsOn":["bare"]}
+        }}
+    }));
+    let error = |target: &str| {
+        TaskGraph::build(&workspace, &[Request::parse(target).unwrap()])
+            .unwrap_err()
+            .to_string()
+    };
+    assert_eq!(
+        error("app:bare"),
+        "The following outputs are invalid: \n - dist\n   ** Reason: Outputs must start with either \"{workspaceRoot}/\" or \"{projectRoot}/\".\n - !dist/keep\n   ** Reason: Outputs must start with either \"{workspaceRoot}/\" or \"{projectRoot}/\".\n\nRun `nx repair` to fix this."
+    );
+    assert_eq!(error("app:build"), error("app:bare"));
+    assert_eq!(
+        error("app:glob"),
+        "The following outputs are defined by a glob pattern from the workspace root: \n - {workspaceRoot}/**/*.js\n\nThese can be slow, replace them with a more specific pattern."
+    );
+    for target in ["app:tokens", "app:defaults"] {
+        assert!(TaskGraph::build(&workspace, &[Request::parse(target).unwrap()]).is_ok());
+    }
 }

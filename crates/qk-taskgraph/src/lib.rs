@@ -345,6 +345,10 @@ impl Builder<'_> {
                 }
             }
         }
+        // As in Nx, creating a task validates its outputs.
+        if let Some(outputs) = &definition.outputs {
+            validate_outputs(outputs)?;
+        }
         let task = Task {
             id: id.clone(),
             project: request.project,
@@ -602,4 +606,83 @@ fn option_flags(key: &str, value: &Value, flags: &mut Vec<String>) {
         Value::Bool(flag) => flags.push(format!("--{key}={flag}")),
         Value::Array(_) | Value::Null => {}
     }
+}
+
+/// Nx 24's `validateOutputs`: each output starts with a token, `!` before it
+/// if negated, and one from `{workspaceRoot}` names a directory before any
+/// pattern. The error lists every output that breaks either rule, in Nx's
+/// words.
+pub fn validate_outputs(outputs: &[String]) -> Result<()> {
+    let missing_prefix: Vec<&String> = outputs
+        .iter()
+        .filter(|output| {
+            // Nx's `^!?\{[\s\S]+\}`: a `{` and, after at least one more
+            // character, a `}`.
+            let mut chars = output.strip_prefix('!').unwrap_or(output).chars();
+            !(chars.next() == Some('{') && chars.next().is_some() && chars.any(|c| c == '}'))
+        })
+        .collect();
+    let workspace_globs: Vec<&String> = outputs
+        .iter()
+        .filter(|output| !missing_prefix.contains(output))
+        .filter(|output| {
+            ["!{workspaceRoot}", "{workspaceRoot}"]
+                .iter()
+                .any(|prefix| output.strip_prefix(prefix).is_some_and(has_no_directory))
+        })
+        .collect();
+    let mut message = String::new();
+    if !missing_prefix.is_empty() {
+        message.push_str(&format!(
+            "The following outputs are invalid: \n{}\n\nRun `nx repair` to fix this.",
+            missing_prefix
+                .iter()
+                .map(|output| format!(
+                    " - {output}\n   ** Reason: Outputs must start with either \"{{workspaceRoot}}/\" or \"{{projectRoot}}/\"."
+                ))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+    if !workspace_globs.is_empty() {
+        message.push_str(&format!(
+            "The following outputs are defined by a glob pattern from the workspace root: \n - {}\n\nThese can be slow, replace them with a more specific pattern.",
+            workspace_globs
+                .iter()
+                .map(|output| output.as_str())
+                .collect::<Vec<_>>()
+                .join("\n - ")
+        ));
+    }
+    if message.is_empty() {
+        Ok(())
+    } else {
+        bail!(message)
+    }
+}
+
+/// Whether `glob` has a pattern before any named directory, as Nx's
+/// `partition_glob` reads it: its leading segments with no glob syntax once
+/// their escapes are read join to nothing. `@` and `+` start no pattern
+/// without a group after them.
+fn has_no_directory(glob: &str) -> bool {
+    let mut directory = Vec::new();
+    for segment in glob.split('/') {
+        let mut syntax = false;
+        let mut chars = segment.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => {
+                    chars.next();
+                }
+                '*' | '?' | '[' | ']' | '{' | '}' | '(' | ')' | '!' => syntax = true,
+                _ => {}
+            }
+        }
+        if syntax {
+            return directory.join("/").is_empty();
+        }
+        directory.push(segment);
+    }
+    false
 }

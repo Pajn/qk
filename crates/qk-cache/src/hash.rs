@@ -2700,7 +2700,7 @@ mod tests {
             post["outputs"] = outputs;
         }
         std::fs::write(root.path().join("project.json"), json!({"name":"app", "targets": {
-            "gen": {"command":"true", "outputs":["generated"]},
+            "gen": {"command":"true", "outputs":["{projectRoot}/generated"]},
             "post": post,
             "build": {"command":"true", "dependsOn":["gen", "post"], "inputs":[{"dependentTasksOutputFiles":"**/*"}]}
         }}).to_string()).unwrap();
@@ -2764,7 +2764,7 @@ mod tests {
 
     #[test]
     fn execution_fingerprints_refresh_sources_and_preserve_artifact_exclusions() {
-        let (root, mut workspace, _) = fixture(Some(json!(["dist"])));
+        let (root, mut workspace, _) = fixture(Some(json!(["{projectRoot}/dist"])));
         let definition = workspace
             .projects
             .get_mut("app")
@@ -2816,7 +2816,7 @@ mod tests {
     fn membership_reuses_settled_candidates_and_detects_directory_changes() {
         let mut fixtures = Vec::new();
         for git in [false, true] {
-            let (root, workspace, graph) = fixture(Some(json!(["dist"])));
+            let (root, workspace, graph) = fixture(Some(json!(["{projectRoot}/dist"])));
             for directory in ["src/empty", "dist", "cache", "ignored"] {
                 std::fs::create_dir_all(root.path().join(directory)).unwrap();
             }
@@ -2973,9 +2973,9 @@ mod tests {
     fn output_publication_reuses_candidates_but_source_names_still_refresh() {
         for partial in [false, true] {
             let outputs = if partial {
-                json!(["dist", "!dist/keep"])
+                json!(["{projectRoot}/dist", "!{projectRoot}/dist/keep"])
             } else {
-                json!(["dist"])
+                json!(["{projectRoot}/dist"])
             };
             let (root, workspace, graph) = fixture(Some(outputs));
             std::fs::create_dir_all(root.path().join("src")).unwrap();
@@ -3143,7 +3143,7 @@ mod tests {
 
     #[test]
     fn scoped_membership_defers_unrelated_changes_until_a_matching_task_asks() {
-        let (root, mut workspace, _) = fixture(Some(json!(["dist"])));
+        let (root, mut workspace, _) = fixture(Some(json!(["{projectRoot}/dist"])));
         let targets = &mut workspace.projects.get_mut("app").unwrap().targets;
         targets.get_mut("post").unwrap().inputs =
             Some(vec![json!("{workspaceRoot}/left/**/*.txt")]);
@@ -3203,7 +3203,7 @@ mod tests {
 
     #[test]
     fn membership_watches_git_ignored_tracked_parents_and_index_policy() {
-        let (root, workspace, graph) = fixture(Some(json!(["dist"])));
+        let (root, workspace, graph) = fixture(Some(json!(["{projectRoot}/dist"])));
         std::fs::create_dir_all(root.path().join("tracked/nested")).unwrap();
         std::fs::write(root.path().join("tracked/.gitignore"), "nested/\n").unwrap();
         std::fs::write(root.path().join("tracked/nested/source"), "one").unwrap();
@@ -3241,7 +3241,7 @@ mod tests {
 
     #[test]
     fn a_new_git_config_include_invalidates_settled_listing_policy() {
-        let (root, workspace, graph) = fixture(Some(json!(["dist"])));
+        let (root, workspace, graph) = fixture(Some(json!(["{projectRoot}/dist"])));
         let policy = tempfile::tempdir().unwrap();
         let included = policy.path().join("included.config");
         let excludes = policy.path().join("excludes");
@@ -3297,7 +3297,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn git_policy_paths_preserve_quoted_origins_and_multiline_values() {
-        let (root, workspace, graph) = fixture(Some(json!(["dist"])));
+        let (root, workspace, graph) = fixture(Some(json!(["{projectRoot}/dist"])));
         let policy = tempfile::tempdir().unwrap();
         // Git's text output C-quotes these origins and octal-escapes UTF-8.
         let included = policy.path().join("included\\é\t\n.config");
@@ -3364,7 +3364,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn symlinked_ignore_policy_never_reuses_stale_membership() {
-        let (root, workspace, graph) = fixture(Some(json!(["dist"])));
+        let (root, workspace, graph) = fixture(Some(json!(["{projectRoot}/dist"])));
         let policy = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(policy.path(), "hidden\n").unwrap();
         std::os::unix::fs::symlink(policy.path(), root.path().join(".gitignore")).unwrap();
@@ -3419,7 +3419,7 @@ mod tests {
 
     #[test]
     fn inspection_keeps_deleted_candidates() {
-        let (root, workspace, graph) = fixture(Some(json!(["dist"])));
+        let (root, workspace, graph) = fixture(Some(json!(["{projectRoot}/dist"])));
         let snapshot = Snapshot::new(&workspace, &graph, &root.path().join("cache"))
             .unwrap()
             .with_candidates(&["src/deleted".into()]);
@@ -3436,7 +3436,7 @@ mod tests {
 
     #[test]
     fn undeclared_writes_invalidate_dependency_values() {
-        for outputs in [None, Some(json!(["generated"]))] {
+        for outputs in [None, Some(json!(["{projectRoot}/generated"]))] {
             let (root, workspace, graph) = fixture(outputs);
             let snapshot = Snapshot::new(&workspace, &graph, &root.path().join("cache")).unwrap();
             let keys = || {
@@ -3459,7 +3459,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn dependency_symlinks_recheck_targets_outside_output_roots() {
-        let (root, mut workspace, _) = fixture(Some(json!(["generated"])));
+        let (root, mut workspace, _) = fixture(Some(json!(["{projectRoot}/generated"])));
         workspace
             .projects
             .get_mut("app")
@@ -3467,7 +3467,7 @@ mod tests {
             .targets
             .get_mut("gen")
             .unwrap()
-            .outputs = Some(vec!["links".into()]);
+            .outputs = Some(vec!["{projectRoot}/links".into()]);
         std::fs::create_dir(root.path().join("links")).unwrap();
         std::os::unix::fs::symlink("../generated/value", root.path().join("links/value")).unwrap();
         let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();

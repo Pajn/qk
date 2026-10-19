@@ -757,7 +757,7 @@ pub fn resolved_outputs(workspace: &Workspace, task: &Task) -> Result<(Vec<Strin
         }
         return Ok((resolved, false));
     };
-    validate_outputs(templates)?;
+    qk_taskgraph::validate_outputs(templates)?;
     let data = OutputData {
         workspace,
         project: &task.project,
@@ -779,31 +779,6 @@ pub fn resolved_outputs(workspace: &Workspace, task: &Task) -> Result<(Vec<Strin
         }
     }
     Ok((resolved, true))
-}
-
-/// As Nx's `validateOutputs`, an output from `{workspaceRoot}` names a
-/// directory before its pattern. Nx also requires every output to start with
-/// a token; qk reads one without as a workspace path, as `nx repair` would
-/// rewrite it.
-fn validate_outputs(outputs: &[String]) -> Result<()> {
-    for output in outputs {
-        let body = output.strip_prefix('!').unwrap_or(output);
-        if let Some(rest) = body.strip_prefix("{workspaceRoot}")
-            && rest
-                .split('/')
-                .find(|part| !part.is_empty())
-                .is_some_and(|part| {
-                    // As Nx 24 reads a segment: `@` and `+` start no
-                    // pattern without a group after them.
-                    part.contains(['*', '?', '[', ']', '{', '}', '(', ')', '!'])
-                })
-        {
-            bail!(
-                "output {output:?} is a glob pattern from the workspace root; name a directory before the pattern"
-            );
-        }
-    }
-    Ok(())
 }
 
 /// `path` without Windows' verbatim `\\?\` prefix on a drive path.
@@ -1288,7 +1263,7 @@ mod tests {
         let workspace = Workspace::load(root.path()).unwrap();
         let mut request = Request::parse("lib:build").unwrap();
         request.args = args.iter().map(|arg| (*arg).to_owned()).collect();
-        let graph = TaskGraph::build(&workspace, &[request]).unwrap();
+        let graph = TaskGraph::build(&workspace, &[request])?;
         resolved_outputs(&workspace, &graph.tasks["lib:build"]).map(|(outputs, _)| outputs)
     }
 
@@ -1528,7 +1503,8 @@ mod tests {
             inside.join("project.json"),
             json!({"name": "app", "targets": {"build": {"command": "true",
                 "outputs": ["{options.out}"], "options": {"out": inside.join("dist/app")}},
-                "outside": {"command": "true", "outputs": ["/elsewhere/dist"]}}})
+                "outside": {"command": "true", "outputs": ["{options.out}"],
+                    "options": {"out": "/elsewhere/dist"}}}})
             .to_string(),
         )
         .unwrap();
