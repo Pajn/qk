@@ -52,8 +52,8 @@ its scripts and dependency declarations with them. The root tsconfig
 (`tsconfig.base.json`, or else `tsconfig.json`) is included as Nx hashes it:
 without `compilerOptions.paths`, so adding or moving a path mapping leaves
 every key as it was. With `selectivelyHashTsConfig: true` in the options of
-nx.json's `tasksRunnerOptions` runner (`default`, or the one `NX_TASKS_RUNNER`
-names), the key also holds the mappings whose targets lie in the projects
+nx.json's `tasksRunnerOptions` runner (the one `--runner` names, else the one
+`NX_TASKS_RUNNER` names, else `default`), the key also holds the mappings whose targets lie in the projects
 whose inputs the task reads: its own, and those its `^` and `projects` inputs
 or a continuous task serving it reach. A root tsconfig that cannot be read as
 JSON with comments is keyed whole. The root `package.json` is not, as in Nx:
