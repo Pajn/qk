@@ -339,6 +339,35 @@ fn takes_a_given_root_as_written_inside_the_workspace() {
     );
 }
 
+/// As Nx reads a project's dependencies from its root's package.json, a
+/// project whose configuration names another root takes that root's
+/// package.json, not the one beside the configuration.
+#[test]
+fn a_given_root_takes_its_own_package_json() {
+    let temp = TempDir::new().unwrap();
+    write(
+        temp.path(),
+        "tools/app/project.json",
+        r#"{"name":"app","root":"apps/app"}"#,
+    );
+    write(
+        temp.path(),
+        "tools/app/package.json",
+        r#"{"name":"beside","dependencies":{"left":"1"}}"#,
+    );
+    write(
+        temp.path(),
+        "apps/app/package.json",
+        r#"{"name":"at-root","dependencies":{"right":"1"}}"#,
+    );
+    write(temp.path(), "project.json", r#"{"name":"top"}"#);
+    let workspace = Workspace::load(temp.path()).unwrap();
+    let package = &workspace.packages["app"];
+    assert_eq!(package.name.as_deref(), Some("at-root"));
+    assert!(package.dependency_ranges().contains_key("right"));
+    assert!(!package.dependency_ranges().contains_key("left"));
+}
+
 #[test]
 fn names_unnamed_projects_as_nx_does() {
     let temp = TempDir::new().unwrap();

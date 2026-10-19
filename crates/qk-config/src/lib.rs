@@ -322,6 +322,19 @@ impl Workspace {
                     project.root
                 );
             }
+            // As in Nx, a project's dependencies, scripts and lockfile
+            // importer are its root's package.json, which is not the one
+            // beside its configuration when the configuration gives
+            // another root.
+            let package = if relative_path(&root, &directory)? == project.root {
+                package
+            } else {
+                let manifest = root.join(&project.root).join("package.json");
+                read_optional_json(&manifest)?
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .with_context(|| format!("invalid {}", manifest.display()))?
+            };
             if let Some(package) = package {
                 workspace.packages.insert(project.name.clone(), package);
             }

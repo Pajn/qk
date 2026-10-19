@@ -89,7 +89,9 @@ The workspace-relative project directory, with forward slashes (`.` for the
 workspace root). It defaults to the configuration's directory; as in Nx, a
 `root` given in project.json or the package's `nx` object is used as written,
 an empty string meaning the workspace root. It must stay inside the
-workspace, and two projects cannot share a root.
+workspace, and two projects cannot share a root. As in Nx, the project's
+package dependencies, scripts and lockfile entry then come from the
+`package.json` at that root, not the one beside the configuration.
 
 ## `sourceRoot`
 
