@@ -956,19 +956,18 @@ fn streams(task: &qk_taskgraph::Task, long_running: bool) -> bool {
             || matches!(target.as_str(), "serve" | "dev" | "start"))
 }
 
-/// The file `summary` keeps a failed task's output in: its id, with what a
-/// file name cannot hold replaced.
+/// The file `summary` keeps a failed task's output in: its id, with every
+/// byte a file name cannot hold, and `_` itself, written as `_` and its hex
+/// value, so two ids never share a file.
 pub fn log_name(id: &str) -> String {
-    let name: String = id
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect();
+    let mut name = String::new();
+    for byte in id.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.') {
+            name.push(char::from(byte));
+        } else {
+            name.push_str(&format!("_{byte:02x}"));
+        }
+    }
     format!("{name}.log")
 }
 
@@ -1038,6 +1037,11 @@ mod tests {
     use super::Expected;
     use std::time::Duration;
 
+    #[test]
+    fn distinct_task_ids_log_to_distinct_files() {
+        assert_ne!(super::log_name("a:b_c"), super::log_name("a_b:c"));
+        assert_eq!(super::log_name("app:build"), "app_3abuild.log");
+    }
     #[test]
     fn remaining_work_accounts_for_the_current_allocation() {
         let expected = Expected {
