@@ -107,6 +107,21 @@ fn unescaped(pattern: &str) -> String {
     result
 }
 
+/// The path a pattern that [`names_a_path`] names: each `\` escape replaced
+/// by the character it escapes.
+pub fn literal_path(pattern: &str) -> String {
+    let mut path = String::new();
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        path.push(if c == '\\' {
+            chars.next().unwrap_or('\\')
+        } else {
+            c
+        });
+    }
+    path
+}
+
 /// Whether `pattern` names a path rather than matching, as Nx 24 reads it:
 /// nothing in it is glob syntax once its escapes are read. `@` and `+` start
 /// a pattern only with a group after them, so `@types` and `c++` are names.

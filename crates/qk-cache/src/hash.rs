@@ -1971,6 +1971,7 @@ impl<'a> Resolver<'a> {
             exclude: list("excludeFields")?.unwrap_or_default(),
         };
         if crate::glob::names_a_path(&path) {
+            let path = crate::glob::literal_path(&path);
             paths::validate_path(&path)?;
             return self.json_file(path, &fields);
         }

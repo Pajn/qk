@@ -739,6 +739,36 @@ fn a_changed_json_input_affects_the_task() {
     assert_eq!(tasks.keys().collect::<Vec<_>>(), ["app:build"]);
 }
 
+/// A path whose glob characters are escaped names one file, which is read
+/// without its escapes.
+#[test]
+fn an_escaped_json_input_path_names_its_file() {
+    let repo = Repo::new(&[
+        (
+            "nx.json",
+            r#"{"targetDefaults": {"build": {"command": "echo build", "inputs": [{"json": "{projectRoot}/\\(group\\)/meta.json", "fields": ["version"]}]}}}"#,
+        ),
+        (
+            "apps/app/project.json",
+            r#"{"name": "app", "targets": {"build": {}}}"#,
+        ),
+        ("apps/app/(group)/meta.json", r#"{"version": 1}"#),
+    ]);
+    write(
+        &repo.root,
+        "apps/app/(group)/meta.json",
+        r#"{"version": 1, "comment": "x"}"#,
+    );
+    assert!(affected_tasks_of(&repo, &["app:build"]).is_empty());
+    write(
+        &repo.root,
+        "apps/app/(group)/meta.json",
+        r#"{"version": 2}"#,
+    );
+    let tasks = affected_tasks_of(&repo, &["app:build"]);
+    assert_eq!(tasks.keys().collect::<Vec<_>>(), ["app:build"]);
+}
+
 #[test]
 fn a_json_input_does_not_narrow_a_file_other_inputs_select_whole() {
     let repo = Repo::new(&[
