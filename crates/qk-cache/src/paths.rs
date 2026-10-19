@@ -368,11 +368,14 @@ impl Outputs {
                 continue;
             }
             let (anchor, glob) = crate::ignored::partition(&pattern);
+            // The path a literal output names, its escapes read, is what a
+            // restore replaces.
             if anchor.is_empty()
-                || workspace
-                    .projects
-                    .values()
-                    .any(|project| project.root == pattern)
+                || glob.is_none()
+                    && workspace
+                        .projects
+                        .values()
+                        .any(|project| project.root == anchor)
             {
                 bail!(
                     "cache outputs must have a fixed directory prefix and cannot replace a project root"
@@ -1674,6 +1677,33 @@ mod tests {
                 .unwrap()
                 .contains("apps/(group)/dist/a.js")
         );
+    }
+
+    /// An output naming a project's root, escaped or not, is refused: a
+    /// restore would replace the project.
+    #[test]
+    fn outputs_cannot_name_a_project_root() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("nx.json"), "{}").unwrap();
+        std::fs::create_dir_all(root.path().join("apps/(group)")).unwrap();
+        std::fs::write(
+            root.path().join("apps/(group)/project.json"),
+            json!({"name": "group", "targets": {
+                "own": {"command": "true", "outputs": ["{projectRoot}"]},
+                "written": {"command": "true", "outputs": ["{workspaceRoot}/apps/\\(group\\)"]},
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let workspace = Workspace::load(root.path()).unwrap();
+        for target in ["own", "written"] {
+            let request = Request::parse(&format!("group:{target}")).unwrap();
+            let graph = TaskGraph::build(&workspace, &[request]).unwrap();
+            assert!(
+                Outputs::new(&workspace, &graph.tasks[&format!("group:{target}")]).is_err(),
+                "{target}"
+            );
+        }
     }
 
     #[test]
