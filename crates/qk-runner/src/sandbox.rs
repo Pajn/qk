@@ -109,6 +109,10 @@ pub struct Sandbox {
 /// Tag in each rule's message: the task a report belongs to.
 const TAG: &str = "qk-task:";
 const SENTINEL: &str = "qk-sandbox-sentinel";
+/// How long a probe's report may take before the probe is made again, and
+/// before the system log is taken not to carry the sandbox's reports.
+const PROBE_RETRY: Duration = Duration::from_millis(500);
+const PROBE_DEADLINE: Duration = Duration::from_secs(10);
 
 impl Sandbox {
     /// Works out what each task may do; on macOS writes its profile and
@@ -636,10 +640,18 @@ pub(crate) struct Report {
 }
 
 /// `log stream`, reading the sandbox's reports while the run lasts.
+///
+/// The system log drops some of the sandbox's reports when many arrive at
+/// once, or as other readers start, for every reader alike and without
+/// saying so. A probe is therefore repeated until one of its reports
+/// arrives, rather than waited for once.
 pub(crate) struct Watcher {
     child: Child,
     reports: Arc<Mutex<Vec<Report>>>,
-    sentinel: Arc<Mutex<bool>>,
+    /// The latest probe whose report has arrived, counted from 1.
+    sentinel: Arc<Mutex<u64>>,
+    /// Probes made so far.
+    probes: std::sync::atomic::AtomicU64,
     marker: String,
     dropped: Arc<std::sync::atomic::AtomicUsize>,
     reader: Option<std::thread::JoinHandle<()>>,
@@ -648,10 +660,11 @@ pub(crate) struct Watcher {
 impl Watcher {
     pub(crate) fn start(directory: &Path) -> Result<Self> {
         let mut child = Command::new("log")
+            // Reports are logged at the default level and refusals as errors;
+            // the debug level would add every profile Seatbelt applies,
+            // which only crowds the log the reports pass through.
             .args([
                 "stream",
-                "--level",
-                "debug",
                 "--style",
                 "ndjson",
                 "--predicate",
@@ -663,7 +676,7 @@ impl Watcher {
             .context("cannot read the system log for the sandbox's reports")?;
         let stdout = child.stdout.take().context("log stream has no output")?;
         let reports = Arc::new(Mutex::new(Vec::new()));
-        let sentinel = Arc::new(Mutex::new(false));
+        let sentinel = Arc::new(Mutex::new(0));
         let marker = format!("{SENTINEL}:{}", directory.canonicalize()?.display());
         let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (ready, started) = std::sync::mpsc::channel();
@@ -682,8 +695,14 @@ impl Watcher {
                     let Some(message) = event["eventMessage"].as_str() else {
                         continue;
                     };
-                    if message.contains(&marker) {
-                        *sentinel.lock().unwrap() = true;
+                    if let Some((_, probe)) = message.split_once(&marker) {
+                        if let Some(probe) = probe
+                            .strip_prefix(':')
+                            .and_then(|probe| probe.trim().parse::<u64>().ok())
+                        {
+                            let mut sentinel = sentinel.lock().unwrap();
+                            *sentinel = (*sentinel).max(probe);
+                        }
                         continue;
                     }
                     if let Some(report) = parse(message) {
@@ -701,6 +720,7 @@ impl Watcher {
             child,
             reports,
             sentinel,
+            probes: std::sync::atomic::AtomicU64::new(0),
             marker,
             dropped,
             reader: Some(reader),
@@ -714,37 +734,57 @@ impl Watcher {
     }
 
     /// Makes the sandbox report a read of a marker file, so the reader knows
-    /// every report before it has arrived.
+    /// every report before it has arrived. The system log delivers reports
+    /// in the order they were made, to within far less than a probe takes,
+    /// so any one of the attempts arriving says as much; an attempt the log
+    /// dropped is made again until the deadline.
     fn probe(&self, directory: &Path, name: &str) -> Result<()> {
         let marker = directory.join(format!("{name}.marker"));
         std::fs::write(&marker, "")?;
         let marker = marker.canonicalize()?;
+        let marker_text = quote(marker.to_str().context("marker path must be UTF-8")?);
         let profile = directory.join(format!("{name}.sb"));
-        std::fs::write(
-            &profile,
-            format!(
-                "(version 1)\n(allow default)\n(allow file-read-data (literal {}) (with report) (with message {}))\n",
-                quote(marker.to_str().context("marker path must be UTF-8")?),
-                quote(&self.marker)
-            ),
-        )?;
-        *self.sentinel.lock().unwrap() = false;
-        Command::new("sandbox-exec")
-            .arg("-f")
-            .arg(&profile)
-            .arg("/bin/cat")
-            .arg(&marker)
-            .stdout(Stdio::null())
-            .status()
-            .context("cannot run sandbox-exec")?;
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !*self.sentinel.lock().unwrap() {
-            if Instant::now() > deadline {
+        let deadline = Instant::now() + PROBE_DEADLINE;
+        let mut first = None;
+        loop {
+            let attempt = self
+                .probes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            let first = *first.get_or_insert(attempt);
+            std::fs::write(
+                &profile,
+                format!(
+                    "(version 1)\n(allow default)\n(allow file-read-data (literal {marker_text}) (with report) (with message {}))\n",
+                    quote(&format!("{}:{attempt}", self.marker))
+                ),
+            )?;
+            let output = Command::new("sandbox-exec")
+                .arg("-f")
+                .arg(&profile)
+                .arg("/bin/cat")
+                .arg(&marker)
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .output()
+                .context("cannot run sandbox-exec")?;
+            if !output.status.success() {
+                bail!(
+                    "sandbox-exec could not run the probe for the sandbox's reports: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            let retry = (Instant::now() + PROBE_RETRY).min(deadline);
+            while Instant::now() < retry {
+                if *self.sentinel.lock().unwrap() >= first {
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            if Instant::now() >= deadline {
                 bail!("the sandbox's reports did not reach the system log");
             }
-            std::thread::sleep(Duration::from_millis(20));
         }
-        Ok(())
     }
 
     pub(crate) fn finish(mut self, directory: &Path) -> Result<(Vec<Report>, usize)> {
