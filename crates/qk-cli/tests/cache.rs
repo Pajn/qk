@@ -1210,9 +1210,11 @@ fn eviction_removes_least_recently_used_entries() {
     assert!(stderr(&success(fixture.build(&fixture.root, &[]))).contains("cache hit"));
     assert_eq!(fixture.runs(), 2);
 
+    // Over the limit, eviction goes on to 90% of it, as in Nx: one entry
+    // fits that, two do not.
     let output = success(fixture.qk(
         &fixture.root,
-        &["cache", "prune", "--max-size", &one.to_string()],
+        &["cache", "prune", "--max-size", &(one * 3 / 2).to_string()],
     ));
     assert!(
         stdout(&output).starts_with("Evicted 1 entries"),
@@ -5009,6 +5011,45 @@ fn the_cache_directory_can_be_set_as_in_nx() {
     .unwrap();
     run(&[]);
     assert!(fixture.root.join("from-nx-json/qk/v1").is_dir());
+    // Then the default runner's, which nx.json's own wins over.
+    let runner =
+        r#""tasksRunnerOptions": {"default": {"options": {"cacheDirectory": "from-runner"}}}"#;
+    fs::write(fixture.root.join("nx.json"), format!("{{{runner}}}")).unwrap();
+    run(&[]);
+    assert!(fixture.root.join("from-runner/qk/v1").is_dir());
+    fs::remove_dir_all(fixture.root.join("from-runner")).unwrap();
+    fs::write(
+        fixture.root.join("nx.json"),
+        format!(r#"{{"cacheDirectory": "from-nx-json", {runner}}}"#),
+    )
+    .unwrap();
+    run(&[]);
+    assert!(!fixture.root.join("from-runner").exists());
+    // A runner must be configured, as in Nx.
+    let output = fixture
+        .command(&fixture.root, &["run", "app:build", "--runner", "custom"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("Could not find runner configuration for custom")
+    );
+    for runner in ["default", "custom"] {
+        if runner == "custom" {
+            fs::write(
+                fixture.root.join("nx.json"),
+                r#"{"tasksRunnerOptions": {"custom": {"runner": "nx/tasks-runners/default"}}}"#,
+            )
+            .unwrap();
+        }
+        success(
+            fixture
+                .command(&fixture.root, &["run", "app:build", "--runner", runner])
+                .output()
+                .unwrap(),
+        );
+    }
 }
 
 #[test]

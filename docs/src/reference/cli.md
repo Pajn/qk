@@ -5,10 +5,10 @@
 | --- | --- |
 | `qk inputs analyze <task> [--report <path>] [--previous <path>] [--suggestions <path>]` | Execute tasks without caching, record file accesses and review input coverage; macOS or Linux with strace. See [Recording task inputs](../guides/input-analysis.md) |
 | `qk show projects [--json]` | Project names in Nx graph order, one per line or as a compact JSON array |
-| `qk show projects -p 'web,tag:library' --exclude 'experimental-*'` | Union of matching names, globs and tags, minus exclusions |
+| `qk show projects -p 'web,tag:library' --exclude 'experimental-*'` | Matching names, globs, tags and roots, minus exclusions |
 | `qk show projects --with-target e2e --type app [--sep ,]` | Projects with one of the targets, of a type (`app`, `lib` or `e2e`, as Nx types them), joined by a separator |
 | `qk show projects --affected --affected-targets build,export` | Affected projects where a task of one of the targets is affected, as task selection decides it |
-| `qk show project <name> [--json]` | Normalized project configuration as JSON |
+| `qk show project <name> [--json]` | The project's graph node data as JSON; a name that is no project matches as a pattern, as in Nx |
 | `qk graph --file <path>` | Workspace project graph in a `{ "graph": { "nodes": ..., "dependencies": ... } }` envelope |
 | `qk graph` or `qk graph --file -` | The same graph on stdout |
 | `qk graph --external` | The graph with the packages the pnpm lockfile installs as `externalNodes` |
@@ -29,7 +29,7 @@
 | `qk show task <project:target>` | A task's recent runs and why its cache key changed |
 | `qk show hash <project:target> [--against <task\|run>]` | A task's cache key and what it covers, or where it differs from another key, without running the task |
 | `qk cache path` | Print the local cache directory without creating it |
-| `qk cache prune [--max-size 1GB]` | Evict least recently used entries until the cache fits |
+| `qk cache prune [--max-size 1GB]` | Evict entries unused for a week, then least recently used entries until the cache fits |
 | `qk warm suggest <project:target>` | Run a task in the sandbox and list directories it wrote outside its outputs, as candidate warm paths (macOS) |
 | `qk reset [--only-cache \| --only-workspace-data]` | Remove the cache and this worktree's state, as `nx reset` does |
 
@@ -46,8 +46,8 @@ subcommands, and Nx commands qk does not implement such as `format` and
 with one of those names.
 
 As in `nx graph`, `--focus` keeps the project and every project connected to
-it through dependencies in either direction, and `--exclude` takes names, globs
-and tags. The kept projects' edges are unchanged, so they can name projects
+it through dependencies in either direction, and `--exclude` takes
+[project selectors](../guides/affected.md#project-selectors). The kept projects' edges are unchanged, so they can name projects
 left out. `--print` and `--file stdout` write to stdout. qk has no browser
 view, so `nx graph`'s `--affected`, `--view` and server options do not apply;
 for a task graph, use `qk run-many -t <targets> --graph`.
@@ -209,6 +209,8 @@ effect.
 `--runner`, `--batch`, `--skip-sync`, `--cloud`, `--no-cloud`, `--dte`,
 `--no-dte`, `--agents`, `--tui`, `--no-tui`, and `--tui-auto-exit` are accepted without
 effect. They do not enable Nx plugins, distributed execution or Nx Cloud.
+As in Nx, `--runner` must name `default` or a runner in nx.json
+`tasksRunnerOptions`.
 
 ## Target inspection
 

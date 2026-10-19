@@ -145,8 +145,8 @@ the workspace it matches. `options: "forward"` passes the target's options,
 its configuration's included, to the dependency as its own options, which
 they override; as in Nx that includes a run-commands target's own `command`,
 so it suits targets of the same executor. `params: "forward"` passes the
-run's own arguments, however the dependency is reached. Project selectors accept names,
-globs, tags and `!` exclusions. As in Nx 24, `projects: "self"` and
+run's own arguments, however the dependency is reached. `projects` takes
+[project selectors](affected.md#project-selectors). As in Nx 24, `projects: "self"` and
 `projects: "dependencies"` fail: leave `projects` out for the task's own
 project, or set `dependencies: true`. As in Nx, a project dependency without the
 target is looked through: the task's `dependsOn` applies again from that

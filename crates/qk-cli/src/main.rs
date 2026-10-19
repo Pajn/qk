@@ -911,6 +911,9 @@ fn run(mut cli: Cli) -> Result<i32> {
         None => find_workspace(&std::env::current_dir().context("cannot read current directory")?)?,
     };
     let workspace = Workspace::load(&root)?;
+    for warning in &workspace.warnings {
+        eprintln!("qk: warning: {warning}");
+    }
     match cli.command {
         Command::UploadWorker => unreachable!("handled before workspace discovery"),
         Command::Inputs {
@@ -1339,10 +1342,24 @@ fn run(mut cli: Cli) -> Result<i32> {
         Command::Show {
             command: ShowCommand::Project { name, .. },
         } => {
-            let Some(project) = workspace.projects.get(&name) else {
-                bail!("unknown project {name:?}");
+            // As Nx: a name that is no project is a pattern matching one.
+            let name = if workspace.projects.contains_key(&name) {
+                name
+            } else {
+                let matched = qk_config::find_matching_projects(
+                    &[name.as_str()],
+                    &workspace.projects,
+                    qk_config::Reader::Nx,
+                );
+                match matched.as_slice() {
+                    [one] => one.clone(),
+                    [] => bail!("Could not find project {name}"),
+                    many => bail!("Multiple projects matched:\n  {}", many.join("\n  ")),
+                }
             };
-            print_json(project)?;
+            // The graph's node, with implicit dependencies expanded.
+            let graph = ProjectGraph::build(&workspace)?;
+            print_json(&graph.nodes[&name].data)?;
         }
         Command::Graph {
             file,
@@ -1403,6 +1420,18 @@ fn execute_narrowed(
     single: bool,
     cases: &std::collections::BTreeMap<String, Vec<String>>,
 ) -> Result<i32> {
+    // As Nx's getRunner: a runner other than `default` must be configured.
+    if let Some(runner) = options.ignored.runner.as_deref()
+        && runner != "default"
+        && workspace
+            .config
+            .extra
+            .get("tasksRunnerOptions")
+            .and_then(|runners| runners.get(runner))
+            .is_none_or(serde_json::Value::is_null)
+    {
+        bail!("Could not find runner configuration for {runner}");
+    }
     if options.profile {
         qk_cache::profile::enable();
     }
@@ -1556,14 +1585,12 @@ fn execute_narrowed(
     );
     if !skip_cache {
         let cache = qk_cache::cache_location(workspace);
+        // Entries unused for a week go even without a size limit, as in Nx.
         let pruned = qk_cache::max_size(workspace.config.extra.get("maxCacheSize"), &cache)
-            .and_then(|limit| match limit {
-                Some(limit) => qk_cache::prune_automatic(&cache, limit).map(Some),
-                None => Ok(None),
-            });
+            .and_then(|limit| qk_cache::prune_automatic(&cache, limit.unwrap_or(u64::MAX)));
         match pruned {
-            Ok(Some(pruned)) if pruned.entries > 0 => qk_executor::status!(
-                "qk: evicted {} cache entries to stay under the cache size limit",
+            Ok(pruned) if pruned.entries > 0 => qk_executor::status!(
+                "qk: evicted {} cache entries unused for a week or over the cache size limit",
                 pruned.entries
             ),
             Ok(_) => {}
@@ -1842,8 +1869,21 @@ fn nx_task_graph(workspace: &Workspace, graph: &TaskGraph) -> Result<serde_json:
         if task.dependencies.is_empty() {
             roots.push(id.clone());
         }
-        dependencies.insert(id.clone(), json!(finite));
-        continuous_dependencies.insert(id.clone(), json!(serving));
+        // As Nx 24's edges: the task id, and for a continuous dependency
+        // whether the task waits for it to be ready or leaves out its inputs.
+        let edge = |dependency: &String| {
+            let mut edge = json!({"id": dependency});
+            let declared = task.edge(dependency);
+            if declared.wait_for == qk_taskgraph::WaitFor::Ready {
+                edge["waitFor"] = json!("ready");
+            }
+            if !declared.inputs {
+                edge["inputs"] = json!(false);
+            }
+            edge
+        };
+        dependencies.insert(id.clone(), finite.into_iter().map(edge).collect());
+        continuous_dependencies.insert(id.clone(), serving.into_iter().map(edge).collect());
     }
     Ok(json!({
         "graph": serde_json::to_value(GraphReport { graph: &projects })?["graph"],
@@ -1898,6 +1938,11 @@ fn requests(
 /// importer installs directly, and edges between installations.
 fn external_nodes(workspace: &Workspace, graph: &mut serde_json::Value) -> Result<()> {
     use serde_json::json;
+    // As in Nx, `analyzeLockfile: false` leaves the graph without them.
+    if !workspace.analyzes_lockfile() {
+        graph["externalNodes"] = json!({});
+        return Ok(());
+    }
     let text = std::fs::read_to_string(workspace.root.join("pnpm-lock.yaml"))
         .context("--external needs a pnpm-lock.yaml")?;
     let lockfile = qk_lockfile::Lockfile::parse(&text)?;

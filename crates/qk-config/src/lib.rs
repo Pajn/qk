@@ -3,8 +3,10 @@
 mod discovery;
 mod extends;
 mod merge;
+pub mod minimatch;
 mod normalize;
 mod overrides;
+mod selector;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -15,6 +17,7 @@ use serde_json::{Map, Value};
 
 pub use discovery::find_workspace;
 pub use overrides::interpolate_override;
+pub use selector::{Matchable, Reader, find_matching_projects, is_glob_pattern};
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -84,6 +87,7 @@ pub struct WorkspaceConfig {
 pub struct Package {
     pub name: Option<String>,
     pub version: Option<String>,
+    pub description: Option<Value>,
     #[serde(default)]
     pub scripts: BTreeMap<String, String>,
     #[serde(default)]
@@ -154,6 +158,8 @@ pub struct Workspace {
     /// The `nx.local.json` and `project.local.json` files merged in,
     /// workspace-relative.
     pub local_overrides: Vec<String>,
+    /// What Nx would warn about while reading the workspace.
+    pub warnings: Vec<String>,
 }
 
 pub use normalize::is_glob;
@@ -260,8 +266,26 @@ impl Workspace {
             } else {
                 Vec::new()
             },
+            warnings: Vec::new(),
         };
-        for directory in discovery::project_directories(&root)? {
+        if workspace
+            .config
+            .extra
+            .get("implicitDependencies")
+            .is_some_and(|value| !matches!(value, Value::Null | Value::Bool(false)))
+        {
+            workspace.warnings.push(
+                "nx.json implicitDependencies is no longer supported and is ignored; \
+                 use namedInputs instead"
+                    .to_owned(),
+            );
+        }
+        // A wrong `cli.packageManager` fails only what runs scripts.
+        let package_manager = workspace.package_manager_name().unwrap_or("npm");
+        let mut roots = BTreeMap::new();
+        for (directory, in_workspaces) in
+            discovery::project_directories(&root, &mut workspace.warnings)?
+        {
             let project_json = read_optional_json(&directory.join("project.json"))?;
             let local = read_optional_json(&directory.join(LOCAL_OVERRIDES))?;
             let package: Option<Package> = read_optional_json(&directory.join("package.json"))?
@@ -269,9 +293,13 @@ impl Workspace {
                 .transpose()
                 .with_context(|| format!("invalid {}", directory.join("package.json").display()))?;
             let project = normalize::project(
-                &root,
-                &directory,
-                &workspace.config,
+                &normalize::Origin {
+                    root: &root,
+                    directory: &directory,
+                    config: &workspace.config,
+                    in_workspaces,
+                    package_manager,
+                },
                 project_json,
                 local.clone(),
                 package.as_ref(),
@@ -285,14 +313,35 @@ impl Workspace {
                     project.root
                 );
             }
+            // Nx merges every configuration naming one root into one
+            // project; qk reads one directory per project.
+            if let Some(previous) = roots.insert(project.root.clone(), project.name.clone()) {
+                bail!(
+                    "projects {previous:?} and {:?} both have root {:?}",
+                    project.name,
+                    project.root
+                );
+            }
+            // As in Nx, a project's dependencies, scripts and lockfile
+            // importer are its root's package.json, which is not the one
+            // beside its configuration when the configuration gives
+            // another root.
+            let package = if relative_path(&root, &directory)? == project.root {
+                package
+            } else {
+                let manifest = root.join(&project.root).join("package.json");
+                read_optional_json(&manifest)?
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .with_context(|| format!("invalid {}", manifest.display()))?
+            };
             if let Some(package) = package {
                 workspace.packages.insert(project.name.clone(), package);
             }
             if local.is_some() {
-                let root = if project.root == "." {
-                    String::new()
-                } else {
-                    format!("{}/", project.root)
+                let root = match relative_path(&root, &directory)?.as_str() {
+                    "." => String::new(),
+                    directory => format!("{directory}/"),
                 };
                 workspace
                     .local_overrides
@@ -301,6 +350,93 @@ impl Workspace {
             workspace.projects.insert(project.name.clone(), project);
         }
         Ok(workspace)
+    }
+}
+
+impl Workspace {
+    /// nx.json `pluginsConfig["@nx/js"]`, which Nx's own plugins read.
+    fn js_plugin_config(&self) -> Option<&Value> {
+        self.config
+            .extra
+            .get("pluginsConfig")
+            .and_then(|config| config.get("@nx/js"))
+    }
+
+    /// Whether package.json dependencies make graph edges: unless
+    /// `analyzePackageJson` is set to anything but `true`, as Nx reads it.
+    /// Nx also turns it off in a workspace without a root package.json; qk,
+    /// which reads such workspaces' pnpm-workspace.yaml, does not.
+    pub fn analyzes_package_json(&self) -> bool {
+        self.js_plugin_config()
+            .and_then(|config| config.get("analyzePackageJson"))
+            .is_none_or(|analyze| *analyze == Value::Bool(true))
+    }
+
+    /// Whether the lockfile describes the installed packages:
+    /// `analyzeLockfile`, by default on unless a `lerna.json` stands without
+    /// an nx.json, as Nx reads it.
+    pub fn analyzes_lockfile(&self) -> bool {
+        match self
+            .js_plugin_config()
+            .and_then(|config| config.get("analyzeLockfile"))
+        {
+            Some(analyze) => {
+                !matches!(analyze, Value::Null | Value::Bool(false))
+                    && analyze.as_str() != Some("")
+                    && analyze.as_f64() != Some(0.0)
+            }
+            None => !self.root.join("lerna.json").is_file() || self.root.join("nx.json").is_file(),
+        }
+    }
+
+    /// The package manager, as Nx detects it: nx.json `cli.packageManager`,
+    /// then the lockfile, then the package manager qk was invoked through. qk
+    /// also reads the root `packageManager` and `pnpm-workspace.yaml` before
+    /// that last step.
+    pub fn package_manager_name(&self) -> Result<&'static str> {
+        let known = |name: &str| -> Result<&'static str> {
+            Ok(match name {
+                "npm" => "npm",
+                "pnpm" => "pnpm",
+                "yarn" => "yarn",
+                "bun" => "bun",
+                other => bail!("unknown package manager {other:?}"),
+            })
+        };
+        if let Some(name) = self
+            .config
+            .extra
+            .get("cli")
+            .and_then(|cli| cli.get("packageManager"))
+            .and_then(Value::as_str)
+        {
+            return known(name);
+        }
+        let root = &self.root;
+        for (file, manager) in [
+            ("bun.lockb", "bun"),
+            ("bun.lock", "bun"),
+            ("yarn.lock", "yarn"),
+            ("pnpm-lock.yaml", "pnpm"),
+            ("package-lock.json", "npm"),
+        ] {
+            if root.join(file).is_file() {
+                return Ok(manager);
+            }
+        }
+        if let Some(declared) = &self.package_manager {
+            return known(declared.split('@').next().unwrap_or(declared));
+        }
+        if root.join("pnpm-workspace.yaml").is_file() {
+            return Ok("pnpm");
+        }
+        let agent = std::env::var("npm_config_user_agent").unwrap_or_default();
+        for manager in ["pnpm", "yarn", "bun"] {
+            if agent.starts_with(&format!("{manager}/")) {
+                return Ok(manager);
+            }
+        }
+        Ok("npm")
     }
 }
 

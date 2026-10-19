@@ -1613,9 +1613,13 @@ impl<'a> Resolver<'a> {
                         other => serde_json::from_value(other.clone())
                             .context("input projects must be a string or an array")?,
                     };
-                    for selected in
-                        qk_graph::select_projects(&self.workspace.projects, &patterns, &[])?
-                    {
+                    // Nx's native hasher reads these patterns, not the
+                    // `findMatchingProjects` the rest of Nx uses.
+                    for selected in qk_config::find_matching_projects(
+                        &patterns,
+                        &self.workspace.projects,
+                        qk_config::Reader::Native,
+                    ) {
                         // As in Nx 24, `dependencies: true` beside `projects`
                         // is each selected project's `^name`, not its own.
                         if dependencies {
@@ -2554,10 +2558,13 @@ pub fn inputs(
     if !inferred.manifests.is_empty() {
         configuration["manifests"] = json!(inferred.manifests);
     }
-    // Warm state configuration never changes a result.
+    // Warm state configuration never changes a result, and as in Nx a
+    // target's metadata, such as the run command shown for a script, is
+    // description only.
     let mut definition = task.definition.clone();
     definition.extra.remove("qk:warm");
     definition.extra.remove("qk:threads");
+    definition.extra.remove("metadata");
     let hash = json!({
         "schema":"qk-local-v4", "qk":env!("CARGO_PKG_VERSION"),
         "platform":[std::env::consts::OS, std::env::consts::ARCH], "workspace":snapshot.workspace_prefix,

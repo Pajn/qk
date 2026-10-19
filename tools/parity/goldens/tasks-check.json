@@ -119,35 +119,57 @@
     },
     "dependencies": {
       "web-e2e:e2e": [
-        "web:build:production"
+        {
+          "id": "web:build:production"
+        }
       ],
       "ui:check": [
-        "ui:build",
-        "ui:test",
-        "ui:lint"
+        {
+          "id": "ui:build"
+        },
+        {
+          "id": "ui:test"
+        },
+        {
+          "id": "ui:lint"
+        }
       ],
       "web:check": [
-        "web:build:production",
-        "web:test",
-        "web:lint"
+        {
+          "id": "web:build:production"
+        },
+        {
+          "id": "web:test"
+        },
+        {
+          "id": "web:lint"
+        }
       ],
       "web:serve": [],
       "web:build:production": [
-        "ui:build"
+        {
+          "id": "ui:build"
+        }
       ],
       "ui:build": [],
       "ui:test": [
-        "ui:build"
+        {
+          "id": "ui:build"
+        }
       ],
       "ui:lint": [],
       "web:test": [
-        "web:build:production"
+        {
+          "id": "web:build:production"
+        }
       ],
       "web:lint": []
     },
     "continuousDependencies": {
       "web-e2e:e2e": [
-        "web:serve"
+        {
+          "id": "web:serve"
+        }
       ],
       "ui:check": [],
       "web:check": [],

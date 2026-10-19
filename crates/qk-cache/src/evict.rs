@@ -1,5 +1,6 @@
 //! Keeps the cache under its size limit by evicting the least recently used
-//! entries, as Nx's `maxCacheSize` does.
+//! entries, as Nx's `maxCacheSize` does: once over the limit, down to 90% of
+//! it. As in Nx, entries unused for a week go whatever the limit.
 //!
 //! An entry's last use is its manifest's modification time, refreshed on every
 //! hit. Blobs are shared between entries, so a blob is deleted only once no
@@ -21,6 +22,10 @@ use serde_json::Value;
 
 /// How long an unreferenced blob or scratch file may be part of a publish.
 const IN_FLIGHT: Duration = Duration::from_secs(60 * 60);
+
+/// How long an entry may go unused before it is evicted, as Nx's
+/// `remove_old_cache_records` evicts records not accessed in 7 days.
+const UNUSED: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Pruned {
@@ -56,8 +61,8 @@ pub fn parse_size(text: &str) -> Result<u64> {
 }
 
 /// The size limit: `NX_MAX_CACHE_SIZE`, then nx.json `maxCacheSize`, then, as
-/// in Nx, a tenth of the disk holding the cache. `None` when the limit is 0,
-/// which means unlimited.
+/// in Nx, a tenth of the disk holding the cache, or 100GB when the disk's
+/// size cannot be read. `None` when the limit is 0, which means unlimited.
 pub fn max_size(configured: Option<&Value>, cache: &Path) -> Result<Option<u64>> {
     let configured = match std::env::var("NX_MAX_CACHE_SIZE") {
         Ok(value) => Some(value),
@@ -68,13 +73,11 @@ pub fn max_size(configured: Option<&Value>, cache: &Path) -> Result<Option<u64>>
     };
     let limit = match configured {
         Some(text) => parse_size(&text)?,
-        None => {
-            let existing = cache
-                .ancestors()
-                .find(|path| path.exists())
-                .context("cache path has no existing ancestor")?;
-            fs2::total_space(existing)? / 10
-        }
+        None => cache
+            .ancestors()
+            .find(|path| path.exists())
+            .and_then(|existing| fs2::total_space(existing).ok())
+            .map_or(100 << 30, |total| total / 10),
     };
     Ok((limit > 0).then_some(limit))
 }
@@ -192,8 +195,9 @@ struct Entry {
     blobs: BTreeSet<String>,
 }
 
-/// Evicts least recently used entries until the cache holds at most `limit`
-/// bytes, and removes what no entry needs. Another prune in progress makes
+/// Evicts entries unused for a week and, when the cache holds more than
+/// `limit` bytes, least recently used entries until it holds at most 90% of
+/// it, and removes what no entry needs. Another prune in progress makes
 /// this one return without doing anything.
 ///
 /// Explicit pruning always remeasures the cache, including files changed in
@@ -298,8 +302,15 @@ fn prune_inner(root: &Path, limit: u64, automatic: bool) -> Result<Pruned> {
     let mut size: u64 =
         entries.iter().map(|entry| entry.size).sum::<u64>() + blob_sizes.values().sum::<u64>();
     entries.sort_by_key(|entry| entry.used);
+    // Nx stops a tenth below the limit, so the next run does not evict again.
+    let target = if size > limit {
+        limit - limit / 10
+    } else {
+        limit
+    };
     for entry in entries {
-        if size <= limit {
+        let unused = now.duration_since(entry.used).is_ok_and(|age| age > UNUSED);
+        if size <= target && !unused {
             break;
         }
         if fs::remove_file(&entry.path).is_err() {
@@ -639,6 +650,58 @@ mod tests {
         let result = prune_automatic(root, 100).unwrap();
         assert_eq!(result.entries, 1);
         assert_eq!(result.size, 100);
+    }
+
+    #[test]
+    fn entries_unused_for_a_week_go_and_eviction_stops_a_tenth_below_the_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        for name in ["entries", "blobs", "locks"] {
+            fs::create_dir(root.join(name)).unwrap();
+        }
+        let now = SystemTime::now();
+        for (name, age_days, size) in [
+            ("stale", 8, 10),
+            ("old", 3, 15),
+            ("middle", 2, 100),
+            ("new", 1, 180),
+        ] {
+            let path = root.join("entries").join(format!("{name}.json"));
+            fs::write(&path, vec![0; size]).unwrap();
+            File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(now - Duration::from_secs(age_days * 24 * 60 * 60))
+                .unwrap();
+        }
+        let left = || {
+            let mut names: Vec<String> = fs::read_dir(root.join("entries"))
+                .unwrap()
+                .map(|item| item.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        // A prune that finds `.prune` held by another test's child does
+        // nothing; try again until one runs.
+        let prune = |limit: u64| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let pruned = prune(root, limit).unwrap();
+                if pruned != Pruned::default() || std::time::Instant::now() > deadline {
+                    return pruned;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        // Without a limit, only the week-old entry goes.
+        assert_eq!(prune(u64::MAX).entries, 1);
+        assert_eq!(left(), ["middle.json", "new.json", "old.json"]);
+        // Over a limit of 290 bytes, eviction goes on to 261: evicting `old`
+        // alone would leave 280.
+        assert_eq!(prune(290).entries, 2);
+        assert_eq!(left(), ["new.json"]);
     }
 
     #[test]

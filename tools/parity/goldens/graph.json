@@ -92,9 +92,6 @@
             "format": {
               "cache": true,
               "executor": "nx:run-script",
-              "outputs": [
-                "{projectRoot}/.format"
-              ],
               "metadata": {
                 "scriptContent": "node ../../scripts/task.mjs @fixture/utils:format .",
                 "runCommand": "pnpm run format"

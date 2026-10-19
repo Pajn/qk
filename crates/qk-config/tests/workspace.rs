@@ -139,11 +139,15 @@ fn ignores_generated_and_gitignored_directories_without_requiring_git() {
     let temp = TempDir::new().unwrap();
     write(temp.path(), "nx.json", "{}");
     write(temp.path(), ".gitignore", "ignored/\n");
+    // ripgrep's `.ignore` files are not Nx's.
+    write(temp.path(), ".ignore", "hidden-by-ignore/\n");
     for directory in [
         "node_modules/foo",
-        "target",
+        "a/node_modules/foo",
         ".git",
-        ".nx",
+        ".nx/cache",
+        ".nx/workspace-data",
+        ".yarn/cache",
         ".qk",
         "ignored",
     ] {
@@ -153,12 +157,36 @@ fn ignores_generated_and_gitignored_directories_without_requiring_git() {
             "invalid JSON",
         );
     }
-    write(temp.path(), ".hidden/project.json", r#"{"name":"visible"}"#);
+    for (directory, name) in [
+        (".hidden", "visible"),
+        ("target", "target"),
+        (".nx/tools", "nx-tools"),
+        ("hidden-by-ignore", "ignore-file"),
+    ] {
+        write(
+            temp.path(),
+            &format!("{directory}/project.json"),
+            &format!(r#"{{"name":"{name}"}}"#),
+        );
+    }
     let workspace = Workspace::load(temp.path()).unwrap();
     assert_eq!(
         workspace.projects.keys().collect::<Vec<_>>(),
-        vec!["visible"]
+        vec!["ignore-file", "nx-tools", "target", "visible"]
     );
+}
+
+#[test]
+fn reads_the_repository_gitignores_above_a_nested_workspace() {
+    let temp = TempDir::new().unwrap();
+    std::fs::create_dir(temp.path().join(".git")).unwrap();
+    write(temp.path(), ".gitignore", "generated/\n");
+    let root = temp.path().join("workspace");
+    write(&root, "nx.json", "{}");
+    write(&root, "generated/project.json", "invalid JSON");
+    write(&root, "app/project.json", r#"{"name":"app"}"#);
+    let workspace = Workspace::load(&root).unwrap();
+    assert_eq!(workspace.projects.keys().collect::<Vec<_>>(), vec!["app"]);
 }
 
 #[test]
@@ -281,16 +309,96 @@ fn explicit_targets_replace_missing_included_scripts() {
 }
 
 #[test]
-fn rejects_root_outside_configuration_directory() {
+fn takes_a_given_root_as_written_inside_the_workspace() {
     let temp = TempDir::new().unwrap();
     write(
         temp.path(),
-        "project.json",
-        r#"{"name":"bad","root":"../outside"}"#,
+        "tools/app/project.json",
+        r#"{"name":"app","root":"apps/app","targets":{"build":{
+            "command":"tsc","options":{"out":"{projectRoot}/dist"}
+        }}}"#,
+    );
+    write(temp.path(), "project.json", r#"{"name":"top","root":""}"#);
+    let workspace = Workspace::load(temp.path()).unwrap();
+    assert_eq!(workspace.projects["app"].root, "apps/app");
+    // Option tokens resolve to that root, not the configuration's directory.
+    assert_eq!(
+        workspace.projects["app"].targets["build"].options["out"],
+        "apps/app/dist"
+    );
+    assert_eq!(workspace.projects["top"].root, ".");
+    write(
+        temp.path(),
+        "tools/app/project.json",
+        r#"{"name":"app","root":"../outside"}"#,
     );
     let error = format!("{:#}", Workspace::load(temp.path()).unwrap_err());
     assert!(
-        error.contains("does not match configuration directory"),
+        error.contains("must be a path inside the workspace"),
+        "{error}"
+    );
+}
+
+/// As Nx reads a project's dependencies from its root's package.json, a
+/// project whose configuration names another root takes that root's
+/// package.json, not the one beside the configuration.
+#[test]
+fn a_given_root_takes_its_own_package_json() {
+    let temp = TempDir::new().unwrap();
+    write(
+        temp.path(),
+        "tools/app/project.json",
+        r#"{"name":"app","root":"apps/app"}"#,
+    );
+    write(
+        temp.path(),
+        "tools/app/package.json",
+        r#"{"name":"beside","dependencies":{"left":"1"}}"#,
+    );
+    write(
+        temp.path(),
+        "apps/app/package.json",
+        r#"{"name":"at-root","dependencies":{"right":"1"}}"#,
+    );
+    write(temp.path(), "project.json", r#"{"name":"top"}"#);
+    let workspace = Workspace::load(temp.path()).unwrap();
+    let package = &workspace.packages["app"];
+    assert_eq!(package.name.as_deref(), Some("at-root"));
+    assert!(package.dependency_ranges().contains_key("right"));
+    assert!(!package.dependency_ranges().contains_key("left"));
+}
+
+#[test]
+fn names_unnamed_projects_as_nx_does() {
+    let temp = TempDir::new().unwrap();
+    write(temp.path(), "nx.json", "{}");
+    write(
+        temp.path(),
+        "package.json",
+        r#"{"name": "root", "workspaces": ["packages/*"]}"#,
+    );
+    write(temp.path(), "libs/Data/Access/project.json", "{}");
+    write(temp.path(), "packages/Unnamed/package.json", "{}");
+    write(
+        temp.path(),
+        "packages/named/package.json",
+        r#"{"name": "@scope/named"}"#,
+    );
+    write(temp.path(), "packages/named/project.json", "{}");
+    let workspace = Workspace::load(temp.path()).unwrap();
+    assert_eq!(
+        workspace
+            .projects
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["@scope/named", "access", "unnamed"]
+    );
+    // An unnamed root package is no project.
+    write(temp.path(), "package.json", r#"{"nx": {}}"#);
+    let error = format!("{:#}", Workspace::load(temp.path()).unwrap_err());
+    assert!(
+        error.contains("root package.json must specify a name"),
         "{error}"
     );
 }
@@ -485,11 +593,13 @@ fn target_defaults_resolve_like_nx_23() {
         "nx.json",
         r#"{"targetDefaults": {
             "test-*": {"cache": true},
+            "*": {"options": {"star": true}},
             "test-e2e*": {"options": {"shard": 1}},
             "build": [
                 {"cache": true},
                 {"filter": {"projects": ["tag:web"]}, "options": {"mode": "web"}},
                 {"filter": {"projects": "lib"}, "options": {"mode": "lib"}},
+                {"filter": {"projects": ["libs/*"], "unknown": true}, "outputs": ["out"]},
                 {"filter": {"executor": "nx:run-script"}, "options": {"script": "never"}}
             ],
             "lint": [{"filter": {"plugin": "nx/core/package-json"}, "cache": true}],
@@ -507,7 +617,9 @@ fn target_defaults_resolve_like_nx_23() {
             "test-unit": {"command": "vitest"},
             "test-e2e-ci": {"command": "playwright test"},
             "deploy": {"command": "wrangler deploy"},
-            "lint": {"command": "oxlint"}
+            "lint": {"command": "oxlint"},
+            "serve": {"command": "vite"},
+            "serve/dev": {"command": "vite --mode dev"}
         }}"#,
     );
     write(
@@ -531,6 +643,9 @@ fn target_defaults_resolve_like_nx_23() {
     assert_eq!(web["test-unit"].cache, Some(true));
     assert_eq!(web["test-e2e-ci"].cache, None);
     assert_eq!(web["test-e2e-ci"].options["shard"], 1);
+    // A glob key's `*` does not cross a `/` in a target name.
+    assert_eq!(web["serve/dev"].options.get("star"), None);
+    assert_eq!(web["serve"].options["star"], true);
     // The executor key's only entry is filtered out, so the name key applies,
     // and its matching entries merge in order; the glob key does not add.
     assert_eq!(web["build"].cache, Some(true));
@@ -544,8 +659,10 @@ fn target_defaults_resolve_like_nx_23() {
     );
     // An entry for another executor is left out, but its key still wins.
     assert_eq!(web["deploy"].cache, None);
-    // filter.plugin tells package.json scripts from project.json targets.
-    assert_eq!(workspace.projects["pkg"].targets["lint"].cache, Some(true));
+    // Project patterns read roots, and unknown filter keys are ignored.
+    assert_eq!(lib.outputs, Some(vec!["out".to_owned()]));
+    // No target comes from a plugin in nx.json, so filter.plugin never matches.
+    assert_eq!(workspace.projects["pkg"].targets["lint"].cache, None);
     assert_eq!(web["lint"].cache, None);
 }
 
@@ -1074,9 +1191,15 @@ fn metadata_and_generators_merge_across_files() {
     ])
     .unwrap();
     let app = &workspace.projects["app"];
+    // Nx replaces a package's own metadata with what it reads from the
+    // package, and project.json's merges over that.
     assert_eq!(
         app.extra["metadata"],
-        json!({"technologies": ["node", "react"], "owner": "a"})
+        json!({
+            "targetGroups": {},
+            "js": {"packageName": "app", "isInPackageManagerWorkspaces": true},
+            "technologies": ["react"]
+        })
     );
     assert_eq!(
         app.extra["generators"],
@@ -1088,5 +1211,227 @@ fn metadata_and_generators_merge_across_files() {
     assert_eq!(
         app.targets["build"].extra["metadata"],
         json!({"technologies": ["tsc", "vite"], "help": {"a": 1, "b": 2}})
+    );
+}
+
+#[test]
+fn project_json_merges_over_package_json_as_in_nx() {
+    let temp = TempDir::new().unwrap();
+    write(temp.path(), "nx.json", "{}");
+    write(
+        temp.path(),
+        "package.json",
+        r#"{"name": "root", "workspaces": ["libs/*"], "packageManager": "pnpm@9.0.0"}"#,
+    );
+    write(
+        temp.path(),
+        "libs/lib/package.json",
+        r#"{"name": "@scope/lib", "version": "1.0.0", "description": "A library",
+            "main": "index.js", "scripts": {"build": "tsc", "test": "vitest", "lint": "eslint"},
+            "nx": {"implicitDependencies": ["other"],
+                   "generators": {"@nx/js:lib": {"a": 1, "b": 1}, "kept": {"x": 1}},
+                   "metadata": {"ignored": true},
+                   "targets": {"test": {"command": "vitest run"}}}}"#,
+    );
+    write(
+        temp.path(),
+        "libs/lib/project.json",
+        r#"{"implicitDependencies": "third",
+            "generators": {"@nx/js:lib": {"b": 2}},
+            "metadata": {"targetGroups": {"NPM Scripts": ["extra"], "Mine": ["a"]}, "owner": "me"},
+            "targets": {"lint": {"command": "oxlint"}}}"#,
+    );
+    write(
+        temp.path(),
+        "libs/other/project.json",
+        r#"{"name": "other"}"#,
+    );
+    write(
+        temp.path(),
+        "libs/third/project.json",
+        r#"{"name": "third"}"#,
+    );
+    let workspace = Workspace::load(temp.path()).unwrap();
+    let lib = &workspace.projects["@scope/lib"];
+    // Implicit dependencies concatenate; a single string is one entry.
+    assert_eq!(lib.implicit_dependencies, ["other", "third"]);
+    // Generators merge by generator and option.
+    assert_eq!(
+        lib.extra["generators"],
+        json!({"@nx/js:lib": {"a": 1, "b": 2}, "kept": {"x": 1}})
+    );
+    // Nx replaces the package's metadata with its own, then merges
+    // project.json's over it, arrays concatenating.
+    assert_eq!(
+        lib.extra["metadata"],
+        json!({
+            "targetGroups": {"NPM Scripts": ["build", "test", "extra"], "Mine": ["a"]},
+            "description": "A library",
+            "js": {
+                "packageName": "@scope/lib",
+                "packageVersion": "1.0.0",
+                "packageMain": "index.js",
+                "isInPackageManagerWorkspaces": true
+            },
+            "owner": "me"
+        })
+    );
+    // A script project.json runs another way is no package target.
+    assert_eq!(lib.targets["lint"].extra.get("metadata"), None);
+    assert_eq!(
+        lib.targets["build"].extra["metadata"],
+        json!({"scriptContent": "tsc", "runCommand": "pnpm run build"})
+    );
+    // A package.json target saying how it runs replaces the script's target.
+    assert_eq!(lib.targets["test"].extra.get("metadata"), None);
+    assert_eq!(lib.targets["test"].options["command"], "vitest run");
+    // A project.json project gains no package metadata.
+    assert!(!workspace.projects["other"].extra.contains_key("metadata"));
+}
+
+#[test]
+fn implicit_dependencies_must_be_strings() {
+    let temp = TempDir::new().unwrap();
+    write(
+        temp.path(),
+        "nx.json",
+        r#"{"implicitDependencies": {"package.json": "*"}}"#,
+    );
+    write(temp.path(), "a/project.json", r#"{"name": "a"}"#);
+    let workspace = Workspace::load(temp.path()).unwrap();
+    assert!(
+        workspace.warnings[0].contains("implicitDependencies is no longer supported"),
+        "{:?}",
+        workspace.warnings
+    );
+    write(
+        temp.path(),
+        "a/project.json",
+        r#"{"name": "a", "implicitDependencies": {"b": true}}"#,
+    );
+    let error = format!("{:#}", Workspace::load(temp.path()).unwrap_err());
+    assert!(
+        error.contains("implicitDependencies should be an array of strings"),
+        "{error}"
+    );
+}
+
+#[test]
+fn workspace_patterns_come_from_every_package_manager_file() {
+    let temp = TempDir::new().unwrap();
+    write(
+        temp.path(),
+        "package.json",
+        r#"{"name": "root", "workspaces": ["./apps/*/", "tools/cli/package.json"]}"#,
+    );
+    write(
+        temp.path(),
+        "pnpm-workspace.yaml",
+        "packages:\n  - libs/**\n  - '!libs/skip'\n",
+    );
+    write(temp.path(), "lerna.json", r#"{"version": "1.0.0"}"#);
+    for (directory, name) in [
+        ("apps/web", "web"),
+        ("tools/cli", "cli"),
+        ("libs/a/b", "deep"),
+        ("libs/skip", "skip"),
+        ("libs/.hidden", "hidden"),
+        ("packages/lerna", "lerna"),
+        ("other", "other"),
+    ] {
+        write(
+            temp.path(),
+            &format!("{directory}/package.json"),
+            &format!(r#"{{"name": "{name}"}}"#),
+        );
+    }
+    let workspace = Workspace::load(temp.path()).unwrap();
+    // All three files' patterns count; minimatch's `*` and `**` skip dot
+    // directories, and an exclusion wins.
+    assert_eq!(
+        workspace
+            .projects
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["cli", "deep", "lerna", "web"]
+    );
+}
+
+#[test]
+fn exclusions_alone_take_every_package_json_and_bad_pnpm_files_warn() {
+    let temp = TempDir::new().unwrap();
+    write(
+        temp.path(),
+        "package.json",
+        r#"{"name": "root", "workspaces": ["!skipped"], "nx": {}}"#,
+    );
+    write(temp.path(), "pnpm-workspace.yaml", "packages: [unclosed\n");
+    write(temp.path(), "a/b/package.json", r#"{"name": "b"}"#);
+    write(
+        temp.path(),
+        "skipped/package.json",
+        r#"{"name": "skipped"}"#,
+    );
+    let workspace = Workspace::load(temp.path()).unwrap();
+    assert_eq!(
+        workspace
+            .projects
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["b", "root"]
+    );
+    assert!(
+        workspace.warnings[0].contains("cannot parse pnpm-workspace.yaml"),
+        "{:?}",
+        workspace.warnings
+    );
+    // A package.json beside a project.json is a project outside the
+    // workspaces, and says so in its metadata.
+    write(temp.path(), "skipped/project.json", "{}");
+    let workspace = Workspace::load(temp.path()).unwrap();
+    assert_eq!(
+        workspace.projects["skipped"].extra["metadata"]["js"]["isInPackageManagerWorkspaces"],
+        false
+    );
+}
+
+#[test]
+fn finds_the_workspace_root_as_nx_does() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    write(&root, "nx.json", "{}");
+    write(&root, "packages/app/pnpm-workspace.yaml", "packages: []\n");
+    write(&root, "packages/app/src/index.js", "");
+    // A nearer package manager workspace does not shadow an Nx root.
+    assert_eq!(
+        find_workspace(&root.join("packages/app/src")).unwrap(),
+        root
+    );
+
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    write(&root, "repo/nx", "#!/bin/sh\n");
+    write(
+        &root,
+        "repo/libs/a/package.json",
+        r#"{"name": "a", "nx": {}}"#,
+    );
+    // The Nx wrapper script marks a root too.
+    assert_eq!(
+        find_workspace(&root.join("repo/libs/a")).unwrap(),
+        root.join("repo")
+    );
+
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    write(&root, "repo/node_modules/nx/package.json", "{}");
+    write(&root, "repo/libs/a/node_modules/nx/package.json", "{}");
+    write(&root, "repo/libs/a/project.json", r#"{"name": "a"}"#);
+    // Without a marker, the topmost directory with Nx installed.
+    assert_eq!(
+        find_workspace(&root.join("repo/libs/a")).unwrap(),
+        root.join("repo")
     );
 }

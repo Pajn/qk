@@ -48,9 +48,15 @@
     },
     "dependencies": {
       "web:verify": [
-        "web:typecheck-app",
-        "web:typecheck-strict",
-        "ui:lint"
+        {
+          "id": "web:typecheck-app"
+        },
+        {
+          "id": "web:typecheck-strict"
+        },
+        {
+          "id": "ui:lint"
+        }
       ],
       "web:typecheck-app": [],
       "web:typecheck-strict": [],

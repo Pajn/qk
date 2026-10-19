@@ -897,53 +897,8 @@ fn boolean(value: Option<&Value>, default: bool, name: &str) -> Result<bool> {
         .map(|value| value.unwrap_or(default))
 }
 
-/// The package manager, as Nx detects it: nx.json `cli.packageManager`,
-/// then the lockfile, then the package manager qk was invoked through. qk
-/// also reads the root `packageManager` before that last step.
 fn package_manager(workspace: &Workspace) -> Result<&'static str> {
-    let known = |name: &str| -> Result<&'static str> {
-        Ok(match name {
-            "npm" => "npm",
-            "pnpm" => "pnpm",
-            "yarn" => "yarn",
-            "bun" => "bun",
-            other => bail!("unknown package manager {other:?}"),
-        })
-    };
-    if let Some(name) = workspace
-        .config
-        .extra
-        .get("cli")
-        .and_then(|cli| cli.get("packageManager"))
-        .and_then(Value::as_str)
-    {
-        return known(name);
-    }
-    let root = &workspace.root;
-    for (file, manager) in [
-        ("bun.lockb", "bun"),
-        ("bun.lock", "bun"),
-        ("yarn.lock", "yarn"),
-        ("pnpm-lock.yaml", "pnpm"),
-        ("package-lock.json", "npm"),
-    ] {
-        if root.join(file).is_file() {
-            return Ok(manager);
-        }
-    }
-    if let Some(declared) = &workspace.package_manager {
-        return known(declared.split('@').next().unwrap_or(declared));
-    }
-    if root.join("pnpm-workspace.yaml").is_file() {
-        return Ok("pnpm");
-    }
-    let agent = std::env::var("npm_config_user_agent").unwrap_or_default();
-    for manager in ["pnpm", "yarn", "bun"] {
-        if agent.starts_with(&format!("{manager}/")) {
-            return Ok(manager);
-        }
-    }
-    Ok("npm")
+    workspace.package_manager_name()
 }
 
 #[cfg(all(test, windows))]

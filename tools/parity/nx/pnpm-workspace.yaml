@@ -2,3 +2,15 @@
 # allowed nor declined. Nx's postinstall is not needed to capture goldens.
 allowBuilds:
   nx: false
+minimumReleaseAgeExclude:
+  - '@nx/nx-darwin-arm64@24.0.0-beta.3'
+  - '@nx/nx-darwin-x64@24.0.0-beta.3'
+  - '@nx/nx-freebsd-x64@24.0.0-beta.3'
+  - '@nx/nx-linux-arm-gnueabihf@24.0.0-beta.3'
+  - '@nx/nx-linux-arm64-gnu@24.0.0-beta.3'
+  - '@nx/nx-linux-arm64-musl@24.0.0-beta.3'
+  - '@nx/nx-linux-x64-gnu@24.0.0-beta.3'
+  - '@nx/nx-linux-x64-musl@24.0.0-beta.3'
+  - '@nx/nx-win32-arm64-msvc@24.0.0-beta.3'
+  - '@nx/nx-win32-x64-msvc@24.0.0-beta.3'
+  - nx@24.0.0-beta.3

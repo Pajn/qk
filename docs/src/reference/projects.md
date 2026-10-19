@@ -1,35 +1,62 @@
 # Projects and discovery
 
-qk searches ancestors for `nx.json`, `pnpm-workspace.yaml`, or a root
-`package.json` with `workspaces`. A standalone `project.json`, or package
-with an `nx` object, also works when no parent workspace marker exists.
-`--workspace <path>` selects a root explicitly.
+qk finds the workspace root as Nx does: `NX_WORKSPACE_ROOT_PATH` when set,
+else the nearest ancestor with an `nx.json` or an `nx` or `nx.bat` wrapper
+script, else the topmost ancestor with Nx installed in `node_modules`. For a
+workspace without Nx, it takes the nearest ancestor with
+`pnpm-workspace.yaml` or a `package.json` with `workspaces`; a standalone
+`project.json`, or package with an `nx` object, also works when no parent
+workspace marker exists. `--workspace <path>` selects a root explicitly.
 
 ## Workspace membership
 
 qk discovers `project.json` files, including nested projects, and package
-manifests selected by pnpm workspace globs or `package.json` workspaces.
-pnpm patterns take precedence; exclusion globs win. An explicit
-`project.json` remains a project outside package globs.
-The root package is a project when it has an `nx` object or adjacent
-`project.json`.
+manifests the package manager's workspaces take in, as Nx's package.json
+plugin does. The workspace patterns are those of the root `package.json`
+`workspaces` (an array, or an object's `packages`), `pnpm-workspace.yaml`
+`packages` and `lerna.json` `packages` together; a `lerna.json` without
+`packages` means `packages/*`. A pattern names directories, or package.json
+files when it ends in `/package.json`. Patterns are minimatch globs without
+the `dot` option, so `*` and `**` pass over directories starting with `.`.
+`!` patterns exclude, and with exclusions alone every package.json not
+excluded is taken in. An unreadable `pnpm-workspace.yaml` or `lerna.json` warns and
+adds none.
 
-Discovery respects workspace ignore files, skips symlink directories, and
-excludes `node_modules`, `.git`, `.nx`, `.qk`, `.pnpm-store`, and the root
-Cargo `target` directory. Parent and global Git ignore rules do not affect
-it. Other hidden project directories remain discoverable.
+A `package.json` beside a `project.json` is part of that project whether the
+workspaces take it in or not. The root package is a project when it has an
+`nx` object or an adjacent `project.json`. With
+`NX_INFER_ALL_PACKAGE_JSONS=true`, a workspace without a root `package.json`
+takes in every package.json, as in Nx.
+
+Discovery reads `.gitignore` and `.nxignore` files with Git's rules, in the
+workspace and, when the workspace is inside a Git repository, the
+repository's `.gitignore` files above it, as Nx does. It does not follow
+symbolic links, and leaves out `node_modules`, `.git`, `.nx/cache`,
+`.nx/workspace-data`, `.yarn/cache` and qk's `.qk` wherever they are. Other
+hidden directories remain discoverable. Unlike Nx, qk does not read the
+machine's global Git excludes, or `.gitignore` files above a workspace that is
+not in a Git repository.
 
 ## Configuration precedence
 
-Package scripts become `nx:run-script` targets, except a script that
-`project.json` gives another way to run: a command, or an executor other
-than run-script running it. Package `nx` configuration is merged over
-these; a target there with an executor or command replaces the script's.
-Adjacent `project.json` merges over that, then `project.local.json`.
-Workspace `targetDefaults` lie beneath them all. Targets merge as described
-in [Merging](targets.md#merging). Tags merge as an ordered union, named
-inputs by name, `generators` by generator and `metadata` one level deep with
-lists concatenated; other project fields are replaced.
+Package scripts become `nx:run-script` targets, except a script that an
+adjacent `project.json` runs another way: with a `command`, another
+executor, or run-script running another script. Package `nx` configuration
+is merged over these; a target there with an `executor` or `command`
+replaces the script's. Adjacent `project.json` merges over that, then
+`project.local.json`. Workspace `targetDefaults` lie beneath them all.
+Targets merge as described in [Merging](targets.md#merging). As in Nx, tags
+merge as an ordered union, `implicitDependencies` concatenate, named inputs
+merge by name, `generators` merge by generator and then option, and
+`metadata` merges by field, arrays concatenating one level down; other
+project fields are replaced.
+
+A package's `metadata` is what Nx reads from it, replacing any in its `nx`
+object: `targetGroups` listing its script targets under `NPM Scripts`, its
+`description`, and under `js` its `name`, `version`, `exports` and `main` and
+whether the package manager's workspaces take it in. Each script target's
+`metadata` holds the script and the package manager's command for it. Neither
+is part of a cache key.
 
 ```jsonc
 {
@@ -49,16 +76,22 @@ lists concatenated; other project fields are replaced.
 
 ## `name`
 
-A nonempty string. An explicit name wins over the package name; otherwise
-qk uses the relative directory with `/` replaced by `-`. For the workspace
-root it uses the directory's name. Duplicate names fail with both roots in
-the error. Use the normalized name in CLI selectors.
+A string. An explicit name wins over the package name; otherwise, as in Nx,
+a project is named after its directory, in lower case: `libs/data/Access`
+is `access`. For the workspace root qk uses the workspace directory's name.
+An unnamed root `package.json` cannot be a project, as in Nx: name it, or
+name the project in its `nx` object. Duplicate names fail with both roots in
+the error.
 
 ## `root`
 
-The workspace-relative configuration directory, normalized with forward
-slashes (`.` for the workspace root). An explicit root must agree with that
-directory; an empty string is also accepted for the workspace root.
+The workspace-relative project directory, with forward slashes (`.` for the
+workspace root). It defaults to the configuration's directory; as in Nx, a
+`root` given in project.json or the package's `nx` object is used as written,
+an empty string meaning the workspace root. It must stay inside the
+workspace, and two projects cannot share a root. As in Nx, the project's
+package dependencies, scripts and lockfile entry then come from the
+`package.json` at that root, not the one beside the configuration.
 
 ## `sourceRoot`
 
@@ -78,9 +111,12 @@ Packages also gain `npm:private` or `npm:public` and `npm:<keyword>` tags.
 
 ## `implicitDependencies`
 
-An array of project selectors, empty by default. Names, globs and tags add
-graph edges; negations remove matching edges. An unknown exact dependency
-name is an error. Package dependency sections also create graph edges when
+An array of [project selectors](../guides/affected.md#project-selectors),
+empty by default. What the selectors match, less the project itself, gains an
+implicit graph edge; a `!` selector removes every edge to the projects it
+matches, package dependencies included. As in Nx, a selector matching no
+project is an error, and the graph's node lists the expanded names, each
+exclusion as `!name`. Package dependency sections also create graph edges when
 the range identifies a workspace package; see [Nx compatibility](../compatibility.md).
 
 ## `namedInputs`

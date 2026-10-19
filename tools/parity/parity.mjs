@@ -69,10 +69,8 @@ import { fileURLToPath } from "node:url";
 // - Object key order, which neither tool treats as meaningful.
 // - The order of `show projects --affected`: Nx prints its traversal order, qk
 //   the graph order of `show projects`, so affected projects compare as sets.
-// - Requested configurations in task graphs: Nx's `--graph` ignores `-c`, even
-//   for an explicit `project:target:configuration`, and plans as if none was
-//   requested; default configurations still apply. qk plans the same arguments
-//   without `-c` to match.
+// - The order of a task's dependencies: Nx keeps the order `dependsOn` reached
+//   them in, qk sorts them, so they compare as sets of edges by task id.
 const RELEASE_TARGETS = new Set(["nx-release-publish"]);
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -300,7 +298,7 @@ check("graph --file is normalised-equal", compareGraphs(readJson(join(goldens, "
 
 // Task graphs: the same tasks, dependencies, and cache and continuous flags.
 for (const [name, args] of Object.entries(taskGraphs)) {
-  const plan = run(qk, ["run-many", ...withoutConfiguration(args), "--graph=stdout"]);
+  const plan = run(qk, ["run-many", ...args, "--graph=stdout"]);
   timings[`tasks ${name}`] = plan.milliseconds;
   check(`task graph ${name} matches`, compareTaskGraphs(readJson(join(goldens, `tasks-${name}.json`)).tasks, JSON.parse(plan.stdout).tasks));
 }
@@ -392,16 +390,6 @@ function resolveTokens(value, project) {
   return value;
 }
 
-/// run-many arguments without a requested configuration.
-function withoutConfiguration(args) {
-  const kept = [];
-  for (let index = 0; index < args.length; index++) {
-    if (["-c", "--configuration"].includes(args[index])) index++;
-    else if (!args[index].startsWith("--configuration=")) kept.push(args[index]);
-  }
-  return kept;
-}
-
 // What task graphs compare: each task's target, root, outputs and flags.
 function keptTasks(tasks) {
   return Object.fromEntries(
@@ -433,14 +421,21 @@ function compareTaskGraphs(nx, qk) {
       }
     }
     for (const kind of ["dependencies", "continuousDependencies"]) {
-      const expected = [...(nx[kind]?.[id] ?? [])].sort();
-      const actual = [...(qk[kind]?.[id] ?? [])].sort();
+      const expected = edges(nx[kind]?.[id]);
+      const actual = edges(qk[kind]?.[id]);
       if (JSON.stringify(expected) !== JSON.stringify(actual)) {
         differences.push(`${id}: ${kind} ${JSON.stringify(expected)} in Nx, ${JSON.stringify(actual)} in qk`);
       }
     }
   }
   return differences;
+}
+
+// A task's edges, each as Nx 24 writes it, sorted by task id.
+function edges(list) {
+  return (list ?? [])
+    .map((edge) => canonical(typeof edge === "string" ? { id: edge } : edge))
+    .sort((a, b) => a.id.localeCompare(b.id));
 }
 
 function diffKeys(kind, expected, actual, differences) {

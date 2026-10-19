@@ -1778,7 +1778,6 @@ name = "qk-config"
 version = "0.7.0"
 dependencies = [
  "anyhow",
- "globset",
  "ignore",
  "jsonc-parser",
  "serde",
@@ -1808,7 +1807,6 @@ name = "qk-graph"
 version = "0.7.0"
 dependencies = [
  "anyhow",
- "globset",
  "qk-config",
  "serde",
  "serde_json",
@@ -1869,7 +1867,6 @@ name = "qk-taskgraph"
 version = "0.7.0"
 dependencies = [
  "anyhow",
- "globset",
  "qk-config",
  "qk-graph",
  "serde",

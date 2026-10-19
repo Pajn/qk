@@ -49,16 +49,21 @@ A named input cannot itself declare `dependencies` or `projects`.
 
 An object of target defaults; defaults to empty. Matching keys are tried in
 this order: executor, target name, then matching target-name globs, longest
-first. The first key with a matching entry wins; keys do not all accumulate.
-As in Nx 24, the selected defaults lie beneath the project's files, which
-merge over them as described in [Merging](targets.md#merging), spreads
-included. Beneath a default there is only the earlier matching entries of
-its key, so a spread in the first adds nothing.
+first. A key is a glob when it holds one of `*`, `|`, `{`, `}`, `(`, `)` or
+`[`, and it matches as minimatch matches: `*` does not cross a `/`. The first
+key with a matching entry wins; keys do not all accumulate. As in Nx 24, the
+selected defaults lie beneath the project's files, which merge over them as
+described in [Merging](targets.md#merging), spreads included. Beneath a
+default there is only the earlier matching entries of its key, so a spread in
+the first adds nothing.
 
 Each value may be a target object or an array of target objects. Array entries
-may have `filter.projects` (names, globs, `tag:` and `!` selectors),
-`filter.plugin` (`nx/core/project-json` or `nx/core/package-json`), and
-`filter.executor`. Matching entries merge in array order, later ones winning.
+may have `filter.projects`, an array of
+[project selectors](../guides/affected.md#project-selectors), and
+`filter.executor`, and other filter keys are ignored. `filter.plugin` names
+the plugin in nx.json `plugins` that wrote the target; targets from
+project.json and package.json have none, so an entry with `filter.plugin`
+never applies. Matching entries merge in array order, later ones winning.
 An entry naming an executor different from the target's own is left out,
 although its key still wins.
 
@@ -128,10 +133,26 @@ An object with `appsDir` and `libsDir` string prefixes used to infer package
 project types. Matching is by plain string prefix. Explicit `project.json`
 configuration can override the inferred type.
 
+## `pluginsConfig["@nx/js"]`
+
+The settings Nx's JavaScript support reads, which qk reads too:
+
+- `analyzePackageJson`: anything but `true` stops package.json dependencies
+  making graph edges.
+- `analyzeLockfile`: `false` leaves the installed packages out of the graph,
+  so `graph --external` adds none and a lockfile change under
+  `projectsAffectedByDependencyUpdates: "auto"` affects every project, where
+  Nx affects none (see [Compatibility](../compatibility.md)). It defaults to
+  on, unless a `lerna.json` stands without an `nx.json`.
+  Cache keys and `externalDependencies` inputs read the lockfile either way.
+- `projectsAffectedByDependencyUpdates`: see
+  [Affected selection](../guides/affected.md).
+
 ## `cacheDirectory`
 
 A path relative to the workspace root, or an absolute path, overriding the
-default cache location. `NX_CACHE_DIRECTORY` takes precedence. qk stores its
+default cache location. `NX_CACHE_DIRECTORY` takes precedence; without either,
+`tasksRunnerOptions.default.options.cacheDirectory` is read, as in Nx. qk stores its
 entries in `qk/v1` beneath this directory so it can coexist with Nx.
 History and worktree state keep their default locations. A relative override
 gives each worktree its own cache.
@@ -139,11 +160,20 @@ gives each worktree its own cache.
 Without an override, the cache lives in `<git common dir>/qk/cache/v1`, or
 `.qk/cache/v1` outside Git. Use `qk cache path` to inspect it.
 
+## `tasksRunnerOptions`
+
+Nx's task runners. qk runs tasks itself, so it reads only what Nx's default
+runner reads from here: `default.options.cacheDirectory`, under
+[`cacheDirectory`](#cachedirectory). As in Nx, `--runner` must name a runner
+configured here, or `default`. A runner's `parallel` option counts in neither
+Nx nor qk: Nx's own `parallel` setting replaces it.
+
 ## `maxCacheSize`
 
 A byte count or size such as `"2GB"`. Units `KB`, `MB` and `GB` use powers of
 1024; `0` means unlimited. `NX_MAX_CACHE_SIZE` takes precedence. The default
-is a tenth of the disk holding the cache. See [Storage limits](../guides/remote-cache.md).
+is a tenth of the disk holding the cache. Entries unused for a week are
+evicted whatever the limit. See [Storage limits](../guides/remote-cache.md).
 
 ## `s3`
 

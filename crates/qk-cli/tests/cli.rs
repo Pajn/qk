@@ -12,7 +12,8 @@ fn isolated_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
             "GIT_CONFIG_GLOBAL",
             if cfg!(windows) { "NUL" } else { "/dev/null" },
         )
-        .env("GIT_CONFIG_NOSYSTEM", "1");
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("NX_WORKSPACE_ROOT_PATH");
     for name in [
         "GIT_ALTERNATE_OBJECT_DIRECTORIES",
         "GIT_CONFIG",
@@ -1650,4 +1651,101 @@ exec "$QK_TEST_REAL_GIT" "$@"
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("apps/stray/generated/runtime.js"));
+}
+
+#[test]
+fn every_package_json_is_a_project_when_nx_is_told_to_infer_them_all() {
+    let temp = TempDir::new().unwrap();
+    std::fs::write(temp.path().join("nx.json"), "{}").unwrap();
+    std::fs::create_dir_all(temp.path().join("tools/script")).unwrap();
+    std::fs::write(
+        temp.path().join("tools/script/package.json"),
+        r#"{"name": "script"}"#,
+    )
+    .unwrap();
+    let projects = |infer: &str| {
+        let output = isolated_command(env!("CARGO_BIN_EXE_qk"))
+            .current_dir(temp.path())
+            .env("NX_INFER_ALL_PACKAGE_JSONS", infer)
+            .args(["show", "projects", "--json"])
+            .output()
+            .unwrap();
+        successful_json(output)
+    };
+    assert_eq!(projects("false"), json!([]));
+    assert_eq!(projects("true"), json!(["script"]));
+    // Nx reads the variable only without a root package.json.
+    std::fs::write(temp.path().join("package.json"), r#"{"name": "root"}"#).unwrap();
+    assert_eq!(projects("true"), json!([]));
+}
+
+#[test]
+fn the_workspace_root_can_be_set_as_in_nx() {
+    let temp = TempDir::new().unwrap();
+    let elsewhere = TempDir::new().unwrap();
+    std::fs::write(temp.path().join("nx.json"), "{}").unwrap();
+    std::fs::write(temp.path().join("project.json"), r#"{"name": "app"}"#).unwrap();
+    let output = isolated_command(env!("CARGO_BIN_EXE_qk"))
+        .current_dir(elsewhere.path())
+        .env("NX_WORKSPACE_ROOT_PATH", temp.path())
+        .args(["show", "projects", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(successful_json(output), json!(["app"]));
+}
+
+#[test]
+fn graph_has_no_packages_when_the_lockfile_is_not_analysed() {
+    let temp = TempDir::new().unwrap();
+    std::fs::write(
+        temp.path().join("nx.json"),
+        r#"{"pluginsConfig": {"@nx/js": {"analyzeLockfile": false}}}"#,
+    )
+    .unwrap();
+    std::fs::write(temp.path().join("project.json"), r#"{"name": "app"}"#).unwrap();
+    std::fs::write(temp.path().join("pnpm-lock.yaml"), "not: [a lockfile").unwrap();
+    let output = isolated_command(env!("CARGO_BIN_EXE_qk"))
+        .args([
+            "--workspace",
+            temp.path().to_str().unwrap(),
+            "graph",
+            "--external",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(successful_json(output)["graph"]["externalNodes"], json!({}));
+}
+
+#[test]
+fn show_project_prints_the_graph_node_and_matches_patterns_as_nx() {
+    // The node lists implicit dependencies expanded.
+    let temp = TempDir::new().unwrap();
+    std::fs::write(temp.path().join("nx.json"), "{}").unwrap();
+    for (name, config) in [
+        (
+            "app",
+            r#"{"name": "app", "implicitDependencies": ["tag:lib", "!b"]}"#,
+        ),
+        ("a", r#"{"name": "a", "tags": ["lib"]}"#),
+        ("b", r#"{"name": "b", "tags": ["lib"]}"#),
+    ] {
+        std::fs::create_dir(temp.path().join(name)).unwrap();
+        std::fs::write(temp.path().join(name).join("project.json"), config).unwrap();
+    }
+    let output = isolated_command(env!("CARGO_BIN_EXE_qk"))
+        .args(["--workspace", temp.path().to_str().unwrap()])
+        .args(["show", "project", "app", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        successful_json(output)["implicitDependencies"],
+        json!(["a", "!b"])
+    );
+    let core = successful_json(qk(&["show", "project", "CORE", "--json"]));
+    assert_eq!(core["name"], "core");
+    let output = qk(&["show", "project", "apps/**", "--json"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Multiple projects matched"));
+    let output = qk(&["show", "project", "absent", "--json"]);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Could not find project absent"));
 }

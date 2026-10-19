@@ -19,7 +19,10 @@ Ranges such as `catalog:`, npm aliases, or ranges outside the workspace
 version do not create an edge. Names are looked up by dependency key, so
 `"ui": "workspace:@scope/ui@*"` does not link to `@scope/ui`.
 When a name occurs in multiple sections, precedence is `dependencies`,
-`devDependencies`, `peerDependencies`, then `optionalDependencies`.
+`devDependencies`, `peerDependencies`, then `optionalDependencies`. When two
+packages share a name, the name means the one whose package.json path sorts
+last, as in Nx. `pluginsConfig["@nx/js"].analyzePackageJson` turns these
+edges off.
 `implicitDependencies` adds selected project edges.
 
 ## Deliberate differences
@@ -83,6 +86,33 @@ When a name occurs in multiple sections, precedence is `dependencies`,
   root in the outputs a target without `outputs` takes. Nx inserts them as
   they are, which turns such a root into a pattern that misses the project's
   files.
+- `pnpm-workspace.yaml` and `lerna.json` name workspace packages in a
+  workspace without a root `package.json` too, and package.json dependencies
+  make edges there; Nx then reads no workspace patterns and analyses no
+  package.json.
+- With `analyzeLockfile: false`, a lockfile change under
+  `projectsAffectedByDependencyUpdates: "auto"` affects every project even
+  when no package changed, where Nx affects none; cache keys and
+  `externalDependencies` inputs still read the lockfile.
+- Project discovery ignores the machine's global Git excludes, and the
+  `.gitignore` files above a workspace that is not in a Git repository;
+  Nx reads both, so what they hide depends on the machine.
+- An unnamed project at the workspace root is named after the workspace
+  directory; Nx names it `.`. Two configurations giving the same `root` are
+  an error, where Nx merges them into one project, and a `root` outside the
+  workspace is refused.
+- Project selectors read `tag:*` and `directory:*` as globs, where Nx takes
+  them for every project, tagged or not. A pattern with an unknown label, such
+  as `scope:shared`, is matched whole; Nx drops the label and would select a
+  project named `shared`. A plain name matches as a word by its characters;
+  Nx puts it unescaped into a regular expression, so `.` there matches any
+  character.
+- A `targetDefaults` `filter.projects` given as a string is one pattern; Nx
+  spreads it into one pattern per character.
+- Globs in project selectors, workspace package patterns, `targetDefaults`
+  keys, project target keys and `dependsOn` targets do not support
+  minimatch's extended globs such as `@(a|b)`: their characters match
+  themselves.
 - For affected-project selection, bare parenthesized extension groups such
   as `**/*.(svg|png)` select projects in qk that Nx 23.1.0 does not.
   See [Inputs and outputs](reference/inputs-outputs.md) for compatible syntax.
@@ -101,7 +131,9 @@ parity claim yet. In particular:
   projects to what they install directly and between installations.
 - Nx plugins and inferred targets are outside the design's scope.
 - qk has its own live output panel, which takes no input, and does not
-  implement Nx release commands.
+  implement Nx release commands. Nx adds an `nx-release-publish` target to
+  each public package when `@nx/js` is installed; qk does not, as its
+  executor is a release executor qk cannot run.
 - An `externalDependencies` entry naming a package nothing installs is an
   error only with a pnpm lockfile qk can read; with any other lockfile qk
   cannot tell, and keys the lockfile whole.

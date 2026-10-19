@@ -137,6 +137,23 @@ fn object_selectors_forward_arguments_and_exclude_projects() {
 }
 
 #[test]
+fn dependency_projects_are_read_as_nx_reads_them() {
+    let (_temp, workspace) = workspace(json!({
+        "app": {"targets":{"build":{"dependsOn":[
+            {"target":"build", "projects":[]},
+            {"target":"lint", "projects":["!tag:skip", "app"]}
+        ]}, "lint":{}}},
+        "lib": {"tags":["skip"], "targets":{"build":{}, "lint":{}}},
+        "other": {"targets":{"build":{}, "lint":{}}}
+    }));
+    let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
+    // No patterns select no project, and patterns apply in order.
+    let mut tasks: Vec<&str> = graph.tasks.keys().map(String::as_str).collect();
+    tasks.sort();
+    assert_eq!(tasks, ["app:build", "app:lint", "other:lint"]);
+}
+
+#[test]
 fn object_dependencies_select_project_edges_and_ignore_arguments_by_default() {
     let (_temp, workspace) = workspace(json!({
         "app": {"implicitDependencies":["lib"], "targets":{"build":{"dependsOn":[{"target":"build", "dependencies":true}]}}},
@@ -236,6 +253,26 @@ fn dependency_targets_may_contain_colons() {
             .map(String::as_str)
             .collect::<Vec<_>>(),
         ["app:e2e:ci", "app:test:unit", "lib:build", "lib:lint:ci"]
+    );
+}
+
+#[test]
+fn dependency_target_globs_match_as_minimatch_does() {
+    let (_temp, workspace) = workspace(json!({
+        "app": {"targets":{
+            "build":{"dependsOn":["lint-*", "serve*"]},
+            "lint-js":{}, "lint-css":{}, "serve":{}, "serve/dev":{}
+        }}
+    }));
+    let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
+    // `*` does not cross a `/`, so `serve*` leaves `serve/dev` out.
+    assert_eq!(
+        graph.tasks["app:build"]
+            .dependencies
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["app:lint-css", "app:lint-js", "app:serve"]
     );
 }
 

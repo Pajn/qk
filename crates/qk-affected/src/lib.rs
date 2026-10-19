@@ -26,7 +26,7 @@ use subprocess::workspace_command;
 use anyhow::{Context, Result, bail, ensure};
 use qk_cache::Pattern;
 use qk_config::Workspace;
-use qk_graph::{ProjectGraph, select_projects};
+use qk_graph::ProjectGraph;
 use qk_lockfile::{Installation, Lockfile};
 use serde::Serialize;
 use serde_json::Value;
@@ -949,11 +949,17 @@ fn touched_by_lockfile(
         setting: setting.clone(),
     };
     match &setting {
-        Value::String(mode) if mode == "auto" => {}
+        // Without the lockfile's packages in the graph, Nx's `auto` finds no
+        // package that changed and takes every project.
+        Value::String(mode) if mode == "auto" && workspace.analyzes_lockfile() => {}
         Value::Array(selectors) => {
             let selectors: Vec<String> = serde_json::from_value(Value::Array(selectors.clone()))
                 .context("projectsAffectedByDependencyUpdates must list project selectors")?;
-            for project in select_projects(&workspace.projects, &selectors, &[])? {
+            for project in qk_config::find_matching_projects(
+                &selectors,
+                &workspace.projects,
+                qk_config::Reader::Nx,
+            ) {
                 touches.touch(&project, reason.clone());
             }
             return Ok(());

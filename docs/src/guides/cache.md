@@ -131,7 +131,7 @@ Every input declaration of Nx 24 is supported, `always` read as absent:
   on, directly or not, and `^{projectRoot}/…`, `^{workspaceRoot}/…` or
   `{"fileset": "…", "dependencies": true}`, a fileset of each of them;
 - `{"input": "name", "projects": […]}`, the named input of the projects the
-  names, globs or `tag:` patterns select;
+  [project selectors](affected.md#project-selectors) select;
 - `env`, `runtime`, `dependentTasksOutputFiles` with `transitive`, and
   `externalDependencies`, which adds every installation of the named
   packages in the pnpm lockfile, whichever importer installs them;
@@ -249,4 +249,6 @@ already holds are stamped again when a dependency's outputs changed in the
 run, so they stay the newer. Symbolic links and directories keep their
 times.
 
-See [remote caching](remote-cache.md) for size limits and cache directory overrides.
+Entries unused for a week are evicted after each run, as in Nx, and the
+cache stays under a size limit. See [remote caching](remote-cache.md#storage-limits)
+for size limits and cache directory overrides.

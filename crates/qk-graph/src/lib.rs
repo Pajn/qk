@@ -51,9 +51,8 @@ fn join(base: &str, path: &str) -> String {
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{Context, Result, bail};
-use globset::Glob;
-use qk_config::{Project, Workspace};
+use anyhow::{Result, bail};
+use qk_config::{Project, Reader, Workspace, find_matching_projects};
 use serde::Serialize;
 
 #[derive(Clone, Debug, Serialize)]
@@ -85,16 +84,43 @@ pub struct GraphReport<'a> {
 
 impl ProjectGraph {
     pub fn build(workspace: &Workspace) -> Result<Self> {
+        // As in Nx, a package name two projects share means the later one,
+        // in the order of their package.json paths.
+        let mut packages: Vec<(String, &String)> = workspace
+            .packages
+            .keys()
+            .map(|name| {
+                let manifest = match workspace.projects[name].root.as_str() {
+                    "." => "package.json".to_owned(),
+                    root => format!("{root}/package.json"),
+                };
+                (manifest, name)
+            })
+            .collect();
+        packages.sort();
         let mut package_names = BTreeMap::new();
-        for (project_name, package) in &workspace.packages {
-            if let Some(name) = &package.name
-                && let Some(previous) = package_names.insert(name, project_name)
-            {
-                bail!(
-                    "duplicate workspace package name {name:?} in projects {previous:?} and {project_name:?}"
-                );
+        if workspace.analyzes_package_json() {
+            for (_, project_name) in packages {
+                if let Some(name) = &workspace.packages[project_name].name {
+                    package_names.insert(name, project_name);
+                }
             }
         }
+        check_implicit_dependencies(&workspace.projects)?;
+        let implicit: BTreeMap<&String, Vec<String>> = workspace
+            .projects
+            .iter()
+            .map(|(name, project)| {
+                (
+                    name,
+                    expand_implicit_dependencies(
+                        name,
+                        &project.implicit_dependencies,
+                        &workspace.projects,
+                    ),
+                )
+            })
+            .collect();
         let mut graph = Self {
             nodes: BTreeMap::new(),
             dependencies: BTreeMap::new(),
@@ -119,33 +145,18 @@ impl ProjectGraph {
                     }
                 }
             }
-            for selector in project
-                .implicit_dependencies
-                .iter()
-                .filter(|s| !s.starts_with('!'))
-            {
-                let selected = matches(&workspace.projects, selector)
-                    .with_context(|| format!("implicitDependencies of project {name:?}"))?;
-                if selected.is_empty() && !is_pattern(selector) {
-                    bail!("project {name:?} has unknown implicit dependency {selector:?}");
-                }
-                for target in selected {
+            for target in &implicit[name] {
+                match target.strip_prefix('!') {
+                    Some(target) => {
+                        edges.remove(target);
+                    }
                     // Nx keeps an implicit edge alongside a static one for the same pair.
-                    if target != *name {
+                    None => {
                         edges
-                            .entry(target)
+                            .entry(target.clone())
                             .or_insert_with(BTreeSet::new)
                             .insert("implicit");
                     }
-                }
-            }
-            for selector in project
-                .implicit_dependencies
-                .iter()
-                .filter_map(|s| s.strip_prefix('!'))
-            {
-                for target in matches(&workspace.projects, selector)? {
-                    edges.remove(&target);
                 }
             }
             graph.dependencies.insert(
@@ -161,12 +172,14 @@ impl ProjectGraph {
                     })
                     .collect(),
             );
+            let mut data = project.clone();
+            data.implicit_dependencies = implicit[name].clone();
             graph.nodes.insert(
                 name.clone(),
                 Node {
                     name: name.clone(),
                     kind: node_type(workspace, name, project).into(),
-                    data: project.clone(),
+                    data,
                 },
             );
         }
@@ -266,55 +279,96 @@ pub fn graph_order(
     names
 }
 
-/// Positive selectors are unioned; exclusions win regardless of their order.
-/// With no positive selectors, start with all projects.
+/// The projects `--projects` and `--exclude` select, as Nx's `run-many`
+/// selects them: every project without patterns, else what the patterns
+/// match, in order, less what the exclusions match among those.
 pub fn select_projects(
     projects: &BTreeMap<String, Project>,
     selectors: &[String],
     excludes: &[String],
 ) -> Result<BTreeSet<String>> {
-    let positives: Vec<_> = selectors.iter().filter(|s| !s.starts_with('!')).collect();
-    let mut selected = if positives.is_empty() {
-        projects.keys().cloned().collect()
+    let selected: BTreeMap<String, &Project> = if selectors.is_empty() {
+        projects
+            .iter()
+            .map(|(name, project)| (name.clone(), project))
+            .collect()
     } else {
-        BTreeSet::new()
+        find_matching_projects(selectors, projects, Reader::Nx)
+            .into_iter()
+            .map(|name| {
+                let project = &projects[&name];
+                (name, project)
+            })
+            .collect()
     };
-    for selector in positives {
-        selected.extend(matches(projects, selector)?);
-    }
-    for selector in selectors
-        .iter()
-        .filter_map(|s| s.strip_prefix('!'))
-        .chain(excludes.iter().map(String::as_str))
-    {
-        for name in matches(projects, selector)? {
-            selected.remove(&name);
-        }
-    }
-    Ok(selected)
-}
-
-fn matches(projects: &BTreeMap<String, Project>, selector: &str) -> Result<BTreeSet<String>> {
-    if selector.is_empty() {
-        bail!("project selector must not be empty");
-    }
-    let tag = selector.strip_prefix("tag:");
-    let glob = Glob::new(tag.unwrap_or(selector))
-        .with_context(|| format!("invalid project selector {selector:?}"))?
-        .compile_matcher();
-    Ok(projects
-        .iter()
-        .filter(|(name, project)| {
-            if tag.is_some() {
-                project.tags.iter().any(|tag| glob.is_match(tag))
-            } else {
-                glob.is_match(name.as_str())
-            }
-        })
-        .map(|(name, _)| name.clone())
+    let excluded: BTreeSet<String> = find_matching_projects(excludes, &selected, Reader::Nx)
+        .into_iter()
+        .collect();
+    Ok(selected
+        .into_keys()
+        .filter(|name| !excluded.contains(name))
         .collect())
 }
 
-fn is_pattern(selector: &str) -> bool {
-    selector.starts_with("tag:") || selector.contains(['*', '?', '[', '{'])
+/// Nx's `assertWorkspaceValidity`: every implicit dependency, `!` ones
+/// included, names a project or a pattern matching one. `nx-cloud:`
+/// references to other workspaces are not checked.
+fn check_implicit_dependencies(projects: &BTreeMap<String, Project>) -> Result<()> {
+    let mut invalid = Vec::new();
+    for (name, project) in projects {
+        let missing: Vec<&String> = project
+            .implicit_dependencies
+            .iter()
+            .filter(|dependency| {
+                let target = dependency.strip_prefix('!').unwrap_or(dependency);
+                !target.starts_with("nx-cloud:")
+                    && !projects.contains_key(target)
+                    && find_matching_projects(&[dependency.as_str()], projects, Reader::Nx)
+                        .is_empty()
+            })
+            .collect();
+        if !missing.is_empty() {
+            let mut message = format!("  {name}");
+            for dependency in missing {
+                message.push_str(&format!("\n    {dependency}"));
+            }
+            invalid.push(message);
+        }
+    }
+    if !invalid.is_empty() {
+        bail!(
+            "The following implicitDependencies point to non-existent project(s):\n{}",
+            invalid.join("\n\n")
+        );
+    }
+    Ok(())
+}
+
+/// Nx's `normalizeImplicitDependencies`: the projects the patterns select,
+/// the project itself left out, then a `!` and the name of each project an
+/// exclusion matches, which removes any other edge to it.
+fn expand_implicit_dependencies(
+    source: &str,
+    dependencies: &[String],
+    projects: &BTreeMap<String, Project>,
+) -> Vec<String> {
+    let (negative, positive): (Vec<&String>, Vec<&String>) = dependencies
+        .iter()
+        .partition(|dependency| dependency.starts_with('!'));
+    let mut expanded: Vec<String> = if positive.is_empty() {
+        Vec::new()
+    } else {
+        let patterns: Vec<&String> = positive.iter().chain(&negative).copied().collect();
+        find_matching_projects(&patterns, projects, Reader::Nx)
+            .into_iter()
+            .filter(|name| name != source)
+            .collect()
+    };
+    let negative: Vec<&str> = negative.iter().map(|dependency| &dependency[1..]).collect();
+    expanded.extend(
+        find_matching_projects(&negative, projects, Reader::Nx)
+            .into_iter()
+            .map(|name| format!("!{name}")),
+    );
+    expanded
 }
