@@ -2286,22 +2286,16 @@ fn the_sandbox_reports_and_refuses_what_a_task_does_not_declare() {
             report.to_str().unwrap(),
         ],
     );
-    // Some machines, such as CI's, keep the sandbox's reports out of the log
-    // qk reads; audit then refuses to start, and enforce still works.
-    if String::from_utf8_lossy(&audit.stderr).contains("did not reach the system log") {
-        eprintln!("the sandbox's reports are not in this machine's log; audit not checked");
-    } else {
-        success(audit);
-        let findings: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
-        let build = &findings["tasks"]["app:build"];
-        assert_eq!(build["undeclaredReads"], json!(["other/notes.txt"]));
-        assert_eq!(build["unkeyedReads"], json!([".env"]));
-        assert_eq!(build["strayWrites"], json!(["stray.txt"]));
-        assert!(findings["tasks"].get("app:clean").is_none(), "{findings}");
-        // Audit lets the task do it all.
-        assert!(temp.path().join("stray.txt").is_file());
-        fs::remove_file(temp.path().join("stray.txt")).unwrap();
-    }
+    success(audit);
+    let findings: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+    let build = &findings["tasks"]["app:build"];
+    assert_eq!(build["undeclaredReads"], json!(["other/notes.txt"]));
+    assert_eq!(build["unkeyedReads"], json!([".env"]));
+    assert_eq!(build["strayWrites"], json!(["stray.txt"]));
+    assert!(findings["tasks"].get("app:clean").is_none(), "{findings}");
+    // Audit lets the task do it all.
+    assert!(temp.path().join("stray.txt").is_file());
+    fs::remove_file(temp.path().join("stray.txt")).unwrap();
     let enforced = run(
         temp.path(),
         &[
@@ -2352,10 +2346,6 @@ fn warm_suggest_lists_the_directories_a_task_wrote_outside_its_outputs() {
     };
     git(&["init", "--quiet"]);
     let output = run(temp.path(), &["warm", "suggest", "app:build"]);
-    if String::from_utf8_lossy(&output.stderr).contains("did not reach the system log") {
-        eprintln!("the sandbox's reports are not in this machine's log; suggest not checked");
-        return;
-    }
     let stdout = String::from_utf8_lossy(&success(output).stdout).into_owned();
     assert!(stdout.contains("\n  .tool  "), "{stdout}");
     // A write beside sources is not the task's directory to keep.
@@ -3044,10 +3034,6 @@ fn input_analysis_recognizes_nested_links_and_structured_link_targets() {
             "analysis.json",
         ],
     );
-    #[cfg(target_os = "macos")]
-    if String::from_utf8_lossy(&output.stderr).contains("did not reach the system log") {
-        return;
-    }
     success(output);
     let report: Value =
         serde_json::from_slice(&fs::read(temp.path().join("analysis.json")).unwrap()).unwrap();
@@ -3127,7 +3113,6 @@ fn input_analysis_cancellation_stops_descendants_and_saves_an_advisory_report() 
         .spawn()
         .unwrap(),
     );
-    // Also permits macOS CI machines without exposed Seatbelt logs to skip.
     let deadline = Instant::now() + Duration::from_secs(15);
     while !temp.path().join("heartbeat.started").exists() {
         if child.try_wait().unwrap().is_some() {
@@ -3139,10 +3124,6 @@ fn input_analysis_cancellation_stops_descendants_and_saves_an_advisory_report() 
                 .unwrap()
                 .read_to_string(&mut stderr)
                 .unwrap();
-            #[cfg(target_os = "macos")]
-            if stderr.contains("did not reach the system log") {
-                return;
-            }
             panic!("recorder did not start: {stderr}");
         }
         assert!(
@@ -3223,11 +3204,6 @@ fn input_analysis_records_descendants_outputs_and_uncovered_inputs_without_cache
             "draft.json",
         ],
     );
-    #[cfg(target_os = "macos")]
-    if String::from_utf8_lossy(&output.stderr).contains("did not reach the system log") {
-        eprintln!("Seatbelt logs unavailable; recorder integration not checked");
-        return;
-    }
     success(output);
     let draft: Value =
         serde_json::from_slice(&fs::read(temp.path().join("draft.json")).unwrap()).unwrap();
