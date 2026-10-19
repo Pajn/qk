@@ -38,7 +38,8 @@ use anyhow::{Result, bail};
 use serde_json::Value;
 use ureq::unversioned::resolver::DefaultResolver;
 use ureq::unversioned::transport::{
-    Buffers, ConnectionDetails, Connector, DefaultConnector, NextTimeout, Transport,
+    Buffers, ConnectProxyConnector, ConnectionDetails, Connector, NextTimeout, RustlsConnector,
+    TcpConnector, Transport,
 };
 
 use store::{Object, Store};
@@ -214,11 +215,21 @@ fn agent() -> ureq::Agent {
         .max_idle_connections(IDLE_CONNECTIONS)
         .max_idle_connections_per_host(IDLE_CONNECTIONS)
         .build();
-    let connector = DefaultConnector::default().chain(Restarting);
-    ureq::Agent::with_parts(config, connector, DefaultResolver::default())
+    ureq::Agent::with_parts(config, connector(), DefaultResolver::default())
 }
 
-/// Wraps each connection so that a read a signal interrupts is made again.
+/// ureq's default connections, a CONNECT proxy's included, with
+/// [`Restarting`] between the socket and TLS: rustls restarts an interrupted
+/// read itself, with the socket's whole timeout each time.
+fn connector() -> impl Connector<Out = impl Transport> {
+    ().chain(ConnectProxyConnector::default())
+        .chain(TcpConnector::default())
+        .chain(Restarting)
+        .chain(RustlsConnector::default())
+}
+
+/// Wraps each connection so that a read a signal interrupts is made again,
+/// within the time the read had left.
 ///
 /// On Linux a socket read with a timeout, as every read of the agent's is,
 /// fails with EINTR when any signal reaches the thread, even one that is then
@@ -230,15 +241,17 @@ fn agent() -> ureq::Agent {
 #[derive(Debug)]
 struct Restarting;
 
-impl Connector<Box<dyn Transport>> for Restarting {
+impl<In: Transport> Connector<In> for Restarting {
     type Out = Box<dyn Transport>;
 
     fn connect(
         &self,
         _details: &ConnectionDetails,
-        chained: Option<Self::Out>,
+        chained: Option<In>,
     ) -> std::result::Result<Option<Self::Out>, ureq::Error> {
-        Ok(chained.map(|transport| Box::new(Restart(transport)) as Self::Out))
+        Ok(chained.map(|transport| {
+            Box::new(Restart(Box::new(transport) as Box<dyn Transport>)) as Self::Out
+        }))
     }
 }
 
@@ -1203,7 +1216,6 @@ mod agent_tests {
     use std::os::unix::thread::JoinHandleExt;
     use std::sync::mpsc::channel;
     use std::time::Duration;
-    use ureq::unversioned::transport::Connector;
 
     extern "C" fn interrupt(_: libc::c_int) {}
 
@@ -1258,8 +1270,21 @@ mod agent_tests {
         server.join().unwrap();
     }
 
+    /// A stalled request times out on time whatever signals arrive, over
+    /// HTTP and over HTTPS, where rustls restarts interrupted reads itself.
     #[test]
     fn signals_do_not_keep_a_stalled_request_waiting_past_its_timeout() {
+        for scheme in ["http", "https"] {
+            let (elapsed, result) = stalled(scheme);
+            assert!(result.unwrap_err().contains("timeout"), "{scheme}");
+            assert!(elapsed < Duration::from_secs(2), "{scheme}: {elapsed:?}");
+        }
+    }
+
+    /// A request to a server that takes the connection and never answers,
+    /// with its client signalled every 20 ms: how long it took, and how it
+    /// ended.
+    fn stalled(scheme: &str) -> (Duration, Result<(), String>) {
         // SAFETY: as above; installing the same handler again is harmless.
         unsafe {
             let mut action: libc::sigaction = std::mem::zeroed();
@@ -1271,18 +1296,15 @@ mod agent_tests {
             );
         }
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}/", listener.local_addr().unwrap());
-        // The server takes the request and never answers.
+        let url = format!("{scheme}://{}/", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || listener.accept().unwrap());
         let client = std::thread::spawn(move || {
             let config = ureq::Agent::config_builder()
                 .timeout_global(Some(Duration::from_millis(300)))
                 .build();
-            let connector =
-                ureq::unversioned::transport::DefaultConnector::default().chain(super::Restarting);
             let agent = ureq::Agent::with_parts(
                 config,
-                connector,
+                super::connector(),
                 ureq::unversioned::resolver::DefaultResolver::default(),
             );
             let started = std::time::Instant::now();
@@ -1295,10 +1317,9 @@ mod agent_tests {
             unsafe { libc::pthread_kill(client.as_pthread_t(), libc::SIGUSR1) };
             std::thread::sleep(Duration::from_millis(20));
         }
-        let (elapsed, result) = client.join().unwrap();
-        assert!(result.unwrap_err().contains("timeout"));
-        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+        let ended = client.join().unwrap();
         drop(server.join());
+        ended
     }
 }
 
