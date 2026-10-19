@@ -124,7 +124,7 @@ of S3, with its token in `QK_STORE_SERVER_TOKEN`:
 
 A store server keeps the same entries, but each run first tells it which
 outputs the local cache holds, and it leaves those out of every entry it sends.
-It keeps the index itself and commits each entry once, so runs neither write
+A run that cannot tell it says why, and receives entries whole. It keeps the index itself and commits each entry once, so runs neither write
 announcements nor merge listings. `localMode`, `ciMode`, `uploadMode` and
 `NX_POWERPACK_CACHE_MODE` apply as they do for `s3`; setting both `s3` and
 `storeServer` is an error. A read token fetches; a write token also uploads.
