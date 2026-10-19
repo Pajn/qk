@@ -760,7 +760,9 @@ impl Snapshot {
                 .values()
                 .flat_map(|scope| &scope.patterns)
                 .filter(|pattern| !pattern.excluded)
-                .map(|pattern| workspace.root.join(&pattern.prefix))
+                .map(|pattern| &pattern.prefix)
+                .chain(resolver.json_globs.iter().map(|glob| &glob.prefix))
+                .map(|prefix| workspace.root.join(prefix))
                 .collect(),
         );
         prefixes.insert(task.id.clone(), Arc::clone(&paths));
@@ -3198,6 +3200,38 @@ mod tests {
                 .unwrap()
                 .files
                 .contains("right/empty/another.txt")
+        );
+    }
+
+    #[test]
+    fn membership_watches_the_directories_json_globs_select_from() {
+        let (root, mut workspace, _) = fixture(Some(json!(["{projectRoot}/dist"])));
+        let targets = &mut workspace.projects.get_mut("app").unwrap().targets;
+        targets.get_mut("build").unwrap().inputs = Some(vec![json!(
+            {"json": "{workspaceRoot}/config/**/*.json", "fields": ["version"]}
+        )]);
+        std::fs::create_dir_all(root.path().join("config/empty")).unwrap();
+        let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
+        let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
+        snapshot.current_files(&workspace.root).unwrap();
+        std::thread::sleep(Duration::from_millis(2100));
+        let prefixes = snapshot
+            .membership_prefixes(&workspace, &graph.tasks["app:build"])
+            .unwrap();
+        snapshot
+            .current_files_for(&workspace.root, Some(&prefixes), "test")
+            .unwrap();
+        std::fs::write(
+            root.path().join("config/empty/new.json"),
+            r#"{"version": 1}"#,
+        )
+        .unwrap();
+        assert!(
+            snapshot
+                .current_files_for(&workspace.root, Some(&prefixes), "test")
+                .unwrap()
+                .files
+                .contains("config/empty/new.json")
         );
     }
 
