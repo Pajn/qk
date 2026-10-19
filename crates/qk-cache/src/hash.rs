@@ -2567,11 +2567,31 @@ pub fn inputs(
     Ok(hash)
 }
 
-/// The key for a task's inputs.
+/// The key for a task's inputs. Objects are keyed with their fields sorted,
+/// so the order they were written in, which configuration keeps, does not
+/// change the key.
 pub fn key(inputs: &Value) -> Result<String> {
-    Ok(blake3::hash(&serde_json::to_vec(inputs)?)
+    Ok(blake3::hash(&serde_json::to_vec(&sorted(inputs))?)
         .to_hex()
         .to_string())
+}
+
+/// `value` with every object's fields in key order.
+fn sorted(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut fields: Vec<_> = object.iter().collect();
+            fields.sort_unstable_by_key(|(name, _)| *name);
+            Value::Object(
+                fields
+                    .into_iter()
+                    .map(|(name, value)| (name.clone(), sorted(value)))
+                    .collect(),
+            )
+        }
+        Value::Array(items) => Value::Array(items.iter().map(sorted).collect()),
+        other => other.clone(),
+    }
 }
 
 pub fn fingerprint(
@@ -2715,6 +2735,15 @@ mod tests {
 
     /// A `json` glob selects a dependency's declared outputs, keyed by their
     /// fields, and makes that dependency a producer, as a fileset does.
+
+    #[test]
+    fn keys_ignore_the_order_object_fields_were_written_in() {
+        let written = json!({"options": {"cwd": "app", "command": "x"}, "args": ["a", "b"]});
+        let reordered = json!({"args": ["a", "b"], "options": {"command": "x", "cwd": "app"}});
+        assert_eq!(key(&written).unwrap(), key(&reordered).unwrap());
+        let swapped = json!({"options": {"cwd": "app", "command": "x"}, "args": ["b", "a"]});
+        assert_ne!(key(&written).unwrap(), key(&swapped).unwrap());
+    }
     #[test]
     fn json_globs_select_dependency_outputs() {
         let root = tempfile::tempdir().unwrap();

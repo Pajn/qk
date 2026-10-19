@@ -57,17 +57,14 @@ pub fn show(workspace: &Workspace, json: bool, strict: bool) -> Result<i32> {
     for (project, definition) in &workspace.projects {
         for (target, definition) in &definition.targets {
             let location = format!("{project}:{target}");
-            let executor = definition.executor.as_deref();
-            if !matches!(
-                executor,
-                Some("nx:run-commands" | "nx:run-script" | "nx:noop")
-            ) {
+            // Every target has an executor: one that runs nothing is a no-op
+            // or left out as the workspace loads.
+            if let Some(executor) = definition.executor.as_deref().filter(|executor| {
+                !matches!(*executor, "nx:run-commands" | "nx:run-script" | "nx:noop")
+            }) {
                 findings.push(Finding {
                     severity: "error", code: "unsupported-executor", location: location.clone(),
-                    message: match executor {
-                        Some(executor) => format!("Executor {executor:?} is unsupported; use shell commands, package scripts or nx:noop."),
-                        None => "Target has no executor or command.".into(),
-                    },
+                    message: format!("Executor {executor:?} is unsupported; use shell commands, package scripts or nx:noop."),
                 });
             }
             for (key, fields) in [

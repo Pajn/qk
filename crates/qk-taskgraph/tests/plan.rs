@@ -11,6 +11,14 @@ fn workspace(projects: Value) -> (TempDir, Workspace) {
         std::fs::create_dir(&directory).unwrap();
         let mut project = project.clone();
         project["name"] = json!(name);
+        // A target that runs nothing is left out, so each runs nx:noop.
+        if let Some(Value::Object(targets)) = project.get_mut("targets") {
+            for target in targets.values_mut() {
+                if target.get("executor").is_none() && target.get("command").is_none() {
+                    target["executor"] = json!("nx:noop");
+                }
+            }
+        }
         std::fs::write(directory.join("project.json"), project.to_string()).unwrap();
     }
     let loaded = Workspace::load(temp.path()).unwrap();
@@ -108,10 +116,10 @@ fn configuration_environment_replaces_base_environment() {
         assert_eq!(task.definition.options["env"], expected);
         if task.configuration.as_deref() == Some("prod") {
             assert_eq!(task.definition.options["command"], "prod");
-            assert_eq!(
-                task.definition.outputs,
-                Some(vec!["{projectRoot}/out".into()])
-            );
+            // As in Nx, a configuration's `outputs` is an option like any
+            // other, its tokens resolved.
+            assert_eq!(task.definition.options["outputs"], json!(["app/out"]));
+            assert_eq!(task.definition.outputs, None);
         }
     }
 }
@@ -156,16 +164,93 @@ fn reports_cycle_path_and_unknown_root_or_configuration() {
 }
 
 #[test]
-fn rejects_conflicting_arguments_for_shared_task() {
-    let (_temp, workspace) = workspace(json!({"app":{"targets":{"build":{}}}}));
-    let first = Request::parse("app:build").unwrap();
+fn a_shared_task_keeps_what_it_was_first_reached_with() {
+    let (_temp, workspace) = workspace(json!({
+        "app": {"targets":{
+            "build":{"options":{"mode":"app"}, "dependsOn":[
+                {"target":"lint", "options":"forward"},
+                {"projects":"lib", "target":"build", "params":"forward"}
+            ]},
+            "lint":{"options":{"mode":"lint"}},
+            "check":{"dependsOn":["lint", "build"]}
+        }},
+        "lib": {"targets":{"build":{}}}
+    }));
+    // lint is reached plainly first, then with app:build's options.
+    let mut request = Request::parse("app:check").unwrap();
+    request.args = vec!["--fast".into()];
+    let graph = TaskGraph::build(&workspace, &[request]).unwrap();
+    assert_eq!(graph.tasks["app:lint"].definition.options["mode"], "lint");
+    assert_eq!(graph.tasks["lib:build"].args, ["--fast"]);
+    let first = Request::parse("app:lint").unwrap();
     let mut second = first.clone();
     second.args.push("different".into());
-    assert!(
-        TaskGraph::build(&workspace, &[first, second])
-            .unwrap_err()
-            .to_string()
-            .contains("conflicting")
+    let graph = TaskGraph::build(&workspace, &[first, second]).unwrap();
+    assert!(graph.tasks["app:lint"].args.is_empty());
+}
+
+#[test]
+fn forwarded_options_become_the_dependency_options() {
+    let (_temp, workspace) = workspace(json!({
+        "app": {"targets":{"build":{
+            "options":{"list":["a", "b"], "none":null, "env":{"A":"1"}, "mode":"base"},
+            "configurations":{"prod":{"mode":"prod"}},
+            "dependsOn":[{"target":"lint", "options":"forward", "unknown":true}]
+        }, "lint":{"options":{"mode":"lint", "own":true}}}}
+    }));
+    let graph = TaskGraph::build(&workspace, &[Request::parse("app:build:prod").unwrap()]).unwrap();
+    let lint = &graph.tasks["app:lint"];
+    assert_eq!(
+        Value::Object(lint.definition.options.clone()),
+        json!({"mode": "prod", "own": true, "list": ["a", "b"], "none": null, "env": {"A": "1"}})
+    );
+    assert!(lint.args.is_empty());
+}
+
+#[test]
+fn params_forward_the_runs_own_arguments_through_any_chain() {
+    let (_temp, workspace) = workspace(json!({
+        "app": {"targets":{"a":{"dependsOn":["b"]}, "b":{"dependsOn":[{"target":"c", "params":"forward"}]}, "c":{}}}
+    }));
+    let mut request = Request::parse("app:a").unwrap();
+    request.args = vec!["--x=1".into()];
+    let graph = TaskGraph::build(&workspace, &[request]).unwrap();
+    assert!(graph.tasks["app:b"].args.is_empty());
+    assert_eq!(graph.tasks["app:c"].args, ["--x=1"]);
+}
+
+#[test]
+fn dependency_targets_may_contain_colons() {
+    let (_temp, workspace) = workspace(json!({
+        "app": {"implicitDependencies":["lib"], "targets":{
+            "build":{"dependsOn":["test:unit", "lib:build", "^lint:ci", {"target":"e2e:ci"}, "missing:target"]},
+            "test:unit":{}, "e2e:ci":{}
+        }},
+        "lib": {"targets":{"build":{}, "lint:ci":{}}}
+    }));
+    let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
+    assert_eq!(
+        graph.tasks["app:build"]
+            .dependencies
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["app:e2e:ci", "app:test:unit", "lib:build", "lib:lint:ci"]
+    );
+}
+
+#[test]
+fn named_projects_win_over_dependencies_true() {
+    let (_temp, workspace) = workspace(json!({
+        "app": {"implicitDependencies":["lib"], "targets":{"build":{"dependsOn":[
+            {"target":"build", "projects":["other"], "dependencies":true}
+        ]}}},
+        "lib": {"targets":{"build":{}}}, "other": {"targets":{"build":{}}}
+    }));
+    let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
+    assert_eq!(
+        graph.tasks["app:build"].dependencies,
+        ["other:build".to_owned()].into()
     );
 }
 

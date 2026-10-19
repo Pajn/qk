@@ -50,7 +50,10 @@ A named input cannot itself declare `dependencies` or `projects`.
 An object of target defaults; defaults to empty. Matching keys are tried in
 this order: executor, target name, then matching target-name globs, longest
 first. The first key with a matching entry wins; keys do not all accumulate.
-Project target definitions override the selected defaults.
+As in Nx 24, the selected defaults lie beneath the project's files, which
+merge over them as described in [Merging](targets.md#merging), spreads
+included. Beneath a default there is only the earlier matching entries of
+its key, so a spread in the first adds nothing.
 
 Each value may be a target object or an array of target objects. Array entries
 may have `filter.projects` (names, globs, `tag:` and `!` selectors),
@@ -59,9 +62,12 @@ may have `filter.projects` (names, globs, `tag:` and `!` selectors),
 An entry naming an executor different from the target's own is left out,
 although its key still wins.
 
-Options merge by key and each named configuration merges by key. Nested
-values and arrays are replaced. Changing executor drops options and
-configurations belonging to the previous executor.
+As in Nx, a default takes the executor of the target it applies to, and a
+run-commands target's command, so that the target merges over it, unless
+it names its own command; a default naming another command or script is
+replaced by the target whole. A default whose target the files replace
+along the way still lies beneath the result; see
+[Nx compatibility](../compatibility.md#deliberate-differences).
 
 ## `defaultBase`
 

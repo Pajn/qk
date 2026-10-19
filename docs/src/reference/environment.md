@@ -3,13 +3,14 @@
 ## Environment precedence
 
 Environment precedence, highest first: `FORCE_COLOR` from `color: true`,
-configuration `env`, `options.env`, target-level `env`, the variables Nx sets
+configuration `env`, `options.env`, target-level `env` (a qk extension), the variables Nx sets
 for every task, the inherited process environment, the task's dotenv files
 in Nx's order: in the
 project root and then the workspace root, `.env.<target>.<configuration>`,
 `.env.<configuration>`, `.env.<target>`, then `.env.local`, `.local.env` and
 `.env`, each also as `.env.<name>.local`, `.<name>.local.env` and
-`.<name>.env`, then `envFile`. A dotenv file never overrides a variable an
+`.<name>.env`, then `envFile`. `color`, `env` and `envFile` are
+run-commands options; run-script reads none of them. A dotenv file never overrides a variable an
 earlier source set. As in Nx 24, `envFile` also sets a variable that is set
 but empty. The
 task variables are `NX_TASK_TARGET_PROJECT`, `NX_TASK_TARGET_TARGET`,

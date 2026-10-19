@@ -51,8 +51,23 @@ When a name occurs in multiple sections, precedence is `dependencies`,
 - `exec --exclude-task-dependencies` runs the command in the selected
   projects; Nx's leaves every project out and runs nothing.
 - `project.local.json`, `nx.local.json`, `qk:threads`, `qk:warm`,
-  `qk:affectedProfiles` and `qk:reachability` are qk extensions. Nx does not
-  apply them.
+  `qk:affectedProfiles`, `qk:reachability` and a target-level `env` are qk
+  extensions. Nx does not apply them.
+- A target default stays beneath a target the project's files replace along
+  the way, for instance when `includedScripts` makes a script target that
+  project.json gives a command. Nx stamps the default with the executor the
+  files end with, so the script target in between replaces it and the
+  default is lost, unlike when the script is left out.
+- Two run-commands targets whose `command` is an array merge when the arrays
+  are equal. Nx compares arrays by identity, so they never do.
+- run-script quotes each of the task's arguments for the shell. Nx joins them
+  as they are, so an argument with a space becomes several.
+- Options a dependency forwards with `options: "forward"` are taken as they
+  are. Nx interpolates them again, which only normalizes as a path the text
+  of a value holding braces, turning `http://x/{args.y}` into
+  `http:/x/{args.y}`.
+- Tokens in a task's arguments resolve with `/` separators on every
+  platform; Nx joins them with `\` on Windows.
 - Input negated-group exclusions apply to the pattern they came from in qk;
   Nx applies them across a project's patterns. qk can include extra inputs.
 - A `json` input naming one file reads it even when source ignore rules

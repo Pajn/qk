@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use qk_config::{Target, Workspace};
 use qk_graph::{ProjectGraph, select_projects};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 #[derive(Clone, Debug)]
 pub struct Request {
@@ -196,7 +196,13 @@ impl TaskGraph {
         };
         let mut roots = BTreeSet::new();
         for request in requests {
-            roots.insert(builder.visit(request.clone(), true)?.with_context(|| {
+            let cli = request.args.clone();
+            let visit = Visit {
+                request: request.clone(),
+                overrides: Map::new(),
+                cli: &cli,
+            };
+            roots.insert(builder.visit(visit, true)?.with_context(|| {
                 format!(
                     "project {:?} has no target {:?}",
                     request.project, request.target
@@ -256,6 +262,24 @@ impl TaskGraph {
     }
 }
 
+/// What one `dependsOn` entry declares: its requests, the options it
+/// forwards, whether its projects are dependencies rather than named ones,
+/// and how it depends on them.
+struct Declared {
+    requests: Vec<Request>,
+    overrides: Map<String, Value>,
+    derived: bool,
+    edge: Edge,
+}
+
+/// A task to visit: its request, the options a dependent forwards to it,
+/// and the run's own arguments, which `params: "forward"` passes on.
+struct Visit<'c> {
+    request: Request,
+    overrides: Map<String, Value>,
+    cli: &'c [String],
+}
+
 struct Builder<'a> {
     workspace: &'a Workspace,
     projects: ProjectGraph,
@@ -267,7 +291,12 @@ struct Builder<'a> {
 }
 
 impl Builder<'_> {
-    fn visit(&mut self, request: Request, required: bool) -> Result<Option<String>> {
+    fn visit(&mut self, visit: Visit, required: bool) -> Result<Option<String>> {
+        let Visit {
+            request,
+            overrides,
+            cli,
+        } = visit;
         let project = self
             .workspace
             .projects
@@ -312,39 +341,38 @@ impl Builder<'_> {
             self.cycles.push(cycle);
             return Ok(Some(id));
         }
-        if let Some(existing) = self.tasks.get(&id) {
-            if existing.args != request.args {
-                bail!("task {id} requested with conflicting forwarded arguments");
-            }
-            if self
-                .visited
-                .contains(&(id.clone(), requested_configuration.clone()))
-            {
-                return Ok(Some(id));
-            }
+        if self
+            .visited
+            .contains(&(id.clone(), requested_configuration.clone()))
+        {
+            return Ok(Some(id));
         }
-        let mut definition = target.clone();
-        if let Some(name) = &configuration {
-            let options = target
-                .configurations
-                .get(name)
-                .with_context(|| format!("{id}: default configuration does not exist"))?;
-            for (key, value) in options {
-                if key == "outputs" {
-                    definition.outputs =
-                        Some(serde_json::from_value(value.clone()).with_context(|| {
-                            format!("{id}: configuration outputs must be an array of paths")
-                        })?);
-                } else {
-                    if key == "env" {
-                        value.as_object().with_context(|| {
-                            format!("{id}: configuration env must be an object")
-                        })?;
+        // As in Nx, a task reached again keeps the arguments and forwarded
+        // options it was first reached with.
+        let (args, definition) = match self.tasks.get(&id) {
+            Some(existing) => (existing.args.clone(), existing.definition.clone()),
+            None => {
+                let mut definition = target.clone();
+                if let Some(name) = &configuration {
+                    let options = target
+                        .configurations
+                        .get(name)
+                        .with_context(|| format!("{id}: default configuration does not exist"))?;
+                    for (key, value) in options {
+                        if key == "env" {
+                            value.as_object().with_context(|| {
+                                format!("{id}: configuration env must be an object")
+                            })?;
+                        }
+                        definition.options.insert(key.clone(), value.clone());
                     }
-                    definition.options.insert(key.clone(), value.clone());
                 }
+                // Forwarded options win over the target's own, as Nx's
+                // overrides do.
+                definition.options.extend(overrides);
+                (request.args, definition)
             }
-        }
+        };
         // As in Nx, creating a task validates its outputs.
         if let Some(outputs) = &definition.outputs {
             validate_outputs(outputs)?;
@@ -354,7 +382,7 @@ impl Builder<'_> {
             project: request.project,
             target: request.target,
             configuration,
-            args: request.args,
+            args,
             definition,
             dependencies: BTreeSet::new(),
             edges: BTreeMap::new(),
@@ -372,6 +400,7 @@ impl Builder<'_> {
             &task,
             &task.project,
             requested_configuration.as_deref(),
+            cli,
             &mut dependencies,
             &mut BTreeSet::new(),
         )?;
@@ -397,6 +426,7 @@ impl Builder<'_> {
         task: &Task,
         derive_from: &str,
         requested_configuration: Option<&str>,
+        cli: &[String],
         dependencies: &mut Dependencies,
         seen: &mut BTreeSet<String>,
     ) -> Result<()> {
@@ -404,8 +434,13 @@ impl Builder<'_> {
             return Ok(());
         }
         for dependency in task.definition.depends_on.as_deref().unwrap_or_default() {
-            let (requests, derived, edge) = self
-                .dependencies(task, derive_from, requested_configuration, dependency)
+            let Declared {
+                requests,
+                overrides,
+                derived,
+                edge,
+            } = self
+                .dependencies(task, derive_from, requested_configuration, cli, dependency)
                 .with_context(|| format!("dependsOn of {}", task.id))?;
             for request in requests {
                 let has_target = self.workspace.projects[&request.project]
@@ -413,28 +448,42 @@ impl Builder<'_> {
                     .contains_key(&request.target);
                 if derived && !has_target {
                     let project = request.project;
-                    self.collect(task, &project, requested_configuration, dependencies, seen)?;
+                    self.collect(
+                        task,
+                        &project,
+                        requested_configuration,
+                        cli,
+                        dependencies,
+                        seen,
+                    )?;
                 } else if request.project == task.project && request.target == task.target {
                     // Reached back to itself through a dependency cycle.
                     continue;
-                } else if let Some(id) = self.visit(request, false)? {
-                    dependencies.insert(id, edge);
+                } else {
+                    let visit = Visit {
+                        request,
+                        overrides: overrides.clone(),
+                        cli,
+                    };
+                    if let Some(id) = self.visit(visit, false)? {
+                        dependencies.insert(id, edge);
+                    }
                 }
             }
         }
         Ok(())
     }
 
-    /// The requests one `dependsOn` entry makes, whether its projects are
-    /// `derive_from`'s dependencies rather than named ones, and how it
-    /// depends on them.
+    /// What one `dependsOn` entry declares, with project dependencies taken
+    /// from `derive_from`.
     fn dependencies(
         &self,
         task: &Task,
         derive_from: &str,
         requested_configuration: Option<&str>,
+        cli: &[String],
         value: &Value,
-    ) -> Result<(Vec<Request>, bool, Edge)> {
+    ) -> Result<Declared> {
         let mut forward_options = false;
         let mut edge = Edge::default();
         let (target, projects, forward, derived) = match value {
@@ -446,43 +495,20 @@ impl Builder<'_> {
                         false,
                         true,
                     )
-                } else if let Some((project, target)) = value.split_once(':') {
-                    (target.to_owned(), vec![project.to_owned()], false, false)
                 } else {
-                    (value.clone(), vec![task.project.clone()], false, false)
+                    let (project, target) = self.target_reference(value, &task.project);
+                    (target, vec![project], false, false)
                 }
             }
             Value::Object(object) => {
+                // As in Nx, fields it does not know are ignored, and any
+                // `params` or `options` but `forward` leaves them behind.
                 let target = object
                     .get("target")
                     .and_then(Value::as_str)
                     .context("dependency target must be a string")?;
-                let forward = match object.get("params").and_then(Value::as_str) {
-                    None if !object.contains_key("params") => false,
-                    Some("ignore") => false,
-                    Some("forward") => true,
-                    _ => bail!("dependency params must be forward or ignore"),
-                };
-                forward_options = match object.get("options").and_then(Value::as_str) {
-                    None if !object.contains_key("options") => false,
-                    Some("ignore") => false,
-                    Some("forward") => true,
-                    _ => bail!("dependency options must be forward or ignore"),
-                };
-                for key in object.keys() {
-                    if !matches!(
-                        key.as_str(),
-                        "target"
-                            | "projects"
-                            | "dependencies"
-                            | "params"
-                            | "options"
-                            | "inputs"
-                            | "waitFor"
-                    ) {
-                        bail!("unsupported dependency field {key:?}");
-                    }
-                }
+                let forward = object.get("params").and_then(Value::as_str) == Some("forward");
+                forward_options = object.get("options").and_then(Value::as_str) == Some("forward");
                 if let Some(inputs) = object.get("inputs") {
                     edge.inputs = inputs
                         .as_bool()
@@ -500,12 +526,8 @@ impl Builder<'_> {
                         .context("dependency dependencies must be boolean")?,
                     None => false,
                 };
-                if dependencies && object.contains_key("projects") {
-                    bail!("dependency cannot specify both projects and dependencies: true");
-                }
-                let projects = if dependencies {
-                    self.project_dependencies(derive_from)
-                } else if let Some(selectors) = object.get("projects") {
+                // Named projects win over `dependencies: true`, as in Nx.
+                let projects = if let Some(selectors) = object.get("projects") {
                     let selectors: Vec<String> = match selectors {
                         // Nx 24 dropped the Nx 15 spellings: a task's own
                         // project is no `projects`, its dependencies `^target`.
@@ -525,16 +547,16 @@ impl Builder<'_> {
                     select_projects(&self.workspace.projects, &selectors, &[])?
                         .into_iter()
                         .collect()
+                } else if dependencies {
+                    self.project_dependencies(derive_from)
                 } else {
                     vec![task.project.clone()]
                 };
-                (target.to_owned(), projects, forward, dependencies)
+                let derived = dependencies && !object.contains_key("projects");
+                (target.to_owned(), projects, forward, derived)
             }
             _ => bail!("dependency must be a string or object"),
         };
-        if target.is_empty() || target.contains(':') || target.starts_with('^') {
-            bail!("invalid dependency target {target:?}");
-        }
         // As in Nx, a glob stands for every target name in the workspace it
         // matches, each then depended on as if named.
         let targets: Vec<String> = if qk_config::is_glob(&target) {
@@ -553,18 +575,22 @@ impl Builder<'_> {
         } else {
             vec![target]
         };
-        // As in Nx, `options: "forward"` passes the task's options, its
-        // configuration's included, as overrides, before any forwarded
-        // arguments so that those win.
-        let mut args = Vec::new();
+        // As in Nx, `options: "forward"` passes the target's options, its
+        // configuration's included, as the dependency's own, and
+        // `params: "forward"` the run's arguments.
+        let mut overrides = Map::new();
         if forward_options {
-            for (key, value) in &task.definition.options {
-                option_flags(key, value, &mut args);
+            let source = &self.workspace.projects[&task.project].targets[&task.target];
+            overrides.extend(source.options.clone());
+            if let Some(options) = task
+                .configuration
+                .as_ref()
+                .and_then(|name| source.configurations.get(name))
+            {
+                overrides.extend(options.clone());
             }
         }
-        if forward {
-            args.extend(task.args.iter().cloned());
-        }
+        let args = if forward { cli.to_vec() } else { Vec::new() };
         let requests = targets
             .iter()
             .flat_map(|target| {
@@ -577,7 +603,26 @@ impl Builder<'_> {
                 })
             })
             .collect();
-        Ok((requests, derived, edge))
+        Ok(Declared {
+            requests,
+            overrides,
+            derived,
+            edge,
+        })
+    }
+
+    /// Nx's `readProjectAndTargetFromTargetString`: `project:target` when
+    /// the first part names a project, and otherwise a target of the task's
+    /// own project, colons and all.
+    fn target_reference(&self, text: &str, current: &str) -> (String, String) {
+        let parts = split_target(text, &self.workspace.projects, current);
+        match &parts[..] {
+            [target] => (current.to_owned(), target.clone()),
+            [project, rest @ ..] if self.workspace.projects.contains_key(project) => {
+                (project.clone(), rest.join(":"))
+            }
+            _ => (current.to_owned(), text.to_owned()),
+        }
     }
 
     fn project_dependencies(&self, project: &str) -> Vec<String> {
@@ -591,21 +636,142 @@ impl Builder<'_> {
     }
 }
 
-/// An option as the flags that set it: `--name=value`, and `--name.key=value`
-/// for each field of an object. A list cannot be spelled as a flag, and is
-/// left out.
-fn option_flags(key: &str, value: &Value, flags: &mut Vec<String>) {
-    match value {
-        Value::Object(fields) => {
-            for (field, value) in fields {
-                option_flags(&format!("{key}.{field}"), value, flags);
+/// Nx's `splitByColons`: parts between colons, a double-quoted run keeping
+/// its colons.
+fn split_by_colons(text: &str) -> Vec<String> {
+    let mut parts = vec![String::new()];
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            ':' => parts.push(String::new()),
+            '"' => {
+                for c in chars.by_ref() {
+                    if c == '"' {
+                        break;
+                    }
+                    parts.last_mut().unwrap().push(c);
+                }
+            }
+            c => parts.last_mut().unwrap().push(c),
+        }
+    }
+    parts
+}
+
+/// Every `[project, target?, configuration?]` reading of the parts that
+/// names a project and, when given, one of its targets and configurations;
+/// read on the current project too, as a bare target.
+fn readings(
+    parts: &[String],
+    projects: &BTreeMap<String, qk_config::Project>,
+    current: &str,
+) -> Vec<Vec<String>> {
+    let mut readings = Vec::new();
+    let read = |project: &str, rest: &[String], readings: &mut Vec<Vec<String>>| {
+        let targets = &projects[project].targets;
+        for end in 1..=rest.len() {
+            let target = rest[..end].join(":");
+            let Some(definition) = targets.get(&target) else {
+                continue;
+            };
+            if end == rest.len() {
+                readings.push(vec![project.to_owned(), target]);
+            } else {
+                let configuration = rest[end..].join(":");
+                if definition.configurations.contains_key(&configuration) {
+                    readings.push(vec![project.to_owned(), target, configuration]);
+                }
             }
         }
-        Value::String(text) => flags.push(format!("--{key}={text}")),
-        Value::Number(number) => flags.push(format!("--{key}={number}")),
-        Value::Bool(flag) => flags.push(format!("--{key}={flag}")),
-        Value::Array(_) | Value::Null => {}
+    };
+    if projects.contains_key(current) {
+        read(current, parts, &mut readings);
     }
+    for end in 1..=parts.len() {
+        let project = parts[..end].join(":");
+        if !projects.contains_key(&project) {
+            continue;
+        }
+        if end == parts.len() {
+            readings.push(vec![project]);
+        } else {
+            read(&project, &parts[end..], &mut readings);
+        }
+    }
+    readings
+}
+
+/// The reading Nx prefers: on the current project, then the longest
+/// project, target and configuration names.
+fn best(readings: Vec<Vec<String>>, current: &str) -> Option<Vec<String>> {
+    let rank = |reading: &Vec<String>| {
+        let length = |index: usize| reading.get(index).map_or(0, String::len);
+        (reading[0] == current, length(0), length(1), length(2))
+    };
+    let mut best: Option<Vec<String>> = None;
+    for reading in readings {
+        if best.as_ref().is_none_or(|best| rank(&reading) > rank(best)) {
+            best = Some(reading);
+        }
+    }
+    best
+}
+
+/// Nx's `splitTargetFromNodes`.
+fn split_target(
+    text: &str,
+    projects: &BTreeMap<String, qk_config::Project>,
+    current: &str,
+) -> Vec<String> {
+    let parts = split_by_colons(text);
+    if let Some(best) = best(readings(&parts, projects, current), current) {
+        return best;
+    }
+    let colon = match text.find(':') {
+        Some(0) => text[1..].find(':').map(|index| index + 1),
+        colon => colon,
+    };
+    if colon.is_none_or(|colon| colon == 0) {
+        return vec![text.to_owned()];
+    }
+    let mut project = parts[0].clone();
+    let mut rest = parts[1..].to_vec();
+    // A leading colon starts the longest known project name it can.
+    if project.is_empty() && !rest.is_empty() {
+        let mut absorbed = 1;
+        for count in (1..rest.len()).rev() {
+            if projects.contains_key(&format!(":{}", rest[..count].join(":"))) {
+                absorbed = count;
+                break;
+            }
+        }
+        project = format!(":{}", rest[..absorbed].join(":"));
+        rest.drain(..absorbed);
+    }
+    let Some(configuration) = rest.last().cloned() else {
+        return vec![project];
+    };
+    // The project and target, with a configuration they do not have.
+    if let Some(head) = text.get(..text.len().saturating_sub(configuration.len() + 1))
+        && let Some(best) = best(readings(&split_by_colons(head), projects, current), current)
+        && best.len() == 2
+    {
+        return vec![best[0].clone(), best[1].clone(), configuration];
+    }
+    let mut result = vec![project.clone()];
+    let targets = projects.get(&project).map(|project| &project.targets);
+    for end in (1..=rest.len()).rev() {
+        let target = rest[..end].join(":");
+        if targets.is_some_and(|targets| targets.contains_key(&target)) {
+            result.push(target);
+            if end < rest.len() {
+                result.push(rest[end..].join(":"));
+            }
+            return result;
+        }
+    }
+    result.extend(rest);
+    result
 }
 
 /// Nx 24's `validateOutputs`: each output starts with a token, `!` before it

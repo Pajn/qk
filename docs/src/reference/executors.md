@@ -27,21 +27,24 @@ Unsupported executors fail before tasks start.
 ### `command` and `commands`
 
 Use `command` for a string (or an array joined with spaces) or `commands` for
-an array of strings or command objects. An empty `commands` succeeds without
-running a process. Each object can have `command`, `forwardAllArgs`,
-`description`, `prefix`, `prefixColor`, `color`, and `bgColor`. Decorations
-apply when commands run in parallel.
+an array of strings or command objects; `command` wins when both are set. An
+empty `commands` succeeds without running a process. Each object can have
+`command`, `forwardAllArgs`, `description`, `prefix`, `prefixColor`, `color`,
+and `bgColor`. Decorations apply when commands run in parallel.
 
 ### `parallel`
 
 A boolean, default `true`, controlling concurrency **within the task**.
 `false` runs commands sequentially and stops at the first failure. It is
-separate from the run's `--parallel` task limit.
+separate from the run's `--parallel` task limit. With `command`, as in Nx,
+it is ignored: the command runs in parallel exactly when `readyWhen` is set.
 
 ### `cwd`
 
-A directory relative to the workspace root, which is the default.
-Supports workspace/project path tokens such as `{projectRoot}`.
+A directory relative to the workspace root, which is the default, or an
+absolute one. Like every option, it may use `{projectRoot}` and
+`{projectName}`, and start with `{workspaceRoot}`, which resolve as the
+workspace loads; see [`options`](targets.md#options).
 
 ### `env`, `envFile`, and `color`
 
@@ -68,10 +71,13 @@ See [Readiness](../guides/running-tasks.md#continuous-tasks-and-readiness).
 ### Other options and task overrides
 
 Other scalar options are forwarded as `--name=value` and exposed as
-`{args.name}`; object values are ignored. Task arguments override values
+`{args.name}`; lists, objects and nulls are not forwarded, and `{args.name}`
+writes a list's items joined with commas. Task arguments override values
 of the same name. An argument naming an executor option sets that option,
 for example `-- --args='--watch'`, `--cwd=dir`, `--no-parallel`, or
-`--env.NAME=value`.
+`--env.NAME=value`. As in Nx, the tokens `{projectRoot}`, `{projectName}`,
+`{project.<field>}` and a leading `{workspaceRoot}` resolve in such a value
+for the task's project.
 
 `usePty: false` runs the target's commands with pipes rather than a
 pseudo-terminal, and `tty: false` leaves the terminal out of raw mode while
@@ -80,8 +86,10 @@ without effect. See [Terminals and input](../guides/running-tasks.md#terminals-a
 
 ## `nx:run-script`
 
-`options.script` names a package script. qk runs it in the project directory
-using the detected package manager:
+`options.script` names a package script. As in Nx, it is the only option
+read: qk runs the script in the project directory, whatever `cwd` says, with
+the task's environment, without `options.env` or `envFile`, using the
+detected package manager:
 
 | Manager | Invocation |
 | --- | --- |
@@ -96,6 +104,8 @@ then root `packageManager` or `pnpm-workspace.yaml`, then the invoking
 manager's `npm_config_user_agent`, else npm. Nx does not use the root
 `packageManager`/workspace-file fallback.
 Missing scripts fail in execution preflight after explicit overrides apply.
+The task's arguments are each quoted for the shell; Nx joins them as they
+are.
 
 ## `nx:noop`
 

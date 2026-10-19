@@ -21,12 +21,15 @@ it. Other hidden project directories remain discoverable.
 
 ## Configuration precedence
 
-Package scripts become `nx:run-script` targets. Package `nx` configuration
-is merged over these, then adjacent `project.json`, then
-`project.local.json`. Workspace `targetDefaults` provide defaults for the
-resulting targets. Options and named configurations merge by key; nested
-values and arrays are replaced. Tags merge as an ordered union and named
-inputs merge by name; other project fields are replaced.
+Package scripts become `nx:run-script` targets, except a script that
+`project.json` gives another way to run: a command, or an executor other
+than run-script running it. Package `nx` configuration is merged over
+these; a target there with an executor or command replaces the script's.
+Adjacent `project.json` merges over that, then `project.local.json`.
+Workspace `targetDefaults` lie beneath them all. Targets merge as described
+in [Merging](targets.md#merging). Tags merge as an ordered union, named
+inputs by name, `generators` by generator and `metadata` one level deep with
+lists concatenated; other project fields are replaced.
 
 ```jsonc
 {

@@ -137,14 +137,15 @@ a target none of which has been measured starts without waiting.
 
 The planner expands `dependsOn` before execution: local targets, `^target`
 on project dependencies, `project:target`, and objects with `target`,
-`projects`, `dependencies`, `params` and `options`. A target may be a glob,
+`projects`, `dependencies`, `params` and `options`. Target names may contain
+colons: `a:b` is project `a`'s target `b` when `a` is a project with that
+target, and otherwise the task's own target `a:b`. A target may be a glob,
 such as `lint-*` or `^build-*`: as in Nx, it stands for every target name in
-the workspace it matches. `options: "forward"` passes the task's options,
-its configuration's included, to the dependency as overrides, as `--name=value`
-arguments (`--env.NAME=value` for an object's fields; lists cannot be passed
-this way), before any arguments `params: "forward"` passes. As in Nx that
-includes a run-commands target's own `command`, so it suits targets of the
-same executor. Project selectors accept names,
+the workspace it matches. `options: "forward"` passes the target's options,
+its configuration's included, to the dependency as its own options, which
+they override; as in Nx that includes a run-commands target's own `command`,
+so it suits targets of the same executor. `params: "forward"` passes the
+run's own arguments, however the dependency is reached. Project selectors accept names,
 globs, tags and `!` exclusions. As in Nx 24, `projects: "self"` and
 `projects: "dependencies"` fail: leave `projects` out for the task's own
 project, or set `dependencies: true`. As in Nx, a project dependency without the
@@ -157,8 +158,9 @@ Requested configurations propagate to dependencies that define the same name;
 otherwise the dependency's default configuration applies. The requested name
 continues through that dependency to its dependencies. Without a requested
 configuration, each task chooses its own default. `run-many -c` treats the
-targets it selects the same way. A shared task
-reached with different forwarded arguments is rejected as ambiguous.
+targets it selects the same way. As in Nx, a shared task reached with
+different forwarded arguments or options keeps those it was first reached
+with.
 
 ## Executors
 
@@ -178,26 +180,31 @@ qk run app:build -- --mode=production 'two words'
 qk run app:package -c release -- --arch=arm64
 ```
 
-Commands support `{projectRoot}`, `{workspaceRoot}`, `{projectName}`,
-`{args}` (all forwarded arguments, with the `args` option last, as in Nx),
-and `{args.name}` (a `--name=value` or `--name value` argument; a flag
-without a value becomes `true`, and `--no-name` sets `name` to `false`). A
-command cannot use both `{args}` and `{args.name}`. Place argument
-tokens outside quotes: qk quotes their values as shell data. A missing named
-argument interpolates as nothing, as in Nx; quoted argument placeholders are
-errors. As in Nx 24, `??` lists fallbacks, and the first that is set and not
-empty applies: another `args.name`, `env.NAME` from the task's environment,
-or a final literal, which may hold path tokens, as in
-`{args.port ?? env.PORT ?? 4200}`. `0` and `false` are values. On Windows, forwarded
-values containing quotes, `%`, `!`, `^` or newlines are currently rejected;
-use target environment variables for those values. Workspace/project path
-tokens are substituted as written, so quote path tokens where your command
-requires it.
+A run-commands command, as Nx's, puts the task's arguments in one of three
+ways:
 
-Without argument tokens, arguments are appended by default; set
-`forwardAllArgs: false` to disable that. With argument tokens, only the
-explicit substitutions are used. Dependencies receive no arguments unless
-their dependency object sets `params: "forward"`.
+- `{args.name}` stands for one value: a `--name=value` or `--name value`
+  argument, a flag without a value as `true`, `--no-name` as `false`, a
+  repeated flag as its values joined with commas, a name the `args` option
+  sets (also in camel case), or another option of the target. The value goes
+  in as it is, unquoted, for the shell to read, so quote the placeholder
+  where the command needs one word: `echo "{args.message}"`. A missing value
+  interpolates as nothing. As in Nx 24, `??` lists fallbacks, and the first
+  that is set and not empty applies: another `args.name`, `env.NAME` from the
+  task's environment, or a final literal, as in
+  `{args.port ?? env.PORT ?? 4200}`. `0` and `false` are values.
+- `{args}` stands for everything: the options run-commands does not know, as
+  `--name=value`, the arguments, and then the `args` option.
+- Without either, the same are appended, unless `forwardAllArgs` is `false`.
+
+A command cannot use both `{args}` and `{args.name}`. Forwarded options and
+arguments the shell would split or read are put in double quotes, as Nx
+puts them, so `$NAME` in one still expands. Arguments that set a
+run-commands option, such as `--cwd=dir`, are not forwarded.
+Path tokens such as `{projectRoot}` in options resolve as the workspace
+loads; see [`options`](../reference/targets.md#options). Dependencies
+receive no arguments unless their dependency object sets
+`params: "forward"`.
 
 ## Failures and cancellation
 

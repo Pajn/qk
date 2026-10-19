@@ -1,142 +1,176 @@
+//! How Nx 24's run-commands puts a task's arguments into its commands:
+//! `{args.name}` and `{args}` placeholders, or the arguments appended.
+
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, bail};
-use qk_config::Workspace;
-use qk_taskgraph::Task;
+use serde_json::{Map, Number, Value};
 
 use crate::tokens::{closing_brace, env_name, fallbacks};
 
-pub(super) struct Interpolation<'a> {
-    workspace: &'a Workspace,
-    task: &'a Task,
-    /// The task's arguments, less those that set run-commands options.
-    args: Vec<String>,
-    named: BTreeMap<String, String>,
-    /// Target options run-commands does not know, as Nx forwards them:
-    /// `--name=value` after the command, unless an argument of the same name
-    /// overrides it.
-    options: Vec<String>,
+/// The run-commands options Nx reads itself, which are never forwarded.
+pub(super) const PROP_KEYS: &[&str] = &[
+    "command",
+    "commands",
+    "color",
+    "no-color",
+    "parallel",
+    "no-parallel",
+    "readyWhen",
+    "cwd",
+    "args",
+    "envFile",
+    "__unparsed__",
+    "env",
+    "usePty",
+    "streamOutput",
+    "verbose",
+    "forwardAllArgs",
+    "tty",
+];
+
+pub(super) struct Interpolation {
+    /// The task's arguments as given, Nx's `__unparsed__`.
+    unparsed: Vec<String>,
+    /// The target options run-commands does not know and no argument sets.
+    unknown: Vec<(String, Value)>,
+    /// What `{args.name}` reads: those options, then the `args` option
+    /// parsed, then the arguments.
+    named: Map<String, Value>,
     /// The `args` option: shell text, forwarded as it is.
     extra: Option<String>,
     /// The task's environment, which `{env.NAME}` fallbacks read, once built.
     env: BTreeMap<String, String>,
 }
 
-impl<'a> Interpolation<'a> {
-    pub fn new(
-        workspace: &'a Workspace,
-        task: &'a Task,
-        args: Vec<String>,
-        options: &BTreeMap<String, String>,
-        extra: Option<&str>,
-    ) -> Result<Self> {
-        let mut interpolation = Self {
-            workspace,
-            task,
-            args,
-            named: BTreeMap::new(),
-            options: Vec::new(),
-            extra: None,
-            env: BTreeMap::new(),
-        };
-        let options: BTreeMap<String, String> = options
+impl Interpolation {
+    pub fn new(unparsed: &[String], options: &Map<String, Value>) -> Result<Self> {
+        let parsed = yargs(unparsed, false, false);
+        let unknown: Vec<(String, Value)> = options
             .iter()
-            .map(|(key, value)| Ok((key.clone(), interpolation.project_tokens(value)?)))
-            .collect::<Result<_>>()?;
-        let extra = extra
-            .map(|extra| interpolation.project_tokens(extra))
-            .transpose()?
-            .filter(|extra| !extra.trim().is_empty());
-        // As in Nx, arguments win over the `args` option, which wins over
-        // other options; `args` names are also readable in camel case.
-        let mut named = options.clone();
-        if let Some(extra) = &extra {
-            let words = shlex::split(extra).context("the args option is not valid shell text")?;
-            for (key, value) in flags(&words) {
-                if key.contains('-') {
-                    named.insert(camel_case(&key), value.clone());
-                }
-                named.insert(key, value);
-            }
-        }
-        named.extend(flags(&interpolation.args));
-        interpolation.options = options
-            .iter()
-            .filter(|(key, value)| named.get(*key) == Some(*value))
-            .map(|(key, value)| format!("--{key}={value}"))
+            .filter(|(key, _)| !PROP_KEYS.contains(&key.as_str()) && !parsed.contains_key(*key))
+            .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
-        interpolation.named = named;
-        interpolation.extra = extra;
-        Ok(interpolation)
-    }
-
-    /// `{projectRoot}`, `{workspaceRoot}` and `{projectName}`, which Nx
-    /// replaces in every option.
-    fn project_tokens(&self, text: &str) -> Result<String> {
-        Ok(text
-            .replace(
-                "{workspaceRoot}",
-                self.workspace
-                    .root
-                    .to_str()
-                    .context("workspace path must be UTF-8")?,
-            )
-            .replace(
-                "{projectRoot}",
-                &self.workspace.projects[&self.task.project].root,
-            )
-            .replace("{projectName}", &self.task.project))
-    }
-
-    /// Forwarded options, the `args` option and then the task's arguments,
-    /// for the shell.
-    fn forwarded(&self) -> Result<String> {
-        let mut parts = self
-            .options
-            .iter()
-            .map(|arg| quote(arg))
-            .collect::<Result<Vec<_>>>()?;
-        parts.extend(self.extra.clone());
-        for arg in &self.args {
-            parts.push(quote(arg)?);
+        let extra = match options.get("args") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(text)) => Some(text.clone()),
+            Some(Value::Array(words)) => Some(
+                words
+                    .iter()
+                    .map(|word| word.as_str().context("args entries must be strings"))
+                    .collect::<Result<Vec<_>>>()?
+                    .join(" "),
+            ),
+            Some(_) => bail!("args must be a string or an array of strings"),
         }
-        Ok(parts.join(" "))
-    }
-
-    /// What `{args}` stands for: as in Nx, the `args` option comes last.
-    fn all(&self, shell: bool) -> Result<String> {
-        let mut parts = Vec::new();
-        for arg in self.options.iter().chain(&self.args) {
-            parts.push(if shell { quote(arg)? } else { arg.clone() });
+        .filter(|extra| !extra.is_empty());
+        let mut named: Map<String, Value> = unknown.iter().cloned().collect();
+        if let Some(extra) = &extra {
+            // Nx strips one pair of surrounding double quotes first.
+            let text = extra.strip_prefix('"').unwrap_or(extra);
+            let text = text.strip_suffix('"').unwrap_or(text);
+            let words = shlex::split(text).context("the args option is not valid shell text")?;
+            named.extend(yargs(&words, true, true));
         }
-        parts.extend(self.extra.clone());
-        Ok(parts.join(" "))
+        named.extend(parsed);
+        Ok(Self {
+            unparsed: unparsed.to_vec(),
+            unknown,
+            named,
+            extra,
+            env: BTreeMap::new(),
+        })
     }
 
-    pub fn arguments(&self) -> Result<String> {
-        self.args
+    /// The unknown options as `--name=value`, for those no argument or the
+    /// `args` option overrides; objects, lists and nulls are left out.
+    fn unknown_arguments(&self) -> Vec<String> {
+        self.unknown
             .iter()
-            .map(|arg| quote(arg))
-            .collect::<Result<Vec<_>>>()
-            .map(|args| args.join(" "))
+            .filter(|(key, value)| {
+                !matches!(value, Value::Object(_) | Value::Array(_) | Value::Null)
+                    && self.named.get(key) == Some(value)
+            })
+            .map(|(key, value)| wrap(&format!("--{key}={}", text(value))))
+            .collect()
     }
 
-    pub fn text(&self, text: &str) -> Result<String> {
-        self.expand(text, false)
+    /// The arguments less those setting run-commands options, as Nx
+    /// forwards them.
+    fn unparsed_arguments(&self) -> Vec<String> {
+        let mut kept = Vec::new();
+        let mut index = 0;
+        while index < self.unparsed.len() {
+            let element = &self.unparsed[index];
+            if let Some(key) = element.strip_prefix("--") {
+                if element.contains('=') {
+                    let name = key.split('=').next().unwrap_or_default();
+                    if !PROP_KEYS.contains(&name.split('.').next().unwrap_or_default()) {
+                        kept.push(element.clone());
+                    }
+                } else if PROP_KEYS.contains(&key) {
+                    // Its value goes with it.
+                    if let Some(next) = self.unparsed.get(index + 1)
+                        && let Some(value) = self.named.get(key).filter(|value| truthy(value))
+                        && *next == text(value)
+                    {
+                        index += 1;
+                    }
+                } else {
+                    kept.push(element.clone());
+                }
+            } else {
+                kept.push(element.clone());
+            }
+            index += 1;
+        }
+        rejoin_quoted_fragments(kept)
+            .iter()
+            .map(|arg| wrap(arg))
+            .collect()
     }
 
+    /// A command with the task's arguments in it, as Nx's
+    /// `interpolateArgsIntoCommand` puts them: values in place of
+    /// `{args.name}`, everything in place of `{args}`, or, when it has
+    /// neither and `forward` is set, everything appended. Values go in as
+    /// they are, unquoted.
     pub fn command(&self, command: &str, forward: bool) -> Result<String> {
         if command.contains("{args.") && command.contains("{args}") {
-            bail!("a command cannot use both {{args}} and {{args.*}}; choose one");
+            bail!(
+                "Command should not contain both {{args}} and {{args.*}} values. Please choose one to use."
+            );
         }
-        let interpolates_args = command.contains("{args.") || command.contains("{args}");
-        let mut command = self.expand(command, true)?;
-        if forward
-            && !interpolates_args
-            && !(self.args.is_empty() && self.options.is_empty() && self.extra.is_none())
-        {
+        if command.contains("{args.") {
+            return self.expand(command);
+        }
+        if command.contains("{args}") {
+            let mut args = self.unknown_arguments();
+            args.extend(self.unparsed_arguments());
+            let all = format!(
+                "{} {}",
+                args.join(" "),
+                self.extra.as_deref().unwrap_or_default()
+            );
+            return Ok(command.replace("{args}", &all));
+        }
+        if !forward {
+            return Ok(command.to_owned());
+        }
+        let mut command = command.to_owned();
+        let unknown = self.unknown_arguments().join(" ");
+        if !unknown.is_empty() {
             command.push(' ');
-            command.push_str(&self.forwarded()?);
+            command.push_str(&unknown);
+        }
+        if let Some(extra) = &self.extra {
+            command.push(' ');
+            command.push_str(extra);
+        }
+        let unparsed = self.unparsed_arguments();
+        if !unparsed.is_empty() {
+            command.push(' ');
+            command.push_str(&unparsed.join(" "));
         }
         Ok(command)
     }
@@ -151,17 +185,17 @@ impl<'a> Interpolation<'a> {
             .collect();
     }
 
-    fn expand(&self, text: &str, shell: bool) -> Result<String> {
-        // One pass: user-provided values must never be interpreted as more
-        // tokens. As in Nx, braces that are not a token stay as text, and the
-        // scan goes on inside them.
+    fn expand(&self, text: &str) -> Result<String> {
+        // One pass: values must never be interpreted as more tokens. As in
+        // Nx, braces that are not a token stay as text, and the scan goes on
+        // inside them.
         let mut result = String::new();
         let mut index = 0;
         while let Some(offset) = text[index..].find('{') {
             let open = index + offset;
             let value = match closing_brace(text, open) {
                 Some(close) => self
-                    .token(&text[open + 1..close], &text[..open], shell)?
+                    .token(&text[open + 1..close])?
                     .map(|value| (value, close)),
                 None => None,
             };
@@ -182,64 +216,36 @@ impl<'a> Interpolation<'a> {
     }
 
     /// The value of the token between a pair of braces, or `None` when it is
-    /// not one.
-    fn token(&self, token: &str, prefix: &str, shell: bool) -> Result<Option<String>> {
-        let value = match token {
-            "workspaceRoot" => self
-                .workspace
-                .root
-                .to_str()
-                .context("workspace path must be UTF-8")?
-                .to_owned(),
-            "projectRoot" => self.workspace.projects[&self.task.project].root.clone(),
-            "projectName" => self.task.project.clone(),
-            "args" => {
-                if shell && quoted_or_escaped(prefix) {
-                    bail!(
-                        "argument placeholders must be unquoted and unescaped; qk quotes their values"
-                    );
-                }
-                self.all(shell)?
+    /// not one: the first of its alternatives that is set and not empty, an
+    /// argument, `env.NAME` of the task's environment or a final literal, and
+    /// nothing when none is.
+    fn token(&self, token: &str) -> Result<Option<String>> {
+        let sources = fallbacks(token);
+        if !sources[0].starts_with("args.") {
+            return Ok(None);
+        }
+        for (index, source) in sources.iter().enumerate() {
+            let found = if let Some(name) = source.strip_prefix("args.") {
+                self.named
+                    .get(name)
+                    .filter(|value| !value.is_null())
+                    .map(text)
+            } else if *source == "args" {
+                None
+            } else if let Some(name) = env_name(source) {
+                self.env_value(name)
+            } else if index + 1 == sources.len() {
+                return Ok(Some(self.expand(source)?));
+            } else {
+                bail!(
+                    "{{{token}}} has a fallback after the literal {source:?} that can never be used"
+                );
+            };
+            if let Some(found) = found.filter(|found| !found.is_empty()) {
+                return Ok(Some(found));
             }
-            _ => {
-                let sources = fallbacks(token);
-                if !sources[0].starts_with("args.") {
-                    return Ok(None);
-                }
-                if shell && quoted_or_escaped(prefix) {
-                    bail!(
-                        "argument placeholders must be unquoted and unescaped; qk quotes their values"
-                    );
-                }
-                // As in Nx 24, the first value that is set and not empty, and
-                // nothing when none is: an argument, `env.NAME` of the task's
-                // environment, or a final literal.
-                let mut value = String::new();
-                for (index, source) in sources.iter().enumerate() {
-                    let found = if let Some(name) = source.strip_prefix("args.") {
-                        self.named.get(name).cloned()
-                    } else if let Some(name) = env_name(source) {
-                        self.env_value(name)
-                    } else if index + 1 == sources.len() {
-                        Some(self.expand(source, false)?)
-                    } else {
-                        bail!(
-                            "{{{token}}} has a fallback after the literal {source:?} that can never be used"
-                        );
-                    };
-                    if let Some(found) = found.filter(|found| !found.is_empty()) {
-                        value = found;
-                        break;
-                    }
-                }
-                if shell && !value.is_empty() {
-                    quote(&value)?
-                } else {
-                    value
-                }
-            }
-        };
-        Ok(Some(value))
+        }
+        Ok(Some(String::new()))
     }
 
     /// A variable of the task's environment; on Windows names ignore case.
@@ -257,29 +263,235 @@ impl<'a> Interpolation<'a> {
     }
 }
 
-/// Flags as yargs reads them: `--name=value`, `--name value`, `--name` for
-/// true and `--no-name` for false.
-pub(super) fn flags(words: &[String]) -> BTreeMap<String, String> {
-    let mut named = BTreeMap::new();
-    let mut words = words.iter().peekable();
-    while let Some(word) = words.next() {
-        let Some(flag) = word.strip_prefix("--") else {
-            continue;
-        };
-        if let Some((key, value)) = flag.split_once('=') {
-            named.insert(key.into(), value.into());
-        } else if let Some(key) = flag.strip_prefix("no-") {
-            named.insert(key.into(), "false".into());
-        } else {
-            let value = if words.peek().is_some_and(|word| !word.starts_with('-')) {
-                words.next().unwrap().clone()
-            } else {
-                "true".into()
-            };
-            named.insert(flag.into(), value);
+/// A value as JavaScript's `String` writes it.
+fn text(value: &Value) -> String {
+    match value {
+        Value::Null => "null".into(),
+        Value::String(text) => text.clone(),
+        Value::Number(number) => number_text(number),
+        Value::Array(items) => items
+            .iter()
+            .map(|item| match item {
+                Value::Null => String::new(),
+                item => text(item),
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+        Value::Object(_) => "[object Object]".into(),
+        Value::Bool(flag) => flag.to_string(),
+    }
+}
+
+fn number_text(number: &Number) -> String {
+    match number.as_f64() {
+        Some(float) if !number.is_f64() || float.fract() != 0.0 => number.to_string(),
+        Some(float) if float.abs() < 1e21 => format!("{float:.0}"),
+        _ => number.to_string(),
+    }
+}
+
+fn truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(flag) => *flag,
+        Value::Number(number) => number.as_f64().is_some_and(|number| number != 0.0),
+        Value::String(text) => !text.is_empty(),
+        _ => true,
+    }
+}
+
+/// Nx's `needsShellQuoting`.
+fn needs_quoting(text: &str) -> bool {
+    text.chars()
+        .any(|c| c.is_whitespace() || "|&;<>()$`\\!\"'*?[]{}~#".contains(c))
+}
+
+/// Nx's `isAlreadyQuoted`.
+fn already_quoted(text: &str) -> bool {
+    text.len() >= 2
+        && ((text.starts_with('\'') && text.ends_with('\''))
+            || (text.starts_with('"') && text.ends_with('"')))
+}
+
+/// Nx's `wrapArgIntoQuotesIfNeeded`: an argument, or a `--name=` flag's
+/// value, in double quotes when the shell would read it otherwise and it is
+/// not quoted already.
+fn wrap(arg: &str) -> String {
+    let quoted = |text: &str| format!("\"{}\"", text.replace('"', "\\\""));
+    if let Some((key, value)) = arg.split_once('=') {
+        if key.starts_with("--") && needs_quoting(value) && !already_quoted(value) {
+            return format!("{key}={}", quoted(value));
+        }
+        arg.to_owned()
+    } else if needs_quoting(arg) && !already_quoted(arg) {
+        quoted(arg)
+    } else {
+        arg.to_owned()
+    }
+}
+
+/// Nx's `rejoinQuotedFragments`: the words of a quoted value the shell
+/// split, back together.
+fn rejoin_quoted_fragments(args: Vec<String>) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let quote = arg
+            .chars()
+            .next()
+            .filter(|c| arg.chars().count() > 1 && (*c == '\'' || *c == '"'));
+        match quote {
+            Some(quote) if !arg.ends_with(quote) => {
+                let mut fragments = vec![arg.clone()];
+                let mut found = false;
+                index += 1;
+                while index < args.len() {
+                    fragments.push(args[index].clone());
+                    index += 1;
+                    if fragments.last().unwrap().ends_with(quote) {
+                        found = true;
+                        break;
+                    }
+                }
+                if found {
+                    result.push(fragments.join(" "));
+                } else {
+                    result.extend(fragments);
+                }
+            }
+            _ => {
+                result.push(arg.clone());
+                index += 1;
+            }
         }
     }
-    named
+    result
+}
+
+/// Whether yargs-parser reads a word as a flag rather than a value: it
+/// starts with `-` and is not a negative number.
+fn is_flag(word: &str) -> bool {
+    word.starts_with('-')
+        && word.len() > 1
+        && !word[1..].starts_with(|c: char| c.is_ascii_digit() || c == '.')
+}
+
+/// Arguments as yargs-parser reads them with Nx's settings: `--name=value`,
+/// `--name value`, `--name` for true and `--no-name` for false, `-abc` for
+/// single letters, repeated names collecting a list, and the rest, and all
+/// after `--`, in `_`. `camel` adds camel-case names for names with
+/// dashes, and `numbers` reads numbers, as Nx reads the `args` option.
+pub(super) fn yargs(words: &[String], camel: bool, numbers: bool) -> Map<String, Value> {
+    let mut parsed = Map::new();
+    let mut positional = Vec::new();
+    let set = |key: &str, value: Value, parsed: &mut Map<String, Value>| {
+        let value = match value {
+            Value::String(text) if numbers => number(&text).unwrap_or(Value::String(text)),
+            value => value,
+        };
+        let mut keys = vec![key.to_owned()];
+        if camel && key.contains('-') {
+            keys.push(camel_case(key));
+        }
+        for key in keys {
+            let merged = match parsed.shift_remove(&key) {
+                None => value.clone(),
+                Some(Value::Array(mut items)) => {
+                    items.push(value.clone());
+                    Value::Array(items)
+                }
+                Some(previous) => Value::Array(vec![previous, value.clone()]),
+            };
+            parsed.insert(key, merged);
+        }
+    };
+    let mut index = 0;
+    while index < words.len() {
+        let word = &words[index];
+        index += 1;
+        if word == "--" {
+            positional.extend(words[index..].iter().cloned());
+            break;
+        }
+        if let Some(flag) = word.strip_prefix("--").filter(|flag| !flag.is_empty()) {
+            if let Some((key, value)) = flag.split_once('=') {
+                set(key, Value::String(value.into()), &mut parsed);
+            } else if let Some(key) = flag.strip_prefix("no-") {
+                set(key, Value::Bool(false), &mut parsed);
+            } else if let Some(next) = words.get(index).filter(|next| !is_flag(next)) {
+                set(flag, Value::String(next.clone()), &mut parsed);
+                index += 1;
+            } else {
+                set(flag, Value::Bool(true), &mut parsed);
+            }
+        } else if is_flag(word) {
+            let letters = &word[1..];
+            if let Some((keys, value)) = letters.split_once('=') {
+                let mut keys: Vec<char> = keys.chars().collect();
+                if let Some(last) = keys.pop() {
+                    for key in keys {
+                        set(&key.to_string(), Value::Bool(true), &mut parsed);
+                    }
+                    set(&last.to_string(), Value::String(value.into()), &mut parsed);
+                }
+                continue;
+            }
+            let mut keys: Vec<char> = letters.chars().collect();
+            let last = keys.pop().unwrap();
+            for key in keys {
+                set(&key.to_string(), Value::Bool(true), &mut parsed);
+            }
+            if let Some(next) = words.get(index).filter(|next| !is_flag(next)) {
+                set(&last.to_string(), Value::String(next.clone()), &mut parsed);
+                index += 1;
+            } else {
+                set(&last.to_string(), Value::Bool(true), &mut parsed);
+            }
+        } else {
+            positional.push(word.clone());
+        }
+    }
+    parsed.insert(
+        "_".into(),
+        Value::Array(positional.into_iter().map(Value::String).collect()),
+    );
+    parsed
+}
+
+/// A number as yargs-parser reads one.
+fn number(text: &str) -> Option<Value> {
+    if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        return u64::from_str_radix(hex, 16).ok().map(Value::from);
+    }
+    // A leading zero before another digit is text, as is anything else
+    // that is not a plain decimal.
+    let digits = text.strip_prefix('-').unwrap_or(text);
+    if digits.starts_with('0') && digits.len() > 1 && !digits.starts_with("0.") {
+        return None;
+    }
+    let mantissa = digits.split(['e', 'E']).next().unwrap_or_default();
+    if mantissa.is_empty() || !mantissa.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return None;
+    }
+    let float: f64 = text.parse().ok()?;
+    if !float.is_finite() || float.floor().abs() > 9_007_199_254_740_991.0 {
+        return None;
+    }
+    if float.fract() == 0.0 {
+        Some(Value::from(float as i64))
+    } else {
+        Number::from_f64(float).map(Value::Number)
+    }
+}
+
+/// The arguments for a package script: each quoted, so that the shell
+/// passes it on as given.
+pub(super) fn quoted_arguments(args: &[String]) -> Result<String> {
+    args.iter()
+        .map(|arg| quote(arg))
+        .collect::<Result<Vec<_>>>()
+        .map(|args| args.join(" "))
 }
 
 pub(super) fn camel_case(key: &str) -> String {
@@ -298,25 +510,6 @@ pub(super) fn camel_case(key: &str) -> String {
     result
 }
 
-fn quoted_or_escaped(text: &str) -> bool {
-    let mut quote = None;
-    let mut escaped = false;
-    for ch in text.chars() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if ch == '\\' && quote != Some('\'') && !cfg!(windows) {
-            escaped = true;
-        } else if Some(ch) == quote {
-            quote = None;
-        } else if quote.is_none() && (ch == '"' || (ch == '\'' && !cfg!(windows))) {
-            quote = Some(ch);
-        }
-    }
-    quote.is_some() || escaped
-}
-
 pub(super) fn quote(value: &str) -> Result<String> {
     if value.contains('\0') {
         bail!("arguments cannot contain NUL bytes");
@@ -333,5 +526,103 @@ pub(super) fn quote(value: &str) -> Result<String> {
     #[cfg(not(windows))]
     {
         Ok(format!("'{}'", value.replace('\'', "'\\''")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn words(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| (*word).to_owned()).collect()
+    }
+
+    #[test]
+    fn arguments_parse_as_yargs_parser_reads_them() {
+        // Each case checked against yargs-parser 21 with Nx's settings.
+        assert_eq!(
+            Value::Object(yargs(
+                &words(&[
+                    "--a=1", "--b", "2", "--c", "--no-d", "pos", "--e=true", "--f", "false"
+                ]),
+                false,
+                false
+            )),
+            json!({"a": "1", "b": "2", "c": true, "d": false, "e": "true", "f": "false", "_": ["pos"]})
+        );
+        assert_eq!(
+            Value::Object(yargs(&words(&["--a=1", "--a=2", "--a", "3"]), false, false)),
+            json!({"a": ["1", "2", "3"], "_": []})
+        );
+        assert_eq!(
+            Value::Object(yargs(
+                &words(&["-x", "val", "-abc", "--k=v=w", "--", "--after", "x"]),
+                false,
+                false
+            )),
+            json!({"x": "val", "a": true, "b": true, "c": true, "k": "v=w", "_": ["--after", "x"]})
+        );
+        assert_eq!(
+            Value::Object(yargs(
+                &words(&["--n", "-1", "--m", "--o=", "--p=null"]),
+                false,
+                false
+            )),
+            json!({"n": "-1", "m": true, "o": "", "p": "null", "_": []})
+        );
+        assert_eq!(
+            Value::Object(yargs(&words(&["--foo-bar=1", "--x", "a b"]), true, true)),
+            json!({"foo-bar": 1, "fooBar": 1, "x": "a b", "_": []})
+        );
+    }
+
+    #[test]
+    fn commands_take_arguments_as_nx_puts_them() {
+        let options = json!({"port": 3000, "name": "a b", "list": [1], "args": "--extra"});
+        let options = options.as_object().unwrap();
+        let interpolation = Interpolation::new(
+            &words(&[
+                "--mode",
+                "dev",
+                "--cwd",
+                "elsewhere",
+                "two words",
+                "'{\"a\":",
+                "1}'",
+            ]),
+            options,
+        )
+        .unwrap();
+        assert_eq!(
+            interpolation.command("serve", true).unwrap(),
+            "serve --port=3000 --name=\"a b\" --extra --mode dev \"two words\" '{\"a\": 1}'"
+        );
+        assert_eq!(
+            interpolation.command("serve {args} end", true).unwrap(),
+            "serve --port=3000 --name=\"a b\" --mode dev \"two words\" '{\"a\": 1}' --extra end"
+        );
+        // Values go in as they are.
+        assert_eq!(
+            interpolation
+                .command(
+                    "echo {args.mode} {args.name} {args.list} {args.extra} {args.none}!",
+                    true
+                )
+                .unwrap(),
+            "echo dev a b 1 true !"
+        );
+        assert_eq!(interpolation.command("serve", false).unwrap(), "serve");
+        assert!(
+            interpolation
+                .command("{args} {args.mode}", true)
+                .unwrap_err()
+                .to_string()
+                .contains("should not contain both")
+        );
+        let plain = Interpolation::new(&[], &Map::new()).unwrap();
+        assert_eq!(plain.command("echo {args}", true).unwrap(), "echo  ");
+        assert_eq!(plain.command("echo", true).unwrap(), "echo");
     }
 }
