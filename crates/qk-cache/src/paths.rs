@@ -731,13 +731,17 @@ pub fn resolved_outputs(workspace: &Workspace, task: &Task) -> Result<(Vec<Strin
                 .filter(|path| path.as_str().is_some_and(|text| !text.is_empty()))
                 .map(|path| option_tokens(workspace, &task.project, path))
                 .collect::<Result<_>>()?,
-            _ if matches!(task.target.as_str(), "build" | "prepare") => [
-                format!("dist/{root}"),
-                format!("{root}/dist"),
-                format!("{root}/build"),
-                format!("{root}/public"),
-            ]
-            .into(),
+            _ if matches!(task.target.as_str(), "build" | "prepare") => {
+                // The root goes in escaped, as in a configured output.
+                let root = crate::glob::escape(root);
+                [
+                    format!("dist/{root}"),
+                    format!("{root}/dist"),
+                    format!("{root}/build"),
+                    format!("{root}/public"),
+                ]
+                .into()
+            }
             _ => Vec::new(),
         };
         for output in defaults {
@@ -891,12 +895,31 @@ impl OutputData<'_> {
             return Ok(None);
         };
         // Nx resolves the project tokens in every option when it builds the
-        // project graph, so an option's value already has them replaced.
+        // project graph, so an option's value already has them replaced. The
+        // value goes in as written, a pattern if it holds one, as in Nx. The
+        // project's own paths go in with their glob characters escaped, so a
+        // root such as `apps/(group)` names that directory; Nx inserts them
+        // as they are.
         Ok(Some(if name == "options" {
             resolve_option_tokens(self.workspace, self.project, &found)?
         } else {
-            found
+            escape_strings(&found)
         }))
+    }
+}
+
+/// `value` with every string in it escaped by [`crate::glob::escape`].
+fn escape_strings(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) => serde_json::Value::String(crate::glob::escape(text)),
+        serde_json::Value::Array(items) => items.iter().map(escape_strings).collect(),
+        serde_json::Value::Object(object) => serde_json::Value::Object(
+            object
+                .iter()
+                .map(|(key, item)| (key.clone(), escape_strings(item)))
+                .collect(),
+        ),
+        other => other.clone(),
     }
 }
 
@@ -1589,6 +1612,68 @@ mod tests {
         std::os::unix::fs::symlink(root.join("outside"), root.join("dist/link")).unwrap();
         let outputs = Outputs::from_paths(&["dist".into(), "dist/link/nested".into()]).unwrap();
         assert!(outputs.entries(root).is_err());
+    }
+
+    /// A project's root and name go into its outputs as the paths they are;
+    /// an option's value goes in as written.
+    #[test]
+    fn outputs_escape_the_project_root_and_name() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("nx.json"), "{}").unwrap();
+        std::fs::create_dir_all(root.path().join("apps/(group)/dist")).unwrap();
+        std::fs::write(root.path().join("apps/(group)/dist/a.js"), "").unwrap();
+        std::fs::write(
+            root.path().join("apps/(group)/project.json"),
+            json!({"name": "a+b", "sourceRoot": "apps/(group)/src", "targets": {
+                "build": {"command": "true"},
+                "emit": {"command": "true", "options": {"out": "out/*.js"}, "outputs": [
+                    "{projectRoot}/dist",
+                    "{workspaceRoot}/dist/{projectName}",
+                    "{project.sourceRoot}/gen",
+                    "{options.out}",
+                ]},
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let workspace = Workspace::load(root.path()).unwrap();
+        let graph = TaskGraph::build(
+            &workspace,
+            &[
+                Request::parse("a+b:emit").unwrap(),
+                Request::parse("a+b:build").unwrap(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            resolved_outputs(&workspace, &graph.tasks["a+b:emit"])
+                .unwrap()
+                .0,
+            [
+                r"apps/\(group\)/dist",
+                r"dist/a\+b",
+                r"apps/\(group\)/src/gen",
+                "out/*.js"
+            ]
+        );
+        assert_eq!(
+            resolved_outputs(&workspace, &graph.tasks["a+b:build"])
+                .unwrap()
+                .0,
+            [
+                r"dist/apps/\(group\)",
+                r"apps/\(group\)/dist",
+                r"apps/\(group\)/build",
+                r"apps/\(group\)/public"
+            ]
+        );
+        let outputs = Outputs::new(&workspace, &graph.tasks["a+b:emit"]).unwrap();
+        assert!(
+            outputs
+                .paths(root.path())
+                .unwrap()
+                .contains("apps/(group)/dist/a.js")
+        );
     }
 
     #[test]

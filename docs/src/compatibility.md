@@ -64,10 +64,13 @@ When a name occurs in multiple sections, precedence is `dependencies`,
 - An `includeIgnored` fileset leaves out the task's own declared outputs, as
   every qk fileset does, so a task that writes into what it reads can still
   be cached. Nx keys them.
-- In filesets, `json` inputs and `includeIgnored` filesets, `{projectRoot}`
-  and `{projectName}` go in with their glob characters escaped, so a project
-  at `apps/(marketing)` reads that directory. Nx inserts them as they are,
-  which turns such a root into a pattern that misses the project's files.
+- In filesets, `json` inputs, `includeIgnored` filesets and outputs,
+  `{projectRoot}` and `{projectName}` go in with their glob characters
+  escaped, so a project at `apps/(marketing)` reads and caches that
+  directory. So do the project's values in an output's `{project.…}` and the
+  root in the outputs a target without `outputs` takes. Nx inserts them as
+  they are, which turns such a root into a pattern that misses the project's
+  files.
 - For affected-project selection, bare parenthesized extension groups such
   as `**/*.(svg|png)` select projects in qk that Nx 23.1.0 does not.
   See [Inputs and outputs](reference/inputs-outputs.md) for compatible syntax.

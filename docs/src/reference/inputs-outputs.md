@@ -197,7 +197,10 @@ project graph. Braces that do not start with a token are glob text, so
 `{projectRoot}/dist/**/*.{js,map}` is one output, and so is `{env.NAME}`:
 environment variables are no placeholder in outputs. As in inputs, `\`
 escapes a glob character, so `{projectRoot}/app/\\(group\\)` in JSON names
-the `app/(group)` directory.
+the `app/(group)` directory. The project's root and name go in as the
+paths they are, so `{projectRoot}/dist` of a project at `apps/(group)` names
+`apps/(group)/dist`, which Nx does not do; an option's value goes in as
+written, a pattern if it holds one.
 
 An output whose `{options.…}` placeholder, or a `{projectRoot}` or
 `{workspaceRoot}` left as text, has no value is left out. `{workspaceRoot}`
