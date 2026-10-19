@@ -1326,26 +1326,32 @@ fn long_running_targets_stream_unless_a_static_style_is_named() {
         "serve": {"command": "echo serving"},
         "build": {"command": "echo built"}
     }));
-    // CI defaults to static without naming it, so a server's output streams.
+    // CI defaults to static without naming it, so a server's output streams,
+    // without a prefix unless NX_PREFIX_OUTPUT asks for one, as in Nx.
     let (stdout, _, _) = plain(
         temp.path(),
         &["run-many", "-t", "serve", "build"],
         &[("CI", "true")],
     );
-    assert!(stdout.contains("app: serving"), "{stdout}");
+    assert!(stdout.lines().any(|line| line == "serving"), "{stdout}");
     assert!(stdout.contains("> nx run app:build\n\nbuilt"), "{stdout}");
+    let (stdout, _, _) = plain(
+        temp.path(),
+        &["run-many", "-t", "serve"],
+        &[("CI", "true"), ("NX_PREFIX_OUTPUT", "true")],
+    );
+    assert!(stdout.contains("app: serving"), "{stdout}");
     let (stdout, _, _) = plain(
         temp.path(),
         &["run-many", "-t", "serve", "--output-style", "static"],
         &[],
     );
     assert!(stdout.contains("> nx run app:serve\n\nserving"), "{stdout}");
-    // NX_STREAM_OUTPUT decides for every task, and NX_PREFIX_OUTPUT=false
-    // drops the prefix.
+    // NX_STREAM_OUTPUT decides for every task.
     let (stdout, _, _) = plain(
         temp.path(),
         &["run-many", "-t", "build", "--output-style", "static"],
-        &[("NX_STREAM_OUTPUT", "true"), ("NX_PREFIX_OUTPUT", "false")],
+        &[("NX_STREAM_OUTPUT", "true")],
     );
     assert!(
         stdout.contains("built") && !stdout.contains("> nx run"),

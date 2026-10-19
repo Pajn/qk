@@ -70,7 +70,7 @@ similar patterns in a value it substitutes, is not reproduced.
 | `NX_DEFAULT_OUTPUT_STYLE` | Default output style, overridden by `--output-style`; an unknown name is ignored, as in Nx |
 | `NX_TASKS_RUNNER_DYNAMIC_OUTPUT=false` | No live panel; `static` instead |
 | `NX_STREAM_OUTPUT` | `true` streams every task's output rather than holding it; `false` streams none but continuous tasks |
-| `NX_PREFIX_OUTPUT=false` | Under the static styles, streamed output goes without the project prefix |
+| `NX_PREFIX_OUTPUT=true` | Under the static styles, streamed output carries the project prefix |
 | `NX_PROCESS_KILL_GRACE_PERIOD` | Milliseconds a cancelled or stopped command has to exit after SIGTERM before it is killed; 5000 by default |
 | `NX_LOAD_DOT_ENV_FILES=false` | Load no dotenv file |
 | `NX_RUN_REPORT` | JSON report path, overridden by `--report` |

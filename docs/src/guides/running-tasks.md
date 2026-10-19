@@ -87,13 +87,13 @@ defaults are qk's; Nx's is `static-failures-only` where it does not use its
 terminal UI. `stream` and `stream-without-prefixes` print `qk:` status lines
 on stderr; `static` shows each task's status in its header instead, and the
 panel and `quiet` collect warnings for the summary. Continuous tasks stream
-with prefixes under the static styles and `stream`, since their output would
-otherwise never appear. As in Nx, when no static style was named, as with
+under the static styles, since their output would otherwise never appear. As in Nx, when no static style was named, as with
 the CI default, a long-running task streams too: one that runs with
 `--watch`, or whose target is `serve`, `dev`, `start` or ends in `-watch`
 or `:watch`. `NX_STREAM_OUTPUT=true` streams every task and
-`NX_STREAM_OUTPUT=false` none but continuous ones; streamed output carries
-the prefix unless `NX_PREFIX_OUTPUT=false`. Colour follows picocolors: off
+`NX_STREAM_OUTPUT=false` none but continuous ones. As in Nx, output streamed
+under a style other than `stream` carries the project prefix only with
+`NX_PREFIX_OUTPUT=true`. Colour follows picocolors: off
 with `NO_COLOR` or `FORCE_COLOR=0`, on with `FORCE_COLOR`, in CI or on a
 terminal.
 

@@ -67,9 +67,7 @@ edges off.
 - qk's default output styles are its own: `static` in CI, the live panel on
   a terminal and `quiet` otherwise for several tasks, and raw output for one.
   Nx defaults to `static-failures-only` where it does not use its terminal UI,
-  and to `summary` when driven by an AI agent. Streamed output under the
-  static styles carries the project prefix unless `NX_PREFIX_OUTPUT=false`,
-  where Nx's carries it only under `NX_PREFIX_OUTPUT=true`.
+  and to `summary` when driven by an AI agent.
 - `--output-style=summary` writes the output of failed tasks only, to the
   worktree's state directory; Nx writes every task's output to its cache
   directory.

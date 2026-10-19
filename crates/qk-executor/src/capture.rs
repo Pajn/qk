@@ -49,7 +49,7 @@ pub enum Shown {
 
 impl Display {
     /// The display for a task under an output style. Continuous tasks never end
-    /// on their own, so held output would never appear; they stream prefixed.
+    /// on their own, so held output would never appear; they stream.
     /// `id` names the task as [`printable`] does. `root` is a task the run was
     /// asked for, rather than a dependency, and `initiating` a task of the
     /// project a single task was asked for, which `static-failures-only`
@@ -70,18 +70,19 @@ impl Display {
             style,
             Static | RunOne | StaticFailuresOnly | RunOneFailuresOnly
         );
+        // As in Nx, a task streamed under another style is prefixed only when
+        // NX_PREFIX_OUTPUT is `true`, which `--output-style=stream` sets.
+        let streamed = || {
+            if std::env::var_os("NX_PREFIX_OUTPUT").is_some_and(|value| value == "true") {
+                Self::Prefixed(prefix(project))
+            } else {
+                Self::Stream
+            }
+        };
         match style {
             StreamWithoutPrefixes => Self::Stream,
             _ if run_one && root && !continuous => Self::Headed { id: id.to_owned() },
-            // A task that streams, behind its prefix unless NX_PREFIX_OUTPUT
-            // turns it off.
-            _ if held && streams && !continuous => {
-                if std::env::var_os("NX_PREFIX_OUTPUT").is_some_and(|value| value == "false") {
-                    Self::Stream
-                } else {
-                    Self::Prefixed(prefix(project))
-                }
-            }
+            _ if held && streams && !continuous => streamed(),
             Static | RunOne | StaticFailuresOnly | RunOneFailuresOnly if !continuous => {
                 Self::Static {
                     id: id.to_owned(),
@@ -101,9 +102,8 @@ impl Display {
                 id: id.to_owned(),
                 log: None,
             },
-            Static | RunOne | StaticFailuresOnly | RunOneFailuresOnly | Summary | Stream => {
-                Self::Prefixed(prefix(project))
-            }
+            Stream => Self::Prefixed(prefix(project)),
+            Static | RunOne | StaticFailuresOnly | RunOneFailuresOnly | Summary => streamed(),
         }
     }
 }
