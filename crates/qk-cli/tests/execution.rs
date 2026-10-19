@@ -1261,7 +1261,8 @@ fn summary_prints_counts_and_where_failed_output_is() {
         .lines()
         .find_map(|line| line.trim().strip_prefix("full log: "))
         .unwrap_or_else(|| panic!("{stderr}"));
-    assert_eq!(fs::read_to_string(log).unwrap(), "broken\n");
+    // On Windows, cmd writes `broken \r\n`.
+    assert_eq!(fs::read_to_string(log).unwrap().trim_end(), "broken");
     assert!(stderr.contains("Re-run with --output-style=static to inline logs."));
 }
 
