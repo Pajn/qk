@@ -1869,8 +1869,21 @@ fn nx_task_graph(workspace: &Workspace, graph: &TaskGraph) -> Result<serde_json:
         if task.dependencies.is_empty() {
             roots.push(id.clone());
         }
-        dependencies.insert(id.clone(), json!(finite));
-        continuous_dependencies.insert(id.clone(), json!(serving));
+        // As Nx 24's edges: the task id, and for a continuous dependency
+        // whether the task waits for it to be ready or leaves out its inputs.
+        let edge = |dependency: &String| {
+            let mut edge = json!({"id": dependency});
+            let declared = task.edge(dependency);
+            if declared.wait_for == qk_taskgraph::WaitFor::Ready {
+                edge["waitFor"] = json!("ready");
+            }
+            if !declared.inputs {
+                edge["inputs"] = json!(false);
+            }
+            edge
+        };
+        dependencies.insert(id.clone(), finite.into_iter().map(edge).collect());
+        continuous_dependencies.insert(id.clone(), serving.into_iter().map(edge).collect());
     }
     Ok(json!({
         "graph": serde_json::to_value(GraphReport { graph: &projects })?["graph"],

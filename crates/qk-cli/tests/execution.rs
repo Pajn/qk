@@ -2255,7 +2255,7 @@ fn the_task_graph_is_written_as_nx_writes_it() {
     let temp = fixture(json!({
         "serve": {"command": "sleep 1", "continuous": true},
         "build": {"command": "echo build", "cache": true, "outputs": ["{projectRoot}/dist"]},
-        "e2e": {"command": "echo e2e", "dependsOn": ["build", "serve"], "parallelism": false}
+        "e2e": {"command": "echo e2e", "dependsOn": ["build", {"target": "serve", "waitFor": "ready", "inputs": false}], "parallelism": false}
     }));
     let graph: Value = serde_json::from_slice(
         &success(run(
@@ -2268,10 +2268,14 @@ fn the_task_graph_is_written_as_nx_writes_it() {
     assert!(graph["graph"]["nodes"]["app"].is_object());
     let tasks = &graph["tasks"];
     assert_eq!(tasks["roots"], json!(["app:build", "app:serve"]));
-    assert_eq!(tasks["dependencies"]["app:e2e"], json!(["app:build"]));
+    // Edges as Nx 24 writes them, with how a continuous one is depended on.
+    assert_eq!(
+        tasks["dependencies"]["app:e2e"],
+        json!([{"id": "app:build"}])
+    );
     assert_eq!(
         tasks["continuousDependencies"]["app:e2e"],
-        json!(["app:serve"])
+        json!([{"id": "app:serve", "waitFor": "ready", "inputs": false}])
     );
     let e2e = &tasks["tasks"]["app:e2e"];
     assert_eq!(e2e["target"], json!({"project": "app", "target": "e2e"}));
