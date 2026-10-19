@@ -784,24 +784,36 @@ fn validate_outputs(outputs: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// `path` without Windows' verbatim `\\?\` prefix on a drive path.
+fn verbatim_free(path: &Path) -> PathBuf {
+    match path.to_str().and_then(|text| text.strip_prefix(r"\\?\")) {
+        Some(rest) if !rest.starts_with("UNC\\") => PathBuf::from(rest),
+        _ => path.to_path_buf(),
+    }
+}
+
 /// An output made workspace-relative, as Nx's cache reads one: an absolute
 /// path inside the workspace is relativized, and one outside it, or a path
 /// that climbs out with `..`, is an error.
 fn workspace_relative(workspace: &Workspace, output: &str) -> Result<String> {
+    let owned;
     let relative = if Path::new(output).is_absolute() || output.starts_with('/') {
-        let root = workspace
-            .root
-            .to_str()
-            .context("workspace path must be UTF-8")?;
-        let inside = output
-            .strip_prefix(root.trim_end_matches('/'))
-            .filter(|rest| {
-                rest.is_empty()
-                    || rest.starts_with('/')
-                    || rest.starts_with(std::path::MAIN_SEPARATOR)
+        // Compared by components, without Windows' `\\?\` prefix, which
+        // one of the two paths may carry and the other not.
+        let inside = verbatim_free(Path::new(output))
+            .strip_prefix(verbatim_free(&workspace.root))
+            .ok()
+            .map(|rest| {
+                rest.components()
+                    .map(|part| part.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/")
             });
         match inside {
-            Some(rest) => rest.trim_start_matches(['/', std::path::MAIN_SEPARATOR]),
+            Some(rest) => {
+                owned = rest;
+                owned.as_str()
+            }
             None => bail!("cache output is outside the workspace: {output}"),
         }
     } else {
@@ -1195,10 +1207,11 @@ fn join_path(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Outputs, Pattern, dot_git, normalize, resolved_outputs};
+    use super::{Outputs, Pattern, dot_git, normalize, resolved_outputs, verbatim_free};
     use qk_config::Workspace;
     use qk_taskgraph::{Request, TaskGraph};
     use serde_json::{Value, json};
+    use std::path::{Path, PathBuf};
 
     /// The outputs of `lib:build` in a workspace with a root project and
     /// `lib` at `libs/lib`, the target configured by `target`.
@@ -1398,6 +1411,20 @@ mod tests {
                 .unwrap()
                 .0,
             ["dist", "out"]
+        );
+    }
+
+    #[test]
+    fn verbatim_prefixes_are_left_out_of_drive_paths_only() {
+        assert_eq!(
+            verbatim_free(Path::new(r"\\?\C:\repo\dist")),
+            PathBuf::from(r"C:\repo\dist")
+        );
+        let unc = Path::new(r"\\?\UNC\server\share");
+        assert_eq!(verbatim_free(unc), unc);
+        assert_eq!(
+            verbatim_free(Path::new("/repo/dist")),
+            Path::new("/repo/dist")
         );
     }
 
