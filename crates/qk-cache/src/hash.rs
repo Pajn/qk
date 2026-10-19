@@ -138,6 +138,9 @@ pub struct Snapshot {
     workspace_prefix: Option<PathBuf>,
     patterns: Mutex<HashMap<(String, bool, bool), Arc<Pattern>>>,
     digests: Mutex<HashMap<String, (Stamp, String)>>,
+    /// Files `includeIgnored` filesets read, whose digests are saved beside
+    /// those of `files`, which may not list them.
+    ignored_files: Mutex<BTreeSet<String>>,
     /// Whether `digests` gained entries worth saving.
     digests_changed: std::sync::atomic::AtomicBool,
     /// Directories already checked not to be symlinks.
@@ -733,6 +736,7 @@ impl Snapshot {
             patterns: Mutex::default(),
             digests: Mutex::new(digests),
             digests_changed: Default::default(),
+            ignored_files: Mutex::default(),
             directories: Mutex::default(),
             runtime: Mutex::default(),
             lockfile: Mutex::new(lockfile),
@@ -879,9 +883,10 @@ impl Snapshot {
             return;
         }
         let digests = self.digests.lock().unwrap();
+        let ignored = self.ignored_files.lock().unwrap();
         let entries: BTreeMap<&String, (&Stamp, &String)> = digests
             .iter()
-            .filter(|(path, _)| self.files.contains(*path))
+            .filter(|(path, _)| self.files.contains(*path) || ignored.contains(*path))
             .map(|(path, (stamp, digest))| (path, (stamp, digest)))
             .collect();
         let path = digests_path(root);
@@ -1095,6 +1100,7 @@ impl Snapshot {
             Err(error) => return Err(error.into()),
         };
         let mode = crate::store::mode(&metadata) & 0o111 != 0;
+        self.ignored_files.lock().unwrap().insert(path.to_owned());
         Ok(Some(
             json!({"content":self.digest(path, &absolute, &metadata)?, "mode":mode}),
         ))
@@ -3397,5 +3403,60 @@ mod tests {
         std::fs::write(root.path().join("generated/value"), "different").unwrap();
         snapshot.outputs_written(&workspace, &graph.tasks["app:post"]);
         assert_ne!(before["app:gen:**/*"], keys()["app:gen:**/*"]);
+    }
+    /// The digest of a git-ignored file an `includeIgnored` fileset reads is
+    /// saved with the others, so a warm run does not read it again.
+    #[test]
+    fn digests_of_ignored_files_read_by_include_ignored_are_saved() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("nx.json"), "{}").unwrap();
+        std::fs::write(root.path().join(".gitignore"), "generated/\n").unwrap();
+        std::fs::write(
+            root.path().join("project.json"),
+            json!({"name": "app", "targets": {"build": {"command": "true", "inputs": [
+                {"fileset": "{projectRoot}/generated/**/*", "includeIgnored": true}
+            ]}}})
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::create_dir(root.path().join("generated")).unwrap();
+        std::fs::write(root.path().join("generated/schema.json"), "{}").unwrap();
+        // Digests are only saved for files old enough to have settled.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        for path in ["generated/schema.json", "generated"] {
+            std::fs::File::open(root.path().join(path))
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(old))
+                .unwrap();
+        }
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root.path())
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            )
+        };
+        git(&["init", "--quiet"]);
+        let workspace = Workspace::load(root.path()).unwrap();
+        let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
+        let snapshot = Snapshot::new(&workspace, &graph, &root.path().join("cache")).unwrap();
+        assert!(!snapshot.files.contains("generated/schema.json"));
+        let prepared =
+            qk_executor::prepare(&workspace, &graph.tasks["app:build"], &BTreeMap::new()).unwrap();
+        inputs(
+            &snapshot,
+            &workspace,
+            &graph.tasks["app:build"],
+            &prepared,
+            &BTreeMap::new(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        snapshot.save_digests(root.path());
+        assert!(load_digests(root.path()).contains_key("generated/schema.json"));
     }
 }
