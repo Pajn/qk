@@ -353,11 +353,25 @@ fn dotenv_files(
 /// The target whose dotenv files a task reads, and the target it was
 /// atomized from, as Nx's getOwnerTargetForTask finds them: through the
 /// project's `metadata.targetGroups`, a target of the task's group that
-/// names a `metadata.nonAtomizedTarget`.
+/// names a `metadata.nonAtomizedTarget`. Unlike Nx, a task that names one
+/// itself is its own owner, so each atomized target reads its own files
+/// rather than the first of its group's.
 fn owner_target<'a>(
     project: &'a qk_config::Project,
     target: &'a str,
 ) -> (&'a str, Option<&'a str>) {
+    let non_atomized = |definition: &'a qk_config::Target| {
+        definition
+            .extra
+            .get("metadata")
+            .and_then(|metadata| metadata.get("nonAtomizedTarget"))
+            .and_then(Value::as_str)
+    };
+    if let Some((name, definition)) = project.targets.get_key_value(target)
+        && let Some(non_atomized) = non_atomized(definition)
+    {
+        return (name, Some(non_atomized));
+    }
     let groups = project
         .extra
         .get("metadata")
@@ -375,11 +389,7 @@ fn owner_target<'a>(
         }
         for member in members {
             if let Some((name, definition)) = project.targets.get_key_value(member)
-                && let Some(non_atomized) = definition
-                    .extra
-                    .get("metadata")
-                    .and_then(|metadata| metadata.get("nonAtomizedTarget"))
-                    .and_then(Value::as_str)
+                && let Some(non_atomized) = non_atomized(definition)
             {
                 return (name, Some(non_atomized));
             }
@@ -423,17 +433,18 @@ fn task_environment(
     base_env: &BTreeMap<OsString, OsString>,
 ) -> Result<(BTreeMap<OsString, OsString>, BTreeMap<OsString, OsString>)> {
     let mut env = base_env.clone();
-    // As Nx's unloadDotEnvFiles: a variable whose value is a root file's
-    // goes, so the task's own files decide it.
-    for file in [".env", ".local.env", ".env.local"] {
-        for (name, value) in dotenv::read_alone(&workspace.root.join(file))? {
-            if env.get(&name) == Some(&value) {
-                env.remove(&name);
-            }
-        }
-    }
     let project = &workspace.projects[&task.project];
     if loads_dotenv(base_env) {
+        // As Nx's unloadDotEnvFiles: a variable whose value is a root file's
+        // goes, so the task's own files decide it. Nx unloads them even when
+        // it did not load them; qk keeps what the shell set then.
+        for file in [".env", ".local.env", ".env.local"] {
+            for (name, value) in dotenv::read_alone(&workspace.root.join(file))? {
+                if env.get(&name) == Some(&value) {
+                    env.remove(&name);
+                }
+            }
+        }
         let (target, non_atomized) = owner_target(project, &task.target);
         let files: Vec<PathBuf> = dotenv_files(
             &project.root,

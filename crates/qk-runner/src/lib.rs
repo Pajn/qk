@@ -224,7 +224,10 @@ pub fn run(
                     if style == OutputStyle::Summary
                         && let Display::Failures { log, .. } = &mut prepared.display
                     {
-                        *log = Some(logs.join(log_name(id)));
+                        let path = logs.join(log_name(id));
+                        // Only this run's failure may name a log.
+                        let _ = std::fs::remove_file(&path);
+                        *log = Some(path);
                     }
                     (id.clone(), prepared)
                 })

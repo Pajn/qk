@@ -1266,6 +1266,37 @@ fn summary_prints_counts_and_where_failed_output_is() {
     assert!(stderr.contains("Re-run with --output-style=static to inline logs."));
 }
 
+/// A task that fails before it prints anything, as one waiting for a server
+/// that exits does, names no log, rather than an earlier run's.
+#[cfg(unix)]
+#[test]
+fn summary_never_names_an_earlier_run_s_log() {
+    let temp = fixture(json!({"e2e": {"command": "echo broken && exit 3"}}));
+    let (_, stderr, _) = plain(
+        temp.path(),
+        &["run", "app:e2e", "--output-style=summary"],
+        &[],
+    );
+    assert!(stderr.contains("full log: "), "{stderr}");
+    fs::write(
+        temp.path().join("project.json"),
+        json!({"name": "app", "targets": {
+            "serve": {"continuous": true, "readyWhen": {"logMatches": "never"}, "command": "exit 0"},
+            "e2e": {"command": "echo e2e-ran", "dependsOn": [{"target": "serve", "waitFor": "ready"}]}
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let (_, stderr, code) = plain(
+        temp.path(),
+        &["run", "app:e2e", "--output-style=summary"],
+        &[],
+    );
+    assert_ne!(code, Some(0));
+    assert!(stderr.contains("exited before it became ready"), "{stderr}");
+    assert!(!stderr.contains("full log: "), "{stderr}");
+}
+
 #[test]
 fn unknown_output_styles_fail_and_unknown_defaults_are_ignored() {
     let temp = fixture(json!({"build": {"command": "echo built"}}));
@@ -1590,6 +1621,50 @@ fn root_dotenv_files_set_run_controls_as_in_nx() {
         .output()
         .unwrap();
     assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
+}
+
+#[cfg(unix)]
+#[test]
+fn without_dotenv_files_a_shell_variable_matching_a_root_file_stays() {
+    let temp = fixture(json!({"show": {"command": "echo url=$API_URL"}}));
+    fs::write(temp.path().join(".env"), "API_URL=x\n").unwrap();
+    let output = command(temp.path(), &["run", "app:show"])
+        .env("NX_LOAD_DOT_ENV_FILES", "false")
+        .env("API_URL", "x")
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(success(output).stdout).unwrap(),
+        "url=x\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_atomized_target_reads_its_own_dotenv_files() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    fs::write(root.join("nx.json"), "{}").unwrap();
+    fs::create_dir_all(root.join("app")).unwrap();
+    let atomized = |spec: &str| json!({"command": "echo $SPEC", "metadata": {"nonAtomizedTarget": "e2e-ci", "spec": spec}});
+    fs::write(
+        root.join("app/project.json"),
+        json!({
+            "name": "app",
+            "metadata": {"targetGroups": {"E2E (CI)": ["e2e-ci--a", "e2e-ci--b", "e2e-ci"]}},
+            "targets": {
+                "e2e-ci--a": atomized("a"),
+                "e2e-ci--b": atomized("b"),
+                "e2e-ci": {"executor": "nx:noop"},
+            },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(root.join("app/.env.e2e-ci--a"), "SPEC=a\n").unwrap();
+    fs::write(root.join("app/.env.e2e-ci--b"), "SPEC=b\n").unwrap();
+    let output = success(command(root, &["run", "app:e2e-ci--b"]).output().unwrap());
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "b\n");
 }
 
 #[cfg(unix)]

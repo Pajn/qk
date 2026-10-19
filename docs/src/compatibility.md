@@ -125,6 +125,12 @@ edges off.
   project named `shared`. A plain name matches as a word by its characters;
   Nx puts it unescaped into a regular expression, so `.` there matches any
   character.
+- An atomized target, one naming a `metadata.nonAtomizedTarget`, reads its
+  own `.env.<target>` files; Nx reads those of the first atomized target in
+  its group for every target of the group.
+- With `NX_LOAD_DOT_ENV_FILES=false`, a task keeps a shell variable whose
+  value a root `.env` file repeats. Nx removes it, unloading files it never
+  loaded.
 - A `targetDefaults` `filter.projects` given as a string is one pattern; Nx
   spreads it into one pattern per character.
 - Globs in project selectors, workspace package patterns, `targetDefaults`

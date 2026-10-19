@@ -13,7 +13,8 @@ project root and then the workspace root, `.env.<target>.<configuration>`,
 run-commands options; run-script reads none of them. A target that a plugin
 atomized, named in its project's `metadata.targetGroups` with a
 `metadata.nonAtomizedTarget`, also reads the files of the target it was split
-from, after its own. The
+from, after its own. Each atomized target reads its own files, where Nx gives
+every target of the group the files of its first atomized one. The
 task variables are `NX_TASK_TARGET_PROJECT`, `NX_TASK_TARGET_TARGET`,
 `NX_TASK_TARGET_CONFIGURATION`, `NX_WORKSPACE_ROOT`, `LERNA_PACKAGE_NAME`,
 `NX_TUI=false`, `NX_INVOCATION_ANCESTOR_PIDS`, `NX_TERMINAL_CAPTURE_STDERR=true`
@@ -45,7 +46,8 @@ environment before it reads its command line, so the run controls below can
 be set there; remote cache credentials arrive the same way. For each task,
 a variable whose value is one of those files' is then removed again, so the
 task's own files decide it, as in Nx. `NX_LOAD_DOT_ENV_FILES=false` turns
-every dotenv file off, `envFile` included, as in Nx. For `envFile`, the
+every dotenv file off, `envFile` included, as in Nx; qk then removes nothing,
+where Nx still removes a shell variable whose value a root file repeats. For `envFile`, the
 task's environment decides, so a task's dotenv file can turn it off.
 
 A task does not see `NX_SET_CLI`, `NX_ORIGINAL_FORCE_COLOR`,
