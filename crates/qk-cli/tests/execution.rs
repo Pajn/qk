@@ -3113,7 +3113,9 @@ fn input_analysis_cancellation_stops_descendants_and_saves_an_advisory_report() 
         .spawn()
         .unwrap(),
     );
-    let deadline = Instant::now() + Duration::from_secs(15);
+    // On macOS the recorder first waits up to 10 seconds for the system log
+    // and up to 10 more for it to carry a probe report.
+    let deadline = Instant::now() + Duration::from_secs(30);
     while !temp.path().join("heartbeat.started").exists() {
         if child.try_wait().unwrap().is_some() {
             use std::io::Read;
