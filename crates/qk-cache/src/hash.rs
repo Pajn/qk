@@ -1452,6 +1452,15 @@ struct FilePattern {
     owner: Option<String>,
 }
 
+/// A `json` glob, kept to select dependency outputs once they are written.
+struct JsonGlob {
+    matcher: Arc<Pattern>,
+    prefix: String,
+    /// The project whose files it selects, or `None` for the workspace's.
+    owner: Option<String>,
+    fields: JsonFields,
+}
+
 #[derive(Default)]
 struct FileSelection {
     patterns: Vec<FilePattern>,
@@ -1473,6 +1482,7 @@ struct Resolver<'a> {
     scopes: BTreeMap<FileScope, FileSelection>,
     values: BTreeMap<String, Value>,
     json_fields: BTreeMap<String, JsonFields>,
+    json_globs: Vec<JsonGlob>,
     named_stack: Vec<(String, String)>,
     /// Dependency named inputs already expanded for `^` inputs.
     expanded: BTreeSet<(String, String)>,
@@ -1503,6 +1513,7 @@ impl<'a> Resolver<'a> {
             scopes: BTreeMap::new(),
             values: BTreeMap::new(),
             json_fields: BTreeMap::new(),
+            json_globs: Vec::new(),
             named_stack: Vec::new(),
             expanded: BTreeSet::new(),
             external: BTreeSet::new(),
@@ -1992,6 +2003,12 @@ impl<'a> Resolver<'a> {
         for file in matched {
             self.json_file(file, &fields)?;
         }
+        self.json_globs.push(JsonGlob {
+            matcher,
+            prefix: crate::ignored::partition(&path).0,
+            owner: owner.map(str::to_owned),
+            fields,
+        });
         Ok(())
     }
 
@@ -2113,7 +2130,8 @@ fn resolve_candidates(
 ) -> Result<Resolved> {
     let mut resolver = Resolver::new(snapshot, workspace, prepared, cancelled, candidates);
     resolver.task_inputs(task)?;
-    // Dependency outputs may also be declared sources. Downstream and unrelated
+    // Dependency outputs may also be declared sources, for filesets and `json`
+    // globs alike. Downstream and unrelated
     // outputs remain artifacts, so producing them cannot invalidate an upstream task.
     let mut upstream = BTreeSet::new();
     let mut pending: Vec<_> = task.dependencies.iter().cloned().collect();
@@ -2143,9 +2161,11 @@ fn resolve_candidates(
             .values()
             .flat_map(|scope| &scope.patterns)
             .filter(|pattern| !pattern.excluded)
-            .any(|pattern| {
+            .map(|pattern| &pattern.prefix)
+            .chain(resolver.json_globs.iter().map(|glob| &glob.prefix))
+            .any(|prefix| {
                 declared.anchors().any(|anchor| {
-                    overlaps(&pattern.prefix, anchor)
+                    overlaps(prefix, anchor)
                         && (!source_ignore.matches_directory(anchor)
                             || !workspace.root.join(anchor).is_dir())
                 })
@@ -2155,12 +2175,24 @@ fn resolve_candidates(
         }
         producers.insert(producer.id.clone());
         let outputs = snapshot.dependency_outputs(workspace, producer)?;
+        let mut json = Vec::new();
         for path in &outputs.files {
             if source_ignore.matches(path)
                 || own_outputs.as_ref().is_some_and(|own| own.matches(path))
             {
                 continue;
             }
+            json.extend(
+                resolver
+                    .json_globs
+                    .iter()
+                    .filter(|glob| {
+                        glob.matcher.is_match(path)
+                            && (glob.owner.is_none()
+                                || snapshot.owner(path) == glob.owner.as_deref())
+                    })
+                    .map(|glob| (path.clone(), glob.fields.clone())),
+            );
             for selection in resolver.scopes.values_mut() {
                 for pattern in &selection.patterns {
                     if pattern.matcher.is_match(path)
@@ -2175,6 +2207,9 @@ fn resolve_candidates(
                     }
                 }
             }
+        }
+        for (path, fields) in json {
+            resolver.json_file(path, &fields)?;
         }
     }
     for selection in resolver.scopes.values() {
@@ -2674,6 +2709,57 @@ mod tests {
         let workspace = Workspace::load(root.path()).unwrap();
         let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
         (root, workspace, graph)
+    }
+
+    /// A `json` glob selects a dependency's declared outputs, keyed by their
+    /// fields, and makes that dependency a producer, as a fileset does.
+    #[test]
+    fn json_globs_select_dependency_outputs() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("nx.json"), "{}").unwrap();
+        for (path, content) in [
+            (
+                "apps/app/project.json",
+                json!({"name": "app", "implicitDependencies": ["lib"], "targets": {
+                    "build": {"command": "true", "dependsOn": ["^build"], "inputs": [
+                        {"json": "{workspaceRoot}/libs/lib/out/*.json", "fields": ["version"]}
+                    ]}
+                }}),
+            ),
+            (
+                "libs/lib/project.json",
+                json!({"name": "lib", "targets": {
+                    "build": {"command": "true", "outputs": ["{projectRoot}/out"]}
+                }}),
+            ),
+            (
+                "libs/lib/out/meta.json",
+                json!({"version": 2, "built": "now"}),
+            ),
+        ] {
+            let path = root.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content.to_string()).unwrap();
+        }
+        let workspace = Workspace::load(root.path()).unwrap();
+        let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
+        let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
+        let resolved = resolve(
+            &snapshot,
+            &workspace,
+            &graph.tasks["app:build"],
+            None,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.declared.values.get("json:libs/lib/out/meta.json"),
+            Some(&json!({"version": 2}))
+        );
+        assert_eq!(
+            resolved.declared.producers,
+            BTreeSet::from(["lib:build".to_owned()])
+        );
     }
 
     #[test]

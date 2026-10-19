@@ -156,8 +156,9 @@ selects matching files from declared outputs of direct task dependencies.
 `transitive: true` also includes outputs of their dependencies. As in Nx, a
 dependency without declared outputs offers none, and other artifacts do not
 change this input's key. Multiple patterns are combined. This and filesets
-selecting a dependency's outputs are the only ways a dependency task keys a
-task, and the only ways a change to it makes the task affected.
+or `json` globs selecting a dependency's outputs are the only ways a
+dependency task keys a task, and the only ways a change to it makes the task
+affected.
 
 ### `workingDirectory`
 
@@ -170,9 +171,10 @@ qk was invoked from in the key.
 selects dotted fields of a JSON or JSONC file. A path with no glob pattern is
 read even when source ignore rules exclude it, which Nx does not do. A glob
 selects, as in Nx, among the files a fileset from the same root would: the
-project's own, or the workspace's from `{workspaceRoot}/`. A file named `.yaml` or `.yml` is read as YAML, which Nx
-does not do: Nx keys such a file by its whole content, so a key qk leaves
-unchanged can still change Nx's. As in Nx, a file qk cannot read is keyed by
+project's own, or the workspace's from `{workspaceRoot}/`, a dependency's
+declared outputs among them once it has written them. A file named `.yaml`
+or `.yml` is read as YAML, which Nx does not do: Nx keys such a file by its
+whole content, so a key qk leaves unchanged can still change Nx's. As in Nx, a file qk cannot read is keyed by
 its whole content, without the field filters.
 
 Affected task selection compares the selected fields at both revisions, so a

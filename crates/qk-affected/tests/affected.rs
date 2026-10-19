@@ -1590,3 +1590,26 @@ fn a_fileset_from_an_escaped_root_reads_no_sibling_outputs() {
         ["other:build"]
     );
 }
+
+/// A `json` glob reads a dependency's declared outputs as a fileset does, so
+/// a change of that dependency carries to the task.
+#[test]
+fn json_globs_read_their_producers_outputs() {
+    let repo = Repo::new(&[
+        (
+            "apps/app/project.json",
+            r#"{"name": "app", "implicitDependencies": ["lib"], "targets": {"build": {"command": "echo build", "dependsOn": ["^build"], "inputs": [{"json": "{workspaceRoot}/libs/lib/out/*.json", "fields": ["version"]}]}}}"#,
+        ),
+        (
+            "libs/lib/project.json",
+            r#"{"name": "lib", "targets": {"build": {"command": "echo build", "inputs": ["{projectRoot}/src/**/*"], "outputs": ["{projectRoot}/out"]}}}"#,
+        ),
+        ("libs/lib/src/index.ts", "index"),
+    ]);
+    write(&repo.root, "libs/lib/src/index.ts", "changed");
+    let tasks = affected_tasks_of(&repo, &["app:build"]);
+    assert_eq!(tasks.keys().collect::<Vec<_>>(), ["app:build", "lib:build"]);
+    assert!(
+        matches!(&tasks["app:build"], qk_affected::TaskCause::Reads { task } if task == "lib:build")
+    );
+}
