@@ -145,10 +145,10 @@ Every input declaration of Nx 24 is supported, `always` read as absent:
 As in Nx, a named input cannot use `dependencies` or `projects`. With a
 package manager other than pnpm, lockfiles are always keyed by content.
 Generated artifacts stay out of source filesets. A consumer's filesets can
-include outputs from its dependency tasks, including transitive dependencies,
-except those in git-ignored directories, which only `dependentTasksOutputFiles`
-reads. Outputs from downstream or unrelated tasks do not feed back into its
-cache key.
+include outputs from its dependency tasks, including transitive dependencies.
+Outputs in git-ignored directories are read only by `dependentTasksOutputFiles`
+and by filesets with `includeIgnored`. Outputs from downstream or unrelated
+tasks do not feed back into its cache key.
 
 `runtime` commands share one evaluation per run when their effective runtime
 environments match, including when tasks request them concurrently. That
