@@ -360,7 +360,7 @@ fn artifact(root: &Path) -> String {
 fn simple_output_globs_restore_nested_artifacts() {
     let fixture = Fixture::new(target(
         "generate-graphql",
-        json!({"inputs": [], "outputs": ["apps/*/graphql/nested/output.txt"]}),
+        json!({"inputs": [], "outputs": ["{workspaceRoot}/apps/*/graphql/nested/output.txt"]}),
     ));
     success(fixture.build(&fixture.root, &[]));
     fs::remove_dir_all(fixture.root.join("apps")).unwrap();
@@ -377,7 +377,7 @@ fn simple_output_globs_restore_nested_artifacts() {
 fn character_class_output_globs_restore_nested_artifacts() {
     let fixture = Fixture::new(target(
         "generate-graphql",
-        json!({"inputs": [], "outputs": ["apps/[a/b]/graphql"]}),
+        json!({"inputs": [], "outputs": ["{workspaceRoot}/apps/[a/b]/graphql"]}),
     ));
     let first = success(fixture.build(&fixture.root, &[]));
     assert!(stderr(&first).contains("qk: cache miss app:build"));
@@ -1136,6 +1136,54 @@ fn external_dependency_inputs_track_packages_any_importer_installs() {
     .unwrap();
     success(fixture.build(&fixture.root, &[]));
     assert_eq!(fixture.runs(), 2);
+}
+
+#[test]
+fn include_ignored_filesets_key_ignored_files_on_disk() {
+    let fixture = Fixture::new(target(
+        "build",
+        json!({"inputs": [
+            "{projectRoot}/src/**/*",
+            {"fileset": "{projectRoot}/generated/**/*", "includeIgnored": true},
+            {"fileset": "!{projectRoot}/generated/**/*.local.json", "includeIgnored": true},
+            {"fileset": "{workspaceRoot}/schema.json", "includeIgnored": true}
+        ]}),
+    ));
+    fs::write(fixture.root.join(".gitignore"), "generated/\nschema.json\n").unwrap();
+    fs::create_dir_all(fixture.root.join("generated")).unwrap();
+    fs::write(fixture.root.join("generated/client.ts"), "one").unwrap();
+    fs::write(fixture.root.join("generated/dev.local.json"), "one").unwrap();
+    assert!(!hit(&fixture, &fixture.root));
+    assert!(hit(&fixture, &fixture.root));
+    fs::write(fixture.root.join("generated/client.ts"), "two").unwrap();
+    assert!(!hit(&fixture, &fixture.root));
+    // A negation filters every includeIgnored fileset of the project.
+    fs::write(fixture.root.join("generated/dev.local.json"), "two").unwrap();
+    assert!(hit(&fixture, &fixture.root));
+    // A path that names a missing file changes the key when it appears.
+    fs::write(fixture.root.join("schema.json"), "{}").unwrap();
+    assert!(!hit(&fixture, &fixture.root));
+    assert!(hit(&fixture, &fixture.root));
+}
+
+#[test]
+fn external_dependency_inputs_name_installed_packages() {
+    let fixture = Fixture::new(target(
+        "build",
+        json!({"inputs": ["{projectRoot}/src/**/*", {"externalDependencies": ["missing"]}]}),
+    ));
+    fs::write(
+        fixture.root.join("pnpm-lock.yaml"),
+        pnpm_lock("1.0.0", "1.0.0"),
+    )
+    .unwrap();
+    // As in Nx, a package nothing installs is an error.
+    let output = fixture.build(&fixture.root, &[]);
+    let text = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        text.contains("the externalDependency \"missing\" of app:build could not be found"),
+        "{text}"
+    );
 }
 
 fn cache_size(fixture: &Fixture) -> u64 {
@@ -4737,7 +4785,7 @@ fn filesets_of_dependencies() {
 fn json_inputs_key_only_the_fields_they_select() {
     let fixture = with_lib(json!([
         {"json": "{projectRoot}/meta.json", "fields": ["version", "build.target"]},
-        {"json": "libs/lib/config.json", "excludeFields": ["comment"]}
+        {"json": "{workspaceRoot}/libs/lib/config.json", "excludeFields": ["comment"]}
     ]));
     let meta = |text: &str| fs::write(fixture.root.join("meta.json"), text).unwrap();
     meta(r#"{"version": 1, "name": "a", "build": {"target": "es2022", "debug": false}}"#);

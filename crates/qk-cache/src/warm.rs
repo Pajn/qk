@@ -249,6 +249,7 @@ fn entry(
             Some(path) => (true, path),
             None => (false, path),
         };
+        dynamic(path)?;
         let path = paths::expand(workspace, &task.project, path)?
             .trim_end_matches('/')
             .to_owned();
@@ -291,6 +292,7 @@ fn entry(
     {
         key.push(match part {
             Value::String(path) => {
+                dynamic(path)?;
                 let path = paths::expand(workspace, &task.project, path)?;
                 paths::validate_path(&path)?;
                 KeyPart::File(path)
@@ -345,6 +347,15 @@ fn entry(
 }
 
 /// The directory `{warm}` names for a task or group, in the worktree's state.
+/// Rejects a warm path that would change with the task's options or
+/// arguments, which qk cannot resolve before the task runs.
+fn dynamic(path: &str) -> Result<()> {
+    if path.contains("{options.") || path.contains("{args.") {
+        bail!("dynamic cache paths are not supported yet");
+    }
+    Ok(())
+}
+
 fn directory(workspace: &Workspace, identity: &str) -> PathBuf {
     paths::worktree_state(&workspace.root)
         .join("warm")

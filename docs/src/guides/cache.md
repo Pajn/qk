@@ -120,12 +120,16 @@ projects nested in its root.
 
 Every input declaration of Nx 24 is supported, `always` read as absent:
 
-- globs with `!` exclusions, and `fileset`;
+- filesets, as strings or `{"fileset": "…"}`, with `!` exclusions; a path
+  with no glob pattern names a file or a whole directory, and `\` escapes a
+  glob character. With `"includeIgnored": true` a fileset reads the disk,
+  gitignored files included, and a file it reads is keyed by the content it
+  points to, wherever that is;
 - named inputs, also as `{"input": "name"}`;
 - `^name` and `{"input": "name", "dependencies": true}` (or `"projects":
   "dependencies"`), which as in Nx cover every project the project depends
-  on, directly or not, and `{"fileset": "…", "dependencies": true}`, a
-  fileset of each of them;
+  on, directly or not, and `^{projectRoot}/…`, `^{workspaceRoot}/…` or
+  `{"fileset": "…", "dependencies": true}`, a fileset of each of them;
 - `{"input": "name", "projects": […]}`, the named input of the projects the
   names, globs or `tag:` patterns select;
 - `env`, `runtime`, `dependentTasksOutputFiles` with `transitive`, and
@@ -134,16 +138,17 @@ Every input declaration of Nx 24 is supported, `always` read as absent:
 - `{"workingDirectory": "relative" | "absolute"}`, the directory qk was run
   from;
 - `{"json": "path", "fields": […], "excludeFields": […]}`, only the selected
-  dotted fields of a JSON file. Affected selection counts any change to the
-  file, even when source ignore rules exclude its path.
+  dotted fields of a JSON file, or of each file a glob selects. Affected
+  selection counts any change to the file, even when source ignore rules
+  exclude its path.
 
 As in Nx, a named input cannot use `dependencies` or `projects`. With a
 package manager other than pnpm, lockfiles are always keyed by content.
 Generated artifacts stay out of source filesets. A consumer's filesets can
-include outputs from its dependency tasks, including transitive dependencies,
-except those in git-ignored directories, which only `dependentTasksOutputFiles`
-reads. Outputs from downstream or unrelated tasks do not feed back into its
-cache key.
+include outputs from its dependency tasks, including transitive dependencies.
+Outputs in git-ignored directories are read only by `dependentTasksOutputFiles`
+and by filesets with `includeIgnored`. Outputs from downstream or unrelated
+tasks do not feed back into its cache key.
 
 `runtime` commands share one evaluation per run when their effective runtime
 environments match, including when tasks request them concurrently. That
@@ -168,16 +173,36 @@ extension groups.
 
 ## Outputs
 
-Outputs resolve as in Nx. `{options.name}` reads the target's options, with
-the task's `--name=value` arguments applied, and `{projectName}`,
-`{project.name}` and `{project.root}` work too; an output naming anything
-without a value is left out. `!` negates an output: what it matches is
-neither cached nor removed when an entry is restored. A target without
-`outputs` takes `options.outputPath`, and a `build` or `prepare` target
-`dist/<root>`, `<root>/dist`, `<root>/build` and `<root>/public`. Those
-defaults are cached and restored, but because they are guesses they are
-not declared outputs: they stay source files that other tasks' filesets can
-select, and `dependentTasksOutputFiles` selects none of them.
+Outputs resolve as in Nx 24. `{projectRoot}` and `{projectName}` name the
+project, `{options.name}` reads the target's options, with the task's
+`--name=value` arguments applied, and the legacy `{project.<path>}` reads
+the project's configuration, such as `{project.sourceRoot}`. A placeholder
+can fall back, left to right, to others and finally to a literal:
+`{options.outputPath ?? options.outDir ?? {projectRoot}/dist}`. A value is
+written as JavaScript writes it, so `false` is `false`, `0` is `0` and an
+array is its items joined with `,`; only a missing option, `null` and `""`
+have no value. Option values have `{projectRoot}`, `{projectName}` and a
+leading `{workspaceRoot}` resolved first, as Nx does when it builds the
+project graph. Braces that do not start with a token are glob text, so
+`{projectRoot}/dist/**/*.{js,map}` is one output, and so is `{env.NAME}`:
+environment variables are no placeholder in outputs.
+
+As in Nx 24, every output starts with a token, after its `!` if negated:
+`{projectRoot}/dist` or `{workspaceRoot}/dist`, not `dist`, which `nx repair`
+rewrites. An output whose `{options.…}` placeholder, or a `{projectRoot}` or
+`{workspaceRoot}` left as text, has no value is left out. `{workspaceRoot}`
+may only start an output, and an output from it must name a directory
+before any pattern: `{workspaceRoot}/dist/**`, not `{workspaceRoot}/**`.
+Building the task graph fails on an output that breaks either rule. An
+absolute output from an option is read relative to the workspace, and one
+outside the workspace is an error. `!` negates an output:
+what it matches is neither cached nor removed when an entry is restored. A
+target without `outputs` takes `options.outputPath`, and a `build` or
+`prepare` target `dist/<root>`, `<root>/dist`, `<root>/build` and
+`<root>/public`. Those defaults are cached and restored, but because they are
+guesses they are not declared outputs: they stay source files that other
+tasks' filesets can select, and `dependentTasksOutputFiles` selects none of
+them.
 
 A negated group such as `src/**/!(*.test).ts` or `dist/!(cache)/**` expands
 as Nx expands it, into a glob with the group widened and one naming the

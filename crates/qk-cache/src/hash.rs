@@ -16,7 +16,7 @@ use qk_lockfile::Lockfile;
 use qk_taskgraph::{Task, TaskGraph};
 use serde_json::{Value, json};
 
-use crate::glob::is_literal;
+use crate::ignored::Group;
 use crate::inputs::{
     Declared, Inferred, JsonFields, Resolved, manifest_for_dependents, workspace_without_resolution,
 };
@@ -135,8 +135,11 @@ pub struct Snapshot {
     source_ignore: Arc<SourceIgnore>,
     canonical_root: PathBuf,
     workspace_prefix: Option<PathBuf>,
-    patterns: Mutex<HashMap<(String, bool), Arc<Pattern>>>,
+    patterns: Mutex<HashMap<(String, bool, bool), Arc<Pattern>>>,
     digests: Mutex<HashMap<String, (Stamp, String)>>,
+    /// Files `includeIgnored` filesets read, whose digests are saved beside
+    /// those of `files`, which may not list them.
+    ignored_files: Mutex<BTreeSet<String>>,
     /// Whether `digests` gained entries worth saving.
     digests_changed: std::sync::atomic::AtomicBool,
     /// Directories already checked not to be symlinks.
@@ -732,6 +735,7 @@ impl Snapshot {
             patterns: Mutex::default(),
             digests: Mutex::new(digests),
             digests_changed: Default::default(),
+            ignored_files: Mutex::default(),
             directories: Mutex::default(),
             runtime: Mutex::default(),
             lockfile: Mutex::new(lockfile),
@@ -756,7 +760,9 @@ impl Snapshot {
                 .values()
                 .flat_map(|scope| &scope.patterns)
                 .filter(|pattern| !pattern.excluded)
-                .map(|pattern| workspace.root.join(&pattern.prefix))
+                .map(|pattern| &pattern.prefix)
+                .chain(resolver.json_globs.iter().map(|glob| &glob.prefix))
+                .map(|prefix| workspace.root.join(prefix))
                 .collect(),
         );
         prefixes.insert(task.id.clone(), Arc::clone(&paths));
@@ -878,9 +884,10 @@ impl Snapshot {
             return;
         }
         let digests = self.digests.lock().unwrap();
+        let ignored = self.ignored_files.lock().unwrap();
         let entries: BTreeMap<&String, (&Stamp, &String)> = digests
             .iter()
-            .filter(|(path, _)| self.files.contains(*path))
+            .filter(|(path, _)| self.files.contains(*path) || ignored.contains(*path))
             .map(|(path, (stamp, digest))| (path, (stamp, digest)))
             .collect();
         let path = digests_path(root);
@@ -970,11 +977,24 @@ impl Snapshot {
     }
 
     fn pattern(&self, pattern: &str, negated: bool) -> Result<Arc<Pattern>> {
-        let key = (pattern.to_owned(), negated);
+        self.compiled(pattern, negated, false)
+    }
+
+    /// A fileset's pattern, see [`Pattern::fileset`].
+    fn fileset_pattern(&self, pattern: &str, negated: bool) -> Result<Arc<Pattern>> {
+        self.compiled(pattern, negated, true)
+    }
+
+    fn compiled(&self, pattern: &str, negated: bool, fileset: bool) -> Result<Arc<Pattern>> {
+        let key = (pattern.to_owned(), negated, fileset);
         if let Some(pattern) = self.patterns.lock().unwrap().get(&key) {
             return Ok(pattern.clone());
         }
-        let compiled = Arc::new(Pattern::new(pattern, negated)?);
+        let compiled = Arc::new(if fileset {
+            Pattern::fileset(pattern, negated)?
+        } else {
+            Pattern::new(pattern, negated)?
+        });
         self.patterns.lock().unwrap().insert(key, compiled.clone());
         Ok(compiled)
     }
@@ -1068,6 +1088,23 @@ impl Snapshot {
                     .any(|a| outputs.anchors.iter().any(|b| overlap(a, b)))
             })
         });
+    }
+
+    /// A file an `includeIgnored` fileset read, by the content it points to
+    /// wherever that is, as Nx reads it; `None` when it is gone.
+    fn ignored_value(&self, root: &Path, path: &str) -> Result<Option<Value>> {
+        let absolute = root.join(path);
+        let metadata = match std::fs::metadata(&absolute) {
+            Ok(metadata) if metadata.is_file() => metadata,
+            Ok(_) => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let mode = crate::store::mode(&metadata) & 0o111 != 0;
+        self.ignored_files.lock().unwrap().insert(path.to_owned());
+        Ok(Some(
+            json!({"content":self.digest(path, &absolute, &metadata)?, "mode":mode}),
+        ))
     }
 
     fn file_value(&self, root: &Path, path: &str) -> Result<Value> {
@@ -1417,6 +1454,15 @@ struct FilePattern {
     owner: Option<String>,
 }
 
+/// A `json` glob, kept to select dependency outputs once they are written.
+struct JsonGlob {
+    matcher: Arc<Pattern>,
+    prefix: String,
+    /// The project whose files it selects, or `None` for the workspace's.
+    owner: Option<String>,
+    fields: JsonFields,
+}
+
 #[derive(Default)]
 struct FileSelection {
     patterns: Vec<FilePattern>,
@@ -1438,10 +1484,15 @@ struct Resolver<'a> {
     scopes: BTreeMap<FileScope, FileSelection>,
     values: BTreeMap<String, Value>,
     json_fields: BTreeMap<String, JsonFields>,
+    json_globs: Vec<JsonGlob>,
     named_stack: Vec<(String, String)>,
     /// Dependency named inputs already expanded for `^` inputs.
     expanded: BTreeSet<(String, String)>,
     external: BTreeSet<String>,
+    /// `includeIgnored` globs, resolved, by the project that reads them and
+    /// whether they came with `dependencies: true`: each is one group, whose
+    /// negations filter all of its positives.
+    ignored: BTreeMap<(String, bool), Vec<String>>,
     /// `None` resolves which inputs a task has without evaluating env or
     /// runtime inputs.
     prepared: Option<&'a PreparedTask>,
@@ -1464,9 +1515,11 @@ impl<'a> Resolver<'a> {
             scopes: BTreeMap::new(),
             values: BTreeMap::new(),
             json_fields: BTreeMap::new(),
+            json_globs: Vec::new(),
             named_stack: Vec::new(),
             expanded: BTreeSet::new(),
             external: BTreeSet::new(),
+            ignored: BTreeMap::new(),
             prepared,
             cancelled,
         }
@@ -1494,14 +1547,47 @@ impl<'a> Resolver<'a> {
         if let Value::Object(object) = input
             && let Some(always) = object.get("always")
         {
-            always.as_bool().context("input always must be boolean")?;
+            // As in Nx, `always` keeps an input on purpose, so a project
+            // pattern it selects nothing with is a mistake.
+            if always.as_bool().context("input always must be boolean")?
+                && let Some(Value::String(name)) = object.get("input")
+                && let Some(projects) = object.get("projects")
+            {
+                let patterns: Vec<String> = match projects {
+                    Value::String(pattern) => vec![pattern.clone()],
+                    other => serde_json::from_value(other.clone())
+                        .context("input projects must be a string or an array")?,
+                };
+                for pattern in patterns.iter().filter(|pattern| {
+                    !pattern.starts_with('!')
+                        && !matches!(pattern.as_str(), "self" | "dependencies")
+                }) {
+                    if qk_graph::select_projects(
+                        &self.workspace.projects,
+                        std::slice::from_ref(pattern),
+                        &[],
+                    )?
+                    .is_empty()
+                    {
+                        bail!(
+                            "the input {{\"input\": \"{name}\", \"projects\"}} with \"always\": true selects \"{pattern}\", which matches no project"
+                        );
+                    }
+                }
+            }
             let mut object = object.clone();
             object.remove("always");
             return self.input(project, &Value::Object(object));
         }
         match input {
-            // As in Nx, `^name` is `name` of every project the project depends
-            // on, directly or not.
+            // As in Nx, `^{projectRoot}/…` and `^{workspaceRoot}/…` are a
+            // fileset of every project the project depends on, directly or
+            // not, and `^name` is `name` of each of them.
+            Value::String(name)
+                if name.starts_with("^{projectRoot}") || name.starts_with("^{workspaceRoot}") =>
+            {
+                self.dependency_fileset(project, &name[1..])?;
+            }
             Value::String(name) if name.starts_with('^') => {
                 self.dependencies_named(project, &name[1..])?;
             }
@@ -1544,19 +1630,44 @@ impl<'a> Resolver<'a> {
                     self.named(project, name)?;
                 }
             }
-            Value::Object(object)
-                if object.contains_key("fileset")
-                    && object.get("dependencies") == Some(&json!(true)) =>
-            {
-                if !self.named_stack.is_empty() {
-                    bail!("named inputs can only refer to named inputs of their own project");
+            Value::Object(object) if object.contains_key("fileset") => {
+                if let Some(key) = object.keys().find(|key| {
+                    !matches!(key.as_str(), "fileset" | "dependencies" | "includeIgnored")
+                }) {
+                    bail!("unsupported fileset input field {key:?}");
                 }
+                let flag = |name: &str| {
+                    object
+                        .get(name)
+                        .map(|value| {
+                            value
+                                .as_bool()
+                                .with_context(|| format!("{name} must be boolean"))
+                        })
+                        .transpose()
+                        .map(Option::unwrap_or_default)
+                };
+                let (dependencies, include_ignored) =
+                    (flag("dependencies")?, flag("includeIgnored")?);
                 let pattern = object["fileset"]
                     .as_str()
                     .context("fileset input must be a glob")?
                     .to_owned();
-                for dependency in self.dependency_closure(project) {
-                    self.fileset(&dependency, &pattern)?;
+                validate_fileset(&pattern)?;
+                match (dependencies, include_ignored) {
+                    (false, false) => self.fileset(project, &pattern)?,
+                    (true, false) => self.dependency_fileset(project, &pattern)?,
+                    (false, true) => self.ignored_fileset(project, &pattern, false),
+                    (true, true) => {
+                        if !self.named_stack.is_empty() {
+                            bail!(
+                                "named inputs can only refer to named inputs of their own project"
+                            );
+                        }
+                        for dependency in self.dependency_closure(project) {
+                            self.ignored_fileset(&dependency, &pattern, true);
+                        }
+                    }
                 }
             }
             Value::Object(object)
@@ -1580,18 +1691,13 @@ impl<'a> Resolver<'a> {
             Value::Object(object) if object.contains_key("json") => {
                 self.json(project, object)?;
             }
-            Value::String(name)
-                if !name.contains("{projectRoot}") && !name.contains("{workspaceRoot}") =>
-            {
-                self.named(project, name)?
+            // As in Nx, a string names a named input when there is one, and is
+            // a fileset otherwise.
+            Value::String(name) if self.has_named(project, name) => self.named(project, name)?,
+            Value::String(pattern) => {
+                validate_fileset(pattern)?;
+                self.fileset(project, pattern)?
             }
-            Value::Object(object) if object.len() == 1 && object.contains_key("fileset") => {
-                let pattern = object["fileset"]
-                    .as_str()
-                    .context("fileset input must be a glob")?;
-                self.fileset(project, pattern)?;
-            }
-            Value::String(pattern) => self.fileset(project, pattern)?,
             Value::Object(object) if object.len() == 1 && object.contains_key("env") => {
                 let name = object["env"]
                     .as_str()
@@ -1704,6 +1810,23 @@ impl<'a> Resolver<'a> {
             {
                 let names: Vec<String> =
                     serde_json::from_value(object["externalDependencies"].clone())?;
+                // As in Nx, a workspace project is no external dependency.
+                if let Some(name) = names
+                    .iter()
+                    .find(|name| self.workspace.projects.contains_key(*name))
+                {
+                    if self.snapshot.projects.dependencies[project]
+                        .iter()
+                        .any(|edge| edge.target == *name)
+                    {
+                        bail!(
+                            "the externalDependency {name:?} of {project} is not an external node and is already a dependency; remove it from the externalDependencies inputs"
+                        );
+                    }
+                    bail!(
+                        "the externalDependency {name:?} of {project} is not an external node; if it is a dependency, add it to the project's implicitDependencies"
+                    );
+                }
                 self.external.extend(names);
             }
             _ => bail!("unsupported task input declaration"),
@@ -1718,22 +1841,22 @@ impl<'a> Resolver<'a> {
             .unwrap_or((false, pattern));
         // Nx hashes workspace files and each project's files in separate
         // scopes, a project's being only the files it owns: those of a project
-        // nested in its root are that project's.
-        let (scope, owner) = if pattern.contains("{workspaceRoot}") {
-            (FileScope::Workspace, None)
-        } else {
+        // nested in its root are that project's. A fileset is the project's
+        // when it starts from `{projectRoot}/`, and the workspace's otherwise,
+        // where only one starting from `{workspaceRoot}/` selects anything.
+        let (scope, owner) = if pattern.starts_with("{projectRoot}/") {
             (
                 FileScope::Project(project.to_owned()),
                 Some(project.to_owned()),
             )
+        } else if pattern.starts_with("{workspaceRoot}/") {
+            (FileScope::Workspace, None)
+        } else {
+            return Ok(());
         };
-        let pattern = paths::expand(self.workspace, project, pattern)?;
-        let matcher = self.snapshot.pattern(&pattern, exclude)?;
-        let prefix = pattern
-            .split('/')
-            .take_while(|part| is_literal(part))
-            .collect::<Vec<_>>()
-            .join("/");
+        let pattern = paths::expand_glob(self.workspace, project, pattern)?;
+        let matcher = self.snapshot.fileset_pattern(&pattern, exclude)?;
+        let (prefix, _) = crate::ignored::partition(pattern.trim_end_matches('/'));
         let candidates: Box<dyn Iterator<Item = &String>> = if prefix.is_empty() {
             Box::new(self.candidates.iter())
         } else {
@@ -1761,6 +1884,50 @@ impl<'a> Resolver<'a> {
         Ok(())
     }
 
+    /// An `includeIgnored` glob of `project`, with its tokens resolved as
+    /// Nx's `resolve_files_glob` resolves them, to read from disk later.
+    fn ignored_fileset(&mut self, project: &str, pattern: &str, dependencies: bool) {
+        // The root and name go in escaped, as for every fileset; Nx inserts
+        // them as they are.
+        let root = &self.workspace.projects[project].root;
+        let resolved = if root == "." {
+            pattern.replace("{projectRoot}/", "")
+        } else {
+            pattern.replace("{projectRoot}", &crate::glob::escape(root))
+        }
+        .replace("{projectName}", &crate::glob::escape(project));
+        let resolved = match resolved.strip_prefix("!{workspaceRoot}/") {
+            Some(rest) => format!("!{rest}"),
+            None => resolved
+                .strip_prefix("{workspaceRoot}/")
+                .map(str::to_owned)
+                .unwrap_or(resolved),
+        };
+        self.ignored
+            .entry((project.to_owned(), dependencies))
+            .or_default()
+            .push(resolved);
+    }
+
+    /// A fileset of every project `project` depends on, directly or not.
+    fn dependency_fileset(&mut self, project: &str, pattern: &str) -> Result<()> {
+        if !self.named_stack.is_empty() {
+            bail!("named inputs can only refer to named inputs of their own project");
+        }
+        for dependency in self.dependency_closure(project) {
+            self.fileset(&dependency, pattern)?;
+        }
+        Ok(())
+    }
+
+    /// Whether `name` names one of `project`'s named inputs.
+    fn has_named(&self, project: &str, name: &str) -> bool {
+        name == "default"
+            || self.workspace.projects[project]
+                .named_inputs
+                .contains_key(name)
+    }
+
     /// Every project `project` depends on, directly or not.
     fn dependency_closure(&self, project: &str) -> BTreeSet<String> {
         let mut closure = BTreeSet::new();
@@ -1785,20 +1952,20 @@ impl<'a> Resolver<'a> {
         Ok(())
     }
 
-    /// A JSON input: the fields of one JSON file, rather than all of it.
-    /// `fields` keeps only the named dotted paths; `excludeFields` removes
-    /// them.
+    /// A JSON input: the fields of a JSON file, rather than all of it, or of
+    /// each file a glob selects. `fields` keeps only the named dotted paths;
+    /// `excludeFields` removes them.
     fn json(&mut self, project: &str, object: &serde_json::Map<String, Value>) -> Result<()> {
         for key in object.keys() {
             if !matches!(key.as_str(), "json" | "fields" | "excludeFields") {
                 bail!("unsupported json input field {key:?}");
             }
         }
-        let path = object["json"]
+        let declared = object["json"]
             .as_str()
             .context("json input must name a file")?;
-        let path = paths::expand(self.workspace, project, path)?;
-        paths::validate_path(&path)?;
+        validate_fileset(declared)?;
+        let path = paths::expand_glob(self.workspace, project, declared)?;
         let list = |name: &str| -> Result<Option<Vec<String>>> {
             object
                 .get(name)
@@ -1812,8 +1979,45 @@ impl<'a> Resolver<'a> {
             fields: list("fields")?,
             exclude: list("excludeFields")?.unwrap_or_default(),
         };
+        if crate::glob::names_a_path(&path) {
+            let path = crate::glob::literal_path(&path);
+            paths::validate_path(&path)?;
+            return self.json_file(path, &fields);
+        }
+        // As in Nx, a glob selects the files a fileset from the same root
+        // would: the project's own, or the workspace's.
+        let owner = if declared.starts_with("{projectRoot}") {
+            Some(project)
+        } else if declared.starts_with("{workspaceRoot}/") {
+            None
+        } else {
+            return Ok(());
+        };
+        let matcher = self.snapshot.pattern(&path, false)?;
+        let snapshot = self.snapshot;
+        let matched: Vec<String> = self
+            .candidates
+            .iter()
+            .filter(|file| matcher.is_match(file))
+            .filter(|file| owner.is_none() || snapshot.owner(file) == owner)
+            .cloned()
+            .collect();
+        for file in matched {
+            self.json_file(file, &fields)?;
+        }
+        self.json_globs.push(JsonGlob {
+            matcher,
+            prefix: crate::ignored::partition(&path).0,
+            owner: owner.map(str::to_owned),
+            fields,
+        });
+        Ok(())
+    }
+
+    /// One file a `json` input selects, keyed by its fields.
+    fn json_file(&mut self, path: String, fields: &JsonFields) -> Result<()> {
         let value = match std::fs::read_to_string(self.workspace.root.join(&path)) {
-            Ok(text) => match json_projection(&path, &text, &fields) {
+            Ok(text) => match json_projection(&path, &text, fields) {
                 Some(value) => value,
                 // As in Nx, a file it cannot read is keyed by its content,
                 // without the field filters. Nx reads no YAML, so it keys a
@@ -1827,7 +2031,7 @@ impl<'a> Resolver<'a> {
             Err(error) => return Err(error.into()),
         };
         self.values.insert(format!("json:{path}"), value);
-        self.json_fields.insert(path, fields);
+        self.json_fields.insert(path, fields.clone());
         Ok(())
     }
 
@@ -1849,6 +2053,18 @@ impl<'a> Resolver<'a> {
         self.named_stack.pop();
         Ok(())
     }
+}
+
+/// As Nx's `validate_file_set`: a fileset starts from `{projectRoot}` or
+/// `{workspaceRoot}`, after its `!`.
+fn validate_fileset(fileset: &str) -> Result<()> {
+    let body = fileset.strip_prefix('!').unwrap_or(fileset);
+    if !body.starts_with("{projectRoot}") && !body.starts_with("{workspaceRoot}") {
+        bail!(
+            "{fileset:?} is an invalid fileset: filesets have to start with either {{workspaceRoot}} or {{projectRoot}}, and a named input must be defined"
+        );
+    }
+    Ok(())
 }
 
 /// A task's declared inputs, or Nx's default when it declares none.
@@ -1916,7 +2132,8 @@ fn resolve_candidates(
 ) -> Result<Resolved> {
     let mut resolver = Resolver::new(snapshot, workspace, prepared, cancelled, candidates);
     resolver.task_inputs(task)?;
-    // Dependency outputs may also be declared sources. Downstream and unrelated
+    // Dependency outputs may also be declared sources, for filesets and `json`
+    // globs alike. Downstream and unrelated
     // outputs remain artifacts, so producing them cannot invalidate an upstream task.
     let mut upstream = BTreeSet::new();
     let mut pending: Vec<_> = task.dependencies.iter().cloned().collect();
@@ -1946,9 +2163,11 @@ fn resolve_candidates(
             .values()
             .flat_map(|scope| &scope.patterns)
             .filter(|pattern| !pattern.excluded)
-            .any(|pattern| {
+            .map(|pattern| &pattern.prefix)
+            .chain(resolver.json_globs.iter().map(|glob| &glob.prefix))
+            .any(|prefix| {
                 declared.anchors().any(|anchor| {
-                    overlaps(&pattern.prefix, anchor)
+                    overlaps(prefix, anchor)
                         && (!source_ignore.matches_directory(anchor)
                             || !workspace.root.join(anchor).is_dir())
                 })
@@ -1958,12 +2177,24 @@ fn resolve_candidates(
         }
         producers.insert(producer.id.clone());
         let outputs = snapshot.dependency_outputs(workspace, producer)?;
+        let mut json = Vec::new();
         for path in &outputs.files {
             if source_ignore.matches(path)
                 || own_outputs.as_ref().is_some_and(|own| own.matches(path))
             {
                 continue;
             }
+            json.extend(
+                resolver
+                    .json_globs
+                    .iter()
+                    .filter(|glob| {
+                        glob.matcher.is_match(path)
+                            && (glob.owner.is_none()
+                                || snapshot.owner(path) == glob.owner.as_deref())
+                    })
+                    .map(|glob| (path.clone(), glob.fields.clone())),
+            );
             for selection in resolver.scopes.values_mut() {
                 for pattern in &selection.patterns {
                     if pattern.matcher.is_match(path)
@@ -1979,6 +2210,9 @@ fn resolve_candidates(
                 }
             }
         }
+        for (path, fields) in json {
+            resolver.json_file(path, &fields)?;
+        }
     }
     for selection in resolver.scopes.values() {
         resolver.selected.extend(
@@ -1989,8 +2223,47 @@ fn resolve_candidates(
                 .cloned(),
         );
     }
+    // `includeIgnored` groups read the disk, gitignored files included, and
+    // a changed path they name counts whether or not it is there. As in Nx,
+    // one reading another task's declared outputs makes that task a producer.
+    let mut ignored = BTreeSet::new();
+    for ((project, _), globs) in &resolver.ignored {
+        let group = Group::new(
+            project,
+            globs,
+            workspace
+                .projects
+                .values()
+                .map(|project| project.root.as_str()),
+        )?;
+        let found = group.expand(&workspace.root)?;
+        ignored.extend(
+            found
+                .into_iter()
+                .chain(
+                    snapshot
+                        .extra_candidates
+                        .iter()
+                        .filter(|path| group.matches(path))
+                        .cloned(),
+                )
+                // A task's own outputs are no input of it, as for any fileset.
+                .filter(|path| own_outputs.as_ref().is_none_or(|own| !own.matches(path))),
+        );
+        for (producer, declared) in &snapshot.generated_tasks {
+            if producer.id != task.id
+                && upstream.contains(&producer.id)
+                && declared.declared()
+                && reads_outputs(&group, declared)
+            {
+                producers.insert(producer.id.clone());
+            }
+        }
+    }
+    resolver.selected.extend(ignored.iter().cloned());
     let mut declared = Declared {
         files: resolver.selected,
+        ignored,
         values: resolver.values,
         json_fields: resolver.json_fields,
         external: resolver.external,
@@ -2019,6 +2292,35 @@ fn resolve_candidates(
     }
     let inferred = infer(snapshot, workspace, task)?;
     Ok(join(declared, inferred))
+}
+
+/// Whether an `includeIgnored` group may read files `outputs` declares, as
+/// Nx's `GlobShape::may_read` judges it from the globs alone: a positive's
+/// directory and an output's meet, the one holding the other, unless the
+/// output lies in a project the positive does not reach, and their
+/// extensions, where both have one, agree.
+fn reads_outputs(group: &Group, outputs: &Outputs) -> bool {
+    let holds = |outer: &str, inner: &str| {
+        outer.is_empty()
+            || inner == outer
+            || inner
+                .strip_prefix(outer)
+                .is_some_and(|rest| rest.starts_with('/'))
+    };
+    group.reads().any(|(root, extension)| {
+        outputs.globs().iter().any(|output| {
+            let (prefix, _) = crate::ignored::partition(output);
+            (holds(root, &prefix) || holds(&prefix, root))
+                && !group
+                    .skipped_below(root)
+                    .iter()
+                    .any(|project| holds(project, &prefix))
+                && match (extension, crate::ignored::extension(output)) {
+                    (Some(read), Some(written)) => read == written,
+                    _ => true,
+                }
+        })
+    })
 }
 
 /// What qk adds to `task`'s key on its own, whatever its inputs declare.
@@ -2193,7 +2495,15 @@ pub fn inputs(
             })
             .collect::<Result<BTreeMap<_, _>>>()
     };
-    let files = file_values(&declared.files)?;
+    let mut files = file_values(&(&declared.files - &declared.ignored))?;
+    for path in &declared.ignored {
+        if let Some(value) = snapshot
+            .ignored_value(&workspace.root, path)
+            .with_context(|| format!("cannot read input {path}"))?
+        {
+            files.insert(path.clone(), value);
+        }
+    }
     let mut values = declared.values;
     let mut configuration = json!({ "files": file_values(&inferred.files)? });
     let installed = snapshot.installed(&workspace.root, &task.id)?;
@@ -2222,9 +2532,16 @@ pub fn inputs(
                 .map(|name| {
                     let digest =
                         installed.digest(&format!("package:{name}"), || lockfile.package(name));
-                    (name.clone(), digest)
+                    // As in Nx, a package nothing installs is an error.
+                    if digest == blake3::hash(b"").to_hex().as_str() {
+                        bail!(
+                            "the externalDependency {name:?} of {} could not be found",
+                            task.id
+                        );
+                    }
+                    Ok((name.clone(), digest))
                 })
-                .collect();
+                .collect::<Result<_>>()?;
             values.insert("externalDependencies".into(), json!(external));
         }
     }
@@ -2385,7 +2702,7 @@ mod tests {
             post["outputs"] = outputs;
         }
         std::fs::write(root.path().join("project.json"), json!({"name":"app", "targets": {
-            "gen": {"command":"true", "outputs":["generated"]},
+            "gen": {"command":"true", "outputs":["{projectRoot}/generated"]},
             "post": post,
             "build": {"command":"true", "dependsOn":["gen", "post"], "inputs":[{"dependentTasksOutputFiles":"**/*"}]}
         }}).to_string()).unwrap();
@@ -2396,9 +2713,60 @@ mod tests {
         (root, workspace, graph)
     }
 
+    /// A `json` glob selects a dependency's declared outputs, keyed by their
+    /// fields, and makes that dependency a producer, as a fileset does.
+    #[test]
+    fn json_globs_select_dependency_outputs() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("nx.json"), "{}").unwrap();
+        for (path, content) in [
+            (
+                "apps/app/project.json",
+                json!({"name": "app", "implicitDependencies": ["lib"], "targets": {
+                    "build": {"command": "true", "dependsOn": ["^build"], "inputs": [
+                        {"json": "{workspaceRoot}/libs/lib/out/*.json", "fields": ["version"]}
+                    ]}
+                }}),
+            ),
+            (
+                "libs/lib/project.json",
+                json!({"name": "lib", "targets": {
+                    "build": {"command": "true", "outputs": ["{projectRoot}/out"]}
+                }}),
+            ),
+            (
+                "libs/lib/out/meta.json",
+                json!({"version": 2, "built": "now"}),
+            ),
+        ] {
+            let path = root.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content.to_string()).unwrap();
+        }
+        let workspace = Workspace::load(root.path()).unwrap();
+        let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
+        let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
+        let resolved = resolve(
+            &snapshot,
+            &workspace,
+            &graph.tasks["app:build"],
+            None,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.declared.values.get("json:libs/lib/out/meta.json"),
+            Some(&json!({"version": 2}))
+        );
+        assert_eq!(
+            resolved.declared.producers,
+            BTreeSet::from(["lib:build".to_owned()])
+        );
+    }
+
     #[test]
     fn execution_fingerprints_refresh_sources_and_preserve_artifact_exclusions() {
-        let (root, mut workspace, _) = fixture(Some(json!(["dist"])));
+        let (root, mut workspace, _) = fixture(Some(json!(["{projectRoot}/dist"])));
         let definition = workspace
             .projects
             .get_mut("app")
@@ -2450,7 +2818,7 @@ mod tests {
     fn membership_reuses_settled_candidates_and_detects_directory_changes() {
         let mut fixtures = Vec::new();
         for git in [false, true] {
-            let (root, workspace, graph) = fixture(Some(json!(["dist"])));
+            let (root, workspace, graph) = fixture(Some(json!(["{projectRoot}/dist"])));
             for directory in ["src/empty", "dist", "cache", "ignored"] {
                 std::fs::create_dir_all(root.path().join(directory)).unwrap();
             }
@@ -2607,9 +2975,9 @@ mod tests {
     fn output_publication_reuses_candidates_but_source_names_still_refresh() {
         for partial in [false, true] {
             let outputs = if partial {
-                json!(["dist", "!dist/keep"])
+                json!(["{projectRoot}/dist", "!{projectRoot}/dist/keep"])
             } else {
-                json!(["dist"])
+                json!(["{projectRoot}/dist"])
             };
             let (root, workspace, graph) = fixture(Some(outputs));
             std::fs::create_dir_all(root.path().join("src")).unwrap();
@@ -2777,7 +3145,7 @@ mod tests {
 
     #[test]
     fn scoped_membership_defers_unrelated_changes_until_a_matching_task_asks() {
-        let (root, mut workspace, _) = fixture(Some(json!(["dist"])));
+        let (root, mut workspace, _) = fixture(Some(json!(["{projectRoot}/dist"])));
         let targets = &mut workspace.projects.get_mut("app").unwrap().targets;
         targets.get_mut("post").unwrap().inputs =
             Some(vec![json!("{workspaceRoot}/left/**/*.txt")]);
@@ -2836,8 +3204,40 @@ mod tests {
     }
 
     #[test]
+    fn membership_watches_the_directories_json_globs_select_from() {
+        let (root, mut workspace, _) = fixture(Some(json!(["{projectRoot}/dist"])));
+        let targets = &mut workspace.projects.get_mut("app").unwrap().targets;
+        targets.get_mut("build").unwrap().inputs = Some(vec![json!(
+            {"json": "{workspaceRoot}/config/**/*.json", "fields": ["version"]}
+        )]);
+        std::fs::create_dir_all(root.path().join("config/empty")).unwrap();
+        let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
+        let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
+        snapshot.current_files(&workspace.root).unwrap();
+        std::thread::sleep(Duration::from_millis(2100));
+        let prefixes = snapshot
+            .membership_prefixes(&workspace, &graph.tasks["app:build"])
+            .unwrap();
+        snapshot
+            .current_files_for(&workspace.root, Some(&prefixes), "test")
+            .unwrap();
+        std::fs::write(
+            root.path().join("config/empty/new.json"),
+            r#"{"version": 1}"#,
+        )
+        .unwrap();
+        assert!(
+            snapshot
+                .current_files_for(&workspace.root, Some(&prefixes), "test")
+                .unwrap()
+                .files
+                .contains("config/empty/new.json")
+        );
+    }
+
+    #[test]
     fn membership_watches_git_ignored_tracked_parents_and_index_policy() {
-        let (root, workspace, graph) = fixture(Some(json!(["dist"])));
+        let (root, workspace, graph) = fixture(Some(json!(["{projectRoot}/dist"])));
         std::fs::create_dir_all(root.path().join("tracked/nested")).unwrap();
         std::fs::write(root.path().join("tracked/.gitignore"), "nested/\n").unwrap();
         std::fs::write(root.path().join("tracked/nested/source"), "one").unwrap();
@@ -2875,7 +3275,7 @@ mod tests {
 
     #[test]
     fn a_new_git_config_include_invalidates_settled_listing_policy() {
-        let (root, workspace, graph) = fixture(Some(json!(["dist"])));
+        let (root, workspace, graph) = fixture(Some(json!(["{projectRoot}/dist"])));
         let policy = tempfile::tempdir().unwrap();
         let included = policy.path().join("included.config");
         let excludes = policy.path().join("excludes");
@@ -2931,7 +3331,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn git_policy_paths_preserve_quoted_origins_and_multiline_values() {
-        let (root, workspace, graph) = fixture(Some(json!(["dist"])));
+        let (root, workspace, graph) = fixture(Some(json!(["{projectRoot}/dist"])));
         let policy = tempfile::tempdir().unwrap();
         // Git's text output C-quotes these origins and octal-escapes UTF-8.
         let included = policy.path().join("included\\é\t\n.config");
@@ -2998,7 +3398,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn symlinked_ignore_policy_never_reuses_stale_membership() {
-        let (root, workspace, graph) = fixture(Some(json!(["dist"])));
+        let (root, workspace, graph) = fixture(Some(json!(["{projectRoot}/dist"])));
         let policy = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(policy.path(), "hidden\n").unwrap();
         std::os::unix::fs::symlink(policy.path(), root.path().join(".gitignore")).unwrap();
@@ -3053,7 +3453,7 @@ mod tests {
 
     #[test]
     fn inspection_keeps_deleted_candidates() {
-        let (root, workspace, graph) = fixture(Some(json!(["dist"])));
+        let (root, workspace, graph) = fixture(Some(json!(["{projectRoot}/dist"])));
         let snapshot = Snapshot::new(&workspace, &graph, &root.path().join("cache"))
             .unwrap()
             .with_candidates(&["src/deleted".into()]);
@@ -3070,7 +3470,7 @@ mod tests {
 
     #[test]
     fn undeclared_writes_invalidate_dependency_values() {
-        for outputs in [None, Some(json!(["generated"]))] {
+        for outputs in [None, Some(json!(["{projectRoot}/generated"]))] {
             let (root, workspace, graph) = fixture(outputs);
             let snapshot = Snapshot::new(&workspace, &graph, &root.path().join("cache")).unwrap();
             let keys = || {
@@ -3093,7 +3493,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn dependency_symlinks_recheck_targets_outside_output_roots() {
-        let (root, mut workspace, _) = fixture(Some(json!(["generated"])));
+        let (root, mut workspace, _) = fixture(Some(json!(["{projectRoot}/generated"])));
         workspace
             .projects
             .get_mut("app")
@@ -3101,7 +3501,7 @@ mod tests {
             .targets
             .get_mut("gen")
             .unwrap()
-            .outputs = Some(vec!["links".into()]);
+            .outputs = Some(vec!["{projectRoot}/links".into()]);
         std::fs::create_dir(root.path().join("links")).unwrap();
         std::os::unix::fs::symlink("../generated/value", root.path().join("links/value")).unwrap();
         let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
@@ -3120,5 +3520,60 @@ mod tests {
         std::fs::write(root.path().join("generated/value"), "different").unwrap();
         snapshot.outputs_written(&workspace, &graph.tasks["app:post"]);
         assert_ne!(before["app:gen:**/*"], keys()["app:gen:**/*"]);
+    }
+    /// The digest of a git-ignored file an `includeIgnored` fileset reads is
+    /// saved with the others, so a warm run does not read it again.
+    #[test]
+    fn digests_of_ignored_files_read_by_include_ignored_are_saved() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("nx.json"), "{}").unwrap();
+        std::fs::write(root.path().join(".gitignore"), "generated/\n").unwrap();
+        std::fs::write(
+            root.path().join("project.json"),
+            json!({"name": "app", "targets": {"build": {"command": "true", "inputs": [
+                {"fileset": "{projectRoot}/generated/**/*", "includeIgnored": true}
+            ]}}})
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::create_dir(root.path().join("generated")).unwrap();
+        std::fs::write(root.path().join("generated/schema.json"), "{}").unwrap();
+        // Digests are only saved for files old enough to have settled.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(root.path().join("generated/schema.json"))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root.path())
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            )
+        };
+        git(&["init", "--quiet"]);
+        let workspace = Workspace::load(root.path()).unwrap();
+        let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
+        let snapshot = Snapshot::new(&workspace, &graph, &root.path().join("cache")).unwrap();
+        assert!(!snapshot.files.contains("generated/schema.json"));
+        let prepared =
+            qk_executor::prepare(&workspace, &graph.tasks["app:build"], &BTreeMap::new()).unwrap();
+        inputs(
+            &snapshot,
+            &workspace,
+            &graph.tasks["app:build"],
+            &prepared,
+            &BTreeMap::new(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        snapshot.save_digests(root.path());
+        assert!(load_digests(root.path()).contains_key("generated/schema.json"));
     }
 }

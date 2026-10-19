@@ -7,7 +7,7 @@ mod process;
 mod pty;
 pub mod readiness;
 pub mod report;
-mod tokens;
+pub mod tokens;
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;

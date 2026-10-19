@@ -739,6 +739,36 @@ fn a_changed_json_input_affects_the_task() {
     assert_eq!(tasks.keys().collect::<Vec<_>>(), ["app:build"]);
 }
 
+/// A path whose glob characters are escaped names one file, which is read
+/// without its escapes.
+#[test]
+fn an_escaped_json_input_path_names_its_file() {
+    let repo = Repo::new(&[
+        (
+            "nx.json",
+            r#"{"targetDefaults": {"build": {"command": "echo build", "inputs": [{"json": "{projectRoot}/\\(group\\)/meta.json", "fields": ["version"]}]}}}"#,
+        ),
+        (
+            "apps/app/project.json",
+            r#"{"name": "app", "targets": {"build": {}}}"#,
+        ),
+        ("apps/app/(group)/meta.json", r#"{"version": 1}"#),
+    ]);
+    write(
+        &repo.root,
+        "apps/app/(group)/meta.json",
+        r#"{"version": 1, "comment": "x"}"#,
+    );
+    assert!(affected_tasks_of(&repo, &["app:build"]).is_empty());
+    write(
+        &repo.root,
+        "apps/app/(group)/meta.json",
+        r#"{"version": 2}"#,
+    );
+    let tasks = affected_tasks_of(&repo, &["app:build"]);
+    assert_eq!(tasks.keys().collect::<Vec<_>>(), ["app:build"]);
+}
+
 #[test]
 fn a_json_input_does_not_narrow_a_file_other_inputs_select_whole() {
     let repo = Repo::new(&[
@@ -1414,4 +1444,172 @@ fn a_task_is_affected_through_a_dependency_only_when_it_reads_its_outputs() {
             assert!(!tasks.contains_key("app:check"), "{inputs}: {tasks:?}");
         }
     }
+}
+
+/// As in Nx, an `includeIgnored` fileset matches a changed path whether
+/// ignore rules leave it out or not, and whether or not it is still there.
+#[test]
+fn include_ignored_filesets_match_ignored_changes() {
+    let repo = Repo::new(&[
+        (
+            "nx.json",
+            r#"{"targetDefaults": {"build": {"command": "echo build", "inputs": [{"fileset": "{projectRoot}/generated/**/*", "includeIgnored": true}, {"fileset": "!{projectRoot}/generated/**/*.local.json", "includeIgnored": true}]},
+                                   "test": {"command": "echo test", "inputs": ["{projectRoot}/**/*"]}}}"#,
+        ),
+        (".nxignore", "apps/app/generated/\n"),
+        (
+            "apps/app/project.json",
+            r#"{"name": "app", "targets": {"build": {}, "test": {}}}"#,
+        ),
+        ("apps/app/generated/schema.json", "before"),
+        ("apps/app/generated/dev.local.json", "before"),
+        (
+            "libs/lib/project.json",
+            r#"{"name": "lib", "targets": {"build": {}, "test": {}}}"#,
+        ),
+    ]);
+    write(&repo.root, "apps/app/generated/dev.local.json", "after");
+    assert!(affected_tasks_of(&repo, &["app:build", "app:test"]).is_empty());
+    write(&repo.root, "apps/app/generated/schema.json", "after");
+    assert_eq!(
+        affected_tasks_of(&repo, &["app:build", "app:test"])
+            .keys()
+            .collect::<Vec<_>>(),
+        ["app:build"]
+    );
+    // A path named explicitly counts even when it is gone.
+    use qk_taskgraph::{Request, TaskGraph};
+    let workspace = Workspace::load(&repo.root).unwrap();
+    let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
+    let tasks = qk_affected::affected_tasks(
+        &workspace,
+        &graph,
+        &Options {
+            files: vec!["apps/app/generated/removed.json".into()],
+            explicit_files: true,
+            ..Options::default()
+        },
+    )
+    .unwrap()
+    .tasks;
+    assert_eq!(tasks.keys().collect::<Vec<_>>(), ["app:build"]);
+}
+
+/// As in Nx, an `includeIgnored` fileset reading a dependency's declared
+/// outputs carries a change of that dependency to the task.
+#[test]
+fn include_ignored_filesets_read_their_producers_outputs() {
+    let repo = |extension: &str| {
+        Repo::new(&[
+            (
+                "nx.json",
+                r#"{"targetDefaults": {"build": {"command": "echo build", "inputs": ["{projectRoot}/src/**/*"], "outputs": ["{workspaceRoot}/dist/{projectRoot}/**/*.js"]}}}"#,
+            ),
+            (
+                "apps/app/project.json",
+                &format!(
+                    r#"{{"name": "app", "implicitDependencies": ["lib"], "targets": {{"build": {{"dependsOn": ["^build"],
+                        "inputs": [{{"fileset": "{{workspaceRoot}}/dist/libs/lib/**/*.{extension}", "includeIgnored": true}}]}}}}}}"#
+                ),
+            ),
+            (
+                "libs/lib/project.json",
+                r#"{"name": "lib", "targets": {"build": {}}}"#,
+            ),
+        ])
+    };
+    let reading = repo("js");
+    write(&reading.root, "libs/lib/src/index.ts", "changed");
+    let tasks = affected_tasks_of(&reading, &["app:build"]);
+    assert_eq!(tasks.keys().collect::<Vec<_>>(), ["app:build", "lib:build"]);
+    assert!(
+        matches!(&tasks["app:build"], qk_affected::TaskCause::Reads { task } if task == "lib:build")
+    );
+    // Files with another extension than any output's are none of them.
+    let other = repo("css");
+    write(&other.root, "libs/lib/src/index.ts", "changed");
+    assert_eq!(
+        affected_tasks_of(&other, &["app:build"])
+            .keys()
+            .collect::<Vec<_>>(),
+        ["lib:build"]
+    );
+}
+
+/// A project root with glob characters, as a route group gives one, names
+/// its directory in filesets, json inputs and includeIgnored filesets.
+#[test]
+fn a_project_root_with_glob_characters_is_a_directory_in_inputs() {
+    for (inputs, file, text) in [
+        (r#"["{projectRoot}/src/**/*"]"#, "src/page.ts", "changed"),
+        (
+            r#"[{"json": "{projectRoot}/meta.json", "fields": ["version"]}]"#,
+            "meta.json",
+            r#"{"version": 2}"#,
+        ),
+        (
+            r#"[{"fileset": "{projectRoot}/src/**/*", "includeIgnored": true}]"#,
+            "src/page.ts",
+            "changed",
+        ),
+    ] {
+        let project = format!(
+            r#"{{"name": "marketing", "targets": {{"build": {{"command": "echo build", "inputs": {inputs}}}}}}}"#
+        );
+        let repo = Repo::new(&[
+            ("apps/(marketing)/project.json", &project),
+            ("apps/(marketing)/src/page.ts", "page"),
+            ("apps/(marketing)/meta.json", r#"{"version": 1}"#),
+        ]);
+        write(&repo.root, &format!("apps/(marketing)/{file}"), text);
+        let tasks = affected_tasks_of(&repo, &["marketing:build"]);
+        assert!(tasks.contains_key("marketing:build"), "{inputs}: {tasks:?}");
+    }
+}
+
+/// A fileset from an escaped project root reads that directory alone, so a
+/// dependency writing elsewhere below the same parent is no producer of it.
+#[test]
+fn a_fileset_from_an_escaped_root_reads_no_sibling_outputs() {
+    let repo = Repo::new(&[
+        (
+            "apps/(marketing)/project.json",
+            r#"{"name": "marketing", "implicitDependencies": ["other"], "targets": {"build": {"command": "echo build", "dependsOn": ["^build"], "inputs": ["{projectRoot}/**/*"]}}}"#,
+        ),
+        (
+            "apps/other/project.json",
+            r#"{"name": "other", "targets": {"build": {"command": "echo build", "inputs": ["{projectRoot}/src/**/*"], "outputs": ["{projectRoot}/dist"]}}}"#,
+        ),
+        ("apps/other/src/index.ts", "index"),
+    ]);
+    write(&repo.root, "apps/other/src/index.ts", "changed");
+    assert_eq!(
+        affected_tasks_of(&repo, &["marketing:build"])
+            .keys()
+            .collect::<Vec<_>>(),
+        ["other:build"]
+    );
+}
+
+/// A `json` glob reads a dependency's declared outputs as a fileset does, so
+/// a change of that dependency carries to the task.
+#[test]
+fn json_globs_read_their_producers_outputs() {
+    let repo = Repo::new(&[
+        (
+            "apps/app/project.json",
+            r#"{"name": "app", "implicitDependencies": ["lib"], "targets": {"build": {"command": "echo build", "dependsOn": ["^build"], "inputs": [{"json": "{workspaceRoot}/libs/lib/out/*.json", "fields": ["version"]}]}}}"#,
+        ),
+        (
+            "libs/lib/project.json",
+            r#"{"name": "lib", "targets": {"build": {"command": "echo build", "inputs": ["{projectRoot}/src/**/*"], "outputs": ["{projectRoot}/out"]}}}"#,
+        ),
+        ("libs/lib/src/index.ts", "index"),
+    ]);
+    write(&repo.root, "libs/lib/src/index.ts", "changed");
+    let tasks = affected_tasks_of(&repo, &["app:build"]);
+    assert_eq!(tasks.keys().collect::<Vec<_>>(), ["app:build", "lib:build"]);
+    assert!(
+        matches!(&tasks["app:build"], qk_affected::TaskCause::Reads { task } if task == "lib:build")
+    );
 }

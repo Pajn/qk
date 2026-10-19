@@ -1,8 +1,9 @@
-//! The placeholder syntax Nx 24 shares between run-commands arguments and
-//! `readyWhen`: `{name}` or `{name.path}`, with `??` fallbacks.
+//! The placeholder syntax Nx 24 shares between run-commands arguments,
+//! `readyWhen` and cache outputs: `{name}` or `{name.path}`, with `??`
+//! fallbacks.
 
 /// Where the brace opening at `open` closes, counting nested pairs.
-pub(crate) fn closing_brace(text: &str, open: usize) -> Option<usize> {
+pub fn closing_brace(text: &str, open: usize) -> Option<usize> {
     let mut depth = 0usize;
     for (index, c) in text[open..].char_indices() {
         match c {
@@ -20,7 +21,7 @@ pub(crate) fn closing_brace(text: &str, open: usize) -> Option<usize> {
 }
 
 /// A token's `??` alternatives, trimmed, outside any nested braces.
-pub(crate) fn fallbacks(token: &str) -> Vec<&str> {
+pub fn fallbacks(token: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0i32;
     let mut start = 0;
@@ -45,7 +46,7 @@ pub(crate) fn fallbacks(token: &str) -> Vec<&str> {
 
 /// The variable an `env.NAME` reference names, as Nx reads one: any name a
 /// dotenv file can define, and Windows names such as `ProgramFiles(x86)`.
-pub(crate) fn env_name(source: &str) -> Option<&str> {
+pub fn env_name(source: &str) -> Option<&str> {
     source.strip_prefix("env.").filter(|name| {
         !name.is_empty()
             && name

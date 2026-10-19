@@ -55,6 +55,19 @@ When a name occurs in multiple sections, precedence is `dependencies`,
   apply them.
 - Input negated-group exclusions apply to the pattern they came from in qk;
   Nx applies them across a project's patterns. qk can include extra inputs.
+- A `json` input naming one file reads it even when source ignore rules
+  exclude it; Nx reads only the files a fileset could select, so qk can key
+  a file Nx leaves out.
+- An `includeIgnored` fileset leaves out the task's own declared outputs, as
+  every qk fileset does, so a task that writes into what it reads can still
+  be cached. Nx keys them.
+- In filesets, `json` inputs, `includeIgnored` filesets and outputs,
+  `{projectRoot}` and `{projectName}` go in with their glob characters
+  escaped, so a project at `apps/(marketing)` reads and caches that
+  directory. So do the project's values in an output's `{project.…}` and the
+  root in the outputs a target without `outputs` takes. Nx inserts them as
+  they are, which turns such a root into a pattern that misses the project's
+  files.
 - For affected-project selection, bare parenthesized extension groups such
   as `**/*.(svg|png)` select projects in qk that Nx 23.1.0 does not.
   See [Inputs and outputs](reference/inputs-outputs.md) for compatible syntax.
@@ -74,6 +87,9 @@ parity claim yet. In particular:
 - Nx plugins and inferred targets are outside the design's scope.
 - qk has its own live output panel, which takes no input, and does not
   implement Nx release commands.
+- An `externalDependencies` entry naming a package nothing installs is an
+  error only with a pnpm lockfile qk can read; with any other lockfile qk
+  cannot tell, and keys the lockfile whole.
 - Pseudo-terminals are Unix only; on Windows commands see pipes, as they do
   in Nx unless `NX_WINDOWS_PTY_SUPPORT` is set. A pseudo-terminal passes `\n`
   through, where Nx's turns it into `\r\n`.

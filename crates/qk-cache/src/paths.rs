@@ -159,6 +159,23 @@ pub fn validate_path(path: &str) -> Result<()> {
     Ok(())
 }
 
+/// [`validate_path`] for an output pattern, whose `\` escapes the character
+/// after it, as in Nx: the paths it can match must be safe.
+fn validate_pattern(pattern: &str) -> Result<()> {
+    let mut path = String::new();
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        path.push(if c == '\\' {
+            chars
+                .next()
+                .with_context(|| format!("unsafe cache artifact path {pattern:?}"))?
+        } else {
+            c
+        });
+    }
+    validate_path(&path)
+}
+
 pub fn safe_parents(root: &Path, path: &str) -> Result<()> {
     validate_path(path)?;
     let mut current = root.to_owned();
@@ -186,21 +203,45 @@ pub fn safe_parents(root: &Path, path: &str) -> Result<()> {
 
 pub use crate::glob::Pattern;
 
+/// A fileset path with its tokens replaced, as Nx resolves an input's:
+/// `{projectRoot}` and `{projectName}` anywhere, and `{workspaceRoot}` only
+/// at the start. Anywhere else `{workspaceRoot}` is glob text, as it is in
+/// Nx, and so is any other brace group.
 pub fn expand(workspace: &Workspace, project: &str, text: &str) -> Result<String> {
-    let project_root = &workspace.projects[project].root;
+    let root = &workspace.projects[project].root;
+    expand_with(text, root, project)
+}
+
+/// [`expand`] for a glob: the project root and name go in with their glob
+/// characters escaped, so a root such as `apps/(marketing)` names that
+/// directory rather than a pattern. Nx inserts them as they are.
+pub fn expand_glob(workspace: &Workspace, project: &str, text: &str) -> Result<String> {
+    let root = &workspace.projects[project].root;
+    let root = if root == "." {
+        root.clone()
+    } else {
+        crate::glob::escape(root)
+    };
+    expand_with(text, &root, &crate::glob::escape(project))
+}
+
+fn expand_with(text: &str, project_root: &str, project_name: &str) -> Result<String> {
     let prefix = if project_root == "." {
         String::new()
     } else {
         format!("{project_root}/")
     };
+    let text = match text.strip_prefix("{workspaceRoot}") {
+        Some(rest) => rest.strip_prefix('/').unwrap_or(match rest {
+            "" => ".",
+            rest => rest,
+        }),
+        None => text,
+    };
     let result = text
-        .replace("{workspaceRoot}/", "")
         .replace("{projectRoot}/", &prefix)
         .replace("{projectRoot}", project_root)
-        .replace("{workspaceRoot}", ".");
-    if result.contains("{options.") || result.contains("{args.") {
-        bail!("dynamic cache paths are not supported yet");
-    }
+        .replace("{projectName}", project_name);
     normalize(&result)
 }
 
@@ -211,7 +252,7 @@ fn normalize(path: &str) -> Result<String> {
         match part {
             "." => {}
             ".." => match parts.pop() {
-                Some(parent) if crate::glob::is_literal(parent) => {}
+                Some(parent) if crate::glob::names_a_path(parent) => {}
                 _ => bail!("cache path {path:?} leaves the workspace or follows a glob with `..`"),
             },
             part => parts.push(part),
@@ -233,8 +274,11 @@ pub struct Outputs {
     globs: Vec<String>,
     /// Negated patterns: what they match is never an output.
     negations: Vec<Pattern>,
+    /// The directories the patterns are read from, their leading literal
+    /// segments with escapes read, as Nx's `partition_glob` takes them.
     anchors: BTreeSet<String>,
-    /// Literal output roots which include their entire subtree.
+    /// Literal output roots which include their entire subtree, with their
+    /// escapes read.
     complete: BTreeSet<String>,
     /// Whether the target declares its outputs, rather than taking Nx's
     /// defaults for a target without them.
@@ -253,21 +297,17 @@ impl Outputs {
         let mut complete = BTreeSet::new();
         for pattern in patterns {
             if let Some(excluded) = pattern.strip_prefix('!') {
-                validate_path(excluded)?;
+                validate_pattern(excluded)?;
                 negations.push(Pattern::new(excluded, false)?);
                 continue;
             }
-            validate_path(pattern)?;
-            let anchor = pattern
-                .split('/')
-                .take_while(|part| crate::glob::is_literal(part))
-                .collect::<Vec<_>>()
-                .join("/");
+            validate_pattern(pattern)?;
+            let (anchor, glob) = crate::ignored::partition(pattern);
             if anchor.is_empty() {
                 bail!("{pattern:?} needs a fixed directory prefix");
             }
-            if pattern.split('/').all(crate::glob::is_literal) {
-                complete.insert(pattern.clone());
+            if glob.is_none() {
+                complete.insert(anchor.clone());
             }
             compiled.push(Pattern::new(pattern, false)?);
             globs.push(pattern.clone());
@@ -322,28 +362,30 @@ impl Outputs {
                 Some(rest) => (true, rest.to_owned()),
                 None => (false, output),
             };
-            validate_path(&pattern)?;
+            validate_pattern(&pattern)?;
             if negated {
                 negations.push(Pattern::new(&pattern, false)?);
                 continue;
             }
-            let anchor = pattern
-                .split('/')
-                .take_while(|part| crate::glob::is_literal(part))
-                .collect::<Vec<_>>()
-                .join("/");
+            let (anchor, glob) = crate::ignored::partition(&pattern);
+            // The path a literal output names, its escapes read, is what a
+            // restore replaces, so it must not hold a project.
             if anchor.is_empty()
-                || workspace
-                    .projects
-                    .values()
-                    .any(|project| project.root == pattern)
+                || glob.is_none()
+                    && workspace.projects.values().any(|project| {
+                        project.root == anchor
+                            || project
+                                .root
+                                .strip_prefix(anchor.as_str())
+                                .is_some_and(|rest| rest.starts_with('/'))
+                    })
             {
                 bail!(
                     "cache outputs must have a fixed directory prefix and cannot replace a project root"
                 );
             }
-            if pattern.split('/').all(crate::glob::is_literal) {
-                complete.insert(pattern.clone());
+            if glob.is_none() {
+                complete.insert(anchor.clone());
             }
             patterns.push(Pattern::new(&pattern, false)?);
             globs.push(pattern);
@@ -369,6 +411,11 @@ impl Outputs {
     /// target without `outputs` are only guesses, and do not count.
     pub fn declared(&self) -> bool {
         self.explicit && !self.patterns.is_empty()
+    }
+
+    /// The patterns as written, without the negated ones.
+    pub(crate) fn globs(&self) -> &[String] {
+        &self.globs
     }
 
     /// Fixed directory prefixes; every matching path lies below one of them.
@@ -668,53 +715,114 @@ fn may_match_below(glob: &str, directory: &str) -> bool {
 }
 
 /// A task's outputs as Nx lists them: workspace-relative paths and globs,
-/// `!` for a negated one, with `{options.name}`, `{projectName}` and the
-/// project tokens replaced; an output naming what has no value is left out.
-/// Without `outputs`, Nx's defaults: `options.outputPath`, and for `build`
-/// and `prepare` targets `dist/<root>`, `<root>/dist`, `<root>/build` and
+/// `!` for a negated one, with their tokens read as [`interpolate_output`]
+/// reads them; an output naming what has no value is left out. Without
+/// `outputs`, Nx's defaults: `options.outputPath`, and for `build` and
+/// `prepare` targets `dist/<root>`, `<root>/dist`, `<root>/build` and
 /// `<root>/public`. The flag tells whether the target declared them.
 pub fn resolved_outputs(workspace: &Workspace, task: &Task) -> Result<(Vec<String>, bool)> {
     let root = &workspace.projects[&task.project].root;
     let options = task_options(task);
-    let (templates, explicit) = match &task.definition.outputs {
-        Some(outputs) => (outputs.clone(), true),
-        None => match options.get("outputPath") {
-            Some(serde_json::Value::String(path)) => (vec![path.clone()], false),
-            Some(serde_json::Value::Array(paths)) => (
-                paths
-                    .iter()
-                    .filter_map(|path| path.as_str().map(str::to_owned))
-                    .collect(),
-                false,
-            ),
-            _ if matches!(task.target.as_str(), "build" | "prepare") => (
+    let mut resolved = Vec::new();
+    let Some(templates) = &task.definition.outputs else {
+        // As in Nx, an `outputPath` counts when it is truthy, so an empty
+        // string falls back to the defaults; an empty path in a list names
+        // nothing.
+        let defaults: Vec<String> = match options.get("outputPath") {
+            Some(path @ serde_json::Value::String(text)) if !text.is_empty() => {
+                vec![option_tokens(workspace, &task.project, path)?]
+            }
+            Some(serde_json::Value::Array(paths)) => paths
+                .iter()
+                .filter(|path| path.as_str().is_some_and(|text| !text.is_empty()))
+                .map(|path| option_tokens(workspace, &task.project, path))
+                .collect::<Result<_>>()?,
+            _ if matches!(task.target.as_str(), "build" | "prepare") => {
+                // The root goes in escaped, as in a configured output.
+                let root = crate::glob::escape(root);
                 [
                     format!("dist/{root}"),
                     format!("{root}/dist"),
                     format!("{root}/build"),
                     format!("{root}/public"),
                 ]
-                .into(),
-                false,
-            ),
-            _ => (Vec::new(), false),
-        },
+                .into()
+            }
+            _ => Vec::new(),
+        };
+        for output in defaults {
+            let (negated, path) = match output.strip_prefix('!') {
+                Some(rest) => (true, rest),
+                None => (false, output.as_str()),
+            };
+            let path = workspace_relative(workspace, path)?;
+            resolved.push(if negated { format!("!{path}") } else { path });
+        }
+        return Ok((resolved, false));
     };
-    let mut resolved = Vec::new();
+    qk_taskgraph::validate_outputs(templates)?;
+    let data = OutputData {
+        workspace,
+        project: &task.project,
+        options: &options,
+    };
     for template in templates {
         let (negated, template) = match template.strip_prefix('!') {
-            Some(rest) => (true, rest.to_owned()),
-            None => (false, template),
+            Some(rest) => (true, rest),
+            None => (false, template.as_str()),
         };
-        let Some(output) = resolve_output(task, &options, &template) else {
+        let Some(output) = interpolate_output(template, &data)? else {
             continue;
         };
-        let path = expand(workspace, &task.project, &output)?
-            .trim_end_matches('/')
-            .to_owned();
-        resolved.push(if negated { format!("!{path}") } else { path });
+        let path = workspace_relative(workspace, &output)?;
+        let path = if negated { format!("!{path}") } else { path };
+        // As in Nx, outputs are a set.
+        if !resolved.contains(&path) {
+            resolved.push(path);
+        }
     }
-    Ok((resolved, explicit))
+    Ok((resolved, true))
+}
+
+/// `path` without Windows' verbatim `\\?\` prefix on a drive path.
+fn verbatim_free(path: &Path) -> PathBuf {
+    match path.to_str().and_then(|text| text.strip_prefix(r"\\?\")) {
+        Some(rest) if !rest.starts_with("UNC\\") => PathBuf::from(rest),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// An output made workspace-relative, as Nx's cache reads one: an absolute
+/// path inside the workspace is relativized, and one outside it, or a path
+/// that climbs out with `..`, is an error.
+fn workspace_relative(workspace: &Workspace, output: &str) -> Result<String> {
+    let owned;
+    let relative = if Path::new(output).is_absolute() || output.starts_with('/') {
+        // Compared by components, without Windows' `\\?\` prefix, which
+        // one of the two paths may carry and the other not.
+        let inside = verbatim_free(Path::new(output))
+            .strip_prefix(verbatim_free(&workspace.root))
+            .ok()
+            .map(|rest| {
+                rest.components()
+                    .map(|part| part.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            });
+        match inside {
+            Some(rest) => {
+                owned = rest;
+                owned.as_str()
+            }
+            None => bail!("cache output is outside the workspace: {output}"),
+        }
+    } else {
+        output
+    };
+    match normalize(relative) {
+        Ok(path) => Ok(path.trim_end_matches('/').to_owned()),
+        Err(_) => bail!("cache output is outside the workspace: {output}"),
+    }
 }
 
 /// The target's options with the task's `--name=value` arguments applied,
@@ -738,49 +846,688 @@ fn task_options(task: &Task) -> serde_json::Map<String, serde_json::Value> {
     options
 }
 
-/// An output with `{options.*}`, `{projectName}` and the legacy
-/// `{project.name}` and `{project.root}` replaced, or `None` when one of
-/// them has no value, which Nx leaves the output out for.
-fn resolve_output(
-    task: &Task,
-    options: &serde_json::Map<String, serde_json::Value>,
-    template: &str,
-) -> Option<String> {
-    let mut result = String::new();
-    let mut rest = template;
-    while let Some(start) = rest.find('{') {
-        result.push_str(&rest[..start]);
-        let end = rest[start..].find('}')? + start;
-        let token = rest[start + 1..end].trim();
-        let value = if let Some(path) = token.strip_prefix("options.") {
-            let mut value = options.get(path.split('.').next()?)?;
-            for part in path.split('.').skip(1) {
-                value = value.get(part)?;
-            }
-            match value {
-                serde_json::Value::String(text) if !text.is_empty() => text.clone(),
-                serde_json::Value::Number(number) => number.to_string(),
-                serde_json::Value::Bool(true) => "true".into(),
-                _ => return None,
-            }
-        } else {
-            match token {
-                "projectName" | "project.name" => task.project.clone(),
-                "project.root" => "{projectRoot}".into(),
-                "projectRoot" | "workspaceRoot" => format!("{{{token}}}"),
-                _ => return None,
-            }
-        };
-        result.push_str(&value);
-        rest = &rest[end + 1..];
+/// What an output's tokens read: as in Nx, `{projectRoot}`, `{projectName}`,
+/// `{options.*}` and the legacy `{project.*}`, the project's configuration.
+struct OutputData<'a> {
+    workspace: &'a Workspace,
+    project: &'a str,
+    options: &'a serde_json::Map<String, serde_json::Value>,
+}
+
+impl OutputData<'_> {
+    fn is_token(name: &str) -> bool {
+        matches!(name, "projectRoot" | "projectName" | "project" | "options")
     }
-    result.push_str(rest);
-    Some(result)
+
+    fn read(&self, name: &str, path: Option<&str>) -> Result<Option<serde_json::Value>> {
+        let value = match name {
+            "projectRoot" => {
+                serde_json::Value::String(self.workspace.projects[self.project].root.clone())
+            }
+            "projectName" => serde_json::Value::String(self.project.to_owned()),
+            "project" => {
+                let mut project = serde_json::to_value(&self.workspace.projects[self.project])?;
+                project["name"] = serde_json::Value::String(self.project.to_owned());
+                project
+            }
+            _ => serde_json::Value::Object(self.options.clone()),
+        };
+        let Some(found) = read_path(&value, path) else {
+            return Ok(None);
+        };
+        // Nx resolves the project tokens in every option when it builds the
+        // project graph, so an option's value already has them replaced. The
+        // value goes in as written, a pattern if it holds one, as in Nx. The
+        // project's own paths go in with their glob characters escaped, so a
+        // root such as `apps/(group)` names that directory; Nx inserts them
+        // as they are.
+        Ok(Some(if name == "options" {
+            resolve_option_tokens(self.workspace, self.project, &found)?
+        } else {
+            escape_strings(&found)
+        }))
+    }
+}
+
+/// `value` with every string in it escaped by [`crate::glob::escape`].
+fn escape_strings(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) => serde_json::Value::String(crate::glob::escape(text)),
+        serde_json::Value::Array(items) => items.iter().map(escape_strings).collect(),
+        serde_json::Value::Object(object) => serde_json::Value::Object(
+            object
+                .iter()
+                .map(|(key, item)| (key.clone(), escape_strings(item)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Walks a dotted path as Nx's `readPath` does: each step must be an own
+/// property, so an object's key, or an array's or string's canonical index
+/// (`0`, `12`, not `01` or `+1`) or `length`.
+fn read_path(value: &serde_json::Value, path: Option<&str>) -> Option<serde_json::Value> {
+    let Some(path) = path else {
+        return Some(value.clone());
+    };
+    let index = |key: &str| {
+        (key == "0" || (!key.starts_with('0') && key.bytes().all(|b| b.is_ascii_digit())))
+            .then(|| key.parse::<usize>().ok())
+            .flatten()
+    };
+    let mut value = value.clone();
+    for key in path.split('.') {
+        value = match &value {
+            serde_json::Value::Object(object) => object.get(key)?.clone(),
+            serde_json::Value::Array(items) if key == "length" => items.len().into(),
+            serde_json::Value::Array(items) => items.get(index(key)?)?.clone(),
+            // A JavaScript string's length and indexes count UTF-16 units.
+            serde_json::Value::String(text) => {
+                let units: Vec<u16> = text.encode_utf16().collect();
+                if key == "length" {
+                    units.len().into()
+                } else {
+                    String::from_utf16_lossy(&[*units.get(index(key)?)?]).into()
+                }
+            }
+            _ => return None,
+        };
+    }
+    Some(value)
+}
+
+/// An option value as Nx's graph holds it, from [`resolve_option_tokens`],
+/// as the text it stands for.
+fn option_tokens(
+    workspace: &Workspace,
+    project: &str,
+    value: &serde_json::Value,
+) -> Result<String> {
+    Ok(text(&resolve_option_tokens(workspace, project, value)?).unwrap_or_default())
+}
+
+/// `{projectRoot}`, `{projectName}` and a leading `{workspaceRoot}` replaced
+/// in every string of an option value, as Nx's `resolveNxTokensInOptions`:
+/// `{workspaceRoot}` anywhere but the start is an error.
+fn resolve_option_tokens(
+    workspace: &Workspace,
+    project: &str,
+    value: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    Ok(match value {
+        serde_json::Value::String(text) => {
+            let text = text
+                .strip_prefix("{workspaceRoot}/")
+                .or_else(|| text.strip_prefix("{workspaceRoot}"))
+                .unwrap_or(text);
+            if text.contains("{workspaceRoot}") {
+                bail!(
+                    "the {{workspaceRoot}} token is only valid at the beginning of an option ({project})"
+                );
+            }
+            serde_json::Value::String(
+                text.replace("{projectRoot}", &workspace.projects[project].root)
+                    .replace("{projectName}", project),
+            )
+        }
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .iter()
+                .map(|item| resolve_option_tokens(workspace, project, item))
+                .collect::<Result<_>>()?,
+        ),
+        serde_json::Value::Object(object) => serde_json::Value::Object(
+            object
+                .iter()
+                .map(|(key, item)| {
+                    Ok((
+                        key.clone(),
+                        resolve_option_tokens(workspace, project, item)?,
+                    ))
+                })
+                .collect::<Result<_>>()?,
+        ),
+        other => other.clone(),
+    })
+}
+
+/// A value as JavaScript's `String()` writes it, or `None` for one Nx counts
+/// as unset: missing, `null` or `''`.
+fn text(value: &serde_json::Value) -> Option<String> {
+    let text = match value {
+        serde_json::Value::Null => return None,
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Bool(flag) => flag.to_string(),
+        serde_json::Value::Number(number) => match number.as_f64() {
+            Some(float) if number.is_f64() && float.fract() == 0.0 && float.abs() < 1e21 => {
+                format!("{float:.0}")
+            }
+            _ => number.to_string(),
+        },
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(|item| text(item).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join(","),
+        serde_json::Value::Object(_) => "[object Object]".to_owned(),
+    };
+    (!text.is_empty()).then_some(text)
+}
+
+/// One piece of a template: text, or a `{token}` with its `??` fallbacks.
+enum Node<'t> {
+    Text(String),
+    Token { raw: &'t str, parts: Vec<Part<'t>> },
+}
+
+enum Part<'t> {
+    Reference {
+        name: &'t str,
+        path: Option<&'t str>,
+    },
+    Literal(Vec<Node<'t>>),
+}
+
+/// A template's pieces, as Nx's `parseTokens`: braces that do not start
+/// with a token are text, and a token can still sit inside them.
+fn parse_tokens(template: &str) -> Result<Vec<Node<'_>>> {
+    let mut nodes = Vec::new();
+    let mut text = String::new();
+    let mut index = 0;
+    while let Some(offset) = template[index..].find('{') {
+        let open = index + offset;
+        let token = match qk_executor::tokens::closing_brace(template, open) {
+            Some(close) => parse_token(&template[open..=close])?.map(|token| (token, close)),
+            None => None,
+        };
+        let Some((token, close)) = token else {
+            text.push_str(&template[index..=open]);
+            index = open + 1;
+            continue;
+        };
+        text.push_str(&template[index..open]);
+        if !text.is_empty() {
+            nodes.push(Node::Text(std::mem::take(&mut text)));
+        }
+        nodes.push(token);
+        index = close + 1;
+    }
+    text.push_str(&template[index..]);
+    if !text.is_empty() {
+        nodes.push(Node::Text(text));
+    }
+    Ok(nodes)
+}
+
+/// A `{...}` as a token, or `None` when its first part names no token. Only
+/// the last fallback may be a literal, which can hold tokens itself. `env.`
+/// is not a token in an output, so it is text there.
+fn parse_token(raw: &str) -> Result<Option<Node<'_>>> {
+    let sources = qk_executor::tokens::fallbacks(&raw[1..raw.len() - 1]);
+    fn reference(source: &str) -> Option<(&str, Option<&str>)> {
+        let (name, path) = match source.split_once('.') {
+            Some((name, path)) => (name, Some(path)),
+            None => (source, None),
+        };
+        OutputData::is_token(name).then_some((name, path))
+    }
+    if reference(sources[0]).is_none() {
+        return Ok(None);
+    }
+    let mut parts = Vec::new();
+    for (index, source) in sources.iter().enumerate() {
+        parts.push(match reference(source) {
+            Some((name, path)) => Part::Reference { name, path },
+            None if index + 1 == sources.len() => Part::Literal(parse_tokens(source)?),
+            None => {
+                bail!("{raw:?} has a fallback after the literal {source:?} that can never be used")
+            }
+        });
+    }
+    Ok(Some(Node::Token { raw, parts }))
+}
+
+/// Whether `{workspaceRoot}` appears only at the very start, which is the
+/// only place Nx allows it in an output. A fallback's literal replaces its
+/// whole token, so a token at the start may fall back to one.
+fn workspace_root_only_at_start(nodes: &[Node], at_start: bool) -> bool {
+    nodes.iter().enumerate().all(|(index, node)| {
+        let node_at_start = at_start && index == 0;
+        match node {
+            Node::Text(text) => {
+                let skip = usize::from(node_at_start).min(text.len());
+                !text[skip..].contains("{workspaceRoot}")
+            }
+            Node::Token { parts, .. } => parts.iter().all(|part| match part {
+                Part::Literal(nodes) => workspace_root_only_at_start(nodes, node_at_start),
+                Part::Reference { .. } => true,
+            }),
+        }
+    })
+}
+
+/// What an output names once its tokens are read, as Nx 24's
+/// `interpolateOutput`, or `None` when Nx leaves it out: it is empty, or a
+/// `{projectRoot}`, `{workspaceRoot}` or `{options...}` placeholder was left
+/// without a value. A token's value is its first part that is set; braces
+/// that start no token, such as `*.{js,map}`, stay as written. The result is
+/// joined as a path, and a leading `{workspaceRoot}/` removed. An output
+/// starting with `/` is taken as written.
+fn interpolate_output(template: &str, data: &OutputData) -> Result<Option<String>> {
+    let output = if template.starts_with('/') || !has_braces(template) {
+        template.to_owned()
+    } else {
+        let nodes = parse_tokens(template)?;
+        if !workspace_root_only_at_start(&nodes, true) {
+            bail!(
+                "output {template:?} is invalid: {{workspaceRoot}} can only be used at the beginning of the expression"
+            );
+        }
+        let mut segments = vec![String::new()];
+        render(&nodes, data, false, &mut segments)?;
+        // `path.join` skips empty segments.
+        segments.retain(|segment| !segment.is_empty());
+        join_path(&segments.join("/")).replacen("{workspaceRoot}/", "", 1)
+    };
+    let unresolved = ["{projectRoot}", "{workspaceRoot}"]
+        .iter()
+        .any(|token| output.contains(token))
+        || output
+            .find("{options")
+            .is_some_and(|start| output[start..].contains('}'));
+    Ok((!output.is_empty() && !unresolved).then_some(output))
+}
+
+/// Whether `template` holds a `{` with something before a later `}`.
+fn has_braces(template: &str) -> bool {
+    template.find('{').is_some_and(|open| {
+        template
+            .get(open + 2..)
+            .is_some_and(|rest| rest.contains('}'))
+    })
+}
+
+/// The template's `/`-separated segments with its tokens read, as Nx's
+/// `joinSegments` gathers them for `path.join`. Text splits segments and a
+/// value joins the segment it lands in, so only a value or a fallback's
+/// literal starting a path can make it absolute.
+fn render(
+    nodes: &[Node],
+    data: &OutputData,
+    literal: bool,
+    segments: &mut Vec<String>,
+) -> Result<()> {
+    for (index, node) in nodes.iter().enumerate() {
+        match node {
+            Node::Text(text) => {
+                let root = if literal && index == 0 && text.starts_with('/') {
+                    "/"
+                } else {
+                    ""
+                };
+                let mut parts = text[root.len()..].split('/');
+                let last = segments.last_mut().expect("segments start with one");
+                last.push_str(root);
+                last.push_str(parts.next().unwrap_or_default());
+                segments.extend(parts.map(str::to_owned));
+            }
+            Node::Token { raw, parts } => {
+                // A root project's `{projectRoot}` is no path segment at all.
+                if *raw == "{projectRoot}" && data.workspace.projects[data.project].root == "." {
+                    continue;
+                }
+                let mut value = Some(*raw);
+                let mut found = None;
+                for part in parts {
+                    match part {
+                        Part::Literal(nodes) => {
+                            render(nodes, data, true, segments)?;
+                            value = None;
+                            break;
+                        }
+                        Part::Reference { name, path } => {
+                            found = data.read(name, *path)?.as_ref().and_then(text);
+                            if found.is_some() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                // A token with no value stays as written.
+                let value = found.as_deref().or(value).unwrap_or_default();
+                segments
+                    .last_mut()
+                    .expect("segments start with one")
+                    .push_str(value);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `path` joined as Node's `path.posix.join` joins it: empty and `.`
+/// segments dropped, `..` applied where it can be, a trailing slash kept.
+fn join_path(path: &str) -> String {
+    let absolute = path.starts_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => match parts.last() {
+                Some(&last) if last != ".." => {
+                    parts.pop();
+                }
+                _ if absolute => {}
+                _ => parts.push(".."),
+            },
+            part => parts.push(part),
+        }
+    }
+    let mut joined = parts.join("/");
+    if absolute {
+        joined.insert(0, '/');
+    }
+    if joined.is_empty() {
+        joined.push('.');
+    }
+    if path.ends_with('/') && !joined.ends_with('/') {
+        joined.push('/');
+    }
+    joined
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Outputs, Pattern, dot_git, normalize};
+    use super::{Outputs, Pattern, dot_git, normalize, resolved_outputs, verbatim_free};
+    use qk_config::Workspace;
+    use qk_taskgraph::{Request, TaskGraph};
+    use serde_json::{Value, json};
+    use std::path::{Path, PathBuf};
+
+    /// The outputs of `lib:build` in a workspace with a root project and
+    /// `lib` at `libs/lib`, the target configured by `target`.
+    fn outputs_of(target: Value, args: &[&str]) -> anyhow::Result<Vec<String>> {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("nx.json"), "{}").unwrap();
+        std::fs::write(
+            root.path().join("project.json"),
+            json!({"name": "root"}).to_string(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.path().join("libs/lib")).unwrap();
+        std::fs::write(
+            root.path().join("libs/lib/project.json"),
+            json!({"name": "lib", "sourceRoot": "libs/lib/src", "tags": ["a", "b"],
+                "targets": {"build": target}})
+            .to_string(),
+        )
+        .unwrap();
+        let workspace = Workspace::load(root.path()).unwrap();
+        let mut request = Request::parse("lib:build").unwrap();
+        request.args = args.iter().map(|arg| (*arg).to_owned()).collect();
+        let graph = TaskGraph::build(&workspace, &[request])?;
+        resolved_outputs(&workspace, &graph.tasks["lib:build"]).map(|(outputs, _)| outputs)
+    }
+
+    fn outputs(outputs: Value, options: Value) -> anyhow::Result<Vec<String>> {
+        outputs_of(
+            json!({"command": "true", "outputs": outputs, "options": options}),
+            &[],
+        )
+    }
+
+    #[test]
+    fn braces_that_are_no_token_stay_as_written() {
+        assert_eq!(
+            outputs(
+                json!([
+                    "{projectRoot}/dist/**/*.{js,map}",
+                    "{workspaceRoot}/x/{a,{projectName}}"
+                ]),
+                json!({})
+            )
+            .unwrap(),
+            ["libs/lib/dist/**/*.{js,map}", "x/{a,lib}"]
+        );
+    }
+
+    #[test]
+    fn placeholders_fall_back_left_to_right() {
+        let resolved = outputs(
+            json!([
+                "{options.a ?? options.b ?? dist/{projectName}}",
+                "{options.missing ?? options.b}/x",
+                "{options.missing ?? {workspaceRoot}/fallback}",
+                "{workspaceRoot}/x/{env.HOME}",
+                "{options.missing}",
+                "{options.missing ?? options.other}",
+            ]),
+            json!({"b": "from-b"}),
+        )
+        .unwrap();
+        // `env.` is no token in an output, and an output with an unresolved
+        // placeholder is left out.
+        assert_eq!(resolved, ["from-b", "from-b/x", "fallback", "x/{env.HOME}"]);
+        assert!(outputs(json!(["{options.a ?? literal ?? options.b}"]), json!({})).is_err());
+    }
+
+    #[test]
+    fn option_values_read_as_javascript_writes_them() {
+        assert_eq!(
+            outputs(
+                json!([
+                    "{workspaceRoot}/dist/{options.flag}",
+                    "{workspaceRoot}/dist/{options.zero}",
+                    "{workspaceRoot}/dist/{options.list}",
+                    "{workspaceRoot}/dist/{options.float}",
+                    "{workspaceRoot}/dist/{options.nested.deep}",
+                    "{workspaceRoot}/dist/{options.list.1}",
+                    "{workspaceRoot}/dist/{options.empty}",
+                    "{workspaceRoot}/dist/{options.none}",
+                ]),
+                json!({"flag": false, "zero": 0, "list": ["a", "b"], "float": 2.0,
+                    "nested": {"deep": "d"}, "empty": "", "none": null}),
+            )
+            .unwrap(),
+            [
+                "dist/false",
+                "dist/0",
+                "dist/a,b",
+                "dist/2",
+                "dist/d",
+                "dist/b"
+            ]
+        );
+    }
+
+    #[test]
+    fn option_values_have_their_project_tokens_resolved() {
+        assert_eq!(
+            outputs(
+                json!(["{options.outputPath}", "{options.list}"]),
+                json!({"outputPath": "{workspaceRoot}/dist/{projectName}/{projectRoot}",
+                    "list": ["{projectName}"]}),
+            )
+            .unwrap(),
+            ["dist/lib/libs/lib", "lib"]
+        );
+        assert!(
+            outputs(
+                json!(["{options.bad}"]),
+                json!({"bad": "x/{workspaceRoot}"})
+            )
+            .is_err()
+        );
+        // Arguments override options and are taken as they are given.
+        assert_eq!(
+            outputs_of(
+                json!({"command": "true", "outputs": ["{options.out}"], "options": {"out": "a"}}),
+                &["--out=b"],
+            )
+            .unwrap(),
+            ["b"]
+        );
+        // Paths step through own properties as Nx's readPath does: an array's
+        // length and canonical indexes only.
+        assert_eq!(
+            outputs(
+                json!([
+                    "{options.list.length}",
+                    "{options.list.1}",
+                    "{options.list.01}"
+                ]),
+                json!({"list": ["a", "b"]}),
+            )
+            .unwrap(),
+            ["2", "b"]
+        );
+        // An empty `outputPath` falls back to a build target's defaults, as
+        // Nx's truthiness check does.
+        assert_eq!(
+            outputs_of(
+                json!({"command": "true", "options": {"outputPath": ""}}),
+                &[],
+            )
+            .unwrap(),
+            [
+                "dist/libs/lib",
+                "libs/lib/dist",
+                "libs/lib/build",
+                "libs/lib/public"
+            ]
+        );
+        assert_eq!(
+            outputs_of(
+                json!({"command": "true", "options": {"outputPath": ["", "dist"]}}),
+                &[],
+            )
+            .unwrap(),
+            ["dist"]
+        );
+        // Without `outputs`, `outputPath` is the output, its tokens resolved.
+        assert_eq!(
+            outputs_of(
+                json!({"command": "true", "options": {"outputPath": "dist/{projectName}"}}),
+                &[],
+            )
+            .unwrap(),
+            ["dist/lib"]
+        );
+    }
+
+    #[test]
+    fn legacy_project_paths_read_the_project_configuration() {
+        assert_eq!(
+            outputs(
+                json!([
+                    "{project.sourceRoot}/gen",
+                    "{workspaceRoot}/dist/{project.name}/{project.tags}",
+                    "{project.missing}/x"
+                ]),
+                json!({})
+            )
+            .unwrap(),
+            ["libs/lib/src/gen", "dist/lib/a,b", "{project.missing}/x"]
+        );
+    }
+
+    #[test]
+    fn workspace_root_outputs_name_a_directory() {
+        for output in ["{workspaceRoot}/**", "{workspaceRoot}/*.js"] {
+            assert!(outputs(json!([output]), json!({})).is_err(), "{output}");
+        }
+        assert_eq!(
+            outputs(json!(["{workspaceRoot}/@scope/**"]), json!({})).unwrap(),
+            ["@scope/**"]
+        );
+    }
+
+    #[test]
+    fn workspace_root_is_allowed_only_at_the_start() {
+        for output in ["{projectRoot}/{workspaceRoot}/dist", "dist/{workspaceRoot}"] {
+            assert!(outputs(json!([output]), json!({})).is_err(), "{output}");
+        }
+        assert_eq!(
+            outputs(
+                json!([
+                    "!{workspaceRoot}/dist/x",
+                    "{workspaceRoot}/dist",
+                    "{workspaceRoot}"
+                ]),
+                json!({})
+            )
+            .unwrap(),
+            ["!dist/x", "dist"]
+        );
+    }
+
+    #[test]
+    fn a_root_projects_root_is_no_segment() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("nx.json"), "{}").unwrap();
+        std::fs::write(
+            root.path().join("project.json"),
+            json!({"name": "app", "targets": {"build": {"command": "true",
+                "outputs": ["{projectRoot}/dist", "{options.out ?? {projectRoot}/out}"]}}})
+            .to_string(),
+        )
+        .unwrap();
+        let workspace = Workspace::load(root.path()).unwrap();
+        let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
+        assert_eq!(
+            resolved_outputs(&workspace, &graph.tasks["app:build"])
+                .unwrap()
+                .0,
+            ["dist", "out"]
+        );
+    }
+
+    #[test]
+    fn verbatim_prefixes_are_left_out_of_drive_paths_only() {
+        assert_eq!(
+            verbatim_free(Path::new(r"\\?\C:\repo\dist")),
+            PathBuf::from(r"C:\repo\dist")
+        );
+        let unc = Path::new(r"\\?\UNC\server\share");
+        assert_eq!(verbatim_free(unc), unc);
+        assert_eq!(
+            verbatim_free(Path::new("/repo/dist")),
+            Path::new("/repo/dist")
+        );
+    }
+
+    #[test]
+    fn absolute_outputs_must_lie_in_the_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let inside = std::fs::canonicalize(root.path()).unwrap();
+        std::fs::write(inside.join("nx.json"), "{}").unwrap();
+        std::fs::write(
+            inside.join("project.json"),
+            json!({"name": "app", "targets": {"build": {"command": "true",
+                "outputs": ["{options.out}"], "options": {"out": inside.join("dist/app")}},
+                "outside": {"command": "true", "outputs": ["{options.out}"],
+                    "options": {"out": "/elsewhere/dist"}}}})
+            .to_string(),
+        )
+        .unwrap();
+        let workspace = Workspace::load(&inside).unwrap();
+        let graph = TaskGraph::build(
+            &workspace,
+            &[
+                Request::parse("app:build").unwrap(),
+                Request::parse("app:outside").unwrap(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            resolved_outputs(&workspace, &graph.tasks["app:build"])
+                .unwrap()
+                .0,
+            ["dist/app"]
+        );
+        assert!(resolved_outputs(&workspace, &graph.tasks["app:outside"]).is_err());
+    }
 
     #[test]
     fn dot_git_finds_a_linked_worktrees_directories_without_git() {
@@ -847,6 +1594,148 @@ mod tests {
         std::os::unix::fs::symlink(root.join("outside"), root.join("dist/link")).unwrap();
         let outputs = Outputs::from_paths(&["dist".into(), "dist/link/nested".into()]).unwrap();
         assert!(outputs.entries(root).is_err());
+    }
+
+    /// A project's root and name go into its outputs as the paths they are;
+    /// an option's value goes in as written.
+    #[test]
+    fn outputs_escape_the_project_root_and_name() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("nx.json"), "{}").unwrap();
+        std::fs::create_dir_all(root.path().join("apps/(group)/dist")).unwrap();
+        std::fs::write(root.path().join("apps/(group)/dist/a.js"), "").unwrap();
+        std::fs::write(
+            root.path().join("apps/(group)/project.json"),
+            json!({"name": "a+b", "sourceRoot": "apps/(group)/src", "targets": {
+                "build": {"command": "true"},
+                "emit": {"command": "true", "options": {"out": "out/*.js"}, "outputs": [
+                    "{projectRoot}/dist",
+                    "{workspaceRoot}/dist/{projectName}",
+                    "{project.sourceRoot}/gen",
+                    "{options.out}",
+                ]},
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let workspace = Workspace::load(root.path()).unwrap();
+        let graph = TaskGraph::build(
+            &workspace,
+            &[
+                Request::parse("a+b:emit").unwrap(),
+                Request::parse("a+b:build").unwrap(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            resolved_outputs(&workspace, &graph.tasks["a+b:emit"])
+                .unwrap()
+                .0,
+            [
+                r"apps/\(group\)/dist",
+                r"dist/a\+b",
+                r"apps/\(group\)/src/gen",
+                "out/*.js"
+            ]
+        );
+        assert_eq!(
+            resolved_outputs(&workspace, &graph.tasks["a+b:build"])
+                .unwrap()
+                .0,
+            [
+                r"dist/apps/\(group\)",
+                r"apps/\(group\)/dist",
+                r"apps/\(group\)/build",
+                r"apps/\(group\)/public"
+            ]
+        );
+        let outputs = Outputs::new(&workspace, &graph.tasks["a+b:emit"]).unwrap();
+        assert!(
+            outputs
+                .paths(root.path())
+                .unwrap()
+                .contains("apps/(group)/dist/a.js")
+        );
+    }
+
+    /// An output naming a project's root or a directory holding one, escaped
+    /// or not, is refused: a restore would replace the project.
+    #[test]
+    fn outputs_cannot_name_a_project_root() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("nx.json"), "{}").unwrap();
+        std::fs::create_dir_all(root.path().join("apps/(group)")).unwrap();
+        std::fs::write(
+            root.path().join("apps/(group)/project.json"),
+            json!({"name": "group", "targets": {
+                "own": {"command": "true", "outputs": ["{projectRoot}"]},
+                "written": {"command": "true", "outputs": ["{workspaceRoot}/apps/\\(group\\)"]},
+                "parent": {"command": "true", "outputs": ["{workspaceRoot}/apps"]},
+                "sibling": {"command": "true", "outputs": ["{workspaceRoot}/apps/\\(gr"]},
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let workspace = Workspace::load(root.path()).unwrap();
+        for (target, refused) in [
+            ("own", true),
+            ("written", true),
+            ("parent", true),
+            ("sibling", false),
+        ] {
+            let request = Request::parse(&format!("group:{target}")).unwrap();
+            let graph = TaskGraph::build(&workspace, &[request]).unwrap();
+            assert_eq!(
+                Outputs::new(&workspace, &graph.tasks[&format!("group:{target}")]).is_err(),
+                refused,
+                "{target}"
+            );
+        }
+    }
+
+    #[test]
+    fn output_patterns_escape_glob_characters() {
+        let workspace = tempfile::tempdir().unwrap();
+        for file in [
+            "app/(group)/page.js",
+            "app/group/page.js",
+            "dist/[id].js",
+            "dist/i.js",
+        ] {
+            let path = workspace.path().join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+        let outputs =
+            Outputs::from_paths(&[r"app/\(group\)".into(), r"dist/\[id\].js".into()]).unwrap();
+        assert_eq!(
+            outputs
+                .paths(workspace.path())
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            ["app/(group)", "app/(group)/page.js", "dist/[id].js"]
+        );
+        // An escaped first segment is the directory the outputs lie in.
+        let outputs = Outputs::from_paths(&[r"\(group\)/dist".into()]).unwrap();
+        std::fs::create_dir_all(workspace.path().join("(group)/dist")).unwrap();
+        std::fs::write(workspace.path().join("(group)/dist/a.js"), "").unwrap();
+        assert_eq!(outputs.anchors().collect::<Vec<_>>(), ["(group)/dist"]);
+        assert_eq!(outputs.complete_roots(), ["(group)/dist"]);
+        assert_eq!(
+            outputs
+                .paths(workspace.path())
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            ["(group)/dist", "(group)/dist/a.js"]
+        );
+        for unsafe_pattern in [r"dist/\.\./x", r"dist\"] {
+            assert!(
+                Outputs::from_paths(&[unsafe_pattern.into()]).is_err(),
+                "{unsafe_pattern}"
+            );
+        }
     }
 
     #[test]
@@ -1128,5 +2017,6 @@ mod tests {
         assert_eq!(normalize(".").unwrap(), ".");
         assert!(normalize("app/../../outside").is_err());
         assert!(normalize("app/**/../x").is_err());
+        assert_eq!(normalize(r"apps/\(group\)/../x").unwrap(), "apps/x");
     }
 }
