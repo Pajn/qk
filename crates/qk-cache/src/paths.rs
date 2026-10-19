@@ -707,13 +707,16 @@ pub fn resolved_outputs(workspace: &Workspace, task: &Task) -> Result<(Vec<Strin
     let options = task_options(task);
     let mut resolved = Vec::new();
     let Some(templates) = &task.definition.outputs else {
+        // As in Nx, an `outputPath` counts when it is truthy, so an empty
+        // string falls back to the defaults; an empty path in a list names
+        // nothing.
         let defaults: Vec<String> = match options.get("outputPath") {
-            Some(path @ serde_json::Value::String(_)) => {
+            Some(path @ serde_json::Value::String(text)) if !text.is_empty() => {
                 vec![option_tokens(workspace, &task.project, path)?]
             }
             Some(serde_json::Value::Array(paths)) => paths
                 .iter()
-                .filter(|path| path.is_string())
+                .filter(|path| path.as_str().is_some_and(|text| !text.is_empty()))
                 .map(|path| option_tokens(workspace, &task.project, path))
                 .collect::<Result<_>>()?,
             _ if matches!(task.target.as_str(), "build" | "prepare") => [
@@ -878,27 +881,40 @@ impl OutputData<'_> {
         // Nx resolves the project tokens in every option when it builds the
         // project graph, so an option's value already has them replaced.
         Ok(Some(if name == "options" {
-            resolve_option_tokens(self.workspace, self.project, found)?
+            resolve_option_tokens(self.workspace, self.project, &found)?
         } else {
-            found.clone()
+            found
         }))
     }
 }
 
-/// Walks a dotted path as Nx's `readPath` does: a step must be an own key of
-/// an object, or an index or `length` of an array.
-fn read_path<'v>(
-    value: &'v serde_json::Value,
-    path: Option<&str>,
-) -> Option<&'v serde_json::Value> {
+/// Walks a dotted path as Nx's `readPath` does: each step must be an own
+/// property, so an object's key, or an array's or string's canonical index
+/// (`0`, `12`, not `01` or `+1`) or `length`.
+fn read_path(value: &serde_json::Value, path: Option<&str>) -> Option<serde_json::Value> {
     let Some(path) = path else {
-        return Some(value);
+        return Some(value.clone());
     };
-    let mut value = value;
+    let index = |key: &str| {
+        (key == "0" || (!key.starts_with('0') && key.bytes().all(|b| b.is_ascii_digit())))
+            .then(|| key.parse::<usize>().ok())
+            .flatten()
+    };
+    let mut value = value.clone();
     for key in path.split('.') {
-        value = match value {
-            serde_json::Value::Object(object) => object.get(key)?,
-            serde_json::Value::Array(items) => items.get(key.parse::<usize>().ok()?)?,
+        value = match &value {
+            serde_json::Value::Object(object) => object.get(key)?.clone(),
+            serde_json::Value::Array(items) if key == "length" => items.len().into(),
+            serde_json::Value::Array(items) => items.get(index(key)?)?.clone(),
+            // A JavaScript string's length and indexes count UTF-16 units.
+            serde_json::Value::String(text) => {
+                let units: Vec<u16> = text.encode_utf16().collect();
+                if key == "length" {
+                    units.len().into()
+                } else {
+                    String::from_utf16_lossy(&[*units.get(index(key)?)?]).into()
+                }
+            }
             _ => return None,
         };
     }
@@ -1335,6 +1351,43 @@ mod tests {
             )
             .unwrap(),
             ["b"]
+        );
+        // Paths step through own properties as Nx's readPath does: an array's
+        // length and canonical indexes only.
+        assert_eq!(
+            outputs(
+                json!([
+                    "{options.list.length}",
+                    "{options.list.1}",
+                    "{options.list.01}"
+                ]),
+                json!({"list": ["a", "b"]}),
+            )
+            .unwrap(),
+            ["2", "b"]
+        );
+        // An empty `outputPath` falls back to a build target's defaults, as
+        // Nx's truthiness check does.
+        assert_eq!(
+            outputs_of(
+                json!({"command": "true", "options": {"outputPath": ""}}),
+                &[],
+            )
+            .unwrap(),
+            [
+                "dist/libs/lib",
+                "libs/lib/dist",
+                "libs/lib/build",
+                "libs/lib/public"
+            ]
+        );
+        assert_eq!(
+            outputs_of(
+                json!({"command": "true", "options": {"outputPath": ["", "dist"]}}),
+                &[],
+            )
+            .unwrap(),
+            ["dist"]
         );
         // Without `outputs`, `outputPath` is the output, its tokens resolved.
         assert_eq!(
