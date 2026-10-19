@@ -141,8 +141,9 @@ The settings Nx's JavaScript support reads, which qk reads too:
   making graph edges.
 - `analyzeLockfile`: `false` leaves the installed packages out of the graph,
   so `graph --external` adds none and a lockfile change under
-  `projectsAffectedByDependencyUpdates: "auto"` affects every project, as in
-  Nx. It defaults to on, unless a `lerna.json` stands without an `nx.json`.
+  `projectsAffectedByDependencyUpdates: "auto"` affects every project, where
+  Nx affects none (see [Compatibility](../compatibility.md)). It defaults to
+  on, unless a `lerna.json` stands without an `nx.json`.
   Cache keys and `externalDependencies` inputs read the lockfile either way.
 - `projectsAffectedByDependencyUpdates`: see
   [Affected selection](../guides/affected.md).
