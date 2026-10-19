@@ -2873,6 +2873,7 @@ fn the_root_tsconfig_keys_path_mappings_as_nx_does() {
             let output = Command::new(env!("CARGO_BIN_EXE_qk"))
                 .args(["--workspace", root.to_str().unwrap(), "run", "app:check"])
                 .env_remove("CI")
+                .env_remove("GITHUB_ACTIONS")
                 .env_remove("NX_TASKS_RUNNER")
                 .output()
                 .unwrap();
@@ -2932,6 +2933,7 @@ fn the_runner_named_on_the_command_line_decides_selective_tsconfig_hashing() {
             .args(["--workspace", root.to_str().unwrap(), "run", "app:check"])
             .args(args)
             .env_remove("CI")
+            .env_remove("GITHUB_ACTIONS")
             .env("NX_TASKS_RUNNER", "default")
             .output()
             .unwrap();
