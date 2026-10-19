@@ -16,8 +16,9 @@ dependencies, peer resolutions, patches and integrity data.
 
 **Affected task**:
 A task selected because revision changes touch its inputs, or because it
-depends on an affected task that is not continuous. A continuous task's inputs
-count as those of the tasks depending on it. Selection can be conservative and does not
+reads the declared outputs of an affected task. Depending on a task without
+reading its outputs carries nothing. A continuous task's inputs count as those
+of the tasks depending on it. Selection can be conservative and does not
 guarantee that the task's cache key changes.
 
 **Change projection**:

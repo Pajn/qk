@@ -25,11 +25,14 @@ in [run history](history.md), so repeated forced runs can reveal flaky outcomes.
 ## What changes the key
 
 A task's key covers its ID, forwarded arguments, resolved target definition,
-declared inputs, the fingerprints of its dependency tasks, the package
-manager, qk's version and the platform. A dependency that declares outputs
-is fingerprinted by the content of those outputs alone, so a run that
-reproduces them leaves its dependents cached however its own inputs changed;
-one without declared outputs is fingerprinted by its key. Files are keyed
+declared inputs, the package manager, qk's version and the platform. As in
+Nx, a dependency task counts only through the outputs the task reads: files
+its `dependentTasksOutputFiles` inputs select from the dependency's declared
+outputs, or that its filesets select. A run that reproduces those outputs
+leaves the task cached however the dependency's own inputs changed, and a
+task that reads none of them is keyed without them. A task that reads a
+dependency's outputs without declaring it can therefore be restored stale;
+declare such reads as inputs. Files are keyed
 by workspace-relative path, content and mode. Branch names and checkout
 locations are not part of the key, so identical sources in two worktrees
 share entries.
@@ -137,8 +140,10 @@ Every input declaration of Nx 24 is supported, `always` read as absent:
 As in Nx, a named input cannot use `dependencies` or `projects`. With a
 package manager other than pnpm, lockfiles are always keyed by content.
 Generated artifacts stay out of source filesets. A consumer's filesets can
-include outputs from its dependency tasks, including transitive dependencies.
-Outputs from downstream or unrelated tasks do not feed back into its cache key.
+include outputs from its dependency tasks, including transitive dependencies,
+except those in git-ignored directories, which only `dependentTasksOutputFiles`
+reads. Outputs from downstream or unrelated tasks do not feed back into its
+cache key.
 
 `runtime` commands share one evaluation per run when their effective runtime
 environments match, including when tasks request them concurrently. That
@@ -170,9 +175,9 @@ without a value is left out. `!` negates an output: what it matches is
 neither cached nor removed when an entry is restored. A target without
 `outputs` takes `options.outputPath`, and a `build` or `prepare` target
 `dist/<root>`, `<root>/dist`, `<root>/build` and `<root>/public`. Those
-defaults are cached and restored, but because they are guesses they stay
-inputs of other tasks, and dependents are keyed by the task's key rather
-than by those files alone.
+defaults are cached and restored, but because they are guesses they are
+not declared outputs: they stay source files that other tasks' filesets can
+select, and `dependentTasksOutputFiles` selects none of them.
 
 A negated group such as `src/**/!(*.test).ts` or `dist/!(cache)/**` expands
 as Nx expands it, into a glob with the group widened and one naming the
@@ -182,8 +187,7 @@ as in Nx. Nx applies such exclusions to every pattern of a project at once;
 qk applies each to the pattern it comes from, which can only add inputs.
 
 A task with any other input declaration, or an output without a fixed
-directory prefix, runs uncached and reports why. Its dependents then run uncached too, naming the task and reason
-they depend on.
+directory prefix, runs uncached and reports why.
 
 ## Saving and restoring results
 

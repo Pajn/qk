@@ -223,9 +223,9 @@ entry sets `waitFor: "ready"`. Continuous tasks do not count towards
 cancelled. A continuous task that only other tasks depend on is stopped, like
 a cancelled command, once all of them have finished; that stop counts as
 success. A continuous task that exits by itself reports its exit status as
-usual. Continuous tasks are never cached, and cacheable tasks depending on one
-run uncached, unless every `dependsOn` entry naming it sets `inputs: false`:
-as in Nx, the task is then keyed without it.
+usual. Continuous tasks are never cached. As in Nx, a cacheable task depending
+on one is keyed with the continuous task's inputs as its own, unless every
+`dependsOn` entry naming it sets `inputs: false`.
 
 With `readyWhen`, a string or an array of strings, a task is ready once every
 string has appeared in its output, on stdout or stderr. Its dependents start

@@ -90,15 +90,18 @@ its lockfile importers or `externalDependencies` install changed, when
 `pnpm-workspace.yaml` changed outside its resolution keys, when a dependency
 project's `package.json` changed in a field its key reads or its version moved
 into or out of the range the task's project declares for it, when a project
-manifest was deleted, or when it depends on an affected task. A file the
+manifest was deleted, or when it reads the declared outputs of an affected
+task, through `dependentTasksOutputFiles` or a fileset that selects them. As
+in Nx, depending on a task without reading its outputs carries nothing, so
+a task ordered after a build but reading only sources is not affected by the
+build's changes. A file the
 task's inputs select counts by any change to it, as in its key. These are the
 same inputs its cache key reads, so an unaffected task would be a cache hit,
 except that env and runtime inputs count as unchanged, since the base
 revision's environment is unknowable. A test-only change then reaches the
 test tasks and not the builds whose `production` inputs exclude tests.
-As in Nx, a continuous task a task depends on, such as the dev server an e2e
-task runs against, does not affect it as a dependency: it has no outputs the
-task reads. Its inputs count as the task's own instead, and so do those of
+A continuous task a task depends on, such as the dev server an e2e task runs
+against, counts its inputs as the task's own instead, and so do those of
 the continuous tasks it depends on in turn. A `dependsOn` entry with
 `inputs: false` leaves them out, unless another entry names the same task
 without it.

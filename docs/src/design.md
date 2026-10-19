@@ -72,7 +72,7 @@ extension, rather than an assumed graph input.
 ### Inputs connect caching and affected selection
 
 Resolved file inputs, environment declarations, runtime values, external
-packages and dependency fingerprints determine a task's cache key.
+packages and the dependency outputs a task reads determine its cache key.
 Task-level affected selection reuses the input model against a change set.
 Environment and runtime inputs require conservative treatment because a
 base revision's process environment cannot be reconstructed from Git.
@@ -88,9 +88,10 @@ Cache keys and storage layouts are versioned. Keys include the tooling and
 platform information needed to avoid incompatible reuse. Paths and
 serialized definitions are normalized deterministically.
 
-Explicit output declarations allow a dependency's output content to define
-its fingerprint even when its own inputs change. Undeclared effects must
-not be assumed equivalent merely because selected output files match.
+A dependency counts for a task only through the declared outputs the task
+reads, as in Nx, so a dependency that reproduces them leaves the task cached
+even when its own inputs change. Reads a task does not declare are not
+keyed.
 
 Per-file blobs allow deduplication across entries. Manifests identify output
 paths, content and file metadata. Restores verify content, remove stale
@@ -420,8 +421,8 @@ is decided by its changed inputs:
 
 1. Any changed input its `sources` do not match runs the whole task, and
    says which file, unless it is a dependency's `package.json` whose fields
-   its dependents read are unchanged. So does an affected task it depends
-   on, whose outputs it may read.
+   its dependents read are unchanged. So does an affected task whose outputs
+   it reads.
 2. Otherwise, if an anchor reaches a change, or the search lost an edge, the
    whole task runs, naming the chain or the gap.
 3. Otherwise, the cases a change reaches are selected, each with the changed

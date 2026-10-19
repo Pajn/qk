@@ -96,10 +96,11 @@ The task's root/project/transitive importer installations are already keyed.
 
 `{"dependentTasksOutputFiles": "**/*.d.ts", "transitive": true}` is
 selects matching files from declared outputs of direct task dependencies.
-`transitive: true` also includes outputs of their dependencies. Other artifacts
-do not change this input's fingerprint. Multiple patterns are combined. Without
-an output input declaration, qk retains its normal dependency fingerprints.
-Dependencies that cannot be fingerprinted still make the consumer run uncached.
+`transitive: true` also includes outputs of their dependencies. As in Nx, a
+dependency without declared outputs offers none, and other artifacts do not
+change this input's key. Multiple patterns are combined. This and filesets
+selecting a dependency's outputs are the only ways a dependency task keys a
+task, and the only ways a change to it makes the task affected.
 
 ### `workingDirectory`
 
@@ -130,9 +131,9 @@ without a value is left out. `!` negates an output: what it matches is
 neither cached nor removed when an entry is restored. A target without
 `outputs` takes `options.outputPath`, and a `build` or `prepare` target
 `dist/<root>`, `<root>/dist`, `<root>/build` and `<root>/public`. Those
-defaults are cached and restored, but because they are guesses they stay
-inputs of other tasks, and dependents are keyed by the task's key rather
-than by those files alone.
+defaults are cached and restored, but because they are guesses they are
+not declared outputs: they stay source files that other tasks' filesets can
+select, and `dependentTasksOutputFiles` selects none of them.
 
 A negated group such as `src/**/!(*.test).ts` or `dist/!(cache)/**` expands
 as Nx expands it, into a glob with the group widened and one naming the
@@ -142,8 +143,7 @@ as in Nx. Nx applies such exclusions to every pattern of a project at once;
 qk applies each to the pattern it comes from, which can only add inputs.
 
 A task with any other input declaration, or an output without a fixed
-directory prefix, runs uncached and reports why. Its dependents then run uncached too, naming the task and reason
-they depend on.
+directory prefix, runs uncached and reports why.
 
 
 Use explicit output declarations for build artifacts. A cache hit removes

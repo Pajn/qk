@@ -309,7 +309,7 @@ impl Cache {
         key: &str,
         outputs: &Outputs,
         log: &Path,
-    ) -> Result<String> {
+    ) -> Result<()> {
         let mut artifacts = BTreeMap::new();
         let mut pending = Vec::new();
         for entry in outputs.entries(root)? {
@@ -363,11 +363,11 @@ impl Cache {
             &self.root,
             &self.root.join("entries").join(format!("{key}.json")),
             &manifest,
-        )?;
-        manifest.output_fingerprint(outputs.declared())
+        )
     }
 
-    /// Restores an entry's outputs and log, returning its output fingerprint.
+    /// Restores an entry's outputs and log, or returns false when there is no
+    /// entry.
     ///
     /// Restored files are stamped with the time the restore starts, which is
     /// after the task's dependencies finished and after its sources were
@@ -386,12 +386,12 @@ impl Cache {
         outputs: &Outputs,
         display: &qk_executor::Display,
         shown: qk_executor::Shown,
-    ) -> Result<Option<String>> {
+    ) -> Result<bool> {
         // Read whole: a File is unbuffered, and serde_json reads byte by byte.
         let header_profile = crate::profile::span(task, "restore_header");
         let bytes = match fs::read(self.root.join("entries").join(format!("{key}.json"))) {
             Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error.into()),
         };
         let manifest = ResultRecord::read(&bytes, key)?;
@@ -426,7 +426,7 @@ impl Cache {
                 }
                 qk_executor::replay(File::open(log)?, display, qk_executor::Shown::Kept)?;
                 crate::evict::touch(&self.root.join("entries").join(format!("{key}.json")));
-                return manifest.output_fingerprint(outputs.declared()).map(Some);
+                return Ok(true);
             }
         }
         drop(held_profile);
@@ -587,7 +587,7 @@ impl Cache {
         qk_executor::replay(File::open(log)?, display, shown)?;
         drop(replay_profile);
         crate::evict::touch(&self.root.join("entries").join(format!("{key}.json")));
-        manifest.output_fingerprint(outputs.declared()).map(Some)
+        Ok(true)
     }
     /// Fills an already validated private stage before output cleanup begins.
     fn stage_files(&self, files: &[(&str, u32, PathBuf)], time: SystemTime) -> Result<()> {
@@ -1034,7 +1034,7 @@ mod tests {
         cache.initialize().unwrap();
         let outputs = Outputs::from_patterns(&["out"]);
         let key = "a".repeat(64);
-        let fingerprint = cache.publish(root, &key, &outputs, &log).unwrap();
+        cache.publish(root, &key, &outputs, &log).unwrap();
         record_outputs(root, "build", &key, &outputs);
         #[cfg(unix)]
         let inode = {
@@ -1049,7 +1049,7 @@ mod tests {
             set_mode(&changed, mode(&fs::metadata(&changed).unwrap()) ^ 0o100).unwrap();
         }
         let before = SystemTime::now();
-        assert_eq!(
+        assert!(
             cache
                 .restore(
                     root,
@@ -1060,8 +1060,7 @@ mod tests {
                     &qk_executor::Display::Hidden,
                     qk_executor::Shown::LocalCache
                 )
-                .unwrap(),
-            Some(fingerprint)
+                .unwrap()
         );
         assert_eq!(fs::read_to_string(&changed).unwrap(), "value-129");
         assert_eq!(fs::read_to_string(&kept).unwrap(), "value-0");
@@ -1108,7 +1107,6 @@ mod tests {
                     qk_executor::Shown::LocalCache
                 )
                 .unwrap()
-                .is_some()
         );
         assert_eq!(fs::read_to_string(&kept).unwrap(), "value-0");
         assert_eq!(fs::read_to_string(&changed).unwrap(), "value-129");
@@ -1172,7 +1170,7 @@ mod tests {
         cache.initialize().unwrap();
         let outputs = Outputs::from_patterns(&["out"]);
         let key = "c".repeat(64);
-        let fingerprint = cache.publish(root, &key, &outputs, &log).unwrap();
+        cache.publish(root, &key, &outputs, &log).unwrap();
         fs::write(root.join("out/nested/value"), "old").unwrap();
         fs::write(root.join("outside"), "keep").unwrap();
         symlink("../outside", &root.join("out/stale-link"), false).unwrap();
@@ -1189,7 +1187,7 @@ mod tests {
             sender: Some(sender),
             worker: Some(worker),
         });
-        assert_eq!(
+        assert!(
             cache
                 .restore(
                     root,
@@ -1200,8 +1198,7 @@ mod tests {
                     &qk_executor::Display::Hidden,
                     qk_executor::Shown::LocalCache
                 )
-                .unwrap(),
-            Some(fingerprint)
+                .unwrap()
         );
         let retired = observed.recv_timeout(Duration::from_secs(10)).unwrap();
         assert_eq!(
@@ -1353,7 +1350,7 @@ mod tests {
         cache.initialize().unwrap();
         let outputs = Outputs::from_patterns(&["out"]);
         let key = "d".repeat(64);
-        let fingerprint = cache.publish(root, &key, &outputs, &log).unwrap();
+        cache.publish(root, &key, &outputs, &log).unwrap();
         record_outputs(root, "build", &key, &outputs);
         fs::write(&file, "original").unwrap();
         set_modified(&file, SystemTime::UNIX_EPOCH + Duration::from_secs(100)).unwrap();
@@ -1363,7 +1360,7 @@ mod tests {
             fs::metadata(&file).unwrap().ino()
         };
         let before = SystemTime::now();
-        assert_eq!(
+        assert!(
             cache
                 .restore(
                     root,
@@ -1374,8 +1371,7 @@ mod tests {
                     &qk_executor::Display::Hidden,
                     qk_executor::Shown::LocalCache
                 )
-                .unwrap(),
-            Some(fingerprint)
+                .unwrap()
         );
         assert!(fs::metadata(&file).unwrap().modified().unwrap() >= before);
         #[cfg(unix)]
@@ -1693,7 +1689,7 @@ mod tests {
         cache.initialize().unwrap();
         let outputs = Outputs::from_patterns(&["out"]);
         let key = "a".repeat(64);
-        let expected = cache.publish(root, &key, &outputs, &log).unwrap();
+        cache.publish(root, &key, &outputs, &log).unwrap();
         fs::write(root.join("unselected"), "keep").unwrap();
         for existing in [false, true] {
             if existing {
@@ -1704,7 +1700,7 @@ mod tests {
                 fs::remove_dir_all(root.join("out")).unwrap();
             }
             let before = SystemTime::now();
-            assert_eq!(
+            assert!(
                 cache
                     .restore(
                         root,
@@ -1715,8 +1711,7 @@ mod tests {
                         &qk_executor::Display::Hidden,
                         qk_executor::Shown::LocalCache
                     )
-                    .unwrap(),
-                Some(expected.clone())
+                    .unwrap()
             );
             let mut common_time = None;
             for index in 0..130 {
@@ -1902,7 +1897,7 @@ mod tests {
     }
 
     #[test]
-    fn parallel_publication_keeps_artifacts_log_and_fingerprints_deterministic() {
+    fn parallel_publication_keeps_artifacts_and_log_deterministic() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         fs::create_dir_all(root.join("dist/empty")).unwrap();
@@ -1924,10 +1919,10 @@ mod tests {
         cache.initialize().unwrap();
         let outputs = Outputs::from_patterns(&["dist"]);
         let key = "a".repeat(64);
-        let first = cache.publish(root, &key, &outputs, &log).unwrap();
+        cache.publish(root, &key, &outputs, &log).unwrap();
         let entry = cache.root.join("entries").join(format!("{key}.json"));
         let manifest = fs::read(&entry).unwrap();
-        assert_eq!(cache.publish(root, &key, &outputs, &log).unwrap(), first);
+        cache.publish(root, &key, &outputs, &log).unwrap();
         assert_eq!(fs::read(&entry).unwrap(), manifest);
         // Concurrent publishers share duplicate blobs but keep independent entries.
         std::thread::scope(|scope| {
@@ -1941,7 +1936,7 @@ mod tests {
             }
         });
         fs::remove_dir_all(root.join("dist")).unwrap();
-        assert_eq!(
+        assert!(
             cache
                 .restore(
                     root,
@@ -1952,8 +1947,7 @@ mod tests {
                     &qk_executor::Display::Hidden,
                     qk_executor::Shown::LocalCache
                 )
-                .unwrap(),
-            Some(first)
+                .unwrap()
         );
         for index in 0..130 {
             let path = root.join(format!("dist/file-{index:03}"));

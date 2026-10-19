@@ -1372,3 +1372,46 @@ fn inputs_marked_always_read_as_without_it() {
     write(&repo.root, "apps/app/README.md", "not an input");
     assert!(affected_tasks_of(&repo, &["app:check"]).is_empty());
 }
+
+/// `lib:build` declares outputs in a tracked folder; `app:check` depends on it
+/// and reads its outputs as `inputs` declares, or not at all.
+fn reading_repo(inputs: &str) -> Repo {
+    let app = format!(
+        r#"{{"name": "app", "implicitDependencies": ["lib"], "targets": {{"check": {{"command": "echo check", "dependsOn": ["^build"], "inputs": {inputs}}}}}}}"#
+    );
+    Repo::new(&[
+        (
+            "nx.json",
+            r#"{"namedInputs": {"default": ["{projectRoot}/**/*"]}}"#,
+        ),
+        ("apps/app/project.json", &app),
+        (
+            "libs/lib/project.json",
+            r#"{"name": "lib", "targets": {"build": {"command": "echo build", "inputs": ["{projectRoot}/src/**/*"], "outputs": ["{projectRoot}/out"]}}}"#,
+        ),
+        ("libs/lib/out/index.js", "built"),
+    ])
+}
+
+#[test]
+fn a_task_is_affected_through_a_dependency_only_when_it_reads_its_outputs() {
+    use qk_affected::TaskCause;
+    for (inputs, reads) in [
+        (r#"["{projectRoot}/**/*"]"#, false),
+        (r#"[{"dependentTasksOutputFiles": "**/*.js"}]"#, true),
+        (r#"["{workspaceRoot}/libs/lib/out/**/*"]"#, true),
+    ] {
+        let repo = reading_repo(inputs);
+        write(&repo.root, "libs/lib/src/index.ts", "changed");
+        let tasks = affected_tasks_of(&repo, &["app:check"]);
+        assert!(tasks.contains_key("lib:build"), "{inputs}: {tasks:?}");
+        if reads {
+            assert!(
+                matches!(&tasks["app:check"], TaskCause::Reads { task } if task == "lib:build"),
+                "{inputs}: {tasks:?}"
+            );
+        } else {
+            assert!(!tasks.contains_key("app:check"), "{inputs}: {tasks:?}");
+        }
+    }
+}

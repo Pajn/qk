@@ -40,10 +40,6 @@ When a name occurs in multiple sections, precedence is `dependencies`,
   already landed upstream.
 - `qk affected` selects projects unless given `--granularity task`. Nx 24
   selects tasks unless nx.json sets `affected.legacy: true`.
-- In task selection, a task depending on an affected task is affected, since
-  its key holds its dependencies' outputs. Nx only carries affectedness to a
-  task whose inputs read the dependency's outputs. As in Nx, a continuous
-  dependency carries none; its inputs count as the task's own.
 - Inputs marked `"always": true` read as without it: the flag only matters to
   a hash taken from an Nx Cloud Ultracache recording, which qk does not read.
 - The run-commands `readyWhen` option accepts readiness text from either

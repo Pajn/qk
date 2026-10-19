@@ -1930,6 +1930,7 @@ fn resolve_candidates(
     let own_outputs = Outputs::new(workspace, task)
         .ok()
         .filter(Outputs::is_explicit);
+    let mut producers = BTreeSet::new();
     for (producer, declared) in &snapshot.generated_tasks {
         if producer.id == task.id || !upstream.contains(&producer.id) {
             continue;
@@ -1955,6 +1956,7 @@ fn resolve_candidates(
         if !relevant {
             continue;
         }
+        producers.insert(producer.id.clone());
         let outputs = snapshot.dependency_outputs(workspace, producer)?;
         for path in &outputs.files {
             if source_ignore.matches(path)
@@ -1987,12 +1989,34 @@ fn resolve_candidates(
                 .cloned(),
         );
     }
-    let declared = Declared {
+    let mut declared = Declared {
         files: resolver.selected,
         values: resolver.values,
         json_fields: resolver.json_fields,
         external: resolver.external,
+        producers,
     };
+    // `dependentTasksOutputFiles` reads its direct dependencies' declared
+    // outputs, or with `transitive` those of every task it depends on.
+    let reads: Vec<bool> = declared
+        .values
+        .iter()
+        .filter(|(name, _)| name.starts_with("dependentTasksOutputFiles:"))
+        .map(|(_, transitive)| transitive == &Value::Bool(true))
+        .collect();
+    if !reads.is_empty() {
+        let transitive = reads.contains(&true);
+        for (producer, outputs) in &snapshot.generated_tasks {
+            let read = if transitive {
+                upstream.contains(&producer.id)
+            } else {
+                task.dependencies.contains(&producer.id)
+            };
+            if read && outputs.declared() {
+                declared.producers.insert(producer.id.clone());
+            }
+        }
+    }
     let inferred = infer(snapshot, workspace, task)?;
     Ok(join(declared, inferred))
 }
@@ -2218,7 +2242,7 @@ pub fn inputs(
     definition.extra.remove("qk:warm");
     definition.extra.remove("qk:threads");
     let hash = json!({
-        "schema":"qk-local-v3", "qk":env!("CARGO_PKG_VERSION"),
+        "schema":"qk-local-v4", "qk":env!("CARGO_PKG_VERSION"),
         "platform":[std::env::consts::OS, std::env::consts::ARCH], "workspace":snapshot.workspace_prefix,
         "id":task.id, "args":task.args, "definition":definition, "packageManager":workspace.package_manager,
         "files":files, "values":values, "inferred":configuration, "dependencies":dependencies,
@@ -2251,26 +2275,18 @@ pub fn fingerprint(
     )?)
 }
 
-/// Use selected dependency artifacts when output inputs are declared; otherwise
-/// preserve the normal dependency fingerprints. All dependencies must have
-/// succeeded and be fingerprintable before this selection is applied.
+/// The dependency outputs a task's `dependentTasksOutputFiles` inputs read,
+/// as Nx hashes them: the files each glob selects of the declared outputs of
+/// its direct dependencies, or with `transitive` of every task it depends on.
+/// Nothing else about a dependency keys a task.
 pub(crate) fn dependency_keys(
     snapshot: &Snapshot,
     workspace: &Workspace,
     graph: &TaskGraph,
     task: &Task,
-    dependencies: &BTreeMap<String, String>,
     cancelled: &AtomicBool,
 ) -> Result<BTreeMap<String, String>> {
-    dependency_keys_impl(
-        snapshot,
-        workspace,
-        graph,
-        task,
-        dependencies,
-        cancelled,
-        false,
-    )
+    dependency_keys_impl(snapshot, workspace, graph, task, cancelled, false)
 }
 
 /// Read dependency artifacts again before accepting an execution as unchanged.
@@ -2279,18 +2295,9 @@ pub(crate) fn recheck_dependency_keys(
     workspace: &Workspace,
     graph: &TaskGraph,
     task: &Task,
-    dependencies: &BTreeMap<String, String>,
     cancelled: &AtomicBool,
 ) -> Result<BTreeMap<String, String>> {
-    dependency_keys_impl(
-        snapshot,
-        workspace,
-        graph,
-        task,
-        dependencies,
-        cancelled,
-        true,
-    )
+    dependency_keys_impl(snapshot, workspace, graph, task, cancelled, true)
 }
 
 fn dependency_keys_impl(
@@ -2298,29 +2305,11 @@ fn dependency_keys_impl(
     workspace: &Workspace,
     graph: &TaskGraph,
     task: &Task,
-    dependencies: &BTreeMap<String, String>,
     cancelled: &AtomicBool,
     fresh: bool,
 ) -> Result<BTreeMap<String, String>> {
     let resolved = resolve(snapshot, workspace, task, None, cancelled)?;
     let selections: Vec<_> = resolved.dependency_output_inputs().collect();
-    if selections.is_empty() {
-        if fresh {
-            return dependencies
-                .iter()
-                .map(|(id, key)| {
-                    let outputs = Outputs::new(workspace, &graph.tasks[id])?;
-                    let key = if outputs.declared() {
-                        crate::output_fingerprint(&workspace.root, &outputs, "")?
-                    } else {
-                        key.clone()
-                    };
-                    Ok((id.clone(), key))
-                })
-                .collect();
-        }
-        return Ok(dependencies.clone());
-    }
     let mut keys = BTreeMap::new();
     let mut fresh_outputs = HashMap::new();
     for (pattern, transitive) in selections {
@@ -2337,6 +2326,10 @@ fn dependency_keys_impl(
             }
         }
         for id in selected {
+            // As in Nx, a dependency without declared outputs offers none.
+            if !Outputs::new(workspace, &graph.tasks[&id])?.declared() {
+                continue;
+            }
             let outputs = if fresh {
                 if !fresh_outputs.contains_key(&id) {
                     fresh_outputs.insert(
@@ -3086,7 +3079,6 @@ mod tests {
                     &workspace,
                     &graph,
                     &graph.tasks["app:build"],
-                    &BTreeMap::new(),
                     &AtomicBool::new(false),
                 )
                 .unwrap()
@@ -3120,7 +3112,6 @@ mod tests {
                 &workspace,
                 &graph,
                 &graph.tasks["app:build"],
-                &BTreeMap::new(),
                 &AtomicBool::new(false),
             )
             .unwrap()

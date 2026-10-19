@@ -102,8 +102,8 @@ key. See [Inputs and outputs](inputs-outputs.md#outputs).
 ## `cache`
 
 A boolean; absent or `false` means the target does not opt in to result
-caching. `true` enables caching when supported by the task's inputs,
-outputs and dependency chain. Continuous and readiness tasks run uncached.
+caching. `true` enables caching when supported by the task's inputs and
+outputs. Continuous and readiness tasks run uncached.
 See [Local cache](../guides/cache.md).
 
 ## `continuous`

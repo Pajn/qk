@@ -1,8 +1,10 @@
 //! Task-level affectedness: a task is affected when what its cache key reads
 //! changed. That is its resolved input files, the lockfile installs of its
 //! importers and `externalDependencies`, and `pnpm-workspace.yaml` outside its
-//! resolution keys, or it depends on an affected task. Env and runtime inputs
-//! count as unchanged, since the base revision's environment is unknowable.
+//! resolution keys, or the declared outputs of an affected task it reads. As
+//! in Nx, depending on a task without reading its outputs carries nothing.
+//! Env and runtime inputs count as unchanged, since the base revision's
+//! environment is unknowable.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
@@ -37,8 +39,8 @@ pub enum TaskCause {
     Touched {
         reasons: Vec<TaskReason>,
     },
-    /// Depends on an affected task.
-    DependsOn {
+    /// Reads the declared outputs of an affected task.
+    Reads {
         task: String,
     },
 }
@@ -224,10 +226,16 @@ pub(crate) fn analyse(
             touched.insert(id.clone(), reasons);
         }
     }
-    let mut tasks = propagate(graph, &touched, &BTreeSet::new());
+    // Each task's producers: the tasks whose declared outputs it reads.
+    let producers: Producers = resolved
+        .iter()
+        .map(|(id, inputs)| (id.clone(), inputs.declared.producers.clone()))
+        .collect();
+    let mut tasks = propagate(graph, &producers, &touched, &BTreeSet::new());
     let mut decisions = BTreeMap::new();
     if let Some(configs) = configs {
-        decisions = reachability::decide_tasks(workspace, graph, &changes, &tasks, configs)?;
+        decisions =
+            reachability::decide_tasks(workspace, graph, &producers, &changes, &tasks, configs)?;
         let left_out: BTreeSet<String> = decisions
             .iter()
             .filter(|(_, decision)| matches!(decision, TaskDecision::LeftOut { .. }))
@@ -235,12 +243,12 @@ pub(crate) fn analyse(
             .collect();
         if !left_out.is_empty() {
             touched.retain(|id, _| !left_out.contains(id));
-            let narrowed = propagate(graph, &touched, &left_out);
+            let narrowed = propagate(graph, &producers, &touched, &left_out);
             for (id, cause) in &tasks {
                 if narrowed.contains_key(id) || left_out.contains(id) {
                     continue;
                 }
-                if let TaskCause::DependsOn { task } = cause {
+                if let TaskCause::Reads { task } = cause {
                     decisions.insert(id.clone(), TaskDecision::Through { task: task.clone() });
                 }
             }
@@ -257,11 +265,14 @@ pub(crate) fn analyse(
     })
 }
 
-/// The touched tasks and, in dependency order, every task depending on an
-/// affected one, except `skipped`. A continuous dependency does not carry it:
-/// its inputs count as the dependent's own instead.
+/// Each task's producers: the tasks whose declared outputs it reads.
+pub(crate) type Producers = BTreeMap<String, BTreeSet<String>>;
+
+/// The touched tasks and, in dependency order, every task reading the outputs
+/// of an affected one, except `skipped`.
 fn propagate(
     graph: &TaskGraph,
+    producers: &Producers,
     touched: &BTreeMap<String, Vec<TaskReason>>,
     skipped: &BTreeSet<String>,
 ) -> BTreeMap<String, TaskCause> {
@@ -293,7 +304,7 @@ fn propagate(
             scheduled[index] = true;
             continue;
         }
-        for dependency in graph.producers(id) {
+        for dependency in producers.get(*id).into_iter().flatten() {
             if let Some(&dependency_index) = indices.get(dependency.as_str()) {
                 dependents[dependency_index].push(index);
             }
@@ -311,13 +322,13 @@ fn propagate(
     // Each task is queued once and each reverse edge is visited once.
     while let Some(Reverse((pass, index))) = pending.pop() {
         let id = ids[index];
-        let dependency = graph
-            .producers(id)
+        let dependency = producers[id]
+            .iter()
             .find(|dependency| tasks.contains_key(dependency.as_str()))
             .expect("a queued task has an affected dependency");
         tasks.insert(
             id.to_owned(),
-            TaskCause::DependsOn {
+            TaskCause::Reads {
                 task: dependency.clone(),
             },
         );
@@ -421,6 +432,15 @@ mod tests {
         }
     }
 
+    /// Producers for these graphs: each task reads its dependencies' outputs.
+    fn reads(graph: &TaskGraph) -> Producers {
+        graph
+            .tasks
+            .iter()
+            .map(|(id, task)| (id.clone(), task.dependencies.clone()))
+            .collect()
+    }
+
     fn touched(ids: &[&str]) -> BTreeMap<String, Vec<TaskReason>> {
         ids.iter()
             .map(|id| {
@@ -463,13 +483,13 @@ mod tests {
                 if tasks.contains_key(*id) {
                     return false;
                 }
-                if let Some(dependency) = graph
-                    .producers(id)
+                if let Some(dependency) = reads(graph)[*id]
+                    .iter()
                     .find(|dependency| tasks.contains_key(*dependency))
                 {
                     tasks.insert(
                         (*id).clone(),
-                        TaskCause::DependsOn {
+                        TaskCause::Reads {
                             task: dependency.clone(),
                         },
                     );
@@ -490,7 +510,7 @@ mod tests {
         skipped: &BTreeSet<String>,
     ) {
         assert_eq!(
-            serde_json::to_value(propagate(graph, touched, skipped)).unwrap(),
+            serde_json::to_value(propagate(graph, &reads(graph), touched, skipped)).unwrap(),
             serde_json::to_value(legacy_propagate(graph, touched, skipped)).unwrap(),
         );
     }
@@ -509,11 +529,11 @@ mod tests {
         let touched = touched(&["b", "z"]);
         let skipped = BTreeSet::from(["d".to_owned()]);
         assert_compatible(&graph, &touched, &skipped);
-        let tasks = propagate(&graph, &touched, &skipped);
-        assert!(matches!(&tasks["c"], TaskCause::DependsOn { task } if task == "a"));
+        let tasks = propagate(&graph, &reads(&graph), &touched, &skipped);
+        assert!(matches!(&tasks["c"], TaskCause::Reads { task } if task == "a"));
         assert!(!tasks.contains_key("d"));
         assert!(!tasks.contains_key("e"));
-        assert!(matches!(&tasks["f"], TaskCause::DependsOn { task } if task == "b"));
+        assert!(matches!(&tasks["f"], TaskCause::Reads { task } if task == "b"));
         assert!(matches!(&tasks["z"], TaskCause::Touched { reasons }
             if matches!(&reasons[..], [TaskReason::Input { file }] if file == "z/source.rs")));
         // Direct callers historically keep touched entries even if also skipped.
@@ -572,12 +592,10 @@ mod tests {
     #[test]
     fn long_reverse_chain_propagates_without_recursion_or_repeated_scans() {
         let (graph, touched) = reverse_chain(20_000);
-        let tasks = propagate(&graph, &touched, &BTreeSet::new());
+        let tasks = propagate(&graph, &reads(&graph), &touched, &BTreeSet::new());
         assert_eq!(tasks.len(), graph.tasks.len());
-        assert!(
-            matches!(&tasks["task-000000"], TaskCause::DependsOn { task }
-            if task == "task-000001")
-        );
+        assert!(matches!(&tasks["task-000000"], TaskCause::Reads { task }
+            if task == "task-000001"));
         assert!(matches!(&tasks["task-019999"], TaskCause::Touched { .. }));
     }
 
@@ -591,7 +609,7 @@ mod tests {
             let legacy = legacy_propagate(&graph, &touched, &skipped);
             let old_elapsed = start.elapsed();
             let start = std::time::Instant::now();
-            let queued = propagate(&graph, &touched, &skipped);
+            let queued = propagate(&graph, &reads(&graph), &touched, &skipped);
             let new_elapsed = start.elapsed();
             assert_eq!(
                 serde_json::to_value(legacy).unwrap(),

@@ -563,6 +563,7 @@ fn visual_repo() -> Repo {
                 "targets": {
                     "visual": {
                         "command": "echo visual",
+                        "outputs": ["{projectRoot}/visual-out"],
                         "inputs": ["default", "^default"],
                         "qk:reachability": {
                             "anchors": ["{projectRoot}/visual/shell.ts"],
@@ -570,7 +571,7 @@ fn visual_repo() -> Repo {
                             "sources": ["{projectRoot}/src/**/*", "{projectRoot}/visual/**/*.ts", "{workspaceRoot}/libs/*/src/**/*"]
                         }
                     },
-                    "report": {"command": "echo report", "dependsOn": ["visual"], "inputs": []}
+                    "report": {"command": "echo report", "dependsOn": ["visual"], "inputs": [{"dependentTasksOutputFiles": "**/*"}]}
                 }
             }"#,
         ),
@@ -731,7 +732,7 @@ fn the_whole_task_runs_when_its_shell_or_a_non_source_input_changes() {
 }
 
 /// `visual_repo` with `report` narrowed too: it reads `lib` alone, through
-/// `app`'s entry point, and depends on `visual`.
+/// `app`'s entry point, and `visual`'s outputs.
 fn report_repo() -> Repo {
     let repo = visual_repo();
     write(
@@ -743,6 +744,7 @@ fn report_repo() -> Repo {
             "targets": {
                 "visual": {
                     "command": "echo visual",
+                    "outputs": ["{projectRoot}/visual-out"],
                     "inputs": ["default", "^default"],
                     "qk:reachability": {
                         "anchors": ["{projectRoot}/visual/shell.ts"],
@@ -753,7 +755,7 @@ fn report_repo() -> Repo {
                 "report": {
                     "command": "echo report",
                     "dependsOn": ["visual"],
-                    "inputs": ["^default"],
+                    "inputs": ["^default", {"dependentTasksOutputFiles": "**/*"}],
                     "qk:reachability": {
                         "anchors": ["{projectRoot}/src/main.ts"],
                         "sources": ["{workspaceRoot}/libs/*/src/**/*"]
@@ -770,7 +772,7 @@ fn report_repo() -> Repo {
 }
 
 #[test]
-fn a_task_touched_only_by_sources_runs_whole_while_a_dependency_runs() {
+fn a_task_touched_only_by_sources_runs_whole_while_a_task_it_reads_runs() {
     let repo = report_repo();
     // `visual` runs for its harness, which is not a source; `report` is
     // touched only by a source its anchors do not import.
@@ -827,7 +829,7 @@ fn a_task_touched_only_by_sources_runs_whole_while_a_dependency_runs() {
 }
 
 #[test]
-fn a_task_narrowed_to_cases_runs_whole_while_a_dependency_runs() {
+fn a_task_narrowed_to_cases_runs_whole_while_a_task_it_reads_runs() {
     let repo = Repo::new(&[
         (
             "apps/app/project.json",
@@ -835,11 +837,11 @@ fn a_task_narrowed_to_cases_runs_whole_while_a_dependency_runs() {
                 "name": "app",
                 "implicitDependencies": ["lib"],
                 "targets": {
-                    "report": {"command": "echo report", "inputs": ["default"]},
+                    "report": {"command": "echo report", "outputs": ["{projectRoot}/report-out"], "inputs": ["default"]},
                     "visual": {
                         "command": "echo visual",
                         "dependsOn": ["report"],
-                        "inputs": ["{projectRoot}/visual/**/*", "^default"],
+                        "inputs": ["{projectRoot}/visual/**/*", "^default", {"dependentTasksOutputFiles": "**/*"}],
                         "qk:reachability": {
                             "anchors": ["{projectRoot}/visual/shell.ts"],
                             "cases": ["{projectRoot}/visual/cases/*.ts"],

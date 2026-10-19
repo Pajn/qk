@@ -700,10 +700,10 @@ fn forced_failure_pairs_with_a_real_success_and_preserves_its_cache_entry() {
 }
 
 #[test]
-fn forced_runs_fingerprint_uncacheable_dependencies_without_retaining_their_logs() {
+fn forced_runs_key_the_outputs_of_uncacheable_dependencies_without_retaining_their_logs() {
     let fixture = Fixture::with_targets(json!({
         "generate": target("generate", json!({"cache": false, "outputs": ["{projectRoot}/generated"], "inputs": ["{projectRoot}/src/**/*"]})),
-        "build": target("build", json!({"dependsOn": ["generate"], "inputs": []}))
+        "build": target("build", json!({"dependsOn": ["generate"], "inputs": [{"dependentTasksOutputFiles": "**/*"}]}))
     }));
     let latest = || -> Value {
         serde_json::from_slice(
@@ -854,8 +854,10 @@ fn unsupported_outputs_elsewhere_do_not_bypass() {
     assert_eq!(fixture.runs(), 1);
 }
 
+/// As in Nx, a dependency keys a task only through the outputs it reads, so
+/// one that cannot be keyed leaves its dependents cached.
 #[test]
-fn bypassed_dependencies_are_named() {
+fn dependents_of_bypassed_tasks_stay_cached() {
     let fixture = Fixture::with_targets(json!({
         "generate": target("generate", json!({
             "cache": false,
@@ -864,13 +866,17 @@ fn bypassed_dependencies_are_named() {
         })),
         "build": target("build", json!({"dependsOn": ["generate"]})),
     }));
-    let output = success(fixture.build(&fixture.root, &[]));
+    let first = success(fixture.build(&fixture.root, &[]));
     assert!(
-        stderr(&output).contains(
-            "qk: app:build: cache bypassed (depends on app:generate: unsupported task input declaration)"
-        ),
+        !stderr(&first).contains("app:build: cache bypassed"),
         "{}",
-        stderr(&output)
+        stderr(&first)
+    );
+    let second = success(fixture.build(&fixture.root, &[]));
+    assert!(
+        stderr(&second).contains("cache hit app:build"),
+        "{}",
+        stderr(&second)
     );
 }
 
@@ -1011,10 +1017,8 @@ fn later_tasks_fingerprint_sources_added_since_snapshot_start() {
 /// Changed dependency artifacts must not be published under their earlier key.
 #[test]
 fn dependency_artifacts_are_rechecked_after_execution() {
-    for inputs in [
-        json!([]),
-        json!([{"dependentTasksOutputFiles": "**/*.txt"}]),
-    ] {
+    {
+        let inputs = json!([{"dependentTasksOutputFiles": "**/*.txt"}]);
         let mut build = target(
             "mutate-dependency",
             json!({
@@ -3179,7 +3183,7 @@ fn dependents_stay_cached_when_a_dependency_reproduces_its_outputs() {
             "outputs": ["{projectRoot}/generated"],
             "inputs": ["{projectRoot}/src/**/*"],
         })),
-        "build": target("build", json!({"dependsOn": ["generate"], "inputs": ["{projectRoot}/generated/**/*"]})),
+        "build": target("build", json!({"dependsOn": ["generate"], "inputs": [{"dependentTasksOutputFiles": "**/*"}]})),
     }));
     success(fixture.build(&fixture.root, &[]));
     assert_eq!(fixture.runs(), 2);
@@ -5765,8 +5769,7 @@ fn runtime_inputs_keep_distinct_target_dotenv_environments() {
 
 #[test]
 fn show_hash_keys_a_task_as_a_run_would_and_compares_keys() {
-    let inputs =
-        |files: &str| json!({"dependsOn": ["gen"], "inputs": [files, {"env": "QK_HASH_MODE"}]});
+    let inputs = |files: &str| json!({"dependsOn": ["gen"], "inputs": [files, {"env": "QK_HASH_MODE"}, {"dependentTasksOutputFiles": "**/*"}]});
     let fixture = Fixture::with_targets(json!({
         "gen": target("generate", json!({"outputs": ["{projectRoot}/generated"]})),
         "build": target("build", inputs("{projectRoot}/src/**/*")),
@@ -5796,12 +5799,14 @@ fn show_hash_keys_a_task_as_a_run_would_and_compares_keys() {
     let shown: Value = serde_json::from_str(&qk(&["show", "hash", "app:build", "--json"])).unwrap();
     assert_eq!(shown["key"], recorded);
     assert!(
-        shown["inputs"]["dependencies"].get("app:gen").is_some(),
+        shown["inputs"]["dependencies"]
+            .get("app:gen:**/*")
+            .is_some(),
         "{shown}"
     );
     assert!(!shown.to_string().contains("secret-value"), "{shown}");
     let text = qk(&["show", "hash", "app:build"]);
-    assert!(text.contains("dependency  app:gen"), "{text}");
+    assert!(text.contains("dependency  app:gen:**/*"), "{text}");
 
     let text = qk(&["show", "hash", "app:build", "--against", run]);
     assert!(text.ends_with("same key\n"), "{text}");
