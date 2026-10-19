@@ -235,7 +235,8 @@ directory prefix, runs uncached and reports why.
 Use explicit output declarations for build artifacts. A cache hit removes
 existing matching outputs before restoring the saved result; negated outputs
 are preserved. An output pattern without a fixed directory prefix disables
-caching, with a reported reason.
+caching, with a reported reason, and so does an output naming a project's root
+or a directory that holds a project, which a restore would replace.
 
 Root `.gitignore` and `.nxignore` rules exclude files from source input discovery,
 including tracked files. Negations use Git ignore semantics. Watch uses the same

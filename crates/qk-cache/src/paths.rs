@@ -369,13 +369,16 @@ impl Outputs {
             }
             let (anchor, glob) = crate::ignored::partition(&pattern);
             // The path a literal output names, its escapes read, is what a
-            // restore replaces.
+            // restore replaces, so it must not hold a project.
             if anchor.is_empty()
                 || glob.is_none()
-                    && workspace
-                        .projects
-                        .values()
-                        .any(|project| project.root == anchor)
+                    && workspace.projects.values().any(|project| {
+                        project.root == anchor
+                            || project
+                                .root
+                                .strip_prefix(anchor.as_str())
+                                .is_some_and(|rest| rest.starts_with('/'))
+                    })
             {
                 bail!(
                     "cache outputs must have a fixed directory prefix and cannot replace a project root"
@@ -1655,8 +1658,8 @@ mod tests {
         );
     }
 
-    /// An output naming a project's root, escaped or not, is refused: a
-    /// restore would replace the project.
+    /// An output naming a project's root or a directory holding one, escaped
+    /// or not, is refused: a restore would replace the project.
     #[test]
     fn outputs_cannot_name_a_project_root() {
         let root = tempfile::tempdir().unwrap();
@@ -1667,16 +1670,24 @@ mod tests {
             json!({"name": "group", "targets": {
                 "own": {"command": "true", "outputs": ["{projectRoot}"]},
                 "written": {"command": "true", "outputs": ["{workspaceRoot}/apps/\\(group\\)"]},
+                "parent": {"command": "true", "outputs": ["{workspaceRoot}/apps"]},
+                "sibling": {"command": "true", "outputs": ["{workspaceRoot}/apps/\\(gr"]},
             }})
             .to_string(),
         )
         .unwrap();
         let workspace = Workspace::load(root.path()).unwrap();
-        for target in ["own", "written"] {
+        for (target, refused) in [
+            ("own", true),
+            ("written", true),
+            ("parent", true),
+            ("sibling", false),
+        ] {
             let request = Request::parse(&format!("group:{target}")).unwrap();
             let graph = TaskGraph::build(&workspace, &[request]).unwrap();
-            assert!(
+            assert_eq!(
                 Outputs::new(&workspace, &graph.tasks[&format!("group:{target}")]).is_err(),
+                refused,
                 "{target}"
             );
         }
