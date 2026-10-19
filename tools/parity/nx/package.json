@@ -2,5 +2,5 @@
   "name": "qk-parity-nx",
   "private": true,
   "description": "The Nx release the parity goldens are captured with.",
-  "devDependencies": { "nx": "23.1.0" }
+  "devDependencies": { "nx": "24.0.0-beta.3" }
 }

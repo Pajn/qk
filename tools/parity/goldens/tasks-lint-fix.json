@@ -1,10 +1,11 @@
 {
   "tasks": {
     "tasks": {
-      "tooling:lint": {
+      "tooling:lint:fix": {
         "target": {
           "project": "tooling",
-          "target": "lint"
+          "target": "lint",
+          "configuration": "fix"
         },
         "projectRoot": "packages/tooling",
         "outputs": [],
@@ -12,10 +13,11 @@
         "continuous": false,
         "parallelism": true
       },
-      "scripts:lint": {
+      "scripts:lint:fix": {
         "target": {
           "project": "scripts",
-          "target": "lint"
+          "target": "lint",
+          "configuration": "fix"
         },
         "projectRoot": "tools/scripts",
         "outputs": [],
@@ -23,10 +25,11 @@
         "continuous": false,
         "parallelism": true
       },
-      "web-e2e:lint": {
+      "web-e2e:lint:fix": {
         "target": {
           "project": "web-e2e",
-          "target": "lint"
+          "target": "lint",
+          "configuration": "fix"
         },
         "projectRoot": "apps/web-e2e",
         "outputs": [],
@@ -34,10 +37,11 @@
         "continuous": false,
         "parallelism": true
       },
-      "mobile:lint": {
+      "mobile:lint:fix": {
         "target": {
           "project": "mobile",
-          "target": "lint"
+          "target": "lint",
+          "configuration": "fix"
         },
         "projectRoot": "apps/mobile",
         "outputs": [],
@@ -45,10 +49,11 @@
         "continuous": false,
         "parallelism": true
       },
-      "ui:lint": {
+      "ui:lint:fix": {
         "target": {
           "project": "ui",
-          "target": "lint"
+          "target": "lint",
+          "configuration": "fix"
         },
         "projectRoot": "packages/ui",
         "outputs": [],
@@ -56,10 +61,11 @@
         "continuous": false,
         "parallelism": true
       },
-      "web:lint": {
+      "web:lint:fix": {
         "target": {
           "project": "web",
-          "target": "lint"
+          "target": "lint",
+          "configuration": "fix"
         },
         "projectRoot": "apps/web",
         "outputs": [],
@@ -69,20 +75,20 @@
       }
     },
     "dependencies": {
-      "tooling:lint": [],
-      "scripts:lint": [],
-      "web-e2e:lint": [],
-      "mobile:lint": [],
-      "ui:lint": [],
-      "web:lint": []
+      "tooling:lint:fix": [],
+      "scripts:lint:fix": [],
+      "web-e2e:lint:fix": [],
+      "mobile:lint:fix": [],
+      "ui:lint:fix": [],
+      "web:lint:fix": []
     },
     "continuousDependencies": {
-      "tooling:lint": [],
-      "scripts:lint": [],
-      "web-e2e:lint": [],
-      "mobile:lint": [],
-      "ui:lint": [],
-      "web:lint": []
+      "tooling:lint:fix": [],
+      "scripts:lint:fix": [],
+      "web-e2e:lint:fix": [],
+      "mobile:lint:fix": [],
+      "ui:lint:fix": [],
+      "web:lint:fix": []
     }
   }
 }

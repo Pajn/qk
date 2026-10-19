@@ -1,11 +1,11 @@
 {
   "tasks": {
     "tasks": {
-      "web:build:production": {
+      "web:build:development": {
         "target": {
           "project": "web",
           "target": "build",
-          "configuration": "production"
+          "configuration": "development"
         },
         "projectRoot": "apps/web",
         "outputs": [
@@ -30,13 +30,15 @@
       }
     },
     "dependencies": {
-      "web:build:production": [
-        "ui:build"
+      "web:build:development": [
+        {
+          "id": "ui:build"
+        }
       ],
       "ui:build": []
     },
     "continuousDependencies": {
-      "web:build:production": [],
+      "web:build:development": [],
       "ui:build": []
     }
   }
