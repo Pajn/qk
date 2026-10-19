@@ -1917,6 +1917,37 @@ fn lockfile_changes_reach_the_tasks_hashing_installed_packages() {
     }
 }
 
+/// A changed lockfile configures no project, so a root project's tasks are
+/// not reconfigured by it: under `"auto"` they are affected only as its
+/// installs are.
+#[test]
+fn a_changed_lockfile_does_not_reconfigure_a_root_project() {
+    let repo = narrow_task_repo(
+        r#", "pluginsConfig": {"@nx/js": {"projectsAffectedByDependencyUpdates": "auto"}}"#,
+        &[
+            ("pnpm-lock.yaml", &lockfile("19.0.0", "19.0.0")),
+            (
+                "project.json",
+                r#"{"name": "root", "targets": {"build": {}}}"#,
+            ),
+        ],
+    );
+    write(&repo.root, "pnpm-lock.yaml", &lockfile("19.0.0", "19.1.0"));
+    assert!(
+        affected_tasks_of(
+            &repo,
+            &[
+                "root:build",
+                "app:build",
+                "app:test",
+                "lib:build",
+                "lib:test"
+            ]
+        )
+        .is_empty()
+    );
+}
+
 /// As in Nx, the root `package.json` moving an installed package reaches the
 /// tasks hashing it, and naming a workspace project reaches that project's.
 #[test]

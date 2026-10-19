@@ -73,8 +73,15 @@ const PLUGIN_LOCKFILES: &[&str] = &[
 /// `project.json` or `package.json` by their `createNodes` globs, whether or
 /// not package discovery then applies to it, or a root lockfile.
 pub(crate) fn is_project_config(file: &str) -> bool {
-    let name = file.rsplit('/').next().unwrap_or(file);
-    matches!(name, "project.json" | "package.json") || PLUGIN_LOCKFILES.contains(&file)
+    is_manifest(file) || PLUGIN_LOCKFILES.contains(&file)
+}
+
+/// Whether `file` is a `project.json` or `package.json`.
+pub(crate) fn is_manifest(file: &str) -> bool {
+    matches!(
+        file.rsplit('/').next().unwrap_or(file),
+        "project.json" | "package.json"
+    )
 }
 
 pub fn affected_projects(

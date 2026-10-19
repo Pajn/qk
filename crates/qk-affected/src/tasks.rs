@@ -173,8 +173,10 @@ pub(crate) fn analyse(
     }
     let ignore = qk_cache::SourceIgnore::new(&workspace.root)?;
     // Changed files projects are created from, by whether they still exist:
-    // a deleted one touches every task, a changed one the configuration of
-    // the project owning it.
+    // a deleted one touches every task, a changed project.json or
+    // package.json the configuration of the project owning it. A changed
+    // lockfile configures no project; dependency updates decide what it
+    // affects.
     let roots = crate::ProjectRoots::new(workspace);
     let mut deleted_manifest = None;
     let mut reconfigured: BTreeMap<&str, &String> = BTreeMap::new();
@@ -184,7 +186,9 @@ pub(crate) fn analyse(
         }
         if !workspace.root.join(file).exists() {
             deleted_manifest.get_or_insert(file);
-        } else if let Some(project) = roots.owner(file) {
+        } else if crate::is_manifest(file)
+            && let Some(project) = roots.owner(file)
+        {
             reconfigured.entry(project).or_insert(file);
         }
     }
