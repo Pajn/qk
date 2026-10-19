@@ -1,9 +1,11 @@
+mod args;
 mod doctor;
 mod explain;
 mod hash;
 mod history;
 mod inputs;
 mod inspect;
+mod signals;
 mod ui;
 mod warm_suggest;
 mod watch;
@@ -16,10 +18,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use qk_config::{Workspace, find_workspace};
 use qk_graph::{GraphReport, ProjectGraph, graph_order, select_projects};
 use qk_taskgraph::{Request, TaskGraph};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Arc, atomic::AtomicBool};
 
 #[derive(Parser)]
 #[command(
@@ -64,28 +63,42 @@ enum Command {
         #[command(subcommand)]
         command: WarmCommand,
     },
-    /// Execute a task and its dependencies. Forward arguments after --.
+    /// Execute a task and its dependencies. Options qk does not know, and
+    /// arguments after --, are forwarded to the task.
     Run {
-        /// project:target[:configuration], or a target of the current directory's project.
-        task: String,
+        /// project:target[:configuration], a target of the current directory's
+        /// project, or a project with a `run` target.
+        task: Option<String>,
+        /// The project, by name or a pattern matching one project.
+        #[arg(short = 'p', long)]
+        project: Option<String>,
+        /// The target, for one whose name has a colon.
+        #[arg(short = 't', long)]
+        target: Option<String>,
         #[command(flatten)]
         options: RunOptions,
     },
     /// Execute targets on selected projects and their dependencies.
     RunMany {
         // Like Nx, lists take commas, spaces or repeated flags.
-        #[arg(short = 't', long, required = true, value_delimiter = ',', num_args = 1..)]
+        #[arg(short = 't', long, alias = "target", required = true, value_delimiter = ',', num_args = 1..)]
         targets: Vec<String>,
         #[arg(short = 'p', long, value_delimiter = ',', num_args = 1..)]
         projects: Vec<String>,
         #[arg(long, value_delimiter = ',', num_args = 1..)]
         exclude: Vec<String>,
+        /// Nx's deprecated `--all`, the default; `--all=false` without
+        /// projects selects none.
+        #[arg(long, hide = true)]
+        all: bool,
+        #[arg(long, hide = true)]
+        no_all: bool,
         #[command(flatten)]
         options: RunOptions,
     },
     /// Execute targets on the projects affected by changes, and their dependencies.
     Affected {
-        #[arg(short = 't', long, required = true, value_delimiter = ',', num_args = 1..)]
+        #[arg(short = 't', long, alias = "target", required = true, value_delimiter = ',', num_args = 1..)]
         targets: Vec<String>,
         #[arg(short = 'p', long, value_delimiter = ',', num_args = 1..)]
         projects: Vec<String>,
@@ -139,8 +152,8 @@ enum Command {
     },
     /// Export the workspace project graph as JSON.
     Graph {
-        /// Output file; use - or stdout for stdout. Paths are relative to the
-        /// current directory.
+        /// A `.json` file to write, as in Nx relative to the workspace root;
+        /// `stdout`, or qk's `-`, for stdout.
         #[arg(long, value_name = "PATH", default_value = "-")]
         file: PathBuf,
         /// Write to stdout, as `--file -`.
@@ -190,6 +203,8 @@ struct RunOptions {
     /// Stop starting tasks after the first failure; also NX_BAIL=true.
     #[arg(long)]
     nx_bail: bool,
+    #[arg(long, hide = true, overrides_with = "nx_bail")]
+    no_nx_bail: bool,
     /// Break task dependency cycles instead of failing; also NX_IGNORE_CYCLES=true.
     #[arg(long)]
     nx_ignore_cycles: bool,
@@ -200,9 +215,12 @@ struct RunOptions {
     /// `--graph=stdout`), without running anything.
     #[arg(long, num_args = 0..=1, default_missing_value = "stdout", value_name = "FILE")]
     graph: Option<String>,
-    /// Set NX_VERBOSE_LOGGING=true for tasks.
+    /// Set NX_VERBOSE_LOGGING=true for tasks; without it, tasks see
+    /// NX_VERBOSE_LOGGING=false unless it is already true.
     #[arg(long)]
     verbose: bool,
+    #[arg(long, hide = true, overrides_with = "verbose")]
+    no_verbose: bool,
     /// Run each task in macOS's sandbox: `audit` (the default) reports what it
     /// reads and writes in the workspace beyond what it declares, `enforce`
     /// refuses it. Tasks run without the cache.
@@ -242,7 +260,9 @@ enum ProjectionFallbackPolicy {
 }
 
 /// What counts as changed, as in Nx. Without `--head`, the working tree is
-/// compared, including uncommitted and untracked files.
+/// compared, including uncommitted and untracked files. As in Nx, `--head`
+/// needs `--base`, and the explicit file sources exclude the revisions and
+/// each other, except that `--stdin` adds to `--files`.
 #[derive(Args)]
 struct ChangeOptions {
     /// Affected profile from nx.json: change projections, import reachability or both.
@@ -256,34 +276,37 @@ struct ChangeOptions {
     #[arg(long)]
     base: Option<String>,
     /// Head revision; defaults to NX_HEAD.
-    #[arg(long)]
+    #[arg(long, requires = "base")]
     head: Option<String>,
     /// Treat exactly these workspace-relative files as changed.
-    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    #[arg(long, value_delimiter = ',', num_args = 1.., conflicts_with_all = ["uncommitted", "untracked", "base", "head"])]
     files: Vec<String>,
     /// Read changed workspace-relative paths from stdin, one per line.
-    #[arg(long, conflicts_with_all = ["files", "uncommitted", "untracked"])]
+    #[arg(long, conflicts_with_all = ["uncommitted", "untracked", "base", "head"])]
     stdin: bool,
     /// Only uncommitted changes.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["untracked", "base", "head"])]
     uncommitted: bool,
     /// Only untracked files.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["base", "head"])]
     untracked: bool,
 }
 
 impl ChangeOptions {
     /// Read the explicit file list once, preserving spaces in paths and empty lists.
+    /// As in Nx, the paths from stdin come before those `--files` names.
     fn read_stdin(&mut self) -> Result<()> {
         if self.stdin {
             use std::io::BufRead;
-            self.files = io::stdin()
+            let mut files: Vec<String> = io::stdin()
                 .lock()
                 .lines()
                 .collect::<std::io::Result<Vec<_>>>()?
                 .into_iter()
                 .filter(|line| !line.is_empty())
                 .collect();
+            files.append(&mut self.files);
+            self.files = files;
         }
         Ok(())
     }
@@ -391,7 +414,17 @@ impl RunOptions {
     }
 
     fn skips_cache(&self) -> bool {
-        self.skip_cache || env_flag("NX_SKIP_NX_CACHE")
+        self.skip_cache || env_flag("NX_SKIP_NX_CACHE") || env_flag("NX_DISABLE_NX_CACHE")
+    }
+
+    /// `--nx-bail`, else NX_BAIL=true, as Nx reads it.
+    fn bails(&self) -> bool {
+        self.nx_bail || (!self.no_nx_bail && env_flag("NX_BAIL"))
+    }
+
+    /// `--verbose` or `--verbose=false`, else NX_VERBOSE_LOGGING=true.
+    fn verbose(&self) -> bool {
+        self.verbose || (!self.no_verbose && env_flag("NX_VERBOSE_LOGGING"))
     }
 
     /// Tasks per run, as Nx reads `--parallel`.
@@ -442,9 +475,9 @@ impl RunOptions {
             // Only this thread exists yet.
             unsafe { std::env::set_var(name, "true") }
         };
-        if self.verbose {
-            set("NX_VERBOSE_LOGGING");
-        }
+        // As in Nx, always `true` or `false`.
+        // Only this thread exists yet.
+        unsafe { std::env::set_var("NX_VERBOSE_LOGGING", self.verbose().to_string()) }
         if self.skips_cache() {
             set("NX_SKIP_NX_CACHE");
         }
@@ -478,12 +511,16 @@ enum Granularity {
     Task,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum OutputStyle {
     Tui,
     Dynamic,
     DynamicLegacy,
     Static,
+    /// As `static`, but a task that did not fail is one line.
+    StaticFailuresOnly,
+    /// Counts, then one line per failed task naming the file with its output.
+    Summary,
     Stream,
     StreamWithoutPrefixes,
     /// qk's own: only failed tasks' output, then a summary.
@@ -502,24 +539,29 @@ enum Rendered {
 
 impl OutputStyle {
     /// The style qk renders; the interactive ones need stderr to be a
-    /// terminal, and are static otherwise, as in Nx. `static` for a single
-    /// `run` streams the requested task, as `nx run` does.
-    fn rendered(self, single: bool) -> Rendered {
-        use std::io::IsTerminal;
+    /// terminal, and are static otherwise, as in Nx, which also leaves them
+    /// for `NX_TASKS_RUNNER_DYNAMIC_OUTPUT=false` and verbose logging.
+    /// `static` for a single `run` streams the requested task, as `nx run`
+    /// does, and `static-failures-only` shows every task in full under
+    /// `--verbose`, as Nx does.
+    fn rendered(self, single: bool, verbose: bool) -> Rendered {
+        use qk_executor::OutputStyle as Executor;
         let fixed = if single {
-            qk_executor::OutputStyle::RunOne
+            Executor::RunOne
         } else {
-            qk_executor::OutputStyle::Static
+            Executor::Static
         };
         match self {
-            Self::Stream => Rendered::Lines(qk_executor::OutputStyle::Stream),
-            Self::StreamWithoutPrefixes => {
-                Rendered::Lines(qk_executor::OutputStyle::StreamWithoutPrefixes)
-            }
+            Self::Stream => Rendered::Lines(Executor::Stream),
+            Self::StreamWithoutPrefixes => Rendered::Lines(Executor::StreamWithoutPrefixes),
             Self::Static => Rendered::Lines(fixed),
+            Self::StaticFailuresOnly if verbose => Rendered::Lines(fixed),
+            Self::StaticFailuresOnly if single => Rendered::Lines(Executor::RunOneFailuresOnly),
+            Self::StaticFailuresOnly => Rendered::Lines(Executor::StaticFailuresOnly),
+            Self::Summary => Rendered::Lines(Executor::Summary),
             Self::Quiet => Rendered::Quiet,
             Self::Tui | Self::Dynamic | Self::DynamicLegacy => {
-                if io::stderr().is_terminal() {
+                if dynamic_output(verbose) {
                     Rendered::Dynamic
                 } else {
                     Rendered::Lines(fixed)
@@ -529,23 +571,38 @@ impl OutputStyle {
     }
 }
 
-/// The output style when none is given: `NX_DEFAULT_OUTPUT_STYLE`, else
-/// `static` in CI, for full logs; raw for a single `run`; and for several
-/// tasks the live panel on a terminal, and `quiet` otherwise, for agents and
-/// scripts.
-fn default_output_style(single: bool) -> Rendered {
+/// Whether the live panel can be shown: on a terminal, unless
+/// `NX_TASKS_RUNNER_DYNAMIC_OUTPUT=false` or verbose logging turn it off, as
+/// they turn off Nx's dynamic output.
+fn dynamic_output(verbose: bool) -> bool {
     use std::io::IsTerminal;
-    if let Ok(name) = std::env::var("NX_DEFAULT_OUTPUT_STYLE")
-        && let Ok(style) = OutputStyle::from_str(&name, false)
-    {
-        return style.rendered(single);
-    }
-    if std::env::var_os("CI").is_some_and(|value| value != "false") {
-        OutputStyle::Static.rendered(single)
+    io::stderr().is_terminal()
+        && !verbose
+        && std::env::var_os("NX_TASKS_RUNNER_DYNAMIC_OUTPUT").is_none_or(|value| value != "false")
+}
+
+/// The style named by `--output-style`, else by `NX_DEFAULT_OUTPUT_STYLE`
+/// when that names one, as Nx reads them.
+fn specified_output_style(options: &RunOptions) -> Option<OutputStyle> {
+    options.output_style.or_else(|| {
+        std::env::var("NX_DEFAULT_OUTPUT_STYLE")
+            .ok()
+            .and_then(|name| OutputStyle::from_str(&name, false).ok())
+    })
+}
+
+/// The output style when none is given: `static` in CI, for full logs; raw
+/// for a single `run`; and for several tasks the live panel on a terminal,
+/// and `quiet` otherwise, for agents and scripts.
+fn default_output_style(single: bool, verbose: bool) -> Rendered {
+    if qk_executor::is_ci() {
+        OutputStyle::Static.rendered(single, verbose)
     } else if single {
         Rendered::Lines(qk_executor::OutputStyle::StreamWithoutPrefixes)
-    } else if io::stderr().is_terminal() {
+    } else if dynamic_output(verbose) {
         Rendered::Dynamic
+    } else if io::IsTerminal::is_terminal(&io::stderr()) {
+        OutputStyle::Static.rendered(single, verbose)
     } else {
         Rendered::Quiet
     }
@@ -630,6 +687,9 @@ enum ShowCommand {
         /// Separate names with this instead of a line each.
         #[arg(long)]
         sep: Option<String>,
+        /// Nx's `--verbose`, which only changes how its errors print.
+        #[arg(long, hide = true)]
+        verbose: bool,
     },
     /// Explain which projects are affected and why; with a project, the path
     /// from it to the change that affects it.
@@ -708,19 +768,37 @@ enum ShowCommand {
     },
     /// Replay retained stdout and stderr from one actual cacheable execution.
     Log { run: String, task: String },
-    /// Show a project's normalized configuration.
+    /// Show a project's normalized configuration: by default the project
+    /// containing the current directory, or a pattern matching one project.
     Project {
-        name: String,
-        /// Emit JSON (currently the default and only format).
+        #[arg(value_name = "PROJECT")]
+        name: Option<String>,
+        #[arg(
+            short = 'p',
+            long = "project-name",
+            hide = true,
+            conflicts_with = "name"
+        )]
+        project_name: Option<String>,
+        /// Emit the configuration as one line of JSON, as Nx does; without
+        /// it, a summary.
         #[arg(long)]
         json: bool,
     },
 }
 
 fn main() {
-    match run(Cli::parse_from(shorthand(kebab_flags(
-        std::env::args_os().collect(),
-    )))) {
+    use clap::CommandFactory;
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    load_root_dotenv(&args);
+    let args = match shorthand(args) {
+        Ok(args) => args,
+        Err(error) => {
+            eprintln!("qk: {error:#}");
+            std::process::exit(1);
+        }
+    };
+    match run(Cli::parse_from(args::normalize(args, &Cli::command()))) {
         Ok(0) => {}
         Ok(code) => std::process::exit(code),
         Err(error) => {
@@ -732,6 +810,35 @@ fn main() {
             }
             eprintln!("qk: {error:#}");
             std::process::exit(1);
+        }
+    }
+}
+
+/// Loads the workspace's root dotenv files into qk's own environment, as Nx
+/// loads them into its process at startup, so that the run controls they set,
+/// such as NX_DEFAULT_OUTPUT_STYLE or NX_PARALLEL, apply. Variables already
+/// set win. Without a workspace there is nothing to load; a file that cannot
+/// be read is reported when the run reads it again.
+fn load_root_dotenv(args: &[std::ffi::OsString]) {
+    let named = args.iter().enumerate().find_map(|(index, arg)| {
+        if arg == "--workspace" {
+            args.get(index + 1).map(PathBuf::from)
+        } else {
+            arg.to_str()?
+                .strip_prefix("--workspace=")
+                .map(PathBuf::from)
+        }
+    });
+    let Some(root) = named.or_else(|| find_workspace(&std::env::current_dir().ok()?).ok()) else {
+        return;
+    };
+    let Ok(environment) = qk_executor::environment(&root) else {
+        return;
+    };
+    for (name, value) in environment {
+        if std::env::var_os(&name).as_ref() != Some(&value) {
+            // Only this thread exists yet.
+            unsafe { std::env::set_var(name, value) }
         }
     }
 }
@@ -760,47 +867,36 @@ const NX_COMMANDS: &[&str] = &[
     "view-logs",
 ];
 
-/// Spells camelCase long flags in kebab-case, since Nx accepts both and qk
-/// defines only the kebab-case one: `--outputStyle=static` becomes
-/// `--output-style=static`. Arguments after `--` are forwarded untouched.
-fn kebab_flags(args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
-    let mut forwarded = false;
-    args.into_iter()
-        .map(|arg| {
-            forwarded |= arg == "--";
-            let Some(text) = arg.to_str().filter(|_| !forwarded) else {
-                return arg;
-            };
-            let Some(flag) = text.strip_prefix("--") else {
-                return arg;
-            };
-            let (name, value) = match flag.split_once('=') {
-                Some((name, value)) => (name, Some(value)),
-                None => (flag, None),
-            };
-            if !name.bytes().any(|byte| byte.is_ascii_uppercase()) {
-                return arg;
-            }
-            let mut kebab = String::from("--");
-            for character in name.chars() {
-                if character.is_ascii_uppercase() {
-                    kebab.push('-');
-                }
-                kebab.push(character.to_ascii_lowercase());
-            }
-            if let Some(value) = value {
-                kebab.push('=');
-                kebab.push_str(value);
-            }
-            kebab.into()
-        })
-        .collect()
-}
+/// Nx's hidden `affected:<target>` commands, which run `affected` for one target.
+const AFFECTED_TARGETS: &[&str] = &[
+    "affected:build",
+    "affected:e2e",
+    "affected:lint",
+    "affected:test",
+];
+
+/// Commands Nx removed but still recognises, with the message it fails with.
+const REMOVED_COMMANDS: &[(&str, &str)] = &[
+    (
+        "affected:graph",
+        "Use `nx graph --affected`, or `nx affected --graph` instead depending on which best suits your use case. The `affected:graph` command has been removed in Nx 19.",
+    ),
+    (
+        "affected:dep-graph",
+        "Use `nx graph --affected`, or `nx affected --graph` instead depending on which best suits your use case. The `affected:graph` command has been removed in Nx 19.",
+    ),
+    (
+        "print-affected",
+        "Use `nx show projects --affected`, `nx affected --graph -t build` or `nx graph --affected` depending on which best suits your use case. The `print-affected` command has been removed in Nx 19.",
+    ),
+];
 
 /// Rewrites Nx's shorthand into `run`: `<target> <project>` and `<project>:<target>`
 /// become `run <project>:<target>`, and a bare `<target>` becomes `run <target>`.
 /// Anything that starts with one of qk's own subcommands is left alone.
-fn shorthand(mut args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+/// `affected:<target>` becomes `affected --targets <target>`, and the commands
+/// Nx removed fail with its message.
+fn shorthand(mut args: Vec<std::ffi::OsString>) -> Result<Vec<std::ffi::OsString>> {
     use clap::CommandFactory;
     let command = Cli::command();
     let mut index = 1;
@@ -817,8 +913,19 @@ fn shorthand(mut args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
         .and_then(|arg| arg.to_str())
         .map(str::to_owned)
     else {
-        return args;
+        return Ok(args);
     };
+    if let Some((_, message)) = REMOVED_COMMANDS.iter().find(|(name, _)| *name == first) {
+        bail!("{message}");
+    }
+    if AFFECTED_TARGETS.contains(&first.as_str()) {
+        let target = first.trim_start_matches("affected:").to_owned();
+        args.splice(
+            index..=index,
+            ["affected".into(), "--targets".into(), target.into()],
+        );
+        return Ok(args);
+    }
     let known = first == "help"
         || NX_COMMANDS.contains(&first.as_str())
         || command.get_subcommands().any(|subcommand| {
@@ -826,7 +933,7 @@ fn shorthand(mut args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
                 || subcommand.get_all_aliases().any(|alias| alias == first)
         });
     if first.starts_with('-') || known {
-        return args;
+        return Ok(args);
     }
     let project = args
         .get(index + 1)
@@ -842,7 +949,7 @@ fn shorthand(mut args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
         }
         None => args.insert(index, "run".into()),
     }
-    args
+    Ok(args)
 }
 
 /// The project whose root most specifically contains the current directory.
@@ -1069,16 +1176,28 @@ fn run(mut cli: Cli) -> Result<i32> {
             }
             return Ok(code);
         }
-        Command::Run { task, options } => {
-            return run_task(&workspace, task, &options);
+        Command::Run {
+            task,
+            project,
+            target,
+            options,
+        } => {
+            let request = run_one_request(&workspace, task, project, target)?;
+            return run_request(&workspace, request, &options);
         }
         Command::RunMany {
             targets,
             projects,
             exclude,
+            no_all,
             options,
+            ..
         } => {
-            let selected = select_projects(&workspace.projects, &projects, &exclude)?;
+            let selected = if no_all && projects.is_empty() {
+                std::collections::BTreeSet::new()
+            } else {
+                select_projects(&workspace.projects, &projects, &exclude)?
+            };
             let requests = requests(
                 &workspace,
                 selected,
@@ -1179,6 +1298,7 @@ fn run(mut cli: Cli) -> Result<i32> {
                     kind,
                     json,
                     sep,
+                    ..
                 },
         } => {
             let mut selected = select_projects(&workspace.projects, &projects, &exclude)?;
@@ -1340,8 +1460,21 @@ fn run(mut cli: Cli) -> Result<i32> {
             command: ShowCommand::Log { run, task },
         } => history::show_log(&workspace, &run, &task)?,
         Command::Show {
-            command: ShowCommand::Project { name, .. },
+            command:
+                ShowCommand::Project {
+                    name,
+                    project_name,
+                    json,
+                },
         } => {
+            let name = match name.or(project_name) {
+                Some(name) => name,
+                None => current_project(&workspace).map_err(|_| {
+                    anyhow::anyhow!(
+                        "Could not find a project in the current working directory; name one as `qk show project <project-name>`"
+                    )
+                })?,
+            };
             // As Nx: a name that is no project is a pattern matching one.
             let name = if workspace.projects.contains_key(&name) {
                 name
@@ -1359,7 +1492,14 @@ fn run(mut cli: Cli) -> Result<i32> {
             };
             // The graph's node, with implicit dependencies expanded.
             let graph = ProjectGraph::build(&workspace)?;
-            print_json(&graph.nodes[&name].data)?;
+            let project = &graph.nodes[&name].data;
+            let mut stdout = io::stdout().lock();
+            if json {
+                serde_json::to_writer(&mut stdout, project)?;
+                writeln!(stdout)?;
+            } else {
+                write!(stdout, "{}", project_summary(&workspace, project))?;
+            }
         }
         Command::Graph {
             file,
@@ -1389,8 +1529,27 @@ fn run(mut cli: Cli) -> Result<i32> {
             if print || file.as_os_str() == "-" || file.as_os_str() == "stdout" {
                 io::stdout().lock().write_all(&bytes)?;
             } else {
-                std::fs::write(&file, bytes)
-                    .with_context(|| format!("cannot write graph to {}", file.display()))?;
+                // As in Nx: relative to the workspace root, with its
+                // directories created, and only JSON.
+                let path = workspace.root.join(&file);
+                match path.extension().and_then(|extension| extension.to_str()) {
+                    Some("json") => {}
+                    Some("html") => bail!(
+                        "qk writes the graph as JSON only; the HTML graph viewer is Nx's. You provided --file={}",
+                        file.display()
+                    ),
+                    _ => bail!(
+                        "Please specify a filename with either .json or .html extension. You provided --file={}",
+                        file.display()
+                    ),
+                }
+                if let Some(directory) = path.parent() {
+                    std::fs::create_dir_all(directory)
+                        .with_context(|| format!("cannot create {}", directory.display()))?;
+                }
+                std::fs::write(&path, bytes)
+                    .with_context(|| format!("cannot write graph to {}", path.display()))?;
+                eprintln!("qk: JSON output created in {}", path.display());
             }
         }
     }
@@ -1479,23 +1638,50 @@ fn execute_narrowed(
         print_json(&graph)?;
         return Ok(0);
     }
+    // As Nx does, refuse to run a task this run was started from.
+    let enclosing = qk_executor::enclosing_invocations();
+    if let Some(task) = graph
+        .tasks
+        .values()
+        .find(|task| enclosing.contains(&qk_executor::invocation(task)))
+    {
+        let mut chain: Vec<&str> = enclosing
+            .iter()
+            .map(|invocation| invocation.split('\u{1f}').next().unwrap_or_default())
+            .collect();
+        chain.push(&task.id);
+        bail!(
+            "Recursive task invocation detected:\n\n  {}\n\nTask \"{}\" was already invoked by a parent qk or Nx process in this chain. This typically happens when a task's command (e.g., \"nx {} {}\") triggers a chain of tasks that eventually re-invokes itself.",
+            chain.join(" -> "),
+            task.id,
+            task.target,
+            task.project
+        );
+    }
     let cancelled = Arc::new(AtomicBool::new(false));
-    let signal = cancelled.clone();
-    ctrlc::set_handler(move || {
-        signal.store(true, Ordering::SeqCst);
-    })
-    .context("cannot register cancellation handler")?;
+    signals::install(cancelled.clone())?;
     // A sandboxed task has to run to be observed.
     let skip_cache =
         options.skips_cache() || options.sandbox.is_some() || options.input_analysis.is_some();
-    let rendered = options.output_style.map_or_else(
-        || default_output_style(single),
-        |style| style.rendered(single),
+    let verbose = options.verbose();
+    let specified = specified_output_style(options);
+    let rendered = specified.map_or_else(
+        || default_output_style(single, verbose),
+        |style| style.rendered(single, verbose),
     );
     let sink = match rendered {
-        Rendered::Lines(qk_executor::OutputStyle::Static | qk_executor::OutputStyle::RunOne) => {
+        Rendered::Lines(
+            qk_executor::OutputStyle::Static
+            | qk_executor::OutputStyle::RunOne
+            | qk_executor::OutputStyle::StaticFailuresOnly
+            | qk_executor::OutputStyle::RunOneFailuresOnly,
+        ) => {
             qk_executor::report::install(Box::new(ui::Static));
             ui::SinkKind::Static
+        }
+        Rendered::Lines(qk_executor::OutputStyle::Summary) => {
+            qk_executor::report::install(Box::new(ui::Static));
+            ui::SinkKind::Summary
         }
         Rendered::Lines(_) => ui::SinkKind::Lines,
         Rendered::Quiet => {
@@ -1560,8 +1746,12 @@ fn execute_narrowed(
             parallel,
             cores,
             skip_cache,
-            bail: options.nx_bail || env_flag("NX_BAIL"),
+            bail: options.bails(),
             style,
+            stream_long_running: !matches!(
+                specified,
+                Some(OutputStyle::Static | OutputStyle::StaticFailuresOnly | OutputStyle::Summary)
+            ),
             sandbox: options.sandbox.map(|mode| match mode {
                 SandboxMode::Audit => qk_runner::sandbox::Mode::Audit,
                 SandboxMode::Enforce => qk_runner::sandbox::Mode::Enforce,
@@ -1601,6 +1791,10 @@ fn execute_narrowed(
         let summary =
             ui::static_summary(&title, &result, &report, parallel, cores, ui::Paint::log());
         qk_executor::report::write_all(true, summary.as_bytes());
+    } else if matches!(sink, ui::SinkKind::Summary) {
+        let logs = qk_cache::worktree_state(&workspace.root).join("terminal-outputs");
+        let summary = ui::summary_style(&graph, &report, &logs, ui::Paint::log());
+        qk_executor::report::write_all(true, summary.as_bytes());
     } else if !single || !matches!(sink, ui::SinkKind::Lines) {
         let summary = ui::summary(
             &result,
@@ -1632,6 +1826,10 @@ fn execute_narrowed(
     ) {
         inputs::present(analysis.clone(), options)?;
     }
+    // A cancelled run exits as the signal that cancelled it, as in Nx.
+    if result.exit_code == 130 {
+        return Ok(signals::exit_code());
+    }
     Ok(result.exit_code)
 }
 
@@ -1647,8 +1845,99 @@ fn task_request(workspace: &Workspace, task: String) -> Result<Request> {
     Request::parse_in(workspace, &task)
 }
 
+/// Nx's short names for common targets, which `nx run` and `nx <target>` take.
+const TARGET_ALIASES: &[(&str, &str)] = &[
+    ("b", "build"),
+    ("e", "e2e"),
+    ("l", "lint"),
+    ("s", "serve"),
+    ("t", "test"),
+];
+
+/// The task `qk run` is asked for, as Nx's run-one reads it: a
+/// `project:target[:configuration]`, else `--target`, else a project with a
+/// `run` target, else a target; `--project` names the project, else the
+/// current directory's. The project can be a pattern matching one project,
+/// and the target one of Nx's short names.
+fn run_one_request(
+    workspace: &Workspace,
+    task: Option<String>,
+    project: Option<String>,
+    target: Option<String>,
+) -> Result<Request> {
+    let mut request = match (task, target) {
+        (Some(task), _) if task.rfind(':').is_some_and(|index| index > 0) => {
+            Request::parse_in(workspace, &task)?
+        }
+        (task, Some(target)) => {
+            // A positional beside --target names the project.
+            if task.is_some() && project.is_some() {
+                bail!("give the project once, as --project or before --target");
+            }
+            Request {
+                project: task.unwrap_or_default(),
+                target,
+                configuration: None,
+                requested_configuration: None,
+                args: Vec::new(),
+            }
+        }
+        (Some(task), None) => {
+            let has_run = workspace
+                .projects
+                .get(&task)
+                .is_some_and(|project| project.targets.contains_key("run"));
+            let (project, target) = if has_run {
+                (task, "run".to_owned())
+            } else {
+                (String::new(), task)
+            };
+            Request {
+                project,
+                target,
+                configuration: None,
+                requested_configuration: None,
+                args: Vec::new(),
+            }
+        }
+        (None, None) => bail!("Both project and target have to be specified"),
+    };
+    if let Some(project) = project {
+        request.project = project;
+    }
+    if request.project.is_empty() {
+        request.project = current_project(workspace)?;
+    }
+    if !workspace.projects.contains_key(&request.project) {
+        let matched = select_projects(
+            &workspace.projects,
+            std::slice::from_ref(&request.project),
+            &[],
+        )
+        .unwrap_or_default();
+        match matched.len() {
+            1 => request.project = matched.into_iter().next().unwrap(),
+            0 => bail!("Cannot find project '{}'", request.project),
+            _ => bail!(
+                "Multiple projects matched:\n{}",
+                matched.into_iter().collect::<Vec<_>>().join("\n")
+            ),
+        }
+    }
+    if let Some((_, target)) = TARGET_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == request.target)
+    {
+        request.target = (*target).to_owned();
+    }
+    Ok(request)
+}
+
 fn run_task(workspace: &Workspace, task: String, options: &RunOptions) -> Result<i32> {
-    let mut request = task_request(workspace, task)?;
+    run_request(workspace, task_request(workspace, task)?, options)
+}
+
+fn run_request(workspace: &Workspace, mut request: Request, options: &RunOptions) -> Result<i32> {
     if let Some(configuration) = &options.configuration() {
         if request
             .configuration
@@ -1894,6 +2183,69 @@ fn nx_task_graph(workspace: &Workspace, graph: &TaskGraph) -> Result<serde_json:
             "continuousDependencies": continuous_dependencies,
         },
     }))
+}
+
+/// A project as `nx show project` prints it without `--json`: its name,
+/// root, source root, tags and implicit dependencies, then each target with
+/// its command, script or executor, and its configurations.
+fn project_summary(workspace: &Workspace, project: &qk_config::Project) -> String {
+    let paint = ui::Paint::stdout();
+    let mut text = String::new();
+    let mut field = |label: &str, value: Option<String>| {
+        if let Some(value) = value.filter(|value| !value.is_empty()) {
+            text.push_str(&format!("{}: {value}\n", paint.bold(label)));
+        }
+    };
+    field("Name", Some(project.name.clone()));
+    field("Root", Some(project.root.clone()));
+    field("Source Root", project.source_root.clone());
+    field("Tags", Some(project.tags.join(",")));
+    field(
+        "Implicit Dependencies",
+        Some(project.implicit_dependencies.join(",")),
+    );
+    if project.targets.is_empty() {
+        return text;
+    }
+    let name_width = project.targets.keys().map(String::len).max().unwrap_or(0);
+    let executor_width = project
+        .targets
+        .values()
+        .map(|target| target.executor.as_deref().map_or(0, str::len))
+        .max()
+        .unwrap_or(0);
+    text.push_str(&format!("{}: \n", paint.bold("Targets")));
+    for (name, target) in &project.targets {
+        let option = |key: &str| target.options.get(key).and_then(serde_json::Value::as_str);
+        // A package script's content stands in for its executor, as Nx's
+        // metadata.scriptContent does.
+        let script = (target.executor.as_deref() == Some("nx:run-script"))
+            .then(|| option("script"))
+            .flatten()
+            .and_then(|script| workspace.packages.get(&project.name)?.scripts.get(script));
+        let commands = target
+            .options
+            .get("commands")
+            .and_then(serde_json::Value::as_array);
+        let command = script
+            .map(String::as_str)
+            .or_else(|| option("command"))
+            .or_else(|| match commands.map(Vec::as_slice) {
+                Some([command]) => command.as_str(),
+                _ => None,
+            })
+            .or(target.executor.as_deref())
+            .unwrap_or("");
+        let configurations: Vec<&str> = target.configurations.keys().map(String::as_str).collect();
+        let label = format!("{name}:");
+        text.push_str(&format!(
+            "- {} {command:width$} {}\n",
+            paint.bold(&format!("{label:width$}", width = name_width + 2)),
+            paint.dim(&configurations.join(", ")),
+            width = executor_width + 2,
+        ));
+    }
+    text
 }
 
 fn print_json(value: &impl serde::Serialize) -> Result<()> {

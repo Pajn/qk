@@ -75,10 +75,18 @@ pub fn worktree_state(root: &Path) -> PathBuf {
 /// What [`worktree_state`] holds. Inside Git, the state directory of the main
 /// worktree also holds the shared cache and run history, so these entries are
 /// removed one by one rather than the directory as a whole.
-const WORKTREE_ENTRIES: &[&str] = &["digests.json", "outputs", "restore", "sandbox", "warm"];
+const WORKTREE_ENTRIES: &[&str] = &[
+    "digests.json",
+    "outputs",
+    "restore",
+    "sandbox",
+    "terminal-outputs",
+    "warm",
+];
 
 /// Removes a worktree's state: its file digests, the outputs it records
-/// holding, its warm directories and any restores or sandboxes left behind.
+/// holding, its warm directories, the logs `--output-style=summary` kept and
+/// any restores or sandboxes left behind.
 pub fn clear_worktree_state(root: &Path) -> Result<()> {
     let state = worktree_state(root);
     for entry in WORKTREE_ENTRIES {

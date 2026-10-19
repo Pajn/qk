@@ -107,9 +107,25 @@ impl Drop for Children<'_> {
     }
 }
 
-/// How long a cancelled or stopped command may take to exit after SIGTERM.
+/// How long a cancelled or stopped command may take to exit after SIGTERM:
+/// NX_PROCESS_KILL_GRACE_PERIOD milliseconds, 5000 by default, as in Nx.
 #[cfg(unix)]
-const GRACE: Duration = Duration::from_secs(5);
+fn grace() -> Duration {
+    grace_period(
+        std::env::var("NX_PROCESS_KILL_GRACE_PERIOD")
+            .ok()
+            .as_deref(),
+    )
+}
+
+#[cfg(unix)]
+fn grace_period(value: Option<&str>) -> Duration {
+    Duration::from_millis(
+        value
+            .and_then(|value| value.parse::<u32>().ok())
+            .map_or(5000, u64::from),
+    )
+}
 
 impl Children<'_> {
     /// Asks every process group to exit, then leaves stragglers to `Drop`.
@@ -119,7 +135,7 @@ impl Children<'_> {
             for child in &self.0 {
                 child.terminate();
             }
-            let deadline = std::time::Instant::now() + GRACE;
+            let deadline = std::time::Instant::now() + grace();
             while std::time::Instant::now() < deadline
                 && self
                     .0
@@ -482,5 +498,17 @@ fn exit_code(status: std::process::ExitStatus) -> i32 {
     #[cfg(not(unix))]
     {
         status.code().unwrap_or(1)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod grace_tests {
+    use super::*;
+
+    #[test]
+    fn the_kill_grace_period_is_read_as_nx_reads_it() {
+        assert_eq!(grace_period(None), Duration::from_millis(5000));
+        assert_eq!(grace_period(Some("250")), Duration::from_millis(250));
+        assert_eq!(grace_period(Some("soon")), Duration::from_millis(5000));
     }
 }

@@ -27,10 +27,10 @@ clap = { version = "4", features = ["derive", "env"] }
 command-group = "5"
 ctrlc = { version = "3", features = ["termination"] }
 notify = "8.2"
-dotenvy = "0.15"
 libc = "0.2"
 shlex = "2"
 globset = "0.4"
+regex = "1"
 ignore = "0.4"
 jsonc-parser = { version = "0.32", features = ["preserve_order", "serde"] }
 serde = { version = "1", features = ["derive"] }

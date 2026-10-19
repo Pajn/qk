@@ -8,13 +8,13 @@
 | `qk show projects -p 'web,tag:library' --exclude 'experimental-*'` | Matching names, globs, tags and roots, minus exclusions |
 | `qk show projects --with-target e2e --type app [--sep ,]` | Projects with one of the targets, of a type (`app`, `lib` or `e2e`, as Nx types them), joined by a separator |
 | `qk show projects --affected --affected-targets build,export` | Affected projects where a task of one of the targets is affected, as task selection decides it |
-| `qk show project <name> [--json]` | The project's graph node data as JSON; a name that is no project matches as a pattern, as in Nx |
-| `qk graph --file <path>` | Workspace project graph in a `{ "graph": { "nodes": ..., "dependencies": ... } }` envelope |
-| `qk graph` or `qk graph --file -` | The same graph on stdout |
+| `qk show project [name] [--json]` | A project's graph node, as Nx's summary or one line of JSON; the current directory's project by default, and a name that is no project matches as a pattern, as in Nx |
+| `qk graph --file <path>.json` | Workspace project graph in a `{ "graph": { "nodes": ..., "dependencies": ... } }` envelope |
+| `qk graph`, `qk graph --file stdout` or `--file -` | The same graph on stdout |
 | `qk graph --external` | The graph with the packages the pnpm lockfile installs as `externalNodes` |
 | `qk graph --focus web --exclude 'tag:e2e'` | Only `web`, what it depends on and what depends on it, minus exclusions |
-| `qk run <project>:<target>[:<configuration>]` | Execute a task and its dependencies |
-| `qk <target> [project]`, `qk <project>:<target>` | Nx-style shorthand for `qk run` |
+| `qk run <project>:<target>[:<configuration>]`, `qk run -p <project> -t <target>` | Execute a task and its dependencies |
+| `qk <target> [project]`, `qk <project>:<target>`, `qk <project>` | Nx-style shorthand for `qk run` |
 | `qk run-many -t build,test -p 'web,core' --parallel 4` | Execute matching targets with bounded task concurrency |
 | `qk exec -p web -- <command>` | Run a command in projects, or as a package script's target, as `nx exec` does |
 | `qk run web:build --dry-run` | Prepare every planned task without running it, and print the task graph as JSON |
@@ -34,7 +34,14 @@
 | `qk reset [--only-cache \| --only-workspace-data]` | Remove the cache and this worktree's state, as `nx reset` does |
 
 As in Nx, `qk build web` and `qk web:build` mean `qk run web:build`, and take the
-same options. Without a project, `qk build` and `qk run build` use the project
+same options. `qk run` reads its task as Nx's run does: a
+`project:target[:configuration]`, else `-t/--target` (for a target whose name
+has a colon) with `-p/--project` or the positional naming the project, else
+a project with a `run` target, which `qk tool` and `qk run tool` run, else a
+target. The project may be a name or a pattern matching exactly one project;
+a pattern matching several fails with Nx's "Multiple projects matched". As
+in Nx, `b`, `e`, `l`, `s` and `t` name the `build`, `e2e`, `lint`, `serve`
+and `test` targets. Without a project, `qk build` and `qk run build` use the project
 whose root most specifically contains the current directory, as Nx does:
 in the root project, `NX_DEFAULT_PROJECT` picks another, and where no
 project contains the directory, `NX_DEFAULT_PROJECT`, then nx.json
@@ -52,15 +59,31 @@ left out. `--print` and `--file stdout` write to stdout. qk has no browser
 view, so `nx graph`'s `--affected`, `--view` and server options do not apply;
 for a task graph, use `qk run-many -t <targets> --graph`.
 
-Flags may be spelled in camelCase as well as kebab-case, so Nx's
-`--outputStyle` works as `--output-style`. Arguments after `--` are forwarded
-unchanged.
+Options are read as Nx's yargs configuration reads them. They may be
+spelled in camelCase as well as kebab-case, so Nx's `--outputStyle` works as
+`--output-style`. A boolean option takes a value or a negation:
+`--nx-bail=false`, `--skip-nx-cache true` and `--no-nx-bail` all work, and
+any value other than `true` means false. An explicit `--nx-bail=false` or
+`--verbose=false` overrides `NX_BAIL` and `NX_VERBOSE_LOGGING`.
 
-`--workspace <path>` works before or after the subcommand. Graph output paths
-are relative to the invocation directory; their parent directories must
-already exist. JSON output has no progress messages mixed into stdout.
-Errors go to stderr and return a nonzero exit code. Unknown commands and
-flags fail explicitly.
+On the commands that run tasks, `run` and its shorthand, `run-many` and
+`affected`, an option qk does not know, and a positional beyond the
+command's own, is forwarded to the requested tasks, as Nx's
+`unknown-options-as-args` forwards it: `qk test web --coverage` runs
+`web:test` with `--coverage`. They are forwarded in order and as spelled,
+followed by any arguments after `--`, which are forwarded unchanged. Nx
+drops the unknown options when a `--` is also given; qk keeps them. The
+other commands reject unknown options.
+
+As in Nx, the hidden `affected:build`, `affected:test`, `affected:lint` and
+`affected:e2e` run `affected` for that target, and `affected:graph` and
+`print-affected`, which Nx removed, fail with Nx's message.
+
+`--workspace <path>` works before or after the subcommand. As in Nx, a
+`graph --file` path is relative to the workspace root, its directories are
+created, and it must end in `.json`; qk has no HTML graph, so a `.html` file
+fails. JSON output has no progress messages mixed into stdout. Errors go to
+stderr and return a nonzero exit code. Unknown commands fail explicitly.
 
 
 ## `exec`
@@ -75,13 +98,17 @@ wrapped in double quotes and the result runs in the shell tasks use, so
   `npm_lifecycle_event`, the current directory's project runs the script's
   target instead, with the run options and any arguments beyond the
   script's own. That task runs the script again, which then takes the first
-  case, so a script such as `"build": "qk exec -- tsc"` is cached.
+  case, so a script such as `"build": "qk exec -- tsc"` is cached. Nx runs
+  `nx run` for it without the run options, and reads the extra arguments as
+  its own options; qk passes the options to the run and the arguments to the
+  task.
 - Otherwise it runs in each project `-p` and `--exclude` select, all by
   default, and in every project they depend on, dependencies first. The
   first failure stops it. `--exclude-task-dependencies` runs only the
   selected projects.
 
-A failing command exits with `1`, as in Nx. Only the package-script case
+The command is what follows `--`; as in Nx, other options `exec` does not
+know are ignored. A failing command exits with `1`, as in Nx. Only the package-script case
 runs a task, so the others refuse `--sandbox`, `--dry-run` and `--graph`
 rather than run the command without them.
 
@@ -97,22 +124,23 @@ These options apply to `run`, `run-many` and `affected`:
 | `--cores <count>` | Positive core budget; `QK_CORES`, then `qk:cores`, then available cores |
 | `--skip-cache` | Bypass all result caching and warm state |
 | `--skip-remote-cache` | Keep local caching only |
-| `--nx-bail` | Stop starting tasks after the first failure |
+| `--nx-bail` | Stop starting tasks after the first failure; `NX_BAIL=true` too |
 | `--nx-ignore-cycles` | Drop cycle-closing dependency edges with a warning |
 | `--exclude-task-dependencies` | Run only requested tasks |
 | `--graph[=<file>]` | Write Nx-shaped project/task graph without execution; default stdout |
 | `--dry-run` | Print qk's task graph; no dotenv, runtime inputs or executor preflight |
 | `--output-style <style>` | Select output behavior; see [Running tasks](../guides/running-tasks.md) |
-| `--verbose` | Set `NX_VERBOSE_LOGGING=true` for tasks |
+| `--verbose` | Set `NX_VERBOSE_LOGGING=true` for tasks, which otherwise see `false` unless it is set to `true`; print every task in full under `static-failures-only` |
 | `--sandbox[=audit\|enforce]` | Report (`audit`, macOS only) or refuse (`enforce`, macOS and Linux) what tasks read and write in the workspace beyond their declarations; skips the cache. See [Checking inputs in a sandbox](../guides/sandbox.md) |
 | `--sandbox-report <path>` | Write every sandbox finding as JSON |
 | `--report <path>` | Save JSON run report; defaults to `NX_RUN_REPORT` when set |
 | `--profile` | Print cache input and restore phase timings to stderr; see [Profiling cache operations](#profiling-cache-operations) |
-| `-- <args>` | Forward arguments to requested tasks |
+| `-- <args>` | Forward arguments to requested tasks, after any unknown options |
 
 `--parallel` alone uses `NX_PARALLEL`, otherwise `3`. Percentages are
 rounded down with a minimum of one task. `--skip-nx-cache` and
-`--disable-nx-cache` alias `--skip-cache`; `--disable-remote-cache` aliases
+`--disable-nx-cache` alias `--skip-cache`, as `NX_SKIP_NX_CACHE=true` and
+`NX_DISABLE_NX_CACHE=true` do; `--disable-remote-cache` aliases
 `--skip-remote-cache`. The corresponding environment flags are documented in
 [Environment variables](environment.md).
 
@@ -167,16 +195,20 @@ different work.
 | `--uncommitted` | Only uncommitted changes |
 | `--untracked` | Only untracked files |
 
-`show projects` change options imply `--affected`. `--stdin` preserves spaces
-in paths and conflicts with `--files`, `--uncommitted` and `--untracked`. For `show tasks`, use
+`show projects` change options imply `--affected`. As in Nx, `--head` needs
+`--base`; `--files`, `--stdin`, `--uncommitted` and `--untracked` exclude
+`--base`, `--head` and each other, except that the paths `--stdin` reads are
+added to `--files`. `--stdin` preserves spaces in paths. For `show tasks`, use
 `--affected` to filter the planned tasks. `affected --granularity task`
 selects by task inputs; `project` is the default.
 See [Affected selection](../guides/affected.md) for merge-base behavior.
 
 ## Selection and inspection
 
-`run-many`, `affected` and `show tasks` accept `-t/--targets`,
-`-p/--projects` and `--exclude`; lists accept commas, spaces or repeated flags.
+`run-many`, `affected` and `show tasks` accept `-t/--targets`
+(`--target` too), `-p/--projects` and `--exclude`; lists accept commas,
+spaces or repeated flags. `run-many` accepts Nx's deprecated `--all`, the
+default; `--all=false` without `--projects` selects nothing, as in Nx.
 `show projects` accepts `-p/--projects`, `--exclude`, `-t/--with-target`,
 `--type app|lib|e2e`, and `--sep`. `--sep` conflicts with `--json`. With
 `--affected`, `--affected-targets` lists the projects where a task of one of
@@ -207,7 +239,8 @@ effect.
 ## Accepted Nx options
 
 `--runner`, `--batch`, `--skip-sync`, `--cloud`, `--no-cloud`, `--dte`,
-`--no-dte`, `--agents`, `--tui`, `--no-tui`, and `--tui-auto-exit` are accepted without
+`--no-dte`, `--agents`, `--tui`, `--no-tui`, and `--tui-auto-exit`, and
+`--verbose` on `show projects`, are accepted without
 effect. They do not enable Nx plugins, distributed execution or Nx Cloud.
 As in Nx, `--runner` must name `default` or a runner in nx.json
 `tasksRunnerOptions`.
@@ -278,7 +311,9 @@ change shows as `definition.inputs reordered`.
 `qk watch -p web --includeDependencies -- <shell command>` watches the selected
 projects and, optionally, their project dependencies. `--all` watches all projects,
 including projects created after watch starts. `--initialRun` runs once before
-waiting for edits. The kebab-case aliases also work.
+waiting for edits. `-g/--includeGlobalWorkspaceFiles` also reacts to files
+that belong to no project, such as root configuration; as in Nx, a command
+naming `NX_PROJECT_NAME` is refused with it. The kebab-case aliases also work.
 
 Callbacks run from the invocation directory with `NX_PROJECT_NAME` and
 `NX_FILE_CHANGES` (workspace-relative paths joined with spaces). If the command
@@ -298,8 +333,9 @@ Workspaces using package presets or presets outside the workspace retain a reloa
 on every source batch, because preset resolution has inputs outside the source set.
 Ctrl+C cancels callbacks and their process groups and exits with 130. Ignored
 source files, node_modules, Git/qk state, configured caches, explicit target
-outputs and warm paths do not trigger callbacks. Global files outside any
-selected project do not trigger callbacks. Watch uses no daemon or Nx plugins.
+outputs and warm paths do not trigger callbacks. Files outside any selected
+project do not trigger callbacks, unless `-g` is given and they belong to no
+project at all. Watch uses no daemon or Nx plugins.
 
 ## Compatibility diagnostics
 

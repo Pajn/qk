@@ -38,6 +38,8 @@ use threads::Threads;
 pub struct RunResult {
     pub outcomes: BTreeMap<String, Outcome>,
     pub skipped: BTreeSet<String>,
+    /// As Nx's: 0 when every task succeeded, 130 when the run was
+    /// cancelled, and 1 when a task failed or was skipped.
     pub exit_code: i32,
     /// What happened to each task that started.
     pub tasks: BTreeMap<String, TaskRecord>,
@@ -118,6 +120,9 @@ pub struct Settings<'a> {
     /// Nx's `--nx-bail`: no task starts after one has failed.
     pub bail: bool,
     pub style: OutputStyle,
+    /// Whether the static styles stream long-running tasks rather than hold
+    /// their output: as in Nx, unless the user named a static style.
+    pub stream_long_running: bool,
     /// Run each task in macOS's sandbox, auditing or enforcing what it declares.
     pub sandbox: Option<sandbox::Mode>,
     /// Execute finite tasks under an advisory file-access recorder.
@@ -143,6 +148,7 @@ pub fn run(
         skip_cache,
         bail: bails,
         style,
+        stream_long_running,
         sandbox: sandbox_mode,
         analyze_inputs,
         expected,
@@ -178,6 +184,14 @@ pub fn run(
     // files over the process environment instead.
     let environment = environment(&workspace.root)?;
     let process_environment: BTreeMap<_, _> = std::env::vars_os().collect();
+    // The project a single requested task belongs to, whose tasks Nx shows
+    // in full under `static-failures-only`.
+    let initiating = match graph.roots.iter().collect::<Vec<_>>()[..] {
+        [root] => graph.tasks.get(root).map(|task| task.project.as_str()),
+        _ => None,
+    };
+    // Where `summary` keeps the output of the tasks that fail.
+    let logs = qk_cache::worktree_state(&workspace.root).join("terminal-outputs");
     // Validate every task before the first command can have side effects.
     let mut prepared = graph
         .tasks
@@ -194,12 +208,27 @@ pub fn run(
                     } else {
                         Display::for_task(
                             style,
-                            id,
+                            &qk_executor::printable(
+                                &task.project,
+                                &task.target,
+                                task.configuration.as_deref(),
+                                &task.args,
+                            ),
                             &task.project,
                             continuous,
                             graph.roots.contains(id),
+                            initiating == Some(task.project.as_str()),
+                            streams(task, stream_long_running),
                         )
                     };
+                    if style == OutputStyle::Summary
+                        && let Display::Failures { log, .. } = &mut prepared.display
+                    {
+                        let path = logs.join(log_name(id));
+                        // Only this run's failure may name a log.
+                        let _ = std::fs::remove_file(&path);
+                        *log = Some(path);
+                    }
                     (id.clone(), prepared)
                 })
         })
@@ -343,11 +372,15 @@ pub fn run(
         .tasks
         .values()
         .any(|task| task.definition.cache == Some(true));
-    let cache = if skip_cache {
-        (sandbox.is_none() && !analyze_inputs && cacheable)
-            .then(|| qk_cache::Cache::for_observation(workspace))
+    // As in Nx, every task is hashed, and sees its hash as NX_TASK_HASH,
+    // whether or not anything can be cached; a run that cannot use the
+    // cache only observes. A sandboxed or recorded task runs as it is.
+    let cache = if sandbox.is_some() || analyze_inputs {
+        None
+    } else if skip_cache || !(warm || cacheable) {
+        Some(qk_cache::Cache::for_observation(workspace))
     } else {
-        (warm || cacheable).then(|| qk_cache::Cache::for_workspace(workspace, &environment))
+        Some(qk_cache::Cache::for_workspace(workspace, &environment))
     };
     let mut skipped = BTreeSet::new();
     let mut exit_code = 0;
@@ -820,9 +853,11 @@ pub fn run(
                             });
                             match outcome {
                                 Outcome::Success => {}
-                                Outcome::Failed(code) => {
+                                Outcome::Failed(_) => {
+                                    // As in Nx, a failure fails the run with 1,
+                                    // whatever the task's own code.
                                     if exit_code == 0 {
-                                        exit_code = code;
+                                        exit_code = 1;
                                     }
                                     bailed |= bails;
                                 }
@@ -867,6 +902,9 @@ pub fn run(
     }
     if cancelled.load(Ordering::SeqCst) {
         exit_code = 130;
+    } else if !skipped.is_empty() {
+        // A skipped task fails the run too, as in Nx.
+        exit_code = exit_code.max(1);
     }
     let sandbox = sandbox
         .map(|sandbox| -> Result<SandboxResult> {
@@ -892,6 +930,45 @@ pub fn run(
         sandbox,
         input_analysis,
     })
+}
+
+/// Whether a task's output streams rather than being held, as Nx decides
+/// it: `NX_STREAM_OUTPUT` when it says, else for a long-running task, one
+/// that is continuous, runs with `--watch` or has a server's target name.
+fn streams(task: &qk_taskgraph::Task, long_running: bool) -> bool {
+    match std::env::var("NX_STREAM_OUTPUT").as_deref() {
+        Ok("true") => return true,
+        Ok("false") => return false,
+        _ => {}
+    }
+    let watching = task.args.iter().any(|arg| {
+        arg == "--watch"
+            || arg
+                .strip_prefix("--watch=")
+                .is_some_and(|value| value != "false")
+    });
+    let target = &task.target;
+    long_running
+        && (task.definition.continuous == Some(true)
+            || watching
+            || target.ends_with(":watch")
+            || target.ends_with("-watch")
+            || matches!(target.as_str(), "serve" | "dev" | "start"))
+}
+
+/// The file `summary` keeps a failed task's output in: its id, with every
+/// byte a file name cannot hold, and `_` itself, written as `_` and its hex
+/// value, so two ids never share a file.
+pub fn log_name(id: &str) -> String {
+    let mut name = String::new();
+    for byte in id.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.') {
+            name.push(char::from(byte));
+        } else {
+            name.push_str(&format!("_{byte:02x}"));
+        }
+    }
+    format!("{name}.log")
 }
 
 /// What the sampler last saw of memory, in bytes.
@@ -960,6 +1037,11 @@ mod tests {
     use super::Expected;
     use std::time::Duration;
 
+    #[test]
+    fn distinct_task_ids_log_to_distinct_files() {
+        assert_ne!(super::log_name("a:b_c"), super::log_name("a_b:c"));
+        assert_eq!(super::log_name("app:build"), "app_3abuild.log");
+    }
     #[test]
     fn remaining_work_accounts_for_the_current_allocation() {
         let expected = Expected {

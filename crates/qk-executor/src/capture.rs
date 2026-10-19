@@ -3,7 +3,8 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// How a task's output reaches the terminal, after Nx's output styles.
+/// How a task's output reaches the terminal, after Nx's output styles. Where
+/// a task is named, it is as Nx prints it after `nx run`: see [`printable`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Display {
     /// Straight through, as the task writes it: Nx's `stream-without-prefixes`.
@@ -11,19 +12,26 @@ pub enum Display {
     Stream,
     /// Each non-empty line behind the given prefix: Nx's `stream`.
     Prefixed(String),
-    /// Held until the task ends, then printed under `> qk run <id>`: Nx's
+    /// Held until the task ends, then printed under `> nx run <task>`: Nx's
     /// `static`. `group` folds each task into a GitHub Actions log group, and
     /// `cached` shows a cache hit's log rather than only its header.
+    /// `collapse`, for Nx's `static-failures-only`, prints a task that did not
+    /// fail as one line instead.
     Static {
         id: String,
         group: bool,
         cached: bool,
+        collapse: bool,
     },
-    /// Straight through under `> qk run <id>`: the task a static `run` is for.
+    /// Straight through under `> nx run <task>`: the task a static `run` is for.
     Headed { id: String },
     /// Held until the task ends, and printed under a header only if it
-    /// failed: for the quiet and dynamic styles.
-    Failures { id: String },
+    /// failed: for the quiet and dynamic styles. With `log`, for Nx's
+    /// `summary`, a failure's output goes to that file instead.
+    Failures {
+        id: String,
+        log: Option<std::path::PathBuf>,
+    },
     /// Not shown at all.
     Hidden,
 }
@@ -41,30 +49,95 @@ pub enum Shown {
 
 impl Display {
     /// The display for a task under an output style. Continuous tasks never end
-    /// on their own, so held output would never appear; they stream prefixed.
-    /// `root` is a task the run was asked for, rather than a dependency.
+    /// on their own, so held output would never appear; they stream.
+    /// `id` names the task as [`printable`] does. `root` is a task the run was
+    /// asked for, rather than a dependency, and `initiating` a task of the
+    /// project a single task was asked for, which `static-failures-only`
+    /// shows in full, as Nx does. `streams` is a task whose output Nx
+    /// streams rather than holding it.
     pub fn for_task(
         style: OutputStyle,
         id: &str,
         project: &str,
         continuous: bool,
         root: bool,
+        initiating: bool,
+        streams: bool,
     ) -> Self {
-        match style {
-            OutputStyle::StreamWithoutPrefixes => Self::Stream,
-            OutputStyle::RunOne if root && !continuous => Self::Headed { id: id.to_owned() },
-            OutputStyle::Static | OutputStyle::RunOne if !continuous => Self::Static {
-                id: id.to_owned(),
-                group: std::env::var_os("GITHUB_ACTIONS").is_some()
-                    && std::env::var_os("NX_SKIP_LOG_GROUPING").is_none_or(|value| value != "true"),
-                cached: style == OutputStyle::Static,
-            },
-            OutputStyle::Quiet => Self::Failures { id: id.to_owned() },
-            OutputStyle::Static | OutputStyle::RunOne | OutputStyle::Stream => {
+        use OutputStyle::*;
+        let run_one = matches!(style, RunOne | RunOneFailuresOnly);
+        let held = matches!(
+            style,
+            Static | RunOne | StaticFailuresOnly | RunOneFailuresOnly
+        );
+        // As in Nx, a task streamed under another style is prefixed only when
+        // NX_PREFIX_OUTPUT is `true`, which `--output-style=stream` sets.
+        let streamed = || {
+            if std::env::var_os("NX_PREFIX_OUTPUT").is_some_and(|value| value == "true") {
                 Self::Prefixed(prefix(project))
+            } else {
+                Self::Stream
             }
+        };
+        match style {
+            StreamWithoutPrefixes => Self::Stream,
+            _ if run_one && root && !continuous => Self::Headed { id: id.to_owned() },
+            _ if held && streams && !continuous => streamed(),
+            Static | RunOne | StaticFailuresOnly | RunOneFailuresOnly if !continuous => {
+                Self::Static {
+                    id: id.to_owned(),
+                    group: std::env::var_os("GITHUB_ACTIONS").is_some()
+                        && std::env::var_os("NX_SKIP_LOG_GROUPING")
+                            .is_none_or(|value| value != "true"),
+                    cached: style == Static,
+                    collapse: style == StaticFailuresOnly
+                        || (style == RunOneFailuresOnly && !initiating),
+                }
+            }
+            Quiet => Self::Failures {
+                id: id.to_owned(),
+                log: None,
+            },
+            Summary if !continuous => Self::Failures {
+                id: id.to_owned(),
+                log: None,
+            },
+            Stream => Self::Prefixed(prefix(project)),
+            Static | RunOne | StaticFailuresOnly | RunOneFailuresOnly | Summary => streamed(),
         }
     }
+}
+
+/// A task as Nx names it after `nx run`: `project:target`, the target quoted
+/// when it has a colon, then `:configuration` and the task's arguments.
+pub fn printable(
+    project: &str,
+    target: &str,
+    configuration: Option<&str>,
+    args: &[String],
+) -> String {
+    let mut text = if target.contains(':') {
+        format!("{project}:\"{target}\"")
+    } else {
+        format!("{project}:{target}")
+    };
+    if let Some(configuration) = configuration {
+        text.push(':');
+        text.push_str(configuration);
+    }
+    for arg in args {
+        text.push(' ');
+        text.push_str(arg);
+    }
+    text
+}
+
+/// How many tasks `static-failures-only` printed as one line, for the hint
+/// the run ends with.
+static COLLAPSED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn collapsed() -> usize {
+    COLLAPSED.load(Ordering::SeqCst)
 }
 
 /// The output styles qk renders.
@@ -77,6 +150,14 @@ pub enum OutputStyle {
     /// under its header, and its dependencies are held, with only the headers
     /// of cache hits.
     RunOne,
+    /// Nx's `static-failures-only`: `static`, but a task that did not fail
+    /// is one line.
+    StaticFailuresOnly,
+    /// `static-failures-only` for one requested task: the tasks of its
+    /// project as `RunOne` shows them, the others as one line unless they fail.
+    RunOneFailuresOnly,
+    /// Nx's `summary`: no task output, failures' output kept in files.
+    Summary,
     /// Only failed tasks' output, for the quiet and dynamic styles.
     Quiet,
 }
@@ -260,10 +341,13 @@ impl Spool {
 }
 
 /// picocolors' rule: colour unless NO_COLOR, when forced, in CI, or on a
-/// terminal that is not dumb.
+/// terminal that is not dumb. `FORCE_COLOR=0` turns it off.
 fn colour() -> bool {
     use std::io::IsTerminal;
     let set = |name| std::env::var_os(name).is_some();
+    if crate::force_colour() == Some(false) {
+        return false;
+    }
     !set("NO_COLOR")
         && (set("FORCE_COLOR")
             || cfg!(windows)
@@ -330,11 +414,24 @@ impl Printer {
     fn finish(&self, shown: Shown) -> io::Result<()> {
         match &self.display {
             Display::Stream | Display::Headed { .. } | Display::Hidden => Ok(()),
-            Display::Failures { id } => {
+            Display::Failures {
+                log: Some(path), ..
+            } => {
+                let mut held = std::mem::take(&mut *self.held.lock().unwrap());
+                if shown == Shown::Failure {
+                    if let Some(directory) = path.parent() {
+                        std::fs::create_dir_all(directory)?;
+                    }
+                    let mut file = File::create(path)?;
+                    held.visit(|bytes| file.write_all(bytes))?;
+                }
+                Ok(())
+            }
+            Display::Failures { id, log: None } => {
                 let mut held = std::mem::take(&mut *self.held.lock().unwrap());
                 if shown == Shown::Failure {
                     crate::report::output_batch(|output| -> io::Result<()> {
-                        output(false, format!("\n✖ qk run {id} failed\n\n").as_bytes());
+                        output(false, format!("\n✖ nx run {id} failed\n\n").as_bytes());
                         held.visit(|bytes| {
                             output(false, bytes);
                             Ok(())
@@ -355,7 +452,21 @@ impl Printer {
                 }
                 Ok(())
             }
-            Display::Static { id, group, cached } => {
+            Display::Static {
+                id, collapse: true, ..
+            } if shown != Shown::Failure => {
+                // Nx's `logCommandSummary`: a tick, then the task on one line.
+                drop(std::mem::take(&mut *self.held.lock().unwrap()));
+                COLLAPSED.fetch_add(1, Ordering::SeqCst);
+                let line = format!("✔  nx run {id}{}\n", status(shown));
+                crate::report::output_batch(|output| -> io::Result<()> {
+                    output(false, line.as_bytes());
+                    Ok(())
+                })
+            }
+            Display::Static {
+                id, group, cached, ..
+            } => {
                 let mut held = std::mem::take(&mut *self.held.lock().unwrap());
                 if !cached && matches!(shown, Shown::LocalCache | Shown::RemoteCache | Shown::Kept)
                 {
@@ -390,15 +501,20 @@ impl Printer {
     }
 }
 
-/// `> qk run <id>`, marked when the output came from the cache.
+/// `> nx run <task>`, marked when the output came from the cache, as Nx
+/// prints it, since tools read logs by it.
 fn header(id: &str, shown: Shown) -> String {
-    let status = match shown {
+    format!("> nx run {id}{}", status(shown))
+}
+
+/// Where a task's output came from, as Nx marks it after the task.
+fn status(shown: Shown) -> &'static str {
+    match shown {
         Shown::LocalCache => "  [local cache]",
         Shown::RemoteCache => "  [remote cache]",
         Shown::Kept => "  [existing outputs match the cache, left as is]",
         Shown::Success | Shown::Failure => "",
-    };
-    format!("> qk run {id}{status}")
+    }
 }
 
 /// Nx's `formatPrefixedLines`: every non-empty line behind the prefix.
@@ -675,7 +791,10 @@ mod tests {
 
     #[test]
     fn held_output_spills_without_losing_binary_stream_order() {
-        let printer = Printer::new(Display::Failures { id: "large".into() });
+        let printer = Printer::new(Display::Failures {
+            id: "large".into(),
+            log: None,
+        });
         let chunk = [0, 255, b'x', b'\n'].repeat(4096);
         for index in 0..32 {
             printer.write(index % 2 == 1, &chunk).unwrap();

@@ -281,7 +281,7 @@ fn dependency_diamond_runs_once_before_dependents_and_streams_raw_output() {
 }
 
 #[test]
-fn failure_preserves_exit_code_skips_dependents_and_runs_independent_roots() {
+fn failure_exits_with_1_skips_dependents_and_runs_independent_roots() {
     let temp = fixture(json!({
         "build":{"command":"echo wrong> must-not-exist", "dependsOn":["fail"]},
         "fail":{"command":"exit 7"},
@@ -291,7 +291,7 @@ fn failure_preserves_exit_code_skips_dependents_and_runs_independent_roots() {
         temp.path(),
         &["run-many", "-t", "build,independent", "--parallel", "1"],
     );
-    assert_eq!(output.status.code(), Some(7));
+    assert_eq!(output.status.code(), Some(1));
     assert!(!temp.path().join("must-not-exist").exists());
     assert!(temp.path().join("independent").exists());
     // Quiet, the default off a terminal, names both in its summary.
@@ -441,7 +441,7 @@ fn command_lists_support_sequential_order_and_stop_on_failure() {
         "commands":["echo first> order.txt", "exit 9", "echo wrong> must-not-exist"], "parallel":false
     }}}));
     let output = run(temp.path(), &["run", "app:build"]);
-    assert_eq!(output.status.code(), Some(9));
+    assert_eq!(output.status.code(), Some(1));
     assert!(temp.path().join("order.txt").exists());
     assert!(!temp.path().join("must-not-exist").exists());
 }
@@ -611,19 +611,24 @@ fn missing_scripts_fail_at_execution_without_running_dependencies() {
     assert!(!temp.path().join("must-not-exist").exists());
 }
 
+#[cfg(unix)]
 #[test]
-fn malformed_dotenv_does_not_expose_secret_values() {
-    let temp = fixture(json!({"test":{"executor":"nx:noop"}}));
+fn dotenv_files_are_read_as_npm_dotenv_reads_them() {
+    let temp = fixture(
+        json!({"show": {"command": "printf '%s|' \"$UNCLOSED\" \"$QUOTED\" \"$EXPANDED\" \"$MULTI\""}}),
+    );
+    // A line it cannot read as quoted is read unquoted, as npm's dotenv does;
+    // single quotes do not stop expansion, as dotenv-expand has it.
     fs::write(
         temp.path().join(".env"),
-        "QK_TEST_SECRET='secret-without-closing-quote",
+        "UNCLOSED='no closing quote\nQUOTED='$UNCLOSED'\nEXPANDED=${MISSING:-default}\nMULTI=\"one\ntwo\"\nnot a variable\n",
     )
     .unwrap();
-    let output = run(temp.path(), &["run", "app:test"]);
-    assert!(!output.status.success());
-    let error = String::from_utf8_lossy(&output.stderr);
-    assert!(error.contains("invalid dotenv"));
-    assert!(!error.contains("secret-without-closing-quote"));
+    let output = success(run(temp.path(), &["run", "app:show"]));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "'no closing quote|'no closing quote|default|one\ntwo|"
+    );
 }
 
 #[cfg(unix)]
@@ -643,8 +648,9 @@ fn failed_parallel_command_terminates_its_running_sibling() {
 
 #[cfg(unix)]
 #[test]
-fn cancellation_terminates_descendants_and_returns_130() {
-    for signal in ["-INT", "-TERM"] {
+fn cancellation_terminates_descendants_and_exits_as_the_signal() {
+    // As Nx's signalToCode: 128 plus the signal's number.
+    for (signal, code) in [("-INT", 130), ("-TERM", 143), ("-HUP", 129)] {
         let temp = fixture(json!({"long":helper_target("tree", "tree")}));
         let mut child = command(temp.path(), &["run", "app:long"])
             .stdout(Stdio::null())
@@ -672,7 +678,7 @@ fn cancellation_terminates_descendants_and_returns_130() {
             }
             std::thread::sleep(Duration::from_millis(10));
         };
-        assert_eq!(status.code(), Some(130));
+        assert_eq!(status.code(), Some(code), "{signal}");
         let before = fs::read(temp.path().join("heartbeat")).unwrap();
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(
@@ -681,6 +687,39 @@ fn cancellation_terminates_descendants_and_returns_130() {
             "descendant survived {signal}"
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_command_ignoring_sigterm_is_killed_after_the_grace_period() {
+    let temp = fixture(json!({"stubborn": {"command": "trap '' TERM; touch started; sleep 30"}}));
+    let mut child = command(temp.path(), &["run", "app:stubborn"])
+        .env("NX_PROCESS_KILL_GRACE_PERIOD", "200")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for(&temp.path().join("started"));
+    let sent = Instant::now();
+    assert!(
+        Command::new("/bin/kill")
+            .arg("-INT")
+            .arg(child.id().to_string())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if sent.elapsed() > Duration::from_secs(4) {
+            let _ = child.kill();
+            panic!("the grace period was not applied");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(status.code(), Some(130));
 }
 
 fn continuous_target(mode: &str, id: &str) -> Value {
@@ -813,7 +852,7 @@ fn continuous_roots_run_until_cancelled() {
 fn continuous_task_exiting_on_its_own_reports_its_exit_code() {
     let temp = fixture(json!({"serve": continuous_target("exit-3", "serve")}));
     let output = run(temp.path(), &["run", "app:serve"]);
-    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(output.status.code(), Some(1));
 }
 
 fn threaded_helper(id: &str, continuous: bool) -> Value {
@@ -1059,6 +1098,7 @@ fn output_styles_follow_nx() {
             .env_remove("NX_DEFAULT_OUTPUT_STYLE")
             .env_remove("GITHUB_ACTIONS")
             .env_remove("CI")
+            .env_remove("GITHUB_ACTIONS")
             .env("NO_COLOR", "1")
             .output()
             .unwrap();
@@ -1082,13 +1122,13 @@ fn output_styles_follow_nx() {
     assert_eq!(stdout(&["run-many", "-t", "build"]), "");
     assert_eq!(
         stdout(&["run-many", "-t", "fail"]),
-        "\n✖ qk run app:fail failed\n\nbroken\n"
+        "\n✖ nx run app:fail failed\n\nbroken\n"
     );
     assert_eq!(stdout(&["run", "app:build"]), "one\ntwo\n");
     // Held output of a failing task still appears.
     assert!(
         stdout(&["run-many", "-t", "fail", "--output-style", "tui"])
-            .contains("> qk run app:fail\n\nbroken")
+            .contains("> nx run app:fail\n\nbroken")
     );
 
     // A cache hit replays its log under the same header, marked as such; with
@@ -1096,7 +1136,7 @@ fn output_styles_follow_nx() {
     stdout(&["run-many", "-t", "cached", "--output-style", "static"]);
     assert_eq!(
         stdout(&["run-many", "-t", "cached", "--output-style", "static"]),
-        "\n> qk run app:cached  [existing outputs match the cache, left as is]\n\ncached\n"
+        "\n> nx run app:cached  [existing outputs match the cache, left as is]\n\ncached\n"
     );
 
     let grouped = command(
@@ -1111,8 +1151,242 @@ fn output_styles_follow_nx() {
         .replace("\r\n", "\n")
         .replace(" \n", "\n");
     assert!(
-        grouped.starts_with("\n::group::✅ > qk run app:build\n\none\ntwo\n::endgroup::\n"),
+        grouped.starts_with("\n::group::✅ > nx run app:build\n\none\ntwo\n::endgroup::\n"),
         "{grouped}"
+    );
+}
+
+/// Runs qk outside CI, without colour, and returns its stdout and stderr.
+fn plain(root: &Path, args: &[&str], env: &[(&str, &str)]) -> (String, String, Option<i32>) {
+    let output = command(root, args)
+        .env_remove("NX_DEFAULT_OUTPUT_STYLE")
+        .env("NO_COLOR", "1")
+        .envs(env.iter().copied())
+        .output()
+        .unwrap();
+    let text = |bytes: Vec<u8>| {
+        String::from_utf8(bytes)
+            .unwrap()
+            .replace("\r\n", "\n")
+            .replace(" \n", "\n")
+    };
+    (
+        text(output.stdout),
+        text(output.stderr),
+        output.status.code(),
+    )
+}
+
+#[test]
+fn static_failures_only_collapses_what_did_not_fail_as_nx_does() {
+    let temp = fixture(json!({
+        "dep": {"command": "echo dep-output"},
+        "build": {"command": "echo built", "dependsOn": ["dep"]},
+        "fail": {"command": "echo broken && exit 3"}
+    }));
+    let (stdout, stderr, _) = plain(
+        temp.path(),
+        &[
+            "run-many",
+            "-t",
+            "dep",
+            "fail",
+            "--output-style",
+            "static-failures-only",
+        ],
+        &[],
+    );
+    assert!(stdout.contains("✔  nx run app:dep\n"), "{stdout}");
+    assert!(!stdout.contains("dep-output"), "{stdout}");
+    assert!(stdout.contains("> nx run app:fail\n\nbroken"), "{stdout}");
+    assert!(
+        stderr.contains(
+            "Output of 1 successful task was not shown. Run with --verbose or --output-style=static to see it."
+        ),
+        "{stderr}"
+    );
+    // --verbose prints every task in full, as `static` does.
+    let (stdout, _, _) = plain(
+        temp.path(),
+        &[
+            "run-many",
+            "-t",
+            "dep",
+            "--output-style",
+            "static-failures-only",
+            "--verbose",
+        ],
+        &[],
+    );
+    assert!(
+        stdout.contains("> nx run app:dep\n\ndep-output"),
+        "{stdout}"
+    );
+    // A single task shows its own project's tasks in full, and the others
+    // collapsed; NX_DEFAULT_OUTPUT_STYLE names the style too.
+    let (stdout, _, _) = plain(
+        temp.path(),
+        &["run", "app:build"],
+        &[("NX_DEFAULT_OUTPUT_STYLE", "static-failures-only")],
+    );
+    assert!(
+        stdout.contains("> nx run app:dep\n\ndep-output"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("> nx run app:build\n\nbuilt"), "{stdout}");
+}
+
+#[test]
+fn summary_prints_counts_and_where_failed_output_is() {
+    let temp = fixture(json!({
+        "ok": {"command": "echo fine"},
+        "fail": {"command": "echo broken && exit 3"},
+        "after": {"command": "echo never", "dependsOn": ["fail"]}
+    }));
+    let (stdout, stderr, _) = plain(
+        temp.path(),
+        &["run-many", "-t", "ok", "after", "--output-style=summary"],
+        &[],
+    );
+    assert!(
+        !stdout.contains("fine") && !stdout.contains("broken"),
+        "{stdout}"
+    );
+    assert!(
+        stderr.contains("3 tasks: 1 succeeded, 1 failed, 1 skipped"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("✖ nx run app:fail\n"), "{stderr}");
+    let log = stderr
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("full log: "))
+        .unwrap_or_else(|| panic!("{stderr}"));
+    // On Windows, cmd writes `broken \r\n`.
+    assert_eq!(fs::read_to_string(log).unwrap().trim_end(), "broken");
+    assert!(stderr.contains("Re-run with --output-style=static to inline logs."));
+}
+
+/// A task that fails before it prints anything, as one waiting for a server
+/// that exits does, names no log, rather than an earlier run's.
+#[cfg(unix)]
+#[test]
+fn summary_never_names_an_earlier_run_s_log() {
+    let temp = fixture(json!({"e2e": {"command": "echo broken && exit 3"}}));
+    let (_, stderr, _) = plain(
+        temp.path(),
+        &["run", "app:e2e", "--output-style=summary"],
+        &[],
+    );
+    assert!(stderr.contains("full log: "), "{stderr}");
+    fs::write(
+        temp.path().join("project.json"),
+        json!({"name": "app", "targets": {
+            "serve": {"continuous": true, "readyWhen": {"logMatches": "never"}, "command": "exit 0"},
+            "e2e": {"command": "echo e2e-ran", "dependsOn": [{"target": "serve", "waitFor": "ready"}]}
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let (_, stderr, code) = plain(
+        temp.path(),
+        &["run", "app:e2e", "--output-style=summary"],
+        &[],
+    );
+    assert_ne!(code, Some(0));
+    assert!(stderr.contains("exited before it became ready"), "{stderr}");
+    assert!(!stderr.contains("full log: "), "{stderr}");
+}
+
+#[test]
+fn unknown_output_styles_fail_and_unknown_defaults_are_ignored() {
+    let temp = fixture(json!({"build": {"command": "echo built"}}));
+    let (_, stderr, code) = plain(
+        temp.path(),
+        &["run", "app:build", "--output-style=fancy"],
+        &[],
+    );
+    assert_eq!(code, Some(2));
+    assert!(stderr.contains("fancy"), "{stderr}");
+    let (stdout, _, code) = plain(
+        temp.path(),
+        &["run", "app:build"],
+        &[("NX_DEFAULT_OUTPUT_STYLE", "fancy")],
+    );
+    assert_eq!((stdout.as_str(), code), ("built\n", Some(0)));
+}
+
+#[test]
+fn ci_is_detected_as_nx_detects_it() {
+    let temp = fixture(json!({"build": {"command": "echo built"}}));
+    // In CI a run defaults to static, which heads each task; CI=0 is CI.
+    for env in [[("CI", "0")], [("BUILDKITE", "true")]] {
+        let (stdout, _, _) = plain(temp.path(), &["run-many", "-t", "build"], &env);
+        assert!(
+            stdout.contains("> nx run app:build\n\nbuilt"),
+            "{env:?}: {stdout}"
+        );
+    }
+    let (stdout, _, _) = plain(
+        temp.path(),
+        &["run-many", "-t", "build"],
+        &[("CI", "false")],
+    );
+    assert_eq!(stdout, "");
+}
+
+#[test]
+fn force_color_zero_keeps_qk_output_plain() {
+    let temp = fixture(json!({"fail": {"command": "exit 3"}}));
+    let output = command(
+        temp.path(),
+        &["run-many", "-t", "fail", "--output-style", "static"],
+    )
+    .env("CI", "true")
+    .env("FORCE_COLOR", "0")
+    .env_remove("NO_COLOR")
+    .output()
+    .unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("Running target fail"), "{stderr}");
+    assert!(!stderr.contains('\x1b'), "{stderr:?}");
+}
+
+#[test]
+fn long_running_targets_stream_unless_a_static_style_is_named() {
+    let temp = fixture(json!({
+        "serve": {"command": "echo serving"},
+        "build": {"command": "echo built"}
+    }));
+    // CI defaults to static without naming it, so a server's output streams,
+    // without a prefix unless NX_PREFIX_OUTPUT asks for one, as in Nx.
+    let (stdout, _, _) = plain(
+        temp.path(),
+        &["run-many", "-t", "serve", "build"],
+        &[("CI", "true")],
+    );
+    assert!(stdout.lines().any(|line| line == "serving"), "{stdout}");
+    assert!(stdout.contains("> nx run app:build\n\nbuilt"), "{stdout}");
+    let (stdout, _, _) = plain(
+        temp.path(),
+        &["run-many", "-t", "serve"],
+        &[("CI", "true"), ("NX_PREFIX_OUTPUT", "true")],
+    );
+    assert!(stdout.contains("app: serving"), "{stdout}");
+    let (stdout, _, _) = plain(
+        temp.path(),
+        &["run-many", "-t", "serve", "--output-style", "static"],
+        &[],
+    );
+    assert!(stdout.contains("> nx run app:serve\n\nserving"), "{stdout}");
+    // NX_STREAM_OUTPUT decides for every task.
+    let (stdout, _, _) = plain(
+        temp.path(),
+        &["run-many", "-t", "build", "--output-style", "static"],
+        &[("NX_STREAM_OUTPUT", "true")],
+    );
+    assert!(
+        stdout.contains("built") && !stdout.contains("> nx run"),
+        "{stdout}"
     );
 }
 
@@ -1153,7 +1427,7 @@ fn large_output_preserves_static_groups_quiet_failures_and_long_line_prefixes() 
     };
     let output = success(invoke("a,b", "static"));
     for id in ["a", "b"] {
-        let header = format!("::group::✅ > qk run app:{id}\n\n");
+        let header = format!("::group::✅ > nx run app:{id}\n\n");
         let start = output
             .stdout
             .windows(header.len())
@@ -1180,7 +1454,7 @@ fn large_output_preserves_static_groups_quiet_failures_and_long_line_prefixes() 
     assert!(
         failed
             .stdout
-            .starts_with("\n✖ qk run app:fail failed\n\n".as_bytes())
+            .starts_with("\n✖ nx run app:fail failed\n\n".as_bytes())
     );
     assert!(failed.stdout.ends_with(&body("fail")));
 
@@ -1222,7 +1496,7 @@ fn a_static_run_streams_its_task_between_banners_like_nx_run() {
     let (stdout, stderr) = run("app:build");
     assert_eq!(
         stdout,
-        "\n::group::✅ > qk run app:dep\n\ndep\n::endgroup::\n\n> qk run app:build\n\nbuilt\n"
+        "\n::group::✅ > nx run app:dep\n\ndep\n::endgroup::\n\n> nx run app:build\n\nbuilt\n"
     );
     assert!(
         stderr.starts_with(
@@ -1241,7 +1515,7 @@ fn a_static_run_streams_its_task_between_banners_like_nx_run() {
     let (stdout, _) = run("app:build");
     assert!(
         stdout.starts_with(
-            "\n::group::⏩ > qk run app:dep  [existing outputs match the cache, left as is]\n\n::endgroup::\n"
+            "\n::group::⏩ > nx run app:dep  [existing outputs match the cache, left as is]\n\n::endgroup::\n"
         ),
         "{stdout}"
     );
@@ -1296,6 +1570,149 @@ fn tasks_load_their_dotenv_files_and_nx_variables_like_nx() {
 
 #[cfg(unix)]
 #[test]
+fn a_task_s_dotenv_files_expand_across_each_other_as_in_nx() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    fs::write(root.join("nx.json"), "{}").unwrap();
+    fs::create_dir_all(root.join("app")).unwrap();
+    fs::write(
+        root.join("app/project.json"),
+        json!({"name": "app", "targets": {"show": {"command": "echo $URL $FROM_ROOT"}}})
+            .to_string(),
+    )
+    .unwrap();
+    // The project's file names what only the root's defines.
+    fs::write(root.join("app/.env.show"), "URL=http://${HOST}:${PORT}\n").unwrap();
+    fs::write(
+        root.join(".env"),
+        "HOST=localhost\nPORT=8080\nFROM_ROOT=$HOST\n",
+    )
+    .unwrap();
+    let output = success(command(root, &["run", "app:show"]).output().unwrap());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "http://localhost:8080 localhost\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn root_dotenv_files_set_run_controls_as_in_nx() {
+    let temp = fixture(json!({"build": {"command": "echo built"}}));
+    // The root dotenv files load into qk's own environment, `.local.env`
+    // first.
+    fs::write(
+        temp.path().join(".local.env"),
+        "NX_DEFAULT_OUTPUT_STYLE=static\n",
+    )
+    .unwrap();
+    fs::write(temp.path().join(".env"), "NX_DEFAULT_OUTPUT_STYLE=stream\n").unwrap();
+    let output = command(temp.path(), &["run-many", "-t", "build"])
+        .env_remove("NX_DEFAULT_OUTPUT_STYLE")
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("> nx run app:build"), "{stdout}");
+    // NX_LOAD_DOT_ENV_FILES=false leaves them out.
+    let output = command(temp.path(), &["run-many", "-t", "build"])
+        .env_remove("NX_DEFAULT_OUTPUT_STYLE")
+        .env("NX_LOAD_DOT_ENV_FILES", "false")
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
+}
+
+#[cfg(unix)]
+#[test]
+fn without_dotenv_files_a_shell_variable_matching_a_root_file_stays() {
+    let temp = fixture(json!({"show": {"command": "echo url=$API_URL"}}));
+    fs::write(temp.path().join(".env"), "API_URL=x\n").unwrap();
+    let output = command(temp.path(), &["run", "app:show"])
+        .env("NX_LOAD_DOT_ENV_FILES", "false")
+        .env("API_URL", "x")
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(success(output).stdout).unwrap(),
+        "url=x\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_atomized_target_reads_its_own_dotenv_files() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    fs::write(root.join("nx.json"), "{}").unwrap();
+    fs::create_dir_all(root.join("app")).unwrap();
+    let atomized = |spec: &str| json!({"command": "echo $SPEC", "metadata": {"nonAtomizedTarget": "e2e-ci", "spec": spec}});
+    fs::write(
+        root.join("app/project.json"),
+        json!({
+            "name": "app",
+            "metadata": {"targetGroups": {"E2E (CI)": ["e2e-ci--a", "e2e-ci--b", "e2e-ci"]}},
+            "targets": {
+                "e2e-ci--a": atomized("a"),
+                "e2e-ci--b": atomized("b"),
+                "e2e-ci": {"executor": "nx:noop"},
+            },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(root.join("app/.env.e2e-ci--a"), "SPEC=a\n").unwrap();
+    fs::write(root.join("app/.env.e2e-ci--b"), "SPEC=b\n").unwrap();
+    let output = success(command(root, &["run", "app:e2e-ci--b"]).output().unwrap());
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "b\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn tasks_see_the_variables_nx_sets_and_not_those_of_an_enclosing_run() {
+    let temp = fixture(json!({
+        "test": {"command": "echo verbose=$NX_VERBOSE_LOGGING capture=$NX_TERMINAL_CAPTURE_STDERR cli=$NX_SET_CLI stream=$NX_STREAM_OUTPUT hash=${NX_TASK_HASH:+set} pids=$NX_INVOCATION_ANCESTOR_PIDS"}
+    }));
+    let output = command(temp.path(), &["run", "app:test"])
+        .env_remove("NX_VERBOSE_LOGGING")
+        .env("NX_SET_CLI", "true")
+        .env("NX_STREAM_OUTPUT", "true")
+        .env("NX_INVOCATION_ANCESTOR_PIDS", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(success(output).stdout).unwrap();
+    let pids = stdout.trim().rsplit_once("pids=").unwrap().1.to_owned();
+    assert!(pids.starts_with("1,") && pids.len() > 2, "{stdout}");
+    assert!(
+        stdout.starts_with("verbose=false capture=true cli= stream= hash=set "),
+        "{stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_task_running_itself_again_is_refused_as_in_nx() {
+    let qk = env!("CARGO_BIN_EXE_qk");
+    let temp = fixture(json!({
+        "loop": {"command": format!("'{qk}' run app:loop")},
+        "outer": {"command": format!("'{qk}' run app:inner")},
+        "inner": {"command": "echo inner"}
+    }));
+    let output = run(temp.path(), &["run", "app:loop"]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Recursive task invocation detected")
+            && stderr.contains("app:loop -> app:loop"),
+        "{stderr}"
+    );
+    // Running another task from a task is fine.
+    let output = success(run(temp.path(), &["run", "app:outer"]));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("inner"));
+}
+
+#[cfg(unix)]
+#[test]
 fn unknown_run_commands_options_are_forwarded_like_nx() {
     let temp = fixture(json!({
         "serve": {"command": "echo serving", "options": {"port": 3000, "dependsOn": ["^tsc"]}},
@@ -1339,11 +1756,12 @@ fn quiet_output_is_plain_text_for_agents() {
         .env_remove("FORCE_COLOR")
         .env_remove("NX_DEFAULT_OUTPUT_STYLE")
         .env_remove("CI")
+        .env_remove("GITHUB_ACTIONS")
         .output()
         .unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
     // Only the failure, without escape sequences.
-    assert_eq!(stdout, "\n✖ qk run app:fail failed\n\nred failure\n");
+    assert_eq!(stdout, "\n✖ nx run app:fail failed\n\nred failure\n");
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("1 of 2 tasks failed"), "{stderr}");
     assert!(!stderr.contains("qk: checking"), "{stderr}");
@@ -1504,7 +1922,7 @@ fn ready_when_starts_dependents_once_the_output_appears() {
         temp.path(),
         &["run", "app:after", "--output-style", "static"],
     );
-    assert_eq!(crashed.status.code(), Some(3));
+    assert_eq!(crashed.status.code(), Some(1));
     assert!(!String::from_utf8_lossy(&crashed.stdout).contains("after\n"));
     let serial = run(temp.path(), &["run", "app:serial"]);
     assert!(
@@ -1745,11 +2163,11 @@ fn command_shapes_and_exit_codes_follow_nx() {
     assert!(started.elapsed() < Duration::from_secs(4));
     assert_eq!(
         run(temp.path(), &["run", "app:serial"]).status.code(),
-        Some(4)
+        Some(1)
     );
     assert_eq!(
         run(temp.path(), &["run", "app:single"]).status.code(),
-        Some(4)
+        Some(1)
     );
 }
 
@@ -2120,8 +2538,25 @@ fn nx_run_flags_work_as_in_nx() {
         "--output-style",
         "static",
     ]);
-    assert!(!bailed.status.success());
+    // It fails with 1, where Nx exits with 130 as if interrupted.
+    assert_eq!(bailed.status.code(), Some(1));
     assert!(!String::from_utf8_lossy(&bailed.stdout).contains("zlast\n"));
+    // NX_BAIL does the same, unless --nx-bail=false says otherwise.
+    let mut command = command(
+        temp.path(),
+        &[
+            "run-many",
+            "-t",
+            "fail,zlast",
+            "--parallel=1",
+            "--output-style",
+            "static",
+        ],
+    );
+    let bailed = command.env("NX_BAIL", "true").output().unwrap();
+    assert!(!String::from_utf8_lossy(&bailed.stdout).contains("zlast\n"));
+    let continued = command.arg("--nxBail=false").output().unwrap();
+    assert!(String::from_utf8_lossy(&continued.stdout).contains("zlast\n"));
     let continued = output(&[
         "run-many",
         "-t",
@@ -3439,7 +3874,7 @@ fn input_analysis_records_descendants_outputs_and_uncovered_inputs_without_cache
         temp.path(),
         &["inputs", "analyze", "app:fail", "--report", "failed.json"],
     );
-    assert_eq!(failed.status.code(), Some(7));
+    assert_eq!(failed.status.code(), Some(1));
     let failed: Value =
         serde_json::from_slice(&fs::read(temp.path().join("failed.json")).unwrap()).unwrap();
     assert_eq!(failed["tasks"]["app:fail"]["outcome"], "failed:7");

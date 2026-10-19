@@ -33,6 +33,9 @@ walkdir.workspace = true
 
 tempfile.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [package.metadata.npm]
 name = "@runqk/cli"
 prefix = "@runqk/cli-"
