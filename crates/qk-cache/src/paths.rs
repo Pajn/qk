@@ -252,7 +252,7 @@ fn normalize(path: &str) -> Result<String> {
         match part {
             "." => {}
             ".." => match parts.pop() {
-                Some(parent) if crate::glob::is_literal(parent) => {}
+                Some(parent) if crate::glob::names_a_path(parent) => {}
                 _ => bail!("cache path {path:?} leaves the workspace or follows a glob with `..`"),
             },
             part => parts.push(part),
@@ -274,8 +274,11 @@ pub struct Outputs {
     globs: Vec<String>,
     /// Negated patterns: what they match is never an output.
     negations: Vec<Pattern>,
+    /// The directories the patterns are read from, their leading literal
+    /// segments with escapes read, as Nx's `partition_glob` takes them.
     anchors: BTreeSet<String>,
-    /// Literal output roots which include their entire subtree.
+    /// Literal output roots which include their entire subtree, with their
+    /// escapes read.
     complete: BTreeSet<String>,
     /// Whether the target declares its outputs, rather than taking Nx's
     /// defaults for a target without them.
@@ -299,16 +302,12 @@ impl Outputs {
                 continue;
             }
             validate_pattern(pattern)?;
-            let anchor = pattern
-                .split('/')
-                .take_while(|part| crate::glob::is_literal(part))
-                .collect::<Vec<_>>()
-                .join("/");
+            let (anchor, glob) = crate::ignored::partition(pattern);
             if anchor.is_empty() {
                 bail!("{pattern:?} needs a fixed directory prefix");
             }
-            if pattern.split('/').all(crate::glob::is_literal) {
-                complete.insert(pattern.clone());
+            if glob.is_none() {
+                complete.insert(anchor.clone());
             }
             compiled.push(Pattern::new(pattern, false)?);
             globs.push(pattern.clone());
@@ -368,11 +367,7 @@ impl Outputs {
                 negations.push(Pattern::new(&pattern, false)?);
                 continue;
             }
-            let anchor = pattern
-                .split('/')
-                .take_while(|part| crate::glob::is_literal(part))
-                .collect::<Vec<_>>()
-                .join("/");
+            let (anchor, glob) = crate::ignored::partition(&pattern);
             if anchor.is_empty()
                 || workspace
                     .projects
@@ -383,8 +378,8 @@ impl Outputs {
                     "cache outputs must have a fixed directory prefix and cannot replace a project root"
                 );
             }
-            if pattern.split('/').all(crate::glob::is_literal) {
-                complete.insert(pattern.clone());
+            if glob.is_none() {
+                complete.insert(anchor.clone());
             }
             patterns.push(Pattern::new(&pattern, false)?);
             globs.push(pattern);
@@ -1619,6 +1614,20 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["app/(group)", "app/(group)/page.js", "dist/[id].js"]
         );
+        // An escaped first segment is the directory the outputs lie in.
+        let outputs = Outputs::from_paths(&[r"\(group\)/dist".into()]).unwrap();
+        std::fs::create_dir_all(workspace.path().join("(group)/dist")).unwrap();
+        std::fs::write(workspace.path().join("(group)/dist/a.js"), "").unwrap();
+        assert_eq!(outputs.anchors().collect::<Vec<_>>(), ["(group)/dist"]);
+        assert_eq!(outputs.complete_roots(), ["(group)/dist"]);
+        assert_eq!(
+            outputs
+                .paths(workspace.path())
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            ["(group)/dist", "(group)/dist/a.js"]
+        );
         for unsafe_pattern in [r"dist/\.\./x", r"dist\"] {
             assert!(
                 Outputs::from_paths(&[unsafe_pattern.into()]).is_err(),
@@ -1906,5 +1915,6 @@ mod tests {
         assert_eq!(normalize(".").unwrap(), ".");
         assert!(normalize("app/../../outside").is_err());
         assert!(normalize("app/**/../x").is_err());
+        assert_eq!(normalize(r"apps/\(group\)/../x").unwrap(), "apps/x");
     }
 }

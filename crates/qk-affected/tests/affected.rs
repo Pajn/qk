@@ -1566,3 +1566,27 @@ fn a_project_root_with_glob_characters_is_a_directory_in_inputs() {
         assert!(tasks.contains_key("marketing:build"), "{inputs}: {tasks:?}");
     }
 }
+
+/// A fileset from an escaped project root reads that directory alone, so a
+/// dependency writing elsewhere below the same parent is no producer of it.
+#[test]
+fn a_fileset_from_an_escaped_root_reads_no_sibling_outputs() {
+    let repo = Repo::new(&[
+        (
+            "apps/(marketing)/project.json",
+            r#"{"name": "marketing", "implicitDependencies": ["other"], "targets": {"build": {"command": "echo build", "dependsOn": ["^build"], "inputs": ["{projectRoot}/**/*"]}}}"#,
+        ),
+        (
+            "apps/other/project.json",
+            r#"{"name": "other", "targets": {"build": {"command": "echo build", "inputs": ["{projectRoot}/src/**/*"], "outputs": ["{projectRoot}/dist"]}}}"#,
+        ),
+        ("apps/other/src/index.ts", "index"),
+    ]);
+    write(&repo.root, "apps/other/src/index.ts", "changed");
+    assert_eq!(
+        affected_tasks_of(&repo, &["marketing:build"])
+            .keys()
+            .collect::<Vec<_>>(),
+        ["other:build"]
+    );
+}

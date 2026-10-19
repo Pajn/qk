@@ -16,7 +16,6 @@ use qk_lockfile::Lockfile;
 use qk_taskgraph::{Task, TaskGraph};
 use serde_json::{Value, json};
 
-use crate::glob::is_literal;
 use crate::ignored::Group;
 use crate::inputs::{
     Declared, Inferred, JsonFields, Resolved, manifest_for_dependents, workspace_without_resolution,
@@ -1844,12 +1843,7 @@ impl<'a> Resolver<'a> {
         };
         let pattern = paths::expand_glob(self.workspace, project, pattern)?;
         let matcher = self.snapshot.fileset_pattern(&pattern, exclude)?;
-        let prefix = pattern
-            .trim_end_matches('/')
-            .split('/')
-            .take_while(|part| is_literal(part))
-            .collect::<Vec<_>>()
-            .join("/");
+        let (prefix, _) = crate::ignored::partition(pattern.trim_end_matches('/'));
         let candidates: Box<dyn Iterator<Item = &String>> = if prefix.is_empty() {
             Box::new(self.candidates.iter())
         } else {
