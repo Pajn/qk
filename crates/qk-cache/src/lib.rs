@@ -25,7 +25,7 @@ use serde_json::Value;
 
 pub use evict::{Pruned, max_size, parse_size, prune, prune_automatic};
 pub use glob::Pattern;
-pub use hash::{SourceIgnore, source_files};
+pub use hash::{DependencyGlob, Selects, SourceIgnore, dependency_globs, source_files};
 pub use inputs::{
     InputChange, InputChanges, JsonFields, ROOT_TSCONFIG_FILES, Resolution, Resolved, TsConfig,
     manifest_for_dependents, resolve_each, resolve_tasks, selectively_hash_tsconfig,

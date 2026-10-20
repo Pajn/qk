@@ -1105,6 +1105,66 @@ fn doctor_reports_unsupported_features_without_side_effects() {
     assert!(run(true).status.success());
 }
 
+/// Doctor names a dependency glob that selects nothing for any task of a
+/// target, from the outputs on disk, without running anything.
+#[test]
+fn doctor_names_dependency_globs_that_select_nothing() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    std::fs::write(root.join("nx.json"), "{}").unwrap();
+    let reads = |pattern: &str| json!([{"dependentTasksOutputFiles": pattern}]);
+    std::fs::write(
+        root.join("project.json"),
+        json!({"name":"app","targets":{
+            "codegen":{"command":"echo ran > ran","outputs":["{projectRoot}/gen"]},
+            // Selects the manifest codegen wrote.
+            "build":{"command":"true","dependsOn":["codegen"],"inputs":reads("**/manifest.json")},
+            // Depends on no task with outputs.
+            "lint":{"command":"true","inputs":reads("**/manifest.json")},
+            // Codegen's outputs hold no such file.
+            "check":{"command":"true","dependsOn":["codegen"],"inputs":reads("**/*.tsx")}
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("gen")).unwrap();
+    std::fs::write(root.join("gen/manifest.json"), "{}").unwrap();
+    let output = isolated_command(env!("CARGO_BIN_EXE_qk"))
+        .current_dir(root)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings: Vec<(&str, &str)> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|finding| finding["code"] == "dependency-outputs-unmatched")
+        .map(|finding| {
+            (
+                finding["location"].as_str().unwrap(),
+                finding["message"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(findings.len(), 2, "{report}");
+    assert_eq!(findings[0].0, r#"dependentTasksOutputFiles "**/*.tsx""#);
+    assert!(
+        findings[0].1.contains("1 target: check (1 task)"),
+        "{report}"
+    );
+    assert_eq!(
+        findings[1].0,
+        r#"dependentTasksOutputFiles "**/manifest.json""#
+    );
+    assert!(
+        findings[1].1.contains("1 target: lint (1 task)"),
+        "{report}"
+    );
+    assert!(!root.join("ran").exists());
+}
+
 /// A field a newer qk added is ignored, as Nx ignores keys it does not know,
 /// and doctor names it.
 #[test]

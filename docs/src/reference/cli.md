@@ -342,6 +342,11 @@ project at all. Watch uses no daemon or Nx plugins.
 `qk doctor` reports unsupported executors, configured Nx plugins, sync
 generators and fields in `qk:warm` or `qk:threads` that this qk does not know,
 without executing commands, loading dotenv files or running plugins.
+It also reports `dependentTasksOutputFiles` globs that select nothing for any
+task of a target, which therefore key nothing: none of those tasks depends on
+a task declaring outputs, or the outputs on disk hold no file the glob
+matches. Outputs not built yet are taken to match. Targets sharing a set of
+such globs, as through a named input, are one finding.
 It also lists Nx CLI options accepted without effect. `--json` returns a
 versioned report with stable finding codes, locations and error/warning counts.
 Unsupported executors cause exit code 1; `--strict` also fails on warnings.

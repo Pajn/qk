@@ -2760,6 +2760,77 @@ fn dependency_keys_impl(
     Ok(keys)
 }
 
+/// What one task's `dependentTasksOutputFiles` glob selects of the outputs it
+/// reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DependencyGlob {
+    pub task: String,
+    pub pattern: String,
+    pub selects: Selects,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Selects {
+    /// None of the tasks it reads declares outputs, so nothing ever.
+    NoDeclaredOutputs,
+    /// Their outputs are not built, so it cannot be told.
+    NotBuilt,
+    /// None of the files their outputs hold now, this many.
+    NoneOf(usize),
+    /// Some of the files their outputs hold now.
+    Some,
+}
+
+/// What each `dependentTasksOutputFiles` glob of `graph`'s tasks selects of
+/// its dependencies' outputs as they are on disk, without running anything.
+pub fn dependency_globs(workspace: &Workspace, graph: &TaskGraph) -> Result<Vec<DependencyGlob>> {
+    let snapshot = Snapshot::new(workspace, graph, &paths::cache_location(workspace))?;
+    let cancelled = AtomicBool::new(false);
+    let mut globs = Vec::new();
+    for task in graph.tasks.values() {
+        // A task whose inputs cannot be resolved fails as it runs instead.
+        let Ok(resolved) = resolve(&snapshot, workspace, task, None, &cancelled) else {
+            continue;
+        };
+        for (pattern, transitive) in resolved.dependency_output_inputs() {
+            let mut selected = task.dependencies.clone();
+            if transitive {
+                let mut pending = selected.clone();
+                while let Some(id) = pending.pop_first() {
+                    for dependency in &graph.tasks[&id].dependencies {
+                        if selected.insert(dependency.clone()) {
+                            pending.insert(dependency.clone());
+                        }
+                    }
+                }
+            }
+            let matcher = snapshot.pattern(pattern, false)?;
+            let (mut declared, mut files, mut matched) = (false, 0, false);
+            for id in &selected {
+                let dependency = &graph.tasks[id];
+                if !Outputs::new(workspace, dependency)?.declared() {
+                    continue;
+                }
+                declared = true;
+                let outputs = snapshot.dependency_outputs(workspace, dependency)?;
+                files += outputs.files.len();
+                matched |= outputs.files.iter().any(|path| matcher.is_match(path));
+            }
+            globs.push(DependencyGlob {
+                task: task.id.clone(),
+                pattern: pattern.to_owned(),
+                selects: match (declared, files, matched) {
+                    (false, ..) => Selects::NoDeclaredOutputs,
+                    (_, _, true) => Selects::Some,
+                    (_, 0, _) => Selects::NotBuilt,
+                    (_, files, _) => Selects::NoneOf(files),
+                },
+            });
+        }
+    }
+    Ok(globs)
+}
+
 #[cfg(test)]
 mod tests {
 
