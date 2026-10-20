@@ -1460,6 +1460,10 @@ fn with_remote(fixture: &Fixture, server: &s3::FakeS3, extra: Value) -> Value {
 }
 
 fn remote_build(fixture: &Fixture, env: &[(&str, &str)]) -> Output {
+    remote_build_command(fixture, env).output().unwrap()
+}
+
+fn remote_build_command(fixture: &Fixture, env: &[(&str, &str)]) -> Command {
     let mut command = fixture.command(&fixture.root, &["run", "app:build"]);
     command
         .env("AWS_ACCESS_KEY_ID", "key")
@@ -1470,7 +1474,7 @@ fn remote_build(fixture: &Fixture, env: &[(&str, &str)]) -> Output {
     for (name, value) in env {
         command.env(name, value);
     }
-    command.output().unwrap()
+    command
 }
 
 fn clear_local_cache(fixture: &Fixture) {
@@ -1531,33 +1535,54 @@ fn detached_uploads_survive_parent_exit_and_local_cache_removal() {
     with_remote(&fixture, &server, json!({"uploadMode": "background"}));
     // Held PUTs never return, so a qk that waited for them would never exit:
     // the deadline only bounds a hang, and a slow run fits within it.
-    let output = std::thread::scope(|scope| {
-        let (send, receive) = std::sync::mpsc::channel();
-        let fixture = &fixture;
-        scope.spawn(move || {
-            // The receiver is gone once the test has failed.
-            let _ = send.send(remote_build(fixture, &[]));
-        });
-        let deadline = std::time::Duration::from_secs(60);
-        match receive.recv_timeout(deadline) {
-            Ok(output) => output,
-            Err(_) => {
-                let held = server.state.lock().unwrap().held_puts;
-                server.state.lock().unwrap().block_puts = false;
-                let released = std::time::Instant::now();
-                let exited = receive.recv_timeout(deadline).is_ok();
-                panic!(
-                    "qk did not exit within {deadline:?} while {held} PUT(s) were held; \
-                     after their release it {}",
-                    if exited {
-                        format!("exited in {:?}", released.elapsed())
-                    } else {
-                        "still did not exit".to_owned()
-                    }
-                );
+    let mut child = remote_build_command(&fixture, &[])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Read on their own threads, so a full pipe never holds qk up.
+    fn drain(mut pipe: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes).unwrap();
+            bytes
+        })
+    }
+    let reading_stdout = drain(child.stdout.take().unwrap());
+    let reading_stderr = drain(child.stderr.take().unwrap());
+    let deadline = std::time::Duration::from_secs(60);
+    let exited = |child: &mut std::process::Child| {
+        let started = std::time::Instant::now();
+        while started.elapsed() < deadline {
+            if let Some(status) = child.try_wait().unwrap() {
+                return Some(status);
             }
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
-    });
+        None
+    };
+    let Some(status) = exited(&mut child) else {
+        let held = server.state.lock().unwrap().held_puts;
+        server.state.lock().unwrap().block_puts = false;
+        let released = std::time::Instant::now();
+        let after = match exited(&mut child) {
+            Some(_) => format!("exited in {:?}", released.elapsed()),
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                "still did not exit, and was killed".to_owned()
+            }
+        };
+        panic!(
+            "qk did not exit within {deadline:?} while {held} PUT(s) were held; \
+             after their release it {after}"
+        );
+    };
+    let output = Output {
+        status,
+        stdout: reading_stdout.join().unwrap(),
+        stderr: reading_stderr.join().unwrap(),
+    };
     let output = success(output);
     assert!(
         stderr(&output).contains("remote uploads continuing in background"),
