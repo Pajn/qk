@@ -2865,6 +2865,30 @@ fn the_sandbox_lists_only_tasks_that_started() {
     assert_eq!(unsandboxed, ["app:alone"], "{findings}");
 }
 
+/// A sandboxed run skips the cache, but a task's log is still kept for
+/// `qk show log`, failed or not.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_sandboxed_task_keeps_its_log() {
+    let _audit = AUDIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = fixture(json!({
+        "test": {"command": "echo checking && echo broken >&2 && exit 1", "cache": true}
+    }));
+    let failed = run(temp.path(), &["run", "app:test", "--sandbox"]);
+    assert!(!failed.status.success());
+    let latest: Value =
+        serde_json::from_slice(&success(run(temp.path(), &["show", "run", "--json"])).stdout)
+            .unwrap();
+    let log = success(run(
+        temp.path(),
+        &["show", "log", latest["id"].as_str().unwrap(), "app:test"],
+    ));
+    assert!(String::from_utf8_lossy(&log.stdout).contains("checking"));
+    assert!(String::from_utf8_lossy(&log.stderr).contains("broken"));
+}
+
 /// A workspace with an `app` project in `apps/app` whose targets read a
 /// package only the root installs, laid out as pnpm installs it: `fallow` and
 /// `other` from the root, `helper` from `apps/app`, and `stale` left from an

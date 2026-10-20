@@ -63,6 +63,24 @@ pub struct SandboxResult {
     pub packages_unchecked: BTreeMap<String, String>,
 }
 
+/// Runs a task without the cache, keeping its log for `qk show log` as a
+/// cache miss does. Its inputs are not rechecked, so the log is not
+/// evidence of flakiness.
+fn execute_retained(
+    task: &qk_executor::PreparedTask,
+    cancelled: &AtomicBool,
+) -> Result<qk_cache::TaskResult> {
+    let capture = qk_executor::Capture::new(None, task.display.clone()).retain_log();
+    let outcome = qk_executor::execute_captured(task, cancelled, Some(&capture))?;
+    Ok(qk_cache::TaskResult {
+        execution: capture.take_log().map(|log| qk_cache::Execution {
+            log,
+            inputs_unchanged: false,
+        }),
+        ..qk_cache::TaskResult::uncached(outcome)
+    })
+}
+
 /// One task of a run, for history and reports.
 pub struct TaskRecord {
     /// When its dependencies were done; before `started` when it then waited
@@ -737,7 +755,7 @@ pub fn run(
                         let result = if let Some(cache) = cache {
                             cache.run(workspace, graph, definition, &task, &cancelled)
                         } else {
-                            execute(&task, &cancelled).map(qk_cache::TaskResult::uncached)
+                            execute_retained(&task, &cancelled)
                         };
                         let _ = sender.send((id, result));
                     });

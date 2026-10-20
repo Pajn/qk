@@ -544,7 +544,7 @@ pub fn show_flaky(
 pub fn show_log(workspace: &Workspace, run: &str, task: &str) -> Result<()> {
     let Some(log) = open(workspace)?.log(run, task)? else {
         bail!(
-            "no retained execution log for {task} in run {run} (cache hit, older run or log evicted)"
+            "no retained execution log for {task} in run {run} (a cache hit, a target that is not cacheable, an older run, or an evicted log)"
         );
     };
     qk_executor::read_capture(log.data.as_slice(), |stderr, bytes| {

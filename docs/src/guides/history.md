@@ -72,8 +72,10 @@ original stream. Cache hits replay a previous success and do not create another
 execution log. Otherwise cacheable tasks run with `--skip-nx-cache` (or its
 aliases or `NX_SKIP_NX_CACHE=true`) retain their keys and execution logs while
 always executing, without restoring or publishing results or warm state.
-Uncacheable tasks, sandboxed tasks, and tasks whose inputs cannot be keyed do
-not retain execution logs. Failed executions never publish reusable
+Tasks run under `--sandbox` or `inputs analyze`, which skip the cache, retain
+their execution logs too, but their inputs are not rechecked, so `show flaky`
+does not count them. Uncacheable tasks and tasks whose inputs cannot be keyed
+do not retain execution logs. Failed executions never publish reusable
 cache entries.
 
 `show flaky [task]` lists task keys with both successful and failed executions
