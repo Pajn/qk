@@ -1165,6 +1165,40 @@ fn doctor_names_dependency_globs_that_select_nothing() {
     assert!(!root.join("ran").exists());
 }
 
+/// `show target` shows qk's own fields as configured.
+#[test]
+fn show_target_includes_qk_fields() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    std::fs::write(
+        root.join("nx.json"),
+        json!({"targetDefaults": {"build": {"qk:threads": {"max": 2}}}}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("project.json"),
+        json!({"name":"app","targets":{"build":{
+            "command":"true",
+            "qk:warm":{"paths":["{projectRoot}/.cache"]}
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let target = successful_json(
+        isolated_command(env!("CARGO_BIN_EXE_qk"))
+            .current_dir(root)
+            .args(["show", "target", "app:build", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        target["qk:warm"],
+        json!({"paths": ["{projectRoot}/.cache"]}),
+        "{target}"
+    );
+    assert_eq!(target["qk:threads"], json!({"max": 2}), "{target}");
+}
+
 /// A field a newer qk added is ignored, as Nx ignores keys it does not know,
 /// and doctor names it.
 #[test]
