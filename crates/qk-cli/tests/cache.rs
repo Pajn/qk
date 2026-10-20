@@ -1489,7 +1489,8 @@ fn detached_log(output: &Output) -> PathBuf {
 }
 
 fn wait_for_detached_uploads(log: &Path) -> String {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    // A bound on a hang, as in the tests waiting for qk to exit.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
         let text = fs::read_to_string(log).unwrap();
         // Formatted stderr writes can become visible one fragment at a time.
@@ -1528,17 +1529,34 @@ fn detached_uploads_survive_parent_exit_and_local_cache_removal() {
         json!({"qk:warm": {"outputs": true, "portable": true}}),
     ));
     with_remote(&fixture, &server, json!({"uploadMode": "background"}));
+    // Held PUTs never return, so a qk that waited for them would never exit:
+    // the deadline only bounds a hang, and a slow run fits within it.
     let output = std::thread::scope(|scope| {
         let (send, receive) = std::sync::mpsc::channel();
         let fixture = &fixture;
         scope.spawn(move || {
-            send.send(remote_build(fixture, &[])).unwrap();
+            // The receiver is gone once the test has failed.
+            let _ = send.send(remote_build(fixture, &[]));
         });
-        let result = receive.recv_timeout(std::time::Duration::from_secs(10));
-        if result.is_err() {
-            server.state.lock().unwrap().block_puts = false;
+        let deadline = std::time::Duration::from_secs(60);
+        match receive.recv_timeout(deadline) {
+            Ok(output) => output,
+            Err(_) => {
+                let held = server.state.lock().unwrap().held_puts;
+                server.state.lock().unwrap().block_puts = false;
+                let released = std::time::Instant::now();
+                let exited = receive.recv_timeout(deadline).is_ok();
+                panic!(
+                    "qk did not exit within {deadline:?} while {held} PUT(s) were held; \
+                     after their release it {}",
+                    if exited {
+                        format!("exited in {:?}", released.elapsed())
+                    } else {
+                        "still did not exit".to_owned()
+                    }
+                );
+            }
         }
-        result.expect("qk must exit while remote PUTs remain blocked")
     });
     let output = success(output);
     assert!(

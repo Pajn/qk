@@ -24,6 +24,8 @@ pub struct State {
     pub cut_reads: bool,
     /// Hold PUT responses until the test releases them.
     pub block_puts: bool,
+    /// PUTs held by `block_puts` right now.
+    pub held_puts: usize,
     /// Answer listings with a server error.
     pub fail_lists: bool,
     /// The most objects one listing response names; all when zero.
@@ -168,8 +170,12 @@ fn serve(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
         reader.read_exact(&mut body)?;
     }
     let arrived = Instant::now();
-    while method == "PUT" && state.lock().unwrap().block_puts {
-        std::thread::sleep(Duration::from_millis(10));
+    if method == "PUT" && state.lock().unwrap().block_puts {
+        state.lock().unwrap().held_puts += 1;
+        while state.lock().unwrap().block_puts {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        state.lock().unwrap().held_puts -= 1;
     }
     let latency = state.lock().unwrap().latency;
     std::thread::sleep(latency);
