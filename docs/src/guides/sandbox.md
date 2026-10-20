@@ -43,13 +43,17 @@ Sandbox audit: 1 of 2 tasks went beyond what they declare
       stray.txt
 ```
 
-For each task it lists the files read outside its inputs, the `.git` and
-dotenv files it read, which no cache key covers, and what it wrote outside
-its outputs. Paths read by many tasks, at least a quarter of those with
-findings, are listed once at the top, under `read by many tasks, likely by
-the tools their commands start through`: they are typically a package
-manager reading every workspace `package.json`, or a version manager reading
-`.tool-versions`, as a command starts.
+For each task it lists the files read outside its inputs, the TypeScript
+configuration (`tsconfig*.json`) it read outside them, which is likely an
+input, the `.git` and dotenv files it read, which no cache key covers, and
+what it wrote outside its outputs. Reads of workspace packages'
+`package.json`, which package managers and bundlers make to resolve them,
+and of version and package managers' configuration, such as
+`.tool-versions`, are counted once at the top rather than listed for each
+task; `--sandbox-report` lists them as `manifestReads` and `toolchainReads`.
+Other paths read by many tasks, at least a quarter of those with findings,
+are listed once at the top, under `read by many tasks, likely by the tools
+their commands start through`.
 
 ### Installed packages outside the key
 

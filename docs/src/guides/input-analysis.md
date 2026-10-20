@@ -80,7 +80,9 @@ existing declarations need no replacement. Earlier version 1 reports remain
 compatible; their successful directory events can still contribute evidence.
 
 `accessReview` separates uncovered potential content reads, workspace package
-manifest reads, toolchain configuration reads, and metadata-only checks. These
+manifest reads, toolchain configuration reads, TypeScript configuration reads
+(`tsconfig*.json`, likely inputs), and metadata-only checks. The sandbox's
+audit groups reads the same way. These
 groups help distinguish likely source dependencies from package-manager scans;
 none proves an access is harmless. Raw events and `uncoveredAccesses` remain
 available in full. The terminal shows content reads first and limits examples

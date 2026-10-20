@@ -590,6 +590,7 @@ pub fn sandbox_summary(sandbox: &qk_runner::SandboxResult, tasks: usize, paint: 
         .filter(|(_, findings, reads, packages)| {
             !reads.is_empty()
                 || !packages.is_empty()
+                || !findings.tsconfig_reads.is_empty()
                 || !findings.unkeyed_reads.is_empty()
                 || !findings.stray_writes.is_empty()
         })
@@ -619,6 +620,35 @@ pub fn sandbox_summary(sandbox: &qk_runner::SandboxResult, tasks: usize, paint: 
             lines.push(paint.dim(&format!("{indent}  … and {} more", paths.len() - SHOWN)));
         }
     };
+    // Package managers and bundlers read every workspace package's manifest
+    // to resolve them, and version managers their configuration, as a
+    // command starts: counted once rather than listed for each task.
+    for (label, group) in [
+        (
+            "workspace package.json read outside the keys, as package managers and bundlers resolve workspace packages",
+            (|findings| &findings.manifest_reads)
+                as fn(&qk_runner::sandbox::Findings) -> &BTreeSet<String>,
+        ),
+        (
+            "toolchain configuration read outside the keys, as commands start",
+            |findings| &findings.toolchain_reads,
+        ),
+    ] {
+        let readers = sandbox
+            .findings
+            .values()
+            .filter(|findings| !group(findings).is_empty())
+            .count();
+        let paths: BTreeSet<&String> = sandbox.findings.values().flat_map(group).collect();
+        if paths.is_empty() {
+            continue;
+        }
+        lines.push(paint.dim(&format!(
+            "  {} {label}, by {readers} task{}",
+            paths.len(),
+            if readers == 1 { "" } else { "s" },
+        )));
+    }
     if !shared.is_empty() {
         let paths: Vec<&String> = sandbox
             .findings
@@ -654,6 +684,12 @@ pub fn sandbox_summary(sandbox: &qk_runner::SandboxResult, tasks: usize, paint: 
     for (id, findings, reads, packages) in own {
         lines.push(format!("  {id}"));
         list("read outside its inputs", &reads, &mut lines, "    ");
+        list(
+            "TypeScript configuration read outside its inputs, likely inputs",
+            &findings.tsconfig_reads.iter().collect::<Vec<_>>(),
+            &mut lines,
+            "    ",
+        );
         list(
             "read, not in any key",
             &findings.unkeyed_reads.iter().collect::<Vec<_>>(),
@@ -1426,6 +1462,58 @@ mod tests {
   a:lint
     1 installed package read, not in its key; name it in its externalDependencies:
       fallow
+"
+        );
+    }
+
+    #[test]
+    fn counts_manifest_and_toolchain_reads_once_and_lists_tsconfigs() {
+        let findings = |manifests: &[&str], tsconfigs: &[&str], reads: &[&str]| {
+            let set = |paths: &[&str]| paths.iter().map(|path| path.to_string()).collect();
+            qk_runner::sandbox::Findings {
+                manifest_reads: set(manifests),
+                toolchain_reads: set(&[".tool-versions"]),
+                tsconfig_reads: set(tsconfigs),
+                undeclared_reads: set(reads),
+                ..Default::default()
+            }
+        };
+        let sandbox = qk_runner::SandboxResult {
+            mode: qk_runner::sandbox::Mode::Audit,
+            findings: [
+                (
+                    "a:build",
+                    findings(
+                        &["packages/a/package.json", "packages/b/package.json"],
+                        &[],
+                        &[],
+                    ),
+                ),
+                (
+                    "b:build",
+                    findings(
+                        &["packages/a/package.json"],
+                        &["packages/b/tsconfig.lib.json"],
+                        &["notes.txt"],
+                    ),
+                ),
+            ]
+            .into_iter()
+            .map(|(id, findings)| (id.to_owned(), findings))
+            .collect(),
+            unsandboxed: BTreeMap::new(),
+            packages_unchecked: BTreeMap::new(),
+        };
+        assert_eq!(
+            sandbox_summary(&sandbox, 2, Paint(false)),
+            "Sandbox audit: 2 of 2 tasks went beyond what they declare
+  2 workspace package.json read outside the keys, as package managers and bundlers resolve workspace packages, by 2 tasks
+  1 toolchain configuration read outside the keys, as commands start, by 2 tasks
+  b:build
+    1 read outside its inputs:
+      notes.txt
+    1 TypeScript configuration read outside its inputs, likely inputs:
+      packages/b/tsconfig.lib.json
 "
         );
     }

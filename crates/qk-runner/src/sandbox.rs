@@ -59,8 +59,16 @@ pub enum Mode {
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Findings {
-    /// Workspace files it read that are not in its cache key.
+    /// Workspace files it read that are not in its cache key, but for those
+    /// grouped below.
     pub undeclared_reads: BTreeSet<String>,
+    /// Workspace packages' `package.json` read outside its key, as package
+    /// managers and bundlers do to resolve workspace packages.
+    pub manifest_reads: BTreeSet<String>,
+    /// Version and package managers' configuration read outside its key.
+    pub toolchain_reads: BTreeSet<String>,
+    /// TypeScript configuration read outside its key: likely inputs.
+    pub tsconfig_reads: BTreeSet<String>,
     /// `.git` and dotenv files it read: allowed, but not in the key either.
     pub unkeyed_reads: BTreeSet<String>,
     /// Paths it wrote in the workspace outside its outputs.
@@ -72,6 +80,9 @@ pub struct Findings {
 impl Findings {
     pub fn is_empty(&self) -> bool {
         self.undeclared_reads.is_empty()
+            && self.manifest_reads.is_empty()
+            && self.toolchain_reads.is_empty()
+            && self.tsconfig_reads.is_empty()
             && self.unkeyed_reads.is_empty()
             && self.stray_writes.is_empty()
             && self.unkeyed_packages.is_empty()
@@ -371,7 +382,13 @@ impl Sandbox {
             } else if unkeyed(&relative) {
                 entry.unkeyed_reads.insert(relative);
             } else {
-                entry.undeclared_reads.insert(relative);
+                match qk_input_analysis::ReadKind::of(&relative) {
+                    qk_input_analysis::ReadKind::Manifest => &mut entry.manifest_reads,
+                    qk_input_analysis::ReadKind::Toolchain => &mut entry.toolchain_reads,
+                    qk_input_analysis::ReadKind::TsConfig => &mut entry.tsconfig_reads,
+                    qk_input_analysis::ReadKind::Content => &mut entry.undeclared_reads,
+                }
+                .insert(relative);
             }
         }
         findings.retain(|_, findings| !findings.is_empty());
