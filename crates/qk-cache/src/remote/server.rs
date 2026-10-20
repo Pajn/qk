@@ -85,26 +85,6 @@ impl Server {
             .as_deref()
     }
 
-    /// The reason a response failed, from its status and JSON error.
-    fn failure(&self, what: &str, response: ureq::http::Response<ureq::Body>) -> anyhow::Error {
-        let status = response.status().as_u16();
-        let body = response.into_body().read_to_string().unwrap_or_default();
-        let message = serde_json::from_str::<Value>(&body)
-            .ok()
-            .and_then(|error| {
-                error
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
-            .unwrap_or(body);
-        match status {
-            401 => anyhow::anyhow!("the store server rejected the token ({what})"),
-            403 => anyhow::anyhow!("the store server token is read-only ({what})"),
-            status => anyhow::anyhow!("{what} returned {status}: {message}"),
-        }
-    }
-
     /// A GET of `path` that answers with a body, or `None` on 404.
     fn read(&self, path: &str, task: &str) -> Result<Option<Body>> {
         let waiting = crate::profile::span(task, "remote_response");
@@ -119,7 +99,7 @@ impl Server {
                 response.into_body().into_reader(),
             )))),
             404 => Ok(None),
-            _ => Err(self.failure(&format!("GET {path}"), response)),
+            _ => Err(failure(&format!("GET {path}"), response)),
         }
     }
 }
@@ -141,17 +121,17 @@ impl Store for Server {
         let url = self.url("sessions");
         let authorization = self.authorization();
         let sessioning = std::thread::spawn(move || {
+            // With no blobs, there is nothing to leave out.
             let bloom = Bloom::for_blobs(&root)?;
-            let response = agent
-                .post(url)
-                .header("Authorization", authorization)
-                .header("Content-Type", "application/x-qk-bloom")
-                .send(&bloom.to_bytes()[..])
-                .ok()
-                .filter(|response| response.status() == 201)?;
-            let body = response.into_body().read_to_string().ok()?;
-            let answer: Value = serde_json::from_str(&body).ok()?;
-            answer.get("session")?.as_str().map(str::to_owned)
+            match open_session(&agent, &url, &authorization, &bloom) {
+                Ok(session) => Some(session),
+                Err(error) => {
+                    qk_executor::status!(
+                        "qk: could not tell the store server which blobs this machine holds, so fetches send them again ({error:#})"
+                    );
+                    None
+                }
+            }
         });
         *self.sessioning.lock().unwrap() = Some(sessioning);
     }
@@ -172,7 +152,7 @@ impl Store for Server {
             .header("Authorization", self.authorization())
             .call()?;
         if response.status() != 200 {
-            return Err(self.failure("GET index", response));
+            return Err(failure("GET index", response));
         }
         let cursor = response
             .headers()
@@ -224,7 +204,7 @@ impl Store for Server {
         match response.status().as_u16() {
             200 => Ok(true),
             404 => Ok(false),
-            _ => Err(self.failure(&format!("HEAD {path}"), response)),
+            _ => Err(failure(&format!("HEAD {path}"), response)),
         }
     }
 
@@ -257,7 +237,7 @@ impl Store for Server {
                     .collect();
                 Err(MissingBlobs(blobs).into())
             }
-            _ => Err(self.failure(&format!("PUT {path}"), response)),
+            _ => Err(failure(&format!("PUT {path}"), response)),
         }
     }
 
@@ -296,7 +276,114 @@ impl Store for Server {
             .send(text.as_bytes())?;
         match response.status().as_u16() {
             200..=299 => Ok(()),
-            _ => Err(self.failure("POST runs", response)),
+            _ => Err(failure("POST runs", response)),
         }
+    }
+}
+
+/// The reason a response failed, from its status and JSON error.
+fn failure(what: &str, response: ureq::http::Response<ureq::Body>) -> anyhow::Error {
+    let status = response.status().as_u16();
+    let body = response.into_body().read_to_string().unwrap_or_default();
+    let message = serde_json::from_str::<Value>(&body)
+        .ok()
+        .and_then(|error| {
+            error
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or(body);
+    match status {
+        401 => anyhow::anyhow!("the store server rejected the token ({what})"),
+        403 => anyhow::anyhow!("the store server token is read-only ({what})"),
+        status => anyhow::anyhow!("{what} returned {status}: {message}"),
+    }
+}
+
+/// Opens a session naming the blobs in `bloom`, returning its id.
+fn open_session(
+    agent: &ureq::Agent,
+    url: &str,
+    authorization: &str,
+    bloom: &Bloom,
+) -> Result<String> {
+    let response = agent
+        .post(url)
+        .header("Authorization", authorization)
+        .header("Content-Type", "application/x-qk-bloom")
+        .send(&bloom.to_bytes()[..])?;
+    if response.status() != 201 {
+        return Err(failure("POST sessions", response));
+    }
+    let answer: Value = serde_json::from_str(&response.into_body().read_to_string()?)
+        .context("POST sessions answered with something other than JSON")?;
+    answer
+        .get("session")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .context("POST sessions answered without a session")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+
+    use super::*;
+
+    /// The URL of a server that reads one request whole and answers it with
+    /// `answer`.
+    fn answer_once(answer: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v4/sessions", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(&stream);
+            let mut length = 0;
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap() > 2 {
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+                line.clear();
+            }
+            reader.read_exact(&mut vec![0; length]).unwrap();
+            (&stream).write_all(answer.as_bytes()).unwrap();
+        });
+        url
+    }
+
+    fn bloom() -> Bloom {
+        let mut bloom = Bloom::new(1);
+        bloom.insert(&"a".repeat(64));
+        bloom
+    }
+
+    #[test]
+    fn a_session_is_the_id_the_server_gives() {
+        let body = r#"{"session":"0123456789abcdef0123456789abcdef","expires":1}"#;
+        let answer = format!(
+            "HTTP/1.1 201 Created\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let url = answer_once(answer);
+        let session = open_session(&super::super::agent(), &url, "Bearer t", &bloom()).unwrap();
+        assert_eq!(session, "0123456789abcdef0123456789abcdef");
+    }
+
+    #[test]
+    fn a_refused_session_says_why() {
+        let body = r#"{"error":"busy","message":"the store could not answer; try again"}"#;
+        let answer = format!(
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let url = answer_once(answer);
+        let error = open_session(&super::super::agent(), &url, "Bearer t", &bloom()).unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "POST sessions returned 503: the store could not answer; try again"
+        );
     }
 }

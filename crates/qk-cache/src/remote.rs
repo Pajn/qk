@@ -36,6 +36,11 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 use serde_json::Value;
+use ureq::unversioned::resolver::DefaultResolver;
+use ureq::unversioned::transport::{
+    Buffers, ConnectProxyConnector, ConnectionDetails, Connector, NextTimeout, RustlsConnector,
+    TcpConnector, Transport,
+};
 
 use store::{Object, Store};
 
@@ -199,7 +204,7 @@ struct Warm {
 
 /// An HTTP client for a store: statuses are answers, not errors.
 fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
+    let config = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .timeout_connect(Some(Duration::from_secs(10)))
         .timeout_global(Some(Duration::from_secs(10 * 60)))
@@ -209,8 +214,93 @@ fn agent() -> ureq::Agent {
         // new connection and repeat the TLS handshake.
         .max_idle_connections(IDLE_CONNECTIONS)
         .max_idle_connections_per_host(IDLE_CONNECTIONS)
-        .build()
-        .into()
+        .build();
+    ureq::Agent::with_parts(config, connector(), DefaultResolver::default())
+}
+
+/// ureq's default connections, a CONNECT proxy's included, with
+/// [`Restarting`] between the socket and TLS: rustls restarts an interrupted
+/// read itself, with the socket's whole timeout each time.
+fn connector() -> impl Connector<Out = impl Transport> {
+    ().chain(ConnectProxyConnector::default())
+        .chain(TcpConnector::default())
+        .chain(Restarting)
+        .chain(RustlsConnector::default())
+}
+
+/// Wraps each connection so that a read a signal interrupts is made again,
+/// within the time the read had left.
+///
+/// On Linux a socket read with a timeout, as every read of the agent's is,
+/// fails with EINTR when any signal reaches the thread, even one that is then
+/// ignored. A child that exits while another thread is spawning one sends such
+/// a signal: spawning blocks every signal in the spawning thread, so the
+/// kernel queues SIGCHLD rather than drop it and wakes a thread that does not
+/// block it. qk spawns processes beside its requests, and ureq returns EINTR as
+/// the request's error; writes need nothing, as `write_all` restarts them.
+#[derive(Debug)]
+struct Restarting;
+
+impl<In: Transport> Connector<In> for Restarting {
+    type Out = Box<dyn Transport>;
+
+    fn connect(
+        &self,
+        _details: &ConnectionDetails,
+        chained: Option<In>,
+    ) -> std::result::Result<Option<Self::Out>, ureq::Error> {
+        Ok(chained.map(|transport| {
+            Box::new(Restart(Box::new(transport) as Box<dyn Transport>)) as Self::Out
+        }))
+    }
+}
+
+#[derive(Debug)]
+struct Restart(Box<dyn Transport>);
+
+impl Transport for Restart {
+    fn buffers(&mut self) -> &mut dyn Buffers {
+        self.0.buffers()
+    }
+
+    fn transmit_output(
+        &mut self,
+        amount: usize,
+        timeout: NextTimeout,
+    ) -> std::result::Result<(), ureq::Error> {
+        self.0.transmit_output(amount, timeout)
+    }
+
+    fn await_input(&mut self, timeout: NextTimeout) -> std::result::Result<bool, ureq::Error> {
+        let started = std::time::Instant::now();
+        let mut next = timeout;
+        loop {
+            match self.0.await_input(next) {
+                // Nothing was read, so reading again loses nothing, within
+                // what is left of the read's time.
+                Err(ureq::Error::Io(error)) if error.kind() == std::io::ErrorKind::Interrupted => {
+                    if let ureq::unversioned::transport::time::Duration::Exact(after) =
+                        timeout.after
+                    {
+                        let left = after.saturating_sub(started.elapsed());
+                        if left.is_zero() {
+                            return Err(ureq::Error::Timeout(timeout.reason));
+                        }
+                        next.after = ureq::unversioned::transport::time::Duration::Exact(left);
+                    }
+                }
+                read => return read,
+            }
+        }
+    }
+
+    fn is_open(&mut self) -> bool {
+        self.0.is_open()
+    }
+
+    fn is_tls(&self) -> bool {
+        self.0.is_tls()
+    }
 }
 
 /// The remote store for a workspace, `Ok(None)` when none is configured or the
@@ -1116,6 +1206,120 @@ mod index_read_tests {
             assert_eq!(results.iter().filter(|r| r.is_err()).count(), 1);
         });
         assert_eq!(used.load(Ordering::Relaxed), LARGEST_INDEX);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod agent_tests {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::os::unix::thread::JoinHandleExt;
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+
+    extern "C" fn interrupt(_: libc::c_int) {}
+
+    #[test]
+    fn a_request_outlasts_a_signal_while_it_waits_for_the_answer() {
+        // SAFETY: the handler does nothing, and no other test uses SIGUSR1.
+        // Without SA_RESTART, a read the signal interrupts fails with EINTR on
+        // every Unix, as a socket read with a timeout does on Linux whatever
+        // the handler.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = interrupt as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            libc::sigemptyset(&mut action.sa_mask);
+            assert_eq!(
+                libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()),
+                0
+            );
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let (asked, request) = channel();
+        let (release, released) = channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(&stream);
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap() > 2 {
+                line.clear();
+            }
+            asked.send(()).unwrap();
+            released.recv().unwrap();
+            (&stream)
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .unwrap();
+        });
+        let client = std::thread::spawn(move || {
+            super::agent()
+                .get(url)
+                .call()
+                .map(|response| response.status().as_u16())
+                .map_err(|error| error.to_string())
+        });
+        // The request is sent; signal the client while it waits for the answer.
+        request.recv().unwrap();
+        for _ in 0..20 {
+            // SAFETY: the thread is not joined yet, so its handle is valid.
+            unsafe { libc::pthread_kill(client.as_pthread_t(), libc::SIGUSR1) };
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        release.send(()).unwrap();
+        assert_eq!(client.join().unwrap(), Ok(200));
+        server.join().unwrap();
+    }
+
+    /// A stalled request times out on time whatever signals arrive, over
+    /// HTTP and over HTTPS, where rustls restarts interrupted reads itself.
+    #[test]
+    fn signals_do_not_keep_a_stalled_request_waiting_past_its_timeout() {
+        for scheme in ["http", "https"] {
+            let (elapsed, result) = stalled(scheme);
+            assert!(result.unwrap_err().contains("timeout"), "{scheme}");
+            assert!(elapsed < Duration::from_secs(2), "{scheme}: {elapsed:?}");
+        }
+    }
+
+    /// A request to a server that takes the connection and never answers,
+    /// with its client signalled every 20 ms: how long it took, and how it
+    /// ended.
+    fn stalled(scheme: &str) -> (Duration, Result<(), String>) {
+        // SAFETY: as above; installing the same handler again is harmless.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = interrupt as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            libc::sigemptyset(&mut action.sa_mask);
+            assert_eq!(
+                libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()),
+                0
+            );
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("{scheme}://{}/", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || listener.accept().unwrap());
+        let client = std::thread::spawn(move || {
+            let config = ureq::Agent::config_builder()
+                .timeout_global(Some(Duration::from_millis(300)))
+                .build();
+            let agent = ureq::Agent::with_parts(
+                config,
+                super::connector(),
+                ureq::unversioned::resolver::DefaultResolver::default(),
+            );
+            let started = std::time::Instant::now();
+            let result = agent.get(url).call().map(|_| ());
+            (started.elapsed(), result.map_err(|error| error.to_string()))
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !client.is_finished() && std::time::Instant::now() < deadline {
+            // SAFETY: the thread is not joined yet, so its handle is valid.
+            unsafe { libc::pthread_kill(client.as_pthread_t(), libc::SIGUSR1) };
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let ended = client.join().unwrap();
+        drop(server.join());
+        ended
     }
 }
 
