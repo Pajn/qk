@@ -912,7 +912,15 @@ pub fn run(
     let sandbox = sandbox
         .map(|sandbox| -> Result<SandboxResult> {
             let mode = sandbox.mode;
-            let finished = sandbox.finish()?;
+            let mut finished = sandbox.finish()?;
+            // How a task would have been held says nothing of one that never
+            // started.
+            finished
+                .unsandboxed
+                .retain(|id, _| records.contains_key(id));
+            finished
+                .packages_unchecked
+                .retain(|id, _| records.contains_key(id));
             Ok(SandboxResult {
                 mode,
                 findings: finished.findings,

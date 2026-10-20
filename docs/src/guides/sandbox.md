@@ -119,9 +119,11 @@ what it lets through on Linux. Audit on macOS, or
 - Seatbelt caps the paths a profile with reports may name at 64 KiB
   together. A task's profile names the shorter list of pnpm's store
   directories, those to report or those not to, which fits stores of a few
-  thousand directories. A task whose profile still does not fit runs
-  sandboxed without reporting installed packages, and is listed as such,
-  under `packagesUnchecked` in `--sandbox-report`.
+  thousand directories. A task whose profile still does not fit is retried
+  without reporting installed packages: if Seatbelt takes that profile, the
+  task runs sandboxed and is listed under `packagesUnchecked` in
+  `--sandbox-report`; if not, it runs unsandboxed and is listed with the
+  reason, as above. Only tasks that started are listed.
 - On Windows, qk has no sandbox.
 
 ## Linux

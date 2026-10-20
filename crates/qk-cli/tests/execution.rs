@@ -2828,6 +2828,43 @@ fn the_sandbox_reports_and_refuses_what_a_task_does_not_declare() {
     assert!(temp.path().join("dist/out.txt").is_file());
 }
 
+/// Only a task that started is listed as running unsandboxed: one skipped
+/// after its dependency failed never ran.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_sandbox_lists_only_tasks_that_started() {
+    let _audit = AUDIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // A fileset with a field qk does not know cannot be resolved.
+    let unresolved = json!([{"fileset": "{projectRoot}/**/*", "unknownField": true}]);
+    let temp = fixture(json!({
+        "fail": {"command": "exit 1"},
+        "after": {"command": "true", "dependsOn": ["fail"], "inputs": unresolved},
+        "alone": {"command": "true", "inputs": unresolved}
+    }));
+    let report = temp.path().join("sandbox.json");
+    let output = run(
+        temp.path(),
+        &[
+            "run-many",
+            "-t",
+            "after,alone",
+            "--sandbox",
+            "--sandbox-report",
+            report.to_str().unwrap(),
+        ],
+    );
+    assert!(!output.status.success());
+    let findings: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+    let unsandboxed: Vec<&String> = findings["unsandboxed"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .collect();
+    assert_eq!(unsandboxed, ["app:alone"], "{findings}");
+}
+
 /// A workspace with an `app` project in `apps/app` whose targets read a
 /// package only the root installs, laid out as pnpm installs it: `fallow` and
 /// `other` from the root, `helper` from `apps/app`, and `stale` left from an
