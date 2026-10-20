@@ -2774,7 +2774,7 @@ fn the_sandbox_reports_and_refuses_what_a_task_does_not_declare() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let temp = fixture(json!({
         "build": {
-            "command": "cat src/in.txt other/notes.txt .env > /dev/null; mkdir -p dist && echo out > dist/out.txt && echo stray > stray.txt",
+            "command": "cat src/in.txt other/notes.txt .env > /dev/null; mkdir -p dist && echo out > dist/out.txt && echo stray > stray.txt && cat stray.txt > /dev/null",
             "inputs": ["{projectRoot}/src/**/*"],
             "outputs": ["{projectRoot}/dist"]
         },
@@ -2802,6 +2802,7 @@ fn the_sandbox_reports_and_refuses_what_a_task_does_not_declare() {
     let build = &findings["tasks"]["app:build"];
     assert_eq!(build["undeclaredReads"], json!(["other/notes.txt"]));
     assert_eq!(build["unkeyedReads"], json!([".env"]));
+    // Read back after writing it, it is listed once, as a write.
     assert_eq!(build["strayWrites"], json!(["stray.txt"]));
     assert!(findings["tasks"].get("app:clean").is_none(), "{findings}");
     // Audit lets the task do it all.

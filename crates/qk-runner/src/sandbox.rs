@@ -391,6 +391,16 @@ impl Sandbox {
                 .insert(relative);
             }
         }
+        // A file a task writes outside its outputs and reads, as a version
+        // stamp it keeps, is one finding: declaring it an output covers both.
+        for findings in findings.values_mut() {
+            for path in &findings.stray_writes {
+                findings.undeclared_reads.remove(path);
+                findings.manifest_reads.remove(path);
+                findings.toolchain_reads.remove(path);
+                findings.tsconfig_reads.remove(path);
+            }
+        }
         findings.retain(|_, findings| !findings.is_empty());
         Ok(Finished {
             findings,

@@ -46,7 +46,9 @@ Sandbox audit: 1 of 2 tasks went beyond what they declare
 For each task it lists the files read outside its inputs, the TypeScript
 configuration (`tsconfig*.json`) it read outside them, which is likely an
 input, the `.git` and dotenv files it read, which no cache key covers, and
-what it wrote outside its outputs. Reads of workspace packages'
+what it wrote outside its outputs. A file it writes there and reads, such as
+a version stamp it keeps, is listed once, as written: declaring it an output
+covers both. Reads of workspace packages'
 `package.json`, which package managers and bundlers make to resolve them,
 and of version and package managers' configuration, such as
 `.tool-versions`, are counted once at the top rather than listed for each
