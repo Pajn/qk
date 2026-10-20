@@ -29,6 +29,10 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+mod store;
+
+pub use store::{Store, store_directory};
+
 /// One installation, as [`Lockfile::installations`] lists it.
 #[derive(Debug)]
 pub struct Installed<'a> {
@@ -315,6 +319,30 @@ impl Lockfile {
             .collect()
     }
 
+    /// The snapshot keys a task keyed by these importers and named packages
+    /// covers: everything each importer installs, every installation of each
+    /// package, and everything those reach.
+    pub fn reached_snapshots<'a>(
+        &self,
+        importers: impl IntoIterator<Item = &'a str>,
+        packages: impl IntoIterator<Item = &'a str>,
+    ) -> BTreeSet<String> {
+        let mut pending: Vec<String> = importers
+            .into_iter()
+            .filter_map(|importer| self.direct(importer))
+            .flatten()
+            .map(|(_, key)| key)
+            .collect();
+        let packages: BTreeSet<&str> = packages.into_iter().collect();
+        pending.extend(
+            self.snapshots
+                .keys()
+                .filter(|key| packages.contains(package_name(key)))
+                .cloned(),
+        );
+        self.reach(pending)
+    }
+
     /// An importer's dependencies as installed names and snapshot keys.
     fn direct(&self, importer: &str) -> Option<Vec<(&str, String)>> {
         let dependencies = self.importers.get(importer)?;
@@ -385,7 +413,7 @@ fn snapshot_key(name: &str, reference: &str) -> Option<String> {
 }
 
 /// The package a snapshot key installs: `@scope/name` or `name`.
-fn package_name(key: &str) -> &str {
+pub fn package_name(key: &str) -> &str {
     let key = package_key(key);
     let start = usize::from(key.starts_with('@'));
     key[start..].find('@').map_or(key, |at| &key[..start + at])
