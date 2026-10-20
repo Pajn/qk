@@ -155,6 +155,7 @@ fn decode(process: u32, call: &str, cwd: &Path) -> Option<Decoded> {
             path: path.to_string_lossy().into_owned(),
             resolved_path: None,
             keyed_path: None,
+            package: None,
             operation,
             result: status.to_owned(),
             category: Category::Uncovered,

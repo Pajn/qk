@@ -85,6 +85,20 @@ pub fn present(mut report: Report, options: &Options) -> Result<()> {
                 lines.push("    … more paths in the JSON report".into());
             }
         }
+        if !task.unkeyed_packages.is_empty() {
+            lines.push(format!(
+                "  {} installed package{} read but not in the key; name {} in the target's externalDependencies",
+                task.unkeyed_packages.len(),
+                if task.unkeyed_packages.len() == 1 { "" } else { "s" },
+                if task.unkeyed_packages.len() == 1 { "it" } else { "them" },
+            ));
+            for (package, files) in &task.unkeyed_packages {
+                lines.push(format!(
+                    "    {package} ({files} file{})",
+                    if *files == 1 { "" } else { "s" }
+                ));
+            }
+        }
         for (category, label) in [
             (
                 Category::Discovery,
@@ -92,7 +106,7 @@ pub fn present(mut report: Report, options: &Options) -> Result<()> {
             ),
             (
                 Category::InstalledPackage,
-                "installed-package paths (package coverage needs review)",
+                "installed-package paths in the key's installs or no package qk can tell",
             ),
             (Category::DependencyOutput, "dependency output paths"),
             (Category::OwnOutput, "own output paths"),
@@ -172,6 +186,7 @@ pub fn present(mut report: Report, options: &Options) -> Result<()> {
                         "notes": task.suggestion_notes,
                         "globs": task.glob_suggestions,
                         "uncovered": task.access_review,
+                        "unkeyedPackages": task.unkeyed_packages,
                     }),
                 )
             })

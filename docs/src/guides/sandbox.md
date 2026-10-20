@@ -9,7 +9,8 @@ temporary files and tool caches.
 Inside the workspace, a task may:
 
 - read the files in its cache key, any `node_modules`, the lockfile, its own
-  outputs, its dependencies' outputs and its warm paths;
+  outputs, its dependencies' outputs and its warm paths, though audit reports
+  reading an installed package its key leaves out;
 - list any directory;
 - write its outputs and warm paths.
 
@@ -50,12 +51,60 @@ the tools their commands start through`: they are typically a package
 manager reading every workspace `package.json`, or a version manager reading
 `.tool-versions`, as a command starts.
 
+### Installed packages outside the key
+
+With a pnpm v9 lockfile qk reads, a task's key counts the packages its
+importers install, and those its `externalDependencies` name. A task that
+names its external dependencies, even none, leaves the root importer out (see
+[the cache](cache.md)), so a tool only the root `package.json` installs, such
+as a linter, is in its key only if the task names it. Audit reports reading
+an installed package the key leaves out, by name:
+
+```text
+$ qk run-many -t lint --sandbox
+…
+Sandbox audit: 1 of 3 tasks went beyond what they declare
+  app:lint
+    1 installed package read, not in its key; name it in its externalDependencies:
+      fallow
+```
+
+Name the package in the task's `externalDependencies` input, beside any it
+names already; its installations and everything they reach then count. A
+package read by many tasks, as for paths, is listed once at the top with how
+many tasks read it.
+
+Audit finds a package by a read of its `package.json`, which Node and
+bundlers make for every package they load, rather than by each of the
+thousands of files a tool may read: reports of those would crowd the system
+log, which drops reports when many arrive at once. A tool reading a package without its
+`package.json` goes unreported; [input analysis](input-analysis.md), which
+records every read, finds it.
+
+A read is placed by the directory of pnpm's store it lies in,
+`node_modules/.pnpm/<directory>`, which pnpm names after the installation's
+snapshot key in the lockfile; a read through an importer's
+`node_modules/<name>` link counts as a read of the directory it points to.
+What lies elsewhere in `node_modules`, such as `.bin`, `.modules.yaml` or a
+tool's `.cache`, and a store directory no snapshot in the lockfile names,
+such as one left from an earlier install, belong to no package and are never
+reported. Without a pnpm lockfile qk reads, with one a task's inputs select,
+or with pnpm's `node-linker=hoisted`, which has no such store, nothing is
+reported.
+
 ## Enforce
 
 `--sandbox=enforce` refuses those reads and writes instead, so a task that
 depends on what it does not declare fails, and only its declared outputs can
 change in the workspace. Reading and writing `.git` and reading dotenv files
 stay allowed.
+
+Reading an installed package the key leaves out stays allowed too, and is
+not listed: Landlock grants a directory with everything beneath it, so on
+Linux a store directory could not be refused while `node_modules` stays open
+for what tools create there as they run, and enforce would refuse on macOS
+what it lets through on Linux. Audit on macOS, or
+[input analysis](input-analysis.md) on either system, finds such reads.
 
 ## Notes
 

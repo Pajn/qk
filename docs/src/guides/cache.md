@@ -85,7 +85,13 @@ content: for the root importer and the importers of the task's project and
 its transitive project dependencies, every package installation they reach,
 by snapshot key (version, peers and patch), integrity and dependencies. The
 root importer counts for every task because its packages resolve from every
-package. A lockfile change therefore invalidates only the tasks whose
+package, unless the task names its external dependencies: as in Nx, a task
+with an `externalDependencies` input, even an empty one, hashes the packages
+it names in place of every installed one, so only the root project's own
+tasks then count the root importer. Name in it every root-installed tool the
+task runs; the [sandbox](sandbox.md)'s audit and
+[input analysis](input-analysis.md) report a package a task reads but its
+key leaves out. A lockfile change therefore invalidates only the tasks whose
 projects install something that changed, plus every task when the lockfile
 version, pnpm's `settings` or the lock of pnpm itself changes. A lockfile qk
 cannot read, or one the task's inputs select, is keyed by its whole content.

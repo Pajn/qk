@@ -37,7 +37,12 @@ pub enum Category {
     DependencyOutput,
     WarmState,
     Generated,
+    /// In `node_modules`, and by an installation the key covers, or by none
+    /// qk can tell.
     InstalledPackage,
+    /// Read from an installed package the key leaves out: one that its
+    /// `externalDependencies` would have to name.
+    UnkeyedPackage,
     ResolutionMetadata,
     StructuredInput,
     Discovery,
@@ -57,6 +62,9 @@ pub struct Access {
     /// A declared symlink input that covers this observed target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keyed_path: Option<String>,
+    /// The installed package an `unkeyedPackage` access read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package: Option<String>,
     pub operation: Operation,
     /// `success`, `missing`, another errno, or `unknown` for Seatbelt events.
     pub result: String,
@@ -123,6 +131,10 @@ pub struct TaskAnalysis {
     pub suggestion_notes: Vec<String>,
     #[serde(default)]
     pub access_review: AccessReview,
+    /// Installed packages read that the key leaves out, by name, with how
+    /// many of their files were read.
+    #[serde(default)]
+    pub unkeyed_packages: BTreeMap<String, usize>,
 }
 
 /// Review groups never discard the raw uncovered accesses.
@@ -149,6 +161,18 @@ impl TaskAnalysis {
             .iter()
             .filter(|event| !event.operation.writes() && event.category == Category::Uncovered)
             .map(|event| event.path.clone())
+            .collect();
+        let mut packages: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        for event in &self.accesses {
+            if event.category == Category::UnkeyedPackage
+                && let Some(package) = &event.package
+            {
+                packages.entry(package).or_default().insert(&event.path);
+            }
+        }
+        self.unkeyed_packages = packages
+            .into_iter()
+            .map(|(package, paths)| (package.to_owned(), paths.len()))
             .collect();
         if self.outcome == "success" && self.coverage.diagnostics.is_empty() {
             self.successful_runs.insert(run.to_owned());
@@ -281,6 +305,7 @@ mod tests {
                 path: path.into(),
                 resolved_path: None,
                 keyed_path: None,
+                package: None,
                 operation: Operation::OpenRead,
                 result: "success".into(),
                 category: Category::Input,
@@ -297,6 +322,7 @@ mod tests {
             successful_directories: BTreeSet::new(),
             suggestion_notes: vec![],
             access_review: AccessReview::default(),
+            unkeyed_packages: BTreeMap::new(),
         };
         task.summarize(path);
         task
@@ -534,6 +560,7 @@ mod tests {
                 path: path.into(),
                 resolved_path: None,
                 keyed_path: None,
+                package: None,
                 operation,
                 result: "unknown".into(),
                 category: Category::Uncovered,
@@ -568,6 +595,7 @@ mod tests {
             path: "public".into(),
             resolved_path: None,
             keyed_path: None,
+            package: None,
             operation: Operation::ReadDirectory,
             result: "unknown".into(),
             category: Category::Discovery,

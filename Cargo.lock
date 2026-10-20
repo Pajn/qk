@@ -1849,6 +1849,7 @@ dependencies = [
  "qk-config",
  "qk-executor",
  "qk-input-analysis",
+ "qk-lockfile",
  "qk-taskgraph",
  "serde",
  "serde_json",
