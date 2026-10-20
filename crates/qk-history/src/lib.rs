@@ -16,7 +16,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 /// Runs kept in the database.
 pub const KEPT_RUNS: usize = 200;
 
@@ -29,6 +29,10 @@ pub struct RunReport {
     pub command: Vec<String>,
     /// The commit checked out, when in a git repository.
     pub sha: Option<String>,
+    /// The worktree it ran in, by its root: linked worktrees share the
+    /// history. Absent for runs recorded before qk kept it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
     /// Milliseconds since the Unix epoch.
     pub started: u64,
     pub ended: u64,
@@ -133,6 +137,8 @@ impl Files {
 pub struct RunSummary {
     pub id: String,
     pub command: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
     pub started: u64,
     pub ended: u64,
     pub exit_code: i32,
@@ -221,6 +227,7 @@ impl History {
                          id TEXT PRIMARY KEY,
                          command TEXT NOT NULL,
                          sha TEXT,
+                         worktree TEXT,
                          started INTEGER NOT NULL,
                          ended INTEGER NOT NULL,
                          exit_code INTEGER NOT NULL,
@@ -254,20 +261,24 @@ impl History {
             }
             Some(SCHEMA_VERSION) => {}
             // Version 2 added what warm state did for each task, version 3
-            // the threads it was given, version 4 execution logs and
-            // version 5 the memory it used.
+            // the threads it was given, version 4 execution logs, version 5
+            // the memory it used and version 6 the worktree a run ran in.
             Some(1) => transaction.execute_batch(
                 "ALTER TABLE tasks ADD COLUMN warm TEXT;
                  ALTER TABLE tasks ADD COLUMN threads INTEGER;
-                 ALTER TABLE tasks ADD COLUMN memory INTEGER;",
+                 ALTER TABLE tasks ADD COLUMN memory INTEGER;
+                 ALTER TABLE runs ADD COLUMN worktree TEXT;",
             )?,
-            Some(3 | 4) => {
-                transaction.execute_batch("ALTER TABLE tasks ADD COLUMN memory INTEGER;")?
-            }
             Some(2) => transaction.execute_batch(
                 "ALTER TABLE tasks ADD COLUMN threads INTEGER;
-                 ALTER TABLE tasks ADD COLUMN memory INTEGER;",
+                 ALTER TABLE tasks ADD COLUMN memory INTEGER;
+                 ALTER TABLE runs ADD COLUMN worktree TEXT;",
             )?,
+            Some(3 | 4) => transaction.execute_batch(
+                "ALTER TABLE tasks ADD COLUMN memory INTEGER;
+                 ALTER TABLE runs ADD COLUMN worktree TEXT;",
+            )?,
+            Some(5) => transaction.execute_batch("ALTER TABLE runs ADD COLUMN worktree TEXT;")?,
             Some(other) => {
                 bail!("run history has schema version {other}; this qk reads {SCHEMA_VERSION}")
             }
@@ -282,7 +293,7 @@ impl History {
                  PRIMARY KEY (run_id, task_id),
                  FOREIGN KEY (run_id, task_id) REFERENCES tasks(run_id, task_id) ON DELETE CASCADE
              );
-             UPDATE schema_version SET version = 5;",
+             UPDATE schema_version SET version = 6;",
         )?;
         transaction.commit()?;
         connection.execute_batch("PRAGMA foreign_keys = ON;")?;
@@ -316,8 +327,8 @@ impl History {
         }
         let transaction = self.connection.transaction()?;
         transaction.execute(
-            "INSERT OR REPLACE INTO runs (id, command, sha, started, ended, exit_code, critical_path)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT OR REPLACE INTO runs (id, command, sha, started, ended, exit_code, critical_path, worktree)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 run.id,
                 serde_json::to_string(&run.command)?,
@@ -326,6 +337,7 @@ impl History {
                 run.ended,
                 run.exit_code,
                 serde_json::to_string(&run.critical_path)?,
+                run.worktree,
             ],
         )?;
         for task in &run.tasks {
@@ -444,23 +456,26 @@ impl History {
         Ok(cause)
     }
 
-    pub fn runs(&self, limit: usize) -> Result<Vec<RunSummary>> {
+    /// The newest runs, of one worktree when `worktree` names it.
+    pub fn runs(&self, limit: usize, worktree: Option<&str>) -> Result<Vec<RunSummary>> {
         let mut statement = self.connection.prepare(
-            "SELECT id, command, started, ended, exit_code FROM runs ORDER BY started DESC LIMIT ?1",
+            "SELECT id, command, started, ended, exit_code, worktree FROM runs
+             WHERE ?2 IS NULL OR worktree = ?2 ORDER BY started DESC LIMIT ?1",
         )?;
         let rows = statement
-            .query_map([limit], |row| {
+            .query_map(params![limit, worktree], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, u64>(2)?,
                     row.get::<_, u64>(3)?,
                     row.get::<_, i32>(4)?,
+                    row.get::<_, Option<String>>(5)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut summaries = Vec::new();
-        for (id, command, started, ended, exit_code) in rows {
+        for (id, command, started, ended, exit_code, worktree) in rows {
             let mut cache = BTreeMap::new();
             let mut tasks = 0;
             let mut counts = self.connection.prepare(
@@ -476,6 +491,7 @@ impl History {
             summaries.push(RunSummary {
                 id,
                 command: serde_json::from_str(&command)?,
+                worktree,
                 started,
                 ended,
                 exit_code,
@@ -486,13 +502,15 @@ impl History {
         Ok(summaries)
     }
 
-    /// A recorded run, the latest when `id` is `None`.
-    pub fn run(&self, id: Option<&str>) -> Result<Option<RunReport>> {
+    /// A recorded run, the latest when `id` is `None`, of one worktree when
+    /// `worktree` names it.
+    pub fn run(&self, id: Option<&str>, worktree: Option<&str>) -> Result<Option<RunReport>> {
         let row = match id {
             Some(id) => self
                 .connection
                 .query_row(
-                    "SELECT id, command, sha, started, ended, exit_code, critical_path FROM runs WHERE id = ?1",
+                    "SELECT id, command, sha, started, ended, exit_code, critical_path, worktree
+                     FROM runs WHERE id = ?1",
                     [id],
                     run_row,
                 )
@@ -500,14 +518,15 @@ impl History {
             None => self
                 .connection
                 .query_row(
-                    "SELECT id, command, sha, started, ended, exit_code, critical_path FROM runs
-                     ORDER BY started DESC LIMIT 1",
-                    [],
+                    "SELECT id, command, sha, started, ended, exit_code, critical_path, worktree
+                     FROM runs WHERE ?1 IS NULL OR worktree = ?1 ORDER BY started DESC LIMIT 1",
+                    [worktree],
                     run_row,
                 )
                 .optional()?,
         };
-        let Some((id, command, sha, started, ended, exit_code, critical_path)) = row else {
+        let Some((id, command, sha, started, ended, exit_code, critical_path, worktree)) = row
+        else {
             return Ok(None);
         };
         let tasks = self.tasks("run_id = ?1", &id, usize::MAX)?;
@@ -516,6 +535,7 @@ impl History {
             id,
             command: serde_json::from_str(&command)?,
             sha,
+            worktree,
             started,
             ended,
             exit_code,
@@ -605,20 +625,28 @@ impl History {
             .collect())
     }
 
-    /// Mixed outcomes for identical verified declared inputs, excluding cache replay.
-    pub fn flaky(&self, task: Option<&str>, limit: usize) -> Result<Vec<Flaky>> {
+    /// Mixed outcomes for identical verified declared inputs, excluding cache
+    /// replay, in one worktree's runs when `worktree` names it.
+    pub fn flaky(
+        &self,
+        task: Option<&str>,
+        limit: usize,
+        worktree: Option<&str>,
+    ) -> Result<Vec<Flaky>> {
         let mut statement = self.connection.prepare(
             "SELECT t.task_id, t.key FROM tasks t
              JOIN execution_logs e ON e.run_id = t.run_id AND e.task_id = t.task_id
+             JOIN runs r ON r.id = t.run_id
              WHERE t.cache IN ('miss', 'uncached') AND t.key IS NOT NULL AND e.inputs_unchanged = 1
                AND t.status IN ('success', 'failure') AND (?1 IS NULL OR t.task_id = ?1)
+               AND (?3 IS NULL OR r.worktree = ?3)
              GROUP BY t.task_id, t.key
              HAVING SUM(t.status = 'success') > 0 AND SUM(t.status = 'failure') > 0
              ORDER BY MAX(t.started) DESC, t.task_id, t.key LIMIT ?2",
         )?;
         let keys = statement
             .query_map(
-                params![task, i64::try_from(limit).unwrap_or(i64::MAX)],
+                params![task, i64::try_from(limit).unwrap_or(i64::MAX), worktree],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -627,12 +655,14 @@ impl History {
                 let mut statement = self.connection.prepare(
                     "SELECT t.run_id, t.status, t.started, e.data IS NOT NULL FROM tasks t
                  JOIN execution_logs e ON e.run_id = t.run_id AND e.task_id = t.task_id
+                 JOIN runs r ON r.id = t.run_id
                  WHERE t.task_id = ?1 AND t.key = ?2 AND t.cache IN ('miss', 'uncached')
                    AND t.status IN ('success', 'failure') AND e.inputs_unchanged = 1
+                   AND (?3 IS NULL OR r.worktree = ?3)
                  ORDER BY t.started DESC, t.run_id DESC",
                 )?;
                 let executions = statement
-                    .query_map(params![task, key], |row| {
+                    .query_map(params![task, key, worktree], |row| {
                         Ok(Observation {
                             run: row.get(0)?,
                             status: row.get(1)?,
@@ -727,7 +757,16 @@ impl History {
     }
 }
 
-type RunRow = (String, String, Option<String>, u64, u64, i32, String);
+type RunRow = (
+    String,
+    String,
+    Option<String>,
+    u64,
+    u64,
+    i32,
+    String,
+    Option<String>,
+);
 
 fn run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
     Ok((
@@ -738,6 +777,7 @@ fn run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
         row.get(4)?,
         row.get(5)?,
         row.get(6)?,
+        row.get(7)?,
     ))
 }
 

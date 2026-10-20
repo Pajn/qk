@@ -1282,6 +1282,7 @@ mod tests {
             id: "run".into(),
             command: vec![],
             sha: None,
+            worktree: None,
             started: 0,
             ended: 2_000 + wait,
             exit_code: 0,

@@ -9,7 +9,11 @@ qk run web:build --report run.json
 
 Every run is recorded in a SQLite database beside the cache
 (`<git common dir>/qk/history.db`, or `.qk/history.db` outside Git), so linked
-worktrees share it. Each task's record holds its status, cache result
+worktrees share it. Each run records the worktree it ran in: `qk show runs`,
+`qk show run` without an id, and `qk show flaky` read the current worktree's
+runs, and `--all-worktrees` reads every worktree's, naming each run's. Runs
+recorded before qk kept the worktree appear only with `--all-worktrees`.
+Each task's record holds its status, cache result
 (`local-hit`, `remote-hit`, `miss` or `uncached`), key, timing and cause: what
 differs from the previous key recorded for the task, grouped as `files` (with
 the paths added, removed and changed), `configuration` (the files qk keys for

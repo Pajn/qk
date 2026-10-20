@@ -35,6 +35,7 @@ fn run(id: &str, started: u64, tasks: Vec<TaskReport>) -> RunReport {
         id: id.into(),
         command: vec!["qk".into(), "run-many".into()],
         sha: None,
+        worktree: None,
         started,
         ended: started + 100,
         exit_code: 0,
@@ -114,8 +115,8 @@ fn explains_what_changed_since_the_previous_key() {
     );
 
     // Stored and read back as recorded.
-    assert_eq!(history.run(None).unwrap().unwrap(), third);
-    assert_eq!(history.run(Some("two")).unwrap().unwrap(), second);
+    assert_eq!(history.run(None, None).unwrap().unwrap(), third);
+    assert_eq!(history.run(Some("two"), None).unwrap().unwrap(), second);
     let records = history.task("app:build", 10).unwrap();
     assert_eq!(
         records
@@ -124,7 +125,7 @@ fn explains_what_changed_since_the_previous_key() {
             .collect::<Vec<_>>(),
         ["three", "two", "one"]
     );
-    let runs = history.runs(10).unwrap();
+    let runs = history.runs(10, None).unwrap();
     assert_eq!(runs.len(), 3);
     assert_eq!(runs[0].cache["miss"], 1);
 }
@@ -261,7 +262,7 @@ fn mixed_outcomes_require_verified_executions_of_the_same_task_key() {
                 )]),
             )
             .unwrap();
-        let groups = history.flaky(None, 20).unwrap();
+        let groups = history.flaky(None, 20, None).unwrap();
         if index < 6 {
             assert!(groups.is_empty());
         } else {
@@ -270,8 +271,13 @@ fn mixed_outcomes_require_verified_executions_of_the_same_task_key() {
             assert_eq!(groups[0].failures, 1);
         }
     }
-    assert!(history.flaky(Some("other:test"), 20).unwrap().is_empty());
-    assert!(history.flaky(None, 0).unwrap().is_empty());
+    assert!(
+        history
+            .flaky(Some("other:test"), 20, None)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(history.flaky(None, 0, None).unwrap().is_empty());
 }
 
 /// Payload eviction leaves observations intact; run pruning removes their logs.
@@ -304,7 +310,7 @@ fn log_retention_is_bounded_without_erasing_mixed_outcomes() {
     let newest = history.log("17", "app:test").unwrap().unwrap();
     assert!(newest.truncated);
     assert_eq!(newest.data.len(), data.len());
-    let groups = history.flaky(None, 20).unwrap();
+    let groups = history.flaky(None, 20, None).unwrap();
     assert_eq!(groups[0].failures, 1);
     assert_eq!(
         groups[0]
@@ -327,7 +333,7 @@ fn log_retention_is_bounded_without_erasing_mixed_outcomes() {
             .unwrap();
     }
     assert!(history.log("17", "app:test").unwrap().is_none());
-    assert!(history.flaky(None, 20).unwrap().is_empty());
+    assert!(history.flaky(None, 20, None).unwrap().is_empty());
 }
 
 /// Existing schema-3 runs remain readable but do not invent execution observations.
@@ -348,13 +354,14 @@ fn upgrades_schema_three_without_inventing_logs() {
         .execute_batch(
             "DROP TABLE execution_logs;
              ALTER TABLE tasks DROP COLUMN memory;
+             ALTER TABLE runs DROP COLUMN worktree;
              UPDATE schema_version SET version = 3;",
         )
         .unwrap();
     let history = History::open(&path).unwrap();
-    assert!(history.run(Some("old")).unwrap().is_some());
+    assert!(history.run(Some("old"), None).unwrap().is_some());
     assert!(history.log("old", "app:test").unwrap().is_none());
-    assert!(history.flaky(None, 20).unwrap().is_empty());
+    assert!(history.flaky(None, 20, None).unwrap().is_empty());
 }
 
 #[test]
@@ -422,6 +429,7 @@ fn records_the_memory_a_task_used_after_upgrading_schema_four() {
         .unwrap()
         .execute_batch(
             "ALTER TABLE tasks DROP COLUMN memory;
+             ALTER TABLE runs DROP COLUMN worktree;
              UPDATE schema_version SET version = 4;",
         )
         .unwrap();
@@ -443,5 +451,87 @@ fn records_the_memory_a_task_used_after_upgrading_schema_four() {
             ("new".to_owned(), Some(3_000_000_000)),
             ("old".to_owned(), None)
         ]
+    );
+}
+
+#[test]
+fn reads_one_worktree_of_a_shared_history() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("history.db");
+    let mut history = History::open(&path).unwrap();
+    let mut record = |id: &str, started: u64, worktree: Option<&str>, status: &str| {
+        let mut test = task("app:test", Some("k"), started, started + 1, &[]);
+        test.status = status.into();
+        test.cache = Some("miss".into());
+        let run = RunReport {
+            worktree: worktree.map(str::to_owned),
+            ..run(id, started, vec![test])
+        };
+        let executions = BTreeMap::from([(
+            "app:test",
+            qk_history::Execution {
+                data: b"",
+                truncated: false,
+                inputs_unchanged: true,
+            },
+        )]);
+        history
+            .record_with_executions(run, &BTreeMap::new(), &executions)
+            .unwrap();
+    };
+    record("before", 1, None, "success");
+    record("main", 10, Some("/repo"), "success");
+    record("linked", 20, Some("/repo-linked"), "failure");
+    let ids = |worktree| -> Vec<String> {
+        history
+            .runs(10, worktree)
+            .unwrap()
+            .into_iter()
+            .map(|run| run.id)
+            .collect()
+    };
+    assert_eq!(ids(Some("/repo")), ["main"]);
+    assert_eq!(ids(None), ["linked", "main", "before"]);
+    assert_eq!(
+        history.run(None, Some("/repo")).unwrap().unwrap().id,
+        "main"
+    );
+    assert_eq!(history.run(None, None).unwrap().unwrap().id, "linked");
+    // A success here and a failure in another worktree are mixed outcomes
+    // only across worktrees.
+    assert!(history.flaky(None, 20, Some("/repo")).unwrap().is_empty());
+    assert_eq!(history.flaky(None, 20, None).unwrap().len(), 1);
+}
+
+#[test]
+fn upgrades_schema_five_to_record_worktrees() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("history.db");
+    History::open(&path).unwrap();
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "ALTER TABLE runs DROP COLUMN worktree;
+             UPDATE schema_version SET version = 5;",
+        )
+        .unwrap();
+    let mut history = History::open(&path).unwrap();
+    history
+        .record(
+            RunReport {
+                worktree: Some("/repo".into()),
+                ..run("new", 1, vec![])
+            },
+            &BTreeMap::new(),
+        )
+        .unwrap();
+    assert_eq!(
+        history
+            .run(None, Some("/repo"))
+            .unwrap()
+            .unwrap()
+            .worktree
+            .as_deref(),
+        Some("/repo")
     );
 }
