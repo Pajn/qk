@@ -2312,7 +2312,18 @@ fn resolve_candidates(
             }
         }
     }
-    let inferred = infer(snapshot, workspace, task)?;
+    let mut inferred = infer(snapshot, workspace, task)?;
+    // As in Nx, a task naming its external dependencies hashes those in place
+    // of every installed package, so the root importer's installs count only
+    // for the root project's own tasks.
+    if declared.external_declared
+        && let Some(importers) = &mut inferred.lockfile
+    {
+        let root = workspace.projects[&task.project].root == ".";
+        if !root {
+            importers.remove(".");
+        }
+    }
     Ok(join(declared, inferred))
 }
 

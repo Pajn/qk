@@ -1917,6 +1917,51 @@ fn lockfile_changes_reach_the_tasks_hashing_installed_packages() {
     }
 }
 
+/// As in Nx, a task naming its external dependencies hashes those in place of
+/// every installed package, so a package only the root installs does not
+/// reach it; a task naming none still hashes everything the root installs.
+#[test]
+fn a_task_naming_its_external_dependencies_ignores_the_root_importer() {
+    let lockfile = |tool: &str| {
+        format!(
+            "lockfileVersion: '9.0'
+importers:
+  .:
+    devDependencies:
+      tool:
+        specifier: ^1.0.0
+        version: {tool}
+  apps/app:
+    dependencies:
+      react:
+        specifier: ^19.0.0
+        version: 19.0.0
+packages:
+  react@19.0.0:
+    resolution: {{integrity: sha512-a}}
+  tool@{tool}:
+    resolution: {{integrity: sha512-{tool}}}
+snapshots:
+  react@19.0.0: {{}}
+  tool@{tool}: {{}}
+"
+        )
+    };
+    let repo = narrow_task_repo(
+        r#", "pluginsConfig": {"@nx/js": {"projectsAffectedByDependencyUpdates": "auto"}}"#,
+        &[("pnpm-lock.yaml", &lockfile("1.0.0"))],
+    );
+    write(&repo.root, "pnpm-lock.yaml", &lockfile("1.1.0"));
+    // `test` names its external dependencies, as an empty list; `build` does not.
+    assert_eq!(
+        affected_tasks(&repo)
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["app:build", "lib:build"]
+    );
+}
+
 /// A changed lockfile configures no project, so a root project's tasks are
 /// not reconfigured by it: under `"auto"` they are affected only as its
 /// installs are.
