@@ -1823,6 +1823,7 @@ fn execute_narrowed(
             let mut bytes = serde_json::to_vec_pretty(&serde_json::json!({
                 "tasks": sandbox.findings,
                 "unsandboxed": sandbox.unsandboxed,
+                "packagesUnchecked": sandbox.packages_unchecked,
             }))?;
             bytes.push(b'\n');
             std::fs::write(path, bytes).with_context(|| {

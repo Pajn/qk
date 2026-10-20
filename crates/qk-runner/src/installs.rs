@@ -67,14 +67,20 @@ impl Installs {
         ))
     }
 
-    /// The store directories on disk holding only installations `covered`
-    /// leaves out.
-    pub(crate) fn unkeyed_directories(&self, covered: &BTreeSet<String>) -> Vec<PathBuf> {
-        self.directories
+    /// The store directories on disk holding an installation `covered`
+    /// counts, and those holding only installations it leaves out.
+    pub(crate) fn directories(&self, covered: &BTreeSet<String>) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        let (keyed, unkeyed): (Vec<_>, Vec<_>) = self
+            .directories
             .iter()
-            .filter(|(_, keys)| !keys.iter().any(|key| covered.contains(key)))
-            .map(|(path, _)| path.clone())
-            .collect()
+            .partition(|(_, keys)| keys.iter().any(|key| covered.contains(key)));
+        let paths = |directories: Vec<&(PathBuf, Vec<String>)>| -> Vec<PathBuf> {
+            directories
+                .into_iter()
+                .map(|(path, _)| path.clone())
+                .collect()
+        };
+        (paths(keyed), paths(unkeyed))
     }
 
     /// The package a read of `path`, absolute, belongs to when `covered`
@@ -254,7 +260,7 @@ snapshots:
             assert_eq!(unkeyed(path).as_deref(), package, "{path}");
         }
         assert_eq!(
-            installs.unkeyed_directories(&none),
+            installs.directories(&none).1,
             [
                 root.join("node_modules/.pnpm/@scope+tool@2.0.0_react@19.0.0"),
                 root.join("node_modules/.pnpm/fallow@1.0.0"),
@@ -275,8 +281,15 @@ snapshots:
             None
         );
         assert_eq!(
-            installs.unkeyed_directories(&fallow),
-            [root.join("node_modules/.pnpm/@scope+tool@2.0.0_react@19.0.0")]
+            installs.directories(&fallow),
+            (
+                vec![
+                    root.join("node_modules/.pnpm/fallow@1.0.0"),
+                    root.join("node_modules/.pnpm/helper@1.0.0"),
+                    root.join("node_modules/.pnpm/react@19.0.0"),
+                ],
+                vec![root.join("node_modules/.pnpm/@scope+tool@2.0.0_react@19.0.0")]
+            )
         );
     }
 }

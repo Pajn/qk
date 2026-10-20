@@ -116,6 +116,12 @@ what it lets through on Linux. Audit on macOS, or
   nothing else happened.
 - A task whose inputs cannot be resolved, or whose profile the sandbox
   rejects, runs unsandboxed and is listed with the reason.
+- Seatbelt caps the paths a profile with reports may name at 64 KiB
+  together. A task's profile names the shorter list of pnpm's store
+  directories, those to report or those not to, which fits stores of a few
+  thousand directories. A task whose profile still does not fit runs
+  sandboxed without reporting installed packages, and is listed as such,
+  under `packagesUnchecked` in `--sandbox-report`.
 - On Windows, qk has no sandbox.
 
 ## Linux
