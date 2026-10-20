@@ -32,9 +32,19 @@ contain filenames and forwarded arguments, so review them before sharing.
 Categories distinguish keyed source files, mandatory workspace/package
 configuration, structured JSON inputs, dependency outputs, own outputs, warm
 state, installed packages, resolution metadata, Git state, discovery and external
-accesses. Installed-package classification does not prove that the package is
-covered by the task's lockfile fingerprint. Discovery includes directory accesses
-and missing-path checks; these deserve review independently of content inputs.
+accesses. Discovery includes directory accesses and missing-path checks; these
+deserve review independently of content inputs.
+
+A content read in `node_modules` is `unkeyedPackage`, with the package named as
+`package`, when it lies in an installation the task's key leaves out, as the
+[sandbox](sandbox.md#installed-packages-outside-the-key) places it: a task
+naming its `externalDependencies`, even none, keys only what its projects'
+importers install and the packages it names, so a tool only the root installs
+must be named. `unkeyedPackages` lists each such package with how many of its
+files were read, and the terminal names them with the fix: add each to the
+target's `externalDependencies`. Other `node_modules` accesses are
+`installedPackage`: in an installation the key covers, outside pnpm's store,
+or in a store directory no lockfile snapshot names.
 
 `uncoveredAccesses` lists workspace paths accessed outside those categories.
 `observedInputs` lists keyed file inputs accessed in this execution. Successful
@@ -78,7 +88,7 @@ from the other groups.
 
 The terminal prints the fragment. `--suggestions inputs-review.json` exports
 fragments grouped by task ID, with a `reviews` entry for every task, including
-no-change notes and uncovered-access groups; this wrapper is not itself a
+no-change notes, uncovered-access groups and unkeyed packages; this wrapper is not itself a
 project configuration. Copy a reviewed fragment into the corresponding project's
 configuration. Suggestions apply to the whole target, even when the recording
 used `-c production`: validate every configuration before accepting them. Expanding

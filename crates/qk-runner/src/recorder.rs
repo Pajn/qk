@@ -10,6 +10,7 @@ use qk_executor::{Outcome, PreparedTask};
 use qk_input_analysis::{Access, Category, Coverage, Declaration, Operation, Report, TaskAnalysis};
 use qk_taskgraph::TaskGraph;
 
+use crate::installs::Installs;
 use crate::sandbox::Watcher;
 
 mod strace;
@@ -20,6 +21,7 @@ pub struct Recorder {
     watcher: Option<Watcher>,
     program: Option<PathBuf>,
     declared: qk_cache::Resolution,
+    installs: Option<Installs>,
     started: std::time::SystemTime,
     symlinks: BTreeMap<String, BTreeSet<PathBuf>>,
     tag_prefix: String,
@@ -51,11 +53,12 @@ impl Recorder {
             directory.path().file_name().unwrap().to_string_lossy()
         );
         let mut recorder = Self {
-            root,
+            root: root.clone(),
             directory,
             watcher: None,
             program: None,
             declared: qk_cache::resolve_each(workspace, graph)?,
+            installs: Installs::load(&root),
             started: std::time::SystemTime::now(),
             symlinks: BTreeMap::new(),
             tag_prefix,
@@ -186,6 +189,7 @@ impl Recorder {
                             path: event.path,
                             resolved_path: None,
                             keyed_path: None,
+                            package: None,
                             operation,
                             result: "unknown".into(),
                             category: Category::Uncovered,
@@ -247,6 +251,10 @@ impl Recorder {
                     .diagnostics
                     .push("some output or warm paths could not be resolved".into());
             }
+            let covered = self.installs.as_ref().and_then(|installs| {
+                let resolved = self.declared.tasks[id].as_ref().ok()?;
+                Some((installs, installs.covered(resolved)?))
+            });
             let mut generated = BTreeSet::new();
             let mut accesses = observed.remove(id).unwrap_or_default();
             for event in &mut accesses {
@@ -289,7 +297,22 @@ impl Recorder {
                         })
                 });
                 event.category = if event.path.split('/').any(|part| part == "node_modules") {
-                    Category::InstalledPackage
+                    // As the sandbox reports them: content read from a
+                    // package the key leaves out.
+                    event.package = covered
+                        .as_ref()
+                        .filter(|_| {
+                            matches!(
+                                event.operation,
+                                Operation::ReadData | Operation::OpenRead | Operation::Execute
+                            ) && matches!(event.result.as_str(), "success" | "unknown")
+                        })
+                        .and_then(|(installs, covered)| installs.unkeyed(covered, &absolute));
+                    if event.package.is_some() {
+                        Category::UnkeyedPackage
+                    } else {
+                        Category::InstalledPackage
+                    }
                 } else if event.path == ".git" || event.path.starts_with(".git/") {
                     Category::GitState
                 } else if outputs
@@ -387,6 +410,7 @@ impl Recorder {
                 successful_directories: BTreeSet::new(),
                 suggestion_notes: vec![],
                 access_review: Default::default(),
+                unkeyed_packages: BTreeMap::new(),
             };
             analysis.summarize(&run_id);
             tasks.insert(id.clone(), analysis);

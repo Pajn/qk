@@ -2830,7 +2830,7 @@ fn the_sandbox_reports_and_refuses_what_a_task_does_not_declare() {
 
 /// A workspace with an `app` project in `apps/app` whose targets read a
 /// package only the root installs, laid out as pnpm installs it.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn root_tool_fixture(targets: Value) -> TempDir {
     let temp = TempDir::new().unwrap();
     let root = temp.path();
@@ -3696,6 +3696,46 @@ fn input_analysis_recognizes_nested_links_and_structured_link_targets() {
             .contains(&json!("other/value.txt")),
         "{report}"
     );
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn input_analysis_reports_a_package_read_that_the_key_leaves_out() {
+    #[cfg(target_os = "macos")]
+    let _audit = AUDIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    #[cfg(target_os = "linux")]
+    if Command::new("strace").arg("-V").output().is_err() {
+        return;
+    }
+    let analyze = |external: Value| {
+        let temp = root_tool_fixture(json!({
+            "lint": {
+                "command": "cat ../../node_modules/fallow/index.js ../../node_modules/fallow/package.json",
+                "options": {"cwd": "apps/app"},
+                "inputs": ["default", {"externalDependencies": external}]
+            }
+        }));
+        let output = success(run(
+            temp.path(),
+            &["inputs", "analyze", "app:lint", "--report", "analysis.json"],
+        ));
+        let report: Value =
+            serde_json::from_slice(&fs::read(temp.path().join("analysis.json")).unwrap()).unwrap();
+        (
+            report["tasks"]["app:lint"]["unkeyedPackages"].clone(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    let (packages, stderr) = analyze(json!([]));
+    assert_eq!(packages, json!({"fallow": 2}));
+    assert!(
+        stderr.contains("1 installed package read but not in the key; name it in the target's externalDependencies\n    fallow (2 files)"),
+        "{stderr}"
+    );
+    let (packages, _) = analyze(json!(["fallow"]));
+    assert_eq!(packages, json!({}));
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
