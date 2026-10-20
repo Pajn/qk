@@ -29,6 +29,7 @@ use qk_executor::report::{self, Event};
 use qk_executor::{Display, Outcome, OutputStyle, environment, execute, prepare};
 use qk_taskgraph::TaskGraph;
 
+mod installs;
 mod memory;
 mod recorder;
 pub mod sandbox;

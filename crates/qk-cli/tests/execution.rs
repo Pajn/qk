@@ -2828,6 +2828,108 @@ fn the_sandbox_reports_and_refuses_what_a_task_does_not_declare() {
     assert!(temp.path().join("dist/out.txt").is_file());
 }
 
+/// A workspace with an `app` project in `apps/app` whose targets read a
+/// package only the root installs, laid out as pnpm installs it.
+#[cfg(target_os = "macos")]
+fn root_tool_fixture(targets: Value) -> TempDir {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    fs::write(root.join("nx.json"), "{}").unwrap();
+    fs::create_dir_all(root.join("apps/app")).unwrap();
+    fs::write(
+        root.join("apps/app/project.json"),
+        json!({"name": "app", "targets": targets}).to_string(),
+    )
+    .unwrap();
+    fs::write(
+        root.join("pnpm-lock.yaml"),
+        "lockfileVersion: '9.0'
+importers:
+  .:
+    devDependencies:
+      fallow:
+        specifier: ^1.0.0
+        version: 1.0.0
+  apps/app: {}
+packages:
+  fallow@1.0.0:
+    resolution: {integrity: sha512-fallow}
+snapshots:
+  fallow@1.0.0: {}
+",
+    )
+    .unwrap();
+    let package = root.join("node_modules/.pnpm/fallow@1.0.0/node_modules/fallow");
+    fs::create_dir_all(&package).unwrap();
+    fs::write(package.join("index.js"), "").unwrap();
+    fs::write(package.join("package.json"), "{}").unwrap();
+    std::os::unix::fs::symlink(
+        ".pnpm/fallow@1.0.0/node_modules/fallow",
+        root.join("node_modules/fallow"),
+    )
+    .unwrap();
+    temp
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn the_sandbox_reports_a_package_read_that_the_key_leaves_out() {
+    let _audit = AUDIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let read = "cat ../../node_modules/fallow/index.js ../../node_modules/fallow/package.json";
+    let targets = |external: Value| {
+        json!({
+            // Naming its external dependencies, even none, leaves the root
+            // importer out of the key.
+            "lint": {"command": read, "options": {"cwd": "apps/app"}, "inputs": ["default", {"externalDependencies": external}]},
+            // Without, every installed package counts.
+            "build": {"command": read, "options": {"cwd": "apps/app"}, "inputs": ["default"]}
+        })
+    };
+    let audit = |temp: &TempDir| {
+        let report = temp.path().join("sandbox.json");
+        let output = success(run(
+            temp.path(),
+            &[
+                "run-many",
+                "-t",
+                "lint,build",
+                "--sandbox",
+                "--sandbox-report",
+                report.to_str().unwrap(),
+            ],
+        ));
+        let findings: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+        (
+            findings,
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    let unnamed = root_tool_fixture(targets(json!([])));
+    let (findings, stderr) = audit(&unnamed);
+    assert_eq!(
+        findings["tasks"]["app:lint"]["unkeyedPackages"],
+        json!(["fallow"]),
+        "{findings}"
+    );
+    assert!(findings["tasks"].get("app:build").is_none(), "{findings}");
+    assert!(
+        stderr.contains(
+            "1 installed package read, not in its key; name it in its externalDependencies:\n      fallow\n"
+        ),
+        "{stderr}"
+    );
+    // Enforce lets a task read any installed package.
+    success(run(
+        unnamed.path(),
+        &["run", "app:lint", "--sandbox=enforce"],
+    ));
+    let named = root_tool_fixture(targets(json!(["fallow"])));
+    let (findings, _) = audit(&named);
+    assert_eq!(findings["tasks"], json!({}), "{findings}");
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn warm_suggest_lists_the_directories_a_task_wrote_outside_its_outputs() {

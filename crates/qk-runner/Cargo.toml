@@ -15,6 +15,7 @@ qk-executor.workspace = true
 qk-taskgraph.workspace = true
 qk-cache.workspace = true
 qk-input-analysis.workspace = true
+qk-lockfile.workspace = true
 tempfile.workspace = true
 serde.workspace = true
 serde_json.workspace = true

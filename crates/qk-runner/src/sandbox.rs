@@ -9,6 +9,14 @@
 //! mode it is refused, except reading and writing `.git` and reading dotenv
 //! files, which a task may need although they are not keyed.
 //!
+//! Audit also reports reading an installed package the key leaves out, as a
+//! task naming its `externalDependencies` but running a tool only the root
+//! installs does. Enforce allows it: Landlock grants a directory with all
+//! beneath it, so a store directory could not be kept from a task while
+//! `node_modules` stays open for what tools create there as they run, such
+//! as `node_modules/.cache`, and enforce would refuse on macOS what it lets
+//! through on Linux.
+//!
 //! On macOS that is Seatbelt, through `sandbox-exec`, with a profile per
 //! task. Each report names the task through the rule's message, so the
 //! kernel's log, read while the run lasts, says which task did what. On
@@ -27,6 +35,8 @@ use anyhow::{Context, Result, bail};
 use qk_config::Workspace;
 use qk_taskgraph::{Task, TaskGraph};
 use serde::Serialize;
+
+use crate::installs::Installs;
 
 #[cfg(target_os = "linux")]
 mod landlock;
@@ -55,6 +65,8 @@ pub struct Findings {
     pub unkeyed_reads: BTreeSet<String>,
     /// Paths it wrote in the workspace outside its outputs.
     pub stray_writes: BTreeSet<String>,
+    /// Installed packages it read that its key leaves out, by name.
+    pub unkeyed_packages: BTreeSet<String>,
 }
 
 impl Findings {
@@ -62,6 +74,7 @@ impl Findings {
         self.undeclared_reads.is_empty()
             && self.unkeyed_reads.is_empty()
             && self.stray_writes.is_empty()
+            && self.unkeyed_packages.is_empty()
     }
 }
 
@@ -81,6 +94,9 @@ struct Plan {
     read_trees: BTreeSet<PathBuf>,
     /// Its outputs and warm paths.
     write_trees: BTreeSet<PathBuf>,
+    /// Audit: the pnpm store directories of installations its key leaves
+    /// out, whose manifests' reads are reported.
+    unkeyed_packages: Vec<PathBuf>,
 }
 
 /// A run's sandbox: what each task may do, its profiles or rules, and on
@@ -91,6 +107,10 @@ pub struct Sandbox {
     state: PathBuf,
     plans: BTreeMap<String, Plan>,
     profiles: BTreeMap<String, PathBuf>,
+    /// Audit: the installed packages, and the installations each task's key
+    /// covers, for telling which package a reported read belongs to.
+    installs: Option<Installs>,
+    covered: BTreeMap<String, BTreeSet<String>>,
     /// Tasks that run unsandboxed, and why.
     unsandboxed: Mutex<BTreeMap<String, String>>,
     watcher: Option<Watcher>,
@@ -135,16 +155,24 @@ impl Sandbox {
         std::fs::create_dir_all(&directory)?;
         let resolution = qk_cache::resolve_each(workspace, graph)?;
         let tree = Tree::new(&resolution.candidates);
+        let installs = (mode == Mode::Audit)
+            .then(|| Installs::load(&root))
+            .flatten();
         let mut plans = BTreeMap::new();
+        let mut covered = BTreeMap::new();
         let mut unsandboxed = BTreeMap::new();
         for (id, task) in &graph.tasks {
             match &resolution.tasks[id] {
                 Ok(resolved) => {
                     let files = resolved.file_inputs().map(str::to_owned).collect();
-                    plans.insert(
-                        id.clone(),
-                        plan(workspace, graph, task, &root, &tree, &files),
-                    );
+                    let mut plan = plan(workspace, graph, task, &root, &tree, &files);
+                    if let Some(installs) = &installs
+                        && let Some(keyed) = installs.covered(resolved)
+                    {
+                        plan.unkeyed_packages = installs.unkeyed_directories(&keyed);
+                        covered.insert(id.clone(), keyed);
+                    }
+                    plans.insert(id.clone(), plan);
                 }
                 Err(reason) => {
                     unsandboxed.insert(id.clone(), reason.clone());
@@ -157,6 +185,8 @@ impl Sandbox {
             state,
             plans,
             profiles: BTreeMap::new(),
+            installs,
+            covered,
             unsandboxed: Mutex::new(unsandboxed),
             watcher: None,
             directory,
@@ -283,8 +313,16 @@ impl Sandbox {
                 continue;
             };
             let relative = relative.to_string_lossy().replace('\\', "/");
+            let package = (!report.operation.starts_with("file-write"))
+                .then(|| {
+                    let installs = self.installs.as_ref()?;
+                    installs.unkeyed(self.covered.get(&report.task)?, Path::new(&report.path))
+                })
+                .flatten();
             let entry = findings.entry(report.task).or_default();
-            if report.operation.starts_with("file-write") {
+            if let Some(package) = package {
+                entry.unkeyed_packages.insert(package);
+            } else if report.operation.starts_with("file-write") {
                 entry.stray_writes.insert(relative);
             } else if unkeyed(&relative) {
                 entry.unkeyed_reads.insert(relative);
@@ -521,6 +559,7 @@ fn plan(
         read_files,
         read_trees,
         write_trees,
+        unkeyed_packages: Vec::new(),
     }
 }
 
@@ -593,12 +632,28 @@ fn profile(plan: &Plan, id: &str, root: &Path, state: &Path, mode: Mode) -> Resu
             ));
         }
     }
-    // Directories may be listed; what a listing finds is not read.
-    rules.push("(allow file-read-data (vnode-type DIRECTORY))".to_owned());
     rules.push(format!(
         "(allow file-read-data file-write* (regex #\"^{}/(.*/)?node_modules/\"))",
         literal_regex(root_text)
     ));
+    // A package the key leaves out is reported by its manifests, which Node
+    // and bundlers read for every package they load: a report for each of
+    // the thousands of files a tool reads would crowd out the run's other
+    // reports, which the log drops when many arrive at once. Seatbelt matches
+    // the path a link resolves to, so reads through an importer's
+    // `node_modules/<name>` land here too.
+    for chunk in plan.unkeyed_packages.chunks(200) {
+        rules.push(
+            "(allow file-read-data (require-all (regex #\"/package\\.json$\") (require-any"
+                .to_owned(),
+        );
+        for directory in chunk {
+            rules.push(format!("  (subpath {})", text(directory)?));
+        }
+        rules.push(format!(")) (with report) (with message {tag}))"));
+    }
+    // Directories may be listed; what a listing finds is not read.
+    rules.push("(allow file-read-data (vnode-type DIRECTORY))".to_owned());
     // qk's own state for the worktree, where warm directories live.
     rules.push(format!(
         "(allow file-read-data file-write* (subpath {}))",

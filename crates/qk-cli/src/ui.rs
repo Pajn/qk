@@ -533,9 +533,11 @@ fn since(later: SystemTime, earlier: SystemTime) -> Duration {
 /// What the sandbox found. Paths read by many tasks, at least a quarter of
 /// those with findings, come first, once: the
 /// package manager and version manager a command starts through read them,
-/// not the task. Then each task's own: the files it read that its key leaves
-/// out, the `.git` and dotenv files it read, and what it wrote outside its
-/// outputs, up to a few paths each.
+/// not the task. Packages read by as many come next, once, each with how many
+/// tasks read it. Then each task's own: the files it read that its key leaves
+/// out, the `.git` and dotenv files it read, the installed packages it read
+/// that its key leaves out, and what it wrote outside its outputs, up to a
+/// few entries each.
 pub fn sandbox_summary(sandbox: &qk_runner::SandboxResult, tasks: usize, paint: Paint) -> String {
     use std::collections::{BTreeMap, BTreeSet};
     const SHOWN: usize = 8;
@@ -549,13 +551,27 @@ pub fn sandbox_summary(sandbox: &qk_runner::SandboxResult, tasks: usize, paint: 
             *readers.entry(path.as_str()).or_insert(0) += 1;
         }
     }
+    let many = |count: usize| count >= 3 && count * 4 >= sandbox.findings.len();
     let shared: BTreeSet<&str> = readers
         .iter()
-        .filter(|(_, count)| **count >= 3 && **count * 4 >= sandbox.findings.len())
+        .filter(|(_, count)| many(**count))
         .map(|(path, _)| *path)
         .collect();
+    let mut package_readers: BTreeMap<&str, usize> = BTreeMap::new();
+    for findings in sandbox.findings.values() {
+        for package in &findings.unkeyed_packages {
+            *package_readers.entry(package.as_str()).or_insert(0) += 1;
+        }
+    }
+    package_readers.retain(|_, count| many(*count));
     let mut lines = Vec::new();
-    let own: Vec<(&String, &qk_runner::sandbox::Findings, Vec<&String>)> = sandbox
+    type Own<'a> = (
+        &'a String,
+        &'a qk_runner::sandbox::Findings,
+        Vec<&'a String>,
+        Vec<&'a String>,
+    );
+    let own: Vec<Own> = sandbox
         .findings
         .iter()
         .map(|(id, findings)| {
@@ -564,10 +580,16 @@ pub fn sandbox_summary(sandbox: &qk_runner::SandboxResult, tasks: usize, paint: 
                 .iter()
                 .filter(|path| !shared.contains(path.as_str()))
                 .collect::<Vec<_>>();
-            (id, findings, reads)
+            let packages = findings
+                .unkeyed_packages
+                .iter()
+                .filter(|package| !package_readers.contains_key(package.as_str()))
+                .collect::<Vec<_>>();
+            (id, findings, reads, packages)
         })
-        .filter(|(_, findings, reads)| {
+        .filter(|(_, findings, reads, packages)| {
             !reads.is_empty()
+                || !packages.is_empty()
                 || !findings.unkeyed_reads.is_empty()
                 || !findings.stray_writes.is_empty()
         })
@@ -613,12 +635,38 @@ pub fn sandbox_summary(sandbox: &qk_runner::SandboxResult, tasks: usize, paint: 
             "  ",
         );
     }
-    for (id, findings, reads) in own {
+    if !package_readers.is_empty() {
+        let packages: Vec<String> = package_readers
+            .iter()
+            .map(|(package, tasks)| format!("{package} ({tasks} tasks)"))
+            .collect();
+        list(
+            &format!(
+                "installed package{} read by many tasks, not in their keys; name {} in each one's externalDependencies",
+                if packages.len() == 1 { "" } else { "s" },
+                if packages.len() == 1 { "it" } else { "them" },
+            ),
+            &packages.iter().collect::<Vec<_>>(),
+            &mut lines,
+            "  ",
+        );
+    }
+    for (id, findings, reads, packages) in own {
         lines.push(format!("  {id}"));
         list("read outside its inputs", &reads, &mut lines, "    ");
         list(
             "read, not in any key",
             &findings.unkeyed_reads.iter().collect::<Vec<_>>(),
+            &mut lines,
+            "    ",
+        );
+        list(
+            &format!(
+                "installed package{} read, not in its key; name {} in its externalDependencies",
+                if packages.len() == 1 { "" } else { "s" },
+                if packages.len() == 1 { "it" } else { "them" },
+            ),
+            &packages,
             &mut lines,
             "    ",
         );
@@ -1325,6 +1373,37 @@ mod tests {
         assert!(
             text.contains("1 task started from warm state: app:b"),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn lists_a_package_read_by_many_tasks_once() {
+        let findings = |packages: &[&str]| qk_runner::sandbox::Findings {
+            unkeyed_packages: packages.iter().map(|package| package.to_string()).collect(),
+            ..Default::default()
+        };
+        let sandbox = qk_runner::SandboxResult {
+            mode: qk_runner::sandbox::Mode::Audit,
+            findings: [
+                ("a:lint", findings(&["eslint", "fallow"])),
+                ("b:lint", findings(&["eslint"])),
+                ("c:lint", findings(&["eslint"])),
+            ]
+            .into_iter()
+            .map(|(id, findings)| (id.to_owned(), findings))
+            .collect(),
+            unsandboxed: BTreeMap::new(),
+        };
+        let text = sandbox_summary(&sandbox, 3, Paint(false));
+        assert_eq!(
+            text,
+            "Sandbox audit: 3 of 3 tasks went beyond what they declare
+  1 installed package read by many tasks, not in their keys; name it in each one's externalDependencies:
+    eslint (3 tasks)
+  a:lint
+    1 installed package read, not in its key; name it in its externalDependencies:
+      fallow
+"
         );
     }
 }
