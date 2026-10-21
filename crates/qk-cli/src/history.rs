@@ -94,6 +94,10 @@ pub fn record(
                 recorded: record
                     .and_then(|record| record.recorded.as_ref())
                     .and_then(|recorded| serde_json::to_value(recorded).ok()),
+                cores: record
+                    .and_then(|record| record.cores)
+                    .map(|cores| cores as u64),
+                cpu: record.and_then(|record| record.cpu),
             }
         })
         .collect();
@@ -176,7 +180,7 @@ pub fn expected(workspace: &Workspace) -> std::collections::BTreeMap<String, qk_
                 .map(|(id, expected)| {
                     let expected = qk_runner::Expected {
                         millis: expected.millis,
-                        threads: expected.threads,
+                        cores: expected.cores,
                         memory: expected.memory,
                     };
                     (id, expected)
@@ -335,10 +339,22 @@ pub fn show_task(
             writeln!(out, "      {warm}")?;
         }
         if let Some(threads) = record.threads {
+            let plural = |count: u64| if count == 1 { "" } else { "s" };
+            match record.cores.filter(|cores| *cores != threads) {
+                Some(cores) => writeln!(
+                    out,
+                    "      ran with {threads} thread{} on {cores} core{}",
+                    plural(threads),
+                    plural(cores)
+                )?,
+                None => writeln!(out, "      ran with {threads} thread{}", plural(threads))?,
+            }
+        }
+        if let Some(busy) = record.busy() {
+            let held = record.cores.or(record.threads).unwrap_or(1);
             writeln!(
                 out,
-                "      ran with {threads} thread{}",
-                if threads == 1 { "" } else { "s" }
+                "      kept {busy:.1} cores busy on average, holding {held}"
             )?;
         }
         if let Some(memory) = record.memory {

@@ -27,6 +27,8 @@ fn task(
         threads: None,
         memory: None,
         recorded: None,
+        cores: None,
+        cpu: None,
     }
 }
 
@@ -355,6 +357,8 @@ fn upgrades_schema_three_without_inventing_logs() {
         .execute_batch(
             "DROP TABLE execution_logs;
              ALTER TABLE tasks DROP COLUMN memory;
+             ALTER TABLE tasks DROP COLUMN cores;
+             ALTER TABLE tasks DROP COLUMN cpu;
              ALTER TABLE runs DROP COLUMN worktree;
              UPDATE schema_version SET version = 3;",
         )
@@ -406,11 +410,32 @@ fn a_task_is_expected_to_take_the_median_time_and_most_memory_of_its_recent_exec
         expected.get("app:test"),
         Some(&qk_history::Expected {
             millis: 30,
-            threads: 4,
+            cores: 4,
             memory: Some(300),
         })
     );
     assert_eq!(expected.get("app:lint"), None);
+}
+
+/// A task told to start more threads than it held cores is expected to
+/// take the cores it held, and its CPU time is kept.
+#[test]
+fn expects_the_cores_a_scaled_task_held_and_keeps_its_cpu_time() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut history = History::open(&temp.path().join("history.db")).unwrap();
+    let mut test = task("app:test", Some("k"), 1_000, 1_040, &[]);
+    test.threads = Some(8);
+    test.cores = Some(4);
+    test.cpu = Some(120);
+    history
+        .record(run("scaled", 1_000, vec![test]), &inputs(&[]))
+        .unwrap();
+    assert_eq!(history.expected().unwrap()["app:test"].cores, 4);
+    let recorded = &history.task("app:test", 1).unwrap()[0].1;
+    assert_eq!(
+        (recorded.threads, recorded.cores, recorded.cpu),
+        (Some(8), Some(4), Some(120))
+    );
 }
 
 /// Runs recorded before memory was measured stay readable, without any.
@@ -430,6 +455,8 @@ fn records_the_memory_a_task_used_after_upgrading_schema_four() {
         .unwrap()
         .execute_batch(
             "ALTER TABLE tasks DROP COLUMN memory;
+             ALTER TABLE tasks DROP COLUMN cores;
+             ALTER TABLE tasks DROP COLUMN cpu;
              ALTER TABLE runs DROP COLUMN worktree;
              UPDATE schema_version SET version = 4;",
         )
@@ -513,6 +540,8 @@ fn upgrades_schema_five_to_record_worktrees() {
         .unwrap()
         .execute_batch(
             "ALTER TABLE runs DROP COLUMN worktree;
+             ALTER TABLE tasks DROP COLUMN cores;
+             ALTER TABLE tasks DROP COLUMN cpu;
              UPDATE schema_version SET version = 5;",
         )
         .unwrap();

@@ -8,6 +8,12 @@
 //! A sample can miss a spike between samples. On macOS the system also keeps
 //! the most each process has used in its life, so a task's peak is at least
 //! that of its largest process.
+//!
+//! Each sample also reads the CPU time each process has used since it
+//! started. Kept per process across samples, it sums to the CPU time a task
+//! used, short of a process that started and exited between two samples and
+//! what its processes used after the last sample before they exited: a
+//! lower bound, close for tasks whose work runs in processes that last.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -25,17 +31,25 @@ pub struct Used {
     pub peak: u64,
 }
 
-/// Each task's memory from the process ids of its commands, in one pass over
-/// the machine's processes.
+/// What one sample saw of a task's processes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Sampled {
+    pub used: Used,
+    /// The CPU milliseconds each of its processes has used since it started.
+    pub cpu: BTreeMap<u32, u64>,
+}
+
+/// Each task's memory and CPU time from the process ids of its commands, in
+/// one pass over the machine's processes.
 pub fn sample<'a>(
     system: &mut System,
     roots: &BTreeMap<&'a str, BTreeSet<u32>>,
-) -> BTreeMap<&'a str, Used> {
-    let kind = ProcessRefreshKind::nothing();
+) -> BTreeMap<&'a str, Sampled> {
+    let kind = ProcessRefreshKind::nothing().with_cpu();
     #[cfg(not(target_os = "macos"))]
     let kind = kind.with_memory();
     system.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
-    let processes: Vec<(u32, Option<u32>, Used)> = system
+    let processes: Vec<(u32, Option<u32>, Used, u64)> = system
         .processes()
         .values()
         // Threads share their process's memory.
@@ -45,6 +59,7 @@ pub fn sample<'a>(
                 process.pid().as_u32(),
                 process.parent().map(Pid::as_u32),
                 memory(process),
+                process.accumulated_cpu_time(),
             )
         })
         .collect();
@@ -120,16 +135,18 @@ fn memory(process: &sysinfo::Process) -> Used {
     Used { now, peak: now }
 }
 
-/// The memory of the processes under each set of roots, roots included, from
-/// each process's id, parent and memory.
+/// The memory and CPU time of the processes under each set of roots, roots
+/// included, from each process's id, parent, memory and CPU time.
 fn trees<'a>(
-    processes: &[(u32, Option<u32>, Used)],
+    processes: &[(u32, Option<u32>, Used, u64)],
     roots: &BTreeMap<&'a str, BTreeSet<u32>>,
-) -> BTreeMap<&'a str, Used> {
+) -> BTreeMap<&'a str, Sampled> {
     let mut children: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
     let mut memory = BTreeMap::new();
-    for &(pid, parent, bytes) in processes {
+    let mut cpu = BTreeMap::new();
+    for &(pid, parent, bytes, millis) in processes {
         memory.insert(pid, bytes);
+        cpu.insert(pid, millis);
         if let Some(parent) = parent {
             children.entry(parent).or_default().push(pid);
         }
@@ -141,9 +158,13 @@ fn trees<'a>(
             let mut stack: Vec<u32> = roots.iter().copied().collect();
             let mut used = Used::default();
             let mut largest = 0;
+            let mut times = BTreeMap::new();
             while let Some(pid) = stack.pop() {
                 if !seen.insert(pid) {
                     continue;
+                }
+                if let Some(millis) = cpu.get(&pid) {
+                    times.insert(pid, *millis);
                 }
                 let process = memory.get(&pid).copied().unwrap_or_default();
                 used.now = used.now.saturating_add(process.now);
@@ -151,7 +172,7 @@ fn trees<'a>(
                 stack.extend(children.get(&pid).into_iter().flatten());
             }
             used.peak = used.now.max(largest);
-            (*task, used)
+            (*task, Sampled { used, cpu: times })
         })
         .collect()
 }
@@ -161,6 +182,13 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::{Used, expected, fits, trees};
+
+    fn used(sampled: BTreeMap<&str, super::Sampled>) -> BTreeMap<&str, Used> {
+        sampled
+            .into_iter()
+            .map(|(task, sampled)| (task, sampled.used))
+            .collect()
+    }
     use crate::Expected;
 
     #[test]
@@ -169,14 +197,14 @@ mod tests {
         // a worker of a worker of 20; 30 is unrelated.
         let at = |now| Used { now, peak: now };
         let processes = [
-            (1, None, at(50)),
-            (10, Some(1), at(5)),
-            (11, Some(10), at(100)),
-            (12, Some(10), at(200)),
-            (20, Some(1), at(7)),
-            (22, Some(20), at(0)),
-            (21, Some(22), at(1_000)),
-            (30, Some(1), at(9_999)),
+            (1, None, at(50), 0),
+            (10, Some(1), at(5), 0),
+            (11, Some(10), at(100), 0),
+            (12, Some(10), at(200), 0),
+            (20, Some(1), at(7), 0),
+            (22, Some(20), at(0), 0),
+            (21, Some(22), at(1_000), 0),
+            (30, Some(1), at(9_999), 0),
         ];
         let roots = BTreeMap::from([
             ("app:test", BTreeSet::from([10])),
@@ -185,7 +213,7 @@ mod tests {
             ("app:lint", BTreeSet::from([40])),
         ]);
         assert_eq!(
-            trees(&processes, &roots),
+            used(trees(&processes, &roots)),
             BTreeMap::from([
                 ("app:test", at(305)),
                 ("app:build", at(1_007)),
@@ -195,9 +223,25 @@ mod tests {
     }
 
     #[test]
+    fn keeps_the_cpu_time_of_each_process_in_a_task() {
+        let at = Used::default();
+        let processes = [
+            (1, None, at, 9_000),
+            (10, Some(1), at, 5),
+            (11, Some(10), at, 1_500),
+            (20, Some(1), at, 700),
+        ];
+        let roots = BTreeMap::from([("app:test", BTreeSet::from([10]))]);
+        assert_eq!(
+            trees(&processes, &roots)["app:test"].cpu,
+            BTreeMap::from([(10, 5), (11, 1_500)])
+        );
+    }
+
+    #[test]
     fn a_task_peaked_at_least_as_high_as_its_largest_process() {
         let processes = [
-            (10, None, Used { now: 5, peak: 5 }),
+            (10, None, Used { now: 5, peak: 5 }, 0),
             // Shrunk since it peaked between samples.
             (
                 11,
@@ -206,6 +250,7 @@ mod tests {
                     now: 100,
                     peak: 3_000,
                 },
+                0,
             ),
             (
                 12,
@@ -214,11 +259,12 @@ mod tests {
                     now: 200,
                     peak: 250,
                 },
+                0,
             ),
         ];
         let roots = BTreeMap::from([("app:tsc", BTreeSet::from([10]))]);
         assert_eq!(
-            trees(&processes, &roots)["app:tsc"],
+            trees(&processes, &roots)["app:tsc"].used,
             Used {
                 now: 305,
                 peak: 3_000
@@ -230,7 +276,7 @@ mod tests {
     fn a_task_without_history_is_expected_to_use_the_median_of_its_target() {
         let history = |memory| Expected {
             millis: 1,
-            threads: 1,
+            cores: 1,
             memory,
         };
         let known = BTreeMap::from([

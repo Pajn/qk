@@ -121,8 +121,15 @@ pub struct TaskRecord {
     pub key: Option<(String, serde_json::Value)>,
     /// What warm state did, for targets that keep it.
     pub warm: Option<qk_cache::warm::WarmReport>,
-    /// The threads it was given, for targets with `qk:threads`.
+    /// The threads it was told to start, for targets with `qk:threads`.
     pub threads: Option<usize>,
+    /// The cores it held, for targets with `qk:threads`: its share of the
+    /// budget, which `scale` can tell it to start more threads than.
+    pub cores: Option<usize>,
+    /// The CPU time, in milliseconds, its processes used together, sampled as
+    /// it ran: at least that, since a process that exits between samples is
+    /// missed. None when it ran too briefly to be sampled.
+    pub cpu: Option<u64>,
     /// The most memory, in bytes, its processes used together, sampled as it
     /// ran; none when it ran too briefly to be sampled.
     pub memory: Option<u64>,
@@ -140,16 +147,16 @@ pub struct TaskRecord {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Expected {
     pub millis: u64,
-    /// The threads it ran with: one, unless its target has `qk:threads`.
-    pub threads: u64,
+    /// The cores it held: one, unless its target has `qk:threads`.
+    pub cores: u64,
     /// The most memory, in bytes, it used, when that was measured.
     pub memory: Option<u64>,
 }
 
 impl Expected {
-    /// Core-milliseconds: the time it takes on the threads it ran with.
+    /// Core-milliseconds: the time it takes on the cores it held.
     fn work(&self) -> u64 {
-        self.millis.saturating_mul(self.threads)
+        self.millis.saturating_mul(self.cores)
     }
 
     /// Historical work less what the current allocation has already done.
@@ -507,13 +514,18 @@ pub fn run(
                 seen.free = system.available_memory();
                 seen.now = used
                     .iter()
-                    .map(|(id, used)| ((*id).to_owned(), used.now))
+                    .map(|(id, sampled)| ((*id).to_owned(), sampled.used.now))
                     .collect();
                 for (id, used) in &used {
                     let peak = seen.peaks.entry((*id).to_owned()).or_default();
-                    *peak = (*peak).max(used.peak);
+                    *peak = (*peak).max(used.used.peak);
+                    let cpu = seen.cpu.entry((*id).to_owned()).or_default();
+                    for (pid, millis) in &used.cpu {
+                        let kept = cpu.entry(*pid).or_default();
+                        *kept = (*kept).max(*millis);
+                    }
                 }
-                seen.run = seen.run.max(used.values().map(|used| used.now).sum());
+                seen.run = seen.run.max(used.values().map(|used| used.used.now).sum());
             }
         });
         let result = (|| -> Result<()> {
@@ -818,8 +830,9 @@ pub fn run(
                         checking: cache.is_some() && narrowed.is_none(),
                     });
                     let definition = &graph.tasks[&id];
-                    if let (Some(threads), Some(count)) = (threads.get(&id), given.get(&id)) {
-                        task.execution.extend(threads.environment(*count));
+                    if let (Some(threads), Some(cores)) = (threads.get(&id), given.get(&id)) {
+                        task.execution
+                            .extend(threads.environment(threads.threads(*cores)));
                     }
                     if let Some(path) = narrowed {
                         task.execution
@@ -994,6 +1007,16 @@ pub fn run(
                             }
                             outcome
                         };
+                        // One lock for both: guards in the record below
+                        // would live until it is built.
+                        let (memory, cpu) = {
+                            let mut seen = seen.lock().unwrap();
+                            let cpu = seen
+                                .cpu
+                                .remove(&id)
+                                .map(|processes| processes.values().sum());
+                            (seen.peaks.remove(&id), cpu)
+                        };
                         records.insert(
                             id.clone(),
                             TaskRecord {
@@ -1004,14 +1027,14 @@ pub fn run(
                                 cache,
                                 key,
                                 warm,
-                                threads: given.remove(&id),
+                                threads: threads
+                                    .get(&id)
+                                    .zip(given.get(&id))
+                                    .map(|(threads, cores)| threads.threads(*cores)),
+                                cores: given.remove(&id),
                                 memory_wait: memory_waits.remove(&id).unwrap_or_default(),
-                                memory: seen
-                                    .lock()
-                                    .unwrap()
-                                    .peaks
-                                    .remove(&id)
-                                    .filter(|bytes| *bytes > 0),
+                                memory: memory.filter(|bytes| *bytes > 0),
+                                cpu: cpu.filter(|millis: &u64| *millis > 0),
                                 execution,
                                 recorded,
                             },
@@ -1119,6 +1142,9 @@ struct Seen {
     now: BTreeMap<String, u64>,
     /// The most each task has used.
     peaks: BTreeMap<String, u64>,
+    /// The most CPU time, in milliseconds, each process of each task has
+    /// been seen to have used.
+    cpu: BTreeMap<String, BTreeMap<u32, u64>>,
     /// The most the run's tasks have used together.
     run: u64,
 }
@@ -1185,7 +1211,7 @@ mod tests {
     fn remaining_work_accounts_for_the_current_allocation() {
         let expected = Expected {
             millis: 1_000,
-            threads: 4,
+            cores: 4,
             memory: None,
         };
         assert_eq!(expected.remaining(Duration::ZERO, 8), 4_000);

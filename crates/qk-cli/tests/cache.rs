@@ -4530,6 +4530,86 @@ fn threaded_tasks_share_the_cores() {
 
 #[cfg(unix)]
 #[test]
+fn a_scaled_task_is_told_more_threads_than_the_cores_it_holds() {
+    let task = |name: &str| {
+        threaded(
+            &format!("echo $QK_THREADS $WORKERS > dist/{name}"),
+            json!({"env": {"WORKERS": "{threads}"}, "scale": 1.5}),
+        )
+    };
+    let fixture = Fixture::with_targets(json!({"a": task("a"), "b": task("b"), "c": task("c")}));
+    let output = success(fixture.qk(
+        &fixture.root,
+        &[
+            "run-many",
+            "-t",
+            "a,b,c",
+            "--parallel",
+            "3",
+            "--cores",
+            "8",
+            "--output-style",
+            "quiet",
+        ],
+    ));
+    // Each holds 2 of the 8 cores, as without scale, and starts 3 threads.
+    for name in ["a", "b", "c"] {
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("dist").join(name)).unwrap(),
+            "3 3\n"
+        );
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Threads of 8 cores: app:a 3 on 2, app:b 3 on 2, app:c 3 on 2"),
+        "{stderr}"
+    );
+    let text = stdout(&success(
+        fixture.qk(&fixture.root, &["show", "task", "app:a"]),
+    ));
+    assert!(text.contains("ran with 3 threads on 2 cores"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn records_how_busy_a_task_kept_the_cores() {
+    // Busy on one core for longer than the summary needs to say how busy.
+    let fixture = Fixture::with_targets(json!({
+        "busy": threaded("perl -e '$end = time + 3; 1 while time < $end'", json!(true))
+    }));
+    let report = fixture.root.join("report.json");
+    let output = success(fixture.qk(
+        &fixture.root,
+        &[
+            "run-many",
+            "-t",
+            "busy",
+            "--cores",
+            "2",
+            "--output-style",
+            "quiet",
+            "--report",
+            report.to_str().unwrap(),
+        ],
+    ));
+    let run: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+    let task = &run["tasks"][0];
+    let busy = task["cpu"].as_f64().unwrap()
+        / (task["ended"].as_f64().unwrap() - task["started"].as_f64().unwrap());
+    assert!((0.4..1.3).contains(&busy), "{task}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Threads of 2 cores: app:busy 2 ("),
+        "{stderr}"
+    );
+    let text = stdout(&success(
+        fixture.qk(&fixture.root, &["show", "task", "app:busy"]),
+    ));
+    assert!(text.contains("cores busy on average, holding 2"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
 fn records_the_memory_a_task_used() {
     // Long enough to be sampled, in a process under the task's shell.
     let fixture = Fixture::with_targets(json!({"slow": {"command": "sleep 1 && true"}}));
@@ -4572,6 +4652,8 @@ fn tasks_wait_for_the_memory_they_are_expected_to_use() {
         threads: None,
         memory: Some(memory),
         recorded: None,
+        cores: None,
+        cpu: None,
     };
     qk_history::History::open(&fixture.root.join(".git/qk/history.db"))
         .unwrap()
