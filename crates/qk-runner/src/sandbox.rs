@@ -608,8 +608,17 @@ fn depended(
             let mut roots: Vec<(String, String)> = seen
                 .into_iter()
                 .filter_map(|name| {
-                    let root = &workspace.projects.get(name)?.root;
-                    (root != "." && !root.is_empty()).then(|| (name.to_owned(), root.clone()))
+                    // A root is kept as written, so `./libs/lib/` is
+                    // `libs/lib`, as reads are named.
+                    let root = workspace
+                        .projects
+                        .get(name)?
+                        .root
+                        .split('/')
+                        .filter(|part| !part.is_empty() && *part != ".")
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    (!root.is_empty()).then(|| (name.to_owned(), root))
                 })
                 .collect();
             roots.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));

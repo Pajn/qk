@@ -2886,7 +2886,11 @@ fn the_sandbox_groups_reads_in_dependency_projects() {
                 "inputs": ["{projectRoot}/**/*"]
             }}}),
         ),
-        ("libs/lib", json!({"name": "lib", "targets": {}})),
+        // A root as written, which reads are matched against normalized.
+        (
+            "libs/lib",
+            json!({"name": "lib", "root": "./libs/lib/", "targets": {}}),
+        ),
         ("libs/other", json!({"name": "other", "targets": {}})),
     ] {
         fs::create_dir_all(root.join(directory)).unwrap();
