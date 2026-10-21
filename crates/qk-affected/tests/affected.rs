@@ -207,6 +207,51 @@ fn deleting_only_a_package_affects_what_linked_to_it() {
 }
 
 #[test]
+fn moving_a_package_affects_what_its_move_unlinked() {
+    // A `file:` path still names where it was, so the head graph has no edge
+    // from `a` to the moved `b` for `a` to be affected through.
+    let repo = packages();
+    write(
+        &repo.root,
+        "packages/a/package.json",
+        r#"{"name": "@x/a", "dependencies": {"@x/b": "file:../b"}}"#,
+    );
+    let base = commit(&repo.root);
+    std::fs::rename(
+        repo.root.join("packages/b"),
+        repo.root.join("packages/new-b"),
+    )
+    .unwrap();
+    let head = commit(&repo.root);
+    let affected = repo.affected(Options {
+        base: Some(base),
+        head: Some(head),
+        ..Options::default()
+    });
+    assert_eq!(affected, names(&["a", "b", "c"]));
+}
+
+#[test]
+fn deleting_a_package_leaves_out_what_excluded_it() {
+    let repo = packages();
+    write(
+        &repo.root,
+        "packages/a/project.json",
+        r#"{"name": "a", "implicitDependencies": ["!b"], "targets": {"build": {"command": "echo build"}}}"#,
+    );
+    let base = commit(&repo.root);
+    std::fs::remove_file(repo.root.join("packages/b/package.json")).unwrap();
+    let head = commit(&repo.root);
+    let affected = repo.affected(Options {
+        base: Some(base),
+        head: Some(head),
+        ..Options::default()
+    });
+    // `a` excluded the edge, so losing the package changes nothing for it.
+    assert_eq!(affected, names(&["b"]));
+}
+
+#[test]
 fn deleting_a_project_nothing_depended_on_affects_nothing_else() {
     let repo = Repo::new(&[]);
     std::fs::remove_dir_all(repo.root.join("tools/tool")).unwrap();

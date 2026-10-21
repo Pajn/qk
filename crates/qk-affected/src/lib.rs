@@ -1078,6 +1078,16 @@ pub(crate) fn removed(workspace: &Workspace, changes: &Changes, files: &[String]
     let Some(base) = changes.base.as_deref().filter(|_| !changes.whole) else {
         return unknown(first, "the files were named rather than compared");
     };
+    // The head graph, whose edges say which links a deletion left in place.
+    let head = match ProjectGraph::build(workspace) {
+        Ok(graph) => graph,
+        Err(error) => {
+            return unknown(
+                first,
+                &format!("the head graph could not be built ({error:#})"),
+            );
+        }
+    };
     let mut dependents = BTreeMap::new();
     // Each directory once, whichever of its manifests went.
     let mut directories: BTreeMap<&str, &String> = BTreeMap::new();
@@ -1122,15 +1132,27 @@ pub(crate) fn removed(workspace: &Workspace, changes: &Changes, files: &[String]
                 .entry(dependent.to_owned())
                 .or_insert_with(|| ((*file).clone(), what.to_owned()));
         };
+        let mut projects = workspace.projects.clone();
+        projects
+            .entry(removed.name.clone())
+            .or_insert_with(|| removed.clone());
+        // A dependent's own implicitDependencies, as at the base: its files
+        // are the same at both revisions unless the change touches it.
+        let implicit = |dependent: &str| {
+            qk_graph::expand_implicit_dependencies(
+                dependent,
+                &workspace.projects[dependent].implicit_dependencies,
+                &projects,
+            )
+        };
+        let excluded = format!("!{}", removed.name);
         if workspace.analyzes_package_json()
             && let Some(package) = &package
             && let Some(name) = &package.name
-            && !workspace
-                .packages
-                .values()
-                .any(|kept| kept.name.as_ref() == Some(name))
         {
             for (dependent, manifest) in &workspace.packages {
+                // The edge the base graph had: linked by its range to where
+                // the package was, unless excluded.
                 let linked = manifest
                     .dependency_ranges()
                     .get(name.as_str())
@@ -1141,17 +1163,25 @@ pub(crate) fn removed(workspace: &Workspace, changes: &Changes, files: &[String]
                             &removed.root,
                             package.version.as_deref(),
                         )
-                    });
-                if linked {
+                    })
+                    && !implicit(dependent).contains(&excluded);
+                // Kept only where the head graph has the same edge, as when
+                // the package moved and its range still links to it.
+                let kept = head
+                    .dependencies
+                    .get(dependent)
+                    .into_iter()
+                    .flatten()
+                    .any(|edge| edge.target == removed.name && edge.kind == "static");
+                if linked && !kept {
                     depended(dependent, name);
                 }
             }
         }
+        // Still a project by that name, what names it still selects it.
         if workspace.projects.contains_key(&removed.name) {
             continue;
         }
-        let mut projects = workspace.projects.clone();
-        projects.insert(removed.name.clone(), removed.clone());
         for (dependent, project) in &workspace.projects {
             let implicit = qk_graph::expand_implicit_dependencies(
                 dependent,

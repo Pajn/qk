@@ -52,9 +52,11 @@ what the change touches already and what still names it: a `package.json`
 dependency that linked to it, or an `implicitDependencies` entry or pattern
 selecting it. Their dependents follow as for any other touched project. A
 deletion can remove a package and leave its project, when a `project.json`
-still makes it, or move a project under the same name: the projects that
-linked to the package are touched in the one case, and nothing else in the
-other. Every project
+still makes it, or move a project under the same name. Either way a project
+whose dependency on the package the head graph no longer has is touched, as
+when a `file:` path names where the package was; one whose link survives,
+such as a `workspace:` range to the moved package, depends on it as before,
+and one whose `implicitDependencies` exclude it was never linked to it. Every project
 is still touched when qk cannot tell: for a deleted root lockfile, for files
 named with `--files`, which are not compared with a base revision, or when the
 removed project's manifests cannot be read there.
