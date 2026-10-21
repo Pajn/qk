@@ -43,11 +43,17 @@ impl Settings {
             }
             Some(_) => bail!("qk:ultracache.mode must be \"on\" or \"off\""),
         }
-        let ignore_reads = match object.get("ignoreReads") {
+        let ignore_reads: Vec<String> = match object.get("ignoreReads") {
             None => Vec::new(),
             Some(value) => serde_json::from_value(value.clone())
                 .context("qk:ultracache.ignoreReads must be an array of globs")?,
         };
+        // Checked before the task runs, rather than after it was traced.
+        for glob in &ignore_reads {
+            crate::glob::Pattern::new(glob, false).with_context(|| {
+                format!("qk:ultracache.ignoreReads has an invalid glob {glob:?}")
+            })?;
+        }
         Ok(Some(Self { ignore_reads }))
     }
 }
@@ -88,6 +94,7 @@ mod tests {
             serde_json::json!({"mode": "warn"}),
             serde_json::json!({"mode": 1}),
             serde_json::json!({"ignoreReads": "tmp/**"}),
+            serde_json::json!({"ignoreReads": ["src/[*.log"]}),
         ] {
             assert!(Settings::of(&task(invalid.clone())).is_err(), "{invalid}");
         }
