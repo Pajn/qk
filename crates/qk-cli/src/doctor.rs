@@ -88,6 +88,16 @@ pub fn show(workspace: &Workspace, json: bool, strict: bool) -> Result<i32> {
                     }
                 }
             }
+            if let Some(value) = definition.extra.get("qk:sandbox")
+                && !value.is_boolean()
+            {
+                findings.push(Finding {
+                    severity: "warning",
+                    code: "invalid-field",
+                    location: location.clone(),
+                    message: format!("qk:sandbox is {value}, but only true or false is read, so it is ignored and the task is sandboxed."),
+                });
+            }
             if definition
                 .extra
                 .get("syncGenerators")
@@ -100,6 +110,37 @@ pub fn show(workspace: &Workspace, json: bool, strict: bool) -> Result<i32> {
                 });
             }
         }
+    }
+    // A dependency glob that selects nothing keys nothing, so the cache
+    // entries of the tasks reading it are reused whatever their dependencies
+    // build. Several globs often share one named input, each for some of the
+    // tasks it reaches: only one selecting nothing for any of them is wrong.
+    let requests: Vec<qk_taskgraph::Request> = workspace
+        .projects
+        .iter()
+        .flat_map(|(project, definition)| {
+            definition
+                .targets
+                .keys()
+                .map(|target| qk_taskgraph::Request {
+                    project: project.clone(),
+                    target: target.clone(),
+                    configuration: None,
+                    requested_configuration: None,
+                    args: Vec::new(),
+                })
+        })
+        .collect();
+    let globs = qk_taskgraph::TaskGraph::build(workspace, &requests)
+        .and_then(|graph| qk_cache::dependency_globs(workspace, &graph));
+    match globs {
+        Ok(globs) => findings.extend(unmatched_globs(&globs)),
+        Err(error) => findings.push(Finding {
+            severity: "warning",
+            code: "dependency-outputs-unchecked",
+            location: "workspace".into(),
+            message: format!("cannot check dependentTasksOutputFiles globs: {error:#}"),
+        }),
     }
     let errors = findings
         .iter()
@@ -135,4 +176,78 @@ pub fn show(workspace: &Workspace, json: bool, strict: bool) -> Result<i32> {
         )?;
     }
     Ok(i32::from(errors > 0 || (strict && warnings > 0)))
+}
+
+/// The dependency globs that select nothing for any task of a target, by
+/// target name, as `targetDefaults` and named inputs configure them. A glob
+/// in a named input reaches every target using it, so the targets sharing a
+/// set of such globs are one finding, most tasks first.
+fn unmatched_globs(globs: &[qk_cache::DependencyGlob]) -> Vec<Finding> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let target = |task: &str| task.split(':').nth(1).unwrap_or(task).to_owned();
+    let mut uses: BTreeMap<String, BTreeMap<&str, Vec<&qk_cache::DependencyGlob>>> =
+        BTreeMap::new();
+    for glob in globs {
+        uses.entry(target(&glob.task))
+            .or_default()
+            .entry(&glob.pattern)
+            .or_default()
+            .push(glob);
+    }
+    // Each set of globs, with the targets they select nothing for and how
+    // many tasks each has.
+    let mut sets: BTreeMap<BTreeSet<&str>, Vec<(String, usize)>> = BTreeMap::new();
+    for (target, patterns) in uses {
+        let tasks = patterns.values().map(Vec::len).max().unwrap_or(0);
+        let unmatched: BTreeSet<&str> = patterns
+            .into_iter()
+            .filter(|(_, uses)| {
+                uses.iter().all(|glob| {
+                    matches!(
+                        glob.selects,
+                        qk_cache::Selects::NoDeclaredOutputs | qk_cache::Selects::NoneOf(_)
+                    )
+                })
+            })
+            .map(|(pattern, _)| pattern)
+            .collect();
+        if !unmatched.is_empty() {
+            sets.entry(unmatched).or_default().push((target, tasks));
+        }
+    }
+    sets.into_iter()
+        .map(|(patterns, mut targets)| {
+            targets.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            const SHOWN: usize = 6;
+            let shown: Vec<String> = targets
+                .iter()
+                .take(SHOWN)
+                .map(|(target, tasks)| {
+                    format!("{target} ({tasks} task{})", if *tasks == 1 { "" } else { "s" })
+                })
+                .collect();
+            let more = if targets.len() > SHOWN {
+                format!(" and {} more", targets.len() - SHOWN)
+            } else {
+                String::new()
+            };
+            let patterns: Vec<String> =
+                patterns.iter().map(|pattern| format!("{pattern:?}")).collect();
+            Finding {
+                severity: "warning",
+                code: "dependency-outputs-unmatched",
+                location: format!("dependentTasksOutputFiles {}", patterns.join(", ")),
+                message: format!(
+                    "select{} nothing for any task of {} target{}: {}{more}. None of those tasks depends on a task whose outputs hold a file to select, so for them the glob{} key{} nothing and their cache entries are reused whatever their dependencies build; where that is wrong, depend on the task producing those files, or fix the glob{}.",
+                    if patterns.len() == 1 { "s" } else { "" },
+                    targets.len(),
+                    if targets.len() == 1 { "" } else { "s" },
+                    shown.join(", "),
+                    if patterns.len() == 1 { "" } else { "s" },
+                    if patterns.len() == 1 { "s" } else { "" },
+                    if patterns.len() == 1 { "" } else { "s" },
+                ),
+            }
+        })
+        .collect()
 }

@@ -23,6 +23,21 @@ pub fn path(workspace: &Workspace) -> PathBuf {
         .join("history.db")
 }
 
+/// The worktree runs are recorded and read in, by its root.
+pub fn worktree(workspace: &Workspace) -> String {
+    workspace
+        .root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.root.clone())
+        .display()
+        .to_string()
+}
+
+/// The worktree a listing is limited to, unless it is of every worktree.
+fn scope(workspace: &Workspace, all_worktrees: bool) -> Option<String> {
+    (!all_worktrees).then(|| worktree(workspace))
+}
+
 fn millis(time: SystemTime) -> u64 {
     time.duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_millis() as u64)
@@ -84,6 +99,7 @@ pub fn record(
         schema_version: qk_history::SCHEMA_VERSION,
         id: format!("{started}-{}", std::process::id()),
         command: std::env::args().collect(),
+        worktree: Some(worktree(workspace)),
         sha: std::process::Command::new("git")
             .current_dir(&workspace.root)
             .args(["rev-parse", "HEAD"])
@@ -178,10 +194,11 @@ pub fn open(workspace: &Workspace) -> Result<History> {
 pub fn show_runs(
     workspace: &Workspace,
     limit: usize,
+    all_worktrees: bool,
     json: bool,
     out: &mut impl Write,
 ) -> Result<()> {
-    let runs = open(workspace)?.runs(limit)?;
+    let runs = open(workspace)?.runs(limit, scope(workspace, all_worktrees).as_deref())?;
     if json {
         serde_json::to_writer_pretty(&mut *out, &runs)?;
         writeln!(out)?;
@@ -204,17 +221,27 @@ pub fn show_runs(
             counts.join(", "),
             command(&run.command),
         )?;
+        if all_worktrees {
+            writeln!(
+                out,
+                "  in {}",
+                run.worktree.as_deref().unwrap_or("a worktree not recorded")
+            )?;
+        }
     }
     Ok(())
 }
 
+/// A run by its id, or else the latest of this worktree, or of every
+/// worktree with `all_worktrees`.
 pub fn show_run(
     workspace: &Workspace,
     id: Option<&str>,
+    all_worktrees: bool,
     json: bool,
     out: &mut impl Write,
 ) -> Result<()> {
-    let Some(run) = open(workspace)?.run(id)? else {
+    let Some(run) = open(workspace)?.run(id, scope(workspace, all_worktrees).as_deref())? else {
         bail!("no run {}", id.unwrap_or("recorded"));
     };
     if json {
@@ -502,10 +529,11 @@ pub fn show_flaky(
     workspace: &Workspace,
     task: Option<&str>,
     limit: usize,
+    all_worktrees: bool,
     json: bool,
     out: &mut impl Write,
 ) -> Result<()> {
-    let groups = open(workspace)?.flaky(task, limit)?;
+    let groups = open(workspace)?.flaky(task, limit, scope(workspace, all_worktrees).as_deref())?;
     if json {
         serde_json::to_writer_pretty(&mut *out, &groups)?;
         writeln!(out)?;
@@ -544,7 +572,7 @@ pub fn show_flaky(
 pub fn show_log(workspace: &Workspace, run: &str, task: &str) -> Result<()> {
     let Some(log) = open(workspace)?.log(run, task)? else {
         bail!(
-            "no retained execution log for {task} in run {run} (cache hit, older run or log evicted)"
+            "no retained execution log for {task} in run {run} (a cache hit, a target that is not cacheable, an older run, or an evicted log)"
         );
     };
     qk_executor::read_capture(log.data.as_slice(), |stderr, bytes| {

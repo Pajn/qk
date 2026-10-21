@@ -144,7 +144,51 @@ pub struct AccessReview {
     pub content_reads: BTreeSet<String>,
     pub manifest_reads: BTreeSet<String>,
     pub toolchain_reads: BTreeSet<String>,
+    #[serde(default)]
+    pub tsconfig_reads: BTreeSet<String>,
     pub metadata_checks: BTreeSet<String>,
+}
+
+/// What a read of a workspace file outside a task's inputs most likely is,
+/// by its path alone. Input analysis and the sandbox's audit group by it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadKind {
+    /// A workspace package's `package.json`, which package managers and
+    /// bundlers read to resolve workspace packages.
+    Manifest,
+    /// A version manager's or package manager's configuration, read as a
+    /// command starts.
+    Toolchain,
+    /// A TypeScript configuration, which changes what tsc and bundlers do,
+    /// so likely an input.
+    TsConfig,
+    /// Anything else, likely content the task uses.
+    Content,
+}
+
+impl ReadKind {
+    pub fn of(path: &str) -> Self {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        if name == "package.json" {
+            Self::Manifest
+        } else if matches!(
+            path,
+            ".tool-versions"
+                | "mise.toml"
+                | ".nvmrc"
+                | ".node-version"
+                | ".npmrc"
+                | ".pnpmfile.cjs"
+                | "rust-toolchain"
+                | "rust-toolchain.toml"
+        ) {
+            Self::Toolchain
+        } else if name.starts_with("tsconfig") && name.ends_with(".json") {
+            Self::TsConfig
+        } else {
+            Self::Content
+        }
+    }
 }
 
 impl TaskAnalysis {
@@ -252,25 +296,18 @@ impl TaskAnalysis {
             .map(|event| event.path.clone())
             .collect();
         for path in &self.uncovered_accesses {
-            if !reads.contains(path) {
-                self.access_review.metadata_checks.insert(path.clone());
-            } else if path.ends_with("/package.json") || path == "package.json" {
-                self.access_review.manifest_reads.insert(path.clone());
-            } else if matches!(
-                path.as_str(),
-                ".tool-versions"
-                    | "mise.toml"
-                    | ".nvmrc"
-                    | ".node-version"
-                    | ".npmrc"
-                    | ".pnpmfile.cjs"
-                    | "rust-toolchain"
-                    | "rust-toolchain.toml"
-            ) {
-                self.access_review.toolchain_reads.insert(path.clone());
+            let review = &mut self.access_review;
+            let group = if !reads.contains(path) {
+                &mut review.metadata_checks
             } else {
-                self.access_review.content_reads.insert(path.clone());
-            }
+                match ReadKind::of(path) {
+                    ReadKind::Manifest => &mut review.manifest_reads,
+                    ReadKind::Toolchain => &mut review.toolchain_reads,
+                    ReadKind::TsConfig => &mut review.tsconfig_reads,
+                    ReadKind::Content => &mut review.content_reads,
+                }
+            };
+            group.insert(path.clone());
         }
         self.suggest();
     }
@@ -551,6 +588,7 @@ mod tests {
         for (path, operation) in [
             ("packages/a/package.json", Operation::ReadData),
             ("mise.toml", Operation::OpenRead),
+            ("packages/a/tsconfig.lib.json", Operation::ReadData),
             ("src/hidden.ts", Operation::Metadata),
             ("src/hidden.ts", Operation::ReadData),
             ("patches/a.patch", Operation::Metadata),
@@ -567,7 +605,7 @@ mod tests {
             });
         }
         task.summarize("failed");
-        assert_eq!(task.uncovered_accesses.len(), 4);
+        assert_eq!(task.uncovered_accesses.len(), 5);
         assert_eq!(
             task.access_review.content_reads,
             ["src/hidden.ts".into()].into()
@@ -579,6 +617,10 @@ mod tests {
         assert_eq!(
             task.access_review.toolchain_reads,
             ["mise.toml".into()].into()
+        );
+        assert_eq!(
+            task.access_review.tsconfig_reads,
+            ["packages/a/tsconfig.lib.json".into()].into()
         );
         assert_eq!(
             task.access_review.metadata_checks,

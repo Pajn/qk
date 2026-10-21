@@ -221,6 +221,14 @@ Other fields are ignored, as Nx ignores keys it does not know, so a
 configuration can use fields a newer qk added; `qk doctor` reports them.
 See [Sharing cores](../guides/threads.md) for allocation examples.
 
+## `qk:sandbox`
+
+`false` runs the task unsandboxed under `--sandbox`, listed with the reason;
+`true`, the default, sandboxes it. For a task that applies a sandbox of its
+own, which cannot run inside qk's, such as an Xcode build running Swift
+macros. See [Checking inputs and outputs in a sandbox](../guides/sandbox.md).
+`qk doctor` reports any other value.
+
 ## `qk:warm`
 
 An object describing reusable scratch state, or an array of them restored and

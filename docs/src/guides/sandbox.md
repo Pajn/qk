@@ -43,13 +43,28 @@ Sandbox audit: 1 of 2 tasks went beyond what they declare
       stray.txt
 ```
 
-For each task it lists the files read outside its inputs, the `.git` and
-dotenv files it read, which no cache key covers, and what it wrote outside
-its outputs. Paths read by many tasks, at least a quarter of those with
-findings, are listed once at the top, under `read by many tasks, likely by
-the tools their commands start through`: they are typically a package
-manager reading every workspace `package.json`, or a version manager reading
-`.tool-versions`, as a command starts.
+For each task it lists the files read outside its inputs, the TypeScript
+configuration (`tsconfig*.json`) it read outside them, which is likely an
+input, the `.git` and dotenv files it read, which no cache key covers, and
+what it wrote outside its outputs. A file it writes there and reads, such as
+a version stamp it keeps, is listed once, as written: declaring it an output
+covers both. Reads of workspace packages'
+`package.json`, which package managers and bundlers make to resolve them,
+and of version and package managers' configuration, such as
+`.tool-versions`, are counted once at the top rather than listed for each
+task; `--sandbox-report` lists them as `manifestReads` and `toolchainReads`.
+Other paths read by many tasks, at least a quarter of those with findings,
+are listed once at the top, under `read by many tasks, likely by the tools
+their commands start through`.
+
+Files read in a project the task's project depends on, directly or not, are
+grouped by that project, as `dependencyReads` in `--sandbox-report`, with how
+many each in the summary. They are what running a dependency's code, or a
+tool following imports into it, reads. Inputs prefixed with `^`, such as
+`^production`, key them. Whether one changes the task's result depends on the
+tool: a test running a dependency's code depends on it, while a lint rule
+that only follows imports to look for a cycle through the linted file cannot
+find one through a project that cannot import back.
 
 ### Installed packages outside the key
 
@@ -124,6 +139,14 @@ what it lets through on Linux. Audit on macOS, or
   task runs sandboxed and is listed under `packagesUnchecked` in
   `--sandbox-report`; if not, it runs unsandboxed and is listed with the
   reason, as above. Only tasks that started are listed.
+- Seatbelt refuses to apply a sandbox inside one that restricts anything, as
+  every task's profile does. A task that applies its own, as Xcode does to
+  run Swift macros, fails with `sandbox_apply: Operation not permitted`.
+  Audit runs it again unsandboxed and lists it with the reason, without the
+  findings of its first attempt, which ended early; enforce leaves it failed.
+  `"qk:sandbox": false` on its target runs it unsandboxed from the start, in
+  either mode. For Swift, `-disable-sandbox` in its Swift flags instead
+  leaves out only the compiler's own sandbox, so the task can be checked.
 - On Windows, qk has no sandbox.
 
 ## Linux

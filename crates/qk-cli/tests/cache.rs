@@ -2779,10 +2779,23 @@ fn history_explains_why_a_task_missed() {
             .len(),
         2
     );
-    // Linked worktrees share the history as they share the cache.
+    // Linked worktrees share the history as they share the cache, but each
+    // lists its own runs unless asked for every worktree's.
     let linked = fixture.worktree();
     let text = stdout(&success(fixture.qk(&linked, &["show", "runs"])));
-    assert_eq!(text.lines().count(), 2, "{text}");
+    assert_eq!(text, "", "{text}");
+    assert!(!fixture.qk(&linked, &["show", "run"]).status.success());
+    let text = stdout(&success(
+        fixture.qk(&linked, &["show", "runs", "--all-worktrees"]),
+    ));
+    let root = fixture.root.canonicalize().unwrap();
+    assert_eq!(
+        text.lines()
+            .filter(|line| *line == format!("  in {}", root.display()))
+            .count(),
+        2,
+        "{text}"
+    );
 }
 
 #[test]
@@ -4567,6 +4580,7 @@ fn tasks_wait_for_the_memory_they_are_expected_to_use() {
                 id: "earlier".into(),
                 command: Vec::new(),
                 sha: None,
+                worktree: None,
                 started: 1_000,
                 ended: 11_000,
                 exit_code: 0,

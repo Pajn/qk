@@ -2774,7 +2774,7 @@ fn the_sandbox_reports_and_refuses_what_a_task_does_not_declare() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let temp = fixture(json!({
         "build": {
-            "command": "cat src/in.txt other/notes.txt .env > /dev/null; mkdir -p dist && echo out > dist/out.txt && echo stray > stray.txt",
+            "command": "cat src/in.txt other/notes.txt .env > /dev/null; mkdir -p dist && echo out > dist/out.txt && echo stray > stray.txt && cat stray.txt > /dev/null",
             "inputs": ["{projectRoot}/src/**/*"],
             "outputs": ["{projectRoot}/dist"]
         },
@@ -2802,6 +2802,7 @@ fn the_sandbox_reports_and_refuses_what_a_task_does_not_declare() {
     let build = &findings["tasks"]["app:build"];
     assert_eq!(build["undeclaredReads"], json!(["other/notes.txt"]));
     assert_eq!(build["unkeyedReads"], json!([".env"]));
+    // Read back after writing it, it is listed once, as a write.
     assert_eq!(build["strayWrites"], json!(["stray.txt"]));
     assert!(findings["tasks"].get("app:clean").is_none(), "{findings}");
     // Audit lets the task do it all.
@@ -2863,6 +2864,175 @@ fn the_sandbox_lists_only_tasks_that_started() {
         .keys()
         .collect();
     assert_eq!(unsandboxed, ["app:alone"], "{findings}");
+}
+
+/// Reads in a project the task's project depends on are grouped by that
+/// project, apart from reads elsewhere outside its inputs.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_sandbox_groups_reads_in_dependency_projects() {
+    let _audit = AUDIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    fs::write(root.join("nx.json"), "{}").unwrap();
+    for (directory, project) in [
+        (
+            "apps/app",
+            json!({"name": "app", "implicitDependencies": ["lib"], "targets": {"lint": {
+                "command": "cat ../../libs/lib/src/a.ts ../../libs/other/b.ts > /dev/null",
+                "options": {"cwd": "apps/app"},
+                "inputs": ["{projectRoot}/**/*"]
+            }}}),
+        ),
+        // A root as written, which reads are matched against normalized.
+        (
+            "libs/lib",
+            json!({"name": "lib", "root": "./libs/lib/", "targets": {}}),
+        ),
+        ("libs/other", json!({"name": "other", "targets": {}})),
+    ] {
+        fs::create_dir_all(root.join(directory)).unwrap();
+        fs::write(
+            root.join(directory).join("project.json"),
+            project.to_string(),
+        )
+        .unwrap();
+    }
+    fs::create_dir_all(root.join("libs/lib/src")).unwrap();
+    fs::write(root.join("libs/lib/src/a.ts"), "").unwrap();
+    fs::write(root.join("libs/other/b.ts"), "").unwrap();
+    let report = root.join("sandbox.json");
+    let output = success(run(
+        root,
+        &[
+            "run",
+            "app:lint",
+            "--sandbox",
+            "--sandbox-report",
+            report.to_str().unwrap(),
+        ],
+    ));
+    let findings: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+    let lint = &findings["tasks"]["app:lint"];
+    assert_eq!(
+        lint["dependencyReads"],
+        json!({"lib": ["libs/lib/src/a.ts"]}),
+        "{findings}"
+    );
+    // `other` is no dependency of `app`.
+    assert_eq!(
+        lint["undeclaredReads"],
+        json!(["libs/other/b.ts"]),
+        "{findings}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "read in 1 project it depends on, outside its inputs; ^ inputs key them: lib (1 file)"
+        ),
+        "{stderr}"
+    );
+}
+
+/// Seatbelt refuses a sandbox inside one that restricts anything, so a task
+/// that applies its own, as Xcode does for Swift macros, runs again
+/// unsandboxed and is listed with why.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_task_applying_its_own_sandbox_runs_again_unsandboxed() {
+    let _audit = AUDIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = fixture(json!({
+        "build": {"command": "sandbox-exec -p '(version 1)(allow default)' /usr/bin/true && echo built > built.txt"}
+    }));
+    let report = temp.path().join("sandbox.json");
+    let output = success(run(
+        temp.path(),
+        &[
+            "run",
+            "app:build",
+            "--sandbox",
+            "--sandbox-report",
+            report.to_str().unwrap(),
+        ],
+    ));
+    assert!(temp.path().join("built.txt").is_file());
+    let findings: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+    assert!(
+        findings["unsandboxed"]["app:build"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("sandbox of its own")),
+        "{findings}"
+    );
+    assert!(findings["tasks"].get("app:build").is_none(), "{findings}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("running it again unsandboxed"), "{stderr}");
+
+    // Enforcing, it fails, and says how to leave it out.
+    fs::remove_file(temp.path().join("built.txt")).unwrap();
+    let enforced = run(temp.path(), &["run", "app:build", "--sandbox=enforce"]);
+    assert!(!enforced.status.success());
+    assert!(!temp.path().join("built.txt").exists());
+    let stderr = String::from_utf8_lossy(&enforced.stderr);
+    assert!(stderr.contains("set \"qk:sandbox\": false"), "{stderr}");
+    assert!(!stderr.contains("running it again"), "{stderr}");
+
+    // Left out of the sandbox, it runs once, unsandboxed, in either mode.
+    fs::write(
+        temp.path().join("project.json"),
+        json!({"name": "app", "targets": {"build": {
+            "command": "sandbox-exec -p '(version 1)(allow default)' /usr/bin/true && echo built > built.txt",
+            "qk:sandbox": false
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    for mode in ["--sandbox=audit", "--sandbox=enforce"] {
+        let output = success(run(
+            temp.path(),
+            &[
+                "run",
+                "app:build",
+                mode,
+                "--sandbox-report",
+                report.to_str().unwrap(),
+            ],
+        ));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("sandbox_apply"), "{stderr}");
+        let findings: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+        assert_eq!(
+            findings["unsandboxed"]["app:build"], "its target sets \"qk:sandbox\": false",
+            "{findings}"
+        );
+    }
+}
+
+/// A sandboxed run skips the cache, but a task's log is still kept for
+/// `qk show log`, failed or not.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_sandboxed_task_keeps_its_log() {
+    let _audit = AUDIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = fixture(json!({
+        "test": {"command": "echo checking && echo broken >&2 && exit 1", "cache": true}
+    }));
+    let failed = run(temp.path(), &["run", "app:test", "--sandbox"]);
+    assert!(!failed.status.success());
+    let latest: Value =
+        serde_json::from_slice(&success(run(temp.path(), &["show", "run", "--json"])).stdout)
+            .unwrap();
+    let log = success(run(
+        temp.path(),
+        &["show", "log", latest["id"].as_str().unwrap(), "app:test"],
+    ));
+    assert!(String::from_utf8_lossy(&log.stdout).contains("checking"));
+    assert!(String::from_utf8_lossy(&log.stderr).contains("broken"));
 }
 
 /// A workspace with an `app` project in `apps/app` whose targets read a

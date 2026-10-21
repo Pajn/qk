@@ -727,16 +727,24 @@ enum ShowCommand {
         #[arg(long)]
         json: bool,
     },
-    /// List recent runs, newest first.
+    /// List this worktree's recent runs, newest first.
     Runs {
         #[arg(long, default_value = "20")]
         limit: usize,
+        /// List the runs of every worktree sharing the history, with each
+        /// one's worktree.
+        #[arg(long)]
+        all_worktrees: bool,
         #[arg(long)]
         json: bool,
     },
-    /// Show a recorded run, the latest by default, as `--report` writes it.
+    /// Show a recorded run, this worktree's latest by default, as `--report`
+    /// writes it.
     Run {
         id: Option<String>,
+        /// Without an id, the latest run of any worktree sharing the history.
+        #[arg(long, conflicts_with = "id")]
+        all_worktrees: bool,
         #[arg(long)]
         json: bool,
     },
@@ -764,12 +772,16 @@ enum ShowCommand {
         #[arg(long)]
         json: bool,
     },
-    /// List task keys with successful and failed executions of identical declared inputs.
+    /// List task keys with successful and failed executions of identical
+    /// declared inputs in this worktree's runs.
     Flaky {
         /// Restrict results to a task id.
         task: Option<String>,
         #[arg(long, default_value = "20")]
         limit: usize,
+        /// Count the runs of every worktree sharing the history.
+        #[arg(long)]
+        all_worktrees: bool,
         #[arg(long)]
         json: bool,
     },
@@ -1419,11 +1431,33 @@ fn run(mut cli: Cli) -> Result<i32> {
             )?;
         }
         Command::Show {
-            command: ShowCommand::Runs { limit, json },
-        } => history::show_runs(&workspace, limit, json, &mut io::stdout().lock())?,
+            command:
+                ShowCommand::Runs {
+                    limit,
+                    all_worktrees,
+                    json,
+                },
+        } => history::show_runs(
+            &workspace,
+            limit,
+            all_worktrees,
+            json,
+            &mut io::stdout().lock(),
+        )?,
         Command::Show {
-            command: ShowCommand::Run { id, json },
-        } => history::show_run(&workspace, id.as_deref(), json, &mut io::stdout().lock())?,
+            command:
+                ShowCommand::Run {
+                    id,
+                    all_worktrees,
+                    json,
+                },
+        } => history::show_run(
+            &workspace,
+            id.as_deref(),
+            all_worktrees,
+            json,
+            &mut io::stdout().lock(),
+        )?,
         Command::Show {
             command:
                 ShowCommand::Hash {
@@ -1458,11 +1492,18 @@ fn run(mut cli: Cli) -> Result<i32> {
             command: ShowCommand::Task { id, limit, json },
         } => history::show_task(&workspace, &id, limit, json, &mut io::stdout().lock())?,
         Command::Show {
-            command: ShowCommand::Flaky { task, limit, json },
+            command:
+                ShowCommand::Flaky {
+                    task,
+                    limit,
+                    all_worktrees,
+                    json,
+                },
         } => history::show_flaky(
             &workspace,
             task.as_deref(),
             limit,
+            all_worktrees,
             json,
             &mut io::stdout().lock(),
         )?,

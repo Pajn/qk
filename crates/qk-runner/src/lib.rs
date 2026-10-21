@@ -63,6 +63,24 @@ pub struct SandboxResult {
     pub packages_unchecked: BTreeMap<String, String>,
 }
 
+/// Runs a task without the cache, keeping its log for `qk show log` as a
+/// cache miss does. Its inputs are not rechecked, so the log is not
+/// evidence of flakiness.
+fn execute_retained(
+    task: &qk_executor::PreparedTask,
+    cancelled: &AtomicBool,
+) -> Result<qk_cache::TaskResult> {
+    let capture = qk_executor::Capture::new(None, task.display.clone()).retain_log();
+    let outcome = qk_executor::execute_captured(task, cancelled, Some(&capture))?;
+    Ok(qk_cache::TaskResult {
+        execution: capture.take_log().map(|log| qk_cache::Execution {
+            log,
+            inputs_unchanged: false,
+        }),
+        ..qk_cache::TaskResult::uncached(outcome)
+    })
+}
+
 /// One task of a run, for history and reports.
 pub struct TaskRecord {
     /// When its dependencies were done; before `started` when it then waited
@@ -733,11 +751,41 @@ pub fn run(
                     }
                     let cache = cache.as_ref().filter(|_| narrowed.is_none());
                     let cancelled = cancelled.clone();
+                    let sandbox = sandbox.as_ref();
                     scope.spawn(move || {
                         let result = if let Some(cache) = cache {
                             cache.run(workspace, graph, definition, &task, &cancelled)
                         } else {
-                            execute(&task, &cancelled).map(qk_cache::TaskResult::uncached)
+                            execute_retained(&task, &cancelled).and_then(|result| {
+                                // Seatbelt refuses a sandbox inside one that
+                                // restricts anything, as Xcode applies to
+                                // Swift macros. An audit runs such a task again
+                                // unsandboxed, as one whose profile Seatbelt
+                                // rejects; enforcing, it fails, and says how
+                                // to leave it out.
+                                match sandbox {
+                                    Some(sandbox)
+                                        if sandbox.mode == sandbox::Mode::Enforce
+                                            && sandbox::nested(&task, &result) =>
+                                    {
+                                        qk_executor::status!(
+                                            "qk: {id}: it applies a sandbox of its own, which cannot run inside qk's; set \"qk:sandbox\": false on its target to run it unsandboxed"
+                                        );
+                                        Ok(result)
+                                    }
+                                    Some(sandbox) if sandbox::nested(&task, &result) => {
+                                        let reason = "it applies a sandbox of its own, which cannot run inside qk's";
+                                        qk_executor::status!("qk: {id}: {reason}; running it again unsandboxed");
+                                        sandbox.unconfined(&id, reason);
+                                        let task = qk_executor::PreparedTask {
+                                            sandbox: None,
+                                            ..task.clone()
+                                        };
+                                        execute_retained(&task, &cancelled)
+                                    }
+                                    _ => Ok(result),
+                                }
+                            })
                         };
                         let _ = sender.send((id, result));
                     });

@@ -158,6 +158,12 @@ pub fn show(workspace: &Workspace, options: Options) -> Result<i32> {
             if let Some(default) = &definition.default_configuration {
                 data["defaultConfiguration"] = json!(default);
             }
+            // qk's own fields, such as `qk:warm` and `qk:threads`, as configured.
+            for (key, value) in &definition.extra {
+                if key.starts_with("qk:") {
+                    data[key] = value.clone();
+                }
+            }
             if let Some(command) = definition
                 .options
                 .get("command")

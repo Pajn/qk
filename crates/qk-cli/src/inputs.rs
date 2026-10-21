@@ -69,6 +69,11 @@ pub fn present(mut report: Report, options: &Options) -> Result<()> {
                 5,
             ),
             (
+                &task.access_review.tsconfig_reads,
+                "TypeScript configuration reads (likely inputs)",
+                5,
+            ),
+            (
                 &task.access_review.metadata_checks,
                 "metadata-only checks (content was not observed)",
                 3,

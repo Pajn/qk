@@ -248,7 +248,8 @@ As in Nx, `--runner` must name `default` or a runner in nx.json
 ## Target inspection
 
 `qk show target <project:target[:configuration]> --json` shows the resolved
-executor, options, caching and concurrency settings, and task dependencies.
+executor, options, caching and concurrency settings, task dependencies, and
+qk's own fields, such as `qk:warm` and `qk:threads`, as configured.
 `-c <configuration>` selects a configuration. A target name without a project
 uses the current project, as `run` does.
 
@@ -342,6 +343,11 @@ project at all. Watch uses no daemon or Nx plugins.
 `qk doctor` reports unsupported executors, configured Nx plugins, sync
 generators and fields in `qk:warm` or `qk:threads` that this qk does not know,
 without executing commands, loading dotenv files or running plugins.
+It also reports `dependentTasksOutputFiles` globs that select nothing for any
+task of a target, which therefore key nothing: none of those tasks depends on
+a task declaring outputs, or the outputs on disk hold no file the glob
+matches. Outputs not built yet are taken to match. Targets sharing a set of
+such globs, as through a named input, are one finding.
 It also lists Nx CLI options accepted without effect. `--json` returns a
 versioned report with stable finding codes, locations and error/warning counts.
 Unsupported executors cause exit code 1; `--strict` also fails on warnings.

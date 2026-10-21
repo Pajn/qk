@@ -1105,6 +1105,159 @@ fn doctor_reports_unsupported_features_without_side_effects() {
     assert!(run(true).status.success());
 }
 
+/// Doctor names a dependency glob that selects nothing for any task of a
+/// target, from the outputs on disk, without running anything.
+#[test]
+fn doctor_names_dependency_globs_that_select_nothing() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    std::fs::write(root.join("nx.json"), "{}").unwrap();
+    let reads = |pattern: &str| json!([{"dependentTasksOutputFiles": pattern}]);
+    std::fs::write(
+        root.join("project.json"),
+        json!({"name":"app","targets":{
+            "codegen":{"command":"echo ran > ran","outputs":["{projectRoot}/gen"]},
+            // Selects the manifest codegen wrote.
+            "build":{"command":"true","dependsOn":["codegen"],"inputs":reads("**/manifest.json")},
+            // Depends on no task with outputs.
+            "lint":{"command":"true","inputs":reads("**/manifest.json")},
+            // Codegen's outputs hold no such file.
+            "check":{"command":"true","dependsOn":["codegen"],"inputs":reads("**/*.tsx")},
+            // Neither do codegen's, but compile is not built yet and may.
+            "compile":{"command":"true","outputs":["{projectRoot}/dist"]},
+            "types":{"command":"true","dependsOn":["codegen","compile"],"inputs":reads("**/*.tsx")}
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("gen")).unwrap();
+    std::fs::write(root.join("gen/manifest.json"), "{}").unwrap();
+    let output = isolated_command(env!("CARGO_BIN_EXE_qk"))
+        .current_dir(root)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings: Vec<(&str, &str)> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|finding| finding["code"] == "dependency-outputs-unmatched")
+        .map(|finding| {
+            (
+                finding["location"].as_str().unwrap(),
+                finding["message"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(findings.len(), 2, "{report}");
+    assert_eq!(findings[0].0, r#"dependentTasksOutputFiles "**/*.tsx""#);
+    assert!(
+        findings[0].1.contains("1 target: check (1 task)"),
+        "{report}"
+    );
+    assert_eq!(
+        findings[1].0,
+        r#"dependentTasksOutputFiles "**/manifest.json""#
+    );
+    assert!(
+        findings[1].1.contains("1 target: lint (1 task)"),
+        "{report}"
+    );
+    assert!(!root.join("ran").exists());
+    // A graph that cannot be built leaves the globs unchecked, and says so.
+    std::fs::write(
+        root.join("project.json"),
+        json!({"name":"app","targets":{
+            "a":{"command":"true","dependsOn":["b"]},
+            "b":{"command":"true","dependsOn":["a"]}
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let output = isolated_command(env!("CARGO_BIN_EXE_qk"))
+        .current_dir(root)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["code"] == "dependency-outputs-unchecked"),
+        "{report}"
+    );
+}
+
+/// `show target` shows qk's own fields as configured.
+#[test]
+fn show_target_includes_qk_fields() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    std::fs::write(
+        root.join("nx.json"),
+        json!({"targetDefaults": {"build": {"qk:threads": {"max": 2}}}}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("project.json"),
+        json!({"name":"app","targets":{"build":{
+            "command":"true",
+            "qk:warm":{"paths":["{projectRoot}/.cache"]}
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let target = successful_json(
+        isolated_command(env!("CARGO_BIN_EXE_qk"))
+            .current_dir(root)
+            .args(["show", "target", "app:build", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        target["qk:warm"],
+        json!({"paths": ["{projectRoot}/.cache"]}),
+        "{target}"
+    );
+    assert_eq!(target["qk:threads"], json!({"max": 2}), "{target}");
+}
+
+/// `qk:sandbox` is read only as a boolean; doctor names any other value.
+#[test]
+fn doctor_names_a_qk_sandbox_that_is_not_a_boolean() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    std::fs::write(root.join("nx.json"), "{}").unwrap();
+    std::fs::write(
+        root.join("project.json"),
+        json!({"name":"app","targets":{
+            "off":{"command":"true","qk:sandbox":false},
+            "typo":{"command":"true","qk:sandbox":"false"}
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let report = successful_json(
+        isolated_command(env!("CARGO_BIN_EXE_qk"))
+            .current_dir(root)
+            .args(["doctor", "--json"])
+            .output()
+            .unwrap(),
+    );
+    let invalid: Vec<&Value> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|finding| finding["code"] == "invalid-field")
+        .collect();
+    assert_eq!(invalid.len(), 1, "{report}");
+    assert_eq!(invalid[0]["location"], "app:typo");
+}
+
 /// A field a newer qk added is ignored, as Nx ignores keys it does not know,
 /// and doctor names it.
 #[test]

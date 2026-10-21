@@ -12,6 +12,7 @@ anyhow.workspace = true
 blake3.workspace = true
 qk-config.workspace = true
 qk-executor.workspace = true
+qk-graph.workspace = true
 qk-taskgraph.workspace = true
 qk-cache.workspace = true
 qk-input-analysis.workspace = true

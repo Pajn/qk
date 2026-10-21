@@ -9,7 +9,11 @@ qk run web:build --report run.json
 
 Every run is recorded in a SQLite database beside the cache
 (`<git common dir>/qk/history.db`, or `.qk/history.db` outside Git), so linked
-worktrees share it. Each task's record holds its status, cache result
+worktrees share it. Each run records the worktree it ran in: `qk show runs`,
+`qk show run` without an id, and `qk show flaky` read the current worktree's
+runs, and `--all-worktrees` reads every worktree's, naming each run's. Runs
+recorded before qk kept the worktree appear only with `--all-worktrees`.
+Each task's record holds its status, cache result
 (`local-hit`, `remote-hit`, `miss` or `uncached`), key, timing and cause: what
 differs from the previous key recorded for the task, grouped as `files` (with
 the paths added, removed and changed), `configuration` (the files qk keys for
@@ -72,8 +76,12 @@ original stream. Cache hits replay a previous success and do not create another
 execution log. Otherwise cacheable tasks run with `--skip-nx-cache` (or its
 aliases or `NX_SKIP_NX_CACHE=true`) retain their keys and execution logs while
 always executing, without restoring or publishing results or warm state.
-Uncacheable tasks, sandboxed tasks, and tasks whose inputs cannot be keyed do
-not retain execution logs. Failed executions never publish reusable
+Finite tasks that run without the cache, under `--sandbox` or
+`inputs analyze`, or with the cases `qk affected` narrowed them to, retain
+their execution logs too, cacheable or not, within the same budget. Their
+inputs are not rechecked, so `show flaky` does not count them. Otherwise,
+uncacheable tasks and tasks whose inputs cannot be keyed do not retain
+execution logs. Failed executions never publish reusable
 cache entries.
 
 `show flaky [task]` lists task keys with both successful and failed executions
@@ -101,3 +109,8 @@ included in mixed-outcome detection.
 
 Schema version 5 adds the memory each task used. Older histories upgrade in
 place, and runs recorded before have none.
+
+Schema version 6 adds the worktree each run ran in. Older histories upgrade in
+place, and runs recorded before have none. Linked worktrees share the history,
+so once one worktree's qk upgrades it, a qk that reads only an earlier version
+cannot read or record runs in any of them.
