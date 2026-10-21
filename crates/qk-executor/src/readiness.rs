@@ -22,7 +22,7 @@ use serde_json::{Map, Value};
 use crate::tokens::{closing_brace, env_name, fallbacks};
 
 // As in Nx 24.0.0-rc.0, long enough for a dev server's cold first build.
-const DEFAULT_TIMEOUT_MS: u64 = 600_000;
+pub const DEFAULT_TIMEOUT_MS: u64 = 600_000;
 /// As in Nx 24.0.0-beta.3, probes retry every 250 ms unless `interval` says
 /// otherwise.
 const DEFAULT_INTERVAL_MS: u64 = 250;
