@@ -1122,7 +1122,10 @@ fn doctor_names_dependency_globs_that_select_nothing() {
             // Depends on no task with outputs.
             "lint":{"command":"true","inputs":reads("**/manifest.json")},
             // Codegen's outputs hold no such file.
-            "check":{"command":"true","dependsOn":["codegen"],"inputs":reads("**/*.tsx")}
+            "check":{"command":"true","dependsOn":["codegen"],"inputs":reads("**/*.tsx")},
+            // Neither do codegen's, but compile is not built yet and may.
+            "compile":{"command":"true","outputs":["{projectRoot}/dist"]},
+            "types":{"command":"true","dependsOn":["codegen","compile"],"inputs":reads("**/*.tsx")}
         }})
         .to_string(),
     )
@@ -1163,6 +1166,30 @@ fn doctor_names_dependency_globs_that_select_nothing() {
         "{report}"
     );
     assert!(!root.join("ran").exists());
+    // A graph that cannot be built leaves the globs unchecked, and says so.
+    std::fs::write(
+        root.join("project.json"),
+        json!({"name":"app","targets":{
+            "a":{"command":"true","dependsOn":["b"]},
+            "b":{"command":"true","dependsOn":["a"]}
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let output = isolated_command(env!("CARGO_BIN_EXE_qk"))
+        .current_dir(root)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["code"] == "dependency-outputs-unchecked"),
+        "{report}"
+    );
 }
 
 /// `show target` shows qk's own fields as configured.

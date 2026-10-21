@@ -121,17 +121,16 @@ pub fn show(workspace: &Workspace, json: bool, strict: bool) -> Result<i32> {
                 })
         })
         .collect();
-    // A graph that cannot be built fails each run naming it, with why.
-    if let Ok(graph) = qk_taskgraph::TaskGraph::build(workspace, &requests) {
-        match qk_cache::dependency_globs(workspace, &graph) {
-            Ok(globs) => findings.extend(unmatched_globs(&globs)),
-            Err(error) => findings.push(Finding {
-                severity: "warning",
-                code: "dependency-outputs-unchecked",
-                location: "workspace".into(),
-                message: format!("cannot check dependentTasksOutputFiles globs: {error:#}"),
-            }),
-        }
+    let globs = qk_taskgraph::TaskGraph::build(workspace, &requests)
+        .and_then(|graph| qk_cache::dependency_globs(workspace, &graph));
+    match globs {
+        Ok(globs) => findings.extend(unmatched_globs(&globs)),
+        Err(error) => findings.push(Finding {
+            severity: "warning",
+            code: "dependency-outputs-unchecked",
+            location: "workspace".into(),
+            message: format!("cannot check dependentTasksOutputFiles globs: {error:#}"),
+        }),
     }
     let errors = findings
         .iter()

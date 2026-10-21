@@ -2773,7 +2773,7 @@ pub struct DependencyGlob {
 pub enum Selects {
     /// None of the tasks it reads declares outputs, so nothing ever.
     NoDeclaredOutputs,
-    /// Their outputs are not built, so it cannot be told.
+    /// Some of their outputs are not built, so it cannot be told.
     NotBuilt,
     /// None of the files their outputs hold now, this many.
     NoneOf(usize),
@@ -2805,7 +2805,8 @@ pub fn dependency_globs(workspace: &Workspace, graph: &TaskGraph) -> Result<Vec<
                 }
             }
             let matcher = snapshot.pattern(pattern, false)?;
-            let (mut declared, mut files, mut matched) = (false, 0, false);
+            // A dependency not built yet may still produce what it matches.
+            let (mut declared, mut files, mut matched, mut unbuilt) = (false, 0, false, false);
             for id in &selected {
                 let dependency = &graph.tasks[id];
                 if !Outputs::new(workspace, dependency)?.declared() {
@@ -2813,17 +2814,18 @@ pub fn dependency_globs(workspace: &Workspace, graph: &TaskGraph) -> Result<Vec<
                 }
                 declared = true;
                 let outputs = snapshot.dependency_outputs(workspace, dependency)?;
+                unbuilt |= outputs.files.is_empty();
                 files += outputs.files.len();
                 matched |= outputs.files.iter().any(|path| matcher.is_match(path));
             }
             globs.push(DependencyGlob {
                 task: task.id.clone(),
                 pattern: pattern.to_owned(),
-                selects: match (declared, files, matched) {
+                selects: match (declared, matched, unbuilt) {
                     (false, ..) => Selects::NoDeclaredOutputs,
-                    (_, _, true) => Selects::Some,
-                    (_, 0, _) => Selects::NotBuilt,
-                    (_, files, _) => Selects::NoneOf(files),
+                    (_, true, _) => Selects::Some,
+                    (_, _, true) => Selects::NotBuilt,
+                    _ => Selects::NoneOf(files),
                 },
             });
         }

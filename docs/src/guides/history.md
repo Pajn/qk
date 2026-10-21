@@ -76,10 +76,12 @@ original stream. Cache hits replay a previous success and do not create another
 execution log. Otherwise cacheable tasks run with `--skip-nx-cache` (or its
 aliases or `NX_SKIP_NX_CACHE=true`) retain their keys and execution logs while
 always executing, without restoring or publishing results or warm state.
-Tasks run under `--sandbox` or `inputs analyze`, which skip the cache, retain
-their execution logs too, but their inputs are not rechecked, so `show flaky`
-does not count them. Uncacheable tasks and tasks whose inputs cannot be keyed
-do not retain execution logs. Failed executions never publish reusable
+Finite tasks that run without the cache, under `--sandbox` or
+`inputs analyze`, or with the cases `qk affected` narrowed them to, retain
+their execution logs too, cacheable or not, within the same budget. Their
+inputs are not rechecked, so `show flaky` does not count them. Otherwise,
+uncacheable tasks and tasks whose inputs cannot be keyed do not retain
+execution logs. Failed executions never publish reusable
 cache entries.
 
 `show flaky [task]` lists task keys with both successful and failed executions
@@ -107,3 +109,8 @@ included in mixed-outcome detection.
 
 Schema version 5 adds the memory each task used. Older histories upgrade in
 place, and runs recorded before have none.
+
+Schema version 6 adds the worktree each run ran in. Older histories upgrade in
+place, and runs recorded before have none. Linked worktrees share the history,
+so once one worktree's qk upgrades it, a qk that reads only an earlier version
+cannot read or record runs in any of them.
