@@ -70,6 +70,10 @@ fn qk(root: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
         .env_remove("NX_CACHE_DIRECTORY")
         .env_remove("QK_RECORD")
         .env_remove("CI")
+        // Only a test's own credentials reach the store.
+        .env_remove("AWS_ACCESS_KEY_ID")
+        .env_remove("AWS_SECRET_ACCESS_KEY")
+        .env_remove("AWS_SESSION_TOKEN")
         .envs(env.iter().copied())
         .output()
         .unwrap();
@@ -354,7 +358,8 @@ fn mode_record_looks_up_shared_recordings_behind_a_local_declared_hit() {
     let machine = with_remote(root, &server);
     let (a, b) = (machine("a"), machine("b"));
     // `b` keeps its declared result before any recording exists, without
-    // the store's credentials, so that `a` has it to run rather than take.
+    // the store's credentials, which the helper clears from what tests
+    // inherit, so that `a` has it to run rather than take.
     let local: Vec<(String, String)> = b
         .iter()
         .filter(|(name, _)| name == "NX_CACHE_DIRECTORY")
