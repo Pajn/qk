@@ -39,7 +39,9 @@ pub struct PathSet {
     /// Directories it listed; `.` is the workspace root.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub listings: BTreeSet<String>,
-    /// Paths it found, without reading them.
+    /// Paths it found, without reading them. A file among them is keyed by
+    /// its content all the same: a tool that compares timestamps, as
+    /// `tsc --build` does, decides by a file it never reads.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub present: BTreeSet<String>,
     /// Paths it looked for and did not find.
@@ -165,16 +167,18 @@ impl PathSet {
         root: &Path,
         outputs: &[&Outputs],
     ) -> Result<Value> {
-        let mut reads = Map::new();
-        for path in &self.reads {
-            let value = match kind(&root.join(path)) {
-                "file" | "symlink" => snapshot
-                    .recorded_value(root, path)
-                    .unwrap_or_else(|_| json!({"unreadable": true})),
-                other => json!(other),
-            };
-            reads.insert(path.clone(), value);
-        }
+        // A file by its content, anything else by what it is.
+        let value = |path: &str| match kind(&root.join(path)) {
+            "file" | "symlink" => snapshot
+                .recorded_value(root, path)
+                .unwrap_or_else(|_| json!({"unreadable": true})),
+            other => json!(other),
+        };
+        let reads: Map<String, Value> = self
+            .reads
+            .iter()
+            .map(|path| (path.clone(), value(path)))
+            .collect();
         let mut listings = Map::new();
         for directory in &self.listings {
             listings.insert(directory.clone(), self.listing(root, directory, outputs)?);
@@ -183,7 +187,7 @@ impl PathSet {
             .present
             .iter()
             .chain(&self.absent)
-            .map(|path| (path.clone(), json!(kind(&root.join(path)))))
+            .map(|path| (path.clone(), value(path)))
             .collect();
         Ok(json!({"reads": reads, "listings": listings, "existence": existence}))
     }
@@ -399,12 +403,13 @@ mod tests {
         )
         .unwrap();
         let snapshot = Snapshot::new(&workspace, &graph, &root.join("cache")).unwrap();
+        std::fs::write(root.join("checked.txt"), "one").unwrap();
         let set = PathSet {
             reads: ["a.txt".into()].into(),
             listings: ["icons".into()].into(),
+            present: ["checked.txt".into()].into(),
             absent: ["optional.txt".into()].into(),
             written: ["icons/sprite.svg".into()].into(),
-            ..PathSet::default()
         };
         let outputs = Outputs::from_paths(&["icons/out".into()]).unwrap();
         let strong = || strong_key("weak", &set, &snapshot, &root, &[&outputs]).unwrap();
@@ -419,6 +424,8 @@ mod tests {
             |root: &Path| std::fs::write(root.join("icons/b.svg"), "").unwrap(),
             |root: &Path| std::fs::write(root.join("optional.txt"), "").unwrap(),
             |root: &Path| std::fs::write(root.join("a.txt"), "two").unwrap(),
+            // A file it only looked at, as by its timestamp.
+            |root: &Path| std::fs::write(root.join("checked.txt"), "two").unwrap(),
         ] {
             let before = strong();
             change(&root);

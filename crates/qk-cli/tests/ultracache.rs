@@ -133,6 +133,11 @@ fn a_recorded_task_is_keyed_by_what_it_read_listed_and_looked_for() {
     assert_eq!(build(root, false), "miss");
     assert_eq!(build(root, true), "miss");
     assert_eq!(build(root, false), "local-hit");
+    // A file it only checked, as a tool comparing timestamps does.
+    write(root, "app/src/checked.txt", "changed\n");
+    assert_eq!(build(root, false), "miss");
+    assert_eq!(build(root, true), "miss");
+    assert_eq!(build(root, false), "local-hit");
     // A file where it looked for one and found none.
     write(root, "app/config.local", "local\n");
     assert_eq!(build(root, false), "miss");

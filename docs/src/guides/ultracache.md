@@ -35,9 +35,11 @@ workspace.
 - A directory it **listed** is keyed by its entries' names and kinds, so a new
   file there, such as another `.svg` in a directory a build bundles whole,
   changes the key even though no recording read it.
-- A path it **looked up** is keyed by whether it exists, and as what. A file
-  created where a resolver once found nothing changes the key; so does
-  deleting one it found.
+- A path it **looked up** is keyed by whether it exists, and as what, and a
+  file it found by its content: a tool that compares timestamps, as
+  `tsc --build` does, decides by files it never reads. A file created where a
+  resolver once found nothing changes the key; so does deleting or changing
+  one it found.
 
 Left out are paths outside the workspace, `node_modules`, which the lockfile
 keys, `.git`, qk's own state, the task's outputs and warm paths, files it wrote
