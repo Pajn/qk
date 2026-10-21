@@ -64,7 +64,7 @@ running alone on 16 starts 32. Rounding up adds less than one thread per
 task, so the threads every task is told stay within `scale` times the
 budget plus one for each task running: eight tasks holding a core each with
 `scale: 1.1` are told 2 threads each. A test's wall-clock budgets, such as a
-`waitFor` or a test timeout, are so no less trustworthy than that bound makes
+`waitFor` or a test timeout, are no less trustworthy than that bound makes
 them, however many tasks run at once. Keep `scale` to targets whose threads wait; for a
 compiler, whose threads keep their cores busy, it only adds contention.
 Vitest reads `VITEST_MAX_WORKERS` itself, and a variable a script sets for
@@ -75,8 +75,9 @@ Nx keeps applying there, since qk sets nothing under Nx.
 While a task runs, qk samples the CPU time of its processes, as it samples
 their memory. The summary follows each threaded task's threads with the
 cores it kept busy on average, `app:test 6 on 3 (2.4 busy)`, and
-`qk show task` says it for every task that ran for two seconds or more, with
-the cores it held. A task busy on fewer cores than it held is waiting, and
+`qk show task` says it, with the cores it held, for a task that ran for two
+seconds or more and whose processes were sampled using CPU time: one whose
+processes all started and exited between samples has no figure. A task busy on fewer cores than it held is waiting, and
 can take a higher `scale`; one busy on more is starting threads it was not
 told about, such as a runtime's own, and holds less than it uses. A process
 that starts and exits between two samples, a quarter of a second apart, is
