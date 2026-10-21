@@ -846,6 +846,7 @@ fn ready_check(
         }
         options.insert(key, value);
     }
+    let full_env = env;
     let env: BTreeMap<String, String> = env
         .iter()
         .filter_map(|(name, value)| Some((name.to_str()?.to_owned(), value.to_str()?.to_owned())))
@@ -860,9 +861,21 @@ fn ready_check(
         options: &options,
         env: &env,
     };
-    Ok(readiness::resolve(&task.id, ready_when, &scope)
-        .map_err(|error| format!("{error:#}"))
-        .transpose())
+    let mut check = readiness::resolve(&task.id, ready_when, &scope);
+    // As in Nx 24, a command check runs as the task's commands do, and
+    // reads the options they run with.
+    if let Ok(Some(readiness::ReadyCheck {
+        probe: readiness::Probe::Command { env: probe_env, .. },
+        ..
+    })) = &mut check
+    {
+        *probe_env = full_env.clone();
+        probe_env.insert(
+            "NX_TASK_OPTIONS".into(),
+            serde_json::to_string(&options)?.into(),
+        );
+    }
+    Ok(check.map_err(|error| format!("{error:#}")).transpose())
 }
 
 /// The run-commands options Nx reads, which a task's arguments may set too.

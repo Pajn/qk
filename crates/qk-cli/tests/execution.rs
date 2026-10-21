@@ -993,6 +993,32 @@ fn tasks_waiting_for_ready_start_once_the_check_passes() {
     assert!(!run(temp.path(), &["run", "app:e2e"]).status.success());
 }
 
+/// As in Nx 24, a command check runs with the server's environment, and reads
+/// the options it runs with from `NX_TASK_OPTIONS`.
+#[cfg(unix)]
+#[test]
+fn a_command_check_runs_as_its_server_does() {
+    let temp = fixture(json!({
+        "serve": {
+            "continuous": true,
+            "readyWhen": {
+                "command": r#"test "$SERVER_NAME" = api && test -f marker && echo "$NX_TASK_OPTIONS" | grep -q '"port":4321'"#,
+                "interval": 50,
+                "timeout": 5000
+            },
+            "options": {"env": {"SERVER_NAME": "api"}, "port": 4321, "forwardAllArgs": false},
+            "command": "sleep 0.5; touch marker; sleep 30"
+        },
+        "e2e": {"command": "test -f marker", "dependsOn": [{"target": "serve", "waitFor": "ready"}]}
+    }));
+    let output = run(temp.path(), &["run", "app:e2e"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn a_failed_check_fails_the_server_and_skips_the_tasks_waiting_for_it() {

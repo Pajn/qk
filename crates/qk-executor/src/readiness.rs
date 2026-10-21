@@ -7,6 +7,7 @@
 //! the run-commands task itself as ready.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::Path;
 use std::process::Stdio;
@@ -36,8 +37,13 @@ pub enum Probe {
     Url(String),
     /// A TCP connection, to loopback unless a host is named.
     Port { port: u16, host: Option<String> },
-    /// A shell command at the workspace root exiting with 0.
-    Command(String),
+    /// A shell command at the workspace root exiting with 0, run with the
+    /// environment the task's commands run with and its options as JSON in
+    /// `NX_TASK_OPTIONS`, as in Nx 24.
+    Command {
+        command: String,
+        env: BTreeMap<OsString, OsString>,
+    },
     /// Every one of these appearing in the task's output.
     LogMatches(Vec<String>),
 }
@@ -59,7 +65,7 @@ impl ReadyCheck {
                 host: Some(host),
             } => format!("port {host}:{port}"),
             Probe::Port { port, host: None } => format!("port {port}"),
-            Probe::Command(command) => format!("command \"{command}\""),
+            Probe::Command { command, .. } => format!("command \"{command}\""),
             Probe::LogMatches(matches) => format!(
                 "logMatches {}",
                 matches
@@ -239,7 +245,10 @@ pub fn resolve(task: &str, ready_when: &Value, scope: &Scope) -> Result<Option<R
             }
         }
         "command" => match text("command", Field::Text)? {
-            Some(Value::String(command)) if !command.is_empty() => Probe::Command(command),
+            Some(Value::String(command)) if !command.is_empty() => Probe::Command {
+                command,
+                env: BTreeMap::new(),
+            },
             _ => return Err(invalid("\"command\" must be a non-empty string".into())),
         },
         _ => {
@@ -388,7 +397,7 @@ pub fn wait(task: &str, check: &ReadyCheck, root: &Path, verdict: &Verdict, stop
         let ready = match &check.probe {
             Probe::Url(url) => probe_url(url, deadline),
             Probe::Port { port, host } => probe_port(*port, host.as_deref(), deadline),
-            Probe::Command(command) => probe_command(command, root, deadline, stop),
+            Probe::Command { command, env } => probe_command(command, env, root, deadline, stop),
             Probe::LogMatches(_) => false,
         };
         if ready {
@@ -580,10 +589,20 @@ fn probe_url(url: &str, deadline: Instant) -> bool {
     }
 }
 
-/// Runs the command through the shell at the workspace root. On timeout or
-/// stop, its whole process group is killed.
-fn probe_command(command: &str, root: &Path, deadline: Instant, stop: &AtomicBool) -> bool {
+/// Runs the command through the shell at the workspace root, with `env` in
+/// place of qk's own when it has any. On timeout or stop, its whole process
+/// group is killed.
+fn probe_command(
+    command: &str,
+    env: &BTreeMap<OsString, OsString>,
+    root: &Path,
+    deadline: Instant,
+    stop: &AtomicBool,
+) -> bool {
     let mut shell = crate::shell(command);
+    if !env.is_empty() {
+        shell.env_clear().envs(env);
+    }
     shell
         .current_dir(root)
         .stdin(Stdio::null())
@@ -848,7 +867,10 @@ mod tests {
         drop(listener);
         let verdict = Verdict::default();
         let check = ReadyCheck {
-            probe: Probe::Command("exit 1".into()),
+            probe: Probe::Command {
+                command: "exit 1".into(),
+                env: BTreeMap::new(),
+            },
             timeout: Duration::from_millis(100),
             interval: Duration::from_millis(10),
         };
@@ -861,7 +883,10 @@ mod tests {
         );
         let verdict = Verdict::default();
         let check = ReadyCheck {
-            probe: Probe::Command("exit 0".into()),
+            probe: Probe::Command {
+                command: "exit 0".into(),
+                env: BTreeMap::new(),
+            },
             ..check
         };
         wait("app:serve", &check, Path::new("."), &verdict, &stop);
