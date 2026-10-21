@@ -112,20 +112,24 @@ impl Cache {
         }
     }
 
-    /// The workspace's cache, with the remote store its nx.json `s3` key
-    /// configures, if any. Credentials and modes are read from `environment`,
-    /// which includes the workspace's dotenv files. A remote store that cannot
-    /// be used is reported and left out; the local cache still works.
+    /// The workspace's cache, with the remote store its nx.json `s3`,
+    /// `storeServer` or `qk:storeServer` key configures, if any. Credentials
+    /// and modes are read from `environment`, which includes the workspace's
+    /// dotenv files. A remote store that cannot be used is reported and left
+    /// out; the local cache still works.
     pub fn for_workspace(
         workspace: &Workspace,
         environment: &BTreeMap<std::ffi::OsString, std::ffi::OsString>,
     ) -> Self {
         let root = paths::cache_location(workspace);
-        let remote = match remote::configure(
-            workspace.config.extra.get("s3"),
-            workspace.config.extra.get("storeServer"),
-            environment,
-        ) {
+        let extra = &workspace.config.extra;
+        // Nx never reads `qk:storeServer`, so a workspace can name a store
+        // server for qk while Nx's own cache plugin keeps `s3`.
+        let (s3, server) = match extra.get("qk:storeServer") {
+            Some(server) => (None, Some(server)),
+            None => (extra.get("s3"), extra.get("storeServer")),
+        };
+        let remote = match remote::configure(s3, server, environment) {
             Ok(remote) => remote.map(std::sync::Arc::new),
             Err(error) => {
                 qk_executor::status!("qk: remote cache disabled: {error:#}");

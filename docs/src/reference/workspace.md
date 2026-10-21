@@ -239,6 +239,11 @@ cannot be set together with `s3`. The token comes from
 
 Modes and upload modes, and the variables that override them, are as for `s3`.
 
+## `qk:storeServer`
+
+The same object as `storeServer`, read by qk alone. When it is set, qk uses it
+and ignores `s3` and `storeServer`, so `s3` can stay for Nx's own cache plugin.
+
 ## `nx.local.json`
 
 A machine-specific overlay on `nx.json`. `targetDefaults` merge per entry,
