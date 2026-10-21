@@ -154,8 +154,8 @@ pub enum Reason {
     /// A file projects are created from was deleted and qk could not tell
     /// what depended on what it removed, which touches every project.
     DeletedManifest { file: String, detail: String },
-    /// The project depended on a project the change removed, by deleting the
-    /// manifests it was created from.
+    /// The project depended on a project or package the change removed, by
+    /// deleting the manifest it was created from: `project` names it.
     DependedOnRemoved { file: String, project: String },
     /// The lockfile changed under a `projectsAffectedByDependencyUpdates`
     /// setting that does not look inside it.
@@ -1050,8 +1050,8 @@ pub(crate) enum Removal {
     None,
     /// qk cannot tell what depended on what was removed.
     Unknown { file: String, detail: String },
-    /// Each project that depended on a removed one, with the deleted file and
-    /// the removed project's name.
+    /// Each project that depended on a removed project or package, with the
+    /// deleted file and the name of what it removed.
     Dependents(BTreeMap<String, (String, String)>),
 }
 
@@ -1090,14 +1090,6 @@ pub(crate) fn removed(workspace: &Workspace, changes: &Changes, files: &[String]
             .or_insert(file);
     }
     for (directory, file) in directories {
-        // Its other manifest may still make the project.
-        if workspace
-            .projects
-            .values()
-            .any(|project| project.root == directory)
-        {
-            continue;
-        }
         let read = |name: &str| {
             let path = match directory {
                 "." => name.to_owned(),
@@ -1121,18 +1113,22 @@ pub(crate) fn removed(workspace: &Workspace, changes: &Changes, files: &[String]
             }
         };
         let (removed, package) = project;
-        // Moved, or renamed in its package.json alone: the head graph has it.
-        if workspace.projects.contains_key(&removed.name) {
-            continue;
-        }
-        let mut depended = |dependent: &str| {
+        // Each way to depend on it goes only where the head lost it: a
+        // project still there, by its other manifest or moved under its
+        // name, keeps what names it, and a package still there what links
+        // to it, though either may be what the deletion removed alone.
+        let mut depended = |dependent: &str, what: &str| {
             dependents
                 .entry(dependent.to_owned())
-                .or_insert_with(|| ((*file).clone(), removed.name.clone()));
+                .or_insert_with(|| ((*file).clone(), what.to_owned()));
         };
         if workspace.analyzes_package_json()
             && let Some(package) = &package
             && let Some(name) = &package.name
+            && !workspace
+                .packages
+                .values()
+                .any(|kept| kept.name.as_ref() == Some(name))
         {
             for (dependent, manifest) in &workspace.packages {
                 let linked = manifest
@@ -1147,9 +1143,12 @@ pub(crate) fn removed(workspace: &Workspace, changes: &Changes, files: &[String]
                         )
                     });
                 if linked {
-                    depended(dependent);
+                    depended(dependent, name);
                 }
             }
+        }
+        if workspace.projects.contains_key(&removed.name) {
+            continue;
         }
         let mut projects = workspace.projects.clone();
         projects.insert(removed.name.clone(), removed.clone());
@@ -1161,7 +1160,7 @@ pub(crate) fn removed(workspace: &Workspace, changes: &Changes, files: &[String]
             );
             let excluded = format!("!{}", removed.name);
             if implicit.contains(&removed.name) && !implicit.contains(&excluded) {
-                depended(dependent);
+                depended(dependent, &removed.name);
             }
         }
     }

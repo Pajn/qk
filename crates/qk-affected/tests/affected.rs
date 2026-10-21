@@ -198,6 +198,15 @@ fn deleting_a_project_affects_what_depended_on_it() {
 }
 
 #[test]
+fn deleting_only_a_package_affects_what_linked_to_it() {
+    let repo = packages();
+    // `b` stays a project by its project.json, but `@x/b` is gone, and with
+    // it `a`'s link.
+    std::fs::remove_file(repo.root.join("packages/b/package.json")).unwrap();
+    assert_eq!(repo.committed(), names(&["a", "b", "c"]));
+}
+
+#[test]
 fn deleting_a_project_nothing_depended_on_affects_nothing_else() {
     let repo = Repo::new(&[]);
     std::fs::remove_dir_all(repo.root.join("tools/tool")).unwrap();
@@ -260,7 +269,7 @@ fn deleting_a_project_affects_the_tasks_reading_what_depended_on_it() {
                 TaskCause::Touched { reasons } if reasons.iter().any(|reason| matches!(
                     reason,
                     TaskReason::DependedOnRemoved { file, project }
-                        if file == "packages/b/package.json" && project == "b"
+                        if file == "packages/b/package.json" && project == "@x/b"
                 ))
             ),
             "{task}: {:?}",

@@ -51,8 +51,10 @@ same manifests at both revisions, so what depended on the removed project is
 what the change touches already and what still names it: a `package.json`
 dependency that linked to it, or an `implicitDependencies` entry or pattern
 selecting it. Their dependents follow as for any other touched project. A
-deletion leaving the project in place, its other manifest still making it, or
-moving it under the same name, touches only through its files. Every project
+deletion can remove a package and leave its project, when a `project.json`
+still makes it, or move a project under the same name: the projects that
+linked to the package are touched in the one case, and nothing else in the
+other. Every project
 is still touched when qk cannot tell: for a deleted root lockfile, for files
 named with `--files`, which are not compared with a base revision, or when the
 removed project's manifests cannot be read there.
