@@ -20,7 +20,8 @@ use serde_json::{Map, Value};
 
 use crate::tokens::{closing_brace, env_name, fallbacks};
 
-const DEFAULT_TIMEOUT_MS: u64 = 60_000;
+// As in Nx 24.0.0-rc.0, long enough for a dev server's cold first build.
+const DEFAULT_TIMEOUT_MS: u64 = 600_000;
 /// As in Nx 24.0.0-beta.3, probes retry every 250 ms unless `interval` says
 /// otherwise.
 const DEFAULT_INTERVAL_MS: u64 = 250;
@@ -396,10 +397,13 @@ pub fn wait(task: &str, check: &ReadyCheck, root: &Path, verdict: &Verdict, stop
         }
         let now = Instant::now();
         if now >= deadline {
+            let longer = (check.timeout.as_millis() as u64 * 2).min(MAX_DURATION_MS);
             verdict.fail(format!(
-                "Task \"{task}\" did not become ready within {}ms (readyWhen: {}). To change \
-                 the check, set \"readyWhen\" on the target or in \"targetDefaults\" in nx.json, \
-                 or set it to null to turn it off.",
+                "Task \"{task}\" did not become ready within {}ms (readyWhen: {}). If it needs \
+                 longer, set \"timeout\": {longer} in the target's \"readyWhen\", as \
+                 {{ \"...\": true, \"timeout\": {longer} }} to keep a check a target default \
+                 sets. To change the check, set \"readyWhen\" on the target or in \
+                 \"targetDefaults\" in nx.json, or set it to null to turn it off.",
                 check.timeout.as_millis(),
                 check.describe()
             ));
@@ -720,7 +724,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(check.probe, Probe::Url("http://localhost:5001/app".into()));
-        assert_eq!(check.timeout, Duration::from_millis(60_000));
+        assert_eq!(check.timeout, Duration::from_millis(600_000));
         assert_eq!(check.interval, Duration::from_millis(250));
         let check = resolved(
             json!({"port": "{options.port}"}),

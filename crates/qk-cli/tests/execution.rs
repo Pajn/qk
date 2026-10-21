@@ -1009,6 +1009,11 @@ fn a_failed_check_fails_the_server_and_skips_the_tasks_waiting_for_it() {
         ),
         "{stderr}"
     );
+    // It says how to give the check longer, keeping what a default sets.
+    assert!(
+        stderr.contains(r#"as { "...": true, "timeout": 400 }"#),
+        "{stderr}"
+    );
     let reason = stderr.find("did not become ready").unwrap();
     let skipped = stderr.find("skipped app:e2e (dependency failed)").unwrap();
     assert!(reason < skipped, "{stderr}");

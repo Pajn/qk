@@ -177,7 +177,7 @@ with `waitFor: "ready"`, as in Nx 24. It is an object with exactly one of:
 | `command` | The command, run through the shell at the workspace root, exits with 0. |
 | `logMatches` | Every one of a string or an array of strings has appeared in the output, terminal control sequences left out. |
 
-`timeout`, 60000 by default, is how many milliseconds the check may take, and
+`timeout`, 600000 (ten minutes) by default, is how many milliseconds the check may take, and
 `interval`, 250 by default, how long a `url`, `port` or `command` check waits
 between tries. Strings may use `{workspaceRoot}`, `{projectRoot}`,
 `{projectName}`, `{options.name}`, `{env.NAME}` and `??` fallbacks, read from
