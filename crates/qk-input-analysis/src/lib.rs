@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub mod strace;
 mod suggestions;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

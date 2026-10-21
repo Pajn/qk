@@ -91,6 +91,9 @@ pub fn record(
                     .and_then(|record| record.threads)
                     .map(|threads| threads as u64),
                 memory: record.and_then(|record| record.memory),
+                recorded: record
+                    .and_then(|record| record.recorded.as_ref())
+                    .and_then(|recorded| serde_json::to_value(recorded).ok()),
             }
         })
         .collect();

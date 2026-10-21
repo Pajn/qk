@@ -133,6 +133,7 @@ These options apply to `run`, `run-many` and `affected`:
 | `--verbose` | Set `NX_VERBOSE_LOGGING=true` for tasks, which otherwise see `false` unless it is set to `true`; print every task in full under `static-failures-only` |
 | `--sandbox[=audit\|enforce]` | Report (`audit`, macOS only) or refuse (`enforce`, macOS and Linux) what tasks read and write in the workspace beyond their declarations; skips the cache. See [Checking inputs in a sandbox](../guides/sandbox.md) |
 | `--sandbox-report <path>` | Write every sandbox finding as JSON |
+| `--record` | Record what each task with `qk:ultracache` reads when it executes, and key its result by that; Linux only. See [Keying tasks by what they read](../guides/ultracache.md) |
 | `--report <path>` | Save JSON run report; defaults to `NX_RUN_REPORT` when set |
 | `--profile` | Print cache input and restore phase timings to stderr; see [Profiling cache operations](#profiling-cache-operations) |
 | `-- <args>` | Forward arguments to requested tasks, after any unknown options |

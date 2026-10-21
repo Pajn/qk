@@ -81,6 +81,33 @@ fn execute_retained(
     })
 }
 
+/// Gives each cacheable task with `qk:ultracache` a recording, in a directory
+/// of its own: strace follows its processes, filtering in the kernel where
+/// strace can. Elsewhere than on Linux nothing is recorded, and that is said
+/// once.
+fn attach_recordings(
+    graph: &TaskGraph,
+    prepared: &mut BTreeMap<String, qk_executor::PreparedTask>,
+) -> Result<Option<tempfile::TempDir>> {
+    if !cfg!(target_os = "linux") {
+        qk_executor::status!("qk: --record records only on Linux; this run records nothing");
+        return Ok(None);
+    }
+    let directory = tempfile::tempdir().context("cannot create a directory for recordings")?;
+    let recording = qk_executor::Recording::probe(directory.path())?;
+    for (index, (id, task)) in graph.tasks.iter().enumerate() {
+        let opted = task.definition.cache == Some(true)
+            && task.definition.continuous != Some(true)
+            && matches!(qk_cache::ultracache::Settings::of(task), Ok(Some(_)));
+        if let Some(prepared) = prepared.get_mut(id).filter(|_| opted) {
+            let traces = directory.path().join(format!("task-{index}"));
+            std::fs::create_dir(&traces)?;
+            prepared.recording = Some(recording.in_directory(traces));
+        }
+    }
+    Ok(Some(directory))
+}
+
 /// One task of a run, for history and reports.
 pub struct TaskRecord {
     /// When its dependencies were done; before `started` when it then waited
@@ -104,6 +131,8 @@ pub struct TaskRecord {
     pub memory_wait: Duration,
     /// Bounded output and input verification for an actual cacheable execution.
     pub execution: Option<qk_cache::Execution>,
+    /// How a task with `qk:ultracache` was keyed.
+    pub recorded: Option<qk_cache::Recorded>,
 }
 
 /// How long a task can be expected to run, and the memory it can be expected
@@ -148,6 +177,9 @@ pub struct Settings<'a> {
     pub sandbox: Option<sandbox::Mode>,
     /// Execute finite tasks under an advisory file-access recorder.
     pub analyze_inputs: bool,
+    /// Record what each task with `qk:ultracache` that executes reads, and
+    /// key its result by that: see `qk_cache::recorded`. Linux only.
+    pub record: bool,
     /// What each task is expected to take; a task without one is expected to
     /// take no time.
     pub expected: &'a BTreeMap<String, Expected>,
@@ -172,11 +204,17 @@ pub fn run(
         stream_long_running,
         sandbox: sandbox_mode,
         analyze_inputs,
+        record,
         expected,
         cases,
     } = *settings;
     if analyze_inputs && sandbox_mode.is_some() {
         bail!("input analysis and sandbox enforcement/audit cannot be combined");
+    }
+    if record && (analyze_inputs || sandbox_mode.is_some() || skip_cache) {
+        bail!(
+            "--record keys results in the cache, so it cannot be combined with --sandbox, inputs analyze or skipping the cache"
+        );
     }
     let skip_cache = skip_cache || analyze_inputs;
     if parallel == 0 || cores == 0 {
@@ -270,6 +308,11 @@ pub fn run(
     let recorder = analyze_inputs
         .then(|| recorder::Recorder::start(workspace, graph, &mut prepared))
         .transpose()?;
+    // Traces of the tasks this run records, kept until it ends.
+    let _recordings = record
+        .then(|| attach_recordings(graph, &mut prepared))
+        .transpose()?
+        .flatten();
     let prepared = prepared;
     let threads: BTreeMap<String, Threads> = graph
         .tasks
@@ -902,19 +945,21 @@ pub fn run(
                                 }
                             }
                         }
-                        let (outcome, cache, key, warm, execution) = match result {
+                        let (outcome, cache, key, warm, execution, recorded) = match result {
                             Ok(result) => (
                                 result.outcome,
                                 result.cache,
                                 result.key,
                                 result.warm,
                                 result.execution,
+                                result.recorded,
                             ),
                             Err(error) => {
                                 qk_executor::status!("qk: {id}: {error:#}");
                                 (
                                     Outcome::Failed(1),
                                     qk_cache::CacheStatus::Uncached,
+                                    None,
                                     None,
                                     None,
                                     None,
@@ -968,6 +1013,7 @@ pub fn run(
                                     .remove(&id)
                                     .filter(|bytes| *bytes > 0),
                                 execution,
+                                recorded,
                             },
                         );
                         outcomes.insert(id, outcome);

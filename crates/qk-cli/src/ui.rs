@@ -869,6 +869,52 @@ fn details(
             list(&warm)
         ));
     }
+    // Tasks with `qk:ultracache`, by how they were keyed.
+    let recorded = |kinds: &[&str]| -> Vec<&str> {
+        report
+            .tasks
+            .iter()
+            .filter(|task| {
+                task.recorded
+                    .as_ref()
+                    .and_then(|recorded| recorded["kind"].as_str())
+                    .is_some_and(|kind| kinds.contains(&kind))
+            })
+            .map(|task| task.id.as_str())
+            .collect()
+    };
+    for (kinds, label) in [
+        (
+            &["hit"][..],
+            "from the cache by what they read when recorded",
+        ),
+        (&["saved"], "recorded"),
+        (
+            &["missed"],
+            "missed what they read when recorded, and ran unrecorded",
+        ),
+        (
+            &["unrecorded"],
+            "with qk:ultracache, keyed by their inputs until recorded",
+        ),
+        (
+            &["failed"],
+            "not recorded, as a recording could not be kept; the run says why",
+        ),
+    ] {
+        let tasks = recorded(kinds);
+        if !tasks.is_empty() {
+            lines.push(format!(
+                "{} {}",
+                paint.dim(&format!(
+                    "{} task{} {label}:",
+                    tasks.len(),
+                    if tasks.len() == 1 { "" } else { "s" }
+                )),
+                list(&tasks)
+            ));
+        }
+    }
     let threaded: Vec<String> = report
         .tasks
         .iter()
@@ -1267,6 +1313,7 @@ mod tests {
             memory: None,
             memory_wait: Duration::ZERO,
             execution: None,
+            recorded: None,
         };
         let report = |id: &str, started: u64, ended: u64, dependencies: &[&str]| TaskReport {
             id: id.into(),
@@ -1283,6 +1330,7 @@ mod tests {
             warm: None,
             threads: None,
             memory: None,
+            recorded: None,
         };
         let result = RunResult {
             sandbox: None,

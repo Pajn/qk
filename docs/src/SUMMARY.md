@@ -11,6 +11,7 @@
 - [Local cache](guides/cache.md)
 - [Remote cache and storage limits](guides/remote-cache.md)
 - [Warm state](guides/warm-state.md)
+- [Keying tasks by what they read](guides/ultracache.md)
 - [Sharing cores](guides/threads.md)
 - [Checking inputs in a sandbox](guides/sandbox.md)
 - [Recording task inputs](guides/input-analysis.md)

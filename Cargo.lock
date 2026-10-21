@@ -1726,6 +1726,7 @@ dependencies = [
  "qk-config",
  "qk-executor",
  "qk-graph",
+ "qk-input-analysis",
  "qk-lockfile",
  "qk-taskgraph",
  "rustix",
@@ -1824,9 +1825,11 @@ dependencies = [
 name = "qk-input-analysis"
 version = "0.8.3"
 dependencies = [
+ "anyhow",
  "globset",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

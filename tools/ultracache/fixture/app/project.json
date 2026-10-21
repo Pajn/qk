@@ -1,0 +1,9 @@
+{
+  "name": "app",
+  "targets": {
+    "build": {
+      "command": "mkdir -p dist && cat src/main.txt src/util.txt src/notes.txt > dist/out.txt && cat icons/*.svg > dist/sprite.svg && if test -e config.local; then cat config.local >> dist/out.txt; fi && test -e src/checked.txt && ls > dist/listing.txt",
+      "options": { "cwd": "{projectRoot}" }
+    }
+  }
+}

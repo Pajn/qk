@@ -18,6 +18,7 @@ qk-config.workspace = true
 qk-graph.workspace = true
 qk-taskgraph.workspace = true
 qk-executor.workspace = true
+qk-input-analysis.workspace = true
 qk-lockfile.workspace = true
 jsonc-parser.workspace = true
 serde.workspace = true

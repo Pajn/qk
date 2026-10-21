@@ -70,6 +70,7 @@ pub fn show(workspace: &Workspace, json: bool, strict: bool) -> Result<i32> {
             for (key, fields) in [
                 ("qk:warm", qk_cache::warm::FIELDS),
                 ("qk:threads", qk_runner::threads::FIELDS),
+                ("qk:ultracache", qk_cache::ultracache::FIELDS),
             ] {
                 let objects = match definition.extra.get(key) {
                     Some(serde_json::Value::Object(object)) => vec![object],
