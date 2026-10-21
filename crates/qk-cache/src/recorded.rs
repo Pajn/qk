@@ -155,19 +155,58 @@ impl PathSet {
             && self.absent.is_empty()
     }
 
-    /// A file the task read or found that changed after `started`, when the
-    /// task ran: keyed by its content now, a recording would key the task by
-    /// what it left there rather than by what it read. A directory is keyed
-    /// by its kind or its listing, which leaves out what the task wrote.
-    pub fn changed_since(&self, root: &Path, started: SystemTime) -> Option<&str> {
-        self.reads
-            .iter()
-            .chain(&self.present)
-            .map(String::as_str)
-            .find(|path| {
-                std::fs::symlink_metadata(root.join(path))
-                    .is_ok_and(|metadata| !metadata.is_dir() && changed(&metadata) >= started)
+    /// A path the set keys that changed after `started`, when the task ran:
+    /// keyed by how it is now, a recording would key the task by what was
+    /// left there rather than by what the task saw.
+    ///
+    /// A file read or found changed if it was written. A listed directory
+    /// changed if an entry other than the task's writes and `outputs` was
+    /// added, renamed or replaced, or, in a directory the task wrote nothing
+    /// to, one was removed: a directory's own time moves with its entries, so
+    /// where the task wrote, a removal cannot be told from its own writes.
+    pub fn changed_since(
+        &self,
+        root: &Path,
+        started: SystemTime,
+        outputs: &[&Outputs],
+    ) -> Option<&str> {
+        let since = |path: &Path| {
+            std::fs::symlink_metadata(path).is_ok_and(|metadata| changed(&metadata) >= started)
+        };
+        let file = self.reads.iter().chain(&self.present).find(|path| {
+            std::fs::symlink_metadata(root.join(path))
+                .is_ok_and(|metadata| !metadata.is_dir() && changed(&metadata) >= started)
+        });
+        file.or_else(|| {
+            self.listings.iter().find(|directory| {
+                let absolute = if *directory == "." {
+                    root.to_path_buf()
+                } else {
+                    root.join(directory)
+                };
+                let Ok(entries) = std::fs::read_dir(&absolute) else {
+                    return false;
+                };
+                let mut own = self.written.iter().any(|path| parent(path) == *directory);
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    let path = if *directory == "." {
+                        name
+                    } else {
+                        format!("{directory}/{name}")
+                    };
+                    if self.written.contains(&path)
+                        || outputs.iter().any(|outputs| outputs.matches(&path))
+                    {
+                        own = true;
+                    } else if since(&entry.path()) {
+                        return true;
+                    }
+                }
+                !own && since(&absolute)
             })
+        })
+        .map(String::as_str)
     }
 
     pub fn digest(&self) -> Result<String> {
@@ -507,18 +546,55 @@ mod tests {
         for path in ["read.txt", "found.txt", "listed.txt"] {
             std::fs::write(temp.path().join(path), "before").unwrap();
         }
+        for directory in ["listed", "written"] {
+            std::fs::create_dir(temp.path().join(directory)).unwrap();
+            std::fs::write(temp.path().join(directory).join("kept.txt"), "").unwrap();
+        }
         let set = PathSet {
             reads: ["read.txt".to_owned(), "gone.txt".to_owned()].into(),
             present: ["found.txt".to_owned(), ".".to_owned()].into(),
-            listings: [".".to_owned()].into(),
+            listings: ["listed".to_owned(), "written".to_owned()].into(),
+            written: ["written/new.txt".to_owned()].into(),
             ..PathSet::default()
         };
         std::thread::sleep(std::time::Duration::from_millis(20));
         let started = now(temp.path());
-        assert_eq!(set.changed_since(temp.path(), started), None);
+        let changed = |set: &PathSet| {
+            set.changed_since(temp.path(), started, &[])
+                .map(str::to_owned)
+        };
+        assert_eq!(changed(&set), None);
+        // What the task wrote, and content in a listed directory, keys nothing.
+        std::fs::write(temp.path().join("written/new.txt"), "").unwrap();
+        std::fs::write(temp.path().join("listed/kept.txt"), "after").unwrap();
         std::fs::write(temp.path().join("listed.txt"), "after").unwrap();
-        assert_eq!(set.changed_since(temp.path(), started), None);
+        // Content in a listed directory is not part of the listing.
+        let unlisted = PathSet {
+            listings: ["written".to_owned()].into(),
+            ..set.clone()
+        };
+        assert_eq!(changed(&unlisted), None);
         std::fs::write(temp.path().join("found.txt"), "after").unwrap();
-        assert_eq!(set.changed_since(temp.path(), started), Some("found.txt"));
+        assert_eq!(changed(&set), Some("found.txt".into()));
+        let listings = PathSet {
+            reads: [].into(),
+            present: [].into(),
+            ..set.clone()
+        };
+        assert_eq!(changed(&listings), Some("listed".into()));
+        // A removal, where the task wrote nothing.
+        let removed = tempfile::tempdir().unwrap();
+        std::fs::write(removed.path().join("gone.txt"), "").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // Taken elsewhere, as qk takes it in its cache: taking it changes the
+        // directory it is taken in.
+        let started = now(temp.path());
+        let root = PathSet {
+            listings: [".".to_owned()].into(),
+            ..PathSet::default()
+        };
+        assert_eq!(root.changed_since(removed.path(), started, &[]), None);
+        std::fs::remove_file(removed.path().join("gone.txt")).unwrap();
+        assert_eq!(root.changed_since(removed.path(), started, &[]), Some("."));
     }
 }

@@ -634,7 +634,7 @@ impl Cache {
                         if set.is_empty() {
                             return Err("its trace named no path in the workspace".to_owned());
                         }
-                        match set.changed_since(&workspace.root, started) {
+                        match set.changed_since(&workspace.root, started, &own) {
                             Some(path) => Err(format!("{path} changed while it ran")),
                             None => Ok(set),
                         }
