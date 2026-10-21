@@ -1693,7 +1693,7 @@ dependencies = [
 
 [[package]]
 name = "qk-affected"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "command-group",
@@ -1713,7 +1713,7 @@ dependencies = [
 
 [[package]]
 name = "qk-cache"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1743,7 +1743,7 @@ dependencies = [
 
 [[package]]
 name = "qk-cli"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -1770,7 +1770,7 @@ dependencies = [
 
 [[package]]
 name = "qk-config"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "ignore",
@@ -1783,7 +1783,7 @@ dependencies = [
 
 [[package]]
 name = "qk-executor"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "command-group",
@@ -1800,7 +1800,7 @@ dependencies = [
 
 [[package]]
 name = "qk-graph"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "qk-config",
@@ -1811,7 +1811,7 @@ dependencies = [
 
 [[package]]
 name = "qk-history"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "rusqlite",
@@ -1822,7 +1822,7 @@ dependencies = [
 
 [[package]]
 name = "qk-input-analysis"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "globset",
  "serde",
@@ -1831,7 +1831,7 @@ dependencies = [
 
 [[package]]
 name = "qk-lockfile"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "serde",
@@ -1841,7 +1841,7 @@ dependencies = [
 
 [[package]]
 name = "qk-runner"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1862,7 +1862,7 @@ dependencies = [
 
 [[package]]
 name = "qk-taskgraph"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "qk-config",
