@@ -71,7 +71,7 @@ impl Listener {
 impl Drop for Listener {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        platform::wake(&self.address);
+        platform::wake(&self.address, self.thread.as_ref());
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -196,7 +196,7 @@ mod platform {
     }
 
     /// The listener polls, so it sees the stop on its own.
-    pub fn wake(_: &OsString) {}
+    pub fn wake(_: &OsString, _: Option<&JoinHandle<()>>) {}
 
     pub fn remove(address: &OsString) {
         let _ = std::fs::remove_file(Path::new(address));
@@ -219,6 +219,7 @@ mod platform {
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, OPEN_EXISTING, PIPE_ACCESS_INBOUND, ReadFile,
     };
+    use windows_sys::Win32::System::IO::CancelSynchronousIo;
     use windows_sys::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
         PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
@@ -308,8 +309,16 @@ mod platform {
         Ok((address, thread))
     }
 
-    /// Connects once, so a listener waiting for a connection sees the stop.
-    pub fn wake(address: &OsString) {
+    /// Cancels the listener's blocking connect or read, so it sees the stop,
+    /// and connects once for a connect it had not started yet. A task holding
+    /// its connection open would otherwise keep the listener reading, with
+    /// the pipe too busy to connect to.
+    pub fn wake(address: &OsString, thread: Option<&JoinHandle<()>>) {
+        if let Some(thread) = thread {
+            use std::os::windows::io::AsRawHandle;
+            // SAFETY: the handle is the listener thread's, not yet joined.
+            unsafe { CancelSynchronousIo(thread.as_raw_handle()) };
+        }
         let name = wide(address);
         // SAFETY: `name` is a NUL-terminated wide string that outlives the call.
         let handle = unsafe {

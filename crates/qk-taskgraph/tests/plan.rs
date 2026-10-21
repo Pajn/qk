@@ -73,7 +73,8 @@ fn preserves_requested_configuration_across_dependency_defaults() {
 #[test]
 fn an_empty_default_configuration_names_none() {
     let (_temp, workspace) = workspace(json!({
-        "app": {"targets":{"build":{"defaultConfiguration":"", "configurations":{"prod":{}}}}}
+        "app": {"targets":{"build":{"defaultConfiguration":"", "configurations":{"prod":{}}}}},
+        "web": {"targets":{"build":{"dependsOn":["app:build"], "configurations":{"ci":{}}}}}
     }));
     let build = |request: Request| {
         let graph = TaskGraph::build(&workspace, &[request]).unwrap();
@@ -93,6 +94,17 @@ fn an_empty_default_configuration_names_none() {
         build(Request::parse("app:build:prod").unwrap()),
         ("app:build:prod".into(), Some("prod".into()))
     );
+    // A dependency reached with a configuration it does not have.
+    let graph = TaskGraph::build(&workspace, &[Request::parse("web:build:ci").unwrap()]).unwrap();
+    assert_eq!(
+        graph.tasks["web:build:ci"]
+            .dependencies
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["app:build"]
+    );
+    assert_eq!(graph.tasks["app:build"].configuration, None);
 }
 
 #[test]
