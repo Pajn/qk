@@ -214,13 +214,55 @@ pub enum Confinement {
 pub struct Recording {
     pub program: PathBuf,
     pub directory: PathBuf,
+    /// Whether strace filters the traced calls in the kernel, with seccomp,
+    /// so untraced calls run at full speed. strace 5.3 and later can.
+    pub seccomp: bool,
 }
 
 impl Recording {
+    /// strace on `PATH`, checked to record child processes, with seccomp
+    /// filtering where it supports it. Its trial traces go in `directory`.
+    pub fn probe(directory: &Path) -> anyhow::Result<Self> {
+        let path = std::env::var_os("PATH").context("recording needs strace on PATH")?;
+        let program = std::env::split_paths(&path)
+            .map(|directory| directory.join("strace"))
+            .find(|candidate| candidate.is_file())
+            .context("recording needs strace on PATH; install strace and retry")?
+            .canonicalize()?;
+        let mut failure = String::new();
+        for seccomp in [true, false] {
+            let recording = Self {
+                program: program.clone(),
+                directory: directory.to_owned(),
+                seccomp,
+            };
+            let probe = recording
+                .command(0, "exec /bin/true")
+                .output()
+                .context("cannot probe strace")?;
+            if probe.status.success() {
+                return Ok(recording);
+            }
+            failure = String::from_utf8_lossy(&probe.stderr).into_owned();
+        }
+        anyhow::bail!("strace cannot record child processes: {failure}")
+    }
+
+    /// The same settings, with traces in `directory`.
+    pub fn in_directory(&self, directory: PathBuf) -> Self {
+        Self {
+            directory,
+            ..self.clone()
+        }
+    }
+
     /// The same invocation is used by preflight and actual task commands.
     pub fn command(&self, index: usize, text: &str) -> std::process::Command {
         let mut command = std::process::Command::new(&self.program);
         // No read/write buffers or exec argument/environment arrays.
+        if self.seccomp {
+            command.arg("--seccomp-bpf");
+        }
         command
             .args([
                 "-ff",

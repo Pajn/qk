@@ -4,10 +4,10 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
 
+use crate::{Access, Category, Operation};
 use anyhow::Result;
-use qk_input_analysis::{Access, Category, Operation};
 
-pub(super) fn normalize(path: &Path) -> PathBuf {
+pub fn normalize(path: &Path) -> PathBuf {
     let mut result = PathBuf::new();
     for part in path.components() {
         match part {
@@ -21,7 +21,7 @@ pub(super) fn normalize(path: &Path) -> PathBuf {
     result
 }
 
-pub(super) fn collect(directory: &Path, cwd: &Path) -> Result<(Vec<Access>, Vec<String>)> {
+pub fn collect(directory: &Path, cwd: &Path) -> Result<(Vec<Access>, Vec<String>)> {
     let mut records = Vec::new();
     let mut diagnostics = Vec::new();
     let mut pending = BTreeMap::<u32, (f64, String)>::new();

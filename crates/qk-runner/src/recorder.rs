@@ -13,7 +13,7 @@ use qk_taskgraph::TaskGraph;
 use crate::installs::Installs;
 use crate::sandbox::Watcher;
 
-mod strace;
+use qk_input_analysis::strace;
 
 pub struct Recorder {
     root: PathBuf,
@@ -112,29 +112,13 @@ impl Recorder {
             }
             recorder.watcher = Some(Watcher::start(recorder.directory.path())?);
         } else {
-            let program = find_strace()?;
-            let probe = qk_executor::Recording {
-                program: program.clone(),
-                directory: recorder.directory.path().to_owned(),
-            }
-            .command(0, "exec /bin/true")
-            .output()
-            .context("cannot probe strace")?;
-            if !probe.status.success() {
-                bail!(
-                    "strace cannot record child processes: {}",
-                    String::from_utf8_lossy(&probe.stderr)
-                );
-            }
+            let recording = qk_executor::Recording::probe(recorder.directory.path())?;
             for (index, task) in prepared.values_mut().enumerate() {
                 let directory = recorder.directory.path().join(format!("task-{index}"));
                 std::fs::create_dir(&directory)?;
-                task.recording = Some(qk_executor::Recording {
-                    program: program.clone(),
-                    directory,
-                });
+                task.recording = Some(recording.in_directory(directory));
             }
-            recorder.program = Some(program);
+            recorder.program = Some(recording.program);
         }
         Ok(recorder)
     }
@@ -446,15 +430,4 @@ impl Recorder {
             diagnostics: Vec::new(),
         }
     }
-}
-
-fn find_strace() -> Result<PathBuf> {
-    let path = std::env::var_os("PATH").context("input analysis needs strace on PATH")?;
-    for directory in std::env::split_paths(&path) {
-        let candidate = directory.join("strace");
-        if candidate.is_file() {
-            return Ok(candidate.canonicalize()?);
-        }
-    }
-    bail!("input analysis needs strace on PATH; install strace and retry")
 }
