@@ -33,9 +33,9 @@ pub struct Declared {
     /// Env, runtime and other named values; env and runtime are evaluated only
     /// with a prepared task.
     pub values: BTreeMap<String, Value>,
-    /// The fields each JSON input selects, by file, so that a change can be
-    /// judged by them.
-    pub json_fields: BTreeMap<String, JsonFields>,
+    /// The fields JSON inputs select, by file, so that a change can be judged
+    /// by them: each distinct selection, when several inputs read one file.
+    pub json_fields: BTreeMap<String, Vec<JsonFields>>,
     /// Packages named by `externalDependencies`.
     pub external: BTreeSet<String>,
     /// Whether any `externalDependencies` input is declared, even an empty
@@ -80,7 +80,7 @@ pub struct Inferred {
 }
 
 /// What a `json` input keys of its file.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct JsonFields {
     /// Only these dotted fields, or all of them.
     pub fields: Option<Vec<String>>,
@@ -452,17 +452,19 @@ impl InputChanges<'_> {
     /// Whether `file` is a JSON input whose selected fields are the same at
     /// both revisions.
     fn json_unchanged(&self, inputs: &Resolved, file: &str) -> bool {
-        let (Some(fields), Some((before, after))) =
+        let (Some(selections), Some((before, after))) =
             (inputs.declared.json_fields.get(file), self.json.get(file))
         else {
             return false;
         };
-        let read = |text: &Option<String>| {
-            text.as_deref()
-                .and_then(|text| hash::json_projection(file, text, fields))
-        };
-        let before = read(before);
-        before.is_some() && before == read(after)
+        selections.iter().all(|fields| {
+            let read = |text: &Option<String>| {
+                text.as_deref()
+                    .and_then(|text| hash::json_projection(file, text, fields))
+            };
+            let before = read(before);
+            before.is_some() && before == read(after)
+        })
     }
 }
 
