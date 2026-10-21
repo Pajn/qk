@@ -203,6 +203,11 @@ type Decoded = (Vec<Access>, Option<PathBuf>, Option<u32>);
 
 fn decode(process: u32, call: &str, cwd: &Path) -> Option<Decoded> {
     let (name, tail) = call.split_once('(')?;
+    // A process ending, which strace may write without a result, or a call
+    // strace could not name in a thread the ending cut short: no access.
+    if matches!(name, "exit" | "exit_group" | "???") {
+        return Some((Vec::new(), None, None));
+    }
     let (args, result) = tail.rsplit_once(" = ")?;
     let args = args.trim_end().strip_suffix(')')?;
     let args = arguments(args);
@@ -470,6 +475,11 @@ mod tests {
     #[test]
     fn accepts_padded_exit_records_and_uses_annotated_cwd() {
         assert!(decode(1, "exit_group(0)         = ?", Path::new("/repo")).is_some());
+        // As a process is torn down.
+        for call in ["exit_group(0)", "???()   = ?", "???( <detached ...>"] {
+            let (events, _, _) = decode(1, call, Path::new("/repo")).unwrap();
+            assert!(events.is_empty(), "{call}");
+        }
         let (events, _, _) = decode(
             2,
             "openat(AT_FDCWD</repo/sub>, \"file\", O_RDONLY) = 3</repo/sub/file>",
