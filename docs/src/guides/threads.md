@@ -18,7 +18,7 @@ given a share of it:
 ```
 
 The task gets its share as `QK_THREADS` and through each `env` variable
-naming `{threads}`; `"qk:threads": true` sets only `QK_THREADS`. A tool
+naming `{threads}`, times its `scale` if it has one (see below); `"qk:threads": true` sets only `QK_THREADS`. A tool
 without such a variable reads it in its configuration, as Vitest's
 `maxWorkers: Number(process.env.QK_THREADS) || undefined` does. Under Nx
 neither is set, so the tool keeps its default there. Every other task holds
@@ -60,10 +60,12 @@ than the cores it holds:
 
 The task holds its share of the budget as without `scale`, and is told
 `ceil(share × scale)` threads: a task holding 3 cores starts 6 workers, and one
-running alone on 16 starts 32. The threads every task is told stay within
-`scale` times the budget, so a test's wall-clock budgets, such as a `waitFor`
-or a test timeout, are no less trustworthy than the scale makes them, however
-many tasks run at once. Keep `scale` to targets whose threads wait; for a
+running alone on 16 starts 32. Rounding up adds less than one thread per
+task, so the threads every task is told stay within `scale` times the
+budget plus one for each task running: eight tasks holding a core each with
+`scale: 1.1` are told 2 threads each. A test's wall-clock budgets, such as a
+`waitFor` or a test timeout, are so no less trustworthy than that bound makes
+them, however many tasks run at once. Keep `scale` to targets whose threads wait; for a
 compiler, whose threads keep their cores busy, it only adds contention.
 Vitest reads `VITEST_MAX_WORKERS` itself, and a variable a script sets for
 Nx keeps applying there, since qk sets nothing under Nx.

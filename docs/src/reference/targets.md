@@ -214,7 +214,7 @@ configuration `env` can override it. See
 
 | Field | Type | Default |
 | --- | --- | --- |
-| `env` | object of string values | Empty; `{threads}` expands to the allocated share |
+| `env` | object of string values | Empty; `{threads}` expands to the threads the task is told to start: its share of cores, times `scale`, rounded up |
 | `min` | positive integer | `1` |
 | `max` | positive integer, at least `min` | Run's core budget |
 | `scale` | number above 0, at most 8 | `1`; threads the task is told to start per core it holds, rounded up |
