@@ -49,8 +49,9 @@ pub struct RunResult {
     pub load: Vec<(f32, bool)>,
     /// The most memory, in bytes, the run's tasks used together.
     pub memory: Option<u64>,
-    /// Under `--sandbox`, what each task did beyond its declarations, and
-    /// the tasks that ran unsandboxed with why.
+    /// Under `--sandbox`, what each task did beyond its declarations, the
+    /// tasks that ran unsandboxed and those whose packages went unchecked,
+    /// with why.
     pub sandbox: Option<SandboxResult>,
     pub input_analysis: Option<qk_input_analysis::Report>,
 }
@@ -59,6 +60,7 @@ pub struct SandboxResult {
     pub mode: sandbox::Mode,
     pub findings: BTreeMap<String, sandbox::Findings>,
     pub unsandboxed: BTreeMap<String, String>,
+    pub packages_unchecked: BTreeMap<String, String>,
 }
 
 /// One task of a run, for history and reports.
@@ -910,11 +912,20 @@ pub fn run(
     let sandbox = sandbox
         .map(|sandbox| -> Result<SandboxResult> {
             let mode = sandbox.mode;
-            let (findings, unsandboxed) = sandbox.finish()?;
+            let mut finished = sandbox.finish()?;
+            // How a task would have been held says nothing of one that never
+            // started.
+            finished
+                .unsandboxed
+                .retain(|id, _| records.contains_key(id));
+            finished
+                .packages_unchecked
+                .retain(|id, _| records.contains_key(id));
             Ok(SandboxResult {
                 mode,
-                findings,
-                unsandboxed,
+                findings: finished.findings,
+                unsandboxed: finished.unsandboxed,
+                packages_unchecked: finished.packages_unchecked,
             })
         })
         .transpose()?;

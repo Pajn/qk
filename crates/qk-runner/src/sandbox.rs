@@ -94,9 +94,30 @@ struct Plan {
     read_trees: BTreeSet<PathBuf>,
     /// Its outputs and warm paths.
     write_trees: BTreeSet<PathBuf>,
-    /// Audit: the pnpm store directories of installations its key leaves
-    /// out, whose manifests' reads are reported.
-    unkeyed_packages: Vec<PathBuf>,
+    /// Audit: the pnpm store directories whose manifests' reads are
+    /// reported, as the shorter list Seatbelt takes.
+    packages: Option<Packages>,
+}
+
+/// The store directories whose manifests' reads are reported.
+#[derive(Clone, Debug)]
+enum Packages {
+    /// Those listed, holding only installations the key leaves out.
+    Unkeyed(Vec<PathBuf>),
+    /// Every one but those listed, which hold an installation it counts.
+    AllBut(Vec<PathBuf>),
+}
+
+impl Packages {
+    /// The store's directories as the shorter list, from those holding an
+    /// installation the key counts and those holding only others.
+    fn shorter(keyed: Vec<PathBuf>, unkeyed: Vec<PathBuf>) -> Self {
+        if keyed.len() < unkeyed.len() {
+            Self::AllBut(keyed)
+        } else {
+            Self::Unkeyed(unkeyed)
+        }
+    }
 }
 
 /// A run's sandbox: what each task may do, its profiles or rules, and on
@@ -113,6 +134,8 @@ pub struct Sandbox {
     covered: BTreeMap<String, BTreeSet<String>>,
     /// Tasks that run unsandboxed, and why.
     unsandboxed: Mutex<BTreeMap<String, String>>,
+    /// Audit: tasks sandboxed without reporting installed packages, and why.
+    packages_unchecked: BTreeMap<String, String>,
     watcher: Option<Watcher>,
     directory: PathBuf,
     /// Linux: every `node_modules` directory and dotenv file of the
@@ -124,6 +147,15 @@ pub struct Sandbox {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     rulesets: Mutex<Vec<Ruleset>>,
     created: Mutex<Vec<PathBuf>>,
+}
+
+/// What a sandboxed run found.
+pub struct Finished {
+    pub findings: BTreeMap<String, Findings>,
+    /// Tasks that ran unsandboxed, and why.
+    pub unsandboxed: BTreeMap<String, String>,
+    /// Tasks sandboxed without reporting installed packages, and why.
+    pub packages_unchecked: BTreeMap<String, String>,
 }
 
 /// Tag in each rule's message: the task a report belongs to.
@@ -169,7 +201,8 @@ impl Sandbox {
                     if let Some(installs) = &installs
                         && let Some(keyed) = installs.covered(resolved)
                     {
-                        plan.unkeyed_packages = installs.unkeyed_directories(&keyed);
+                        let (keyed_directories, unkeyed) = installs.directories(&keyed);
+                        plan.packages = Some(Packages::shorter(keyed_directories, unkeyed));
                         covered.insert(id.clone(), keyed);
                     }
                     plans.insert(id.clone(), plan);
@@ -188,6 +221,7 @@ impl Sandbox {
             installs,
             covered,
             unsandboxed: Mutex::new(unsandboxed),
+            packages_unchecked: BTreeMap::new(),
             watcher: None,
             directory,
             shared: Vec::new(),
@@ -197,16 +231,19 @@ impl Sandbox {
         };
         if cfg!(target_os = "macos") {
             for (index, id) in sandbox.plans.keys().enumerate() {
-                let profile = profile(&sandbox.plans[id], id, &sandbox.root, &sandbox.state, mode)?;
                 let path = sandbox.directory.join(format!("{index}.sb"));
-                std::fs::write(&path, profile)?;
+                let plan = &sandbox.plans[id];
                 // A profile Seatbelt cannot take would fail the task; it runs
                 // unsandboxed instead, with the reason.
-                match compiles(&path) {
-                    Ok(()) => {
+                match seatbelt(plan, id, &sandbox.root, &sandbox.state, mode, &path)? {
+                    Fit::Whole => {
                         sandbox.profiles.insert(id.clone(), path);
                     }
-                    Err(reason) => {
+                    Fit::WithoutPackages(reason) => {
+                        sandbox.profiles.insert(id.clone(), path);
+                        sandbox.packages_unchecked.insert(id.clone(), reason);
+                    }
+                    Fit::Rejected(reason) => {
                         sandbox
                             .unsandboxed
                             .lock()
@@ -290,8 +327,9 @@ impl Sandbox {
     }
 
     /// Stops reading the log, once every report so far has arrived, and
-    /// returns each task's findings, and the tasks that ran unsandboxed.
-    pub fn finish(mut self) -> Result<(BTreeMap<String, Findings>, BTreeMap<String, String>)> {
+    /// returns each task's findings, the tasks that ran unsandboxed and those
+    /// whose installed packages went unchecked.
+    pub fn finish(mut self) -> Result<Finished> {
         let reports = match self.watcher.take() {
             Some(watcher) => {
                 let (reports, dropped) = watcher.finish(&self.directory)?;
@@ -319,6 +357,12 @@ impl Sandbox {
                     installs.unkeyed(self.covered.get(&report.task)?, Path::new(&report.path))
                 })
                 .flatten();
+            // Reads in `node_modules` are reported only to find packages: one
+            // the key covers, or a manifest belonging to no package, is not
+            // a finding.
+            if package.is_none() && relative.split('/').any(|part| part == "node_modules") {
+                continue;
+            }
             let entry = findings.entry(report.task).or_default();
             if let Some(package) = package {
                 entry.unkeyed_packages.insert(package);
@@ -331,8 +375,11 @@ impl Sandbox {
             }
         }
         findings.retain(|_, findings| !findings.is_empty());
-        let unsandboxed = std::mem::take(&mut *self.unsandboxed.lock().unwrap());
-        Ok((findings, unsandboxed))
+        Ok(Finished {
+            findings,
+            unsandboxed: std::mem::take(&mut *self.unsandboxed.lock().unwrap()),
+            packages_unchecked: std::mem::take(&mut self.packages_unchecked),
+        })
     }
 }
 
@@ -419,6 +466,46 @@ fn dependencies<'a>(graph: &'a TaskGraph, task: &'a Task) -> Vec<&'a Task> {
         }
     }
     found
+}
+
+/// How much of a task's plan its profile holds it to.
+#[derive(Debug, PartialEq)]
+enum Fit {
+    Whole,
+    /// All but its installed packages, with why.
+    WithoutPackages(String),
+    /// Nothing: Seatbelt rejects its profile, with why.
+    Rejected(String),
+}
+
+/// Writes a task's profile to `path`. Seatbelt caps the paths a profile with
+/// reports may name, and a large store can take them all: a task whose
+/// profile it rejects is still held to its inputs and outputs, without
+/// reporting packages.
+fn seatbelt(
+    plan: &Plan,
+    id: &str,
+    root: &Path,
+    state: &Path,
+    mode: Mode,
+    path: &Path,
+) -> Result<Fit> {
+    std::fs::write(path, profile(plan, id, root, state, mode)?)?;
+    let Err(reason) = compiles(path) else {
+        return Ok(Fit::Whole);
+    };
+    if plan.packages.is_none() {
+        return Ok(Fit::Rejected(reason));
+    }
+    let without = Plan {
+        packages: None,
+        ..plan.clone()
+    };
+    std::fs::write(path, profile(&without, id, root, state, mode)?)?;
+    Ok(match compiles(path) {
+        Ok(()) => Fit::WithoutPackages(reason),
+        Err(reason) => Fit::Rejected(reason),
+    })
 }
 
 /// Whether Seatbelt accepts a profile, or its complaint.
@@ -559,7 +646,7 @@ fn plan(
         read_files,
         read_trees,
         write_trees,
-        unkeyed_packages: Vec::new(),
+        packages: None,
     }
 }
 
@@ -642,15 +729,37 @@ fn profile(plan: &Plan, id: &str, root: &Path, state: &Path, mode: Mode) -> Resu
     // reports, which the log drops when many arrive at once. Seatbelt matches
     // the path a link resolves to, so reads through an importer's
     // `node_modules/<name>` land here too.
-    for chunk in plan.unkeyed_packages.chunks(200) {
-        rules.push(
-            "(allow file-read-data (require-all (regex #\"/package\\.json$\") (require-any"
-                .to_owned(),
-        );
-        for directory in chunk {
-            rules.push(format!("  (subpath {})", text(directory)?));
+    //
+    // Seatbelt caps the paths a profile with reports may name at 64 KiB
+    // together, whatever rules they are spread over, and a store may hold
+    // thousands of directories: the shorter of the two lists is named, those
+    // to report or, after a rule reporting every manifest in the store, those
+    // not to, since a later rule wins.
+    let manifests = |directories: &[PathBuf], report: &str| -> Result<Vec<String>> {
+        let mut rules = Vec::new();
+        for chunk in directories.chunks(200) {
+            rules.push(
+                "(allow file-read-data (require-all (regex #\"/package\\.json$\") (require-any"
+                    .to_owned(),
+            );
+            for directory in chunk {
+                rules.push(format!("  (subpath {})", text(directory)?));
+            }
+            rules.push(format!(")){report})"));
         }
-        rules.push(format!(")) (with report) (with message {tag}))"));
+        Ok(rules)
+    };
+    let report = format!(" (with report) (with message {tag})");
+    match &plan.packages {
+        None => {}
+        Some(Packages::Unkeyed(directories)) => rules.extend(manifests(directories, &report)?),
+        Some(Packages::AllBut(directories)) => {
+            rules.push(format!(
+                "(allow file-read-data (regex #\"^{}/node_modules/\\.pnpm/[^/]+/(.*/)?package\\.json$\"){report})",
+                literal_regex(root_text)
+            ));
+            rules.extend(manifests(directories, "")?);
+        }
     }
     // Directories may be listed; what a listing finds is not read.
     rules.push("(allow file-read-data (vnode-type DIRECTORY))".to_owned());
@@ -665,8 +774,8 @@ fn profile(plan: &Plan, id: &str, root: &Path, state: &Path, mode: Mode) -> Resu
             text(directory)?
         ));
     }
-    // Seatbelt limits each rule's data to 64 KiB, so the paths are spread
-    // over rules of a few hundred each.
+    // The paths are spread over rules of a few hundred each; together they
+    // count toward Seatbelt's cap, as the packages' do.
     for chunk in plan.read_files.chunks(200) {
         rules.push("(allow file-read-data".to_owned());
         for file in chunk {
@@ -969,6 +1078,54 @@ mod tests {
             .collect()
         );
         assert!(linked_targets(&root, &root.join("file.txt")).is_empty());
+    }
+
+    /// Seatbelt rejects a profile naming thousands of store directories with
+    /// reports; the shorter list fits, and a store too large for either still
+    /// holds the task to its inputs and outputs.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fits_a_large_store_into_a_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let store = |range: std::ops::Range<usize>| -> Vec<PathBuf> {
+            range
+                .map(|index| {
+                    root.join(format!(
+                        "node_modules/.pnpm/@scope+package-{index}@1.0.{index}_peer@2.0.0"
+                    ))
+                })
+                .collect()
+        };
+        let plan = |packages| Plan {
+            read_files: vec![root.join("src/index.ts")],
+            packages: Some(packages),
+            ..Plan::default()
+        };
+        let fit = |plan: &Plan| {
+            seatbelt(
+                plan,
+                "app:lint",
+                &root,
+                &root.join(".qk"),
+                Mode::Audit,
+                &root.join("p.sb"),
+            )
+            .unwrap()
+        };
+        let (keyed, unkeyed) = (store(0..100), store(100..2600));
+        assert_eq!(
+            fit(&plan(Packages::shorter(keyed, unkeyed.clone()))),
+            Fit::Whole
+        );
+        assert!(matches!(
+            fit(&plan(Packages::Unkeyed(unkeyed))),
+            Fit::WithoutPackages(reason) if reason.contains("exceeds maximum")
+        ));
+        assert!(matches!(
+            Packages::shorter(store(0..2), store(2..3)),
+            Packages::Unkeyed(directories) if directories.len() == 1
+        ));
     }
 
     #[test]

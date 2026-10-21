@@ -2828,8 +2828,47 @@ fn the_sandbox_reports_and_refuses_what_a_task_does_not_declare() {
     assert!(temp.path().join("dist/out.txt").is_file());
 }
 
+/// Only a task that started is listed as running unsandboxed: one skipped
+/// after its dependency failed never ran.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_sandbox_lists_only_tasks_that_started() {
+    let _audit = AUDIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // A fileset with a field qk does not know cannot be resolved.
+    let unresolved = json!([{"fileset": "{projectRoot}/**/*", "unknownField": true}]);
+    let temp = fixture(json!({
+        "fail": {"command": "exit 1"},
+        "after": {"command": "true", "dependsOn": ["fail"], "inputs": unresolved},
+        "alone": {"command": "true", "inputs": unresolved}
+    }));
+    let report = temp.path().join("sandbox.json");
+    let output = run(
+        temp.path(),
+        &[
+            "run-many",
+            "-t",
+            "after,alone",
+            "--sandbox",
+            "--sandbox-report",
+            report.to_str().unwrap(),
+        ],
+    );
+    assert!(!output.status.success());
+    let findings: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+    let unsandboxed: Vec<&String> = findings["unsandboxed"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .collect();
+    assert_eq!(unsandboxed, ["app:alone"], "{findings}");
+}
+
 /// A workspace with an `app` project in `apps/app` whose targets read a
-/// package only the root installs, laid out as pnpm installs it.
+/// package only the root installs, laid out as pnpm installs it: `fallow` and
+/// `other` from the root, `helper` from `apps/app`, and `stale` left from an
+/// earlier install.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn root_tool_fixture(targets: Value) -> TempDir {
     let temp = TempDir::new().unwrap();
@@ -2850,19 +2889,41 @@ importers:
       fallow:
         specifier: ^1.0.0
         version: 1.0.0
-  apps/app: {}
+      other:
+        specifier: ^1.0.0
+        version: 1.0.0
+  apps/app:
+    dependencies:
+      helper:
+        specifier: ^1.0.0
+        version: 1.0.0
 packages:
   fallow@1.0.0:
     resolution: {integrity: sha512-fallow}
+  helper@1.0.0:
+    resolution: {integrity: sha512-helper}
+  other@1.0.0:
+    resolution: {integrity: sha512-other}
 snapshots:
   fallow@1.0.0: {}
+  helper@1.0.0: {}
+  other@1.0.0: {}
 ",
     )
     .unwrap();
-    let package = root.join("node_modules/.pnpm/fallow@1.0.0/node_modules/fallow");
-    fs::create_dir_all(&package).unwrap();
-    fs::write(package.join("index.js"), "").unwrap();
-    fs::write(package.join("package.json"), "{}").unwrap();
+    for (directory, name) in [
+        ("fallow@1.0.0", "fallow"),
+        ("helper@1.0.0", "helper"),
+        ("other@1.0.0", "other"),
+        ("stale@0.1.0", "stale"),
+    ] {
+        let package = root.join(format!(
+            "node_modules/.pnpm/{directory}/node_modules/{name}"
+        ));
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join("index.js"), "").unwrap();
+        fs::write(package.join("package.json"), "{}").unwrap();
+    }
     std::os::unix::fs::symlink(
         ".pnpm/fallow@1.0.0/node_modules/fallow",
         root.join("node_modules/fallow"),
@@ -2877,7 +2938,11 @@ fn the_sandbox_reports_a_package_read_that_the_key_leaves_out() {
     let _audit = AUDIT
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let read = "cat ../../node_modules/fallow/index.js ../../node_modules/fallow/package.json";
+    // `helper`, which `apps/app` installs, is in either key; `stale` is in
+    // no lockfile snapshot, so it is no package.
+    let read = "cat ../../node_modules/fallow/index.js ../../node_modules/fallow/package.json \
+        ../../node_modules/.pnpm/helper@1.0.0/node_modules/helper/package.json \
+        ../../node_modules/.pnpm/stale@0.1.0/node_modules/stale/package.json";
     let targets = |external: Value| {
         json!({
             // Naming its external dependencies, even none, leaves the root
@@ -2911,6 +2976,12 @@ fn the_sandbox_reports_a_package_read_that_the_key_leaves_out() {
     assert_eq!(
         findings["tasks"]["app:lint"]["unkeyedPackages"],
         json!(["fallow"]),
+        "{findings}"
+    );
+    // Reads of a package the key covers, and of no package, are no finding.
+    assert_eq!(
+        findings["tasks"]["app:lint"]["undeclaredReads"],
+        json!([]),
         "{findings}"
     );
     assert!(findings["tasks"].get("app:build").is_none(), "{findings}");

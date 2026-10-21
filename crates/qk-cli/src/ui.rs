@@ -680,6 +680,28 @@ pub fn sandbox_summary(sandbox: &qk_runner::SandboxResult, tasks: usize, paint: 
     for (id, reason) in &sandbox.unsandboxed {
         lines.push(paint.dim(&format!("  {id} ran unsandboxed: {reason}")));
     }
+    // Many tasks of a large store may share this; the report has each
+    // reason.
+    if !sandbox.packages_unchecked.is_empty() {
+        let ids: Vec<&str> = sandbox
+            .packages_unchecked
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let shown = ids.len().min(SHOWN);
+        let more = if ids.len() > shown {
+            format!(" and {} more", ids.len() - shown)
+        } else {
+            String::new()
+        };
+        lines.push(paint.dim(&format!(
+            "  {} without checking installed packages, as the sandbox rejected {} profile{} naming them: {}{more}",
+            if ids.len() == 1 { "1 task ran".to_owned() } else { format!("{} tasks ran", ids.len()) },
+            if ids.len() == 1 { "its" } else { "their" },
+            if ids.len() == 1 { "" } else { "s" },
+            ids[..shown].join(", "),
+        )));
+    }
     lines.join("\n") + "\n"
 }
 
@@ -1393,6 +1415,7 @@ mod tests {
             .map(|(id, findings)| (id.to_owned(), findings))
             .collect(),
             unsandboxed: BTreeMap::new(),
+            packages_unchecked: BTreeMap::new(),
         };
         let text = sandbox_summary(&sandbox, 3, Paint(false));
         assert_eq!(
@@ -1403,6 +1426,25 @@ mod tests {
   a:lint
     1 installed package read, not in its key; name it in its externalDependencies:
       fallow
+"
+        );
+    }
+
+    #[test]
+    fn counts_the_tasks_whose_packages_went_unchecked_on_one_line() {
+        let sandbox = qk_runner::SandboxResult {
+            mode: qk_runner::sandbox::Mode::Audit,
+            findings: BTreeMap::new(),
+            unsandboxed: BTreeMap::new(),
+            packages_unchecked: (0..10)
+                .map(|index| (format!("lib{index}:lint"), "too long".to_owned()))
+                .collect(),
+        };
+        let text = sandbox_summary(&sandbox, 10, Paint(false));
+        assert_eq!(
+            text,
+            "Sandbox audit: 10 tasks kept to what they declare
+  10 tasks ran without checking installed packages, as the sandbox rejected their profiles naming them: lib0:lint, lib1:lint, lib2:lint, lib3:lint, lib4:lint, lib5:lint, lib6:lint, lib7:lint and 2 more
 "
         );
     }
