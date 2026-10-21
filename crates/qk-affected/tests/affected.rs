@@ -152,12 +152,121 @@ fn ignored_files_affect_nothing() {
     assert_eq!(repo.committed(), Vec::<String>::new());
 }
 
+/// Packages: `a` depends on `b`, which `c` reaches through `a`; `d` names
+/// `b` with a range its version is outside of, which npm resolves instead.
+fn packages() -> Repo {
+    let build = r#""targets": {"build": {"command": "echo build"}}"#;
+    Repo::new(&[
+        (
+            "packages/b/project.json",
+            &format!(r#"{{"name": "b", {build}}}"#),
+        ),
+        (
+            "packages/b/package.json",
+            r#"{"name": "@x/b", "version": "1.0.0"}"#,
+        ),
+        (
+            "packages/a/project.json",
+            &format!(r#"{{"name": "a", {build}}}"#),
+        ),
+        (
+            "packages/a/package.json",
+            r#"{"name": "@x/a", "dependencies": {"@x/b": "workspace:*"}}"#,
+        ),
+        (
+            "packages/c/project.json",
+            &format!(r#"{{"name": "c", "implicitDependencies": ["a"], {build}}}"#),
+        ),
+        (
+            "packages/d/project.json",
+            &format!(r#"{{"name": "d", {build}}}"#),
+        ),
+        (
+            "packages/d/package.json",
+            r#"{"name": "@x/d", "dependencies": {"@x/b": "^2.0.0"}}"#,
+        ),
+    ])
+}
+
 #[test]
-fn deleting_a_project_manifest_affects_every_project() {
+fn deleting_a_project_affects_what_depended_on_it() {
+    let repo = packages();
+    std::fs::remove_dir_all(repo.root.join("packages/b")).unwrap();
+    // `a` still declares it, so its build is the one that breaks; `c`
+    // depends on `a`. `d`'s range never linked to it.
+    assert_eq!(repo.committed(), names(&["a", "c"]));
+}
+
+#[test]
+fn deleting_a_project_nothing_depended_on_affects_nothing_else() {
     let repo = Repo::new(&[]);
     std::fs::remove_dir_all(repo.root.join("tools/tool")).unwrap();
-    // The deleted project is gone from the head workspace.
-    assert_eq!(repo.committed(), names(&["app", "lib"]));
+    assert_eq!(repo.committed(), Vec::<String>::new());
+}
+
+#[test]
+fn deleting_a_project_affects_what_named_it_by_a_pattern() {
+    // A pattern still selecting a project at the head: Nx rejects one
+    // selecting none.
+    let repo = Repo::new(&[
+        (
+            "tools/tool/project.json",
+            r#"{"name": "tool", "implicitDependencies": ["lib*"]}"#,
+        ),
+        ("libs/lib2/project.json", r#"{"name": "lib2"}"#),
+    ]);
+    std::fs::remove_dir_all(repo.root.join("libs/lib")).unwrap();
+    // `app` named it outright, so dropping it changes `app` itself.
+    write(
+        &repo.root,
+        "apps/app/project.json",
+        r#"{"name": "app", "targets": {"tsc": {"executor": "nx:noop", "inputs": ["default", "shared"]}}}"#,
+    );
+    assert_eq!(repo.committed(), names(&["app", "tool"]));
+}
+
+#[test]
+fn moving_a_project_under_its_name_affects_only_it() {
+    let repo = Repo::new(&[]);
+    std::fs::rename(repo.root.join("tools/tool"), repo.root.join("tools/moved")).unwrap();
+    assert_eq!(repo.committed(), names(&["tool"]));
+}
+
+#[test]
+fn a_deleted_project_named_rather_than_compared_affects_every_project() {
+    let repo = Repo::new(&[]);
+    std::fs::remove_dir_all(repo.root.join("tools/tool")).unwrap();
+    commit(&repo.root);
+    let affected = repo.affected(Options {
+        files: vec!["tools/tool/project.json".into()],
+        explicit_files: true,
+        ..Options::default()
+    });
+    assert_eq!(affected, names(&["app", "lib"]));
+}
+
+#[test]
+fn deleting_a_project_affects_the_tasks_reading_what_depended_on_it() {
+    use qk_affected::{TaskCause, TaskReason};
+    let repo = packages();
+    std::fs::remove_dir_all(repo.root.join("packages/b")).unwrap();
+    let tasks = affected_tasks_of(&repo, &["a:build", "c:build", "d:build"]);
+    assert_eq!(tasks.keys().collect::<Vec<_>>(), ["a:build", "c:build"]);
+    // `c:build` reads `a`, which depended on it.
+    for task in ["a:build", "c:build"] {
+        assert!(
+            matches!(
+                &tasks[task],
+                TaskCause::Touched { reasons } if reasons.iter().any(|reason| matches!(
+                    reason,
+                    TaskReason::DependedOnRemoved { file, project }
+                        if file == "packages/b/package.json" && project == "b"
+                ))
+            ),
+            "{task}: {:?}",
+            tasks[task]
+        );
+    }
 }
 
 #[test]

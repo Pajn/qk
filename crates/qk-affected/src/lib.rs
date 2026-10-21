@@ -151,9 +151,12 @@ pub enum Reason {
         target: String,
         input: String,
     },
-    /// A file projects are created from was deleted, which touches every
-    /// project.
-    DeletedManifest { file: String },
+    /// A file projects are created from was deleted and qk could not tell
+    /// what depended on what it removed, which touches every project.
+    DeletedManifest { file: String, detail: String },
+    /// The project depended on a project the change removed, by deleting the
+    /// manifests it was created from.
+    DependedOnRemoved { file: String, project: String },
     /// The lockfile changed under a `projectsAffectedByDependencyUpdates`
     /// setting that does not look inside it.
     DependencyUpdates { file: String, setting: Value },
@@ -202,10 +205,13 @@ impl std::fmt::Display for Reason {
                 f,
                 "{file} changed, matching input {input} of target {target}"
             ),
-            Self::DeletedManifest { file } => write!(
+            Self::DeletedManifest { file, detail } => write!(
                 f,
-                "{file} was deleted, which affects every project because its dependents are unknown"
+                "{file} was deleted, which affects every project because {detail}"
             ),
+            Self::DependedOnRemoved { file, project } => {
+                write!(f, "it depended on {project}, which deleting {file} removes")
+            }
             Self::DependencyUpdates { file, setting } => write!(
                 f,
                 "{file} changed, and projectsAffectedByDependencyUpdates is {setting}"
@@ -1013,21 +1019,153 @@ fn workspace_inputs(
     }
 }
 
-/// A deleted file that projects are created from may have removed a project,
-/// which leaves Nx no way of knowing what depended on it.
+/// A deleted file that projects are created from may have removed a project.
+/// Nx then touches every project, having no way of knowing what depended on
+/// it. qk's graph is made of manifests alone, and a project whose files the
+/// change leaves alone has the same manifests at both revisions, so what
+/// depended on a removed project is what still declares it, read at the
+/// head; a project whose files changed is touched already.
 fn touched_by_deleted_manifests(
     workspace: &Workspace,
     changes: &Changes,
     touches: &mut Touches,
 ) -> Result<()> {
-    let deleted = changes
-        .files
-        .iter()
-        .find(|file| is_project_config(file) && !workspace.root.join(file).exists());
-    if let Some(file) = deleted {
-        touches.all(workspace, Reason::DeletedManifest { file: file.clone() });
+    match removed(workspace, changes, &changes.files) {
+        Removal::None => {}
+        Removal::Unknown { file, detail } => {
+            touches.all(workspace, Reason::DeletedManifest { file, detail });
+        }
+        Removal::Dependents(dependents) => {
+            for (dependent, (file, project)) in dependents {
+                touches.touch(&dependent, Reason::DependedOnRemoved { file, project });
+            }
+        }
     }
     Ok(())
+}
+
+/// What deleting files projects are created from removed from the graph.
+pub(crate) enum Removal {
+    /// No project: none was deleted, or each deleted one is still a project.
+    None,
+    /// qk cannot tell what depended on what was removed.
+    Unknown { file: String, detail: String },
+    /// Each project that depended on a removed one, with the deleted file and
+    /// the removed project's name.
+    Dependents(BTreeMap<String, (String, String)>),
+}
+
+/// What the deleted manifests among `files` removed: the projects at the
+/// base revision that the head no longer has, and what depended on them.
+pub(crate) fn removed(workspace: &Workspace, changes: &Changes, files: &[String]) -> Removal {
+    let deleted: Vec<&String> = files
+        .iter()
+        .filter(|file| is_project_config(file) && !workspace.root.join(file).exists())
+        .collect();
+    let Some(first) = deleted.first() else {
+        return Removal::None;
+    };
+    let unknown = |file: &str, detail: &str| Removal::Unknown {
+        file: file.to_owned(),
+        detail: detail.to_owned(),
+    };
+    if let Some(file) = deleted
+        .iter()
+        .find(|file| PLUGIN_LOCKFILES.contains(&file.as_str()))
+    {
+        return unknown(file, "it configures every project");
+    }
+    let Some(base) = changes.base.as_deref().filter(|_| !changes.whole) else {
+        return unknown(first, "the files were named rather than compared");
+    };
+    let mut dependents = BTreeMap::new();
+    // Each directory once, whichever of its manifests went.
+    let mut directories: BTreeMap<&str, &String> = BTreeMap::new();
+    for file in &deleted {
+        directories
+            .entry(
+                file.rsplit_once('/')
+                    .map_or(".", |(directory, _)| directory),
+            )
+            .or_insert(file);
+    }
+    for (directory, file) in directories {
+        // Its other manifest may still make the project.
+        if workspace
+            .projects
+            .values()
+            .any(|project| project.root == directory)
+        {
+            continue;
+        }
+        let read = |name: &str| {
+            let path = match directory {
+                "." => name.to_owned(),
+                directory => format!("{directory}/{name}"),
+            };
+            changes.read(&path, Some(base))
+        };
+        let (project_json, package_json) = (read("project.json"), read("package.json"));
+        let project = match workspace.project_from_manifests(
+            directory,
+            project_json.as_deref(),
+            package_json.as_deref(),
+        ) {
+            Ok(Some(project)) => project,
+            Ok(None) => return unknown(file, "it could not be read at the base revision"),
+            Err(error) => {
+                return unknown(
+                    file,
+                    &format!("it could not be read at the base revision ({error:#})"),
+                );
+            }
+        };
+        let (removed, package) = project;
+        // Moved, or renamed in its package.json alone: the head graph has it.
+        if workspace.projects.contains_key(&removed.name) {
+            continue;
+        }
+        let mut depended = |dependent: &str| {
+            dependents
+                .entry(dependent.to_owned())
+                .or_insert_with(|| ((*file).clone(), removed.name.clone()));
+        };
+        if workspace.analyzes_package_json()
+            && let Some(package) = &package
+            && let Some(name) = &package.name
+        {
+            for (dependent, manifest) in &workspace.packages {
+                let linked = manifest
+                    .dependency_ranges()
+                    .get(name.as_str())
+                    .is_some_and(|range| {
+                        qk_graph::links(
+                            range,
+                            &workspace.projects[dependent].root,
+                            &removed.root,
+                            package.version.as_deref(),
+                        )
+                    });
+                if linked {
+                    depended(dependent);
+                }
+            }
+        }
+        let mut projects = workspace.projects.clone();
+        projects.insert(removed.name.clone(), removed.clone());
+        for (dependent, project) in &workspace.projects {
+            let implicit = qk_graph::expand_implicit_dependencies(
+                dependent,
+                &project.implicit_dependencies,
+                &projects,
+            );
+            let excluded = format!("!{}", removed.name);
+            if implicit.contains(&removed.name) && !implicit.contains(&excluded) {
+                depended(dependent);
+            }
+        }
+    }
+    Removal::Dependents(dependents)
 }
 
 fn touched_by_lockfile(

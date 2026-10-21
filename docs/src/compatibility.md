@@ -57,6 +57,9 @@ edges off.
   [What changes the key](guides/cache.md#what-changes-the-key).
 - A tracked upstream can adjust the affected base to avoid counting changes
   already landed upstream.
+- Deleting a project's manifests affects the projects that depended on it,
+  read from its manifests at the base revision, where Nx affects every
+  project. See [How changes reach projects](guides/affected.md#how-changes-reach-projects).
 - `qk affected` selects projects unless given `--granularity task`. Nx 24
   selects tasks unless nx.json sets `affected.legacy: true`.
 - Nx's Ultracache keys tasks by recordings Nx Cloud makes, which qk cannot

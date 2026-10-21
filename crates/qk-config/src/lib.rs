@@ -354,6 +354,44 @@ impl Workspace {
 }
 
 impl Workspace {
+    /// The project the manifests of `directory`, workspace-relative, would
+    /// make, given as text rather than read from disk: a project as it was
+    /// at another revision, such as one a change deleted. `None` when
+    /// neither manifest is given.
+    pub fn project_from_manifests(
+        &self,
+        directory: &str,
+        project_json: Option<&str>,
+        package_json: Option<&str>,
+    ) -> Result<Option<(Project, Option<Package>)>> {
+        if project_json.is_none() && package_json.is_none() {
+            return Ok(None);
+        }
+        let project_json = project_json
+            .map(|text| parse_json(text, "project.json"))
+            .transpose()?;
+        let package: Option<Package> = package_json
+            .map(|text| parse_json(text, "package.json"))
+            .transpose()?
+            .map(serde_json::from_value)
+            .transpose()
+            .context("invalid package.json")?;
+        let package_manager = self.package_manager_name().unwrap_or("npm");
+        let project = normalize::project(
+            &normalize::Origin {
+                root: &self.root,
+                directory: &self.root.join(directory),
+                config: &self.config,
+                in_workspaces: package.is_some(),
+                package_manager,
+            },
+            project_json,
+            None,
+            package.as_ref(),
+        )?;
+        Ok(Some((project, package)))
+    }
+
     /// nx.json `pluginsConfig["@nx/js"]`, which Nx's own plugins read.
     fn js_plugin_config(&self) -> Option<&Value> {
         self.config
@@ -461,13 +499,19 @@ pub(crate) fn read_optional_json(path: &Path) -> Result<Option<Value>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
     };
-    let mut value: Value = jsonc_parser::parse_to_serde_value(&text, &Default::default())
-        .with_context(|| format!("cannot parse {}", path.display()))?;
+    parse_json(&text, &path.display().to_string()).map(Some)
+}
+
+/// A JSON object as configuration files hold it: comments allowed, and
+/// `//` keys left out. `label` names it in errors.
+fn parse_json(text: &str, label: &str) -> Result<Value> {
+    let mut value: Value = jsonc_parser::parse_to_serde_value(text, &Default::default())
+        .with_context(|| format!("cannot parse {label}"))?;
     if !value.is_object() {
-        bail!("{} must contain a JSON object", path.display());
+        bail!("{label} must contain a JSON object");
     }
     remove_comment_keys(&mut value);
-    Ok(Some(value))
+    Ok(value)
 }
 
 fn remove_comment_keys(value: &mut Value) {
