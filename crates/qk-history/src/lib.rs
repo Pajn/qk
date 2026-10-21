@@ -69,6 +69,11 @@ pub struct TaskReport {
     /// executed long enough to be sampled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<u64>,
+    /// For a task with `qk:ultracache`, how it was keyed: `{"kind": "hit" |
+    /// "saved", "key"}`, `missed`, `unrecorded` or `failed` with a `reason`.
+    /// In the run's report, not in the history database.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded: Option<Value>,
 }
 
 impl TaskReport {
@@ -749,6 +754,8 @@ impl History {
                             warm: warm.map(|warm| serde_json::from_str(&warm)).transpose()?,
                             threads,
                             memory,
+                            // Not kept in the history database.
+                            recorded: None,
                         },
                     ))
                 },

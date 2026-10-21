@@ -4571,6 +4571,7 @@ fn tasks_wait_for_the_memory_they_are_expected_to_use() {
         warm: None,
         threads: None,
         memory: Some(memory),
+        recorded: None,
     };
     qk_history::History::open(&fixture.root.join(".git/qk/history.db"))
         .unwrap()

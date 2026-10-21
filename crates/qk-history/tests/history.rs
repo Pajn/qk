@@ -26,6 +26,7 @@ fn task(
         warm: None,
         threads: None,
         memory: None,
+        recorded: None,
     }
 }
 

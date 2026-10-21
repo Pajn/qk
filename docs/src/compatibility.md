@@ -59,8 +59,13 @@ edges off.
   already landed upstream.
 - `qk affected` selects projects unless given `--granularity task`. Nx 24
   selects tasks unless nx.json sets `affected.legacy: true`.
-- Inputs marked `"always": true` read as without it: the flag only matters to
-  a hash taken from an Nx Cloud Ultracache recording, which qk does not read.
+- Nx's Ultracache keys tasks by recordings Nx Cloud makes, which qk cannot
+  read. qk's `qk:ultracache` records tasks itself, with `--record` on Linux,
+  and keys them by the files they read, the directories they listed and the
+  paths they looked up, rather than by globs. Nx's target `ultracache` field
+  is read and merged, but has no effect. Inputs marked `"always": true` count
+  for a task keyed by its recordings, and read as without the flag otherwise.
+  See [Keying tasks by what they read](guides/ultracache.md).
 - The run-commands `readyWhen` option accepts readiness text from either
   stdout or stderr.
 - A target's `readyWhen` is checked only while a task in the run waits for

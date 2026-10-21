@@ -8,8 +8,10 @@ mod inputs;
 mod paths;
 pub mod profile;
 mod record;
+pub mod recorded;
 mod remote;
 mod store;
+pub mod ultracache;
 pub mod warm;
 
 use std::collections::BTreeMap;
@@ -77,6 +79,25 @@ pub struct TaskResult {
     /// What warm state did, for targets that keep it.
     pub warm: Option<warm::WarmReport>,
     pub execution: Option<Execution>,
+    /// How a task keyed by its recordings was keyed: see [`recorded`].
+    pub recorded: Option<Recorded>,
+}
+
+/// How a task with `qk:ultracache` was keyed.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum Recorded {
+    /// One of its path sets' keys had a result, restored under that key.
+    Hit { key: String },
+    /// This run recorded it, and stored its result under its new key.
+    Saved { key: String },
+    /// None of its path sets' keys had a result, and this run did not record.
+    Missed,
+    /// It has no path set yet, and this run did not record one: it was keyed
+    /// by its declared inputs.
+    Unrecorded,
+    /// Recording it failed, with why.
+    Failed { reason: String },
 }
 
 impl TaskResult {
@@ -87,6 +108,7 @@ impl TaskResult {
             key: None,
             warm: None,
             execution: None,
+            recorded: None,
         }
     }
 }
@@ -341,6 +363,7 @@ impl Cache {
                 key: keyed,
                 warm: warm_report,
                 execution: None,
+                recorded: None,
             });
         }
         if !self.reuse {
@@ -359,6 +382,7 @@ impl Cache {
                     log,
                     inputs_unchanged,
                 }),
+                recorded: None,
             });
         }
         if let Err(error) = self.initialize() {
@@ -390,26 +414,114 @@ impl Cache {
         {
             return bypass("inputs changed while waiting for another run".into());
         }
+        // Keyed by its recordings, a task's path sets stand in for its
+        // declared file inputs: see `recorded`.
+        let settings = ultracache::Settings::of(task).unwrap_or_else(|error| {
+            qk_executor::status!("qk: {}: qk:ultracache ignored ({error:#})", task.id);
+            None
+        });
+        let warm_outputs = paths::Outputs::from_paths(&warm::kept_paths(&entries)).ok();
+        let own: Vec<&paths::Outputs> = std::iter::once(&outputs)
+            .chain(warm_outputs.as_ref())
+            .collect();
+        let inputs = &keyed.as_ref().expect("a cacheable task is keyed").1;
+        let recordings = settings.and_then(|settings| {
+            let weak = hash::weak_key(
+                snapshot,
+                workspace,
+                graph,
+                task,
+                prepared,
+                inputs,
+                &settings.ignore_reads,
+                cancelled,
+            );
+            match weak {
+                Ok(weak) => Some((recorded::load(&self.root, &weak), weak, settings)),
+                Err(error) => {
+                    qk_executor::status!(
+                        "qk: {}: not keyed by its recordings ({error:#})",
+                        task.id
+                    );
+                    None
+                }
+            }
+        });
+        if let Some((sets, weak, _)) = &recordings {
+            let recorded_profile = profile::span(&task.id, "recorded_restore");
+            for set in sets {
+                let strong = match recorded::strong_key(weak, set, snapshot, &workspace.root, &own)
+                {
+                    Ok(strong) => strong,
+                    Err(error) => {
+                        qk_executor::status!("qk: {}: ignoring a path set ({error:#})", task.id);
+                        continue;
+                    }
+                };
+                match self.restore(
+                    &workspace.root,
+                    &task.id,
+                    &task.dependencies,
+                    &strong,
+                    &outputs,
+                    &prepared.display,
+                    qk_executor::Shown::LocalCache,
+                ) {
+                    Ok(true) => {
+                        recorded::touch(&self.root, weak);
+                        qk_executor::report::event(qk_executor::report::Event::Cache {
+                            id: task.id.clone(),
+                            cached: qk_executor::report::Cached::Hit,
+                        });
+                        return Ok(TaskResult {
+                            outcome: Outcome::Success,
+                            cache: CacheStatus::LocalHit,
+                            key: keyed,
+                            warm: None,
+                            execution: None,
+                            recorded: Some(Recorded::Hit { key: strong }),
+                        });
+                    }
+                    Ok(false) => {}
+                    Err(error) => qk_executor::status!(
+                        "qk: {}: ignoring unusable cache entry ({error})",
+                        task.id
+                    ),
+                }
+            }
+            drop(recorded_profile);
+        }
+        // A task with path sets is keyed by them alone: its declared inputs
+        // are what a recording found wanting.
+        let declared = recordings
+            .as_ref()
+            .is_none_or(|(sets, _, _)| sets.is_empty());
         // An entry fetched ahead of this task is local, but it came from the
         // remote store, and is reported as such.
-        let prefetched = self.remote.as_ref().is_some_and(|remote| {
-            remote.resolved(&key);
-            remote.prefetched(&key)
-        });
+        let prefetched = declared
+            && self.remote.as_ref().is_some_and(|remote| {
+                remote.resolved(&key);
+                remote.prefetched(&key)
+            });
         let local_profile = profile::span(&task.id, "local_restore");
-        match self.restore(
-            &workspace.root,
-            &task.id,
-            &task.dependencies,
-            &key,
-            &outputs,
-            &prepared.display,
-            if prefetched {
-                qk_executor::Shown::RemoteCache
-            } else {
-                qk_executor::Shown::LocalCache
-            },
-        ) {
+        let restored = if declared {
+            self.restore(
+                &workspace.root,
+                &task.id,
+                &task.dependencies,
+                &key,
+                &outputs,
+                &prepared.display,
+                if prefetched {
+                    qk_executor::Shown::RemoteCache
+                } else {
+                    qk_executor::Shown::LocalCache
+                },
+            )
+        } else {
+            Ok(false)
+        };
+        match restored {
             Ok(true) => {
                 let claimed = match &self.remote {
                     Some(remote) if prefetched && remote.claim(&key) => true,
@@ -437,6 +549,7 @@ impl Cache {
                     key: keyed,
                     warm: None,
                     execution: None,
+                    recorded: recordings.as_ref().map(|_| Recorded::Unrecorded),
                 });
             }
             Ok(false) => {}
@@ -445,7 +558,7 @@ impl Cache {
             }
         }
         drop(local_profile);
-        if let Some(remote) = &self.remote {
+        if let Some(remote) = self.remote.as_ref().filter(|_| declared) {
             let fetch_profile = profile::span(&task.id, "remote_fetch");
             let fetched = remote.fetch(&self.root, &key, &task.id, cancelled);
             drop(fetch_profile);
@@ -475,6 +588,7 @@ impl Cache {
                         key: keyed,
                         warm: None,
                         execution: None,
+                        recorded: recordings.as_ref().map(|_| Recorded::Unrecorded),
                     });
                 }
                 Ok(false) => {}
@@ -504,6 +618,25 @@ impl Cache {
             log,
             inputs_unchanged,
         });
+        let mut recorded = recordings.as_ref().map(|(sets, _, _)| {
+            if sets.is_empty() {
+                Recorded::Unrecorded
+            } else {
+                Recorded::Missed
+            }
+        });
+        let path_set = match (&recordings, &prepared.recording) {
+            (Some((_, _, settings)), Some(recording)) => {
+                Some(self.path_set(workspace, recording, prepared, settings, &own))
+            }
+            _ => None,
+        };
+        if let Some(Err(reason)) = &path_set {
+            qk_executor::status!("qk: {}: not recorded ({reason})", task.id);
+            recorded = Some(Recorded::Failed {
+                reason: reason.clone(),
+            });
+        }
         if outcome == Outcome::Success && inputs_unchanged && capture.healthy() {
             let publishing = profile::span(&task.id, "publish");
             let published = self.publish(&workspace.root, &key, &outputs, log.path());
@@ -519,6 +652,24 @@ impl Cache {
                     qk_executor::status!("qk: {}: could not save cache entry ({error})", task.id);
                 }
             }
+            // Its result is kept under the key of what it read, too.
+            if let (Some((_, weak, _)), Some(Ok(set))) = (&recordings, path_set) {
+                let saved = recorded::strong_key(weak, &set, snapshot, &workspace.root, &own)
+                    .and_then(|strong| {
+                        self.publish(&workspace.root, &strong, &outputs, log.path())?;
+                        recorded::save(&self.root, weak, set)?;
+                        Ok(strong)
+                    });
+                recorded = Some(match saved {
+                    Ok(key) => Recorded::Saved { key },
+                    Err(error) => {
+                        qk_executor::status!("qk: {}: recording not saved ({error:#})", task.id);
+                        Recorded::Failed {
+                            reason: format!("{error:#}"),
+                        }
+                    }
+                });
+            }
         }
         Ok(TaskResult {
             outcome,
@@ -526,7 +677,59 @@ impl Cache {
             key: keyed,
             warm: warm_report,
             execution,
+            recorded,
         })
+    }
+
+    /// The path set of a task's recording, or why there is none.
+    fn path_set(
+        &self,
+        workspace: &Workspace,
+        recording: &qk_executor::Recording,
+        prepared: &PreparedTask,
+        settings: &ultracache::Settings,
+        own: &[&paths::Outputs],
+    ) -> std::result::Result<recorded::PathSet, String> {
+        let failed = |error: anyhow::Error| format!("{error:#}");
+        let (accesses, diagnostics) =
+            qk_input_analysis::strace::collect(&recording.directory, &prepared.cwd)
+                .map_err(failed)?;
+        // A partial trace would key the task by part of what it read.
+        if let Some(diagnostic) = diagnostics.first() {
+            return Err(diagnostic.clone());
+        }
+        let canonical = workspace
+            .root
+            .canonicalize()
+            .map_err(|e| failed(e.into()))?;
+        let ignore = settings
+            .ignore_reads
+            .iter()
+            .map(|glob| Pattern::new(glob, false))
+            .collect::<Result<Vec<_>>>()
+            .map_err(failed)?;
+        // qk's own directories, where they lie inside the workspace.
+        let state = [self.root.clone(), worktree_state(&workspace.root)]
+            .iter()
+            .filter_map(|path| {
+                [&workspace.root, &canonical]
+                    .iter()
+                    .find_map(|root| path.strip_prefix(root).ok())
+                    .and_then(|relative| relative.to_str())
+                    .map(|relative| relative.replace('\\', "/"))
+            })
+            .collect();
+        let exclusions = recorded::Exclusions {
+            roots: [&workspace.root, &canonical],
+            outputs: own,
+            ignore,
+            state,
+        };
+        Ok(recorded::PathSet::from_accesses(
+            &accesses,
+            &exclusions,
+            &canonical,
+        ))
     }
 
     /// Rechecks declared inputs for successful and failed executions alike.

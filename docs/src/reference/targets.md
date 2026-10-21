@@ -236,6 +236,21 @@ own, which cannot run inside qk's, such as an Xcode build running Swift
 macros. See [Checking inputs and outputs in a sandbox](../guides/sandbox.md).
 `qk doctor` reports any other value.
 
+## `qk:ultracache`
+
+An object: the task is keyed by what it read when a run with `--record` last
+recorded it, rather than by its declared file inputs, once it has been
+recorded. See [Keying tasks by what they read](../guides/ultracache.md).
+
+| Field | Type | Default |
+| --- | --- | --- |
+| `mode` | `"on"` or `"off"` | `"on"`; `"off"` keys the task by its declared inputs, as without the field |
+| `ignoreReads` | array of workspace globs | Empty; files left out of recordings, whose changes cannot change the result |
+
+Nx's `"warn"` and `"error"` modes are not supported yet. Other fields are
+ignored, as in `qk:threads`, and `qk doctor` reports them. The field does not
+change the task's key; `ignoreReads` changes what its recordings key.
+
 ## `qk:warm`
 
 An object describing reusable scratch state, or an array of them restored and

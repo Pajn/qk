@@ -1,0 +1,6 @@
+# A Linux environment for qk's recording tests: Rust, git and strace.
+FROM docker.io/library/rust:1-bookworm
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends strace git \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /qk

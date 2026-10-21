@@ -229,6 +229,10 @@ struct RunOptions {
     /// Write every sandbox finding to this file as JSON.
     #[arg(long, value_name = "PATH", requires = "sandbox")]
     sandbox_report: Option<PathBuf>,
+    /// Record what each task with `qk:ultracache` reads when it executes,
+    /// and key its result by that; also QK_RECORD=true. Linux only.
+    #[arg(long)]
+    record: bool,
     /// Nx options qk has no use for, accepted so Nx commands run unchanged.
     #[command(flatten)]
     ignored: IgnoredOptions,
@@ -415,6 +419,11 @@ impl RunOptions {
 
     fn skips_cache(&self) -> bool {
         self.skip_cache || env_flag("NX_SKIP_NX_CACHE") || env_flag("NX_DISABLE_NX_CACHE")
+    }
+
+    /// `--record`, else QK_RECORD=true.
+    fn records(&self) -> bool {
+        self.record || env_flag("QK_RECORD")
     }
 
     /// `--nx-bail`, else NX_BAIL=true, as Nx reads it.
@@ -1809,6 +1818,7 @@ fn execute_narrowed(
             }),
             expected: &expected,
             analyze_inputs: options.input_analysis.is_some(),
+            record: options.records(),
             cases,
         },
         cancelled,

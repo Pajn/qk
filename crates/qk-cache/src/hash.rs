@@ -1108,6 +1108,11 @@ impl Snapshot {
         ))
     }
 
+    /// A file a recording read, keyed as an input file is.
+    pub(crate) fn recorded_value(&self, root: &Path, path: &str) -> Result<Value> {
+        self.file_value(root, path)
+    }
+
     fn file_value(&self, root: &Path, path: &str) -> Result<Value> {
         self.file_value_with_links(root, path, &mut BTreeSet::new())
     }
@@ -2635,6 +2640,8 @@ pub fn inputs(
     definition.extra.remove("qk:warm");
     definition.extra.remove("qk:threads");
     definition.extra.remove("metadata");
+    // What a recording keys is the recording's own concern.
+    definition.extra.remove("qk:ultracache");
     let hash = json!({
         "schema":"qk-local-v4", "qk":env!("CARGO_PKG_VERSION"),
         "platform":[std::env::consts::OS, std::env::consts::ARCH], "workspace":snapshot.workspace_prefix,
@@ -2687,6 +2694,57 @@ pub fn fingerprint(
         dependencies,
         cancelled,
     )?)
+}
+
+/// The key of a task keyed by its recordings, before its path set: `inputs`,
+/// the task's key, without its declared file inputs, which a path set
+/// replaces, but with its `"always": true` inputs, which count whatever it
+/// read, and with what `ignoreReads` leaves out of its path sets.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn weak_key(
+    snapshot: &Snapshot,
+    workspace: &Workspace,
+    graph: &TaskGraph,
+    task: &Task,
+    prepared: &PreparedTask,
+    inputs: &Value,
+    ignore_reads: &[String],
+    cancelled: &AtomicBool,
+) -> Result<String> {
+    let mut weak = inputs.clone();
+    let object = weak
+        .as_object_mut()
+        .context("a key's inputs are an object")?;
+    object.remove("files");
+    object.remove("dependencies");
+    if let Some(Value::Object(values)) = object.get_mut("values") {
+        values.retain(|name, _| {
+            !name.starts_with("json:") && !name.starts_with("dependentTasksOutputFiles:")
+        });
+    }
+    let mut always = task.clone();
+    always.definition.inputs = Some(
+        declared_inputs(task)
+            .into_iter()
+            .filter(|input| input.get("always") == Some(&Value::Bool(true)))
+            .collect(),
+    );
+    let dependencies = dependency_keys(snapshot, workspace, graph, &always, cancelled)?;
+    let always = self::inputs(
+        snapshot,
+        workspace,
+        &always,
+        prepared,
+        &dependencies,
+        cancelled,
+    )?;
+    object.insert(
+        "always".into(),
+        json!({"files": always["files"], "values": always["values"], "dependencies": always["dependencies"]}),
+    );
+    object.insert("schema".into(), json!("qk-weak-v1"));
+    object.insert("ignoreReads".into(), json!(ignore_reads));
+    key(&weak)
 }
 
 /// The dependency outputs a task's `dependentTasksOutputFiles` inputs read,
