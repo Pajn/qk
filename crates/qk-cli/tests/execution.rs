@@ -2866,6 +2866,42 @@ fn the_sandbox_lists_only_tasks_that_started() {
     assert_eq!(unsandboxed, ["app:alone"], "{findings}");
 }
 
+/// Seatbelt refuses a sandbox inside one that restricts anything, so a task
+/// that applies its own, as Xcode does for Swift macros, runs again
+/// unsandboxed and is listed with why.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_task_applying_its_own_sandbox_runs_again_unsandboxed() {
+    let _audit = AUDIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = fixture(json!({
+        "build": {"command": "sandbox-exec -p '(version 1)(allow default)' /usr/bin/true && echo built > built.txt"}
+    }));
+    let report = temp.path().join("sandbox.json");
+    let output = success(run(
+        temp.path(),
+        &[
+            "run",
+            "app:build",
+            "--sandbox",
+            "--sandbox-report",
+            report.to_str().unwrap(),
+        ],
+    ));
+    assert!(temp.path().join("built.txt").is_file());
+    let findings: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+    assert!(
+        findings["unsandboxed"]["app:build"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("sandbox of its own")),
+        "{findings}"
+    );
+    assert!(findings["tasks"].get("app:build").is_none(), "{findings}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("running it again unsandboxed"), "{stderr}");
+}
+
 /// A sandboxed run skips the cache, but a task's log is still kept for
 /// `qk show log`, failed or not.
 #[cfg(target_os = "macos")]

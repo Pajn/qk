@@ -280,6 +280,14 @@ impl Sandbox {
         Ok(sandbox)
     }
 
+    /// Records that a task ran unsandboxed after all, and why.
+    pub(crate) fn unconfined(&self, id: &str, reason: &str) {
+        self.unsandboxed
+            .lock()
+            .unwrap()
+            .insert(id.to_owned(), reason.to_owned());
+    }
+
     /// How a task is held to its plan, as it starts; `None` runs it
     /// unsandboxed, with the reason recorded.
     pub fn confine(&self, id: &str) -> Option<qk_executor::Confinement> {
@@ -401,10 +409,13 @@ impl Sandbox {
                 findings.tsconfig_reads.remove(path);
             }
         }
-        findings.retain(|_, findings| !findings.is_empty());
+        let unsandboxed = std::mem::take(&mut *self.unsandboxed.lock().unwrap());
+        // A task run again unsandboxed was audited only until it failed, so it
+        // is listed as unsandboxed rather than with part of its findings.
+        findings.retain(|id, findings| !findings.is_empty() && !unsandboxed.contains_key(id));
         Ok(Finished {
             findings,
-            unsandboxed: std::mem::take(&mut *self.unsandboxed.lock().unwrap()),
+            unsandboxed,
             packages_unchecked: std::mem::take(&mut self.packages_unchecked),
         })
     }
@@ -533,6 +544,32 @@ fn seatbelt(
         Ok(()) => Fit::WithoutPackages(reason),
         Err(reason) => Fit::Rejected(reason),
     })
+}
+
+/// Whether `task` failed because a command in it applied a sandbox of its
+/// own inside the task's, which Seatbelt refuses once the outer one restricts
+/// anything, as every task's profile does.
+pub(crate) fn nested(task: &qk_executor::PreparedTask, result: &qk_cache::TaskResult) -> bool {
+    const REFUSED: &[u8] = b"sandbox_apply: Operation not permitted";
+    if !matches!(task.sandbox, Some(qk_executor::Confinement::Seatbelt(_)))
+        || !matches!(result.outcome, qk_executor::Outcome::Failed(_))
+    {
+        return false;
+    }
+    let Some(execution) = &result.execution else {
+        return false;
+    };
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    let read = qk_executor::read_capture(execution.log.data.as_slice(), |is_stderr, bytes| {
+        if is_stderr { &mut stderr } else { &mut stdout }.extend_from_slice(bytes);
+        Ok(())
+    });
+    read.is_ok()
+        && [stdout, stderr].iter().any(|stream| {
+            stream
+                .windows(REFUSED.len())
+                .any(|window| window == REFUSED)
+        })
 }
 
 /// Whether Seatbelt accepts a profile, or its complaint.

@@ -751,11 +751,31 @@ pub fn run(
                     }
                     let cache = cache.as_ref().filter(|_| narrowed.is_none());
                     let cancelled = cancelled.clone();
+                    let sandbox = sandbox.as_ref();
                     scope.spawn(move || {
                         let result = if let Some(cache) = cache {
                             cache.run(workspace, graph, definition, &task, &cancelled)
                         } else {
-                            execute_retained(&task, &cancelled)
+                            execute_retained(&task, &cancelled).and_then(|result| {
+                                // Seatbelt refuses a sandbox inside one that
+                                // restricts anything, as Xcode applies to
+                                // Swift macros: such a task runs again
+                                // unsandboxed, as one whose profile Seatbelt
+                                // rejects does.
+                                match sandbox {
+                                    Some(sandbox) if sandbox::nested(&task, &result) => {
+                                        let reason = "it applies a sandbox of its own, which cannot run inside qk's";
+                                        qk_executor::status!("qk: {id}: {reason}; running it again unsandboxed");
+                                        sandbox.unconfined(&id, reason);
+                                        let task = qk_executor::PreparedTask {
+                                            sandbox: None,
+                                            ..task.clone()
+                                        };
+                                        execute_retained(&task, &cancelled)
+                                    }
+                                    _ => Ok(result),
+                                }
+                            })
                         };
                         let _ = sender.send((id, result));
                     });
