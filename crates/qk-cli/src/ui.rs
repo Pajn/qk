@@ -915,6 +915,44 @@ fn details(
             ));
         }
     }
+    // Tasks with `qk:ultracache` mode "record", where what their recordings
+    // would have done differs from what their declared inputs did.
+    let shadowed = |kind: &str, hit: bool| -> Vec<&str> {
+        report
+            .tasks
+            .iter()
+            .filter(|task| {
+                task.shadow
+                    .as_ref()
+                    .and_then(|shadow| shadow["kind"].as_str())
+                    == Some(kind)
+                    && matches!(task.cache.as_deref(), Some("local-hit" | "remote-hit")) == hit
+            })
+            .map(|task| task.id.as_str())
+            .collect()
+    };
+    for (tasks, label) in [
+        (
+            shadowed("wouldHit", false),
+            "missed by their inputs, where what they read when recorded had a result",
+        ),
+        (
+            shadowed("wouldMiss", true),
+            "from the cache by their inputs, where what they read when recorded had none",
+        ),
+    ] {
+        if !tasks.is_empty() {
+            lines.push(format!(
+                "{} {}",
+                paint.dim(&format!(
+                    "{} task{} {label}:",
+                    tasks.len(),
+                    if tasks.len() == 1 { "" } else { "s" }
+                )),
+                list(&tasks)
+            ));
+        }
+    }
     let threaded: Vec<String> = report
         .tasks
         .iter()
@@ -1326,6 +1364,7 @@ mod tests {
             memory_wait: Duration::ZERO,
             execution: None,
             recorded: None,
+            shadow: None,
         };
         let report = |id: &str, started: u64, ended: u64, dependencies: &[&str]| TaskReport {
             id: id.into(),
@@ -1345,6 +1384,7 @@ mod tests {
             recorded: None,
             cores: None,
             cpu: None,
+            shadow: None,
         };
         let result = RunResult {
             sandbox: None,

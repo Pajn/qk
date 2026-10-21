@@ -148,6 +148,29 @@ impl PathSet {
         set
     }
 
+    /// Whether every path it names lies within the workspace: relative, and
+    /// never through `..`.
+    pub fn is_relative(&self) -> bool {
+        [
+            &self.reads,
+            &self.listings,
+            &self.present,
+            &self.absent,
+            &self.written,
+        ]
+        .into_iter()
+        .flatten()
+        .all(|path| {
+            !path.is_empty()
+                && Path::new(path).components().all(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::Normal(_) | std::path::Component::CurDir
+                    )
+                })
+        })
+    }
+
     pub fn is_empty(&self) -> bool {
         self.reads.is_empty()
             && self.listings.is_empty()
@@ -340,6 +363,46 @@ pub(crate) fn save(cache: &Path, weak: &str, set: PathSet) -> Result<()> {
     let mut sets = load(cache, weak);
     sets.retain(|kept| kept != &set);
     sets.insert(0, set);
+    keep(cache, weak, sets)
+}
+
+/// The record of `weak`'s path sets as the local cache keeps them, for the
+/// remote store.
+pub(crate) fn record(cache: &Path, weak: &str) -> Option<Vec<u8>> {
+    std::fs::read(location(cache, weak)).ok()
+}
+
+/// Adds the path sets in a record the remote store held for `weak` behind
+/// those kept locally, returning the ones that are new here. A record for
+/// another weak key or another version adds nothing, and neither does a set
+/// naming a path outside the workspace.
+pub(crate) fn merge(cache: &Path, weak: &str, record: &[u8]) -> Result<Vec<PathSet>> {
+    let Some(fetched) = serde_json::from_slice::<Stored>(record)
+        .ok()
+        .filter(|stored| stored.version == 1 && stored.weak == weak)
+    else {
+        return Ok(Vec::new());
+    };
+    let mut sets = load(cache, weak);
+    let mut added = Vec::new();
+    for set in fetched.sets {
+        if sets.len() + added.len() < KEPT
+            && set.is_relative()
+            && !set.is_empty()
+            && !sets.contains(&set)
+            && !added.contains(&set)
+        {
+            added.push(set);
+        }
+    }
+    if !added.is_empty() {
+        sets.extend(added.iter().cloned());
+        keep(cache, weak, sets)?;
+    }
+    Ok(added)
+}
+
+fn keep(cache: &Path, weak: &str, mut sets: Vec<PathSet>) -> Result<()> {
     sets.truncate(KEPT);
     std::fs::create_dir_all(cache.join("pathsets"))?;
     crate::record::publish(
@@ -538,6 +601,45 @@ mod tests {
             .collect();
         assert_eq!(kept, ["5", "9", "8", "7", "6", "4", "3", "2"]);
         assert!(load(temp.path(), "other").is_empty());
+    }
+
+    #[test]
+    fn merges_the_sets_another_machine_recorded_behind_its_own() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("tmp")).unwrap();
+        let set = |read: &str| PathSet {
+            reads: [read.to_owned()].into(),
+            ..PathSet::default()
+        };
+        save(temp.path(), "weak", set("a")).unwrap();
+        let record = |weak: &str, sets: Vec<PathSet>| {
+            serde_json::to_vec(&Stored {
+                version: 1,
+                weak: weak.into(),
+                sets,
+            })
+            .unwrap()
+        };
+        let fetched = record(
+            "weak",
+            vec![set("b"), set("a"), set("../escape"), set("/abs")],
+        );
+        assert_eq!(merge(temp.path(), "weak", &fetched).unwrap(), [set("b")]);
+        assert_eq!(load(temp.path(), "weak"), [set("a"), set("b")]);
+        assert!(merge(temp.path(), "weak", &fetched).unwrap().is_empty());
+        assert!(
+            merge(temp.path(), "weak", &record("other", vec![set("c")]))
+                .unwrap()
+                .is_empty()
+        );
+        let many = (0..10).map(|index| set(&format!("{index}"))).collect();
+        assert_eq!(
+            merge(temp.path(), "weak", &record("weak", many))
+                .unwrap()
+                .len(),
+            6
+        );
+        assert_eq!(load(temp.path(), "weak").len(), KEPT);
     }
 
     #[test]

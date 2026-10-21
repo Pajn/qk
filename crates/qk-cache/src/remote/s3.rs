@@ -86,6 +86,7 @@ impl S3 {
                 self.object("warm", &format!("{identity}/{branch}.json"))
             }
             Object::Blob(hash) => self.object("blobs", hash),
+            Object::PathSets(weak) => self.object("pathsets", &format!("{weak}.json")),
         }
     }
 

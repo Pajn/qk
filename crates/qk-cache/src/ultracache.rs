@@ -7,8 +7,11 @@
 //! so a change to a file the task never read is still a hit, and a new file
 //! in a directory it listed is a miss. See [`crate::recorded`].
 //!
-//! - `mode`: `"on"`, the default once the field is set, or `"off"`. Nx's
-//!   `"warn"` and `"error"` are not supported yet.
+//! - `mode`: `"on"`, the default once the field is set, `"record"` or
+//!   `"off"`. With `"record"`, a task is recorded and its recordings kept and
+//!   shared as with `"on"`, but it is keyed by its declared inputs, and the
+//!   run reports what its recordings would have done. Nx's `"warn"` and
+//!   `"error"` are not supported yet.
 //! - `ignoreReads`: workspace globs left out of the path set, for files whose
 //!   changes cannot change the result.
 
@@ -22,12 +25,22 @@ pub const FIELDS: &[&str] = &["mode", "ignoreReads"];
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Settings {
+    pub mode: Mode,
     pub ignore_reads: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Mode {
+    /// Keyed by its recordings once it has any.
+    #[default]
+    On,
+    /// Recorded, but keyed by its declared inputs.
+    Record,
+}
+
 impl Settings {
-    /// The target's settings when it is keyed by its recordings, `None` when
-    /// it is not: without the field, or with `mode` `"off"`.
+    /// The target's settings when it is recorded, `None` when it is not:
+    /// without the field, or with `mode` `"off"`.
     pub fn of(task: &Task) -> Result<Option<Self>> {
         let Some(value) = task.definition.extra.get("qk:ultracache") else {
             return Ok(None);
@@ -35,14 +48,17 @@ impl Settings {
         let Value::Object(object) = value else {
             bail!("qk:ultracache must be an object");
         };
-        match object.get("mode").map(Value::as_str) {
-            None | Some(Some("on")) => {}
+        let mode = match object.get("mode").map(Value::as_str) {
+            None | Some(Some("on")) => Mode::On,
+            Some(Some("record")) => Mode::Record,
             Some(Some("off")) => return Ok(None),
             Some(Some(mode @ ("warn" | "error"))) => {
-                bail!("qk:ultracache.mode {mode:?} is not supported yet; use \"on\" or \"off\"")
+                bail!(
+                    "qk:ultracache.mode {mode:?} is not supported yet; use \"on\", \"record\" or \"off\""
+                )
             }
-            Some(_) => bail!("qk:ultracache.mode must be \"on\" or \"off\""),
-        }
+            Some(_) => bail!("qk:ultracache.mode must be \"on\", \"record\" or \"off\""),
+        };
         let ignore_reads: Vec<String> = match object.get("ignoreReads") {
             None => Vec::new(),
             Some(value) => serde_json::from_value(value.clone())
@@ -54,7 +70,7 @@ impl Settings {
                 format!("qk:ultracache.ignoreReads has an invalid glob {glob:?}")
             })?;
         }
-        Ok(Some(Self { ignore_reads }))
+        Ok(Some(Self { mode, ignore_reads }))
     }
 }
 
@@ -84,6 +100,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(on.ignore_reads, ["tmp/**"]);
+        assert_eq!(on.mode, Mode::On);
+        let record = Settings::of(&task(serde_json::json!({"mode": "record"})))
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.mode, Mode::Record);
         assert!(
             Settings::of(&task(serde_json::json!({"mode": "off"})))
                 .unwrap()

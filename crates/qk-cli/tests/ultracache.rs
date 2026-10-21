@@ -61,7 +61,7 @@ fn has_strace() -> bool {
     found
 }
 
-fn qk(root: &Path, args: &[&str]) -> Output {
+fn qk(root: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let output = Command::new(env!("CARGO_BIN_EXE_qk"))
         .current_dir(root)
         .arg("--workspace")
@@ -70,6 +70,7 @@ fn qk(root: &Path, args: &[&str]) -> Output {
         .env_remove("NX_CACHE_DIRECTORY")
         .env_remove("QK_RECORD")
         .env_remove("CI")
+        .envs(env.iter().copied())
         .output()
         .unwrap();
     assert!(
@@ -81,23 +82,29 @@ fn qk(root: &Path, args: &[&str]) -> Output {
     output
 }
 
-/// Runs `app:build`, recording it or not, and says where its result came
-/// from, `miss` or `local-hit`, and how its recordings keyed it.
-fn build_keyed(root: &Path, record: bool) -> (String, String) {
+/// Runs `app:build`, recording it or not, and returns its report.
+fn build_report(root: &Path, record: bool, env: &[(&str, &str)]) -> Value {
     let report = root.join(".git/report.json");
     let mut args = vec!["run", "app:build", "--report", report.to_str().unwrap()];
     if record {
         args.push("--record");
     }
-    qk(root, &args);
+    qk(root, &args, env);
     let run: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
-    let task = &run["tasks"][0];
+    run["tasks"][0].clone()
+}
+
+fn kind(value: &Value) -> String {
+    value["kind"].as_str().unwrap_or("none").to_owned()
+}
+
+/// Runs `app:build`, recording it or not, and says where its result came
+/// from, `miss` or `local-hit`, and how its recordings keyed it.
+fn build_keyed(root: &Path, record: bool) -> (String, String) {
+    let task = build_report(root, record, &[]);
     (
         task["cache"].as_str().unwrap().to_owned(),
-        task["recorded"]["kind"]
-            .as_str()
-            .unwrap_or("none")
-            .to_owned(),
+        kind(&task["recorded"]),
     )
 }
 
@@ -203,4 +210,102 @@ fn a_task_that_changes_what_it_read_is_not_recorded() {
         build_keyed(root, false),
         ("local-hit".into(), "unrecorded".into())
     );
+}
+
+#[path = "support/s3.rs"]
+#[allow(dead_code)]
+mod s3;
+
+/// The fixture, sharing a remote store, and the environment of a machine of
+/// its own: its cache directory and the store's credentials.
+fn with_remote(root: &Path, server: &s3::FakeS3) -> impl Fn(&str) -> Vec<(String, String)> {
+    let path = root.join("nx.json");
+    let mut nx: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    nx["s3"] = serde_json::json!({
+        "bucket": "cache", "region": "us-east-1",
+        "endpoint": server.endpoint, "forcePathStyle": true
+    });
+    fs::write(&path, nx.to_string()).unwrap();
+    let root = root.to_owned();
+    move |machine| {
+        vec![
+            (
+                "NX_CACHE_DIRECTORY".into(),
+                root.join(".git").join(machine).to_str().unwrap().into(),
+            ),
+            ("AWS_ACCESS_KEY_ID".into(), "key".into()),
+            ("AWS_SECRET_ACCESS_KEY".into(), "secret".into()),
+        ]
+    }
+}
+
+fn pairs(env: &[(String, String)]) -> Vec<(&str, &str)> {
+    env.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect()
+}
+
+#[test]
+fn recordings_are_shared_through_the_remote_store() {
+    if !has_strace() {
+        return;
+    }
+    let temp = fixture();
+    let root = temp.path();
+    let server = s3::FakeS3::start();
+    let machine = with_remote(root, &server);
+    let (a, b) = (machine("a"), machine("b"));
+    let task = build_report(root, true, &pairs(&a));
+    assert_eq!(
+        (task["cache"].as_str(), kind(&task["recorded"]).as_str()),
+        (Some("miss"), "saved")
+    );
+    // Another machine, with a file the task never read edited: its declared
+    // key misses, and what it read is in the store.
+    write(root, "app/README.md", "# app\n\nStill not read.\n");
+    let task = build_report(root, false, &pairs(&b));
+    assert_eq!(
+        (task["cache"].as_str(), kind(&task["recorded"]).as_str()),
+        (Some("remote-hit"), "hit")
+    );
+    // A read file edited: the shared path set keys it, and misses.
+    write(root, "app/src/main.txt", "changed\n");
+    let task = build_report(root, false, &pairs(&b));
+    assert_eq!(
+        (task["cache"].as_str(), kind(&task["recorded"]).as_str()),
+        (Some("miss"), "missed")
+    );
+}
+
+#[test]
+fn a_task_in_mode_record_is_keyed_by_its_inputs_and_says_what_its_recordings_would_do() {
+    if !has_strace() {
+        return;
+    }
+    let temp = fixture();
+    let root = temp.path();
+    let nx = fs::read_to_string(root.join("nx.json")).unwrap();
+    write(
+        root,
+        "nx.json",
+        &nx.replace(r#""ignoreReads""#, r#""mode": "record", "ignoreReads""#),
+    );
+    let shadow = |record: bool| {
+        let task = build_report(root, record, &[]);
+        (
+            task["cache"].as_str().unwrap().to_owned(),
+            kind(&task["recorded"]),
+            kind(&task["shadow"]),
+        )
+    };
+    let expect = |cache: &str, recorded: &str, shadow: &str| {
+        (cache.to_owned(), recorded.to_owned(), shadow.to_owned())
+    };
+    assert_eq!(shadow(true), expect("miss", "saved", "unrecorded"));
+    assert_eq!(shadow(false), expect("local-hit", "none", "wouldHit"));
+    // Declared inputs miss what the recording would have hit.
+    write(root, "app/README.md", "# app\n\nStill not read.\n");
+    assert_eq!(shadow(false), expect("miss", "none", "wouldHit"));
+    // And the recording misses where the declared key, now kept, hits.
+    write(root, "app/src/main.txt", "changed\n");
+    assert_eq!(shadow(false), expect("miss", "none", "wouldMiss"));
+    assert_eq!(shadow(false), expect("local-hit", "none", "wouldMiss"));
 }

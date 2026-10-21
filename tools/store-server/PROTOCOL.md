@@ -121,6 +121,14 @@ them and commits again.
 Write token. Body: an upload body. The newest save replaces the last. Answer:
 `204`, or `422` as for entries.
 
+### `GET pathsets/<weak>`, `HEAD pathsets/<weak>`, `PUT pathsets/<weak>`
+
+The path sets recorded for a weak key, 64 hex digits, as a record citing no
+blob: `{"version": 1, "weak": <weak>, "sets": […]}`. `GET` answers `200`, a
+pack, or `404`; `HEAD` answers `200` or `404`. `PUT` needs a write token and
+an upload body of at most 16 MiB whose record's `weak` is `<weak>` and which
+cites no blob; the newest save replaces the last. Answer: `204`, or `400`.
+
 ### `GET index[?since=<cursor>]`
 
 Answer: `200`, text, with the header `Qk-Index-Cursor: <cursor>`. Lines are

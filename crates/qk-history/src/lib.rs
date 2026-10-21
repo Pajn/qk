@@ -82,6 +82,11 @@ pub struct TaskReport {
     /// In the run's report, not in the history database.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recorded: Option<Value>,
+    /// For a task with `qk:ultracache` mode `"record"`, what its recordings
+    /// would have done: `{"kind": "wouldHit", "key"}`, `wouldMiss` or
+    /// `unrecorded`. In the run's report, not in the history database.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow: Option<Value>,
 }
 
 impl TaskReport {
@@ -793,6 +798,7 @@ impl History {
                             recorded: None,
                             cores,
                             cpu,
+                            shadow: None,
                         },
                     ))
                 },

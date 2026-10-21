@@ -89,8 +89,44 @@ recording yet. `--report` writes each task's as `recorded`.
   into the directory, an entry another process removed meanwhile cannot be
   told from the task's own writes, and goes unnoticed.
 
-Recordings are kept in the local cache for now: a machine uses the recordings
-it made itself.
+## Sharing recordings
+
+With a [remote cache](remote-cache.md), recordings are shared. A recorded run
+uploads a task's path sets for its weak key, as `pathsets/<weak>`, and its
+result under the key of what it read, beside its result under its declared
+key. A task whose local path sets all miss fetches the path sets the store
+holds for its weak key, adds the new ones to its own, and fetches a result for
+any of their keys the store's index lists. A machine that never records, such
+as one on macOS, is keyed by the recordings CI made.
+
+A local hit makes no request. A local miss makes one for the path sets, and
+fetches only results the store holds. The newest upload of a weak key's path
+sets replaces the last, after merging what the store held when the task was
+looked up; two machines recording one weak key at once can lose one's path
+set, which costs a miss, never a wrong result.
+
+## Trying it out
+
+```json
+"qk:ultracache": { "mode": "record" }
+```
+
+With `"record"`, a task is keyed by its declared inputs, as without the field,
+while a run with `--record` records it and keeps and shares its recordings as
+with `"on"`. Every run also looks the task up by its recordings without
+restoring anything, and says what they would have done: `--report` writes it
+as `shadow`, `wouldHit` with the key that had a result, `wouldMiss`, or
+`unrecorded` without path sets. The run summary names the tasks where the two
+disagree:
+
+- a task its declared inputs missed where its recordings had a result: a
+  change it never read, which `"on"` would have taken from the cache;
+- a task its declared inputs took from the cache where its recordings had
+  none: a change to what it read that its declared inputs leave out, a hit
+  that may be stale, or a recorded result never shared.
+
+Looking a task up by its recordings costs, on a local miss, the request for
+its path sets. Switching to `"on"` keys it by them.
 
 ## Running the tests
 

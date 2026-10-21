@@ -4,7 +4,8 @@
 //!
 //! Objects live under `<cacheKeyPrefix>qk/v4/`, so a bucket shared with Nx never
 //! mixes the two: `entries/<key>` for results, `warm/<task>/<branch>` for warm
-//! records and `blobs/<hash>` for large blobs. Each entry or record is a
+//! records, `pathsets/<weak>` for recorded path sets and `blobs/<hash>` for
+//! large blobs. Each entry or record is a
 //! Zstandard level 3 [`pack`] holding it with the small blobs it cites, so one
 //! request reads or writes it whole; the store's latency is per request, and
 //! an entry can cite thousands of blobs. A blob whose compressed size reaches
@@ -193,6 +194,15 @@ struct Upload {
     /// A warm record to write, with its task identity and branch, instead of
     /// the entry.
     warm: Option<Warm>,
+    /// The path sets to write for a weak key, instead of the entry.
+    #[serde(default)]
+    path_sets: Option<PathSets>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct PathSets {
+    weak: String,
+    record: Vec<u8>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -618,6 +628,15 @@ impl Remote {
         Ok(true)
     }
 
+    /// Whether the store holds the entry for `key`, as its index says, or as
+    /// the store answers when the index could not be read.
+    pub(crate) fn holds(&self, key: &str) -> Result<bool> {
+        match self.known() {
+            Some(known) => Ok(known.keys.contains_key(key)),
+            None => self.store.has(Object::Entry(key)),
+        }
+    }
+
     /// Notes that the local cache held the entry for `key`.
     pub(crate) fn held(&self, key: &str) {
         self.held.lock().unwrap().insert(key.to_owned());
@@ -639,7 +658,38 @@ impl Remote {
             key: key.to_owned(),
             local: root.to_owned(),
             warm: None,
+            path_sets: None,
         });
+    }
+
+    /// Queues the path sets recorded for `weak`, as the local cache keeps
+    /// them now.
+    pub(crate) fn upload_path_sets(self: &Arc<Self>, root: &Path, weak: &str, record: Vec<u8>) {
+        self.enqueue(Upload {
+            key: format!("{weak} path sets"),
+            local: root.to_owned(),
+            warm: None,
+            path_sets: Some(PathSets {
+                weak: weak.to_owned(),
+                record,
+            }),
+        });
+    }
+
+    /// The path sets the store holds for `weak`, as their record, or `None`
+    /// when it holds none for it.
+    pub(crate) fn fetch_path_sets(
+        &self,
+        root: &Path,
+        weak: &str,
+        task: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let received = AtomicU64::new(0);
+        let fetched =
+            self.fetch_pack(root, Object::PathSets(weak), task, &received, &[], |_| {
+                Ok(())
+            })?;
+        Ok(fetched.map(|(record, _, _)| record))
     }
 
     /// Queues a task's warm record for its branch, after the blobs it cites.
@@ -658,6 +708,7 @@ impl Remote {
                 branch: branch.to_owned(),
                 record,
             }),
+            path_sets: None,
         });
     }
 
@@ -846,6 +897,10 @@ impl Remote {
                 branch: &warm.branch,
             };
             return self.put_pack(&job.local, object, &warm.record);
+        }
+        if let Some(sets) = &job.path_sets {
+            // As with warm records, the newest save replaces the last one.
+            return self.put_pack(&job.local, Object::PathSets(&sets.weak), &sets.record);
         }
         let object = Object::Entry(&job.key);
         let exists = self.store.has(object)?;
@@ -1354,6 +1409,7 @@ mod flight_tests {
             Object::Entry(key) => format!("entries/{key}"),
             Object::Warm { identity, branch } => format!("warm/{identity}/{branch}"),
             Object::Blob(hash) => format!("blobs/{hash}"),
+            Object::PathSets(weak) => format!("pathsets/{weak}"),
         }
     }
 

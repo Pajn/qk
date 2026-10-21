@@ -63,6 +63,7 @@ impl Server {
                 format!("warm/{identity}/{branch}")
             }
             Object::Blob(hash) => format!("blobs/{hash}"),
+            Object::PathSets(weak) => format!("pathsets/{weak}"),
         }
     }
 
@@ -189,7 +190,7 @@ impl Store for Server {
                 let (identity, branch) = warm_names(identity, branch);
                 format!("warm={identity}/{branch}")
             }
-            Object::Blob(_) => String::new(),
+            Object::Blob(_) | Object::PathSets(_) => String::new(),
         };
         self.read(&format!("blobs/{hash}?{owner}"), task)
     }

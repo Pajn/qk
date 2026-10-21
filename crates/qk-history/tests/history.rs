@@ -29,6 +29,7 @@ fn task(
         recorded: None,
         cores: None,
         cpu: None,
+        shadow: None,
     }
 }
 

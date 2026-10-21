@@ -20,7 +20,7 @@ header followed by the client's own zstd frames.
 | `src/index-do.ts` | The `Index` Durable Object (SQLite) |
 | `src/auth.ts` | Bearer tokens checked against SHA-256 digests |
 
-R2 holds `entries/<key>` and `warm/<a>/<b>` (upload bodies), `blobs/<hash>`
+R2 holds `entries/<key>`, `warm/<a>/<b>` and `pathsets/<weak>` (upload bodies), `blobs/<hash>`
 (one zstd frame each) and `sessions/<id>` (Bloom filters).
 
 ## Deploying
@@ -82,7 +82,7 @@ pnpm typecheck
 ## Limits
 
 - Upload bodies (`PUT entries/…`, `PUT warm/…`) are read into memory, up to
-  100 MiB; Cloudflare's own request size limit for the account's plan applies
+  100 MiB, and path sets (`PUT pathsets/…`) up to 16 MiB; Cloudflare's own request size limit for the account's plan applies
   first. Blobs stored apart (`PUT blobs/…`) stream to R2.
 - A pack carries inline at most 64 MiB of blobs stored apart; the rest the
   client fetches by hash.

@@ -140,6 +140,9 @@ pub struct TaskRecord {
     pub execution: Option<qk_cache::Execution>,
     /// How a task with `qk:ultracache` was keyed.
     pub recorded: Option<qk_cache::Recorded>,
+    /// What the recordings of a task with `qk:ultracache` mode `"record"`
+    /// would have done.
+    pub shadow: Option<qk_cache::Shadow>,
 }
 
 /// How long a task can be expected to run, and the memory it can be expected
@@ -958,7 +961,8 @@ pub fn run(
                                 }
                             }
                         }
-                        let (outcome, cache, key, warm, execution, recorded) = match result {
+                        let (outcome, cache, key, warm, execution, recorded, shadow) = match result
+                        {
                             Ok(result) => (
                                 result.outcome,
                                 result.cache,
@@ -966,12 +970,14 @@ pub fn run(
                                 result.warm,
                                 result.execution,
                                 result.recorded,
+                                result.shadow,
                             ),
                             Err(error) => {
                                 qk_executor::status!("qk: {id}: {error:#}");
                                 (
                                     Outcome::Failed(1),
                                     qk_cache::CacheStatus::Uncached,
+                                    None,
                                     None,
                                     None,
                                     None,
@@ -1037,6 +1043,7 @@ pub fn run(
                                 cpu: cpu.filter(|millis: &u64| *millis > 0),
                                 execution,
                                 recorded,
+                                shadow,
                             },
                         );
                         outcomes.insert(id, outcome);
