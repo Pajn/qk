@@ -180,3 +180,27 @@ fn a_task_turned_off_or_never_recorded_keeps_its_declared_key() {
     write(root, "app/README.md", "edited again\n");
     assert_eq!(build(root, false), "miss");
 }
+
+#[test]
+fn a_task_that_changes_what_it_read_is_not_recorded() {
+    if !has_strace() {
+        return;
+    }
+    let temp = fixture();
+    let root = temp.path();
+    let project = fs::read_to_string(root.join("app/project.json")).unwrap();
+    write(
+        root,
+        "app/project.json",
+        &project.replace(
+            " > dist/listing.txt",
+            " > dist/listing.txt && touch src/util.txt",
+        ),
+    );
+    // Its result is still kept under its declared key.
+    assert_eq!(build_keyed(root, true), ("miss".into(), "failed".into()));
+    assert_eq!(
+        build_keyed(root, false),
+        ("local-hit".into(), "unrecorded".into())
+    );
+}

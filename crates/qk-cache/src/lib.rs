@@ -608,6 +608,7 @@ impl Cache {
         let capture =
             Capture::new(Some(log.as_file().try_clone()?), prepared.display.clone()).retain_log();
         let restored = before(running);
+        let started = std::time::SystemTime::now();
         let executing = profile::span(&task.id, "execute");
         let outcome = execute_captured(running, cancelled, Some(&capture))?;
         drop(executing);
@@ -626,9 +627,19 @@ impl Cache {
             }
         });
         let path_set = match (&recordings, &prepared.recording) {
-            (Some((_, _, settings)), Some(recording)) => {
-                Some(self.path_set(workspace, recording, prepared, settings, &own))
-            }
+            (Some((_, _, settings)), Some(recording)) => Some(
+                self.path_set(workspace, recording, prepared, settings, &own)
+                    .and_then(|set| {
+                        // Keyed by nothing, a recording would match any workspace.
+                        if set.is_empty() {
+                            return Err("its trace named no path in the workspace".to_owned());
+                        }
+                        match set.changed_since(&workspace.root, started) {
+                            Some(path) => Err(format!("{path} changed while it ran")),
+                            None => Ok(set),
+                        }
+                    }),
+            ),
             _ => None,
         };
         if let Some(Err(reason)) = &path_set {

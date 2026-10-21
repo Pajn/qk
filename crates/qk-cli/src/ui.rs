@@ -899,7 +899,7 @@ fn details(
         ),
         (
             &["failed"],
-            "not recorded, as their traces could not be read",
+            "not recorded, as a recording could not be kept; the run says why",
         ),
     ] {
         let tasks = recorded(kinds);

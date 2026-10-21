@@ -15,6 +15,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
 use qk_input_analysis::{Access, Operation};
@@ -152,6 +153,21 @@ impl PathSet {
             && self.listings.is_empty()
             && self.present.is_empty()
             && self.absent.is_empty()
+    }
+
+    /// A file the task read or found that changed after `started`, when the
+    /// task ran: keyed by its content now, a recording would key the task by
+    /// what it left there rather than by what it read. A directory is keyed
+    /// by its kind or its listing, which leaves out what the task wrote.
+    pub fn changed_since(&self, root: &Path, started: SystemTime) -> Option<&str> {
+        self.reads
+            .iter()
+            .chain(&self.present)
+            .map(String::as_str)
+            .find(|path| {
+                std::fs::symlink_metadata(root.join(path))
+                    .is_ok_and(|metadata| !metadata.is_dir() && changed(&metadata) >= started)
+            })
     }
 
     pub fn digest(&self) -> Result<String> {
@@ -314,6 +330,24 @@ pub(crate) fn strong_key(
     }))
 }
 
+/// When a path's content or metadata last changed: its ctime where there is
+/// one, which a tool resetting the modification time does not hide.
+fn changed(metadata: &std::fs::Metadata) -> SystemTime {
+    let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let ctime = u64::try_from(metadata.ctime()).ok().map(|seconds| {
+            SystemTime::UNIX_EPOCH
+                + Duration::new(seconds, u32::try_from(metadata.ctime_nsec()).unwrap_or(0))
+        });
+        if let Some(ctime) = ctime {
+            return modified.max(ctime);
+        }
+    }
+    modified
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,5 +485,26 @@ mod tests {
             .collect();
         assert_eq!(kept, ["5", "9", "8", "7", "6", "4", "3", "2"]);
         assert!(load(temp.path(), "other").is_empty());
+    }
+
+    #[test]
+    fn finds_what_changed_while_the_task_ran() {
+        let temp = tempfile::tempdir().unwrap();
+        for path in ["read.txt", "found.txt", "listed.txt"] {
+            std::fs::write(temp.path().join(path), "before").unwrap();
+        }
+        let set = PathSet {
+            reads: ["read.txt".to_owned(), "gone.txt".to_owned()].into(),
+            present: ["found.txt".to_owned(), ".".to_owned()].into(),
+            listings: [".".to_owned()].into(),
+            ..PathSet::default()
+        };
+        std::thread::sleep(Duration::from_millis(20));
+        let started = SystemTime::now();
+        assert_eq!(set.changed_since(temp.path(), started), None);
+        std::fs::write(temp.path().join("listed.txt"), "after").unwrap();
+        assert_eq!(set.changed_since(temp.path(), started), None);
+        std::fs::write(temp.path().join("found.txt"), "after").unwrap();
+        assert_eq!(set.changed_since(temp.path(), started), Some("found.txt"));
     }
 }

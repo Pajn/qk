@@ -80,7 +80,10 @@ recording yet. `--report` writes each task's as `recorded`.
   runs is read by its interpreter, and so recorded.
 - Files opened before the task started, and reads through `io_uring`.
 - A recording a task's trace was too large for, or that strace could not
-  decode wholly, is not kept, and the summary says so.
+  decode wholly, is not kept, and the summary says so. Neither is one that
+  names no path in the workspace, which would match any workspace, nor one
+  whose task changed a file it read or found while it ran: keyed by the file
+  as the task left it, it would be keyed by the task's own write.
 
 Recordings are kept in the local cache for now: a machine uses the recordings
 it made itself.
