@@ -2866,6 +2866,72 @@ fn the_sandbox_lists_only_tasks_that_started() {
     assert_eq!(unsandboxed, ["app:alone"], "{findings}");
 }
 
+/// Reads in a project the task's project depends on are grouped by that
+/// project, apart from reads elsewhere outside its inputs.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_sandbox_groups_reads_in_dependency_projects() {
+    let _audit = AUDIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    fs::write(root.join("nx.json"), "{}").unwrap();
+    for (directory, project) in [
+        (
+            "apps/app",
+            json!({"name": "app", "implicitDependencies": ["lib"], "targets": {"lint": {
+                "command": "cat ../../libs/lib/src/a.ts ../../libs/other/b.ts > /dev/null",
+                "options": {"cwd": "apps/app"},
+                "inputs": ["{projectRoot}/**/*"]
+            }}}),
+        ),
+        ("libs/lib", json!({"name": "lib", "targets": {}})),
+        ("libs/other", json!({"name": "other", "targets": {}})),
+    ] {
+        fs::create_dir_all(root.join(directory)).unwrap();
+        fs::write(
+            root.join(directory).join("project.json"),
+            project.to_string(),
+        )
+        .unwrap();
+    }
+    fs::create_dir_all(root.join("libs/lib/src")).unwrap();
+    fs::write(root.join("libs/lib/src/a.ts"), "").unwrap();
+    fs::write(root.join("libs/other/b.ts"), "").unwrap();
+    let report = root.join("sandbox.json");
+    let output = success(run(
+        root,
+        &[
+            "run",
+            "app:lint",
+            "--sandbox",
+            "--sandbox-report",
+            report.to_str().unwrap(),
+        ],
+    ));
+    let findings: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+    let lint = &findings["tasks"]["app:lint"];
+    assert_eq!(
+        lint["dependencyReads"],
+        json!({"lib": ["libs/lib/src/a.ts"]}),
+        "{findings}"
+    );
+    // `other` is no dependency of `app`.
+    assert_eq!(
+        lint["undeclaredReads"],
+        json!(["libs/other/b.ts"]),
+        "{findings}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "read in 1 project it depends on, outside its inputs; ^ inputs key them: lib (1 file)"
+        ),
+        "{stderr}"
+    );
+}
+
 /// Seatbelt refuses a sandbox inside one that restricts anything, so a task
 /// that applies its own, as Xcode does for Swift macros, runs again
 /// unsandboxed and is listed with why.

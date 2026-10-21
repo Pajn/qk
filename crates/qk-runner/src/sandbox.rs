@@ -69,6 +69,10 @@ pub struct Findings {
     pub toolchain_reads: BTreeSet<String>,
     /// TypeScript configuration read outside its key: likely inputs.
     pub tsconfig_reads: BTreeSet<String>,
+    /// Files read outside its key in projects its project depends on, by
+    /// project: what running a dependency's code or following imports into
+    /// it reads. `^` inputs key them.
+    pub dependency_reads: BTreeMap<String, BTreeSet<String>>,
     /// `.git` and dotenv files it read: allowed, but not in the key either.
     pub unkeyed_reads: BTreeSet<String>,
     /// Paths it wrote in the workspace outside its outputs.
@@ -83,6 +87,7 @@ impl Findings {
             && self.manifest_reads.is_empty()
             && self.toolchain_reads.is_empty()
             && self.tsconfig_reads.is_empty()
+            && self.dependency_reads.is_empty()
             && self.unkeyed_reads.is_empty()
             && self.stray_writes.is_empty()
             && self.unkeyed_packages.is_empty()
@@ -143,6 +148,9 @@ pub struct Sandbox {
     /// covers, for telling which package a reported read belongs to.
     installs: Option<Installs>,
     covered: BTreeMap<String, BTreeSet<String>>,
+    /// The projects each task's project depends on, directly or not, by name
+    /// with their roots, innermost first.
+    depended: BTreeMap<String, Vec<(String, String)>>,
     /// Tasks that run unsandboxed, and why.
     unsandboxed: Mutex<BTreeMap<String, String>>,
     /// Audit: tasks sandboxed without reporting installed packages, and why.
@@ -201,6 +209,7 @@ impl Sandbox {
         let installs = (mode == Mode::Audit)
             .then(|| Installs::load(&root))
             .flatten();
+        let depended = depended(workspace, graph)?;
         let mut plans = BTreeMap::new();
         let mut covered = BTreeMap::new();
         let mut unsandboxed = BTreeMap::new();
@@ -231,6 +240,7 @@ impl Sandbox {
             profiles: BTreeMap::new(),
             installs,
             covered,
+            depended,
             unsandboxed: Mutex::new(unsandboxed),
             packages_unchecked: BTreeMap::new(),
             watcher: None,
@@ -382,6 +392,13 @@ impl Sandbox {
             if package.is_none() && relative.split('/').any(|part| part == "node_modules") {
                 continue;
             }
+            let dependency = self
+                .depended
+                .get(&report.task)
+                .into_iter()
+                .flatten()
+                .find(|(_, root)| relative.starts_with(&format!("{root}/")))
+                .map(|(project, _)| project.clone());
             let entry = findings.entry(report.task).or_default();
             if let Some(package) = package {
                 entry.unkeyed_packages.insert(package);
@@ -389,6 +406,15 @@ impl Sandbox {
                 entry.stray_writes.insert(relative);
             } else if unkeyed(&relative) {
                 entry.unkeyed_reads.insert(relative);
+            } else if let Some(project) = dependency
+                && qk_input_analysis::ReadKind::of(&relative)
+                    == qk_input_analysis::ReadKind::Content
+            {
+                entry
+                    .dependency_reads
+                    .entry(project)
+                    .or_default()
+                    .insert(relative);
             } else {
                 match qk_input_analysis::ReadKind::of(&relative) {
                     qk_input_analysis::ReadKind::Manifest => &mut entry.manifest_reads,
@@ -407,7 +433,13 @@ impl Sandbox {
                 findings.manifest_reads.remove(path);
                 findings.toolchain_reads.remove(path);
                 findings.tsconfig_reads.remove(path);
+                for paths in findings.dependency_reads.values_mut() {
+                    paths.remove(path);
+                }
             }
+            findings
+                .dependency_reads
+                .retain(|_, paths| !paths.is_empty());
         }
         let unsandboxed = std::mem::take(&mut *self.unsandboxed.lock().unwrap());
         // A task run again unsandboxed was audited only until it failed, so it
@@ -544,6 +576,44 @@ fn seatbelt(
         Ok(()) => Fit::WithoutPackages(reason),
         Err(reason) => Fit::Rejected(reason),
     })
+}
+
+/// For each task, the projects its project depends on, directly or not, with
+/// their roots, the deepest root first so a nested project is found before
+/// the one around it. The workspace's root project is left out: every path
+/// is beneath it.
+fn depended(
+    workspace: &Workspace,
+    graph: &TaskGraph,
+) -> Result<BTreeMap<String, Vec<(String, String)>>> {
+    let projects = qk_graph::ProjectGraph::build(workspace)?;
+    let mut by_project: BTreeMap<&str, Vec<(String, String)>> = BTreeMap::new();
+    let mut found = BTreeMap::new();
+    for (id, task) in &graph.tasks {
+        let roots = by_project.entry(task.project.as_str()).or_insert_with(|| {
+            let mut seen = BTreeSet::new();
+            let mut pending = vec![task.project.as_str()];
+            while let Some(project) = pending.pop() {
+                for dependency in projects.dependencies.get(project).into_iter().flatten() {
+                    if dependency.target != task.project && seen.insert(dependency.target.as_str())
+                    {
+                        pending.push(&dependency.target);
+                    }
+                }
+            }
+            let mut roots: Vec<(String, String)> = seen
+                .into_iter()
+                .filter_map(|name| {
+                    let root = &workspace.projects.get(name)?.root;
+                    (root != "." && !root.is_empty()).then(|| (name.to_owned(), root.clone()))
+                })
+                .collect();
+            roots.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+            roots
+        });
+        found.insert(id.clone(), roots.clone());
+    }
+    Ok(found)
 }
 
 /// Whether `task` failed because a command in it applied a sandbox of its

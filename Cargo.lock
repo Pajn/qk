@@ -1848,6 +1848,7 @@ dependencies = [
  "qk-cache",
  "qk-config",
  "qk-executor",
+ "qk-graph",
  "qk-input-analysis",
  "qk-lockfile",
  "qk-taskgraph",

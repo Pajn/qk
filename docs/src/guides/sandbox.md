@@ -57,6 +57,15 @@ Other paths read by many tasks, at least a quarter of those with findings,
 are listed once at the top, under `read by many tasks, likely by the tools
 their commands start through`.
 
+Files read in a project the task's project depends on, directly or not, are
+grouped by that project, as `dependencyReads` in `--sandbox-report`, with how
+many each in the summary. They are what running a dependency's code, or a
+tool following imports into it, reads. Inputs prefixed with `^`, such as
+`^production`, key them. Whether one changes the task's result depends on the
+tool: a test running a dependency's code depends on it, while a lint rule
+that only follows imports to look for a cycle through the linted file cannot
+find one through a project that cannot import back.
+
 ### Installed packages outside the key
 
 With a pnpm v9 lockfile qk reads, a task's key counts the packages its

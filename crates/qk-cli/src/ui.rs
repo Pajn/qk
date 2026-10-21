@@ -591,6 +591,7 @@ pub fn sandbox_summary(sandbox: &qk_runner::SandboxResult, tasks: usize, paint: 
             !reads.is_empty()
                 || !packages.is_empty()
                 || !findings.tsconfig_reads.is_empty()
+                || !findings.dependency_reads.is_empty()
                 || !findings.unkeyed_reads.is_empty()
                 || !findings.stray_writes.is_empty()
         })
@@ -684,6 +685,32 @@ pub fn sandbox_summary(sandbox: &qk_runner::SandboxResult, tasks: usize, paint: 
     for (id, findings, reads, packages) in own {
         lines.push(format!("  {id}"));
         list("read outside its inputs", &reads, &mut lines, "    ");
+        // Each project's files are named in the report; here, how many.
+        if !findings.dependency_reads.is_empty() {
+            let projects: Vec<String> = findings
+                .dependency_reads
+                .iter()
+                .map(|(project, paths)| {
+                    format!(
+                        "{project} ({} file{})",
+                        paths.len(),
+                        if paths.len() == 1 { "" } else { "s" }
+                    )
+                })
+                .collect();
+            let shown = projects.len().min(SHOWN);
+            let more = if projects.len() > shown {
+                format!(", and {} more", projects.len() - shown)
+            } else {
+                String::new()
+            };
+            lines.push(format!(
+                "    read in {} project{} it depends on, outside its inputs; ^ inputs key them: {}{more}",
+                projects.len(),
+                if projects.len() == 1 { "" } else { "s" },
+                projects[..shown].join(", "),
+            ));
+        }
         list(
             "TypeScript configuration read outside its inputs, likely inputs",
             &findings.tsconfig_reads.iter().collect::<Vec<_>>(),
