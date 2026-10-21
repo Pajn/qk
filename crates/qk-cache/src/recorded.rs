@@ -15,7 +15,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use anyhow::Result;
 use qk_input_analysis::{Access, Operation};
@@ -330,6 +330,17 @@ pub(crate) fn strong_key(
     }))
 }
 
+/// Now, as the file system in `directory` stamps a file it writes. The kernel
+/// stamps files from a clock coarser than the system's, so a file written
+/// just after a [`SystemTime::now`] can bear an earlier time; this one is
+/// never later than the stamp of a file written after it.
+pub(crate) fn now(directory: &Path) -> SystemTime {
+    tempfile::NamedTempFile::new_in(directory)
+        .and_then(|file| file.as_file().metadata())
+        .map(|metadata| changed(&metadata))
+        .unwrap_or_else(|_| SystemTime::now())
+}
+
 /// When a path's content or metadata last changed: its ctime where there is
 /// one, which a tool resetting the modification time does not hide.
 fn changed(metadata: &std::fs::Metadata) -> SystemTime {
@@ -339,7 +350,10 @@ fn changed(metadata: &std::fs::Metadata) -> SystemTime {
         use std::os::unix::fs::MetadataExt;
         let ctime = u64::try_from(metadata.ctime()).ok().map(|seconds| {
             SystemTime::UNIX_EPOCH
-                + Duration::new(seconds, u32::try_from(metadata.ctime_nsec()).unwrap_or(0))
+                + std::time::Duration::new(
+                    seconds,
+                    u32::try_from(metadata.ctime_nsec()).unwrap_or(0),
+                )
         });
         if let Some(ctime) = ctime {
             return modified.max(ctime);
@@ -499,8 +513,8 @@ mod tests {
             listings: [".".to_owned()].into(),
             ..PathSet::default()
         };
-        std::thread::sleep(Duration::from_millis(20));
-        let started = SystemTime::now();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let started = now(temp.path());
         assert_eq!(set.changed_since(temp.path(), started), None);
         std::fs::write(temp.path().join("listed.txt"), "after").unwrap();
         assert_eq!(set.changed_since(temp.path(), started), None);

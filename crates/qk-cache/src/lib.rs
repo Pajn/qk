@@ -608,7 +608,7 @@ impl Cache {
         let capture =
             Capture::new(Some(log.as_file().try_clone()?), prepared.display.clone()).retain_log();
         let restored = before(running);
-        let started = std::time::SystemTime::now();
+        let started = recorded::now(&self.root.join("tmp"));
         let executing = profile::span(&task.id, "execute");
         let outcome = execute_captured(running, cancelled, Some(&capture))?;
         drop(executing);
