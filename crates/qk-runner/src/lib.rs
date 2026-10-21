@@ -690,6 +690,18 @@ pub fn run(
                     if let Some(sandbox) = &sandbox {
                         task.sandbox = sandbox.confine(&id);
                     }
+                    // As in Nx, a task learns the address of the one server it
+                    // waited for that reported one.
+                    let urls: Vec<String> = graph.tasks[&id]
+                        .dependencies
+                        .iter()
+                        .filter(|dependency| waits(&id, dependency))
+                        .filter_map(|dependency| prepared[dependency].verdict.url())
+                        .collect();
+                    if let [url] = &urls[..] {
+                        task.execution
+                            .insert(qk_executor::ready_signal::URL_ENV.into(), url.into());
+                    }
                     let sender = sender.clone();
                     if serving.contains(&id) {
                         report::event(Event::StartedContinuous { id: id.clone() });
@@ -699,9 +711,29 @@ pub fn run(
                         let stop = Arc::new(AtomicBool::new(false));
                         stops.insert(id.clone(), stop.clone());
                         let waited = waiters.contains_key(id.as_str());
+                        // A `signal` check's socket, kept while the task runs,
+                        // or why it could not be opened.
+                        let mut listener = None;
+                        let mut unheard = None;
+                        if waited
+                            && let Some(Ok(check)) = &task.ready_check
+                            && check.probe == qk_executor::readiness::Probe::Signal
+                        {
+                            match qk_executor::ready_signal::Listener::start(
+                                &id,
+                                task.verdict.clone(),
+                            ) {
+                                Ok(started) => {
+                                    task.execution.extend(started.env(&id));
+                                    listener = Some(started);
+                                }
+                                Err(error) => unheard = Some(format!("{error:#}")),
+                            }
+                        }
                         // As in Nx, an invalid readyWhen fails the task only
                         // when something in the run waits for it.
                         let invalid = match &task.ready_check {
+                            _ if unheard.is_some() => unheard,
                             Some(Err(reason)) if waited => Some(reason.clone()),
                             Some(Err(reason)) => {
                                 qk_executor::status!(
@@ -728,6 +760,7 @@ pub fn run(
                             _ => None,
                         };
                         scope.spawn(move || {
+                            let _listener = listener;
                             let result = match invalid {
                                 Some(reason) => Err(anyhow::anyhow!(reason)),
                                 None => execute(&task, &stop).map(qk_cache::TaskResult::uncached),

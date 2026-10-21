@@ -753,6 +753,39 @@ fn a_changed_json_input_affects_the_task() {
     assert_eq!(tasks.keys().collect::<Vec<_>>(), ["app:build"]);
 }
 
+/// Two inputs selecting different fields of one file: a change to either's
+/// fields affects the task.
+#[test]
+fn json_inputs_sharing_a_file_each_affect_the_task() {
+    let repo = Repo::new(&[
+        (
+            "nx.json",
+            r#"{"targetDefaults": {"build": {"command": "echo build", "inputs": [
+                {"json": "{projectRoot}/meta.json", "fields": ["version"]},
+                {"json": "{projectRoot}/meta.json", "fields": ["build"]}]}}}"#,
+        ),
+        (
+            "apps/app/project.json",
+            r#"{"name": "app", "targets": {"build": {}}}"#,
+        ),
+        ("apps/app/meta.json", r#"{"version": 1, "build": "a"}"#),
+    ]);
+    write(
+        &repo.root,
+        "apps/app/meta.json",
+        r#"{"version": 1, "build": "a", "comment": "x"}"#,
+    );
+    assert!(affected_tasks_of(&repo, &["app:build"]).is_empty());
+    for changed in [
+        r#"{"version": 2, "build": "a"}"#,
+        r#"{"version": 1, "build": "b"}"#,
+    ] {
+        write(&repo.root, "apps/app/meta.json", changed);
+        let tasks = affected_tasks_of(&repo, &["app:build"]);
+        assert_eq!(tasks.keys().collect::<Vec<_>>(), ["app:build"], "{changed}");
+    }
+}
+
 /// A path whose glob characters are escaped names one file, which is read
 /// without its escapes.
 #[test]

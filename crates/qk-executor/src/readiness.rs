@@ -7,6 +7,7 @@
 //! the run-commands task itself as ready.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::Path;
 use std::process::Stdio;
@@ -20,7 +21,8 @@ use serde_json::{Map, Value};
 
 use crate::tokens::{closing_brace, env_name, fallbacks};
 
-const DEFAULT_TIMEOUT_MS: u64 = 60_000;
+// As in Nx 24.0.0-rc.0, long enough for a dev server's cold first build.
+pub const DEFAULT_TIMEOUT_MS: u64 = 600_000;
 /// As in Nx 24.0.0-beta.3, probes retry every 250 ms unless `interval` says
 /// otherwise.
 const DEFAULT_INTERVAL_MS: u64 = 250;
@@ -35,10 +37,18 @@ pub enum Probe {
     Url(String),
     /// A TCP connection, to loopback unless a host is named.
     Port { port: u16, host: Option<String> },
-    /// A shell command at the workspace root exiting with 0.
-    Command(String),
+    /// A shell command at the workspace root exiting with 0, run with the
+    /// environment the task's commands run with and its options as JSON in
+    /// `NX_TASK_OPTIONS`, as in Nx 24.
+    Command {
+        command: String,
+        env: BTreeMap<OsString, OsString>,
+    },
     /// Every one of these appearing in the task's output.
     LogMatches(Vec<String>),
+    /// The task reporting it is ready, through the socket qk names to it in
+    /// `NX_READY_SIGNAL_SOCKET`, as `@nx/devkit`'s `signalTaskReady` does.
+    Signal,
 }
 
 /// A resolved `readyWhen`.
@@ -58,7 +68,7 @@ impl ReadyCheck {
                 host: Some(host),
             } => format!("port {host}:{port}"),
             Probe::Port { port, host: None } => format!("port {port}"),
-            Probe::Command(command) => format!("command \"{command}\""),
+            Probe::Command { command, .. } => format!("command \"{command}\""),
             Probe::LogMatches(matches) => format!(
                 "logMatches {}",
                 matches
@@ -67,6 +77,7 @@ impl ReadyCheck {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            Probe::Signal => "signal".into(),
         }
     }
 }
@@ -81,6 +92,8 @@ const FAILED: u8 = 2;
 pub struct Verdict {
     state: AtomicU8,
     reason: Mutex<Option<String>>,
+    /// The address a `signal` check's task reported with its readiness.
+    url: Mutex<Option<String>>,
 }
 
 impl Verdict {
@@ -102,6 +115,26 @@ impl Verdict {
         let _ = self
             .state
             .compare_exchange(PENDING, READY, Ordering::SeqCst, Ordering::SeqCst);
+    }
+
+    /// Ready, with the address the task reported, unless it was decided
+    /// already.
+    pub fn set_ready_at(&self, url: Option<String>) {
+        let mut stored = self.url.lock().unwrap();
+        if self
+            .state
+            .compare_exchange(PENDING, READY, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            *stored = url;
+        }
+    }
+
+    /// The address the task reported once ready, if it reported one.
+    pub fn url(&self) -> Option<String> {
+        self.is_ready()
+            .then(|| self.url.lock().unwrap().clone())
+            .flatten()
     }
 
     /// Records a failure unless the check was decided already, and says
@@ -152,18 +185,19 @@ pub fn resolve(task: &str, ready_when: &Value, scope: &Scope) -> Result<Option<R
     for key in config.keys() {
         if !matches!(
             key.as_str(),
-            "url" | "port" | "host" | "command" | "logMatches" | "timeout" | "interval"
+            "url" | "port" | "host" | "command" | "logMatches" | "signal" | "timeout" | "interval"
         ) {
             return Err(invalid(format!("unknown key \"{key}\"")));
         }
     }
-    let present: Vec<&str> = ["url", "port", "command", "logMatches"]
+    let present: Vec<&str> = ["url", "port", "command", "logMatches", "signal"]
         .into_iter()
         .filter(|key| config.get(*key).is_some_and(|value| !value.is_null()))
         .collect();
     let [kind] = present[..] else {
         return Err(invalid(
-            "expected exactly one of \"url\", \"port\", \"command\", \"logMatches\"".into(),
+            "expected exactly one of \"url\", \"port\", \"command\", \"logMatches\", \"signal\""
+                .into(),
         ));
     };
     let duration = |key: &str, default: Option<u64>| -> Result<Option<Duration>> {
@@ -237,8 +271,20 @@ pub fn resolve(task: &str, ready_when: &Value, scope: &Scope) -> Result<Option<R
                 }
             }
         }
+        "signal" => {
+            if config["signal"] != Value::Bool(true) {
+                return Err(invalid("\"signal\" must be true".into()));
+            }
+            if config.get("interval").is_some_and(|value| !value.is_null()) {
+                return Err(invalid("\"interval\" is not used by \"signal\"".into()));
+            }
+            Probe::Signal
+        }
         "command" => match text("command", Field::Text)? {
-            Some(Value::String(command)) if !command.is_empty() => Probe::Command(command),
+            Some(Value::String(command)) if !command.is_empty() => Probe::Command {
+                command,
+                env: BTreeMap::new(),
+            },
             _ => return Err(invalid("\"command\" must be a non-empty string".into())),
         },
         _ => {
@@ -387,8 +433,9 @@ pub fn wait(task: &str, check: &ReadyCheck, root: &Path, verdict: &Verdict, stop
         let ready = match &check.probe {
             Probe::Url(url) => probe_url(url, deadline),
             Probe::Port { port, host } => probe_port(*port, host.as_deref(), deadline),
-            Probe::Command(command) => probe_command(command, root, deadline, stop),
-            Probe::LogMatches(_) => false,
+            Probe::Command { command, env } => probe_command(command, env, root, deadline, stop),
+            // Decided by the task's output, or by its signal.
+            Probe::LogMatches(_) | Probe::Signal => false,
         };
         if ready {
             verdict.set_ready();
@@ -396,16 +443,19 @@ pub fn wait(task: &str, check: &ReadyCheck, root: &Path, verdict: &Verdict, stop
         }
         let now = Instant::now();
         if now >= deadline {
+            let longer = (check.timeout.as_millis() as u64 * 2).min(MAX_DURATION_MS);
             verdict.fail(format!(
-                "Task \"{task}\" did not become ready within {}ms (readyWhen: {}). To change \
-                 the check, set \"readyWhen\" on the target or in \"targetDefaults\" in nx.json, \
-                 or set it to null to turn it off.",
+                "Task \"{task}\" did not become ready within {}ms (readyWhen: {}). If it needs \
+                 longer, set \"timeout\": {longer} in the target's \"readyWhen\", as \
+                 {{ \"...\": true, \"timeout\": {longer} }} to keep a check a target default \
+                 sets. To change the check, set \"readyWhen\" on the target or in \
+                 \"targetDefaults\" in nx.json, or set it to null to turn it off.",
                 check.timeout.as_millis(),
                 check.describe()
             ));
             return;
         }
-        let pause = if matches!(check.probe, Probe::LogMatches(_)) {
+        let pause = if matches!(check.probe, Probe::LogMatches(_) | Probe::Signal) {
             deadline - now
         } else {
             check.interval.min(deadline - now)
@@ -576,10 +626,20 @@ fn probe_url(url: &str, deadline: Instant) -> bool {
     }
 }
 
-/// Runs the command through the shell at the workspace root. On timeout or
-/// stop, its whole process group is killed.
-fn probe_command(command: &str, root: &Path, deadline: Instant, stop: &AtomicBool) -> bool {
+/// Runs the command through the shell at the workspace root, with `env` in
+/// place of qk's own when it has any. On timeout or stop, its whole process
+/// group is killed.
+fn probe_command(
+    command: &str,
+    env: &BTreeMap<OsString, OsString>,
+    root: &Path,
+    deadline: Instant,
+    stop: &AtomicBool,
+) -> bool {
     let mut shell = crate::shell(command);
+    if !env.is_empty() {
+        shell.env_clear().envs(env);
+    }
     shell
         .current_dir(root)
         .stdin(Stdio::null())
@@ -720,7 +780,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(check.probe, Probe::Url("http://localhost:5001/app".into()));
-        assert_eq!(check.timeout, Duration::from_millis(60_000));
+        assert_eq!(check.timeout, Duration::from_millis(600_000));
         assert_eq!(check.interval, Duration::from_millis(250));
         let check = resolved(
             json!({"port": "{options.port}"}),
@@ -783,6 +843,36 @@ mod tests {
     }
 
     #[test]
+    fn a_signal_waits_for_the_task_to_report() {
+        let check = resolved(json!({"signal": true, "timeout": 5}), json!({}), &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (check.probe.clone(), check.describe()),
+            (Probe::Signal, "signal".into())
+        );
+        // Nothing but the task's own report makes it ready.
+        let verdict = Verdict::default();
+        wait(
+            "app:serve",
+            &check,
+            Path::new("."),
+            &verdict,
+            &AtomicBool::new(false),
+        );
+        assert!(
+            verdict
+                .failure()
+                .unwrap()
+                .contains("did not become ready within 5ms")
+        );
+        let verdict = Verdict::default();
+        verdict.set_ready_at(Some("http://localhost:1/".into()));
+        verdict.set_ready_at(Some("http://localhost:2/".into()));
+        assert_eq!(verdict.url().as_deref(), Some("http://localhost:1/"));
+    }
+
+    #[test]
     fn invalid_settings_say_why() {
         for (ready_when, reason) in [
             (json!({}), "exactly one of"),
@@ -794,6 +884,13 @@ mod tests {
             (json!({"logMatches": []}), "logMatches"),
             (json!({"port": 1, "timeout": 0}), "\"timeout\""),
             (json!({"port": 1, "other": 0}), "unknown key"),
+            (json!({"signal": false}), "\"signal\" must be true"),
+            (json!({"signal": "yes"}), "\"signal\" must be true"),
+            (
+                json!({"signal": true, "interval": 10}),
+                "not used by \"signal\"",
+            ),
+            (json!({"signal": true, "port": 1}), "exactly one of"),
             (
                 json!({"url": "http://{options.a ?? x ?? options.b}"}),
                 "can never be used",
@@ -844,7 +941,10 @@ mod tests {
         drop(listener);
         let verdict = Verdict::default();
         let check = ReadyCheck {
-            probe: Probe::Command("exit 1".into()),
+            probe: Probe::Command {
+                command: "exit 1".into(),
+                env: BTreeMap::new(),
+            },
             timeout: Duration::from_millis(100),
             interval: Duration::from_millis(10),
         };
@@ -857,7 +957,10 @@ mod tests {
         );
         let verdict = Verdict::default();
         let check = ReadyCheck {
-            probe: Probe::Command("exit 0".into()),
+            probe: Probe::Command {
+                command: "exit 0".into(),
+                env: BTreeMap::new(),
+            },
             ..check
         };
         wait("app:serve", &check, Path::new("."), &verdict, &stop);

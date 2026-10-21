@@ -1226,6 +1226,61 @@ fn show_target_includes_qk_fields() {
     assert_eq!(target["qk:threads"], json!({"max": 2}), "{target}");
 }
 
+/// `show target` shows a target's `readyWhen` with the timeout it gets, as
+/// Nx 24 does: one spreading a target default's keeps its check.
+#[test]
+fn show_target_includes_ready_when() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    std::fs::write(
+        root.join("nx.json"),
+        json!({"targetDefaults": {"serve": {"continuous": true, "readyWhen": {"port": 3000}}}})
+            .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("project.json"),
+        json!({"name":"app","targets":{
+            "serve":{"command":"true","readyWhen":{"...": true, "timeout": 1_200_000}},
+            "dev":{"command":"true","continuous":true,"readyWhen":{"url":"http://localhost:4200"}},
+            "preview":{"command":"true","continuous":true,"readyWhen":null},
+            "build":{"command":"true"}
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let target = |name: &str| {
+        successful_json(
+            isolated_command(env!("CARGO_BIN_EXE_qk"))
+                .current_dir(root)
+                .args(["show", "target", &format!("app:{name}"), "--json"])
+                .output()
+                .unwrap(),
+        )
+    };
+    assert_eq!(
+        target("serve")["readyWhen"],
+        json!({"port": 3000, "timeout": 1_200_000})
+    );
+    assert_eq!(
+        target("dev")["readyWhen"],
+        json!({"url": "http://localhost:4200", "timeout": 600_000})
+    );
+    assert_eq!(target("preview")["readyWhen"], Value::Null);
+    assert!(
+        target("preview")
+            .as_object()
+            .unwrap()
+            .contains_key("readyWhen")
+    );
+    assert!(
+        !target("build")
+            .as_object()
+            .unwrap()
+            .contains_key("readyWhen")
+    );
+}
+
 /// `qk:sandbox` is read only as a boolean; doctor names any other value.
 #[test]
 fn doctor_names_a_qk_sandbox_that_is_not_a_boolean() {

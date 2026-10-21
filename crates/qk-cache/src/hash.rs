@@ -1484,7 +1484,7 @@ struct Resolver<'a> {
     selected: BTreeSet<String>,
     scopes: BTreeMap<FileScope, FileSelection>,
     values: BTreeMap<String, Value>,
-    json_fields: BTreeMap<String, JsonFields>,
+    json_fields: BTreeMap<String, Vec<JsonFields>>,
     json_globs: Vec<JsonGlob>,
     named_stack: Vec<(String, String)>,
     /// Dependency named inputs already expanded for `^` inputs.
@@ -2029,24 +2029,45 @@ impl<'a> Resolver<'a> {
         Ok(())
     }
 
-    /// One file a `json` input selects, keyed by its fields.
+    /// One file a `json` input selects, keyed by its fields. Several inputs
+    /// may select different fields of one file: each counts, as in Nx since
+    /// 24.0.0-rc.0, where one used to replace the other.
     fn json_file(&mut self, path: String, fields: &JsonFields) -> Result<()> {
-        let value = match std::fs::read_to_string(self.workspace.root.join(&path)) {
-            Ok(text) => match json_projection(&path, &text, fields) {
-                Some(value) => value,
-                // As in Nx, a file it cannot read is keyed by its content,
-                // without the field filters. Nx reads no YAML, so it keys a
-                // YAML file whole where qk keys its fields.
-                None => {
-                    self.selected.insert(path);
-                    return Ok(());
-                }
-            },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Value::Null,
+        let text = match std::fs::read_to_string(self.workspace.root.join(&path)) {
+            Ok(text) => Some(text),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(error.into()),
         };
+        let mut selections = self.json_fields.get(&path).cloned().unwrap_or_default();
+        if !selections.contains(fields) {
+            selections.push(fields.clone());
+            // In one order, whichever input came first.
+            selections.sort();
+        }
+        let mut values = Vec::new();
+        for selection in &selections {
+            values.push(match &text {
+                Some(text) => match json_projection(&path, text, selection) {
+                    Some(value) => value,
+                    // As in Nx, a file it cannot read is keyed by its content,
+                    // without the field filters. Nx reads no YAML, so it keys
+                    // a YAML file whole where qk keys its fields.
+                    None => {
+                        self.selected.insert(path);
+                        return Ok(());
+                    }
+                },
+                None => Value::Null,
+            });
+        }
+        // One selection keys its fields as before; several, each in turn.
+        let value = if values.len() == 1 {
+            values.remove(0)
+        } else {
+            Value::Array(values)
+        };
         self.values.insert(format!("json:{path}"), value);
-        self.json_fields.insert(path, fields.clone());
+        self.json_fields.insert(path, selections);
         Ok(())
     }
 

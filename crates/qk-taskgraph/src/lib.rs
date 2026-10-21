@@ -320,7 +320,11 @@ impl Builder<'_> {
                 request.project,
                 request.target
             ),
-            _ => target.default_configuration.clone(),
+            // As in Nx, an empty default names no configuration.
+            _ => target
+                .default_configuration
+                .clone()
+                .filter(|name| !name.is_empty()),
         };
         let id = format!(
             "{}:{}{}",

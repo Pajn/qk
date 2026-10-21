@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 use qk_config::Workspace;
 use qk_taskgraph::{Request, TaskGraph};
-use serde_json::json;
+use serde_json::{Value, json};
 
 #[derive(Args)]
 pub struct Options {
@@ -157,6 +157,17 @@ pub fn show(workspace: &Workspace, options: Options) -> Result<i32> {
             }
             if let Some(default) = &definition.default_configuration {
                 data["defaultConfiguration"] = json!(default);
+            }
+            // As in Nx 24, with the timeout it gets when it sets none, or
+            // `null` where it turns off a check a default sets.
+            if let Some(ready_when) = definition.extra.get("readyWhen") {
+                let mut ready_when = ready_when.clone();
+                if let Value::Object(check) = &mut ready_when {
+                    check
+                        .entry("timeout")
+                        .or_insert(json!(qk_executor::readiness::DEFAULT_TIMEOUT_MS));
+                }
+                data["readyWhen"] = ready_when;
             }
             // qk's own fields, such as `qk:warm` and `qk:threads`, as configured.
             for (key, value) in &definition.extra {

@@ -68,6 +68,45 @@ fn preserves_requested_configuration_across_dependency_defaults() {
     }
 }
 
+/// An empty default configuration names none, so the task runs with its base
+/// options, whether no configuration is asked for or one it does not have.
+#[test]
+fn an_empty_default_configuration_names_none() {
+    let (_temp, workspace) = workspace(json!({
+        "app": {"targets":{"build":{"defaultConfiguration":"", "configurations":{"prod":{}}}}},
+        "web": {"targets":{"build":{"dependsOn":["app:build"], "configurations":{"ci":{}}}}}
+    }));
+    let build = |request: Request| {
+        let graph = TaskGraph::build(&workspace, &[request]).unwrap();
+        let (id, task) = graph.tasks.into_iter().next().unwrap();
+        (id, task.configuration)
+    };
+    assert_eq!(
+        build(Request::parse("app:build").unwrap()),
+        ("app:build".into(), None)
+    );
+    // As `run-many -c ci` asks a target without that configuration: the
+    // configuration is asked for, but not one the target has.
+    let mut missing = Request::parse("app:build").unwrap();
+    missing.requested_configuration = Some("ci".into());
+    assert_eq!(build(missing).0, "app:build");
+    assert_eq!(
+        build(Request::parse("app:build:prod").unwrap()),
+        ("app:build:prod".into(), Some("prod".into()))
+    );
+    // A dependency reached with a configuration it does not have.
+    let graph = TaskGraph::build(&workspace, &[Request::parse("web:build:ci").unwrap()]).unwrap();
+    assert_eq!(
+        graph.tasks["web:build:ci"]
+            .dependencies
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["app:build"]
+    );
+    assert_eq!(graph.tasks["app:build"].configuration, None);
+}
+
 #[test]
 fn shared_tasks_collect_dependencies_from_each_requested_configuration() {
     let (_temp, workspace) = workspace(json!({

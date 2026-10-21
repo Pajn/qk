@@ -174,16 +174,23 @@ with `waitFor: "ready"`, as in Nx 24. It is an object with exactly one of:
 | --- | --- |
 | `url` | An HTTP or HTTPS `GET` gets a status from 200 to 403. Redirects are not followed, and a 404 at the root path is tried again at `/index.html`. |
 | `port` | A TCP connection succeeds, to `127.0.0.1` or `::1` unless `host` names the address. |
-| `command` | The command, run through the shell at the workspace root, exits with 0. |
+| `command` | The command, run through the shell at the workspace root with the environment the target's commands run with, exits with 0. It reads the options they run with, as JSON, from `NX_TASK_OPTIONS`. |
 | `logMatches` | Every one of a string or an array of strings has appeared in the output, terminal control sequences left out. |
+| `signal` | `true`: the task reports that it is ready, as `@nx/devkit`'s `signalTaskReady` does, through the socket qk names in `NX_READY_SIGNAL_SOCKET`. |
 
-`timeout`, 60000 by default, is how many milliseconds the check may take, and
+`timeout`, 600000 (ten minutes) by default, is how many milliseconds the check may take, and
 `interval`, 250 by default, how long a `url`, `port` or `command` check waits
 between tries. Strings may use `{workspaceRoot}`, `{projectRoot}`,
 `{projectName}`, `{options.name}`, `{env.NAME}` and `??` fallbacks, read from
 the options, arguments and environment the task runs with. `null` turns off
 a check set by a target default. See
 [Continuous tasks](../guides/running-tasks.md#continuous-tasks-and-readiness).
+
+A `signal` takes no `interval`. The address a signalling task reports is
+passed on in `NX_READY_URL` to a task that waited for it, when it is the only
+server that task waited for to report one. A task that sets
+`NX_USE_V8_SERIALIZER=true` signals in Node's own serialization, which qk
+cannot read.
 
 This is unrelated to the run-commands `readyWhen` option, which marks the
 task itself as ready.

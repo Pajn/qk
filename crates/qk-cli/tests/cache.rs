@@ -4988,6 +4988,25 @@ fn json_inputs_key_only_the_fields_they_select() {
     assert!(!hit(&fixture, &fixture.root));
 }
 
+/// Two inputs selecting different fields of one file both count: a change
+/// to either's fields misses, as Nx keys them since 24.0.0-rc.0.
+#[test]
+fn json_inputs_sharing_a_file_each_count() {
+    let fixture = with_lib(json!([
+        {"json": "{projectRoot}/meta.json", "fields": ["version"]},
+        {"json": "{projectRoot}/meta.json", "fields": ["build"]}
+    ]));
+    let meta = |text: &str| fs::write(fixture.root.join("meta.json"), text).unwrap();
+    meta(r#"{"version": 1, "build": "a", "name": "a"}"#);
+    assert!(!hit(&fixture, &fixture.root));
+    meta(r#"{"version": 1, "build": "a", "name": "b"}"#);
+    assert!(hit(&fixture, &fixture.root));
+    meta(r#"{"version": 2, "build": "a", "name": "b"}"#);
+    assert!(!hit(&fixture, &fixture.root));
+    meta(r#"{"version": 2, "build": "b", "name": "b"}"#);
+    assert!(!hit(&fixture, &fixture.root));
+}
+
 #[test]
 fn json_inputs_key_the_fields_of_yaml_files() {
     let fixture = with_lib(json!([
