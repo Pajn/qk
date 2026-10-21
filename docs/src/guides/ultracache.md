@@ -83,7 +83,11 @@ recording yet. `--report` writes each task's as `recorded`.
   decode wholly, is not kept, and the summary says so. Neither is one that
   names no path in the workspace, which would match any workspace, nor one
   whose task changed a file it read or found while it ran: keyed by the file
-  as the task left it, it would be keyed by the task's own write.
+  as the task left it, it would be keyed by the task's own write. Nor is one
+  where an entry in a directory it listed was added, renamed or removed while
+  it ran, other than what it wrote there and its outputs. Where the task wrote
+  into the directory, an entry another process removed meanwhile cannot be
+  told from the task's own writes, and goes unnoticed.
 
 Recordings are kept in the local cache for now: a machine uses the recordings
 it made itself.
