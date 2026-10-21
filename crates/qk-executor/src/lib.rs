@@ -8,6 +8,7 @@ mod process;
 #[cfg(unix)]
 mod pty;
 pub mod readiness;
+pub mod ready_signal;
 pub mod report;
 pub mod tokens;
 
@@ -465,6 +466,11 @@ fn task_environment(
         "NX_TERMINAL_OUTPUT_PATH",
         "NX_STREAM_OUTPUT",
         "NX_PREFIX_OUTPUT",
+        // A task of an enclosing run's signal socket and reported address:
+        // a task here neither signals for that task nor reads its address.
+        ready_signal::SOCKET_ENV,
+        ready_signal::TASK_ENV,
+        ready_signal::URL_ENV,
     ] {
         env.remove(std::ffi::OsStr::new(name));
     }

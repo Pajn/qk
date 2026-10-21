@@ -993,6 +993,81 @@ fn tasks_waiting_for_ready_start_once_the_check_passes() {
     assert!(!run(temp.path(), &["run", "app:e2e"]).status.success());
 }
 
+/// A server that signals readiness, as `@nx/devkit`'s `signalTaskReady`
+/// does, releases the tasks waiting for it, which get the address it
+/// reported in `NX_READY_URL`. An enclosing run's signal variables reach no
+/// task.
+#[test]
+fn a_signal_check_releases_the_tasks_waiting_for_it() {
+    if Command::new("node").arg("--version").output().is_err() {
+        eprintln!("skipped: needs node");
+        return;
+    }
+    let temp = fixture(json!({
+        "serve": {
+            "continuous": true,
+            "readyWhen": {"signal": true, "timeout": 10000},
+            "command": "node serve.js"
+        },
+        "e2e": {
+            "command": "node e2e.js",
+            "dependsOn": [{"target": "serve", "waitFor": "ready"}]
+        },
+        "plain": {"command": "node plain.js"}
+    }));
+    // Signals once it has written its marker, framed as Nx frames it.
+    fs::write(
+        temp.path().join("serve.js"),
+        r#"setTimeout(() => {
+  require('fs').writeFileSync('marker', '');
+  const socket = require('net').connect(process.env.NX_READY_SIGNAL_SOCKET, () => {
+    const payload = Buffer.from(JSON.stringify({
+      type: 'TO_PARENT_FROM_CHILDREN',
+      message: { type: 'nx-ready-signal:ready', taskId: process.env.NX_READY_SIGNAL_TASK, url: 'http://localhost:4321/' },
+    }));
+    socket.write('NX_MSG_' + payload.length + ':');
+    socket.write(payload);
+  });
+}, 300);
+setInterval(() => {}, 1000);
+"#,
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("e2e.js"),
+        r#"if (!require('fs').existsSync('marker')) { console.error('not ready'); process.exit(1); }
+if (process.env.NX_READY_URL !== 'http://localhost:4321/') { console.error('url ' + process.env.NX_READY_URL); process.exit(1); }
+"#,
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("plain.js"),
+        r#"for (const name of ['NX_READY_SIGNAL_SOCKET', 'NX_READY_SIGNAL_TASK', 'NX_READY_URL']) {
+  if (process.env[name] !== undefined) { console.error(name + ' inherited'); process.exit(1); }
+}
+"#,
+    )
+    .unwrap();
+    let output = command(temp.path(), &["run", "app:e2e"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("waiting for app:serve to be ready (signal)"),
+        "{stderr}"
+    );
+    let output = command(temp.path(), &["run", "app:plain"])
+        .env("NX_READY_SIGNAL_SOCKET", "elsewhere")
+        .env("NX_READY_SIGNAL_TASK", "other:serve")
+        .env("NX_READY_URL", "http://localhost:1/")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// As in Nx 24, a command check runs with the server's environment, and reads
 /// the options it runs with from `NX_TASK_OPTIONS`.
 #[cfg(unix)]

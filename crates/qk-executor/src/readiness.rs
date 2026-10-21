@@ -46,6 +46,9 @@ pub enum Probe {
     },
     /// Every one of these appearing in the task's output.
     LogMatches(Vec<String>),
+    /// The task reporting it is ready, through the socket qk names to it in
+    /// `NX_READY_SIGNAL_SOCKET`, as `@nx/devkit`'s `signalTaskReady` does.
+    Signal,
 }
 
 /// A resolved `readyWhen`.
@@ -74,6 +77,7 @@ impl ReadyCheck {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            Probe::Signal => "signal".into(),
         }
     }
 }
@@ -88,6 +92,8 @@ const FAILED: u8 = 2;
 pub struct Verdict {
     state: AtomicU8,
     reason: Mutex<Option<String>>,
+    /// The address a `signal` check's task reported with its readiness.
+    url: Mutex<Option<String>>,
 }
 
 impl Verdict {
@@ -109,6 +115,26 @@ impl Verdict {
         let _ = self
             .state
             .compare_exchange(PENDING, READY, Ordering::SeqCst, Ordering::SeqCst);
+    }
+
+    /// Ready, with the address the task reported, unless it was decided
+    /// already.
+    pub fn set_ready_at(&self, url: Option<String>) {
+        let mut stored = self.url.lock().unwrap();
+        if self
+            .state
+            .compare_exchange(PENDING, READY, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            *stored = url;
+        }
+    }
+
+    /// The address the task reported once ready, if it reported one.
+    pub fn url(&self) -> Option<String> {
+        self.is_ready()
+            .then(|| self.url.lock().unwrap().clone())
+            .flatten()
     }
 
     /// Records a failure unless the check was decided already, and says
@@ -159,18 +185,19 @@ pub fn resolve(task: &str, ready_when: &Value, scope: &Scope) -> Result<Option<R
     for key in config.keys() {
         if !matches!(
             key.as_str(),
-            "url" | "port" | "host" | "command" | "logMatches" | "timeout" | "interval"
+            "url" | "port" | "host" | "command" | "logMatches" | "signal" | "timeout" | "interval"
         ) {
             return Err(invalid(format!("unknown key \"{key}\"")));
         }
     }
-    let present: Vec<&str> = ["url", "port", "command", "logMatches"]
+    let present: Vec<&str> = ["url", "port", "command", "logMatches", "signal"]
         .into_iter()
         .filter(|key| config.get(*key).is_some_and(|value| !value.is_null()))
         .collect();
     let [kind] = present[..] else {
         return Err(invalid(
-            "expected exactly one of \"url\", \"port\", \"command\", \"logMatches\"".into(),
+            "expected exactly one of \"url\", \"port\", \"command\", \"logMatches\", \"signal\""
+                .into(),
         ));
     };
     let duration = |key: &str, default: Option<u64>| -> Result<Option<Duration>> {
@@ -243,6 +270,15 @@ pub fn resolve(task: &str, ready_when: &Value, scope: &Scope) -> Result<Option<R
                     ));
                 }
             }
+        }
+        "signal" => {
+            if config["signal"] != Value::Bool(true) {
+                return Err(invalid("\"signal\" must be true".into()));
+            }
+            if config.get("interval").is_some_and(|value| !value.is_null()) {
+                return Err(invalid("\"interval\" is not used by \"signal\"".into()));
+            }
+            Probe::Signal
         }
         "command" => match text("command", Field::Text)? {
             Some(Value::String(command)) if !command.is_empty() => Probe::Command {
@@ -398,7 +434,8 @@ pub fn wait(task: &str, check: &ReadyCheck, root: &Path, verdict: &Verdict, stop
             Probe::Url(url) => probe_url(url, deadline),
             Probe::Port { port, host } => probe_port(*port, host.as_deref(), deadline),
             Probe::Command { command, env } => probe_command(command, env, root, deadline, stop),
-            Probe::LogMatches(_) => false,
+            // Decided by the task's output, or by its signal.
+            Probe::LogMatches(_) | Probe::Signal => false,
         };
         if ready {
             verdict.set_ready();
@@ -418,7 +455,7 @@ pub fn wait(task: &str, check: &ReadyCheck, root: &Path, verdict: &Verdict, stop
             ));
             return;
         }
-        let pause = if matches!(check.probe, Probe::LogMatches(_)) {
+        let pause = if matches!(check.probe, Probe::LogMatches(_) | Probe::Signal) {
             deadline - now
         } else {
             check.interval.min(deadline - now)
@@ -806,6 +843,36 @@ mod tests {
     }
 
     #[test]
+    fn a_signal_waits_for_the_task_to_report() {
+        let check = resolved(json!({"signal": true, "timeout": 5}), json!({}), &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (check.probe.clone(), check.describe()),
+            (Probe::Signal, "signal".into())
+        );
+        // Nothing but the task's own report makes it ready.
+        let verdict = Verdict::default();
+        wait(
+            "app:serve",
+            &check,
+            Path::new("."),
+            &verdict,
+            &AtomicBool::new(false),
+        );
+        assert!(
+            verdict
+                .failure()
+                .unwrap()
+                .contains("did not become ready within 5ms")
+        );
+        let verdict = Verdict::default();
+        verdict.set_ready_at(Some("http://localhost:1/".into()));
+        verdict.set_ready_at(Some("http://localhost:2/".into()));
+        assert_eq!(verdict.url().as_deref(), Some("http://localhost:1/"));
+    }
+
+    #[test]
     fn invalid_settings_say_why() {
         for (ready_when, reason) in [
             (json!({}), "exactly one of"),
@@ -817,6 +884,13 @@ mod tests {
             (json!({"logMatches": []}), "logMatches"),
             (json!({"port": 1, "timeout": 0}), "\"timeout\""),
             (json!({"port": 1, "other": 0}), "unknown key"),
+            (json!({"signal": false}), "\"signal\" must be true"),
+            (json!({"signal": "yes"}), "\"signal\" must be true"),
+            (
+                json!({"signal": true, "interval": 10}),
+                "not used by \"signal\"",
+            ),
+            (json!({"signal": true, "port": 1}), "exactly one of"),
             (
                 json!({"url": "http://{options.a ?? x ?? options.b}"}),
                 "can never be used",
