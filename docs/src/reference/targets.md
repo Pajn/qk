@@ -214,13 +214,15 @@ configuration `env` can override it. See
 
 | Field | Type | Default |
 | --- | --- | --- |
-| `env` | object of string values | Empty; `{threads}` expands to the allocated share |
+| `env` | object of string values | Empty; `{threads}` expands to the threads the task is told to start: its share of cores, times `scale`, rounded up |
 | `min` | positive integer | `1` |
 | `max` | positive integer, at least `min` | Run's core budget |
+| `scale` | number above 0, at most 8 | `1`; threads the task is told to start per core it holds, rounded up |
 
 Opted-in tasks receive `QK_THREADS`; `true` sets only that variable.
-The share is fixed when the task starts. Without this key a task holds one
-core. The setting and allocated count do not affect cache keys.
+The share is fixed when the task starts. `min` and `max` bound the cores a
+task holds; `scale` only changes how many threads it is told to start on them.
+Without this key a task holds one core. The setting and allocated count do not affect cache keys.
 Continuous tasks do not take a core share; this setting does not allocate
 threads or set these environment variables for them.
 `false` is not a supported value; omit the key to disable it.

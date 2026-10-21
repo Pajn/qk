@@ -18,7 +18,7 @@ given a share of it:
 ```
 
 The task gets its share as `QK_THREADS` and through each `env` variable
-naming `{threads}`; `"qk:threads": true` sets only `QK_THREADS`. A tool
+naming `{threads}`, times its `scale` if it has one (see below); `"qk:threads": true` sets only `QK_THREADS`. A tool
 without such a variable reads it in its configuration, as Vitest's
 `maxWorkers: Number(process.env.QK_THREADS) || undefined` does. Under Nx
 neither is set, so the tool keeps its default there. Every other task holds
@@ -41,3 +41,46 @@ share stays within `min` (default 1) and `max` (default the budget); a task
 waits until `min` cores are free, unless nothing else runs. The thread count
 is not part of the cache key, and neither is `qk:threads`. The summary lists
 what each threaded task was given, and `qk show task` records it.
+
+## Threads that wait
+
+A share counts cores, one thread to each. Test runners' workers spend much of
+their time waiting, on the file system, a database or timers, so one worker
+per core leaves the cores idle. `scale` tells the task to start more threads
+than the cores it holds:
+
+```jsonc
+"test": {
+  "qk:threads": {
+    "scale": 2,
+    "env": { "VITEST_MAX_WORKERS": "{threads}" }
+  }
+}
+```
+
+The task holds its share of the budget as without `scale`, and is told
+`ceil(share × scale)` threads: a task holding 3 cores starts 6 workers, and one
+running alone on 16 starts 32. Rounding up adds less than one thread per
+task, so the threads every task is told stay within `scale` times the
+budget plus one for each task running: eight tasks holding a core each with
+`scale: 1.1` are told 2 threads each. A test's wall-clock budgets, such as a
+`waitFor` or a test timeout, are no less trustworthy than that bound makes
+them, however many tasks run at once. Keep `scale` to targets whose threads wait; for a
+compiler, whose threads keep their cores busy, it only adds contention.
+Vitest reads `VITEST_MAX_WORKERS` itself, and a variable a script sets for
+Nx keeps applying there, since qk sets nothing under Nx.
+
+## How busy a task kept the cores
+
+While a task runs, qk samples the CPU time of its processes, as it samples
+their memory. The summary follows each threaded task's threads with the
+cores it kept busy on average, `app:test 6 on 3 (2.4 busy)`, and
+`qk show task` says it, with the cores it held, for a task that ran for two
+seconds or more and whose processes were sampled using CPU time: one whose
+processes all started and exited between samples has no figure. A task busy on fewer cores than it held is waiting, and
+can take a higher `scale`; one busy on more is starting threads it was not
+told about, such as a runtime's own, and holds less than it uses. A process
+that starts and exits between two samples, a quarter of a second apart, is
+not counted, so the figure is a lower bound, close for a task whose work runs
+in processes that last.
+

@@ -918,7 +918,17 @@ fn details(
     let threaded: Vec<String> = report
         .tasks
         .iter()
-        .filter_map(|task| Some(format!("{} {}", task.id, task.threads?)))
+        .filter_map(|task| {
+            let threads = task.threads?;
+            let mut line = format!("{} {threads}", task.id);
+            if let Some(cores) = task.cores.filter(|cores| *cores != threads) {
+                line.push_str(&format!(" on {cores}"));
+            }
+            if let Some(busy) = task.busy() {
+                line.push_str(&format!(" ({busy:.1} busy)"));
+            }
+            Some(line)
+        })
         .collect();
     if !threaded.is_empty() {
         lines.push(format!(
@@ -1310,6 +1320,8 @@ mod tests {
             key: None,
             warm: None,
             threads: None,
+            cores: None,
+            cpu: None,
             memory: None,
             memory_wait: Duration::ZERO,
             execution: None,
@@ -1331,6 +1343,8 @@ mod tests {
             threads: None,
             memory: None,
             recorded: None,
+            cores: None,
+            cpu: None,
         };
         let result = RunResult {
             sandbox: None,

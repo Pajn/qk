@@ -16,7 +16,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 /// Runs kept in the database.
 pub const KEPT_RUNS: usize = 200;
 
@@ -62,9 +62,17 @@ pub struct TaskReport {
     /// how long saving it took.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warm: Option<Value>,
-    /// The threads the task was given, for targets with `qk:threads`.
+    /// The threads the task was told to start, for targets with `qk:threads`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threads: Option<u64>,
+    /// The cores it held, for targets with `qk:threads`; the same as
+    /// `threads` unless its `scale` tells it to start more.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cores: Option<u64>,
+    /// The CPU time, in milliseconds, the task's processes used together, at
+    /// least, when it executed long enough to be sampled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<u64>,
     /// The most memory, in bytes, the task's processes used together, when it
     /// executed long enough to be sampled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -92,6 +100,21 @@ pub struct CriticalPath {
     pub tasks: Vec<String>,
     pub duration: u64,
 }
+
+impl TaskReport {
+    /// How many cores the task kept busy on average while it ran: its CPU
+    /// time over how long it took. None for a task not sampled, or that ran
+    /// too briefly for the average to say much.
+    pub fn busy(&self) -> Option<f64> {
+        let millis = self.ended?.checked_sub(self.started?)?;
+        let cpu = self.cpu?;
+        (millis >= BUSY_AFTER).then(|| cpu as f64 / millis as f64)
+    }
+}
+
+/// How long, in milliseconds, a task runs before [`TaskReport::busy`] says how
+/// busy it kept the cores: samples are a quarter of a second apart.
+const BUSY_AFTER: u64 = 2_000;
 
 /// How a task's key differs from the previous key recorded for it.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -192,8 +215,8 @@ pub struct Observation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Expected {
     pub millis: u64,
-    /// The threads it ran with: one, unless its target has `qk:threads`.
-    pub threads: u64,
+    /// The cores it held: one, unless its target has `qk:threads`.
+    pub cores: u64,
     /// The most memory, in bytes, any of those runs used, when any recorded it.
     pub memory: Option<u64>,
 }
@@ -254,6 +277,8 @@ impl History {
                          warm TEXT,
                          threads INTEGER,
                          memory INTEGER,
+                         cores INTEGER,
+                         cpu INTEGER,
                          PRIMARY KEY (run_id, task_id)
                      );
                      CREATE INDEX tasks_by_task ON tasks (task_id, started);
@@ -267,23 +292,26 @@ impl History {
             Some(SCHEMA_VERSION) => {}
             // Version 2 added what warm state did for each task, version 3
             // the threads it was given, version 4 execution logs, version 5
-            // the memory it used and version 6 the worktree a run ran in.
-            Some(1) => transaction.execute_batch(
-                "ALTER TABLE tasks ADD COLUMN warm TEXT;
-                 ALTER TABLE tasks ADD COLUMN threads INTEGER;
-                 ALTER TABLE tasks ADD COLUMN memory INTEGER;
-                 ALTER TABLE runs ADD COLUMN worktree TEXT;",
-            )?,
-            Some(2) => transaction.execute_batch(
-                "ALTER TABLE tasks ADD COLUMN threads INTEGER;
-                 ALTER TABLE tasks ADD COLUMN memory INTEGER;
-                 ALTER TABLE runs ADD COLUMN worktree TEXT;",
-            )?,
-            Some(3 | 4) => transaction.execute_batch(
-                "ALTER TABLE tasks ADD COLUMN memory INTEGER;
-                 ALTER TABLE runs ADD COLUMN worktree TEXT;",
-            )?,
-            Some(5) => transaction.execute_batch("ALTER TABLE runs ADD COLUMN worktree TEXT;")?,
+            // the memory it used, version 6 the worktree a run ran in and
+            // version 7 the cores a task held and the CPU time it used.
+            Some(version @ 1..=6) => {
+                let added: &[(u32, &str)] = &[
+                    (2, "ALTER TABLE tasks ADD COLUMN warm TEXT;"),
+                    (3, "ALTER TABLE tasks ADD COLUMN threads INTEGER;"),
+                    (5, "ALTER TABLE tasks ADD COLUMN memory INTEGER;"),
+                    (6, "ALTER TABLE runs ADD COLUMN worktree TEXT;"),
+                    (
+                        7,
+                        "ALTER TABLE tasks ADD COLUMN cores INTEGER;
+                         ALTER TABLE tasks ADD COLUMN cpu INTEGER;",
+                    ),
+                ];
+                for (since, statement) in added {
+                    if version < *since {
+                        transaction.execute_batch(statement)?;
+                    }
+                }
+            }
             Some(other) => {
                 bail!("run history has schema version {other}; this qk reads {SCHEMA_VERSION}")
             }
@@ -298,7 +326,7 @@ impl History {
                  PRIMARY KEY (run_id, task_id),
                  FOREIGN KEY (run_id, task_id) REFERENCES tasks(run_id, task_id) ON DELETE CASCADE
              );
-             UPDATE schema_version SET version = 6;",
+             UPDATE schema_version SET version = 7;",
         )?;
         transaction.commit()?;
         connection.execute_batch("PRAGMA foreign_keys = ON;")?;
@@ -349,8 +377,9 @@ impl History {
             transaction.execute(
                 "INSERT OR REPLACE INTO tasks
                      (run_id, task_id, project, target, configuration, status, cache, key,
-                      started, ended, dependencies, cause, warm, threads, memory)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                      started, ended, dependencies, cause, warm, threads, memory, cores, cpu)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                         ?16, ?17)",
                 params![
                     run.id,
                     task.id,
@@ -367,6 +396,8 @@ impl History {
                     task.warm.as_ref().map(serde_json::to_string).transpose()?,
                     task.threads,
                     task.memory,
+                    task.cores,
+                    task.cpu,
                 ],
             )?;
         }
@@ -591,7 +622,7 @@ impl History {
     /// expecting too little memory is what costs.
     pub fn expected(&self) -> Result<BTreeMap<String, Expected>> {
         let mut statement = self.connection.prepare(
-            "SELECT task_id, ended - started, threads, memory FROM tasks
+            "SELECT task_id, ended - started, COALESCE(cores, threads), memory FROM tasks
              WHERE cache IN ('miss', 'uncached') AND status IN ('success', 'failure')
                AND started IS NOT NULL AND ended IS NOT NULL
              ORDER BY task_id, started DESC",
@@ -606,12 +637,12 @@ impl History {
         })?;
         let mut recent: BTreeMap<String, Vec<Expected>> = BTreeMap::new();
         for row in rows {
-            let (task, millis, threads, memory) = row?;
+            let (task, millis, cores, memory) = row?;
             let executions = recent.entry(task).or_default();
             if executions.len() < EXPECTED_FROM {
                 executions.push(Expected {
                     millis: millis.max(0) as u64,
-                    threads: threads.map_or(1, |threads| threads.max(1) as u64),
+                    cores: cores.map_or(1, |cores| cores.max(1) as u64),
                     memory: memory.map(|memory| memory.max(0) as u64),
                 });
             }
@@ -691,7 +722,7 @@ impl History {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut statement = self.connection.prepare(&format!(
             "SELECT run_id, task_id, project, target, configuration, status, cache, key,
-                    started, ended, dependencies, cause, warm, threads, memory
+                    started, ended, dependencies, cause, warm, threads, memory, cores, cpu
              FROM tasks WHERE {filter}
              ORDER BY started IS NULL, started DESC, task_id LIMIT ?2"
         ))?;
@@ -713,6 +744,8 @@ impl History {
                     row.get::<_, Option<String>>(12)?,
                     row.get::<_, Option<u64>>(13)?,
                     row.get::<_, Option<u64>>(14)?,
+                    row.get::<_, Option<u64>>(15)?,
+                    row.get::<_, Option<u64>>(16)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -734,6 +767,8 @@ impl History {
                     warm,
                     threads,
                     memory,
+                    cores,
+                    cpu,
                 )| {
                     Ok((
                         run,
@@ -756,6 +791,8 @@ impl History {
                             memory,
                             // Not kept in the history database.
                             recorded: None,
+                            cores,
+                            cpu,
                         },
                     ))
                 },
