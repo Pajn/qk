@@ -691,17 +691,37 @@ impl Cache {
         own: &[&paths::Outputs],
     ) -> std::result::Result<recorded::PathSet, String> {
         let failed = |error: anyhow::Error| format!("{error:#}");
+        let canonical = workspace
+            .root
+            .canonicalize()
+            .map_err(|e| failed(e.into()))?;
+        // Only what a path set can hold is kept and counted: a build reads
+        // far more in node_modules and outside the workspace than in it.
+        let keep = |path: &std::path::Path| {
+            [&workspace.root, &canonical].iter().any(|root| {
+                path.strip_prefix(root).is_ok_and(|relative| {
+                    !relative.components().any(|component| {
+                        matches!(
+                            component.as_os_str().to_str(),
+                            Some("node_modules" | ".git")
+                        )
+                    })
+                })
+            })
+        };
+        let limits = qk_input_analysis::strace::Limits {
+            records: 1_000_000,
+            bytes: 256 * 1024 * 1024,
+            accesses: 500_000,
+            keep: Some(&keep),
+        };
         let (accesses, diagnostics) =
-            qk_input_analysis::strace::collect(&recording.directory, &prepared.cwd)
+            qk_input_analysis::strace::collect_within(&recording.directory, &prepared.cwd, &limits)
                 .map_err(failed)?;
         // A partial trace would key the task by part of what it read.
         if let Some(diagnostic) = diagnostics.first() {
             return Err(diagnostic.clone());
         }
-        let canonical = workspace
-            .root
-            .canonicalize()
-            .map_err(|e| failed(e.into()))?;
         let ignore = settings
             .ignore_reads
             .iter()

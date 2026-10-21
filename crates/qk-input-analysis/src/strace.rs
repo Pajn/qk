@@ -21,7 +21,63 @@ pub fn normalize(path: &Path) -> PathBuf {
     result
 }
 
+/// How much of a trace is read, and which accesses are kept.
+pub struct Limits<'a> {
+    /// Lines kept, and their bytes; past either the trace is cut short.
+    pub records: usize,
+    pub bytes: usize,
+    /// Accesses kept; past it the trace is cut short.
+    pub accesses: usize,
+    /// Whether an access to an absolute path is kept; `None` keeps all.
+    pub keep: Option<&'a dyn Fn(&Path) -> bool>,
+}
+
+/// What `inputs analyze` reads of a trace: every access, within a budget
+/// that keeps its report readable.
+pub const ANALYSIS: Limits<'static> = Limits {
+    records: 200_000,
+    bytes: 32 * 1024 * 1024,
+    accesses: 100_000,
+    keep: None,
+};
+
+/// A cwd no path can be in, to tell a line whose paths depend on the
+/// process's working directory from one that names its paths whole: deep
+/// enough that no `..` climbs out of it. A path relative to a descriptor,
+/// `AT_FDCWD` included, which strace names, does not depend on it.
+static UNKNOWN_CWD: std::sync::LazyLock<PathBuf> =
+    std::sync::LazyLock::new(|| std::iter::once("/").chain(["\0"; 64]).collect());
+
+/// Whether a trace line can matter under `keep`: it changes a process's
+/// working directory or makes a process, names a path relative to the
+/// working directory, cannot be decoded, or names a kept path.
+fn relevant(process: u32, call: &str, keep: &dyn Fn(&Path) -> bool) -> bool {
+    let unknown = UNKNOWN_CWD.as_path();
+    let Some((events, change, child)) = decode(process, call, unknown) else {
+        return true;
+    };
+    change.is_some()
+        || child.is_some()
+        || events.iter().any(|event| {
+            let path = Path::new(&event.path);
+            // Still somewhere below the unknown cwd, after any `..`.
+            path.components()
+                .any(|component| component.as_os_str() == "\0")
+                || keep(path)
+        })
+}
+
 pub fn collect(directory: &Path, cwd: &Path) -> Result<(Vec<Access>, Vec<String>)> {
+    collect_within(directory, cwd, &ANALYSIS)
+}
+
+/// The accesses of a trace within `limits`, in the order they were made,
+/// and what kept them from being complete.
+pub fn collect_within(
+    directory: &Path,
+    cwd: &Path,
+    limits: &Limits,
+) -> Result<(Vec<Access>, Vec<String>)> {
     let mut records = Vec::new();
     let mut diagnostics = Vec::new();
     let mut pending = BTreeMap::<u32, (f64, String)>::new();
@@ -40,12 +96,12 @@ pub fn collect(directory: &Path, cwd: &Path) -> Result<(Vec<Access>, Vec<String>
         let reader = BufReader::new(std::fs::File::open(entry.path())?);
         for (sequence, line) in reader.lines().enumerate() {
             let line = line?;
-            bytes_read = bytes_read.saturating_add(line.len());
-            if bytes_read > 32 * 1024 * 1024 || records.len() >= 200_000 {
-                diagnostics.push(
-                    "trace collection exceeded its 32 MiB/200000-record budget; report truncated"
-                        .into(),
-                );
+            if bytes_read > limits.bytes || records.len() >= limits.records {
+                diagnostics.push(format!(
+                    "trace collection exceeded its {} MiB/{}-record budget; report truncated",
+                    limits.bytes / 1024 / 1024,
+                    limits.records
+                ));
                 break 'files;
             }
             let Some((time, call)) = line.split_once(' ') else {
@@ -78,6 +134,13 @@ pub fn collect(directory: &Path, cwd: &Path) -> Result<(Vec<Access>, Vec<String>
             } else {
                 call.to_owned()
             };
+            if limits
+                .keep
+                .is_some_and(|keep| !relevant(process, &call, keep))
+            {
+                continue;
+            }
+            bytes_read = bytes_read.saturating_add(call.len());
             records.push((time, process, sequence, call));
         }
     }
@@ -99,7 +162,11 @@ pub fn collect(directory: &Path, cwd: &Path) -> Result<(Vec<Access>, Vec<String>
             .clone();
         match decode(process, &call, &current) {
             Some((events, change, child)) => {
-                accesses.extend(events);
+                accesses.extend(
+                    events.into_iter().filter(|event| {
+                        limits.keep.is_none_or(|keep| keep(Path::new(&event.path)))
+                    }),
+                );
                 if let Some(directory) = change {
                     directories.insert(process, directory);
                 }
@@ -112,9 +179,12 @@ pub fn collect(directory: &Path, cwd: &Path) -> Result<(Vec<Access>, Vec<String>
                 undecoded_names.insert(call.split('(').next().unwrap_or("unknown").to_owned());
             }
         }
-        if accesses.len() > 100_000 {
-            accesses.truncate(100_000);
-            diagnostics.push("recording exceeded 100000 accesses; report truncated".into());
+        if accesses.len() > limits.accesses {
+            accesses.truncate(limits.accesses);
+            diagnostics.push(format!(
+                "recording exceeded {} accesses; report truncated",
+                limits.accesses
+            ));
             break;
         }
     }
@@ -433,6 +503,44 @@ mod tests {
         assert_eq!(events[3].operation, Operation::Write);
         assert_eq!(events[4].operation, Operation::Metadata);
         assert!(decode(123, "chroot(\"/other\") = 0", Path::new("/repo")).is_none());
+    }
+
+    #[test]
+    fn a_filter_keeps_only_what_can_matter() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("command-0.10"),
+            concat!(
+                "1.000 openat(AT_FDCWD</repo>, \"node_modules/x/index.js\", O_RDONLY) = 3</repo/node_modules/x/index.js>\n",
+                "1.001 openat(AT_FDCWD</repo>, \"src/a.ts\", O_RDONLY) = 3</repo/src/a.ts>\n",
+                "1.002 openat(AT_FDCWD</repo>, \"/usr/lib/libc.so\", O_RDONLY) = 3</usr/lib/libc.so>\n",
+                "1.003 chdir(\"lib\") = 0\n",
+                // Relative to the working directory, which the filter cannot
+                // know: kept, and placed once it is known.
+                "1.004 stat(\"../src/b.ts\", {...}) = 0\n",
+            ),
+        )
+        .unwrap();
+        let keep =
+            |path: &Path| path.starts_with("/repo") && !path.starts_with("/repo/node_modules");
+        let limits = Limits {
+            keep: Some(&keep),
+            ..ANALYSIS
+        };
+        let (events, diagnostics) =
+            collect_within(directory.path(), Path::new("/repo"), &limits).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let paths: Vec<&str> = events.iter().map(|event| event.path.as_str()).collect();
+        assert_eq!(paths, ["/repo/src/a.ts", "/repo/src/b.ts"]);
+        // Only kept accesses count toward the budget.
+        let tight = Limits {
+            accesses: 2,
+            keep: Some(&keep),
+            ..ANALYSIS
+        };
+        let (_, diagnostics) =
+            collect_within(directory.path(), Path::new("/repo"), &tight).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
     #[test]
