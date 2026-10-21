@@ -67,8 +67,12 @@ pub enum TaskReason {
     Lockfile,
     /// `pnpm-workspace.yaml` changed outside its resolution keys.
     WorkspaceFile,
-    /// A file projects are created from was deleted, which touches every task.
+    /// A file projects are created from was deleted and qk could not tell
+    /// what depended on what it removed, which touches every task.
     DeletedManifest { file: String },
+    /// The task's project, or one whose files it reads, depended on a project
+    /// the change removed by deleting the manifests it was created from.
+    DependedOnRemoved { file: String, project: String },
     /// A file projects are created from changed, in a project whose
     /// configuration the task reads.
     ProjectConfiguration { file: String },
@@ -106,6 +110,10 @@ impl std::fmt::Display for TaskReason {
                 write!(f, "pnpm-workspace.yaml changed outside its resolution keys")
             }
             Self::DeletedManifest { file } => write!(f, "{file} was deleted"),
+            Self::DependedOnRemoved { file, project } => write!(
+                f,
+                "it reads a project that depended on {project}, which deleting {file} removes"
+            ),
             Self::ProjectConfiguration { file } => {
                 write!(
                     f,
@@ -173,25 +181,26 @@ pub(crate) fn analyse(
     }
     let ignore = qk_cache::SourceIgnore::new(&workspace.root)?;
     // Changed files projects are created from, by whether they still exist:
-    // a deleted one touches every task, a changed project.json or
-    // package.json the configuration of the project owning it. A changed
-    // lockfile configures no project; dependency updates decide what it
-    // affects.
+    // a deleted one touches the tasks reading what depended on the project it
+    // removed, a changed project.json or package.json the configuration of
+    // the project owning it. A changed lockfile configures no project;
+    // dependency updates decide what it affects.
     let roots = crate::ProjectRoots::new(workspace);
-    let mut deleted_manifest = None;
+    let mut deleted = Vec::new();
     let mut reconfigured: BTreeMap<&str, &String> = BTreeMap::new();
     for file in &changes.files {
         if !crate::is_project_config(file) || ignore.matches(file) {
             continue;
         }
         if !workspace.root.join(file).exists() {
-            deleted_manifest.get_or_insert(file);
+            deleted.push(file.clone());
         } else if crate::is_manifest(file)
             && let Some(project) = roots.owner(file)
         {
             reconfigured.entry(project).or_insert(file);
         }
     }
+    let removal = crate::removed(workspace, &changes, &deleted);
     let tsconfig = tsconfig_touch(workspace, &changes, &roots);
     let dependency_updates = crate::changed_lockfile(&changes)
         .filter(|file| !ignore.matches(file))
@@ -275,8 +284,23 @@ pub(crate) fn analyse(
     for (id, inputs) in &resolved {
         let task = &graph.tasks[id];
         let mut reasons = Vec::new();
-        if let Some(file) = deleted_manifest {
-            reasons.push(TaskReason::DeletedManifest { file: file.clone() });
+        match &removal {
+            crate::Removal::None => {}
+            crate::Removal::Unknown { file, .. } => {
+                reasons.push(TaskReason::DeletedManifest { file: file.clone() });
+            }
+            crate::Removal::Dependents(dependents) => {
+                // At the base, it read the removed project through one of them.
+                let read = std::iter::once(&task.project)
+                    .chain(&inputs.declared.projects)
+                    .find_map(|project| dependents.get(project.as_str()));
+                if let Some((file, project)) = read {
+                    reasons.push(TaskReason::DependedOnRemoved {
+                        file: file.clone(),
+                        project: project.clone(),
+                    });
+                }
+            }
         }
         reasons.extend(
             input_changes

@@ -8,7 +8,7 @@ pub use npm_range::satisfies;
 /// range, `*`, a `file:` path to it, or a semver range its version
 /// satisfies, prereleases included. Anything else, such as `catalog:`,
 /// `npm:` aliases or a range the version is outside of, is left to npm.
-fn links(range: &str, root: &str, target: &str, version: Option<&str>) -> bool {
+pub fn links(range: &str, root: &str, target: &str, version: Option<&str>) -> bool {
     if range.starts_with("workspace:") || range == "*" {
         return true;
     }
@@ -347,7 +347,7 @@ fn check_implicit_dependencies(projects: &BTreeMap<String, Project>) -> Result<(
 /// Nx's `normalizeImplicitDependencies`: the projects the patterns select,
 /// the project itself left out, then a `!` and the name of each project an
 /// exclusion matches, which removes any other edge to it.
-fn expand_implicit_dependencies(
+pub fn expand_implicit_dependencies(
     source: &str,
     dependencies: &[String],
     projects: &BTreeMap<String, Project>,

@@ -40,10 +40,28 @@ the range is its own history, and nothing is flagged.
 A changed file touches the project whose root most specifically contains it.
 `nx.json` touches every project. A file named by a `{workspaceRoot}` input
 touches the projects declaring it; an input without glob syntax, such as
-`{workspaceRoot}/generated`, names that file or everything under it. A deleted
-file that Nx's default plugins create projects from, any `project.json` or
-`package.json` or a root lockfile, touches every project, since what depended
-on a removed project is unknown. Path mappings changed in the root tsconfig
+`{workspaceRoot}/generated`, names that file or everything under it.
+
+A deleted `project.json` or `package.json` that removes a project touches the
+projects that depended on it. Nx touches every project instead, having no way
+of knowing what depended on it; qk reads the removed project's manifests at
+the base revision and looks for what still declares it. qk's graph is made of
+manifests alone, and a project whose files the change leaves alone has the
+same manifests at both revisions, so what depended on the removed project is
+what the change touches already and what still names it: a `package.json`
+dependency that linked to it, or an `implicitDependencies` entry or pattern
+selecting it. Their dependents follow as for any other touched project. A
+deletion can remove a package and leave its project, when a `project.json`
+still makes it, or move a project under the same name. Either way a project
+whose dependency on the package the head graph no longer has is touched, as
+when a `file:` path names where the package was; one whose link survives,
+such as a `workspace:` range to the moved package, depends on it as before,
+and one whose `implicitDependencies` exclude it was never linked to it. Every project
+is still touched when qk cannot tell: for a deleted root lockfile, for files
+named with `--files`, which are not compared with a base revision, or when the
+removed project's manifests cannot be read there.
+
+Path mappings changed in the root tsconfig
 touch the projects they point into, and any other change to it every project.
 
 A change to the root lockfile (`pnpm-lock.yaml`, `pnpm-lock.yml`,
@@ -117,7 +135,8 @@ As in Nx, that is when:
   a tracked output is a file like any other;
 - a file projects are created from changed in a project whose inputs it
   reads, its own or one its `^` and `projects` inputs reach, or such a file
-  was deleted, which affects every task;
+  was deleted and removed a project that one of those depended on, by the
+  rule above, which falls back on every task where it does;
 - the root tsconfig changed outside `compilerOptions.paths`, or, with
   `selectivelyHashTsConfig`, in path mappings into a project whose inputs it
   reads (see [What changes the key](cache.md#what-changes-the-key));
