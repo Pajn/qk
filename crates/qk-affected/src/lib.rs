@@ -1089,6 +1089,8 @@ pub(crate) fn removed(workspace: &Workspace, changes: &Changes, files: &[String]
         }
     };
     let mut dependents = BTreeMap::new();
+    // The head's projects, each removed one added in turn, as the base had it.
+    let mut projects = workspace.projects.clone();
     // Each directory once, whichever of its manifests went.
     let mut directories: BTreeMap<&str, &String> = BTreeMap::new();
     for file in &deleted {
@@ -1132,10 +1134,10 @@ pub(crate) fn removed(workspace: &Workspace, changes: &Changes, files: &[String]
                 .entry(dependent.to_owned())
                 .or_insert_with(|| ((*file).clone(), what.to_owned()));
         };
-        let mut projects = workspace.projects.clone();
-        projects
-            .entry(removed.name.clone())
-            .or_insert_with(|| removed.clone());
+        let added = !projects.contains_key(&removed.name);
+        if added {
+            projects.insert(removed.name.clone(), removed.clone());
+        }
         // A dependent's own implicitDependencies, as at the base: its files
         // are the same at both revisions unless the change touches it.
         let implicit = |dependent: &str| {
@@ -1192,6 +1194,10 @@ pub(crate) fn removed(workspace: &Workspace, changes: &Changes, files: &[String]
             if implicit.contains(&removed.name) && !implicit.contains(&excluded) {
                 depended(dependent, &removed.name);
             }
+        }
+        // Only a name the head lacks was added, and so reaches here.
+        if added {
+            projects.remove(&removed.name);
         }
     }
     Removal::Dependents(dependents)
