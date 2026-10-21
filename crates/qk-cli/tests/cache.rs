@@ -1394,6 +1394,24 @@ fn s3_and_a_store_server_together_are_refused() {
 }
 
 #[test]
+fn a_qk_store_server_is_used_beside_the_s3_key_nx_reads() {
+    let server = store_server::FakeStoreServer::start();
+    let fixture = Fixture::new(target("build", json!({})));
+    fs::write(
+        fixture.root.join("nx.json"),
+        json!({
+            "qk:storeServer": {"url": server.url},
+            "s3": {"bucket": "cache", "region": "us-east-1"}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let output = success(server_build(&fixture, store_server::WRITE_TOKEN, &[]));
+    assert!(!stderr(&output).contains("not both"), "{}", stderr(&output));
+    assert_eq!(server.state.lock().unwrap().records.len(), 1);
+}
+
+#[test]
 fn background_uploads_go_where_the_run_was_told_to_send_them() {
     let server = store_server::FakeStoreServer::start();
     let fixture = Fixture::new(target("build", json!({})));

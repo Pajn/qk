@@ -130,6 +130,10 @@ million. It keeps the index itself and commits each entry once, so runs
 neither write announcements nor merge listings. `localMode`, `ciMode`, `uploadMode` and
 `NX_POWERPACK_CACHE_MODE` apply as they do for `s3`; setting both `s3` and
 `storeServer` is an error. A read token fetches; a write token also uploads.
+
+A workspace that still runs some tasks with Nx can keep `s3` for Nx's cache
+plugin and name qk's store server as `qk:storeServer`, which Nx does not read.
+qk then uses the store server and ignores `s3` and `storeServer`.
 `tools/store-server` in qk's repository is a reference server, a Cloudflare
 Worker over R2, and documents the protocol in its `PROTOCOL.md`.
 
