@@ -309,3 +309,30 @@ fn a_task_in_mode_record_is_keyed_by_its_inputs_and_says_what_its_recordings_wou
     assert_eq!(shadow(false), expect("miss", "none", "wouldMiss"));
     assert_eq!(shadow(false), expect("local-hit", "none", "wouldMiss"));
 }
+
+#[test]
+fn a_task_without_recordings_cached_locally_asks_the_store_for_none() {
+    if !has_strace() {
+        return;
+    }
+    let temp = fixture();
+    let root = temp.path();
+    let server = s3::FakeS3::start();
+    let machine = with_remote(root, &server);
+    let a = machine("a");
+    let task = build_report(root, false, &pairs(&a));
+    assert_eq!(task["cache"].as_str(), Some("miss"));
+    server.state.lock().unwrap().requests.clear();
+    let task = build_report(root, false, &pairs(&a));
+    assert_eq!(
+        (task["cache"].as_str(), kind(&task["recorded"]).as_str()),
+        (Some("local-hit"), "unrecorded")
+    );
+    let requests = server.state.lock().unwrap().requests.clone();
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.contains("/pathsets/")),
+        "{requests:?}"
+    );
+}

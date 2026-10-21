@@ -483,7 +483,7 @@ impl Cache {
             let recorded_profile = profile::span(&task.id, "recorded_restore");
             let keyed_by = settings.mode == ultracache::Mode::On;
             let found = self.by_recordings(
-                workspace, task, prepared, snapshot, &outputs, &own, sets, weak, keyed_by,
+                workspace, task, prepared, snapshot, &outputs, &own, sets, weak, &key, keyed_by,
                 cancelled,
             );
             drop(recorded_profile);
@@ -761,6 +761,7 @@ impl Cache {
         own: &[&paths::Outputs],
         sets: &mut Vec<recorded::PathSet>,
         weak: &str,
+        declared: &str,
         restore: bool,
         cancelled: &AtomicBool,
     ) -> Found {
@@ -808,6 +809,18 @@ impl Cache {
         let Some(remote) = &self.remote else {
             return Found::Nothing;
         };
+        // Without path sets here, a result here under the declared key is
+        // the task's, and asking the store for path sets would only delay
+        // it, run after run, and have them shadow it.
+        if sets.is_empty()
+            && self
+                .root
+                .join("entries")
+                .join(format!("{declared}.json"))
+                .is_file()
+        {
+            return Found::Nothing;
+        }
         // Path sets other machines recorded, new here.
         let fetched = remote
             .fetch_path_sets(&self.root, weak, &task.id)
