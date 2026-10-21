@@ -1226,6 +1226,38 @@ fn show_target_includes_qk_fields() {
     assert_eq!(target["qk:threads"], json!({"max": 2}), "{target}");
 }
 
+/// `qk:sandbox` is read only as a boolean; doctor names any other value.
+#[test]
+fn doctor_names_a_qk_sandbox_that_is_not_a_boolean() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    std::fs::write(root.join("nx.json"), "{}").unwrap();
+    std::fs::write(
+        root.join("project.json"),
+        json!({"name":"app","targets":{
+            "off":{"command":"true","qk:sandbox":false},
+            "typo":{"command":"true","qk:sandbox":"false"}
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let report = successful_json(
+        isolated_command(env!("CARGO_BIN_EXE_qk"))
+            .current_dir(root)
+            .args(["doctor", "--json"])
+            .output()
+            .unwrap(),
+    );
+    let invalid: Vec<&Value> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|finding| finding["code"] == "invalid-field")
+        .collect();
+    assert_eq!(invalid.len(), 1, "{report}");
+    assert_eq!(invalid[0]["location"], "app:typo");
+}
+
 /// A field a newer qk added is ignored, as Nx ignores keys it does not know,
 /// and doctor names it.
 #[test]

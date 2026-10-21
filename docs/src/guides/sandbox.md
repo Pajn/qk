@@ -141,9 +141,12 @@ what it lets through on Linux. Audit on macOS, or
   reason, as above. Only tasks that started are listed.
 - Seatbelt refuses to apply a sandbox inside one that restricts anything, as
   every task's profile does. A task that applies its own, as Xcode does to
-  run Swift macros, fails with `sandbox_apply: Operation not permitted`; qk
-  runs it again unsandboxed and lists it with the reason, without the
-  findings of its first attempt, which ended early.
+  run Swift macros, fails with `sandbox_apply: Operation not permitted`.
+  Audit runs it again unsandboxed and lists it with the reason, without the
+  findings of its first attempt, which ended early; enforce leaves it failed.
+  `"qk:sandbox": false` on its target runs it unsandboxed from the start, in
+  either mode. For Swift, `-disable-sandbox` in its Swift flags instead
+  leaves out only the compiler's own sandbox, so the task can be checked.
 - On Windows, qk has no sandbox.
 
 ## Linux

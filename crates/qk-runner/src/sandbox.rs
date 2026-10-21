@@ -214,6 +214,10 @@ impl Sandbox {
         let mut covered = BTreeMap::new();
         let mut unsandboxed = BTreeMap::new();
         for (id, task) in &graph.tasks {
+            if task.definition.extra.get("qk:sandbox") == Some(&serde_json::Value::Bool(false)) {
+                unsandboxed.insert(id.clone(), "its target sets \"qk:sandbox\": false".into());
+                continue;
+            }
             match &resolution.tasks[id] {
                 Ok(resolved) => {
                     let files = resolved.file_inputs().map(str::to_owned).collect();

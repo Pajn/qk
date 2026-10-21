@@ -88,6 +88,16 @@ pub fn show(workspace: &Workspace, json: bool, strict: bool) -> Result<i32> {
                     }
                 }
             }
+            if let Some(value) = definition.extra.get("qk:sandbox")
+                && !value.is_boolean()
+            {
+                findings.push(Finding {
+                    severity: "warning",
+                    code: "invalid-field",
+                    location: location.clone(),
+                    message: format!("qk:sandbox is {value}, but only true or false is read, so it is ignored and the task is sandboxed."),
+                });
+            }
             if definition
                 .extra
                 .get("syncGenerators")

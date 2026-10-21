@@ -759,10 +759,20 @@ pub fn run(
                             execute_retained(&task, &cancelled).and_then(|result| {
                                 // Seatbelt refuses a sandbox inside one that
                                 // restricts anything, as Xcode applies to
-                                // Swift macros: such a task runs again
+                                // Swift macros. An audit runs such a task again
                                 // unsandboxed, as one whose profile Seatbelt
-                                // rejects does.
+                                // rejects; enforcing, it fails, and says how
+                                // to leave it out.
                                 match sandbox {
+                                    Some(sandbox)
+                                        if sandbox.mode == sandbox::Mode::Enforce
+                                            && sandbox::nested(&task, &result) =>
+                                    {
+                                        qk_executor::status!(
+                                            "qk: {id}: it applies a sandbox of its own, which cannot run inside qk's; set \"qk:sandbox\": false on its target to run it unsandboxed"
+                                        );
+                                        Ok(result)
+                                    }
                                     Some(sandbox) if sandbox::nested(&task, &result) => {
                                         let reason = "it applies a sandbox of its own, which cannot run inside qk's";
                                         qk_executor::status!("qk: {id}: {reason}; running it again unsandboxed");

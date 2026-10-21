@@ -2966,6 +2966,45 @@ fn a_task_applying_its_own_sandbox_runs_again_unsandboxed() {
     assert!(findings["tasks"].get("app:build").is_none(), "{findings}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("running it again unsandboxed"), "{stderr}");
+
+    // Enforcing, it fails, and says how to leave it out.
+    fs::remove_file(temp.path().join("built.txt")).unwrap();
+    let enforced = run(temp.path(), &["run", "app:build", "--sandbox=enforce"]);
+    assert!(!enforced.status.success());
+    assert!(!temp.path().join("built.txt").exists());
+    let stderr = String::from_utf8_lossy(&enforced.stderr);
+    assert!(stderr.contains("set \"qk:sandbox\": false"), "{stderr}");
+    assert!(!stderr.contains("running it again"), "{stderr}");
+
+    // Left out of the sandbox, it runs once, unsandboxed, in either mode.
+    fs::write(
+        temp.path().join("project.json"),
+        json!({"name": "app", "targets": {"build": {
+            "command": "sandbox-exec -p '(version 1)(allow default)' /usr/bin/true && echo built > built.txt",
+            "qk:sandbox": false
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    for mode in ["--sandbox=audit", "--sandbox=enforce"] {
+        let output = success(run(
+            temp.path(),
+            &[
+                "run",
+                "app:build",
+                mode,
+                "--sandbox-report",
+                report.to_str().unwrap(),
+            ],
+        ));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("sandbox_apply"), "{stderr}");
+        let findings: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+        assert_eq!(
+            findings["unsandboxed"]["app:build"], "its target sets \"qk:sandbox\": false",
+            "{findings}"
+        );
+    }
 }
 
 /// A sandboxed run skips the cache, but a task's log is still kept for
