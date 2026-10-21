@@ -271,7 +271,8 @@ mod platform {
                 if connected && !stop.load(Ordering::SeqCst) {
                     let mut buffer = Vec::new();
                     let mut chunk = [0u8; 4096];
-                    loop {
+                    // A read starting after the stop would not be cancelled.
+                    while !stop.load(Ordering::SeqCst) {
                         let mut read = 0;
                         // SAFETY: `chunk` is writable for its length, and
                         // `read` receives how much was written.
@@ -309,32 +310,44 @@ mod platform {
         Ok((address, thread))
     }
 
-    /// Cancels the listener's blocking connect or read, so it sees the stop,
-    /// and connects once for a connect it had not started yet. A task holding
-    /// its connection open would otherwise keep the listener reading, with
-    /// the pipe too busy to connect to.
+    /// Cancels the listener's blocking read or connect, and connects to it,
+    /// until it sees the stop and ends. A task holding its connection open
+    /// would otherwise keep the listener reading, with the pipe too busy to
+    /// connect to, and a read it began just after a cancellation would wait.
     pub fn wake(address: &OsString, thread: Option<&JoinHandle<()>>) {
-        if let Some(thread) = thread {
-            use std::os::windows::io::AsRawHandle;
-            // SAFETY: the handle is the listener thread's, not yet joined.
-            unsafe { CancelSynchronousIo(thread.as_raw_handle()) };
-        }
         let name = wide(address);
-        // SAFETY: `name` is a NUL-terminated wide string that outlives the call.
-        let handle = unsafe {
-            CreateFileW(
-                name.as_ptr(),
-                GENERIC_WRITE,
-                0,
-                std::ptr::null(),
-                OPEN_EXISTING,
-                0,
-                std::ptr::null_mut(),
-            )
-        };
-        if handle != INVALID_HANDLE_VALUE {
-            // SAFETY: the handle was just opened here.
-            unsafe { CloseHandle(handle) };
+        // Until the listener ends: a read it began after one cancellation
+        // is cancelled by the next, and a connection it waits for is made.
+        loop {
+            if let Some(thread) = thread {
+                if thread.is_finished() {
+                    return;
+                }
+                use std::os::windows::io::AsRawHandle;
+                // SAFETY: the handle is the listener thread's, not yet joined.
+                unsafe { CancelSynchronousIo(thread.as_raw_handle()) };
+            }
+            // SAFETY: `name` is a NUL-terminated wide string that outlives
+            // the call.
+            let handle = unsafe {
+                CreateFileW(
+                    name.as_ptr(),
+                    GENERIC_WRITE,
+                    0,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    0,
+                    std::ptr::null_mut(),
+                )
+            };
+            if handle != INVALID_HANDLE_VALUE {
+                // SAFETY: the handle was just opened here.
+                unsafe { CloseHandle(handle) };
+            }
+            if thread.is_none() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
 
