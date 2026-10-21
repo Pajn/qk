@@ -389,6 +389,43 @@ mod tests {
         assert_eq!(verdict.url().as_deref(), Some("http://localhost:4200/"));
     }
 
+    /// Connects as libuv does, read-write first and write-only when the
+    /// inbound pipe refuses that, and writes the header and payload apart,
+    /// as Node does, many times over.
+    #[cfg(windows)]
+    #[test]
+    fn hears_signals_on_a_named_pipe_as_node_sends_them() {
+        use std::io::Write;
+        let payload = r#"{"type":"TO_PARENT_FROM_CHILDREN","message":{"type":"nx-ready-signal:ready","taskId":"app:serve"}}"#;
+        for attempt in 0..200 {
+            let verdict = Arc::new(Verdict::default());
+            let listener = Listener::start("app:serve", verdict.clone()).unwrap();
+            let address = listener.address.clone();
+            assert!(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&address)
+                    .is_err(),
+                "an inbound pipe takes no reader"
+            );
+            let mut pipe = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&address)
+                .unwrap_or_else(|error| panic!("attempt {attempt}: {error}"));
+            pipe.write_all(format!("NX_MSG_{}:", payload.len()).as_bytes())
+                .unwrap();
+            pipe.write_all(payload.as_bytes()).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !verdict.is_ready() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(verdict.is_ready(), "attempt {attempt}: no signal heard");
+            drop(pipe);
+            drop(listener);
+        }
+    }
+
     #[test]
     fn drops_a_stream_not_framed_as_nx_frames_it() {
         let reader = Reader {
