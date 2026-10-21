@@ -226,7 +226,14 @@ fn decode(process: u32, call: &str, cwd: &Path) -> Option<Decoded> {
         "stat" | "lstat" | "stat64" | "lstat64" | "access" | "statfs" | "statfs64" | "getxattr"
         | "lgetxattr" | "listxattr" | "llistxattr" => emit(path(0, None)?, Operation::Metadata),
         "newfstatat" | "fstatat64" | "statx" | "faccessat" | "faccessat2" | "name_to_handle_at" => {
-            emit(path(1, Some(0))?, Operation::Metadata)
+            // With an empty path, the call reads the descriptor itself: a
+            // pipe, socket or other descriptor that is no file names no path.
+            let unnamed = quoted(args.get(1)?).is_some_and(|path| path.is_empty())
+                && args[0].contains('<')
+                && descriptor(args[0]).is_none();
+            if !unnamed {
+                emit(path(1, Some(0))?, Operation::Metadata);
+            }
         }
         "inotify_add_watch" => emit(path(1, None)?, Operation::Metadata),
         "unlink" | "rmdir" => emit(path(0, None)?, Operation::Delete),
@@ -426,5 +433,25 @@ mod tests {
         assert_eq!(events[3].operation, Operation::Write);
         assert_eq!(events[4].operation, Operation::Metadata);
         assert!(decode(123, "chroot(\"/other\") = 0", Path::new("/repo")).is_none());
+    }
+
+    #[test]
+    fn stats_of_pipes_and_sockets_name_no_path() {
+        let cwd = Path::new("/repo");
+        for call in [
+            "newfstatat(1<pipe:[123]>, \"\", {st_mode=S_IFIFO|0600, ...}, AT_EMPTY_PATH) = 0",
+            "statx(17<socket:[456]>, \"\", AT_STATX_SYNC_AS_STAT|AT_EMPTY_PATH, STATX_ALL, {...}) = 0",
+        ] {
+            let (events, _, _) = decode(1, call, cwd).unwrap();
+            assert!(events.is_empty(), "{call}");
+        }
+        // A file's descriptor still names its file.
+        let (events, _, _) = decode(
+            1,
+            "newfstatat(3</repo/a.txt>, \"\", {st_mode=S_IFREG|0644, ...}, AT_EMPTY_PATH) = 0",
+            cwd,
+        )
+        .unwrap();
+        assert_eq!(events[0].path, "/repo/a.txt");
     }
 }
