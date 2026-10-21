@@ -811,8 +811,10 @@ impl Cache {
         };
         // Without path sets here, a result here under the declared key is
         // the task's, and asking the store for path sets would only delay
-        // it, run after run, and have them shadow it.
-        if sets.is_empty()
+        // it, run after run, and have them shadow it. Looking up without
+        // restoring, for mode "record", the lookup is all there is to do.
+        if restore
+            && sets.is_empty()
             && self
                 .root
                 .join("entries")

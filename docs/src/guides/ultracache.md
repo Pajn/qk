@@ -125,8 +125,9 @@ disagree:
   none: a change to what it read that its declared inputs leave out, a hit
   that may be stale, or a recorded result never shared.
 
-Looking a task up by its recordings costs, on a local miss, the request for
-its path sets. Switching to `"on"` keys it by them.
+Looking a task up by its recordings costs the request for its path sets
+whenever it has none of its own, even when its declared inputs hit the local
+cache: that is where a stale hit would show. Switching to `"on"` keys it by them.
 
 ## Running the tests
 

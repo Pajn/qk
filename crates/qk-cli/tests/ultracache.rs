@@ -336,3 +336,42 @@ fn a_task_without_recordings_cached_locally_asks_the_store_for_none() {
         "{requests:?}"
     );
 }
+
+#[test]
+fn mode_record_looks_up_shared_recordings_behind_a_local_declared_hit() {
+    if !has_strace() {
+        return;
+    }
+    let temp = fixture();
+    let root = temp.path();
+    let nx = fs::read_to_string(root.join("nx.json")).unwrap();
+    write(
+        root,
+        "nx.json",
+        &nx.replace(r#""ignoreReads""#, r#""mode": "record", "ignoreReads""#),
+    );
+    let server = s3::FakeS3::start();
+    let machine = with_remote(root, &server);
+    let (a, b) = (machine("a"), machine("b"));
+    // `b` keeps its declared result before any recording exists, without
+    // the store's credentials, so that `a` has it to run rather than take.
+    let local: Vec<(String, String)> = b
+        .iter()
+        .filter(|(name, _)| name == "NX_CACHE_DIRECTORY")
+        .cloned()
+        .collect();
+    let task = build_report(root, false, &pairs(&local));
+    assert_eq!(
+        (task["cache"].as_str(), kind(&task["shadow"]).as_str()),
+        (Some("miss"), "unrecorded")
+    );
+    // `a` records, from the cache it shares, and uploads what it read.
+    let task = build_report(root, true, &pairs(&a));
+    assert_eq!(kind(&task["recorded"]), "saved");
+    // `b` hits its own declared result, and still finds `a`'s recording.
+    let task = build_report(root, false, &pairs(&b));
+    assert_eq!(
+        (task["cache"].as_str(), kind(&task["shadow"]).as_str()),
+        (Some("local-hit"), "wouldHit")
+    );
+}
