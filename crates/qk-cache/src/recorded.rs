@@ -182,20 +182,21 @@ impl PathSet {
     /// keyed by how it is now, a recording would key the task by what was
     /// left there rather than by what the task saw.
     ///
-    /// A file read or found changed if it was written. A listed directory
-    /// changed if an entry other than the task's writes and `outputs` was
-    /// added, renamed or replaced, or, in a directory the task wrote nothing
-    /// to, one was removed: a directory's own time moves with its entries, so
-    /// where the task wrote, a removal cannot be told from its own writes.
+    /// A file read or found changed if it was written. A listing, which keys
+    /// its entries' names and kinds, changed if an entry was added, removed
+    /// or renamed, which moves the directory's own modification time; what
+    /// is written inside an entry does not change it, though it moves the
+    /// entry's change time. Where the task wrote into the directory, its time
+    /// moves with the task's own writes, so there an entry other than the
+    /// task's writes and `outputs` created after `started` changed it, by its
+    /// birth time, which a file system without one cannot tell; a removal
+    /// there cannot be told from the task's own writes.
     pub fn changed_since(
         &self,
         root: &Path,
         started: SystemTime,
         outputs: &[&Outputs],
     ) -> Option<&str> {
-        let since = |path: &Path| {
-            std::fs::symlink_metadata(path).is_ok_and(|metadata| changed(&metadata) >= started)
-        };
         let file = self.reads.iter().chain(&self.present).find(|path| {
             std::fs::symlink_metadata(root.join(path))
                 .is_ok_and(|metadata| !metadata.is_dir() && changed(&metadata) >= started)
@@ -222,11 +223,16 @@ impl PathSet {
                         || outputs.iter().any(|outputs| outputs.matches(&path))
                     {
                         own = true;
-                    } else if since(&entry.path()) {
+                    } else if std::fs::symlink_metadata(entry.path())
+                        .and_then(|metadata| metadata.created())
+                        .is_ok_and(|born| born >= started)
+                    {
                         return true;
                     }
                 }
-                !own && since(&absolute)
+                !own && std::fs::symlink_metadata(&absolute)
+                    .and_then(|metadata| metadata.modified())
+                    .is_ok_and(|modified| modified >= started)
             })
         })
         .map(String::as_str)
@@ -652,6 +658,7 @@ mod tests {
             std::fs::create_dir(temp.path().join(directory)).unwrap();
             std::fs::write(temp.path().join(directory).join("kept.txt"), "").unwrap();
         }
+        std::fs::create_dir(temp.path().join("listed/sub")).unwrap();
         let set = PathSet {
             reads: ["read.txt".to_owned(), "gone.txt".to_owned()].into(),
             present: ["found.txt".to_owned(), ".".to_owned()].into(),
@@ -683,6 +690,21 @@ mod tests {
             present: [].into(),
             ..set.clone()
         };
+        // Another task writing inside an entry, or rewriting one in place,
+        // leaves the listing as it was.
+        std::fs::write(temp.path().join("listed/sub/made.txt"), "").unwrap();
+        assert_eq!(changed(&listings), None);
+        // An entry another process adds where the task wrote too.
+        std::fs::write(temp.path().join("written/other.txt"), "").unwrap();
+        if std::fs::metadata(temp.path().join("written/other.txt"))
+            .and_then(|metadata| metadata.created())
+            .is_ok()
+        {
+            assert_eq!(changed(&listings), Some("written".into()));
+        }
+        std::fs::remove_file(temp.path().join("written/other.txt")).unwrap();
+        // An entry added where the task wrote nothing.
+        std::fs::write(temp.path().join("listed/new.txt"), "").unwrap();
         assert_eq!(changed(&listings), Some("listed".into()));
         // A removal, where the task wrote nothing.
         let removed = tempfile::tempdir().unwrap();

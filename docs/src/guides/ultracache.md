@@ -85,9 +85,12 @@ recording yet. `--report` writes each task's as `recorded`.
   whose task changed a file it read or found while it ran: keyed by the file
   as the task left it, it would be keyed by the task's own write. Nor is one
   where an entry in a directory it listed was added, renamed or removed while
-  it ran, other than what it wrote there and its outputs. Where the task wrote
-  into the directory, an entry another process removed meanwhile cannot be
-  told from the task's own writes, and goes unnoticed.
+  it ran, other than what it wrote there and its outputs; what another task
+  writes inside one of its entries, or a file it rewrites in place, leaves
+  the listing as it was. Where the task wrote into the directory, an entry
+  another process removed meanwhile cannot be told from the task's own
+  writes, and goes unnoticed, and an added one is told by its creation time,
+  which a file system that keeps none cannot tell either.
 
 ## Sharing recordings
 
