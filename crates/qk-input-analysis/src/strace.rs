@@ -155,6 +155,8 @@ pub fn collect_within(
     let mut accesses = Vec::new();
     let mut undecoded = 0;
     let mut undecoded_names = std::collections::BTreeSet::new();
+    // The first record not decoded, quoted so that a report names it.
+    let mut undecoded_example = None;
     for (_, process, _, call) in records {
         let current = directories
             .entry(process)
@@ -177,6 +179,8 @@ pub fn collect_within(
             None => {
                 undecoded += 1;
                 undecoded_names.insert(call.split('(').next().unwrap_or("unknown").to_owned());
+                undecoded_example
+                    .get_or_insert_with(|| call.chars().take(EXAMPLE_CHARS).collect::<String>());
             }
         }
         if accesses.len() > limits.accesses {
@@ -190,8 +194,9 @@ pub fn collect_within(
     }
     if undecoded > 0 {
         diagnostics.push(format!(
-            "{undecoded} syscall records could not be decoded: {}",
-            undecoded_names.into_iter().collect::<Vec<_>>().join(", ")
+            "{undecoded} syscall records could not be decoded: {}, such as {:?}",
+            undecoded_names.into_iter().collect::<Vec<_>>().join(", "),
+            undecoded_example.unwrap_or_default()
         ));
     }
     diagnostics.sort();
@@ -201,11 +206,27 @@ pub fn collect_within(
 
 type Decoded = (Vec<Access>, Option<PathBuf>, Option<u32>);
 
+/// How much of a record a diagnostic quotes.
+const EXAMPLE_CHARS: usize = 200;
+
 fn decode(process: u32, call: &str, cwd: &Path) -> Option<Decoded> {
     let (name, tail) = call.split_once('(')?;
-    // A process ending, which strace may write without a result, or a call
-    // strace could not name in a thread the ending cut short: no access.
-    if matches!(name, "exit" | "exit_group" | "???") {
+    // A process ending, which strace may write without a result, a call
+    // strace could not name in a thread the ending cut short, or a signal,
+    // which a process sending it to itself can cut short: no access, however
+    // strace writes it.
+    if matches!(
+        name,
+        "exit"
+            | "exit_group"
+            | "???"
+            | "kill"
+            | "tkill"
+            | "tgkill"
+            | "rt_sigqueueinfo"
+            | "rt_tgsigqueueinfo"
+            | "pidfd_send_signal"
+    ) {
         return Some((Vec::new(), None, None));
     }
     let (args, result) = tail.rsplit_once(" = ")?;
@@ -301,13 +322,33 @@ fn decode(process: u32, call: &str, cwd: &Path) -> Option<Decoded> {
         "stat" | "lstat" | "stat64" | "lstat64" | "access" | "statfs" | "statfs64" | "getxattr"
         | "lgetxattr" | "listxattr" | "llistxattr" => emit(path(0, None)?, Operation::Metadata),
         "newfstatat" | "fstatat64" | "statx" | "faccessat" | "faccessat2" | "name_to_handle_at" => {
-            // With an empty path, the call reads the descriptor itself: a
-            // pipe, socket or other descriptor that is no file names no path.
-            let unnamed = quoted(args.get(1)?).is_some_and(|path| path.is_empty())
-                && args[0].contains('<')
-                && descriptor(args[0]).is_none();
-            if !unnamed {
-                emit(path(1, Some(0))?, Operation::Metadata);
+            // With an empty path, or a NULL one with AT_EMPTY_PATH, the call
+            // reads the descriptor itself: a pipe, socket or other descriptor
+            // that is no file names no path. A NULL path without the flag
+            // names nothing, as a runtime passes to see whether the call
+            // exists.
+            let null = args.get(1) == Some(&"NULL");
+            // The flags: statx's third argument, name_to_handle_at's fifth,
+            // the others' fourth; faccessat takes none.
+            let flags = match name {
+                "statx" => args.get(2),
+                "name_to_handle_at" => args.get(4),
+                "faccessat" => None,
+                _ => args.get(3),
+            };
+            let probe = null && !flags.is_some_and(|flags| flags.contains("AT_EMPTY_PATH"));
+            let empty = null || quoted(args.get(1)?).is_some_and(|path| path.is_empty());
+            let unnamed = empty && args[0].contains('<') && descriptor(args[0]).is_none();
+            if !probe && !unnamed {
+                let target = if null {
+                    normalize(
+                        &descriptor(args[0])
+                            .or_else(|| args[0].starts_with("AT_FDCWD").then(|| cwd.to_owned()))?,
+                    )
+                } else {
+                    path(1, Some(0))?
+                };
+                emit(target, Operation::Metadata);
             }
         }
         "inotify_add_watch" => emit(path(1, None)?, Operation::Metadata),
@@ -559,17 +600,36 @@ mod tests {
         for call in [
             "newfstatat(1<pipe:[123]>, \"\", {st_mode=S_IFIFO|0600, ...}, AT_EMPTY_PATH) = 0",
             "statx(17<socket:[456]>, \"\", AT_STATX_SYNC_AS_STAT|AT_EMPTY_PATH, STATX_ALL, {...}) = 0",
+            // Node's probe for statx, and one on a descriptor whose name
+            // holds the flag's name, which is no flag.
+            "statx(0</dev/null<char 1:3>>, NULL, AT_STATX_SYNC_AS_STAT, STATX_ALL, NULL) = -1 EFAULT (Bad address)",
+            "statx(3</repo/AT_EMPTY_PATH.txt>, NULL, AT_STATX_SYNC_AS_STAT, STATX_ALL, NULL) = -1 EFAULT (Bad address)",
         ] {
             let (events, _, _) = decode(1, call, cwd).unwrap();
             assert!(events.is_empty(), "{call}");
         }
-        // A file's descriptor still names its file.
-        let (events, _, _) = decode(
-            1,
+        // A file's descriptor still names its file, with an empty path or,
+        // as newer kernels take, a NULL one.
+        for call in [
             "newfstatat(3</repo/a.txt>, \"\", {st_mode=S_IFREG|0644, ...}, AT_EMPTY_PATH) = 0",
-            cwd,
-        )
-        .unwrap();
-        assert_eq!(events[0].path, "/repo/a.txt");
+            "statx(3</repo/a.txt>, NULL, AT_STATX_SYNC_AS_STAT|AT_EMPTY_PATH, STATX_ALL, {...}) = 0",
+        ] {
+            let (events, _, _) = decode(1, call, cwd).unwrap();
+            assert_eq!(events[0].path, "/repo/a.txt", "{call}");
+        }
+    }
+
+    #[test]
+    fn a_signal_is_no_access_however_strace_writes_it() {
+        let cwd = Path::new("/repo");
+        for call in [
+            "tgkill(42, 43, SIGRTMIN) = 0",
+            "tgkill(42, 42, SIGKILL <unfinished ...>) = ?",
+            "tgkill(42, 42, SIGABRT",
+            "kill(42, SIGTERM) = 0",
+        ] {
+            let (events, _, _) = decode(1, call, cwd).unwrap_or_else(|| panic!("{call}"));
+            assert!(events.is_empty(), "{call}");
+        }
     }
 }

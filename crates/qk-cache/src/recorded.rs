@@ -182,20 +182,23 @@ impl PathSet {
     /// keyed by how it is now, a recording would key the task by what was
     /// left there rather than by what the task saw.
     ///
-    /// A file read or found changed if it was written. A listed directory
-    /// changed if an entry other than the task's writes and `outputs` was
-    /// added, renamed or replaced, or, in a directory the task wrote nothing
-    /// to, one was removed: a directory's own time moves with its entries, so
-    /// where the task wrote, a removal cannot be told from its own writes.
+    /// A file read or found changed if it was written. A listing, which keys
+    /// its entries' names and kinds, changed if an entry was added, removed
+    /// or renamed, which moves the directory's own modification time; what
+    /// is written inside an entry does not change it, though it moves the
+    /// entry's change time. Where the task wrote into the directory, its time
+    /// moves with the task's own writes, so there an entry other than the
+    /// task's writes and `outputs` changed it: a file whose change time
+    /// moved, by being added, moved in or rewritten, or a subdirectory
+    /// created after `started`, by its birth time, which a file system
+    /// without one cannot tell. A removal there, or a subdirectory moved in,
+    /// cannot be told from the task's own writes.
     pub fn changed_since(
         &self,
         root: &Path,
         started: SystemTime,
         outputs: &[&Outputs],
     ) -> Option<&str> {
-        let since = |path: &Path| {
-            std::fs::symlink_metadata(path).is_ok_and(|metadata| changed(&metadata) >= started)
-        };
         let file = self.reads.iter().chain(&self.present).find(|path| {
             std::fs::symlink_metadata(root.join(path))
                 .is_ok_and(|metadata| !metadata.is_dir() && changed(&metadata) >= started)
@@ -210,23 +213,41 @@ impl PathSet {
                 let Ok(entries) = std::fs::read_dir(&absolute) else {
                     return false;
                 };
-                let mut own = self.written.iter().any(|path| parent(path) == *directory);
-                for entry in entries.flatten() {
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    let path = if *directory == "." {
-                        name
-                    } else {
-                        format!("{directory}/{name}")
-                    };
-                    if self.written.contains(&path)
-                        || outputs.iter().any(|outputs| outputs.matches(&path))
-                    {
-                        own = true;
-                    } else if since(&entry.path()) {
-                        return true;
-                    }
+                // Each entry by its path, and whether the task wrote it.
+                let entries: Vec<(std::fs::DirEntry, bool)> = entries
+                    .flatten()
+                    .map(|entry| {
+                        let name = entry.file_name().to_string_lossy().into_owned();
+                        let path = if *directory == "." {
+                            name
+                        } else {
+                            format!("{directory}/{name}")
+                        };
+                        let own = self.written.contains(&path)
+                            || outputs.iter().any(|outputs| outputs.matches(&path));
+                        (entry, own)
+                    })
+                    .collect();
+                let own = self.written.iter().any(|path| parent(path) == *directory)
+                    || entries.iter().any(|(_, own)| *own);
+                if !own {
+                    return std::fs::symlink_metadata(&absolute)
+                        .and_then(|metadata| metadata.modified())
+                        .is_ok_and(|modified| modified >= started);
                 }
-                !own && since(&absolute)
+                entries.iter().filter(|(_, own)| !own).any(|(entry, _)| {
+                    std::fs::symlink_metadata(entry.path()).is_ok_and(|metadata| {
+                        // A file's change time moves when it is moved in,
+                        // and with a rewrite, which counts too. A
+                        // subdirectory's moves with what is written inside
+                        // it, so it counts only once it was created.
+                        if metadata.is_dir() {
+                            metadata.created().is_ok_and(|born| born >= started)
+                        } else {
+                            changed(&metadata) >= started
+                        }
+                    })
+                })
             })
         })
         .map(String::as_str)
@@ -645,13 +666,14 @@ mod tests {
     #[test]
     fn finds_what_changed_while_the_task_ran() {
         let temp = tempfile::tempdir().unwrap();
-        for path in ["read.txt", "found.txt", "listed.txt"] {
+        for path in ["read.txt", "found.txt", "listed.txt", "before.txt"] {
             std::fs::write(temp.path().join(path), "before").unwrap();
         }
         for directory in ["listed", "written"] {
             std::fs::create_dir(temp.path().join(directory)).unwrap();
             std::fs::write(temp.path().join(directory).join("kept.txt"), "").unwrap();
         }
+        std::fs::create_dir(temp.path().join("listed/sub")).unwrap();
         let set = PathSet {
             reads: ["read.txt".to_owned(), "gone.txt".to_owned()].into(),
             present: ["found.txt".to_owned(), ".".to_owned()].into(),
@@ -683,6 +705,37 @@ mod tests {
             present: [].into(),
             ..set.clone()
         };
+        // Another task writing inside an entry, or rewriting one in place,
+        // leaves the listing as it was.
+        std::fs::write(temp.path().join("listed/sub/made.txt"), "").unwrap();
+        assert_eq!(changed(&listings), None);
+        // An entry another process adds where the task wrote too.
+        std::fs::write(temp.path().join("written/other.txt"), "").unwrap();
+        if std::fs::metadata(temp.path().join("written/other.txt"))
+            .and_then(|metadata| metadata.created())
+            .is_ok()
+        {
+            assert_eq!(changed(&listings), Some("written".into()));
+        }
+        std::fs::remove_file(temp.path().join("written/other.txt")).unwrap();
+        // A file that was there before, unchanged, moved in where the task
+        // wrote too: a move updates its change time, which Unix keeps.
+        #[cfg(unix)]
+        {
+            std::fs::rename(
+                temp.path().join("before.txt"),
+                temp.path().join("written/moved.txt"),
+            )
+            .unwrap();
+            assert_eq!(changed(&listings), Some("written".into()));
+            std::fs::rename(
+                temp.path().join("written/moved.txt"),
+                temp.path().join("before.txt"),
+            )
+            .unwrap();
+        }
+        // An entry added where the task wrote nothing.
+        std::fs::write(temp.path().join("listed/new.txt"), "").unwrap();
         assert_eq!(changed(&listings), Some("listed".into()));
         // A removal, where the task wrote nothing.
         let removed = tempfile::tempdir().unwrap();
