@@ -13,7 +13,7 @@
 //! task's outputs and warm paths, files it wrote before reading them and its
 //! `ignoreReads` are left out.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -184,20 +184,24 @@ impl PathSet {
     ///
     /// A file read or found changed if it was written. A listing, which keys
     /// its entries' names and kinds, changed if an entry was added, removed
-    /// or renamed, which moves the directory's own modification time; what
-    /// is written inside an entry does not change it, though it moves the
-    /// entry's change time. Where the task wrote into the directory, its time
-    /// moves with the task's own writes, so there an entry other than the
-    /// task's writes and `outputs` changed it: a file whose change time
-    /// moved, by being added, moved in or rewritten, or a subdirectory
-    /// created after `started`, by its birth time, which a file system
-    /// without one cannot tell. A removal there, or a subdirectory moved in,
-    /// cannot be told from the task's own writes.
+    /// or renamed. In a directory `before` holds, that is told exactly, by
+    /// comparing its entries with those before the task ran, leaving out
+    /// what the task wrote and what listings leave out. Elsewhere it moves
+    /// the directory's own modification time; what is written inside an
+    /// entry does not change it, though it moves the entry's change time.
+    /// Where the task wrote into the directory, or its own outputs are
+    /// there, its time moves with the task's own writes, so there an entry
+    /// other than those changed it: a file whose change time moved, by being
+    /// added, moved in or rewritten, or a subdirectory created after
+    /// `started`, by its birth time, which a file system without one cannot
+    /// tell. A removal there, or a subdirectory moved in, cannot be told
+    /// from the task's own writes.
     pub(crate) fn changed_since(
         &self,
         root: &Path,
         started: SystemTime,
         unlisted: &Unlisted,
+        before: &Before,
     ) -> Option<&str> {
         let file = self.reads.iter().chain(&self.present).find(|path| {
             std::fs::symlink_metadata(root.join(path))
@@ -210,43 +214,51 @@ impl PathSet {
                 } else {
                     root.join(directory)
                 };
+                let skipped = |path: &str| self.written.contains(path) || unlisted.matches(path);
+                if let Some(earlier) = before.0.get(*directory) {
+                    let earlier: BTreeSet<_> = earlier
+                        .iter()
+                        .filter(|(name, _)| !self.written.contains(&child(directory, name)))
+                        .cloned()
+                        .collect();
+                    return entries(root, directory, skipped).is_none_or(|now| now != earlier);
+                }
                 let Ok(entries) = std::fs::read_dir(&absolute) else {
                     return false;
                 };
-                // Each entry by its path, and whether the task wrote it.
-                let entries: Vec<(std::fs::DirEntry, bool)> = entries
+                // Each entry, whether listings leave it out, and whether the
+                // task wrote it or it is among the task's own outputs.
+                let entries: Vec<(std::fs::DirEntry, bool, bool)> = entries
                     .flatten()
                     .map(|entry| {
-                        let name = entry.file_name().to_string_lossy().into_owned();
-                        let path = if *directory == "." {
-                            name
-                        } else {
-                            format!("{directory}/{name}")
-                        };
-                        let own = self.written.contains(&path) || unlisted.matches(&path);
-                        (entry, own)
+                        let path = child(directory, &entry.file_name().to_string_lossy());
+                        let own = self.written.contains(&path) || unlisted.own(&path);
+                        (entry, skipped(&path), own)
                     })
                     .collect();
                 let own = self.written.iter().any(|path| parent(path) == *directory)
-                    || entries.iter().any(|(_, own)| *own);
+                    || entries.iter().any(|(_, _, own)| *own);
                 if !own {
                     return std::fs::symlink_metadata(&absolute)
                         .and_then(|metadata| metadata.modified())
                         .is_ok_and(|modified| modified >= started);
                 }
-                entries.iter().filter(|(_, own)| !own).any(|(entry, _)| {
-                    std::fs::symlink_metadata(entry.path()).is_ok_and(|metadata| {
-                        // A file's change time moves when it is moved in,
-                        // and with a rewrite, which counts too. A
-                        // subdirectory's moves with what is written inside
-                        // it, so it counts only once it was created.
-                        if metadata.is_dir() {
-                            metadata.created().is_ok_and(|born| born >= started)
-                        } else {
-                            changed(&metadata) >= started
-                        }
+                entries
+                    .iter()
+                    .filter(|(_, skipped, _)| !skipped)
+                    .any(|(entry, _, _)| {
+                        std::fs::symlink_metadata(entry.path()).is_ok_and(|metadata| {
+                            // A file's change time moves when it is moved in,
+                            // and with a rewrite, which counts too. A
+                            // subdirectory's moves with what is written inside
+                            // it, so it counts only once it was created.
+                            if metadata.is_dir() {
+                                metadata.created().is_ok_and(|born| born >= started)
+                            } else {
+                                changed(&metadata) >= started
+                            }
+                        })
                     })
-                })
             })
         })
         .map(String::as_str)
@@ -332,6 +344,39 @@ fn parent(path: &str) -> &str {
     path.rsplit_once('/').map_or(".", |(parent, _)| parent)
 }
 
+/// The path of `name` in `directory`, `.` being the workspace root.
+fn child(directory: &str, name: &str) -> String {
+    if directory == "." {
+        name.to_owned()
+    } else {
+        format!("{directory}/{name}")
+    }
+}
+
+/// The names and kinds of `directory`'s entries but those `skipped`; none
+/// when it cannot be read.
+fn entries(
+    root: &Path,
+    directory: &str,
+    skipped: impl Fn(&str) -> bool,
+) -> Option<BTreeSet<(String, &'static str)>> {
+    let absolute = if directory == "." {
+        root.to_path_buf()
+    } else {
+        root.join(directory)
+    };
+    Some(
+        std::fs::read_dir(&absolute)
+            .ok()?
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                (!skipped(&child(directory, &name))).then(|| (name, kind(&entry.path())))
+            })
+            .collect(),
+    )
+}
+
 /// What is at `path`, without following a link.
 fn kind(path: &Path) -> &'static str {
     match std::fs::symlink_metadata(path) {
@@ -350,14 +395,57 @@ fn kind(path: &Path) -> &'static str {
 /// `ignoreReads` names. Only listings leave them out: a file among them that
 /// the task read is still keyed by its content.
 pub(crate) struct Unlisted<'a> {
-    pub outputs: Vec<&'a Outputs>,
+    pub own: Vec<&'a Outputs>,
+    pub siblings: &'a [Outputs],
     pub ignore: &'a [Pattern],
 }
 
 impl Unlisted<'_> {
     fn matches(&self, path: &str) -> bool {
-        self.outputs.iter().any(|outputs| outputs.matches(path))
+        self.own(path)
+            || self.siblings.iter().any(|outputs| outputs.matches(path))
             || self.ignore.iter().any(|pattern| pattern.is_match(path))
+    }
+
+    fn own(&self, path: &str) -> bool {
+        self.own.iter().any(|outputs| outputs.matches(path))
+    }
+
+    /// Where other targets' outputs and ignored paths come and go while the
+    /// task runs: the directories holding those outputs, and the root of the
+    /// task's project, where a tool's `ignoreReads` state usually sits.
+    pub(crate) fn directories(&self, project_root: &str) -> BTreeSet<String> {
+        let project_root = if project_root.is_empty() {
+            "."
+        } else {
+            project_root
+        };
+        self.siblings
+            .iter()
+            .flat_map(Outputs::anchors)
+            .map(|anchor| parent(anchor).to_owned())
+            .chain([project_root.to_owned()])
+            .collect()
+    }
+}
+
+/// The entries of directories before a task ran, but those its listings
+/// leave out, so a listing whose directory gained or lost something else as
+/// it ran is told apart from one where only those came and went.
+#[derive(Default)]
+pub(crate) struct Before(BTreeMap<String, BTreeSet<(String, &'static str)>>);
+
+impl Before {
+    pub(crate) fn take(root: &Path, directories: BTreeSet<String>, unlisted: &Unlisted) -> Self {
+        Self(
+            directories
+                .into_iter()
+                .filter_map(|directory| {
+                    let entries = entries(root, &directory, |path| unlisted.matches(path))?;
+                    Some((directory, entries))
+                })
+                .collect(),
+        )
     }
 }
 
@@ -507,7 +595,8 @@ mod tests {
 
     /// Nothing left out of listings.
     const NOTHING: Unlisted<'static> = Unlisted {
-        outputs: Vec::new(),
+        own: Vec::new(),
+        siblings: &[],
         ignore: &[],
     };
     use qk_input_analysis::Category;
@@ -606,7 +695,8 @@ mod tests {
         };
         let outputs = Outputs::from_paths(&["icons/out".into()]).unwrap();
         let unlisted = Unlisted {
-            outputs: vec![&outputs],
+            own: vec![&outputs],
+            siblings: &[],
             ignore: &[],
         };
         let strong = || strong_key("weak", &set, &snapshot, &root, &unlisted).unwrap();
@@ -710,7 +800,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         let started = now(temp.path());
         let changed = |set: &PathSet| {
-            set.changed_since(temp.path(), started, &NOTHING)
+            set.changed_since(temp.path(), started, &NOTHING, &Before::default())
                 .map(str::to_owned)
         };
         assert_eq!(changed(&set), None);
@@ -774,10 +864,13 @@ mod tests {
             listings: [".".to_owned()].into(),
             ..PathSet::default()
         };
-        assert_eq!(root.changed_since(removed.path(), started, &NOTHING), None);
+        assert_eq!(
+            root.changed_since(removed.path(), started, &NOTHING, &Before::default()),
+            None
+        );
         std::fs::remove_file(removed.path().join("gone.txt")).unwrap();
         assert_eq!(
-            root.changed_since(removed.path(), started, &NOTHING),
+            root.changed_since(removed.path(), started, &NOTHING, &Before::default()),
             Some(".")
         );
     }
@@ -804,24 +897,39 @@ mod tests {
             listings: ["app".to_owned()].into(),
             ..PathSet::default()
         };
-        let build = Outputs::from_patterns(&["app/.syb-ts"]);
+        std::fs::write(root.join("app/kept.txt"), "").unwrap();
+        let build = [Outputs::from_patterns(&["app/.syb-ts"])];
         let ignore = [Pattern::new("**/.fallow", false).unwrap()];
         let unlisted = Unlisted {
-            outputs: vec![&build],
+            own: Vec::new(),
+            siblings: &build,
             ignore: &ignore,
         };
+        assert_eq!(unlisted.directories("app"), ["app".to_owned()].into());
         let snapshot = Snapshot::new(&workspace, &graph, &root.join("cache")).unwrap();
         let key = || strong_key("weak", &set, &snapshot, root, &unlisted).unwrap();
         let before = key();
         std::thread::sleep(std::time::Duration::from_millis(20));
+        let taken = Before::take(root, unlisted.directories("app"), &unlisted);
         let started = now(root);
+        let changed = |taken: &Before| set.changed_since(root, started, &unlisted, taken);
         // Another target's output and an ignored path appear as it runs.
         std::fs::create_dir(root.join("app/.syb-ts")).unwrap();
         std::fs::create_dir(root.join("app/.fallow")).unwrap();
         assert_eq!(key(), before);
-        assert_eq!(set.changed_since(root, started, &unlisted), None);
-        // Anything else is still part of the listing.
+        assert_eq!(changed(&taken), None);
+        // Without the entries from before, the directory's time is all there
+        // is, and it moved.
+        assert_eq!(changed(&Before::default()), Some("app"));
+        // A removal is still a change, though left-out entries are there.
+        std::fs::remove_file(root.join("app/kept.txt")).unwrap();
+        assert_ne!(key(), before);
+        assert_eq!(changed(&taken), Some("app"));
+        std::fs::write(root.join("app/kept.txt"), "").unwrap();
+        assert_eq!(changed(&taken), None);
+        // So is anything else added.
         std::fs::write(root.join("app/README.md"), "").unwrap();
         assert_ne!(key(), before);
+        assert_eq!(changed(&taken), Some("app"));
     }
 }

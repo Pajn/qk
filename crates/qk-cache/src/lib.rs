@@ -473,7 +473,8 @@ impl Cache {
             })
             .unwrap_or_default();
         let unlisted = recorded::Unlisted {
-            outputs: own.iter().copied().chain(&siblings).collect(),
+            own: own.clone(),
+            siblings: &siblings,
             ignore: &ignore,
         };
         let inputs = &keyed.as_ref().expect("a cacheable task is keyed").1;
@@ -676,6 +677,20 @@ impl Cache {
         let capture =
             Capture::new(Some(log.as_file().try_clone()?), prepared.display.clone()).retain_log();
         let restored = before(running);
+        let listed = match (&recordings, &prepared.recording) {
+            (Some(_), Some(_)) => {
+                let project_root = workspace
+                    .projects
+                    .get(&task.project)
+                    .map_or("", |project| project.root.as_str());
+                recorded::Before::take(
+                    &workspace.root,
+                    unlisted.directories(project_root),
+                    &unlisted,
+                )
+            }
+            _ => recorded::Before::default(),
+        };
         let started = recorded::now(&self.root.join("tmp"));
         let executing = profile::span(&task.id, "execute");
         let outcome = execute_captured(running, cancelled, Some(&capture))?;
@@ -699,7 +714,7 @@ impl Cache {
                         if set.is_empty() {
                             return Err("its trace named no path in the workspace".to_owned());
                         }
-                        match set.changed_since(&workspace.root, started, &unlisted) {
+                        match set.changed_since(&workspace.root, started, &unlisted, &listed) {
                             Some(path) => Err(format!("{path} changed while it ran")),
                             None => Ok(set),
                         }
@@ -1061,7 +1076,8 @@ pub fn run_upload_worker() -> anyhow::Result<()> {
 }
 
 /// The outputs of every other target of `task`'s project, as their targets
-/// declare them; a target whose outputs cannot be read is left out.
+/// declare them, and as each of their configurations does with its options,
+/// which can move an output; one whose outputs cannot be read is left out.
 fn project_outputs(workspace: &Workspace, task: &Task) -> Vec<paths::Outputs> {
     let Some(project) = workspace.projects.get(&task.project) else {
         return Vec::new();
@@ -1070,17 +1086,26 @@ fn project_outputs(workspace: &Workspace, task: &Task) -> Vec<paths::Outputs> {
         .targets
         .iter()
         .filter(|(target, _)| **target != task.target)
-        .filter_map(|(target, definition)| {
-            let sibling = Task {
-                id: format!("{}:{target}", task.project),
-                project: task.project.clone(),
-                target: target.clone(),
-                configuration: None,
-                args: Vec::new(),
-                definition: definition.clone(),
-                dependencies: Default::default(),
-                edges: Default::default(),
-            };
+        .flat_map(|(target, definition)| {
+            let configured = definition.configurations.iter().map(|(name, options)| {
+                let mut definition = definition.clone();
+                definition.options.extend(options.clone());
+                (Some(name.clone()), definition)
+            });
+            std::iter::once((None, definition.clone()))
+                .chain(configured)
+                .map(move |(configuration, definition)| Task {
+                    id: format!("{}:{target}", task.project),
+                    project: task.project.clone(),
+                    target: target.clone(),
+                    configuration,
+                    args: Vec::new(),
+                    definition,
+                    dependencies: Default::default(),
+                    edges: Default::default(),
+                })
+        })
+        .filter_map(|sibling| {
             paths::Outputs::new(workspace, &sibling)
                 .ok()
                 .filter(paths::Outputs::declared)
@@ -1284,5 +1309,33 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    #[test]
+    fn project_outputs_include_each_configuration_of_other_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(root.join("nx.json"), "{}").unwrap();
+        std::fs::create_dir(root.join("app")).unwrap();
+        std::fs::write(
+            root.join("app/project.json"),
+            r#"{"name":"app","targets":{
+                "build":{"command":"true","outputs":["{options.outputPath}"],
+                  "options":{"outputPath":"app/dist"},
+                  "configurations":{"production":{"outputPath":"app/dist-production"}}},
+                "lint":{"command":"true"}}}"#,
+        )
+        .unwrap();
+        let workspace = Workspace::load(root).unwrap();
+        let graph = qk_taskgraph::TaskGraph::build(
+            &workspace,
+            &[qk_taskgraph::Request::parse("app:lint").unwrap()],
+        )
+        .unwrap();
+        let outputs = project_outputs(&workspace, &graph.tasks["app:lint"]);
+        let matched = |path: &str| outputs.iter().any(|outputs| outputs.matches(path));
+        assert!(matched("app/dist/main.js"));
+        assert!(matched("app/dist-production/main.js"));
+        assert!(!matched("app/src/main.ts"));
     }
 }
