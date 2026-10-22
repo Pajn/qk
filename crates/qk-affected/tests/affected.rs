@@ -1398,9 +1398,9 @@ fn unreadable_lockfile_and_root_dependency_changes_affect_every_project() {
 
 #[test]
 fn deleted_mandatory_workspace_files_affect_tasks_with_narrow_inputs() {
+    // Not `.gitignore` or `.nxignore`, which, as in Nx, count only through the
+    // files they leave out of a task's inputs.
     for file in [
-        ".gitignore",
-        ".nxignore",
         "tsconfig.base.json",
         "package-lock.json",
         "pnpm-lock.yaml",
@@ -2267,4 +2267,14 @@ fn named_json_inputs_count_as_changed_whole() {
         }),
         ["app:build"]
     );
+}
+
+/// As in Nx, an ignore file is not an input of every task: an edit that
+/// changes no task's files affects no task.
+#[test]
+fn an_ignore_file_edit_that_changes_no_inputs_affects_no_task() {
+    let repo = task_graph_repo();
+    write(&repo.root, ".gitignore", "dist/\ncoverage/\n");
+    write(&repo.root, ".nxignore", "libs/lib/generated/\ntmp/\n");
+    assert!(affected_tasks(&repo).is_empty());
 }

@@ -5809,29 +5809,43 @@ fn generated_source_is_keyed_alongside_selective_dependency_outputs() {
     }
 }
 
+/// As in Nx, an ignore file is keyed only through the files it leaves in or
+/// out of a task's inputs.
 #[test]
-fn root_ignore_files_are_keyed_with_narrow_inputs() {
+fn root_ignore_files_count_through_the_inputs_they_change() {
     let fixture = Fixture::new(target(
         "build",
         json!({"inputs":["{projectRoot}/src/**/*"]}),
     ));
+    // An untracked source file, which an ignore file can leave out.
+    fs::write(fixture.root.join("src/extra.txt"), "extra").unwrap();
     success(fixture.build(&fixture.root, &[]));
+    assert_eq!(fixture.runs(), 1);
     let ignore = fixture.root.join(".gitignore");
     let original = fs::read_to_string(&ignore).unwrap();
+    // A comment changes no input.
     fs::write(&ignore, format!("{original}# changed\n")).unwrap();
+    let hit = success(fixture.build(&fixture.root, &[]));
+    assert!(stderr(&hit).contains("cache hit app:build"));
+    assert_eq!(fixture.runs(), 1);
+    // Leaving the source file out does.
+    fs::write(&ignore, format!("{original}src/extra.txt\n")).unwrap();
     success(fixture.build(&fixture.root, &[]));
     assert_eq!(fixture.runs(), 2);
     let nxignore = fixture.root.join(".nxignore");
     fs::write(&nxignore, "# first\n").unwrap();
-    success(fixture.build(&fixture.root, &[]));
-    assert_eq!(fixture.runs(), 3);
-    fs::write(&nxignore, "# second\n").unwrap();
-    success(fixture.build(&fixture.root, &[]));
-    assert_eq!(fixture.runs(), 4);
+    let hit = success(fixture.build(&fixture.root, &[]));
+    assert!(stderr(&hit).contains("cache hit app:build"));
+    assert_eq!(fixture.runs(), 2);
+    fs::write(&ignore, &original).unwrap();
+    fs::write(&nxignore, "src/extra.txt\n").unwrap();
+    let hit = success(fixture.build(&fixture.root, &[]));
+    assert!(stderr(&hit).contains("cache hit app:build"));
+    assert_eq!(fixture.runs(), 2);
     fs::remove_file(nxignore).unwrap();
     let restored = success(fixture.build(&fixture.root, &[]));
     assert!(stderr(&restored).contains("cache hit app:build"));
-    assert_eq!(fixture.runs(), 4);
+    assert_eq!(fixture.runs(), 2);
 }
 
 #[test]

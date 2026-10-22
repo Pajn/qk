@@ -2404,10 +2404,11 @@ fn infer(snapshot: &Snapshot, workspace: &Workspace, task: &Task) -> Result<Infe
         .into_iter()
         .find(|name| exists(name))
         .map(str::to_owned);
+    // As in Nx, `.gitignore` and `.nxignore` are not keyed: what they change
+    // about a task's inputs is which files its filesets list, which the key
+    // holds already, and an edit that changes no listing changes no key.
     for path in [
         "nx.json",
-        ".gitignore",
-        ".nxignore",
         qk_config::LOCAL_WORKSPACE,
         "package-lock.json",
         "yarn.lock",
@@ -3348,7 +3349,6 @@ mod tests {
         let cancelled = AtomicBool::new(false);
         let expected = |name: &str| {
             BTreeSet::from([
-                ".nxignore".into(),
                 "nx.json".into(),
                 "project.json".into(),
                 format!("src/{name}.txt"),

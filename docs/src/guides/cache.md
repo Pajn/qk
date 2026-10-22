@@ -45,10 +45,14 @@ selects a whole file qk would add, the file counts whole, as the input says. A
 `json` input on such a file adds its fields beside qk's copy rather than
 narrowing it.
 
-Root workspace files (`nx.json`, `.gitignore`, `.nxignore`,
-`pnpm-workspace.yaml`, lockfiles) and the manifests of the task's project
-(`project.json`, `project.local.json` and `package.json`) are always included,
-its scripts and dependency declarations with them. The root tsconfig
+Root workspace files (`nx.json`, `pnpm-workspace.yaml`, lockfiles) and the
+manifests of the task's project (`project.json`, `project.local.json` and
+`package.json`) are always included, its scripts and dependency declarations
+with them. As in Nx, `.gitignore` and `.nxignore` are not: what they change
+about a task's inputs is which files its inputs list, which the key holds
+already. A tool that reads `.gitignore` itself, as a linter or formatter
+deciding what to check does, should declare it, such as
+`{workspaceRoot}/.gitignore`. The root tsconfig
 (`tsconfig.base.json`, or else `tsconfig.json`) is included as Nx hashes it:
 without `compilerOptions.paths`, so adding or moving a path mapping leaves
 every key as it was. With `selectivelyHashTsConfig: true` in the options of
