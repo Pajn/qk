@@ -193,11 +193,11 @@ impl PathSet {
     /// created after `started`, by its birth time, which a file system
     /// without one cannot tell. A removal there, or a subdirectory moved in,
     /// cannot be told from the task's own writes.
-    pub fn changed_since(
+    pub(crate) fn changed_since(
         &self,
         root: &Path,
         started: SystemTime,
-        outputs: &[&Outputs],
+        unlisted: &Unlisted,
     ) -> Option<&str> {
         let file = self.reads.iter().chain(&self.present).find(|path| {
             std::fs::symlink_metadata(root.join(path))
@@ -223,8 +223,7 @@ impl PathSet {
                         } else {
                             format!("{directory}/{name}")
                         };
-                        let own = self.written.contains(&path)
-                            || outputs.iter().any(|outputs| outputs.matches(&path));
+                        let own = self.written.contains(&path) || unlisted.matches(&path);
                         (entry, own)
                     })
                     .collect();
@@ -264,7 +263,7 @@ impl PathSet {
         &self,
         snapshot: &Snapshot,
         root: &Path,
-        outputs: &[&Outputs],
+        unlisted: &Unlisted,
     ) -> Result<Value> {
         // A file by its content, anything else by what it is.
         let value = |path: &str| match kind(&root.join(path)) {
@@ -280,7 +279,7 @@ impl PathSet {
             .collect();
         let mut listings = Map::new();
         for directory in &self.listings {
-            listings.insert(directory.clone(), self.listing(root, directory, outputs)?);
+            listings.insert(directory.clone(), self.listing(root, directory, unlisted)?);
         }
         let existence: Map<String, Value> = self
             .present
@@ -292,7 +291,7 @@ impl PathSet {
     }
 
     /// A directory's entries by name and kind, without what the task writes.
-    fn listing(&self, root: &Path, directory: &str, outputs: &[&Outputs]) -> Result<Value> {
+    fn listing(&self, root: &Path, directory: &str, unlisted: &Unlisted) -> Result<Value> {
         let absolute = if directory == "." {
             root.to_path_buf()
         } else {
@@ -319,8 +318,7 @@ impl PathSet {
             } else {
                 format!("{directory}/{name}")
             };
-            if self.written.contains(&path) || outputs.iter().any(|outputs| outputs.matches(&path))
-            {
+            if self.written.contains(&path) || unlisted.matches(&path) {
                 continue;
             }
             listed.insert(name, json!(kind(&entry.path())));
@@ -342,6 +340,24 @@ fn kind(path: &Path) -> &'static str {
         Ok(metadata) if metadata.is_file() => "file",
         Ok(_) => "other",
         Err(_) => "absent",
+    }
+}
+
+/// What a recording's listings leave out of a directory's entries: what is
+/// there after a task runs whether or not it read anything, rather than what
+/// it read. The task's own outputs, those of every other target of its
+/// project, such as a build's output beside a lint's sources, and what its
+/// `ignoreReads` names. Only listings leave them out: a file among them that
+/// the task read is still keyed by its content.
+pub(crate) struct Unlisted<'a> {
+    pub outputs: Vec<&'a Outputs>,
+    pub ignore: &'a [Pattern],
+}
+
+impl Unlisted<'_> {
+    fn matches(&self, path: &str) -> bool {
+        self.outputs.iter().any(|outputs| outputs.matches(path))
+            || self.ignore.iter().any(|pattern| pattern.is_match(path))
     }
 }
 
@@ -443,13 +459,13 @@ pub(crate) fn strong_key(
     set: &PathSet,
     snapshot: &Snapshot,
     root: &Path,
-    outputs: &[&Outputs],
+    unlisted: &Unlisted,
 ) -> Result<String> {
     key(&json!({
         "schema": "qk-recorded-v1",
         "weak": weak,
         "set": set.digest()?,
-        "values": set.values(snapshot, root, outputs)?,
+        "values": set.values(snapshot, root, unlisted)?,
     }))
 }
 
@@ -488,6 +504,12 @@ fn changed(metadata: &std::fs::Metadata) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Nothing left out of listings.
+    const NOTHING: Unlisted<'static> = Unlisted {
+        outputs: Vec::new(),
+        ignore: &[],
+    };
     use qk_input_analysis::Category;
 
     fn access(path: &str, operation: Operation, result: &str) -> Access {
@@ -583,7 +605,11 @@ mod tests {
             written: ["icons/sprite.svg".into()].into(),
         };
         let outputs = Outputs::from_paths(&["icons/out".into()]).unwrap();
-        let strong = || strong_key("weak", &set, &snapshot, &root, &[&outputs]).unwrap();
+        let unlisted = Unlisted {
+            outputs: vec![&outputs],
+            ignore: &[],
+        };
+        let strong = || strong_key("weak", &set, &snapshot, &root, &unlisted).unwrap();
         let first = strong();
         // What the task writes in a listed directory, or its outputs there,
         // and files it never read change nothing.
@@ -684,7 +710,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         let started = now(temp.path());
         let changed = |set: &PathSet| {
-            set.changed_since(temp.path(), started, &[])
+            set.changed_since(temp.path(), started, &NOTHING)
                 .map(str::to_owned)
         };
         assert_eq!(changed(&set), None);
@@ -748,8 +774,54 @@ mod tests {
             listings: [".".to_owned()].into(),
             ..PathSet::default()
         };
-        assert_eq!(root.changed_since(removed.path(), started, &[]), None);
+        assert_eq!(root.changed_since(removed.path(), started, &NOTHING), None);
         std::fs::remove_file(removed.path().join("gone.txt")).unwrap();
-        assert_eq!(root.changed_since(removed.path(), started, &[]), Some("."));
+        assert_eq!(
+            root.changed_since(removed.path(), started, &NOTHING),
+            Some(".")
+        );
+    }
+
+    #[test]
+    fn listings_leave_out_other_targets_outputs_and_ignored_reads() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = &temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("app/src")).unwrap();
+        std::fs::write(root.join("app/src/main.ts"), "").unwrap();
+        std::fs::write(root.join("nx.json"), "{}").unwrap();
+        std::fs::write(
+            root.join("project.json"),
+            r#"{"name":"app","targets":{"build":{"command":"true"}}}"#,
+        )
+        .unwrap();
+        let workspace = qk_config::Workspace::load(root).unwrap();
+        let graph = qk_taskgraph::TaskGraph::build(
+            &workspace,
+            &[qk_taskgraph::Request::parse("app:build").unwrap()],
+        )
+        .unwrap();
+        let set = PathSet {
+            listings: ["app".to_owned()].into(),
+            ..PathSet::default()
+        };
+        let build = Outputs::from_patterns(&["app/.syb-ts"]);
+        let ignore = [Pattern::new("**/.fallow", false).unwrap()];
+        let unlisted = Unlisted {
+            outputs: vec![&build],
+            ignore: &ignore,
+        };
+        let snapshot = Snapshot::new(&workspace, &graph, &root.join("cache")).unwrap();
+        let key = || strong_key("weak", &set, &snapshot, root, &unlisted).unwrap();
+        let before = key();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let started = now(root);
+        // Another target's output and an ignored path appear as it runs.
+        std::fs::create_dir(root.join("app/.syb-ts")).unwrap();
+        std::fs::create_dir(root.join("app/.fallow")).unwrap();
+        assert_eq!(key(), before);
+        assert_eq!(set.changed_since(root, started, &unlisted), None);
+        // Anything else is still part of the listing.
+        std::fs::write(root.join("app/README.md"), "").unwrap();
+        assert_ne!(key(), before);
     }
 }
