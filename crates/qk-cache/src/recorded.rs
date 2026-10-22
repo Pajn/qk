@@ -354,7 +354,7 @@ fn child(directory: &str, name: &str) -> String {
 }
 
 /// The names and kinds of `directory`'s entries but those `skipped`; none
-/// when it, or any of its entries, cannot be read.
+/// when it, or any of its entries or their kinds, cannot be read.
 fn entries(
     root: &Path,
     directory: &str,
@@ -370,7 +370,7 @@ fn entries(
         let entry = entry.ok()?;
         let name = entry.file_name().to_string_lossy().into_owned();
         if !skipped(&child(directory, &name)) {
-            found.insert((name, kind(&entry.path())));
+            found.insert((name, file_kind(entry.file_type().ok()?)));
         }
     }
     Some(found)
@@ -378,12 +378,18 @@ fn entries(
 
 /// What is at `path`, without following a link.
 fn kind(path: &Path) -> &'static str {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => "symlink",
-        Ok(metadata) if metadata.is_dir() => "directory",
-        Ok(metadata) if metadata.is_file() => "file",
-        Ok(_) => "other",
-        Err(_) => "absent",
+    std::fs::symlink_metadata(path).map_or("absent", |metadata| file_kind(metadata.file_type()))
+}
+
+fn file_kind(file_type: std::fs::FileType) -> &'static str {
+    if file_type.is_symlink() {
+        "symlink"
+    } else if file_type.is_dir() {
+        "directory"
+    } else if file_type.is_file() {
+        "file"
+    } else {
+        "other"
     }
 }
 
