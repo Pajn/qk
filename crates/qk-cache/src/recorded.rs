@@ -354,7 +354,7 @@ fn child(directory: &str, name: &str) -> String {
 }
 
 /// The names and kinds of `directory`'s entries but those `skipped`; none
-/// when it cannot be read.
+/// when it, or any of its entries, cannot be read.
 fn entries(
     root: &Path,
     directory: &str,
@@ -365,16 +365,15 @@ fn entries(
     } else {
         root.join(directory)
     };
-    Some(
-        std::fs::read_dir(&absolute)
-            .ok()?
-            .flatten()
-            .filter_map(|entry| {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                (!skipped(&child(directory, &name))).then(|| (name, kind(&entry.path())))
-            })
-            .collect(),
-    )
+    let mut found = BTreeSet::new();
+    for entry in std::fs::read_dir(&absolute).ok()? {
+        let entry = entry.ok()?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !skipped(&child(directory, &name)) {
+            found.insert((name, kind(&entry.path())));
+        }
+    }
+    Some(found)
 }
 
 /// What is at `path`, without following a link.
