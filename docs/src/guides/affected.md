@@ -128,8 +128,10 @@ ui is touched:
 ## Selecting affected tasks by inputs
 
 With `--granularity task`, `qk affected` selects tasks instead of projects. A
-task is affected when Nx 24 would select it, or when its cache key changed.
-As in Nx, that is when:
+task is affected when Nx 24 would select it, or when its cache key changed,
+except that qk narrows a lockfile change, as below, and a deleted manifest, as
+in [How changes reach projects](#how-changes-reach-projects). As in Nx, that
+is when:
 
 - a changed file is one of its resolved inputs, a declared output included:
   a tracked output is a file like any other;
@@ -153,6 +155,11 @@ keys, and each dependency project's `package.json` in the fields its key
 reads, so a task is affected when any of these changed, or a dependency's
 version moved into or out of the range the task's project declares for it.
 Under `"auto"`, these installed sets are what a lockfile change is judged by.
+Nx instead selects, on any lockfile change, every task it keys by the whole
+lockfile, such as those of a project that depends on no package, and every
+task that hashes a package whose lockfile entry moved, even where what the
+task's importers install stayed the same. qk keys neither, so it selects
+neither.
 
 A task is also affected when it reads the declared outputs of an affected
 task, through `dependentTasksOutputFiles` or a fileset that selects them. As

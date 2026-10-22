@@ -1,0 +1,8 @@
+[
+  "mobile:lint",
+  "scripts:lint",
+  "tooling:lint",
+  "ui:lint",
+  "web-e2e:lint",
+  "web:lint"
+]
