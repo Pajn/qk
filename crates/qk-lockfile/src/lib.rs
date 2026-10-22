@@ -292,12 +292,7 @@ impl Lockfile {
     /// Fingerprints of every installation of the package `name`, whichever
     /// importer installs it, and of everything each one reaches.
     pub fn package(&self, name: &str) -> BTreeSet<String> {
-        let keys = self
-            .snapshots
-            .keys()
-            .filter(|key| package_name(key) == name)
-            .cloned()
-            .collect();
+        let keys = self.installed_as(name).into_iter().collect();
         self.reach(keys)
             .iter()
             .map(|key| self.fingerprint(key))
@@ -307,12 +302,7 @@ impl Lockfile {
     /// The names of every package an installation of `name` reaches, `name`
     /// included when it is installed.
     pub fn reached_packages(&self, name: &str) -> BTreeSet<String> {
-        let keys = self
-            .snapshots
-            .keys()
-            .filter(|key| package_name(key) == name)
-            .cloned()
-            .collect();
+        let keys = self.installed_as(name).into_iter().collect();
         self.reach(keys)
             .iter()
             .map(|key| package_name(key).to_owned())
@@ -333,13 +323,9 @@ impl Lockfile {
             .flatten()
             .map(|(_, key)| key)
             .collect();
-        let packages: BTreeSet<&str> = packages.into_iter().collect();
-        pending.extend(
-            self.snapshots
-                .keys()
-                .filter(|key| packages.contains(package_name(key)))
-                .cloned(),
-        );
+        for package in packages {
+            pending.extend(self.installed_as(package));
+        }
         self.reach(pending)
     }
 
@@ -354,6 +340,28 @@ impl Lockfile {
                 })
                 .collect(),
         )
+    }
+
+    /// The snapshot keys of `name`: every installation of the package, and,
+    /// as Nx makes an alias a package of its own, what an importer or a
+    /// package installs under that name, such as `typescript@7.0.2` for a
+    /// dependency `"@typescript/native": "npm:typescript@7.0.2"`.
+    fn installed_as(&self, name: &str) -> BTreeSet<String> {
+        let mut keys: BTreeSet<String> = self
+            .snapshots
+            .keys()
+            .filter(|key| package_name(key) == name)
+            .cloned()
+            .collect();
+        let dependencies = self.importers.values().chain(self.snapshots.values());
+        for (dependency, reference) in dependencies.flatten() {
+            if dependency == name
+                && let Some(key) = snapshot_key(dependency, reference)
+            {
+                keys.insert(key);
+            }
+        }
+        keys
     }
 
     /// The snapshot keys reachable from `pending`, including them.

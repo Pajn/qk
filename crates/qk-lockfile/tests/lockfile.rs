@@ -399,3 +399,42 @@ fn shared_snapshot_fingerprints_stay_local_to_each_lockfile() {
         original.snapshots.into_values().collect()
     );
 }
+
+#[test]
+fn finds_a_package_by_an_alias_it_is_installed_under() {
+    // `"@typescript/native": "npm:typescript@7.0.2"`, as Nx names it too.
+    let text = lockfile(
+        &[
+            ("app-a", &[("@typescript/native", "typescript@7.0.2")]),
+            ("app-b", &[("typescript", "5.9.3")]),
+        ],
+        &[
+            ("typescript@7.0.2", &[("dep", "1.0.0")]),
+            ("typescript@5.9.3", &[]),
+            ("dep@1.0.0", &[]),
+        ],
+    );
+    let lockfile = Lockfile::parse(&text).unwrap();
+    let keys = |name: &str| -> Vec<serde_json::Value> {
+        lockfile
+            .package(name)
+            .into_iter()
+            .map(|fingerprint| {
+                serde_json::from_str::<serde_json::Value>(&fingerprint).unwrap()["key"].clone()
+            })
+            .collect()
+    };
+    assert_eq!(
+        keys("@typescript/native"),
+        ["dep@1.0.0", "typescript@7.0.2"]
+    );
+    // The package's own name still finds every installation of it.
+    assert_eq!(
+        keys("typescript"),
+        ["dep@1.0.0", "typescript@5.9.3", "typescript@7.0.2"]
+    );
+    assert_eq!(
+        lockfile.reached_packages("@typescript/native"),
+        ["dep".to_owned(), "typescript".to_owned()].into()
+    );
+}
