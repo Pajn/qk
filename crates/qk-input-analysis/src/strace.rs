@@ -322,16 +322,25 @@ fn decode(process: u32, call: &str, cwd: &Path) -> Option<Decoded> {
         "stat" | "lstat" | "stat64" | "lstat64" | "access" | "statfs" | "statfs64" | "getxattr"
         | "lgetxattr" | "listxattr" | "llistxattr" => emit(path(0, None)?, Operation::Metadata),
         "newfstatat" | "fstatat64" | "statx" | "faccessat" | "faccessat2" | "name_to_handle_at" => {
-            // With an empty path, the call reads the descriptor itself: a
-            // pipe, socket or other descriptor that is no file names no path.
-            // Nor does a NULL path, as a runtime passes to see whether the
-            // call exists.
-            let unnamed = args.get(1) == Some(&"NULL")
-                || quoted(args.get(1)?).is_some_and(|path| path.is_empty())
-                    && args[0].contains('<')
-                    && descriptor(args[0]).is_none();
-            if !unnamed {
-                emit(path(1, Some(0))?, Operation::Metadata);
+            // With an empty path, or a NULL one with AT_EMPTY_PATH, the call
+            // reads the descriptor itself: a pipe, socket or other descriptor
+            // that is no file names no path. A NULL path without the flag
+            // names nothing, as a runtime passes to see whether the call
+            // exists.
+            let null = args.get(1) == Some(&"NULL");
+            let probe = null && !args.iter().any(|arg| arg.contains("AT_EMPTY_PATH"));
+            let empty = null || quoted(args.get(1)?).is_some_and(|path| path.is_empty());
+            let unnamed = empty && args[0].contains('<') && descriptor(args[0]).is_none();
+            if !probe && !unnamed {
+                let target = if null {
+                    normalize(
+                        &descriptor(args[0])
+                            .or_else(|| args[0].starts_with("AT_FDCWD").then(|| cwd.to_owned()))?,
+                    )
+                } else {
+                    path(1, Some(0))?
+                };
+                emit(target, Operation::Metadata);
             }
         }
         "inotify_add_watch" => emit(path(1, None)?, Operation::Metadata),
@@ -589,14 +598,15 @@ mod tests {
             let (events, _, _) = decode(1, call, cwd).unwrap();
             assert!(events.is_empty(), "{call}");
         }
-        // A file's descriptor still names its file.
-        let (events, _, _) = decode(
-            1,
+        // A file's descriptor still names its file, with an empty path or,
+        // as newer kernels take, a NULL one.
+        for call in [
             "newfstatat(3</repo/a.txt>, \"\", {st_mode=S_IFREG|0644, ...}, AT_EMPTY_PATH) = 0",
-            cwd,
-        )
-        .unwrap();
-        assert_eq!(events[0].path, "/repo/a.txt");
+            "statx(3</repo/a.txt>, NULL, AT_STATX_SYNC_AS_STAT|AT_EMPTY_PATH, STATX_ALL, {...}) = 0",
+        ] {
+            let (events, _, _) = decode(1, call, cwd).unwrap();
+            assert_eq!(events[0].path, "/repo/a.txt", "{call}");
+        }
     }
 
     #[test]
