@@ -1015,19 +1015,26 @@ fn a_signal_check_releases_the_tasks_waiting_for_it() {
         },
         "plain": {"command": "node plain.js"}
     }));
-    // Signals once it has written its marker, framed as Nx frames it.
+    // Signals once it has written its marker, framed as Nx frames it, and
+    // says how far it got, for a failure to show.
     fs::write(
         temp.path().join("serve.js"),
-        r#"setTimeout(() => {
+        r#"const started = Date.now();
+const log = (what) => console.log(`serve: ${Date.now() - started}ms ${what}`);
+log(`started, signalling to ${process.env.NX_READY_SIGNAL_SOCKET}`);
+setTimeout(() => {
   require('fs').writeFileSync('marker', '');
   const socket = require('net').connect(process.env.NX_READY_SIGNAL_SOCKET, () => {
+    log('connected');
     const payload = Buffer.from(JSON.stringify({
       type: 'TO_PARENT_FROM_CHILDREN',
       message: { type: 'nx-ready-signal:ready', taskId: process.env.NX_READY_SIGNAL_TASK, url: 'http://localhost:4321/' },
     }));
     socket.write('NX_MSG_' + payload.length + ':');
-    socket.write(payload);
+    socket.write(payload, () => log('written'));
   });
+  socket.on('error', (error) => log(`error ${error.code} ${error.message}`));
+  socket.on('close', () => log('closed'));
 }, 300);
 setInterval(() => {}, 1000);
 "#,
@@ -1050,7 +1057,11 @@ if (process.env.NX_READY_URL !== 'http://localhost:4321/') { console.error('url 
     .unwrap();
     let output = command(temp.path(), &["run", "app:e2e"]).output().unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "{stderr}");
+    assert!(
+        output.status.success(),
+        "{stderr}\nstdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
     assert!(
         stderr.contains("waiting for app:serve to be ready (signal)"),
         "{stderr}"
