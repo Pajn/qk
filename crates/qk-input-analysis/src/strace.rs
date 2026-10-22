@@ -328,7 +328,15 @@ fn decode(process: u32, call: &str, cwd: &Path) -> Option<Decoded> {
             // names nothing, as a runtime passes to see whether the call
             // exists.
             let null = args.get(1) == Some(&"NULL");
-            let probe = null && !args.iter().any(|arg| arg.contains("AT_EMPTY_PATH"));
+            // The flags: statx's third argument, name_to_handle_at's fifth,
+            // the others' fourth; faccessat takes none.
+            let flags = match name {
+                "statx" => args.get(2),
+                "name_to_handle_at" => args.get(4),
+                "faccessat" => None,
+                _ => args.get(3),
+            };
+            let probe = null && !flags.is_some_and(|flags| flags.contains("AT_EMPTY_PATH"));
             let empty = null || quoted(args.get(1)?).is_some_and(|path| path.is_empty());
             let unnamed = empty && args[0].contains('<') && descriptor(args[0]).is_none();
             if !probe && !unnamed {
@@ -592,8 +600,10 @@ mod tests {
         for call in [
             "newfstatat(1<pipe:[123]>, \"\", {st_mode=S_IFIFO|0600, ...}, AT_EMPTY_PATH) = 0",
             "statx(17<socket:[456]>, \"\", AT_STATX_SYNC_AS_STAT|AT_EMPTY_PATH, STATX_ALL, {...}) = 0",
-            // Node's probe for statx.
+            // Node's probe for statx, and one on a descriptor whose name
+            // holds the flag's name, which is no flag.
             "statx(0</dev/null<char 1:3>>, NULL, AT_STATX_SYNC_AS_STAT, STATX_ALL, NULL) = -1 EFAULT (Bad address)",
+            "statx(3</repo/AT_EMPTY_PATH.txt>, NULL, AT_STATX_SYNC_AS_STAT, STATX_ALL, NULL) = -1 EFAULT (Bad address)",
         ] {
             let (events, _, _) = decode(1, call, cwd).unwrap();
             assert!(events.is_empty(), "{call}");

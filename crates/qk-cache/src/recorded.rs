@@ -666,7 +666,7 @@ mod tests {
     #[test]
     fn finds_what_changed_while_the_task_ran() {
         let temp = tempfile::tempdir().unwrap();
-        for path in ["read.txt", "found.txt", "listed.txt"] {
+        for path in ["read.txt", "found.txt", "listed.txt", "before.txt"] {
             std::fs::write(temp.path().join(path), "before").unwrap();
         }
         for directory in ["listed", "written"] {
@@ -718,18 +718,22 @@ mod tests {
             assert_eq!(changed(&listings), Some("written".into()));
         }
         std::fs::remove_file(temp.path().join("written/other.txt")).unwrap();
-        // A file that was there before, moved in where the task wrote too.
-        std::fs::rename(
-            temp.path().join("listed.txt"),
-            temp.path().join("written/moved.txt"),
-        )
-        .unwrap();
-        assert_eq!(changed(&listings), Some("written".into()));
-        std::fs::rename(
-            temp.path().join("written/moved.txt"),
-            temp.path().join("listed.txt"),
-        )
-        .unwrap();
+        // A file that was there before, unchanged, moved in where the task
+        // wrote too: a move updates its change time, which Unix keeps.
+        #[cfg(unix)]
+        {
+            std::fs::rename(
+                temp.path().join("before.txt"),
+                temp.path().join("written/moved.txt"),
+            )
+            .unwrap();
+            assert_eq!(changed(&listings), Some("written".into()));
+            std::fs::rename(
+                temp.path().join("written/moved.txt"),
+                temp.path().join("before.txt"),
+            )
+            .unwrap();
+        }
         // An entry added where the task wrote nothing.
         std::fs::write(temp.path().join("listed/new.txt"), "").unwrap();
         assert_eq!(changed(&listings), Some("listed".into()));
