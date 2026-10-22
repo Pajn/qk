@@ -410,7 +410,8 @@ fn finds_a_package_by_an_alias_it_is_installed_under() {
         ],
         &[
             ("typescript@7.0.2", &[("dep", "1.0.0")]),
-            ("typescript@5.9.3", &[]),
+            // A package installing another under an alias of its own.
+            ("typescript@5.9.3", &[("vendored-dep", "dep@1.0.0")]),
             ("dep@1.0.0", &[]),
         ],
     );
@@ -427,6 +428,11 @@ fn finds_a_package_by_an_alias_it_is_installed_under() {
     assert_eq!(
         keys("@typescript/native"),
         ["dep@1.0.0", "typescript@7.0.2"]
+    );
+    assert_eq!(keys("vendored-dep"), ["dep@1.0.0"]);
+    assert_eq!(
+        lockfile.reached_snapshots([], ["@typescript/native"]),
+        ["dep@1.0.0".to_owned(), "typescript@7.0.2".to_owned()].into()
     );
     // The package's own name still finds every installation of it.
     assert_eq!(
