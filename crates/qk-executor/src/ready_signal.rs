@@ -217,7 +217,7 @@ mod platform {
         INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, OPEN_EXISTING, PIPE_ACCESS_INBOUND, ReadFile,
+        CreateFileW, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile,
     };
     use windows_sys::Win32::System::IO::CancelSynchronousIo;
     use windows_sys::Win32::System::Pipes::{
@@ -231,13 +231,17 @@ mod platform {
         address.encode_wide().chain(Some(0)).collect()
     }
 
+    /// A pipe instance, duplex though qk only reads, as Node's own pipe
+    /// servers are: libuv opens a pipe for reading and writing first, and an
+    /// inbound one refuses that, which sends it down a slower path that can
+    /// wait for an instance it finds busy.
     fn instance(address: &OsString) -> HANDLE {
         let name = wide(address);
         // SAFETY: `name` is a NUL-terminated wide string that outlives the call.
         unsafe {
             CreateNamedPipeW(
                 name.as_ptr(),
-                PIPE_ACCESS_INBOUND,
+                PIPE_ACCESS_DUPLEX,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                 PIPE_UNLIMITED_INSTANCES,
                 0,
@@ -389,9 +393,8 @@ mod tests {
         assert_eq!(verdict.url().as_deref(), Some("http://localhost:4200/"));
     }
 
-    /// Connects as libuv does, read-write first and write-only when the
-    /// inbound pipe refuses that, and writes the header and payload apart,
-    /// as Node does, many times over.
+    /// Connects as libuv does, for reading and writing, and writes the
+    /// header and payload apart, as Node does, many times over.
     #[cfg(windows)]
     #[test]
     fn hears_signals_on_a_named_pipe_as_node_sends_them() {
@@ -401,15 +404,8 @@ mod tests {
             let verdict = Arc::new(Verdict::default());
             let listener = Listener::start("app:serve", verdict.clone()).unwrap();
             let address = listener.address.clone();
-            assert!(
-                std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&address)
-                    .is_err(),
-                "an inbound pipe takes no reader"
-            );
             let mut pipe = std::fs::OpenOptions::new()
+                .read(true)
                 .write(true)
                 .open(&address)
                 .unwrap_or_else(|error| panic!("attempt {attempt}: {error}"));

@@ -1006,7 +1006,9 @@ fn a_signal_check_releases_the_tasks_waiting_for_it() {
     let temp = fixture(json!({
         "serve": {
             "continuous": true,
-            "readyWhen": {"signal": true, "timeout": 10000},
+            // Long enough for Node to start on a loaded Windows runner: the
+            // test is of what a signal releases, not of how soon.
+            "readyWhen": {"signal": true, "timeout": 60000},
             "command": "node serve.js"
         },
         "e2e": {
@@ -1020,10 +1022,12 @@ fn a_signal_check_releases_the_tasks_waiting_for_it() {
     fs::write(
         temp.path().join("serve.js"),
         r#"const started = Date.now();
-const log = (what) => console.log(`serve: ${Date.now() - started}ms ${what}`);
+const log = (what) =>
+  console.log(`serve: ${new Date().toISOString()} +${Date.now() - started}ms ${what}`);
 log(`started, signalling to ${process.env.NX_READY_SIGNAL_SOCKET}`);
 setTimeout(() => {
   require('fs').writeFileSync('marker', '');
+  log('connecting');
   const socket = require('net').connect(process.env.NX_READY_SIGNAL_SOCKET, () => {
     log('connected');
     const payload = Buffer.from(JSON.stringify({
