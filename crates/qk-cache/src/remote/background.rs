@@ -128,9 +128,10 @@ fn snapshot(jobs: &[Upload]) -> Result<(tempfile::TempDir, Vec<Upload>)> {
     }
     let mut pinned = Vec::with_capacity(jobs.len());
     for job in jobs {
-        let record = match &job.warm {
-            Some(warm) => warm.record.clone(),
-            None => {
+        let record = match (&job.warm, &job.path_sets) {
+            (Some(warm), _) => warm.record.clone(),
+            (None, Some(sets)) => sets.record.clone(),
+            (None, None) => {
                 if !crate::record::valid_hash(&job.key) {
                     bail!("invalid upload key");
                 }
@@ -370,6 +371,7 @@ mod tests {
                 key,
                 local: root.clone(),
                 warm: None,
+                path_sets: None,
             },
             Upload {
                 key: "warm state".into(),
@@ -382,6 +384,7 @@ mod tests {
                     )
                     .unwrap(),
                 }),
+                path_sets: None,
             },
         ];
         let (pinned, jobs) = snapshot(&jobs).unwrap();

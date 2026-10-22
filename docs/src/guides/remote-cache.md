@@ -18,7 +18,8 @@ holding its manifest and its small outputs, so that a lookup or restore of an
 entry whose outputs are all small is one request however many files the task
 wrote. A local miss fetches it, keeps the
 outputs the local cache lacks, verifying each against its hash, and shows
-`[remote cache]`; any failure is a miss.
+`[remote cache]`; any failure is a miss. The path sets of tasks with
+[`qk:ultracache`](ultracache.md) are stored as `pathsets/<weak>`.
 
 An output whose compressed size reaches 1 MiB is stored apart, as
 `blobs/<hash>`, uploaded once for every entry that has it and only when the

@@ -13,7 +13,7 @@ pub const WRITE_TOKEN: &str = "write-token";
 
 #[derive(Default)]
 pub struct State {
-    /// Upload bodies by `entries/<key>` or `warm/<a>/<b>`.
+    /// Upload bodies by `entries/<key>`, `warm/<a>/<b>` or `pathsets/<weak>`.
     pub records: BTreeMap<String, Vec<u8>>,
     /// Blobs stored apart, each one zstd frame, by hash.
     pub blobs: BTreeMap<String, Vec<u8>>,
@@ -305,7 +305,11 @@ fn handle(
                 _ => (405, Vec::new(), Vec::new()),
             }
         }
-        (method, path) if path.starts_with("entries/") || path.starts_with("warm/") => {
+        (method, path)
+            if path.starts_with("entries/")
+                || path.starts_with("warm/")
+                || path.starts_with("pathsets/") =>
+        {
             let entry = path.starts_with("entries/");
             match method {
                 "HEAD" => match state.records.contains_key(path) {

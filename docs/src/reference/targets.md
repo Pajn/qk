@@ -246,7 +246,7 @@ recorded. See [Keying tasks by what they read](../guides/ultracache.md).
 
 | Field | Type | Default |
 | --- | --- | --- |
-| `mode` | `"on"` or `"off"` | `"on"`; `"off"` keys the task by its declared inputs, as without the field |
+| `mode` | `"on"`, `"record"` or `"off"` | `"on"`; `"record"` records the task and reports what its recordings would have done, but keys it by its declared inputs; `"off"` keys it by its declared inputs, as without the field |
 | `ignoreReads` | array of workspace globs | Empty; files left out of recordings, whose changes cannot change the result |
 
 Nx's `"warn"` and `"error"` modes are not supported yet. Other fields are

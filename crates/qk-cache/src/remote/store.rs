@@ -22,6 +22,8 @@ pub(super) enum Object<'a> {
     Warm { identity: &'a str, branch: &'a str },
     /// A blob stored apart from the packs that cite it, named by its hash.
     Blob(&'a str),
+    /// The path sets recorded for a weak key, a pack citing no blob.
+    PathSets(&'a str),
 }
 
 /// How a store wants a record and the blobs it carries sent.

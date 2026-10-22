@@ -1,7 +1,7 @@
 // The qk store server: the requests in PROTOCOL.md, over an R2 bucket and one
 // Durable Object for the index.
 //
-// R2 holds `entries/<key>` and `warm/<a>/<b>` as the upload bodies clients
+// R2 holds `entries/<key>`, `warm/<a>/<b>` and `pathsets/<weak>` as the upload bodies clients
 // sent, `blobs/<hash>` as one zstd frame each, and `sessions/<id>` as the
 // Bloom filters sessions were opened with. A fetched record is composed from
 // its upload body without touching the compressed bytes.
@@ -43,6 +43,8 @@ const LARGEST_BLOB = 5 * 2 ** 30;
 const INLINE_APART_BUDGET = 64 << 20;
 const LARGEST_MISSING_QUERY = 4096;
 const LARGEST_LISTING = 32 << 20;
+/** The largest upload of a weak key's path sets, which cite no blob. */
+const LARGEST_PATH_SETS = 16 << 20;
 const SESSION_LIFETIME = 24 * 60 * 60 * 1000;
 /** How many R2 requests one request makes at a time. */
 const CONCURRENCY = 32;
@@ -148,6 +150,18 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
     if (method === "PUT") {
       write();
       return putWarm(name, request, env);
+    }
+  }
+  if (kind === "pathsets" && KEY.test(name)) {
+    if (method === "GET") {
+      return getPack(`pathsets/${name}`, false, url, env, ctx);
+    }
+    if (method === "HEAD") {
+      return (await env.STORE.head(`pathsets/${name}`)) ? new Response(null) : notFound();
+    }
+    if (method === "PUT") {
+      write();
+      return putPathSets(name, request, env);
     }
   }
   throw new Failure(404, "not_found", "no such request");
@@ -493,6 +507,19 @@ async function putWarm(name: string, request: Request, env: Env): Promise<Respon
   const upload = parseUpload(body);
   await requireBlobs(upload.header, env);
   await env.STORE.put(`warm/${name}`, body, { httpMetadata: { contentType: "application/x-qk-upload" } });
+  return new Response(null, { status: 204 });
+}
+
+async function putPathSets(weak: string, request: Request, env: Env): Promise<Response> {
+  const body = await readBody(request, LARGEST_PATH_SETS);
+  const upload = parseUpload(body);
+  if (upload.header.blobs.length > 0) {
+    throw new Failure(400, "malformed", "path sets cite no blob");
+  }
+  if (upload.json.weak !== weak) {
+    throw new Failure(400, "malformed", `the record is not for weak key ${weak}`);
+  }
+  await env.STORE.put(`pathsets/${weak}`, body, { httpMetadata: { contentType: "application/x-qk-upload" } });
   return new Response(null, { status: 204 });
 }
 

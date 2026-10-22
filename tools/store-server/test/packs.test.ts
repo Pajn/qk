@@ -136,3 +136,17 @@ describe("warm records", () => {
     expect(new Uint8Array(await found.arrayBuffer())).toEqual(rawFrame(second[0]!.raw));
   });
 });
+
+describe("path sets", () => {
+  it("are replaced by the newest save for their weak key alone", async () => {
+    const weak = hash();
+    const record = (read: string) => bytes(JSON.stringify({ version: 1, weak, sets: [{ reads: [read] }] }));
+    expect((await request("PUT", `pathsets/${weak}`, { body: upload(record("a"), []) })).status).toBe(204);
+    expect((await request("PUT", `pathsets/${weak}`, { body: upload(record("b"), []) })).status).toBe(204);
+    expect(await pack(`pathsets/${weak}`)).toEqual(expectedPack(record("b"), [], () => true));
+    expect((await request("HEAD", `pathsets/${weak}`)).status).toBe(200);
+    expect((await request("PUT", `pathsets/${hash()}`, { body: upload(record("c"), []) })).status).toBe(400);
+    const cited = [blob("cited", true)];
+    expect((await request("PUT", `pathsets/${weak}`, { body: upload(record("d"), cited) })).status).toBe(400);
+  });
+});

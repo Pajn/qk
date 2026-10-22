@@ -98,6 +98,9 @@ pub fn record(
                     .and_then(|record| record.cores)
                     .map(|cores| cores as u64),
                 cpu: record.and_then(|record| record.cpu),
+                shadow: record
+                    .and_then(|record| record.shadow.as_ref())
+                    .and_then(|shadow| serde_json::to_value(shadow).ok()),
             }
         })
         .collect();
