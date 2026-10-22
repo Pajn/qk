@@ -4593,7 +4593,12 @@ fn a_scaled_task_is_told_more_threads_than_the_cores_it_holds() {
 fn records_how_busy_a_task_kept_the_cores() {
     // Busy on one core for longer than the summary needs to say how busy.
     let fixture = Fixture::with_targets(json!({
-        "busy": threaded("perl -e '$end = time + 3; 1 while time < $end'", json!(true))
+        // Busy until it has used three seconds of CPU, however long another
+        // test's load makes that take.
+        "busy": threaded(
+            "perl -MTime::HiRes=clock_gettime,CLOCK_PROCESS_CPUTIME_ID -e '$end = clock_gettime(CLOCK_PROCESS_CPUTIME_ID) + 3; 1 while clock_gettime(CLOCK_PROCESS_CPUTIME_ID) < $end'",
+            json!(true)
+        )
     }));
     let report = fixture.root.join("report.json");
     let output = success(fixture.qk(
@@ -4612,11 +4617,13 @@ fn records_how_busy_a_task_kept_the_cores() {
     ));
     let run: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
     let task = &run["tasks"][0];
-    let busy = task["cpu"].as_f64().unwrap()
-        / (task["ended"].as_f64().unwrap() - task["started"].as_f64().unwrap());
+    let cpu = task["cpu"].as_f64().unwrap();
+    let busy = cpu / (task["ended"].as_f64().unwrap() - task["started"].as_f64().unwrap());
     // One core's loop gets less than a core while other tests load the
     // machine, so the floor only says CPU time was measured.
     assert!((0.05..1.3).contains(&busy), "{task}");
+    // Sampled, so it can miss the last quarter second, never more.
+    assert!(cpu > 2_000.0, "{task}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("Threads of 2 cores: app:busy 2 ("),
