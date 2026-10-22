@@ -26,11 +26,16 @@
 //
 //   "taskGraphs": { "<name>": [<run-many arguments>] }
 //   "affected":   { "<name>": { "change": {"delete": []} } | { "base": "<rev>", "head": "<rev>" } }
+//   "affectedTargets": [<targets>]
 //   "runs":       { "<name>": { "change": {}, "args": [<run-many arguments>] } }
 //
 // Task graphs compare `--graph` output: tasks, their targets, roots, outputs,
 // cache, continuous and parallelism flags, and dependencies.
-// Affected cases compare `show projects --affected` sets. Runs execute the
+// Affected cases compare `show projects --affected` sets, and with
+// `affectedTargets`, the affected tasks of those targets: the tasks Nx 24's
+// `show projects --affected -t <targets> --explain --json` lists as affected,
+// against the tasks of those targets `qk show tasks --affected --json` lists.
+// A case accepts a difference in tasks with `acceptedTasks`. Runs execute the
 // tasks without cache and compare whether the run failed and which tasks ran,
 // as recorded by the fixture's tasks. An affected or run case whose results
 // differ fails unless it carries the difference it accepts and why:
@@ -90,6 +95,7 @@ let goldens = resolve(external ? option("--goldens") : join(here, "goldens"));
 const config = JSON.parse(readFileSync(external ? join(goldens, "parity.json") : join(here, "cases.json"), "utf8"));
 const taskGraphs = config.taskGraphs ?? {};
 const affectedCases = config.affected ?? {};
+const affectedTargets = config.affectedTargets ?? [];
 const runCases = config.runs ?? {};
 const inspections = config.inspections ?? {};
 const scratchRoot = mkdtempSync(join(tmpdir(), "qk-parity-"));
@@ -149,7 +155,7 @@ function onCase(name, spec, body) {
 
 // Runs a command three times and reports the median wall time, so a cold
 // file system cache on the first run does not skew the timings.
-function run(binary, args, { times = 3, allowFailure = false } = {}) {
+function run(binary, args, { times = 3, allowFailure = false, env = {} } = {}) {
   const durations = [];
   let result;
   for (let attempt = 0; attempt < times; attempt++) {
@@ -158,7 +164,7 @@ function run(binary, args, { times = 3, allowFailure = false } = {}) {
       cwd: workspace,
       encoding: "utf8",
       maxBuffer: 1 << 30,
-      env: { ...process.env, NX_DAEMON: "false", NX_NO_CLOUD: "true", NX_TUI: "false", FIXTURE_ROOT: workspace },
+      env: { ...process.env, NX_DAEMON: "false", NX_NO_CLOUD: "true", NX_TUI: "false", FIXTURE_ROOT: workspace, ...env },
     });
     durations.push(performance.now() - started);
     if (result.status !== 0 && !allowFailure) {
@@ -174,6 +180,15 @@ function readJson(path) {
 }
 
 const affectedArgs = ({ base, head }) => ["show", "projects", "--affected", "--base", base, "--head", head, "--json"];
+const nxAffectedTaskArgs = ({ base, head }) => [
+  "show", "projects", "--affected", "-t", affectedTargets.join(","), "--base", base, "--head", head, "--explain", "--json",
+];
+const qkAffectedTaskArgs = ({ base, head }) => [
+  "show", "tasks", "-t", affectedTargets.join(","), "--affected", "--base", base, "--head", head, "--json",
+];
+/// The tasks of the requested targets in qk's answer, which also lists the
+/// tasks they depend on.
+const requestedTasks = (tasks) => Object.keys(tasks).filter((id) => affectedTargets.includes(id.split(":")[1]));
 const lastLine = (text) => text.trim().split("\n").pop();
 
 /// Runs a case's tasks without cache and reports the outcome and the tasks
@@ -226,6 +241,14 @@ if (command === "capture") {
     const affected = onCase(name, spec, (revisions) => run(nx, affectedArgs(revisions)));
     writeFileSync(join(goldens, `affected-${name}.json`), `${JSON.stringify(JSON.parse(lastLine(affected.stdout)).sort())}\n`);
     timings[`affected ${name}`] = affected.milliseconds;
+    if (affectedTargets.length === 0) continue;
+    // Task selection is Nx 24's default; a workspace with `affected.legacy`
+    // still selects tasks here.
+    const tasks = onCase(name, spec, (revisions) =>
+      run(nx, nxAffectedTaskArgs(revisions), { env: { NX_LEGACY_AFFECTED: "false" } }),
+    );
+    const ids = Object.keys(JSON.parse(tasks.stdout).affected).sort();
+    writeFileSync(join(goldens, `affected-tasks-${name}.json`), `${JSON.stringify(ids, null, 2)}\n`);
   }
   for (const [name, spec] of Object.entries(runCases)) {
     const result = onCase(name, spec, () => execute(nx, spec.args, "--skip-nx-cache"));
@@ -314,6 +337,14 @@ for (const [name, spec] of Object.entries(affectedCases)) {
   const affected = onCase(name, spec, (revisions) => run(qk, affectedArgs(revisions)));
   timings[`affected ${name}`] = affected.milliseconds;
   checkSets(`affected ${name}`, new Set(readJson(join(goldens, `affected-${name}.json`))), new Set(JSON.parse(affected.stdout)), spec.accepted);
+  if (affectedTargets.length === 0) continue;
+  const tasks = onCase(name, spec, (revisions) => run(qk, qkAffectedTaskArgs(revisions)));
+  checkSets(
+    `affected tasks ${name}`,
+    new Set(readJson(join(goldens, `affected-tasks-${name}.json`))),
+    new Set(requestedTasks(JSON.parse(tasks.stdout).tasks)),
+    spec.acceptedTasks,
+  );
 }
 
 // Runs: the same outcome and the same tasks run.

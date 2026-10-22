@@ -1,0 +1,11 @@
+[
+  "@fixture/utils:format",
+  "@fixture/utils:test",
+  "mobile:build",
+  "ui:build",
+  "ui:format",
+  "ui:test",
+  "web:build:production",
+  "web:format",
+  "web:test"
+]

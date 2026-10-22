@@ -1,0 +1,18 @@
+[
+  "@fixture/native:build",
+  "@fixture/utils:test",
+  "mobile:build",
+  "mobile:lint",
+  "scripts:lint",
+  "tooling:lint",
+  "ui:build",
+  "ui:format",
+  "ui:lint",
+  "ui:test",
+  "web-e2e:lint",
+  "web:build:production",
+  "web:format",
+  "web:lint",
+  "web:test",
+  "web:typecheck-app"
+]

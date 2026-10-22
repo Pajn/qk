@@ -455,6 +455,28 @@ impl Cache {
         let own: Vec<&paths::Outputs> = std::iter::once(&outputs)
             .chain(warm_outputs.as_ref())
             .collect();
+        // What its recordings' listings leave out, by the workspace's
+        // configuration rather than what this run schedules, so that the
+        // same recording keys the same in any run.
+        let siblings = settings
+            .as_ref()
+            .map(|_| project_outputs(workspace, task))
+            .unwrap_or_default();
+        let ignore: Vec<Pattern> = settings
+            .as_ref()
+            .map(|settings| {
+                settings
+                    .ignore_reads
+                    .iter()
+                    .filter_map(|glob| Pattern::new(glob, false).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let unlisted = recorded::Unlisted {
+            own: own.clone(),
+            siblings: &siblings,
+            ignore: &ignore,
+        };
         let inputs = &keyed.as_ref().expect("a cacheable task is keyed").1;
         let mut recordings = settings.and_then(|settings| {
             let weak = hash::weak_key(
@@ -483,8 +505,8 @@ impl Cache {
             let recorded_profile = profile::span(&task.id, "recorded_restore");
             let keyed_by = settings.mode == ultracache::Mode::On;
             let found = self.by_recordings(
-                workspace, task, prepared, snapshot, &outputs, &own, sets, weak, &key, keyed_by,
-                cancelled,
+                workspace, task, prepared, snapshot, &outputs, &unlisted, sets, weak, &key,
+                keyed_by, cancelled,
             );
             drop(recorded_profile);
             match (keyed_by, found) {
@@ -655,6 +677,20 @@ impl Cache {
         let capture =
             Capture::new(Some(log.as_file().try_clone()?), prepared.display.clone()).retain_log();
         let restored = before(running);
+        let listed = match (&recordings, &prepared.recording) {
+            (Some(_), Some(_)) => {
+                let project_root = workspace
+                    .projects
+                    .get(&task.project)
+                    .map_or("", |project| project.root.as_str());
+                recorded::Before::take(
+                    &workspace.root,
+                    unlisted.directories(project_root),
+                    &unlisted,
+                )
+            }
+            _ => recorded::Before::default(),
+        };
         let started = recorded::now(&self.root.join("tmp"));
         let executing = profile::span(&task.id, "execute");
         let outcome = execute_captured(running, cancelled, Some(&capture))?;
@@ -678,7 +714,7 @@ impl Cache {
                         if set.is_empty() {
                             return Err("its trace named no path in the workspace".to_owned());
                         }
-                        match set.changed_since(&workspace.root, started, &own) {
+                        match set.changed_since(&workspace.root, started, &unlisted, &listed) {
                             Some(path) => Err(format!("{path} changed while it ran")),
                             None => Ok(set),
                         }
@@ -709,7 +745,7 @@ impl Cache {
             }
             // Its result is kept under the key of what it read, too.
             if let (Some((_, weak, _)), Some(Ok(set))) = (&recordings, path_set) {
-                let saved = recorded::strong_key(weak, &set, snapshot, &workspace.root, &own)
+                let saved = recorded::strong_key(weak, &set, snapshot, &workspace.root, &unlisted)
                     .and_then(|strong| {
                         self.publish(&workspace.root, &strong, &outputs, log.path())?;
                         recorded::save(&self.root, weak, set)?;
@@ -758,7 +794,7 @@ impl Cache {
         prepared: &PreparedTask,
         snapshot: &hash::Snapshot,
         outputs: &paths::Outputs,
-        own: &[&paths::Outputs],
+        unlisted: &recorded::Unlisted,
         sets: &mut Vec<recorded::PathSet>,
         weak: &str,
         declared: &str,
@@ -766,7 +802,7 @@ impl Cache {
         cancelled: &AtomicBool,
     ) -> Found {
         let strong = |set: &recorded::PathSet| {
-            recorded::strong_key(weak, set, snapshot, &workspace.root, own)
+            recorded::strong_key(weak, set, snapshot, &workspace.root, unlisted)
                 .inspect_err(|error| {
                     qk_executor::status!("qk: {}: ignoring a path set ({error:#})", task.id);
                 })
@@ -1039,6 +1075,44 @@ pub fn run_upload_worker() -> anyhow::Result<()> {
     remote::background::run()
 }
 
+/// The outputs of every other target of `task`'s project, as their targets
+/// declare them, and as each of their configurations does with its options,
+/// which can move an output; one whose outputs cannot be read is left out.
+fn project_outputs(workspace: &Workspace, task: &Task) -> Vec<paths::Outputs> {
+    let Some(project) = workspace.projects.get(&task.project) else {
+        return Vec::new();
+    };
+    project
+        .targets
+        .iter()
+        .filter(|(target, _)| **target != task.target)
+        .flat_map(|(target, definition)| {
+            let configured = definition.configurations.iter().map(|(name, options)| {
+                let mut definition = definition.clone();
+                definition.options.extend(options.clone());
+                (Some(name.clone()), definition)
+            });
+            std::iter::once((None, definition.clone()))
+                .chain(configured)
+                .map(move |(configuration, definition)| Task {
+                    id: format!("{}:{target}", task.project),
+                    project: task.project.clone(),
+                    target: target.clone(),
+                    configuration,
+                    args: Vec::new(),
+                    definition,
+                    dependencies: Default::default(),
+                    edges: Default::default(),
+                })
+        })
+        .filter_map(|sibling| {
+            paths::Outputs::new(workspace, &sibling)
+                .ok()
+                .filter(paths::Outputs::declared)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1235,5 +1309,33 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    #[test]
+    fn project_outputs_include_each_configuration_of_other_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(root.join("nx.json"), "{}").unwrap();
+        std::fs::create_dir(root.join("app")).unwrap();
+        std::fs::write(
+            root.join("app/project.json"),
+            r#"{"name":"app","targets":{
+                "build":{"command":"true","outputs":["{options.outputPath}"],
+                  "options":{"outputPath":"app/dist"},
+                  "configurations":{"production":{"outputPath":"app/dist-production"}}},
+                "lint":{"command":"true"}}}"#,
+        )
+        .unwrap();
+        let workspace = Workspace::load(root).unwrap();
+        let graph = qk_taskgraph::TaskGraph::build(
+            &workspace,
+            &[qk_taskgraph::Request::parse("app:lint").unwrap()],
+        )
+        .unwrap();
+        let outputs = project_outputs(&workspace, &graph.tasks["app:lint"]);
+        let matched = |path: &str| outputs.iter().any(|outputs| outputs.matches(path));
+        assert!(matched("app/dist/main.js"));
+        assert!(matched("app/dist-production/main.js"));
+        assert!(!matched("app/src/main.ts"));
     }
 }
