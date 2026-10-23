@@ -69,8 +69,6 @@ edges off.
   is read and merged, but has no effect. Inputs marked `"always": true` count
   for a task keyed by its recordings, and read as without the flag otherwise.
   See [Keying tasks by what they read](guides/ultracache.md).
-- The run-commands `readyWhen` option accepts readiness text from either
-  stdout or stderr.
 - A target's `readyWhen` is checked only while a task in the run waits for
   it, and its verdict is not shared with other qk processes. The `local-ip`
   hosts resolve to the machine's outward address of their family, close to

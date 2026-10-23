@@ -278,8 +278,7 @@ ready, as in Nx, unless it is also continuous. Such a task holds a
 hold its dependents back until then. A task whose commands exit before it is
 ready ends with their status. With `commands`, `readyWhen` requires
 `parallel`. These tasks are not cached, since their commands outlive any
-result. Unlike Nx, which counts text on stderr as a failure, either stream
-makes a task ready.
+result.
 
 A continuous target's own [`readyWhen`](../reference/targets.md#readywhen),
 an object, is a check for the tasks that depend on it with
