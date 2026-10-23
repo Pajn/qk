@@ -1413,6 +1413,17 @@ mod tests {
         assert!(lint.matches(".cache"));
         assert!(lint.matches("app/extra"));
         assert!(!lint.matches("lib"));
+        // Before the task runs, the directories those folders come and go
+        // in are listed, another project's root among them.
+        let unlisted = recorded::Unlisted {
+            own: Vec::new(),
+            others: Some(lint),
+            ignore: &[],
+        };
+        let directories = unlisted.directories("lib");
+        for directory in [".", ".cache", "app", "app/extra"] {
+            assert!(directories.contains(directory), "{directory}");
+        }
         // A dependency's output is the test's input, and only that of the
         // configuration it depends on.
         assert!(!others("app:test").matches("lib/dist"));

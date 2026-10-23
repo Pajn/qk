@@ -461,7 +461,6 @@ pub(crate) struct WorkspaceOutputs {
     /// such as `.cache` for `.cache/build`, which exist to hold it.
     folders: Vec<Vec<String>>,
     by_folder: BTreeMap<String, Vec<usize>>,
-    roots: Vec<String>,
 }
 
 impl WorkspaceOutputs {
@@ -470,7 +469,6 @@ impl WorkspaceOutputs {
         let mut by_anchor: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         let mut by_folder: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         let mut folders = Vec::new();
-        let mut project_roots = Vec::new();
         // No project's root, nor a directory holding one, is a folder an
         // output owns.
         let projects: BTreeSet<&str> = roots
@@ -514,18 +512,12 @@ impl WorkspaceOutputs {
                 }
             }
             folders.push(held);
-            project_roots.push(if root.is_empty() {
-                ".".to_owned()
-            } else {
-                root.to_owned()
-            });
         }
         Self {
             outputs,
             by_anchor,
             folders,
             by_folder,
-            roots: project_roots,
         }
     }
 
@@ -632,9 +624,11 @@ impl Unlisted<'_> {
                     directories.insert(anchor.to_owned());
                     directories.insert(parent(anchor).to_owned());
                 }
-                directories.extend(all.folders[index].iter().cloned());
-                if !all.folders[index].is_empty() {
-                    directories.insert(all.roots[index].clone());
+                // Each folder, and the directory holding it, which can be
+                // another project's root.
+                for folder in &all.folders[index] {
+                    directories.insert(folder.clone());
+                    directories.insert(parent(folder).to_owned());
                 }
             }
         }
