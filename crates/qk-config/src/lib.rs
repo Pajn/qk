@@ -158,6 +158,10 @@ pub struct Workspace {
     /// The `nx.local.json` and `project.local.json` files merged in,
     /// workspace-relative.
     pub local_overrides: Vec<String>,
+    /// Each project's configuration directory, workspace-relative, `.` for
+    /// the root: where its `project.json` and `project.local.json` are read,
+    /// which a `root` it gives can move away from its root.
+    pub configuration_directories: BTreeMap<String, String>,
     /// What Nx would warn about while reading the workspace.
     pub warnings: Vec<String>,
 }
@@ -434,6 +438,7 @@ impl Workspace {
             } else {
                 Vec::new()
             },
+            configuration_directories: BTreeMap::new(),
             warnings: Vec::new(),
         };
         if workspace
@@ -517,6 +522,9 @@ impl Workspace {
             if let Some(package) = package {
                 workspace.packages.insert(project.name.clone(), package);
             }
+            workspace
+                .configuration_directories
+                .insert(project.name.clone(), relative_path(&root, &directory)?);
             if local.is_some() {
                 let root = match relative_path(&root, &directory)?.as_str() {
                     "." => String::new(),
