@@ -56,6 +56,9 @@
     "lint-config": {
       "change": {}
     },
+    "project-json": {
+      "change": {}
+    },
     "nx-json": {
       "change": {},
       "accepted": {

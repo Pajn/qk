@@ -58,10 +58,18 @@ impl NxJsonChange {
                 .and_then(Path::to_str)
                 .map(|path| path.replace('\\', "/"));
             match relative {
-                Some(relative) if changes.changed(&relative) => changes
-                    .read(&relative, Some(base))
-                    .map(Some)
-                    .with_context(|| format!("{relative} could not be read at the base revision")),
+                // Project manifests are the head's: their changes count by
+                // their own rule.
+                Some(relative)
+                    if changes.changed(&relative) && !crate::is_project_file(&relative) =>
+                {
+                    changes
+                        .read(&relative, Some(base))
+                        .map(Some)
+                        .with_context(|| {
+                            format!("{relative} could not be read at the base revision")
+                        })
+                }
                 _ => match std::fs::read_to_string(path) {
                     Ok(text) => Ok(Some(text)),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),

@@ -55,6 +55,21 @@ only to settings that change no task's work, such as `defaultBase`,
 `parallel` or `release`, touches nothing. Where a revision cannot be read or
 parsed, or the files were named with `--files`, every project is touched.
 
+A changed `project.json` or `project.local.json` that a project has at both
+revisions touches its project as any file does when an input of the
+project's targets selects it, as `default` does unless the workspace leaves
+the files out of it (see [What changes the key](cache.md#what-changes-the-key)).
+It also touches projects by what it changes. qk reads the changed manifests
+at the base revision, resolves the workspace with them and the head's other
+files, and compares every project's configuration, since a tag or a name
+decides what other projects' inputs and dependencies select. A project is
+touched where its targets, named inputs or other keys differ, where its
+dependencies do, or where an input of it naming projects, such as
+`tag:shared`, selects others. Where no input selects the file, a change to
+comments or formatting touches nothing. A manifest the change added, or one
+that cannot be read at the base revision or was named with `--files`,
+touches its project as any other file does.
+
 A deleted `project.json` or `package.json` that removes a project touches the
 projects that depended on it. Nx touches every project instead, having no way
 of knowing what depended on it; qk reads the removed project's manifests at
@@ -112,6 +127,9 @@ Some rules deliberately differ from Nx:
 - A change to the file nx.json `extends` counts as a change to nx.json does.
   Nx does not look at that file, although it configures the workspace as much
   as nx.json does.
+- A change to a project's `project.json` that no input of the project
+  selects touches what it changes, by the rule above. Nx touches the project
+  whatever changed.
 
 `show projects --affected` prints projects in graph order; Nx prints its
 traversal order, so compare the two as sets.
@@ -145,8 +163,8 @@ ui is touched:
 
 With `--granularity task`, `qk affected` selects tasks instead of projects. A
 task is affected when Nx 24 would select it, or when its cache key changed,
-except that qk narrows a lockfile change, as below, and a deleted manifest and
-an nx.json change, as in
+except that qk narrows a lockfile change, as below, and a deleted manifest, an
+nx.json change and a `project.json` change, as in
 [How changes reach projects](#how-changes-reach-projects). As in Nx, that is
 when:
 
@@ -155,7 +173,9 @@ when:
 - a file projects are created from changed in a project whose inputs it
   reads, its own or one its `^` and `projects` inputs reach, or such a file
   was deleted and removed a project that one of those depended on, by the
-  rule above, which falls back on every task where it does;
+  rule above, which falls back on every task where it does. A `project.json`
+  or `project.local.json` compared at both revisions counts by its inputs
+  and the rule below instead;
 - the root tsconfig changed outside `compilerOptions.paths`, or, with
   `selectivelyHashTsConfig`, in path mappings into a project whose inputs it
   reads (see [What changes the key](cache.md#what-changes-the-key));
@@ -173,6 +193,17 @@ task's definition differs, or what its inputs select does, its own or a
 dependency's through `^` inputs. A named input that selects the same files
 leaves the task alone. A task declaring `{workspaceRoot}/nx.json` as an input
 is affected by any change to the file, as its key holds it whole.
+
+A changed `project.json` or `project.local.json` selects every task whose
+inputs select it, as any input does, its dependents' through `^` inputs
+included; with `default` holding `{projectRoot}/**/*`, that is every task
+reading the project's files, as in Nx. For a task whose inputs leave it out,
+it counts as nx.json does: the task is selected when, resolved with the
+manifests the base revision had, its definition differs, or what its key
+holds of its project's configuration, such as its root and output paths,
+or what its inputs select, or the dependency manifests and importers qk adds
+for it. Editing one target then selects that target's tasks, and a tag the
+tasks whose inputs select projects by it.
 
 Beyond those, qk's key also reads what its lockfile importers or
 `externalDependencies` install, `pnpm-workspace.yaml` outside its resolution

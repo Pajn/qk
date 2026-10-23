@@ -174,8 +174,12 @@ struct Effect {
 }
 
 fn effect(repo: &Repo) -> Effect {
+    effect_of(repo, &["app:build", "lib:build", "lib:lint", "tool:lint"])
+}
+
+fn effect_of(repo: &Repo, tasks: &[&str]) -> Effect {
     let analysis = analyse(repo, &repo.base, &commit(&repo.root));
-    let causes = affected_tasks_of(repo, &["app:build", "lib:build", "lib:lint", "tool:lint"]);
+    let causes = affected_tasks_of(repo, tasks);
     Effect {
         touched: analysis
             .projects
@@ -402,6 +406,243 @@ fn nx_json_named_inputs_reading_dependency_outputs_affect_the_task() {
         &tasks["app:build"],
         TaskCause::Touched { reasons } if matches!(&reasons[..], [TaskReason::ResolvedInputs { .. }])
     ));
+}
+
+const LIB: &str = r#"{"name": "lib", "targets": {"build": {}, "lint": {}}}"#;
+
+/// The settings, with `default` leaving out each project's `project.json`
+/// and `project.local.json`, so that its tasks count them only by what they
+/// change.
+fn narrowed_settings() -> String {
+    SETTINGS.replace(
+        r#""default": ["{projectRoot}/**/*"]"#,
+        r#""default": ["{projectRoot}/**/*", "!{projectRoot}/project.json", "!{projectRoot}/project.local.json"]"#,
+    )
+}
+
+/// As [`settings_repo`], with [`narrowed_settings`].
+fn narrowed_repo(files: &[(&str, &str)]) -> Repo {
+    let settings = narrowed_settings();
+    let mut all = vec![("nx.json", settings.as_str())];
+    all.extend_from_slice(files);
+    settings_repo(&all)
+}
+
+#[test]
+fn a_project_json_its_inputs_select_counts_whole() {
+    use qk_affected::{TaskCause, TaskReason};
+    let repo = settings_repo(&[]);
+    write(
+        &repo.root,
+        "libs/lib/project.json",
+        &format!("// The library.\n{LIB}"),
+    );
+    let effect = effect(&repo);
+    // `default`, `{projectRoot}/**/*`, selects it, as in Nx: lib's tasks
+    // read it, and app's build through ^production.
+    assert_eq!(effect.touched, names(&["lib"]));
+    assert_eq!(effect.tasks, names(&["app:build", "lib:build", "lib:lint"]));
+    assert!(matches!(
+        &effect.causes["app:build"],
+        TaskCause::Touched { reasons }
+            if matches!(&reasons[..], [TaskReason::Input { file }] if file == "libs/lib/project.json")
+    ));
+}
+
+#[test]
+fn project_json_comments_and_formatting_affect_nothing_it_is_not_an_input_of() {
+    let repo = narrowed_repo(&[]);
+    write(
+        &repo.root,
+        "libs/lib/project.json",
+        &format!("// The library.\n{}\n", LIB.replace(", ", ",\n  ")),
+    );
+    let effect = effect(&repo);
+    assert!(effect.projects.is_empty(), "{:?}", effect.projects);
+    assert!(effect.tasks.is_empty(), "{:?}", effect.tasks);
+}
+
+#[test]
+fn a_project_json_target_affects_only_its_tasks() {
+    use qk_affected::{Cause, TaskCause, TaskReason};
+    let repo = narrowed_repo(&[]);
+    write(
+        &repo.root,
+        "libs/lib/project.json",
+        &LIB.replace(r#""lint": {}"#, r#""lint": {"command": "echo lint --fix"}"#),
+    );
+    let effect = effect(&repo);
+    assert_eq!(effect.touched, names(&["lib"]));
+    // app is affected as lib's dependent, but no task of it is: its build
+    // reads lib's production files, which the change leaves alone.
+    assert_eq!(effect.projects, names(&["app", "lib"]));
+    assert_eq!(effect.tasks, names(&["lib:lint"]));
+    let Cause::Touched { reasons } = &effect.analysis.projects["lib"] else {
+        panic!("lib is touched");
+    };
+    assert_eq!(
+        reasons[0].to_string(),
+        "libs/lib/project.json changed, which changes its target lint"
+    );
+    assert!(matches!(
+        &effect.causes["lib:lint"],
+        TaskCause::Touched { reasons } if matches!(&reasons[..], [TaskReason::Definition { file, .. }] if file == "libs/lib/project.json")
+    ));
+}
+
+#[test]
+fn project_json_named_inputs_affect_the_tasks_whose_inputs_use_them() {
+    use qk_affected::{TaskCause, TaskReason};
+    let repo = narrowed_repo(&[]);
+    write(
+        &repo.root,
+        "libs/lib/project.json",
+        &LIB.replace(
+            r#""targets""#,
+            r#""namedInputs": {"production": ["default", "!{projectRoot}/**/*.md"]}, "targets""#,
+        ),
+    );
+    let effect = effect(&repo);
+    assert_eq!(effect.touched, names(&["lib"]));
+    // lib's README.md left its production files, which app's build reads
+    // through ^production.
+    assert_eq!(effect.tasks, names(&["app:build", "lib:build"]));
+    assert!(matches!(
+        &effect.causes["app:build"],
+        TaskCause::Touched { reasons } if matches!(&reasons[..], [TaskReason::ResolvedInputs { .. }])
+    ));
+}
+
+#[test]
+fn project_json_tags_affect_the_projects_selecting_by_them() {
+    use qk_affected::Cause;
+    let repo = narrowed_repo(&[(
+        "tools/tool/project.json",
+        r#"{"name": "tool", "targets": {"lint": {"inputs": ["default", {"input": "default", "projects": "tag:shared"}]}}}"#,
+    )]);
+    write(
+        &repo.root,
+        "libs/lib/project.json",
+        &LIB.replace(r#""targets""#, r#""tags": ["shared"], "targets""#),
+    );
+    let effect = effect(&repo);
+    assert_eq!(effect.touched, names(&["lib", "tool"]));
+    // tool's lint now reads lib's files; lib's own keys hold no tag.
+    assert_eq!(effect.tasks, names(&["tool:lint"]));
+    let Cause::Touched { reasons } = &effect.analysis.projects["tool"] else {
+        panic!("tool is touched");
+    };
+    assert_eq!(
+        reasons[0].to_string(),
+        "libs/lib/project.json changed, which changes its projects its inputs name"
+    );
+}
+
+#[test]
+fn a_project_json_input_named_exactly_counts_the_file_whole() {
+    use qk_affected::{TaskCause, TaskReason};
+    let repo = narrowed_repo(&[(
+        "libs/lib/project.json",
+        r#"{"name": "lib", "targets": {"build": {}, "lint": {"inputs": ["{projectRoot}/src/**/*", "{projectRoot}/project.json"]}}}"#,
+    )]);
+    let text = std::fs::read_to_string(repo.root.join("libs/lib/project.json")).unwrap();
+    write(
+        &repo.root,
+        "libs/lib/project.json",
+        &format!("// Read by a tool.\n{text}"),
+    );
+    let effect = effect(&repo);
+    assert_eq!(effect.touched, names(&["lib"]));
+    assert_eq!(effect.tasks, names(&["lib:lint"]));
+    assert!(matches!(
+        &effect.causes["lib:lint"],
+        TaskCause::Touched { reasons }
+            if matches!(&reasons[..], [TaskReason::Input { file }] if file == "libs/lib/project.json")
+    ));
+}
+
+#[test]
+fn project_local_json_counts_by_what_it_changes() {
+    let repo = narrowed_repo(&[("libs/lib/project.local.json", r#"{"targets": {}}"#)]);
+    write(
+        &repo.root,
+        "libs/lib/project.local.json",
+        "// Mine.\n{\"targets\": {}}\n",
+    );
+    let unchanged = effect(&repo);
+    assert!(unchanged.projects.is_empty(), "{:?}", unchanged.projects);
+    assert!(unchanged.tasks.is_empty(), "{:?}", unchanged.tasks);
+
+    write(
+        &repo.root,
+        "libs/lib/project.local.json",
+        r#"{"targets": {"lint": {"command": "echo lint --fix"}}}"#,
+    );
+    let changed = effect(&repo);
+    assert_eq!(changed.touched, names(&["lib"]));
+    assert_eq!(changed.tasks, names(&["lib:lint"]));
+}
+
+/// A project.json counts as a file for its project where a task of it
+/// reads it, as its inputs resolve: through a named input given as an
+/// object, but not through a fileset of its dependencies.
+#[test]
+fn a_project_json_counts_whole_as_its_tasks_inputs_resolve() {
+    use qk_affected::{TaskCause, TaskReason};
+    for (inputs, read) in [
+        (r#"[{"input": "default"}]"#, true),
+        (r#"[{"input": "default", "projects": "self"}]"#, true),
+        (
+            r#"["{projectRoot}/src/**/*", {"fileset": "{projectRoot}/**/*", "dependencies": true}]"#,
+            false,
+        ),
+    ] {
+        let project =
+            format!(r#"{{"name": "tool", "targets": {{"lint": {{"inputs": {inputs}}}}}}}"#);
+        let repo = settings_repo(&[("tools/tool/project.json", &project)]);
+        write(
+            &repo.root,
+            "tools/tool/project.json",
+            &format!("// The tool.\n{project}"),
+        );
+        let effect = effect(&repo);
+        if read {
+            assert_eq!(effect.touched, names(&["tool"]), "{inputs}");
+            assert_eq!(effect.tasks, names(&["tool:lint"]), "{inputs}");
+            assert!(matches!(
+                &effect.causes["tool:lint"],
+                TaskCause::Touched { reasons }
+                    if matches!(&reasons[..], [TaskReason::Input { file }] if file == "tools/tool/project.json")
+            ));
+        } else {
+            assert!(
+                effect.projects.is_empty(),
+                "{inputs}: {:?}",
+                effect.projects
+            );
+            assert!(effect.tasks.is_empty(), "{inputs}: {:?}", effect.tasks);
+        }
+    }
+}
+
+#[test]
+fn added_and_deleted_project_json_count_as_before() {
+    let repo = settings_repo(&[]);
+    write(
+        &repo.root,
+        "tools/added/project.json",
+        r#"{"name": "added", "targets": {"lint": {}}}"#,
+    );
+    assert_eq!(effect(&repo).touched, names(&["added"]));
+
+    let repo = settings_repo(&[]);
+    std::fs::remove_file(repo.root.join("tools/tool/project.json")).unwrap();
+    // Nothing depended on tool, so nothing is affected.
+    assert!(
+        effect_of(&repo, &["app:build", "lib:build", "lib:lint"])
+            .projects
+            .is_empty()
+    );
 }
 
 #[test]
@@ -2273,19 +2514,36 @@ fn narrow_task_repo(nx_json_extra: &str, extra: &[(&str, &str)]) -> Repo {
     Repo::new(&files)
 }
 
-/// As in Nx, a changed project configuration reaches the tasks reading that
-/// project's inputs, its dependents' through `^` inputs included, whether or
-/// not their filesets select the file.
+/// A project configuration that cannot be compared, as when named with
+/// `--files`, reaches the tasks reading that project's inputs, as in Nx, its
+/// dependents' through `^` inputs included, whether or not their filesets
+/// select the file. Compared, a tag nothing selects by reaches none.
 #[test]
 fn a_changed_project_configuration_affects_the_tasks_reading_that_project() {
     use qk_affected::{TaskCause, TaskReason};
+    use qk_taskgraph::{Request, TaskGraph};
     let repo = narrow_task_repo("", &[]);
     write(
         &repo.root,
         "libs/lib/project.json",
         r#"{"name": "lib", "tags": ["scope:shared"], "targets": {"build": {}, "test": {}}}"#,
     );
-    let tasks = affected_tasks(&repo);
+    let workspace = Workspace::load(&repo.root).unwrap();
+    let requests: Vec<Request> = ["app:build", "app:test", "lib:build", "lib:test"]
+        .iter()
+        .map(|id| Request::parse(id).unwrap())
+        .collect();
+    let graph = TaskGraph::build(&workspace, &requests).unwrap();
+    let tasks = qk_affected::affected_tasks(
+        &workspace,
+        &graph,
+        &Options {
+            files: vec!["libs/lib/project.json".into()],
+            ..Options::default()
+        },
+    )
+    .unwrap()
+    .tasks;
     assert_eq!(
         tasks.keys().collect::<Vec<_>>(),
         ["app:build", "lib:build", "lib:test"]
@@ -2295,6 +2553,7 @@ fn a_changed_project_configuration_affects_the_tasks_reading_that_project() {
         TaskCause::Touched { reasons }
             if matches!(&reasons[..], [TaskReason::ProjectConfiguration { file }] if file == "libs/lib/project.json")
     ));
+    assert!(affected_tasks(&repo).is_empty());
 }
 
 /// As in Nx, the root tsconfig's path mappings are not part of a task's

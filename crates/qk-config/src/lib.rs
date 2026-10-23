@@ -171,8 +171,9 @@ pub const LOCAL_OVERRIDES: &str = "project.local.json";
 /// Merged over nx.json in the same way, for the workspace.
 pub const LOCAL_WORKSPACE: &str = "nx.local.json";
 
-/// Reads the workspace configuration files for [`Workspace::load_with`]:
-/// the text of a file by its absolute path, or `None` when it is absent.
+/// Reads the workspace and project configuration files for
+/// [`Workspace::load_with`]: the text of a file by its absolute path, or
+/// `None` when it is absent.
 pub type ConfigReader<'a> = &'a dyn Fn(&Path) -> Result<Option<String>>;
 
 /// The files `load` reads, from disk.
@@ -331,15 +332,51 @@ impl WorkspaceConfig {
     }
 }
 
+/// The project keys [`Project::keyed_settings`] leaves out, each of which
+/// reaches a task only through what its key holds otherwise or changes no
+/// task's work: the name is in its id; `targets` reach it through its
+/// definition and `namedInputs` through what its inputs select; `tags` and
+/// `implicitDependencies` through which projects its inputs and dependencies
+/// select; `sourceRoot` through the output paths `{project.sourceRoot}`
+/// names; the rest describe the project, or configure qk's affected
+/// selection.
+pub const UNKEYED_PROJECT_SETTINGS: &[&str] = &[
+    "name",
+    "targets",
+    "namedInputs",
+    "tags",
+    "implicitDependencies",
+    "sourceRoot",
+    "metadata",
+    "projectType",
+    "$schema",
+    "generators",
+    "release",
+    "qk:reachability",
+];
+
+impl Project {
+    /// The configuration that can change a task of the project other than
+    /// through its resolved configuration: every key but
+    /// [`UNKEYED_PROJECT_SETTINGS`], such as its `root`.
+    pub fn keyed_settings(&self) -> Map<String, Value> {
+        let Ok(Value::Object(mut settings)) = serde_json::to_value(self) else {
+            unreachable!("a project serializes as an object");
+        };
+        settings.retain(|key, _| !UNKEYED_PROJECT_SETTINGS.contains(&key.as_str()));
+        settings
+    }
+}
+
 impl Workspace {
     pub fn load(root: &Path) -> Result<Self> {
         Self::load_with(root, &read_disk)
     }
 
     /// As [`Workspace::load`], with nx.json, the file it extends,
-    /// nx.local.json and every package.json read with `read`: the workspace
-    /// another revision of those files makes of the project.json files on
-    /// disk.
+    /// nx.local.json, each project's `project.json` and `project.local.json`
+    /// and every package.json read with `read`: the workspace another revision
+    /// of those files makes.
     pub fn load_with(root: &Path, read: ConfigReader) -> Result<Self> {
         let root = root
             .canonicalize()
@@ -417,12 +454,23 @@ impl Workspace {
         for (directory, in_workspaces) in
             discovery::project_directories(&root, read, &mut workspace.warnings)?
         {
-            let project_json = read_optional_json(&directory.join("project.json"))?;
-            let local = read_optional_json(&directory.join(LOCAL_OVERRIDES))?;
+            let manifest = |name: &str| -> Result<Option<Value>> {
+                let path = directory.join(name);
+                read(&path)?
+                    .map(|text| parse_json(&text, &path.display().to_string()))
+                    .transpose()
+            };
+            let project_json = manifest("project.json")?;
+            let local = manifest(LOCAL_OVERRIDES)?;
             let package: Option<Package> = package_json(&directory.join("package.json"))?
                 .map(serde_json::from_value)
                 .transpose()
                 .with_context(|| format!("invalid {}", directory.join("package.json").display()))?;
+            // A project.json `read` holds absent, as at a revision before it
+            // was added, makes no project of a directory with nothing else.
+            if project_json.is_none() && package.is_none() {
+                continue;
+            }
             let project = normalize::project(
                 &normalize::Origin {
                     root: &root,

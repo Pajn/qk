@@ -6403,3 +6403,97 @@ fn a_declared_nx_json_input_keys_the_file_whole() {
     .unwrap();
     assert_eq!(both(&fixture), (false, true));
 }
+
+/// The fixture's root project with `build` reading its default inputs and
+/// `lint` reading `lint_inputs` with no outputs. With `narrowed`, nx.json's
+/// `default` leaves out the project's `project.json` and
+/// `project.local.json`; otherwise `default` selects them.
+fn manifest_fixture(lint_inputs: Value, narrowed: bool) -> Fixture {
+    let mut lint = target("lint", json!({ "inputs": lint_inputs }));
+    lint.as_object_mut().unwrap().remove("outputs");
+    let fixture = Fixture::with_targets(json!({"build": target("build", json!({})), "lint": lint}));
+    if narrowed {
+        let settings = json!({"namedInputs": {"default": [
+            "{projectRoot}/**/*",
+            "!{projectRoot}/project.json",
+            "!{projectRoot}/project.local.json"
+        ]}});
+        fs::write(fixture.root.join("nx.json"), settings.to_string()).unwrap();
+    }
+    fixture
+}
+
+fn project_json(fixture: &Fixture) -> Value {
+    serde_json::from_str(&fs::read_to_string(fixture.root.join("project.json")).unwrap()).unwrap()
+}
+
+#[test]
+fn a_project_json_its_inputs_select_keys_it_whole() {
+    let fixture = manifest_fixture(json!(["{projectRoot}/src/**/*"]), false);
+    assert_eq!(both(&fixture), (false, false));
+    let project = project_json(&fixture);
+    fs::write(
+        fixture.root.join("project.json"),
+        format!("// The project.\n{project}"),
+    )
+    .unwrap();
+    // `default` selects it, as in Nx; `lint` reads only `src`.
+    assert_eq!(both(&fixture), (false, true));
+}
+
+#[test]
+fn project_json_keys_tasks_by_what_it_changes() {
+    let fixture = manifest_fixture(json!(["{projectRoot}/src/**/*"]), true);
+    let path = fixture.root.join("project.json");
+    assert_eq!(both(&fixture), (false, false));
+    assert_eq!(both(&fixture), (true, true));
+
+    // Comments and formatting change nothing.
+    let mut project = project_json(&fixture);
+    let pretty = serde_json::to_string_pretty(&project).unwrap();
+    fs::write(&path, format!("// The project.\n{pretty}\n")).unwrap();
+    assert_eq!(both(&fixture), (true, true));
+
+    // Nor does a tag nothing selects by.
+    project["tags"] = json!(["scope:app"]);
+    fs::write(&path, project.to_string()).unwrap();
+    assert_eq!(both(&fixture), (true, true));
+
+    // A target reaches only its own tasks.
+    project["targets"]["lint"]["outputs"] = json!(["{projectRoot}/lint"]);
+    fs::write(&path, project.to_string()).unwrap();
+    assert_eq!(both(&fixture), (true, false));
+
+    // A named input reaches the tasks whose inputs it changes.
+    project["namedInputs"] = json!({"default": ["{projectRoot}/src/**/*"]});
+    fs::write(&path, project.to_string()).unwrap();
+    assert_eq!(both(&fixture), (false, true));
+}
+
+#[test]
+fn a_project_json_input_named_exactly_keys_the_file_whole() {
+    let fixture = manifest_fixture(
+        json!(["{projectRoot}/src/**/*", "{projectRoot}/project.json"]),
+        true,
+    );
+    assert_eq!(both(&fixture), (false, false));
+    let project = project_json(&fixture);
+    fs::write(
+        fixture.root.join("project.json"),
+        format!("// A tool reads this file.\n{project}"),
+    )
+    .unwrap();
+    assert_eq!(both(&fixture), (true, false));
+}
+
+#[test]
+fn project_local_json_keys_tasks_by_what_it_changes() {
+    let fixture = manifest_fixture(json!(["{projectRoot}/src/**/*"]), true);
+    let path = fixture.root.join("project.local.json");
+    assert_eq!(both(&fixture), (false, false));
+    let local = json!({"targets": {"lint": {"outputs": ["{projectRoot}/lint"]}}});
+    fs::write(&path, local.to_string()).unwrap();
+    assert_eq!(both(&fixture), (true, false));
+    fs::write(&path, format!("// Mine.\n{local}")).unwrap();
+    assert_eq!(both(&fixture), (true, true));
+}

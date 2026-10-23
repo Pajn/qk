@@ -57,7 +57,8 @@ listings leave out has nothing in them to key.
 A task with `qk:ultracache` has a weak key: its key without its declared file
 inputs. It keeps the command, arguments, environment and runtime inputs,
 `externalDependencies`, the lockfile and what qk keys for every task, such
-as the nx.json settings and its project's manifests, and its inputs marked
+as the nx.json settings and its project's configuration and `package.json`,
+and its inputs marked
 `"always": true`, which count whether it read them or not. Up to eight path
 sets are kept for a weak key, the newest first. A task that reads differently
 from run to run keeps a set for each way.

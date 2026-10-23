@@ -2439,8 +2439,8 @@ fn infer(snapshot: &Snapshot, workspace: &Workspace, task: &Task) -> Result<Infe
     if exists("pnpm-lock.yaml") && !readable {
         inferred.files.insert("pnpm-lock.yaml".into());
     }
-    // The task's own manifests count whole, its package scripts and dependency
-    // declarations with them. A dependency's package.json counts by what it
+    // The task's own package.json counts whole, its package scripts and
+    // dependency declarations with it. A dependency's package.json counts by what it
     // decides for dependents, such as where their imports of it resolve; its
     // installs count through the lockfile.
     let mut packages = BTreeSet::from([task.project.clone()]);
@@ -2467,6 +2467,14 @@ fn infer(snapshot: &Snapshot, workspace: &Workspace, task: &Task) -> Result<Infe
                 .to_str()
                 .context("project path must be UTF-8")?
                 .replace('\\', "/");
+            // Its project.json and project.local.json are not added: what
+            // they decide for the task counts through its resolved
+            // configuration, and an input selecting them keys them as it
+            // says.
+            if own && name != "package.json" {
+                inferred.project.insert(path);
+                continue;
+            }
             if own {
                 inferred.files.insert(path);
                 continue;
@@ -2580,6 +2588,7 @@ pub fn inputs(
     let mut configuration = json!({
         "files": file_values(&inferred.files)?,
         "settings": workspace.config.keyed_settings(),
+        "project": task_configuration(workspace, task),
     });
     let installed = snapshot.installed(&workspace.root, &task.id)?;
     if let (Some(importers), Some(installed)) = (&inferred.lockfile, &installed)
@@ -2663,6 +2672,23 @@ pub fn keyed_definition(task: &Task) -> qk_config::Target {
     // What a recording keys is the recording's own concern.
     definition.extra.remove("qk:ultracache");
     definition
+}
+
+/// What a task's key holds of its project's configuration beside its
+/// definition and resolved inputs: the project's keyed settings, such as its
+/// root, the paths its outputs resolve to, which `{project.*}` tokens can
+/// read from anywhere in the configuration, and all of the configuration
+/// when a forwarded argument holds such a token, as the task reads it then.
+pub fn task_configuration(workspace: &Workspace, task: &Task) -> Value {
+    let project = &workspace.projects[&task.project];
+    let mut value = json!({ "settings": project.keyed_settings() });
+    if let Ok((outputs, _)) = paths::resolved_outputs(workspace, task) {
+        value["outputs"] = json!(outputs);
+    }
+    if task.args.iter().any(|arg| arg.contains("{project")) {
+        value["configuration"] = serde_json::to_value(project).unwrap_or_default();
+    }
+    value
 }
 
 /// The key for a task's inputs. Objects are keyed with their fields sorted,
@@ -3363,7 +3389,6 @@ mod tests {
         let expected = |name: &str| {
             BTreeSet::from([
                 ".nxignore".into(),
-                "project.json".into(),
                 format!("src/{name}.txt"),
                 format!("generated/{name}.txt"),
             ])

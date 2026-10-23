@@ -65,6 +65,10 @@ pub struct Inferred {
     /// their resolved configuration or change no task's work: see
     /// [`qk_config::WorkspaceConfig::keyed_settings`].
     pub settings: BTreeSet<String>,
+    /// The task's project's `project.json` and `project.local.json`, keyed
+    /// by what they decide for the task beside its definition and resolved
+    /// inputs: see [`crate::task_configuration`].
+    pub project: BTreeSet<String>,
     /// `pnpm-workspace.yaml` without its resolution keys, which reach tasks
     /// through the lockfile instead.
     pub workspace_file: bool,
@@ -99,6 +103,7 @@ impl Inferred {
         self.files
             .iter()
             .chain(&self.settings)
+            .chain(&self.project)
             .map(String::as_str)
             .chain(self.workspace_file.then_some("pnpm-workspace.yaml"))
             .chain(self.lockfile.is_some().then_some("pnpm-lock.yaml"))
@@ -211,22 +216,28 @@ impl Resolved {
     }
 
     /// Whether `other`, the same task's inputs resolved from another
-    /// configuration, selects what these do for its key: the same files,
-    /// values and external packages, the same producers, whose outputs the
-    /// key holds once they are written, and the same projects when
-    /// `selectivelyHashTsConfig` keys their root tsconfig paths. Values hold
-    /// what `json` inputs select and `dependentTasksOutputFiles` globs; env
-    /// and runtime inputs compare by name. Declaring `externalDependencies`
-    /// also leaves the root importer out of the lockfile importers keyed.
+    /// configuration of the same files, selects what these do for its key:
+    /// the same files, values and external packages, the same producers,
+    /// whose outputs the key holds once they are written, the same projects
+    /// when `selectivelyHashTsConfig` keys their root tsconfig paths, and the
+    /// same files, manifests and importers qk adds, which the project graph
+    /// and declaring `externalDependencies` decide. Values hold what `json`
+    /// inputs select and `dependentTasksOutputFiles` globs; env and runtime
+    /// inputs compare by name.
     pub fn selects_alike(&self, other: &Resolved, workspace: &Workspace) -> bool {
         let (one, two) = (&self.declared, &other.declared);
+        let (mine, theirs) = (&self.inferred, &other.inferred);
         one.files == two.files
             && one.ignored == two.ignored
             && one.values == two.values
             && one.external == two.external
             && one.producers == two.producers
             && (!selectively_hash_tsconfig(workspace) || one.projects == two.projects)
-            && self.inferred.lockfile == other.inferred.lockfile
+            && mine.files == theirs.files
+            && mine.manifests.keys().eq(theirs.manifests.keys())
+            && mine.lockfile == theirs.lockfile
+            && mine.tsconfig == theirs.tsconfig
+            && mine.workspace_file == theirs.workspace_file
     }
 
     pub fn json_inputs(&self) -> impl Iterator<Item = &str> {
@@ -901,7 +912,7 @@ mod tests {
         // is not one: qk keys its settings, and the input the file whole.
         assert!(!inputs.inferred.files.contains("nx.json"));
         assert!(inputs.inferred.settings.contains("nx.json"));
-        assert!(inputs.inferred.files.contains("app/project.json"));
+        assert!(inputs.inferred.project.contains("app/project.json"));
         assert_eq!(inputs.inferred.lockfile, None);
         assert_eq!(
             inputs.inferred.covered,

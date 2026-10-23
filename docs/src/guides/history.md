@@ -17,8 +17,10 @@ Each task's record holds its status, cache result
 (`local-hit`, `remote-hit`, `miss` or `uncached`), key, timing and cause: what
 differs from the previous key recorded for the task, grouped as `files` (with
 the paths added, removed and changed), `configuration` (the files qk keys for
-every task, such as `.gitignore` and the task's own manifests, listed with
-`files`, the nx.json settings every key holds, by key, and dependency
+every task, such as `.gitignore` and the task's own `package.json`, listed
+with `files`, the nx.json settings every key holds, by key, what the key
+holds of the task's project's configuration, such as its root and output
+paths, and dependency
 manifests and `pnpm-workspace.yaml` as dependents read them), `env`, `runtime`, `dependencies` (the dependency outputs
 `dependentTasksOutputFiles` reads, by task and pattern),
 `lockfile` (with the importers and packages), `inputs`, `definition` (with each field that differs and both of its

@@ -952,6 +952,33 @@ pub fn diff(before: &Value, after: &Value) -> Cause {
             values.push(format!("nx.json {key}"));
         }
     }
+    let project = |inferred: &Value, key: &str| {
+        inferred
+            .get("project")
+            .and_then(|project| project.get(key))
+            .cloned()
+    };
+    let settings = |inferred: &Value| {
+        project(inferred, "settings")
+            .and_then(|settings| settings.as_object().cloned())
+            .unwrap_or_default()
+    };
+    let (old, new) = (settings(&inferred_before), settings(&inferred_after));
+    for key in old.keys().chain(new.keys()).collect::<BTreeSet<_>>() {
+        if old.get(key) != new.get(key) {
+            changed.insert("configuration".to_owned());
+            values.push(format!("project {key}"));
+        }
+    }
+    for (key, name) in [
+        ("outputs", "output paths"),
+        ("configuration", "project configuration its arguments read"),
+    ] {
+        if project(&inferred_before, key) != project(&inferred_after, key) {
+            changed.insert("configuration".to_owned());
+            values.push(name.to_owned());
+        }
+    }
     if inferred_before.get("workspaceFile") != inferred_after.get("workspaceFile") {
         changed.insert("configuration".to_owned());
         values.push("pnpm-workspace.yaml outside its resolution keys".to_owned());
