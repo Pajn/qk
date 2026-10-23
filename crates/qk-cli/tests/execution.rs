@@ -993,6 +993,31 @@ fn tasks_waiting_for_ready_start_once_the_check_passes() {
     assert!(!run(temp.path(), &["run", "app:e2e"]).status.success());
 }
 
+/// A server that signals readiness once it has written its marker, reporting
+/// `http://localhost:4321/`, framed as Nx frames it. It says how far it got,
+/// for a failure to show.
+const SIGNALLING_SERVER: &str = r#"const started = Date.now();
+const log = (what) =>
+  console.log(`serve: ${new Date().toISOString()} +${Date.now() - started}ms ${what}`);
+log(`started, signalling to ${process.env.NX_READY_SIGNAL_SOCKET}`);
+setTimeout(() => {
+  require('fs').writeFileSync('marker', '');
+  log('connecting');
+  const socket = require('net').connect(process.env.NX_READY_SIGNAL_SOCKET, () => {
+    log('connected');
+    const payload = Buffer.from(JSON.stringify({
+      type: 'TO_PARENT_FROM_CHILDREN',
+      message: { type: 'nx-ready-signal:ready', taskId: process.env.NX_READY_SIGNAL_TASK, url: 'http://localhost:4321/' },
+    }));
+    socket.write('NX_MSG_' + payload.length + ':');
+    socket.write(payload, () => log('written'));
+  });
+  socket.on('error', (error) => log(`error ${error.code} ${error.message}`));
+  socket.on('close', () => log('closed'));
+}, 300);
+setInterval(() => {}, 1000);
+"#;
+
 /// A server that signals readiness, as `@nx/devkit`'s `signalTaskReady`
 /// does, releases the tasks waiting for it, which get the address it
 /// reported in `NX_READY_URL`. An enclosing run's signal variables reach no
@@ -1017,33 +1042,7 @@ fn a_signal_check_releases_the_tasks_waiting_for_it() {
         },
         "plain": {"command": "node plain.js"}
     }));
-    // Signals once it has written its marker, framed as Nx frames it, and
-    // says how far it got, for a failure to show.
-    fs::write(
-        temp.path().join("serve.js"),
-        r#"const started = Date.now();
-const log = (what) =>
-  console.log(`serve: ${new Date().toISOString()} +${Date.now() - started}ms ${what}`);
-log(`started, signalling to ${process.env.NX_READY_SIGNAL_SOCKET}`);
-setTimeout(() => {
-  require('fs').writeFileSync('marker', '');
-  log('connecting');
-  const socket = require('net').connect(process.env.NX_READY_SIGNAL_SOCKET, () => {
-    log('connected');
-    const payload = Buffer.from(JSON.stringify({
-      type: 'TO_PARENT_FROM_CHILDREN',
-      message: { type: 'nx-ready-signal:ready', taskId: process.env.NX_READY_SIGNAL_TASK, url: 'http://localhost:4321/' },
-    }));
-    socket.write('NX_MSG_' + payload.length + ':');
-    socket.write(payload, () => log('written'));
-  });
-  socket.on('error', (error) => log(`error ${error.code} ${error.message}`));
-  socket.on('close', () => log('closed'));
-}, 300);
-setInterval(() => {}, 1000);
-"#,
-    )
-    .unwrap();
+    fs::write(temp.path().join("serve.js"), SIGNALLING_SERVER).unwrap();
     fs::write(
         temp.path().join("e2e.js"),
         r#"if (!require('fs').existsSync('marker')) { console.error('not ready'); process.exit(1); }
@@ -1081,6 +1080,147 @@ if (process.env.NX_READY_URL !== 'http://localhost:4321/') { console.error('url 
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// A proxy waiting for the signalling server, and a task waiting for the
+/// proxy's own check; `None` without Node.
+#[cfg(unix)]
+fn proxied_fixture(proxy_ready_when: Value) -> Option<TempDir> {
+    if Command::new("node").arg("--version").output().is_err() {
+        eprintln!("skipped: needs node");
+        return None;
+    }
+    let temp = fixture(json!({
+        "serve": {
+            "continuous": true,
+            "readyWhen": {"signal": true, "timeout": 60000},
+            "command": "node serve.js"
+        },
+        "proxy": {
+            "continuous": true,
+            "readyWhen": proxy_ready_when,
+            "command": r#"echo "proxying to $NX_READY_URL"; touch proxied; sleep 30"#,
+            "dependsOn": [{"target": "serve", "waitFor": "ready"}]
+        },
+        "e2e": {
+            "command": "test -f proxied",
+            "dependsOn": [{"target": "proxy", "waitFor": "ready"}]
+        }
+    }));
+    fs::write(temp.path().join("serve.js"), SIGNALLING_SERVER).unwrap();
+    Some(temp)
+}
+
+/// As in Nx 24.0.1, a task waiting for a signalling server resolves its own
+/// readyWhen once that server is ready, so it reads the address the server
+/// reported, in placeholders and in a command check's environment.
+#[cfg(unix)]
+#[test]
+fn a_check_reads_the_address_its_signalling_server_reported() {
+    for (ready_when, describe) in [
+        (
+            json!({"logMatches": "proxying to {env.NX_READY_URL}", "timeout": 60000}),
+            r#"logMatches "proxying to http://localhost:4321/""#,
+        ),
+        (
+            json!({
+                "command": r#"test "$NX_READY_URL" = http://localhost:4321/ && test -f proxied"#,
+                "interval": 50,
+                "timeout": 60000
+            }),
+            "command",
+        ),
+    ] {
+        let Some(temp) = proxied_fixture(ready_when.clone()) else {
+            return;
+        };
+        let output = run(temp.path(), &["run", "app:e2e"]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{ready_when}: {stderr}");
+        assert!(
+            stderr.contains(&format!("waiting for app:proxy to be ready ({describe}")),
+            "{ready_when}: {stderr}"
+        );
+    }
+}
+
+/// Only a signal check reports an address, so a readyWhen that needs one
+/// behind a server with another check fails without one.
+#[cfg(unix)]
+#[test]
+fn a_check_needing_an_address_no_server_reports_fails() {
+    let temp = fixture(json!({
+        "serve": {
+            "continuous": true,
+            "readyWhen": {"logMatches": "listening"},
+            "command": "echo listening; sleep 30"
+        },
+        "proxy": {
+            "continuous": true,
+            "readyWhen": {"url": "{env.NX_READY_URL}"},
+            "command": "touch proxied; sleep 30",
+            "dependsOn": [{"target": "serve", "waitFor": "ready"}]
+        },
+        "e2e": {"command": "true", "dependsOn": [{"target": "proxy", "waitFor": "ready"}]}
+    }));
+    let output = run(temp.path(), &["run", "app:e2e"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "Task \"app:proxy\" has an invalid \"readyWhen\": \"{env.NX_READY_URL}\" has no value."
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("skipped app:e2e (dependency failed)"),
+        "{stderr}"
+    );
+    assert!(!temp.path().join("proxied").exists());
+}
+
+/// As in Nx 24.0.1, behind a signalling server a port read from
+/// `NX_READY_URL` gets the address, which is no port: a fallback no longer
+/// applies, and the check fails once the server is ready. A readyWhen that
+/// is invalid whatever the address says why.
+#[cfg(unix)]
+#[test]
+fn a_port_read_from_the_reported_address_is_invalid() {
+    let port = "\"port\" must be an integer from 0 to 65535, or \"auto\".";
+    for (ready_when, reason) in [
+        (json!({"port": "{env.NX_READY_URL ?? 4310}"}), port),
+        (json!({"port": "{env.NX_READY_URL}"}), port),
+        (
+            json!({"url": "{env.PROXY_URL}/health"}),
+            "\"{env.PROXY_URL}\" has no value.",
+        ),
+    ] {
+        let Some(temp) = proxied_fixture(ready_when.clone()) else {
+            return;
+        };
+        let output = command(temp.path(), &["run", "app:e2e"])
+            .env_remove("PROXY_URL")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!(
+                "Task \"app:proxy\" has an invalid \"readyWhen\": {reason}"
+            )),
+            "{ready_when}: {stderr}"
+        );
+        // It failed once the server it waits for was ready, without running.
+        assert!(
+            stderr.contains("waiting for app:serve to be ready (signal)"),
+            "{ready_when}: {stderr}"
+        );
+        assert!(
+            stderr.contains("skipped app:e2e (dependency failed)"),
+            "{ready_when}: {stderr}"
+        );
+        assert!(!temp.path().join("proxied").exists(), "{ready_when}");
+    }
 }
 
 /// As in Nx 24, a command check runs with the server's environment, and reads

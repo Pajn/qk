@@ -302,8 +302,12 @@ pub struct PreparedTask {
     /// Set once all of `ready_when` has appeared.
     pub ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// A continuous target's own `readyWhen`, which tasks depending on it
-    /// with `waitFor: "ready"` wait for, or why it is invalid.
+    /// with `waitFor: "ready"` wait for, or why it is invalid. Prepared, it is
+    /// resolved without `NX_READY_URL`; see [`PreparedTask::resolve_ready_check`].
     pub ready_check: Option<std::result::Result<readiness::ReadyCheck, String>>,
+    /// What `ready_check` is resolved from, to resolve it again once the
+    /// servers the task waits for have reported their address.
+    pub ready_inputs: Option<std::sync::Arc<ReadyInputs>>,
     /// What `ready_check` concluded.
     pub verdict: std::sync::Arc<readiness::Verdict>,
     /// The process ids of its commands while they run, from which the runner
@@ -836,8 +840,8 @@ pub fn prepare(
     }
     // As in Nx, commands run side by side share qk's output through pipes.
     pseudo_terminal &= commands.len() == 1 || !parallel;
-    let ready_check = ready_check(workspace, task, options, &env)?;
-    Ok(PreparedTask {
+    let ready_inputs = ready_inputs(workspace, task, options)?.map(std::sync::Arc::new);
+    let mut prepared = PreparedTask {
         id: task.id.clone(),
         commands,
         parallel,
@@ -848,7 +852,8 @@ pub fn prepare(
         execution,
         ready_when,
         ready: Default::default(),
-        ready_check,
+        ready_check: None,
+        ready_inputs,
         verdict: Default::default(),
         processes: Default::default(),
         decorations,
@@ -858,18 +863,31 @@ pub fn prepare(
         sandbox: None,
         recording: None,
         display: Display::default(),
-    })
+    };
+    prepared.ready_check = prepared.resolve_ready_check(None);
+    Ok(prepared)
 }
 
-/// A continuous target's `readyWhen`, resolved against the options and the
-/// environment the task runs with, as Nx 24 resolves it. `null` turns off one
+/// A continuous target's `readyWhen` and what its placeholders read but the
+/// environment: the options the task runs with, its arguments applied.
+#[derive(Debug)]
+pub struct ReadyInputs {
+    config: Value,
+    workspace_root: String,
+    project_root: String,
+    project_name: String,
+    options: Map<String, Value>,
+    /// `options` as a command check reads them, in `NX_TASK_OPTIONS`.
+    options_json: String,
+}
+
+/// A continuous target's `readyWhen`, as Nx 24 reads it. `null` turns off one
 /// a target default sets. A target that is not continuous has none.
-fn ready_check(
+fn ready_inputs(
     workspace: &Workspace,
     task: &Task,
     options: &Map<String, Value>,
-    env: &BTreeMap<OsString, OsString>,
-) -> Result<Option<std::result::Result<readiness::ReadyCheck, String>>> {
+) -> Result<Option<ReadyInputs>> {
     let Some(ready_when) = task
         .definition
         .extra
@@ -894,36 +912,61 @@ fn ready_check(
         }
         options.insert(key, value);
     }
-    let full_env = env;
-    let env: BTreeMap<String, String> = env
-        .iter()
-        .filter_map(|(name, value)| Some((name.to_str()?.to_owned(), value.to_str()?.to_owned())))
-        .collect();
-    let scope = readiness::Scope {
+    Ok(Some(ReadyInputs {
+        config: ready_when.clone(),
         workspace_root: workspace
             .root
             .to_str()
-            .context("workspace path must be UTF-8")?,
-        project_root: &workspace.projects[&task.project].root,
-        project_name: &task.project,
-        options: &options,
-        env: &env,
-    };
-    let mut check = readiness::resolve(&task.id, ready_when, &scope);
-    // As in Nx 24, a command check runs as the task's commands do, and
-    // reads the options they run with.
-    if let Ok(Some(readiness::ReadyCheck {
-        probe: readiness::Probe::Command { env: probe_env, .. },
-        ..
-    })) = &mut check
-    {
-        *probe_env = full_env.clone();
-        probe_env.insert(
-            "NX_TASK_OPTIONS".into(),
-            serde_json::to_string(&options)?.into(),
-        );
+            .context("workspace path must be UTF-8")?
+            .to_owned(),
+        project_root: project.root.clone(),
+        project_name: task.project.clone(),
+        options_json: serde_json::to_string(&options)?,
+        options,
+    }))
+}
+
+impl PreparedTask {
+    /// The task's own `readyWhen`, resolved against its options and the
+    /// environment it runs with, with `url` as `NX_READY_URL`. As in Nx
+    /// 24.0.1, a task waiting for a server that reports its address resolves
+    /// it once that server is ready, so its placeholders and a command check
+    /// read the address.
+    pub fn resolve_ready_check(
+        &self,
+        url: Option<&str>,
+    ) -> Option<std::result::Result<readiness::ReadyCheck, String>> {
+        let inputs = self.ready_inputs.as_deref()?;
+        let mut full_env = self.env.clone();
+        if let Some(url) = url {
+            full_env.insert(ready_signal::URL_ENV.into(), url.into());
+        }
+        let env: BTreeMap<String, String> = full_env
+            .iter()
+            .filter_map(|(name, value)| {
+                Some((name.to_str()?.to_owned(), value.to_str()?.to_owned()))
+            })
+            .collect();
+        let scope = readiness::Scope {
+            workspace_root: &inputs.workspace_root,
+            project_root: &inputs.project_root,
+            project_name: &inputs.project_name,
+            options: &inputs.options,
+            env: &env,
+        };
+        let mut check = readiness::resolve(&self.id, &inputs.config, &scope);
+        // As in Nx 24, a command check runs as the task's commands do, and
+        // reads the options they run with.
+        if let Ok(Some(readiness::ReadyCheck {
+            probe: readiness::Probe::Command { env: probe_env, .. },
+            ..
+        })) = &mut check
+        {
+            *probe_env = full_env;
+            probe_env.insert("NX_TASK_OPTIONS".into(), inputs.options_json.clone().into());
+        }
+        check.map_err(|error| format!("{error:#}")).transpose()
     }
-    Ok(check.map_err(|error| format!("{error:#}")).transpose())
 }
 
 /// The run-commands options Nx reads, which a task's arguments may set too.

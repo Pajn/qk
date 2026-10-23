@@ -445,6 +445,7 @@ fn callbacks(
                 ready_when: Vec::new(),
                 ready: Default::default(),
                 ready_check: None,
+                ready_inputs: None,
                 verdict: Default::default(),
                 processes: Default::default(),
                 decorations: Vec::new(),

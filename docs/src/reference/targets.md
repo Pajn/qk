@@ -192,6 +192,13 @@ server that task waited for to report one. A task that sets
 `NX_USE_V8_SERIALIZER=true` signals in Node's own serialization, which qk
 cannot read.
 
+As in Nx 24.0.1, a task resolves its own `readyWhen` once the servers it
+waits for are ready, so `{env.NX_READY_URL}` and a `command` check's
+environment have the address. Only a signal check reports one: behind a
+server with another check, `{env.NX_READY_URL}` has no value. Behind a
+signalling server, a `port` read from `NX_READY_URL` gets the address rather
+than a `??` fallback, so it is not an integer, and the check is invalid.
+
 This is unrelated to the run-commands `readyWhen` option, which marks the
 task itself as ready.
 
