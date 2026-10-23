@@ -393,22 +393,88 @@ fn file_kind(file_type: std::fs::FileType) -> &'static str {
     }
 }
 
+/// The declared outputs of every target in the workspace, and of each of
+/// their configurations, which can move an output with its options, by the
+/// workspace's configuration rather than what a run schedules. Indexed by
+/// their anchors, so a path is matched only against the outputs that can
+/// hold it.
+#[derive(Default)]
+pub(crate) struct WorkspaceOutputs {
+    outputs: Vec<(TargetOf, Outputs)>,
+    by_anchor: BTreeMap<String, Vec<usize>>,
+}
+
+impl WorkspaceOutputs {
+    pub(crate) fn new(outputs: Vec<(TargetOf, Outputs)>) -> Self {
+        let mut by_anchor: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (index, (_, declared)) in outputs.iter().enumerate() {
+            for anchor in declared.anchors() {
+                by_anchor.entry(anchor.to_owned()).or_default().push(index);
+            }
+        }
+        Self { outputs, by_anchor }
+    }
+
+    /// The outputs whose anchor is `path` or a directory holding it.
+    fn holding<'a>(&'a self, path: &'a str) -> impl Iterator<Item = &'a (TargetOf, Outputs)> {
+        std::iter::once(path)
+            .chain(path.match_indices('/').map(|(at, _)| &path[..at]))
+            .filter_map(|anchor| self.by_anchor.get(anchor))
+            .flatten()
+            .map(|&index| &self.outputs[index])
+    }
+}
+
+/// A target by project, target and configuration, whose options can move
+/// its outputs.
+pub(crate) type TargetOf = (String, String, Option<String>);
+
+/// Other targets' outputs a recording's listings leave out: every target's
+/// in the workspace but the task's own and those it depends on, whose
+/// outputs are its inputs.
+pub(crate) struct Others<'a> {
+    pub outputs: &'a WorkspaceOutputs,
+    /// The task's target and its upstream.
+    pub upstream: BTreeSet<TargetOf>,
+}
+
+impl Others<'_> {
+    /// Whether `path` is another target's output, and none of the
+    /// upstream's: an output both declare is the task's input.
+    pub(crate) fn matches(&self, path: &str) -> bool {
+        let mut other = false;
+        for (target, outputs) in self.outputs.holding(path) {
+            if outputs.matches(path) {
+                if self.upstream.contains(target) {
+                    return false;
+                }
+                other = true;
+            }
+        }
+        other
+    }
+}
+
 /// What a recording's listings leave out of a directory's entries: what is
 /// there after a task runs whether or not it read anything, rather than what
-/// it read. The task's own outputs, those of every other target of its
-/// project, such as a build's output beside a lint's sources, and what its
-/// `ignoreReads` names. Only listings leave them out: a file among them that
-/// the task read is still keyed by its content.
+/// it read. The task's own outputs, the outputs of other targets, such as a
+/// build's output beside a lint's sources or another project's coverage, but
+/// not those of the targets it depends on, and what its `ignoreReads` names.
+/// Only listings leave them out: a file among them that the task read is
+/// still keyed by its content.
 pub(crate) struct Unlisted<'a> {
     pub own: Vec<&'a Outputs>,
-    pub siblings: &'a [Outputs],
+    pub others: Option<Others<'a>>,
     pub ignore: &'a [Pattern],
 }
 
 impl Unlisted<'_> {
     fn matches(&self, path: &str) -> bool {
         self.own(path)
-            || self.siblings.iter().any(|outputs| outputs.matches(path))
+            || self
+                .others
+                .as_ref()
+                .is_some_and(|others| others.matches(path))
             || self.ignore.iter().any(|pattern| pattern.is_match(path))
     }
 
@@ -417,7 +483,8 @@ impl Unlisted<'_> {
     }
 
     /// Where other targets' outputs and ignored paths come and go while the
-    /// task runs: the directories holding those outputs, and the root of the
+    /// task runs: the directories holding those outputs, and their anchors,
+    /// where an output a glob declares comes and goes, and the root of the
     /// task's project, where a tool's `ignoreReads` state usually sits.
     pub(crate) fn directories(&self, project_root: &str) -> BTreeSet<String> {
         let project_root = if project_root.is_empty() {
@@ -425,10 +492,17 @@ impl Unlisted<'_> {
         } else {
             project_root
         };
-        self.siblings
+        self.others
             .iter()
-            .flat_map(Outputs::anchors)
-            .map(|anchor| parent(anchor).to_owned())
+            .flat_map(|others| {
+                others
+                    .outputs
+                    .outputs
+                    .iter()
+                    .filter(|(target, _)| !others.upstream.contains(target))
+                    .flat_map(|(_, outputs)| outputs.anchors())
+            })
+            .flat_map(|anchor| [anchor.to_owned(), parent(anchor).to_owned()])
             .chain([project_root.to_owned()])
             .collect()
     }
@@ -601,7 +675,7 @@ mod tests {
     /// Nothing left out of listings.
     const NOTHING: Unlisted<'static> = Unlisted {
         own: Vec::new(),
-        siblings: &[],
+        others: None,
         ignore: &[],
     };
     use qk_input_analysis::Category;
@@ -701,7 +775,7 @@ mod tests {
         let outputs = Outputs::from_paths(&["icons/out".into()]).unwrap();
         let unlisted = Unlisted {
             own: vec![&outputs],
-            siblings: &[],
+            others: None,
             ignore: &[],
         };
         let strong = || strong_key("weak", &set, &snapshot, &root, &unlisted).unwrap();
@@ -903,14 +977,51 @@ mod tests {
             ..PathSet::default()
         };
         std::fs::write(root.join("app/kept.txt"), "").unwrap();
-        let build = [Outputs::from_patterns(&["app/.syb-ts"])];
+        std::fs::create_dir(root.join("app/out")).unwrap();
+        let outputs = WorkspaceOutputs::new(vec![
+            (
+                ("app".into(), "tsc".into(), None),
+                Outputs::from_patterns(&["app/.tsc"]),
+            ),
+            (
+                ("app".into(), "codegen".into(), None),
+                Outputs::from_patterns(&["app/generated"]),
+            ),
+            // An output a glob declares, inside a directory the task lists.
+            (
+                ("app".into(), "bundle".into(), None),
+                Outputs::from_patterns(&["app/out/*.js"]),
+            ),
+            // Another target declaring the dependency's output too.
+            (
+                ("app".into(), "package".into(), None),
+                Outputs::from_patterns(&["app/generated"]),
+            ),
+        ]);
         let ignore = [Pattern::new("**/.fallow", false).unwrap()];
         let unlisted = Unlisted {
             own: Vec::new(),
-            siblings: &build,
+            others: Some(Others {
+                outputs: &outputs,
+                // It depends on codegen, whose output is its input.
+                upstream: [
+                    ("app".into(), "build".into(), None),
+                    ("app".into(), "codegen".into(), None),
+                ]
+                .into(),
+            }),
             ignore: &ignore,
         };
-        assert_eq!(unlisted.directories("app"), ["app".to_owned()].into());
+        assert_eq!(
+            unlisted.directories("app"),
+            [
+                "app".to_owned(),
+                "app/.tsc".to_owned(),
+                "app/generated".to_owned(),
+                "app/out".to_owned()
+            ]
+            .into()
+        );
         let snapshot = Snapshot::new(&workspace, &graph, &root.join("cache")).unwrap();
         let key = || strong_key("weak", &set, &snapshot, root, &unlisted).unwrap();
         let before = key();
@@ -919,10 +1030,24 @@ mod tests {
         let started = now(root);
         let changed = |taken: &Before| set.changed_since(root, started, &unlisted, taken);
         // Another target's output and an ignored path appear as it runs.
-        std::fs::create_dir(root.join("app/.syb-ts")).unwrap();
+        std::fs::create_dir(root.join("app/.tsc")).unwrap();
         std::fs::create_dir(root.join("app/.fallow")).unwrap();
         assert_eq!(key(), before);
         assert_eq!(changed(&taken), None);
+        // An output appearing in a listed directory a glob declares it in.
+        std::fs::write(root.join("app/out/new.js"), "").unwrap();
+        let out = PathSet {
+            listings: ["app/out".to_owned()].into(),
+            ..PathSet::default()
+        };
+        assert_eq!(out.changed_since(root, started, &unlisted, &taken), None);
+        assert_eq!(
+            out.changed_since(root, started, &unlisted, &Before::default()),
+            Some("app/out")
+        );
+        // A dependency's output is the task's input, and stays listed.
+        assert!(!unlisted.matches("app/generated"));
+        assert!(unlisted.matches("app/.tsc/index.js"));
         // Without the entries from before, the directory's time is all there
         // is, and it moved.
         assert_eq!(changed(&Before::default()), Some("app"));

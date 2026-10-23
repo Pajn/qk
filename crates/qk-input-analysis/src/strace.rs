@@ -232,6 +232,11 @@ fn decode(process: u32, call: &str, cwd: &Path) -> Option<Decoded> {
     let (args, result) = tail.rsplit_once(" = ")?;
     let args = args.trim_end().strip_suffix(')')?;
     let args = arguments(args);
+    // A lookup that never returned, cut short by its process ending: what it
+    // would have found reached nothing, and strace may not have read its path.
+    if result.starts_with('?') && lookup(name) {
+        return Some((Vec::new(), None, None));
+    }
     let success = !result.starts_with("-1") && !result.starts_with('?');
     let status = if result.starts_with("-1 ENOENT") {
         "missing"
@@ -384,6 +389,33 @@ fn decode(process: u32, call: &str, cwd: &Path) -> Option<Decoded> {
         _ => return None,
     }
     Some((events, change, child))
+}
+
+/// A call that only reads what is at a path, changing nothing.
+fn lookup(name: &str) -> bool {
+    matches!(
+        name,
+        "stat"
+            | "lstat"
+            | "stat64"
+            | "lstat64"
+            | "access"
+            | "statfs"
+            | "statfs64"
+            | "getxattr"
+            | "lgetxattr"
+            | "listxattr"
+            | "llistxattr"
+            | "newfstatat"
+            | "fstatat64"
+            | "statx"
+            | "faccessat"
+            | "faccessat2"
+            | "name_to_handle_at"
+            | "readlink"
+            | "readlinkat"
+            | "getdents64"
+    )
 }
 
 fn descriptor(arg: &str) -> Option<PathBuf> {
@@ -617,6 +649,22 @@ mod tests {
             let (events, _, _) = decode(1, call, cwd).unwrap();
             assert_eq!(events[0].path, "/repo/a.txt", "{call}");
         }
+    }
+
+    #[test]
+    fn a_lookup_its_process_ending_cut_short_is_no_access() {
+        let cwd = Path::new("/repo");
+        for call in [
+            "access(0x7fff7546b1d0, F_OK) = ?",
+            "newfstatat(AT_FDCWD, \"a.txt\", 0x7ffd, 0) = ?",
+            "getdents64(3</repo>, 0x5555, 32768) = ?",
+        ] {
+            let (events, _, _) = decode(1, call, cwd).expect(call);
+            assert!(events.is_empty(), "{call}");
+        }
+        // A call that may have changed something still counts.
+        let (events, _, _) = decode(1, "unlink(\"/repo/a.txt\") = ?", cwd).unwrap();
+        assert_eq!(events.len(), 1);
     }
 
     #[test]
