@@ -14,7 +14,7 @@ mod store;
 pub mod ultracache;
 pub mod warm;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -52,6 +52,8 @@ pub struct Cache {
     /// Warm state being saved in the background.
     saves: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>,
     cleanup: std::sync::Mutex<Option<store::Cleanup>>,
+    /// Every target's declared outputs, which recordings' listings leave out.
+    workspace_outputs: OnceLock<recorded::WorkspaceOutputs>,
 }
 
 /// Where a task's result came from.
@@ -148,6 +150,7 @@ impl Cache {
             kept: Default::default(),
             saves: Default::default(),
             cleanup: Default::default(),
+            workspace_outputs: OnceLock::new(),
         }
     }
 
@@ -458,10 +461,12 @@ impl Cache {
         // What its recordings' listings leave out, by the workspace's
         // configuration rather than what this run schedules, so that the
         // same recording keys the same in any run.
-        let siblings = settings
-            .as_ref()
-            .map(|_| project_outputs(workspace, task))
-            .unwrap_or_default();
+        let others = settings.as_ref().map(|_| recorded::Others {
+            outputs: self
+                .workspace_outputs
+                .get_or_init(|| workspace_outputs(workspace)),
+            upstream: upstream(graph, task),
+        });
         let ignore: Vec<Pattern> = settings
             .as_ref()
             .map(|settings| {
@@ -474,7 +479,7 @@ impl Cache {
             .unwrap_or_default();
         let unlisted = recorded::Unlisted {
             own: own.clone(),
-            siblings: &siblings,
+            others,
             ignore: &ignore,
         };
         let inputs = &keyed.as_ref().expect("a cacheable task is keyed").1;
@@ -1075,42 +1080,62 @@ pub fn run_upload_worker() -> anyhow::Result<()> {
     remote::background::run()
 }
 
-/// The outputs of every other target of `task`'s project, as their targets
-/// declare them, and as each of their configurations does with its options,
+/// The declared outputs of every target in the workspace, as their targets
+/// declare them and as each of their configurations does with its options,
 /// which can move an output; one whose outputs cannot be read is left out.
-fn project_outputs(workspace: &Workspace, task: &Task) -> Vec<paths::Outputs> {
-    let Some(project) = workspace.projects.get(&task.project) else {
-        return Vec::new();
-    };
-    project
-        .targets
-        .iter()
-        .filter(|(target, _)| **target != task.target)
-        .flat_map(|(target, definition)| {
-            let configured = definition.configurations.iter().map(|(name, options)| {
-                let mut definition = definition.clone();
-                definition.options.extend(options.clone());
-                (Some(name.clone()), definition)
-            });
-            std::iter::once((None, definition.clone()))
-                .chain(configured)
-                .map(move |(configuration, definition)| Task {
-                    id: format!("{}:{target}", task.project),
-                    project: task.project.clone(),
+fn workspace_outputs(workspace: &Workspace) -> recorded::WorkspaceOutputs {
+    let mut outputs = Vec::new();
+    for (name, project) in &workspace.projects {
+        for (target, definition) in &project.targets {
+            let configured = definition
+                .configurations
+                .iter()
+                .map(|(configuration, options)| {
+                    let mut definition = definition.clone();
+                    definition.options.extend(options.clone());
+                    (Some(configuration.clone()), definition)
+                });
+            for (configuration, definition) in
+                std::iter::once((None, definition.clone())).chain(configured)
+            {
+                let task = Task {
+                    id: format!("{name}:{target}"),
+                    project: name.clone(),
                     target: target.clone(),
                     configuration,
                     args: Vec::new(),
                     definition,
                     dependencies: Default::default(),
                     edges: Default::default(),
-                })
-        })
-        .filter_map(|sibling| {
-            paths::Outputs::new(workspace, &sibling)
-                .ok()
-                .filter(paths::Outputs::declared)
-        })
-        .collect()
+                };
+                if let Some(declared) = paths::Outputs::new(workspace, &task)
+                    .ok()
+                    .filter(paths::Outputs::declared)
+                {
+                    outputs.push(((name.clone(), target.clone()), declared));
+                }
+            }
+        }
+    }
+    recorded::WorkspaceOutputs::new(outputs)
+}
+
+/// `task`'s target and those of every task it depends on, by project and
+/// target.
+fn upstream(graph: &TaskGraph, task: &Task) -> BTreeSet<(String, String)> {
+    let mut targets = BTreeSet::from([(task.project.clone(), task.target.clone())]);
+    let mut seen = BTreeSet::new();
+    let mut pending: Vec<&String> = task.dependencies.iter().collect();
+    while let Some(id) = pending.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        if let Some(dependency) = graph.tasks.get(id) {
+            targets.insert((dependency.project.clone(), dependency.target.clone()));
+            pending.extend(&dependency.dependencies);
+        }
+    }
+    targets
 }
 
 #[cfg(test)]
@@ -1312,30 +1337,47 @@ mod tests {
     }
 
     #[test]
-    fn project_outputs_include_each_configuration_of_other_targets() {
+    fn listings_leave_out_every_target_s_outputs_but_those_upstream() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         std::fs::write(root.join("nx.json"), "{}").unwrap();
-        std::fs::create_dir(root.join("app")).unwrap();
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        std::fs::create_dir_all(root.join("lib")).unwrap();
         std::fs::write(
             root.join("app/project.json"),
             r#"{"name":"app","targets":{
                 "build":{"command":"true","outputs":["{options.outputPath}"],
                   "options":{"outputPath":"app/dist"},
                   "configurations":{"production":{"outputPath":"app/dist-production"}}},
-                "lint":{"command":"true"}}}"#,
+                "lint":{"command":"true"},
+                "test":{"command":"true","dependsOn":[{"projects":["lib"],"target":"build"}]}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("lib/project.json"),
+            r#"{"name":"lib","targets":{"build":{"command":"true","outputs":["{projectRoot}/dist"]}}}"#,
         )
         .unwrap();
         let workspace = Workspace::load(root).unwrap();
         let graph = qk_taskgraph::TaskGraph::build(
             &workspace,
-            &[qk_taskgraph::Request::parse("app:lint").unwrap()],
+            &[
+                qk_taskgraph::Request::parse("app:lint").unwrap(),
+                qk_taskgraph::Request::parse("app:test").unwrap(),
+            ],
         )
         .unwrap();
-        let outputs = project_outputs(&workspace, &graph.tasks["app:lint"]);
-        let matched = |path: &str| outputs.iter().any(|outputs| outputs.matches(path));
-        assert!(matched("app/dist/main.js"));
-        assert!(matched("app/dist-production/main.js"));
-        assert!(!matched("app/src/main.ts"));
+        let outputs = workspace_outputs(&workspace);
+        let others = |task: &str| recorded::Others {
+            outputs: &outputs,
+            upstream: upstream(&graph, &graph.tasks[task]),
+        };
+        let lint = others("app:lint");
+        assert!(lint.matches("app/dist/main.js"));
+        assert!(lint.matches("app/dist-production/main.js"));
+        assert!(lint.matches("lib/dist"));
+        assert!(!lint.matches("app/src/main.ts"));
+        // A dependency's output is the test's input.
+        assert!(!others("app:test").matches("lib/dist"));
     }
 }

@@ -45,7 +45,10 @@ Left out are paths outside the workspace, `node_modules`, which the lockfile
 keys, `.git`, qk's own state, the task's outputs and warm paths, files it wrote
 before reading them, and what its `ignoreReads` names. A directory's listing
 leaves out the task's outputs and what it wrote there, which are there after
-it runs and need not be before.
+it runs and need not be before, and the declared outputs of every other
+target in the workspace, which other tasks write whether or not this one
+reads them. The outputs of the targets it depends on are its inputs, and stay
+in its listings.
 
 ## Keying
 
@@ -85,7 +88,7 @@ recording yet. `--report` writes each task's as `recorded`.
   whose task changed a file it read or found while it ran: keyed by the file
   as the task left it, it would be keyed by the task's own write. Nor is one
   where an entry in a directory it listed was added, renamed or removed while
-  it ran, other than what it wrote there and its outputs; what another task
+  it ran, other than what its listings leave out; what another task
   writes inside one of its entries, or a file it rewrites in place, leaves
   the listing as it was. Where the task wrote into the directory, any file
   there that changed counts, rewritten or not, and a subdirectory counts if
