@@ -719,8 +719,11 @@ impl Cache {
                         if set.is_empty() {
                             return Err("its trace named no path in the workspace".to_owned());
                         }
-                        match set.changed_since(&workspace.root, started, &unlisted, &listed) {
-                            Some(path) => Err(format!("{path} changed while it ran")),
+                        match set
+                            .changed_since(&workspace.root, started, &unlisted, &listed)
+                            .map(|changed| changed.to_string())
+                        {
+                            Some(reason) => Err(reason),
                             None => Ok(set),
                         }
                     }),
@@ -1117,7 +1120,12 @@ fn workspace_outputs(workspace: &Workspace) -> recorded::WorkspaceOutputs {
             }
         }
     }
-    recorded::WorkspaceOutputs::new(outputs)
+    let roots = workspace
+        .projects
+        .iter()
+        .map(|(name, project)| (name.clone(), project.root.clone()))
+        .collect();
+    recorded::WorkspaceOutputs::new(outputs, &roots)
 }
 
 /// `task`'s target and those of every task it depends on, each with the
@@ -1357,6 +1365,7 @@ mod tests {
                   "options":{"outputPath":"app/dist"},
                   "configurations":{"production":{"outputPath":"app/dist-production"}}},
                 "lint":{"command":"true"},
+                "wasm":{"command":"true","outputs":["{projectRoot}/target/wasm/release/*.wasm"]},
                 "test":{"command":"true","dependsOn":[{"projects":["lib"],"target":"build"}],
                   "configurations":{"production":{}}}}}"#,
         )
@@ -1388,6 +1397,10 @@ mod tests {
         assert!(lint.matches("app/dist-production/main.js"));
         assert!(lint.matches("lib/dist"));
         assert!(!lint.matches("app/src/main.ts"));
+        // The directories holding an output count as it, not its project's.
+        assert!(lint.matches("app/target"));
+        assert!(lint.matches("app/target/wasm"));
+        assert!(!lint.matches("app"));
         // A dependency's output is the test's input, and only that of the
         // configuration it depends on.
         assert!(!others("app:test").matches("lib/dist"));

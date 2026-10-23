@@ -202,66 +202,102 @@ impl PathSet {
         started: SystemTime,
         unlisted: &Unlisted,
         before: &Before,
-    ) -> Option<&str> {
+    ) -> Option<Changed<'_>> {
         let file = self.reads.iter().chain(&self.present).find(|path| {
             std::fs::symlink_metadata(root.join(path))
                 .is_ok_and(|metadata| !metadata.is_dir() && changed(&metadata) >= started)
         });
-        file.or_else(|| {
-            self.listings.iter().find(|directory| {
-                let absolute = if *directory == "." {
-                    root.to_path_buf()
-                } else {
-                    root.join(directory)
-                };
-                let skipped = |path: &str| self.written.contains(path) || unlisted.matches(path);
-                if let Some(earlier) = before.0.get(*directory) {
-                    let earlier: BTreeSet<_> = earlier
-                        .iter()
-                        .filter(|(name, _)| !self.written.contains(&child(directory, name)))
-                        .cloned()
-                        .collect();
-                    return entries(root, directory, skipped).is_none_or(|now| now != earlier);
-                }
-                let Ok(entries) = std::fs::read_dir(&absolute) else {
-                    return false;
-                };
-                // Each entry, whether listings leave it out, and whether the
-                // task wrote it or it is among the task's own outputs.
-                let entries: Vec<(std::fs::DirEntry, bool, bool)> = entries
-                    .flatten()
-                    .map(|entry| {
-                        let path = child(directory, &entry.file_name().to_string_lossy());
-                        let own = self.written.contains(&path) || unlisted.own(&path);
-                        (entry, skipped(&path), own)
-                    })
-                    .collect();
-                let own = self.written.iter().any(|path| parent(path) == *directory)
-                    || entries.iter().any(|(_, _, own)| *own);
-                if !own {
-                    return std::fs::symlink_metadata(&absolute)
-                        .and_then(|metadata| metadata.modified())
-                        .is_ok_and(|modified| modified >= started);
-                }
-                entries
-                    .iter()
-                    .filter(|(_, skipped, _)| !skipped)
-                    .any(|(entry, _, _)| {
-                        std::fs::symlink_metadata(entry.path()).is_ok_and(|metadata| {
-                            // A file's change time moves when it is moved in,
-                            // and with a rewrite, which counts too. A
-                            // subdirectory's moves with what is written inside
-                            // it, so it counts only once it was created.
-                            if metadata.is_dir() {
-                                metadata.created().is_ok_and(|born| born >= started)
-                            } else {
-                                changed(&metadata) >= started
-                            }
-                        })
-                    })
-            })
+        if let Some(path) = file {
+            return Some(Changed { path, how: None });
+        }
+        self.listings.iter().find_map(|directory| {
+            self.listing_changed(root, directory, started, unlisted, before)
+                .map(|how| Changed {
+                    path: directory,
+                    how,
+                })
         })
-        .map(String::as_str)
+    }
+
+    /// Whether `directory`'s listing changed while the task ran, and if so,
+    /// what changed in it, where that can be told.
+    fn listing_changed(
+        &self,
+        root: &Path,
+        directory: &str,
+        started: SystemTime,
+        unlisted: &Unlisted,
+        before: &Before,
+    ) -> Option<Option<String>> {
+        // A directory listings leave out, such as another target's output,
+        // has nothing in it to key.
+        if directory != "." && unlisted.matches(directory) {
+            return None;
+        }
+        let absolute = if directory == "." {
+            root.to_path_buf()
+        } else {
+            root.join(directory)
+        };
+        let skipped = |path: &str| self.written.contains(path) || unlisted.matches(path);
+        if let Some(earlier) = before.0.get(directory) {
+            let earlier: BTreeSet<_> = earlier
+                .iter()
+                .filter(|(name, _)| !self.written.contains(&child(directory, name)))
+                .cloned()
+                .collect();
+            let Some(now) = entries(root, directory, skipped) else {
+                return Some(Some("it could no longer be read".to_owned()));
+            };
+            if let Some((name, _)) = now.difference(&earlier).next() {
+                return Some(Some(format!("{name} added")));
+            }
+            if let Some((name, _)) = earlier.difference(&now).next() {
+                return Some(Some(format!("{name} removed")));
+            }
+            return None;
+        }
+        let entries = std::fs::read_dir(&absolute).ok()?;
+        // Each entry, whether listings leave it out, and whether the task
+        // wrote it or it is among the task's own outputs.
+        let entries: Vec<(std::fs::DirEntry, bool, bool)> = entries
+            .flatten()
+            .map(|entry| {
+                let path = child(directory, &entry.file_name().to_string_lossy());
+                let own = self.written.contains(&path) || unlisted.own(&path);
+                (entry, skipped(&path), own)
+            })
+            .collect();
+        // A file's change time moves when it is moved in, and with a rewrite,
+        // which counts too. A subdirectory's moves with what is written
+        // inside it, so it counts only once it was created.
+        let new = |entry: &std::fs::DirEntry| {
+            std::fs::symlink_metadata(entry.path()).is_ok_and(|metadata| {
+                if metadata.is_dir() {
+                    metadata.created().is_ok_and(|born| born >= started)
+                } else {
+                    changed(&metadata) >= started
+                }
+            })
+        };
+        let unskipped = || entries.iter().filter(|(_, skipped, _)| !skipped);
+        let name = |entry: &std::fs::DirEntry| entry.file_name().to_string_lossy().into_owned();
+        let own = self.written.iter().any(|path| parent(path) == directory)
+            || entries.iter().any(|(_, _, own)| *own);
+        if !own {
+            let moved = std::fs::symlink_metadata(&absolute)
+                .and_then(|metadata| metadata.modified())
+                .is_ok_and(|modified| modified >= started);
+            return moved.then(|| {
+                Some(unskipped().find(|(entry, _, _)| new(entry)).map_or_else(
+                    || "an entry removed or renamed".to_owned(),
+                    |(entry, _, _)| format!("{} added or changed", name(entry)),
+                ))
+            });
+        }
+        unskipped()
+            .find(|(entry, _, _)| new(entry))
+            .map(|(entry, _, _)| Some(format!("{} added or changed", name(entry))))
     }
 
     pub fn digest(&self) -> Result<String> {
@@ -393,6 +429,23 @@ fn file_kind(file_type: std::fs::FileType) -> &'static str {
     }
 }
 
+/// A path whose recording changed while the task ran, and what changed in
+/// it, where that can be told.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Changed<'a> {
+    pub path: &'a str,
+    pub how: Option<String>,
+}
+
+impl std::fmt::Display for Changed<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.how {
+            Some(how) => write!(f, "{} changed while it ran ({how})", self.path),
+            None => write!(f, "{} changed while it ran", self.path),
+        }
+    }
+}
+
 /// The declared outputs of every target in the workspace, and of each of
 /// their configurations, which can move an output with its options, by the
 /// workspace's configuration rather than what a run schedules. Indexed by
@@ -402,17 +455,52 @@ fn file_kind(file_type: std::fs::FileType) -> &'static str {
 pub(crate) struct WorkspaceOutputs {
     outputs: Vec<(TargetOf, Outputs)>,
     by_anchor: BTreeMap<String, Vec<usize>>,
+    /// The directories between each output's project root and its anchor,
+    /// such as `.cache` for `.cache/build`, which exist to hold it.
+    folders: Vec<Vec<String>>,
+    by_folder: BTreeMap<String, Vec<usize>>,
+    roots: Vec<String>,
 }
 
 impl WorkspaceOutputs {
-    pub(crate) fn new(outputs: Vec<(TargetOf, Outputs)>) -> Self {
+    /// `roots` holds each project's root.
+    pub(crate) fn new(outputs: Vec<(TargetOf, Outputs)>, roots: &BTreeMap<String, String>) -> Self {
         let mut by_anchor: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-        for (index, (_, declared)) in outputs.iter().enumerate() {
+        let mut by_folder: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        let mut folders = Vec::new();
+        let mut project_roots = Vec::new();
+        for (index, ((project, _, _), declared)) in outputs.iter().enumerate() {
+            let root = roots.get(project).map_or("", String::as_str);
+            let mut held = Vec::new();
             for anchor in declared.anchors() {
                 by_anchor.entry(anchor.to_owned()).or_default().push(index);
+                let Some(rest) = (!root.is_empty())
+                    .then(|| anchor.strip_prefix(root)?.strip_prefix('/'))
+                    .flatten()
+                else {
+                    continue;
+                };
+                // Each directory below the root that holds the anchor.
+                for (at, _) in rest.match_indices('/') {
+                    let folder = format!("{root}/{}", &rest[..at]);
+                    by_folder.entry(folder.clone()).or_default().push(index);
+                    held.push(folder);
+                }
             }
+            folders.push(held);
+            project_roots.push(if root.is_empty() {
+                ".".to_owned()
+            } else {
+                root.to_owned()
+            });
         }
-        Self { outputs, by_anchor }
+        Self {
+            outputs,
+            by_anchor,
+            folders,
+            by_folder,
+            roots: project_roots,
+        }
     }
 
     /// The outputs whose anchor is `path` or a directory holding it.
@@ -441,15 +529,29 @@ pub(crate) struct Others<'a> {
 impl Others<'_> {
     /// Whether `path` is another target's output, and none of the
     /// upstream's: an output both declare is the task's input.
+    ///
+    /// A directory that only holds another target's outputs, between its
+    /// project's root and the outputs, counts as one, as `.cache` does for
+    /// `.cache/build`: it comes and goes with them.
     pub(crate) fn matches(&self, path: &str) -> bool {
         let mut other = false;
-        for (target, outputs) in self.outputs.holding(path) {
-            if outputs.matches(path) {
-                if self.upstream.contains(target) {
-                    return false;
-                }
-                other = true;
+        let holding = self
+            .outputs
+            .holding(path)
+            .filter(|(_, outputs)| outputs.matches(path))
+            .map(|(target, _)| target);
+        let folders = self
+            .outputs
+            .by_folder
+            .get(path)
+            .into_iter()
+            .flatten()
+            .map(|&index| &self.outputs.outputs[index].0);
+        for target in holding.chain(folders) {
+            if self.upstream.contains(target) {
+                return false;
             }
+            other = true;
         }
         other
     }
@@ -483,28 +585,34 @@ impl Unlisted<'_> {
     }
 
     /// Where other targets' outputs and ignored paths come and go while the
-    /// task runs: the directories holding those outputs, and their anchors,
-    /// where an output a glob declares comes and goes, and the root of the
-    /// task's project, where a tool's `ignoreReads` state usually sits.
+    /// task runs: the directories holding those outputs, up to their
+    /// project's root, and their anchors, where an output a glob declares
+    /// comes and goes, and the root of the task's project, where a tool's
+    /// `ignoreReads` state usually sits.
     pub(crate) fn directories(&self, project_root: &str) -> BTreeSet<String> {
         let project_root = if project_root.is_empty() {
             "."
         } else {
             project_root
         };
-        self.others
-            .iter()
-            .flat_map(|others| {
-                others
-                    .outputs
-                    .outputs
-                    .iter()
-                    .filter(|(target, _)| !others.upstream.contains(target))
-                    .flat_map(|(_, outputs)| outputs.anchors())
-            })
-            .flat_map(|anchor| [anchor.to_owned(), parent(anchor).to_owned()])
-            .chain([project_root.to_owned()])
-            .collect()
+        let mut directories = BTreeSet::from([project_root.to_owned()]);
+        if let Some(others) = &self.others {
+            let all = &others.outputs;
+            for (index, (target, outputs)) in all.outputs.iter().enumerate() {
+                if others.upstream.contains(target) {
+                    continue;
+                }
+                for anchor in outputs.anchors() {
+                    directories.insert(anchor.to_owned());
+                    directories.insert(parent(anchor).to_owned());
+                }
+                directories.extend(all.folders[index].iter().cloned());
+                if !all.folders[index].is_empty() {
+                    directories.insert(all.roots[index].clone());
+                }
+            }
+        }
+        directories
     }
 }
 
@@ -880,7 +988,7 @@ mod tests {
         let started = now(temp.path());
         let changed = |set: &PathSet| {
             set.changed_since(temp.path(), started, &NOTHING, &Before::default())
-                .map(str::to_owned)
+                .map(|changed| changed.path.to_owned())
         };
         assert_eq!(changed(&set), None);
         // What the task wrote, and content in a listed directory, keys nothing.
@@ -944,12 +1052,14 @@ mod tests {
             ..PathSet::default()
         };
         assert_eq!(
-            root.changed_since(removed.path(), started, &NOTHING, &Before::default()),
+            root.changed_since(removed.path(), started, &NOTHING, &Before::default())
+                .map(|changed| changed.path),
             None
         );
         std::fs::remove_file(removed.path().join("gone.txt")).unwrap();
         assert_eq!(
-            root.changed_since(removed.path(), started, &NOTHING, &Before::default()),
+            root.changed_since(removed.path(), started, &NOTHING, &Before::default())
+                .map(|changed| changed.path),
             Some(".")
         );
     }
@@ -978,26 +1088,35 @@ mod tests {
         };
         std::fs::write(root.join("app/kept.txt"), "").unwrap();
         std::fs::create_dir(root.join("app/out")).unwrap();
-        let outputs = WorkspaceOutputs::new(vec![
-            (
-                ("app".into(), "tsc".into(), None),
-                Outputs::from_patterns(&["app/.tsc"]),
-            ),
-            (
-                ("app".into(), "codegen".into(), None),
-                Outputs::from_patterns(&["app/generated"]),
-            ),
-            // An output a glob declares, inside a directory the task lists.
-            (
-                ("app".into(), "bundle".into(), None),
-                Outputs::from_patterns(&["app/out/*.js"]),
-            ),
-            // Another target declaring the dependency's output too.
-            (
-                ("app".into(), "package".into(), None),
-                Outputs::from_patterns(&["app/generated"]),
-            ),
-        ]);
+        let roots = [("app".to_owned(), "app".to_owned())].into();
+        let outputs = WorkspaceOutputs::new(
+            vec![
+                (
+                    ("app".into(), "tsc".into(), None),
+                    Outputs::from_patterns(&["app/.tsc"]),
+                ),
+                (
+                    ("app".into(), "codegen".into(), None),
+                    Outputs::from_patterns(&["app/generated"]),
+                ),
+                // An output a glob declares, inside a directory the task lists.
+                (
+                    ("app".into(), "bundle".into(), None),
+                    Outputs::from_patterns(&["app/out/*.js"]),
+                ),
+                // Another target declaring the dependency's output too.
+                (
+                    ("app".into(), "package".into(), None),
+                    Outputs::from_patterns(&["app/generated"]),
+                ),
+                // An output inside a directory that only exists to hold it.
+                (
+                    ("app".into(), "deploy".into(), None),
+                    Outputs::from_patterns(&["app/.cache/deploy"]),
+                ),
+            ],
+            &roots,
+        );
         let ignore = [Pattern::new("**/.fallow", false).unwrap()];
         let unlisted = Unlisted {
             own: Vec::new(),
@@ -1016,6 +1135,8 @@ mod tests {
             unlisted.directories("app"),
             [
                 "app".to_owned(),
+                "app/.cache".to_owned(),
+                "app/.cache/deploy".to_owned(),
                 "app/.tsc".to_owned(),
                 "app/generated".to_owned(),
                 "app/out".to_owned()
@@ -1028,12 +1149,30 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         let taken = Before::take(root, unlisted.directories("app"), &unlisted);
         let started = now(root);
-        let changed = |taken: &Before| set.changed_since(root, started, &unlisted, taken);
-        // Another target's output and an ignored path appear as it runs.
+        let changed = |taken: &Before| {
+            set.changed_since(root, started, &unlisted, taken)
+                .map(|changed| changed.path)
+        };
+        // Another target's output, the directory holding another's, and an
+        // ignored path appear as it runs.
         std::fs::create_dir(root.join("app/.tsc")).unwrap();
+        std::fs::create_dir_all(root.join("app/.cache/deploy")).unwrap();
         std::fs::create_dir(root.join("app/.fallow")).unwrap();
         assert_eq!(key(), before);
         assert_eq!(changed(&taken), None);
+        // Another target's output listed itself has nothing to key, though
+        // nothing listed it before.
+        std::fs::write(root.join("app/.tsc/index.js"), "").unwrap();
+        let output = PathSet {
+            listings: ["app/.tsc".to_owned()].into(),
+            ..PathSet::default()
+        };
+        assert_eq!(
+            output.changed_since(root, started, &unlisted, &Before::default()),
+            None
+        );
+        // The project's root is no folder holding its outputs.
+        assert!(!unlisted.matches("app"));
         // An output appearing in a listed directory a glob declares it in.
         std::fs::write(root.join("app/out/new.js"), "").unwrap();
         let out = PathSet {
@@ -1042,7 +1181,8 @@ mod tests {
         };
         assert_eq!(out.changed_since(root, started, &unlisted, &taken), None);
         assert_eq!(
-            out.changed_since(root, started, &unlisted, &Before::default()),
+            out.changed_since(root, started, &unlisted, &Before::default())
+                .map(|changed| changed.path),
             Some("app/out")
         );
         // A dependency's output is the task's input, and stays listed.
@@ -1054,12 +1194,20 @@ mod tests {
         // A removal is still a change, though left-out entries are there.
         std::fs::remove_file(root.join("app/kept.txt")).unwrap();
         assert_ne!(key(), before);
-        assert_eq!(changed(&taken), Some("app"));
+        assert_eq!(
+            set.changed_since(root, started, &unlisted, &taken)
+                .and_then(|changed| changed.how),
+            Some("kept.txt removed".to_owned())
+        );
         std::fs::write(root.join("app/kept.txt"), "").unwrap();
         assert_eq!(changed(&taken), None);
-        // So is anything else added.
+        // So is anything else added, which the reason names.
         std::fs::write(root.join("app/README.md"), "").unwrap();
         assert_ne!(key(), before);
-        assert_eq!(changed(&taken), Some("app"));
+        assert_eq!(
+            set.changed_since(root, started, &unlisted, &taken)
+                .map(|changed| changed.to_string()),
+            Some("app changed while it ran (README.md added)".to_owned())
+        );
     }
 }
