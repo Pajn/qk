@@ -1368,7 +1368,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             root.join("app/project.json"),
-            r#"{"name":"app","targets":{
+            r#"{"name":"app","root":"./app","targets":{
                 "build":{"command":"true","outputs":["{options.outputPath}"],
                   "options":{"outputPath":"app/dist"},
                   "configurations":{"production":{"outputPath":"app/dist-production"}}},

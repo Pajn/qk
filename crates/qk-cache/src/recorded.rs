@@ -431,6 +431,17 @@ fn file_kind(file_type: std::fs::FileType) -> &'static str {
     }
 }
 
+/// A project's root as output paths name it: without a leading `./` or a
+/// trailing `/`, and empty for the workspace's root, which `""` and `"."`
+/// both name.
+fn relative_root(root: &str) -> &str {
+    let mut root = root.trim_end_matches('/');
+    while let Some(rest) = root.strip_prefix("./") {
+        root = rest;
+    }
+    if root == "." { "" } else { root }
+}
+
 /// A path whose recording changed while the task ran, and what changed in
 /// it, where that can be told.
 #[derive(Debug, PartialEq, Eq)]
@@ -473,17 +484,14 @@ impl WorkspaceOutputs {
         // output owns.
         let projects: BTreeSet<&str> = roots
             .values()
+            .map(|root| relative_root(root))
+            .filter(|root| !root.is_empty())
             .flat_map(|root| {
-                std::iter::once(root.as_str())
-                    .chain(root.match_indices('/').map(|(at, _)| &root[..at]))
+                std::iter::once(root).chain(root.match_indices('/').map(|(at, _)| &root[..at]))
             })
             .collect();
         for (index, ((project, _, _), declared)) in outputs.iter().enumerate() {
-            let root = roots
-                .get(project)
-                .map_or("", String::as_str)
-                .trim_start_matches("./");
-            let root = if root == "." { "" } else { root };
+            let root = roots.get(project).map_or("", |root| relative_root(root));
             let mut held = Vec::new();
             for anchor in declared.anchors() {
                 by_anchor.entry(anchor.to_owned()).or_default().push(index);
@@ -608,10 +616,9 @@ impl Unlisted<'_> {
     /// comes and goes, and the root of the task's project, where a tool's
     /// `ignoreReads` state usually sits.
     pub(crate) fn directories(&self, project_root: &str) -> BTreeSet<String> {
-        let project_root = if project_root.is_empty() {
-            "."
-        } else {
-            project_root
+        let project_root = match relative_root(project_root) {
+            "" => ".",
+            root => root,
         };
         let mut directories = BTreeSet::from([project_root.to_owned()]);
         if let Some(others) = &self.others {
