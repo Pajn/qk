@@ -142,11 +142,7 @@ edges off.
   an error, where Nx merges them into one project, and a `root` outside the
   workspace is refused.
 - Project selectors read `tag:*` and `directory:*` as globs, where Nx takes
-  them for every project, tagged or not. A pattern with an unknown label, such
-  as `scope:shared`, is matched whole; Nx drops the label and would select a
-  project named `shared`. A plain name matches as a word by its characters;
-  Nx puts it unescaped into a regular expression, so `.` there matches any
-  character.
+  them for every project, tagged or not.
 - An atomized target, one naming a `metadata.nonAtomizedTarget`, reads its
   own `.env.<target>` files; Nx reads those of the first atomized target in
   its group for every target of the group.

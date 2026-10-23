@@ -96,9 +96,9 @@ pub fn find_matching_projects<P: Matchable>(
                 Some(("name", value)) => (Kind::Name, value),
                 Some(("tag", value)) => (Kind::Tag, value),
                 Some(("directory", value)) => (Kind::Directory, value),
-                // Nx drops an unknown label and reads on, so `scope:shared`
-                // would select a project named `shared`; qk reads the whole
-                // pattern instead.
+                // qk reads a pattern with an unknown label whole, as Nx
+                // 24.0.1 does, so `scope:shared` does not select a project
+                // named `shared`.
                 _ => (Kind::Unlabeled, pattern),
             }
         };
@@ -171,8 +171,7 @@ pub fn find_matching_projects<P: Matchable>(
 
 /// Whether `name` holds `word` with no letter, digit, `-` or `@` on either
 /// side, ignoring case: Nx's ``(?<![@a-zA-Z0-9-])${word}(?![@a-zA-Z0-9-])``.
-/// Nx builds that regular expression from the pattern unescaped; qk matches
-/// the pattern's characters as they are.
+/// As in Nx 24.0.1, the pattern's characters match as they are.
 fn contains_word(name: &str, word: &str) -> bool {
     let joins = |char: Option<char>| {
         char.is_some_and(|char| char.is_ascii_alphanumeric() || char == '-' || char == '@')
