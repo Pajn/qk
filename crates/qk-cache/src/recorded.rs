@@ -981,7 +981,7 @@ mod tests {
         let outputs = WorkspaceOutputs::new(vec![
             (
                 ("app".into(), "tsc".into(), None),
-                Outputs::from_patterns(&["app/.syb-ts"]),
+                Outputs::from_patterns(&["app/.tsc"]),
             ),
             (
                 ("app".into(), "codegen".into(), None),
@@ -1016,7 +1016,7 @@ mod tests {
             unlisted.directories("app"),
             [
                 "app".to_owned(),
-                "app/.syb-ts".to_owned(),
+                "app/.tsc".to_owned(),
                 "app/generated".to_owned(),
                 "app/out".to_owned()
             ]
@@ -1030,7 +1030,7 @@ mod tests {
         let started = now(root);
         let changed = |taken: &Before| set.changed_since(root, started, &unlisted, taken);
         // Another target's output and an ignored path appear as it runs.
-        std::fs::create_dir(root.join("app/.syb-ts")).unwrap();
+        std::fs::create_dir(root.join("app/.tsc")).unwrap();
         std::fs::create_dir(root.join("app/.fallow")).unwrap();
         assert_eq!(key(), before);
         assert_eq!(changed(&taken), None);
@@ -1047,7 +1047,7 @@ mod tests {
         );
         // A dependency's output is the task's input, and stays listed.
         assert!(!unlisted.matches("app/generated"));
-        assert!(unlisted.matches("app/.syb-ts/index.js"));
+        assert!(unlisted.matches("app/.tsc/index.js"));
         // Without the entries from before, the directory's time is all there
         // is, and it moved.
         assert_eq!(changed(&Before::default()), Some("app"));

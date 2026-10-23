@@ -1344,7 +1344,7 @@ mod tests {
     }
 
     #[test]
-    fn listings_leave_out_every_target_s_outputs_but_those_upstream() {
+    fn listings_leave_out_other_targets_outputs_but_the_upstreams() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         std::fs::write(root.join("nx.json"), "{}").unwrap();
