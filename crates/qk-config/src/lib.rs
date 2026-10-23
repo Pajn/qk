@@ -214,6 +214,10 @@ pub const UNKEYED_SETTINGS: &[&str] = &[
     "qk:storeServer",
     "qk:affectedProfiles",
     "qk:reachability",
+    "storeServer",
+    "affectedProfiles",
+    "cacheDirectory",
+    "maxCacheSize",
     // No longer supported, as in Nx, and ignored with a warning.
     "implicitDependencies",
 ];

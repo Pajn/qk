@@ -75,9 +75,11 @@ that change no task's work: `$schema`, `extends`, `defaultBase`, `affected`,
 `parallel`, `tui`, `cli` other than `cli.packageManager`, `generators`,
 `release`, `sync`, `s3`, `nxCloudId`, `nxCloudAccessToken`, `nxCloudUrl`,
 `nxCloudEncryptionKey`, `neverConnectToCloud`, `defaultProject`,
-`qk:storeServer`, `qk:affectedProfiles`, `qk:reachability`, and the
-workspace-wide `implicitDependencies`, which Nx no longer supports. Every other
-setting, such as `plugins`, `pluginsConfig`, `workspaceLayout` or one qk does
+`cacheDirectory`, `maxCacheSize`, `qk:storeServer` and `storeServer`,
+`qk:affectedProfiles` and `affectedProfiles`, `qk:reachability`, and the
+workspace-wide `implicitDependencies`, which Nx no longer supports. Every
+other setting, such as `plugins`, `pluginsConfig`, `workspaceLayout`,
+`tasksRunnerOptions`, which can set `selectivelyHashTsConfig`, or one qk does
 not know, changes every task's key. Comments and formatting change none, and
 neither does a named input edited to select the same files. A tool that reads
 `nx.json` itself declares `{workspaceRoot}/nx.json` as an input, which keys

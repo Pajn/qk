@@ -6345,6 +6345,35 @@ fn nx_json_keys_tasks_by_what_it_changes() {
 }
 
 #[test]
+fn moving_or_resizing_the_cache_keys_no_task() {
+    let fixture = settings_fixture(&settings());
+    let path = fixture.root.join("nx.json");
+    let mut config = settings();
+    config["cacheDirectory"] = json!("first-cache");
+    fs::write(&path, config.to_string()).unwrap();
+    assert_eq!(both(&fixture), (false, false));
+    assert_eq!(both(&fixture), (true, true));
+
+    // Another cache holds none of the results, so the tasks run again, and
+    // keep their results there.
+    config["cacheDirectory"] = json!("second-cache");
+    fs::write(&path, config.to_string()).unwrap();
+    assert_eq!(both(&fixture), (false, false));
+    assert!(fixture.root.join("second-cache/qk/v1").is_dir());
+    assert_eq!(both(&fixture), (true, true));
+
+    // The first still holds its results under the same keys.
+    config["cacheDirectory"] = json!("first-cache");
+    fs::write(&path, config.to_string()).unwrap();
+    assert_eq!(both(&fixture), (true, true));
+
+    // A size limit decides what is kept, not how a task is keyed.
+    config["maxCacheSize"] = json!("10GB");
+    fs::write(&path, config.to_string()).unwrap();
+    assert_eq!(both(&fixture), (true, true));
+}
+
+#[test]
 fn the_file_nx_json_extends_keys_tasks_by_what_it_changes() {
     let fixture = settings_fixture(&json!({"extends": "./nx.base.json"}));
     let path = fixture.root.join("nx.base.json");
