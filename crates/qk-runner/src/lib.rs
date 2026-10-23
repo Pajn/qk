@@ -49,6 +49,10 @@ pub struct RunResult {
     pub load: Vec<(f32, bool)>,
     /// The most memory, in bytes, the run's tasks used together.
     pub memory: Option<u64>,
+    /// Whether threaded tasks ran, rather than came from the cache, and none
+    /// of them was expected to take anything, so that each was given an even
+    /// split of the cores.
+    pub unexpected: bool,
     /// Under `--sandbox`, what each task did beyond its declarations, the
     /// tasks that ran unsandboxed and those whose packages went unchecked,
     /// with why.
@@ -1100,6 +1104,19 @@ pub fn run(
     let input_analysis = recorder
         .map(|recorder| recorder.finish(workspace, graph, &prepared, &outcomes))
         .transpose()?;
+    let mut ran_threaded = records
+        .iter()
+        .filter(|(_, record)| {
+            record.cores.is_some()
+                && matches!(
+                    record.cache,
+                    qk_cache::CacheStatus::Miss | qk_cache::CacheStatus::Uncached
+                )
+        })
+        .map(|(id, _)| id)
+        .peekable();
+    let unexpected =
+        ran_threaded.peek().is_some() && ran_threaded.all(|id| !expected.contains_key(id));
     Ok(RunResult {
         outcomes,
         skipped,
@@ -1107,6 +1124,7 @@ pub fn run(
         tasks: records,
         load: load.into_inner().unwrap(),
         memory: Some(seen.into_inner().unwrap().run).filter(|bytes| *bytes > 0),
+        unexpected,
         sandbox,
         input_analysis,
     })

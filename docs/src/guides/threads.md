@@ -50,7 +50,10 @@ Cores come back as tasks finish and go to the next to start. A
 share stays within `min` (default 1) and `max` (default the budget); a task
 waits until `min` cores are free, unless nothing else runs. The thread count
 is not part of the cache key, and neither is `qk:threads`. The summary lists
-what each threaded task was given, and `qk show task` records it.
+what each threaded task was given, and `qk show task` records it. When none of
+the threaded tasks that ran had an expectation, the summary says so below
+them: every share was then an even split, as on a CI job with neither local
+history nor a remote store to read one from.
 
 ## Threads that wait
 

@@ -4674,9 +4674,25 @@ fn threaded_tasks_share_the_cores() {
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("Threads of 8 cores: app:a 2, app:b 2, app:c 2"),
+        stderr.contains("Threads of 8 cores: app:a 2, app:b 2, app:c 2\n  none had run before, here or in the remote store, so each was given an even split"),
         "{stderr}"
     );
+    let again = success(fixture.qk(
+        &fixture.root,
+        &[
+            "run-many",
+            "-t",
+            "a,b,c",
+            "--cores",
+            "8",
+            "--output-style",
+            "quiet",
+        ],
+    ));
+    // The first run is history now.
+    let stderr = String::from_utf8_lossy(&again.stderr);
+    assert!(stderr.contains("Threads of 8 cores:"), "{stderr}");
+    assert!(!stderr.contains("none had run before"), "{stderr}");
     success(fixture.qk(&fixture.root, &["run", "app:a", "--cores", "8"]));
     assert_eq!(
         fs::read_to_string(fixture.root.join("dist/a")).unwrap(),
