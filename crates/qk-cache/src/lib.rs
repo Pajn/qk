@@ -1102,7 +1102,7 @@ fn workspace_outputs(workspace: &Workspace) -> recorded::WorkspaceOutputs {
                     id: format!("{name}:{target}"),
                     project: name.clone(),
                     target: target.clone(),
-                    configuration,
+                    configuration: configuration.clone(),
                     args: Vec::new(),
                     definition,
                     dependencies: Default::default(),
@@ -1112,7 +1112,7 @@ fn workspace_outputs(workspace: &Workspace) -> recorded::WorkspaceOutputs {
                     .ok()
                     .filter(paths::Outputs::declared)
                 {
-                    outputs.push(((name.clone(), target.clone()), declared));
+                    outputs.push(((name.clone(), target.clone(), configuration), declared));
                 }
             }
         }
@@ -1120,10 +1120,17 @@ fn workspace_outputs(workspace: &Workspace) -> recorded::WorkspaceOutputs {
     recorded::WorkspaceOutputs::new(outputs)
 }
 
-/// `task`'s target and those of every task it depends on, by project and
-/// target.
-fn upstream(graph: &TaskGraph, task: &Task) -> BTreeSet<(String, String)> {
-    let mut targets = BTreeSet::from([(task.project.clone(), task.target.clone())]);
+/// `task`'s target and those of every task it depends on, each with the
+/// configuration it runs with.
+fn upstream(graph: &TaskGraph, task: &Task) -> BTreeSet<recorded::TargetOf> {
+    let of = |task: &Task| {
+        (
+            task.project.clone(),
+            task.target.clone(),
+            task.configuration.clone(),
+        )
+    };
+    let mut targets = BTreeSet::from([of(task)]);
     let mut seen = BTreeSet::new();
     let mut pending: Vec<&String> = task.dependencies.iter().collect();
     while let Some(id) = pending.pop() {
@@ -1131,7 +1138,7 @@ fn upstream(graph: &TaskGraph, task: &Task) -> BTreeSet<(String, String)> {
             continue;
         }
         if let Some(dependency) = graph.tasks.get(id) {
-            targets.insert((dependency.project.clone(), dependency.target.clone()));
+            targets.insert(of(dependency));
             pending.extend(&dependency.dependencies);
         }
     }
@@ -1350,12 +1357,15 @@ mod tests {
                   "options":{"outputPath":"app/dist"},
                   "configurations":{"production":{"outputPath":"app/dist-production"}}},
                 "lint":{"command":"true"},
-                "test":{"command":"true","dependsOn":[{"projects":["lib"],"target":"build"}]}}}"#,
+                "test":{"command":"true","dependsOn":[{"projects":["lib"],"target":"build"}],
+                  "configurations":{"production":{}}}}}"#,
         )
         .unwrap();
         std::fs::write(
             root.join("lib/project.json"),
-            r#"{"name":"lib","targets":{"build":{"command":"true","outputs":["{projectRoot}/dist"]}}}"#,
+            r#"{"name":"lib","targets":{"build":{"command":"true","outputs":["{options.outputPath}"],
+                "options":{"outputPath":"lib/dist"},
+                "configurations":{"production":{"outputPath":"lib/dist-production"}}}}}"#,
         )
         .unwrap();
         let workspace = Workspace::load(root).unwrap();
@@ -1364,6 +1374,7 @@ mod tests {
             &[
                 qk_taskgraph::Request::parse("app:lint").unwrap(),
                 qk_taskgraph::Request::parse("app:test").unwrap(),
+                qk_taskgraph::Request::parse("app:test:production").unwrap(),
             ],
         )
         .unwrap();
@@ -1377,7 +1388,12 @@ mod tests {
         assert!(lint.matches("app/dist-production/main.js"));
         assert!(lint.matches("lib/dist"));
         assert!(!lint.matches("app/src/main.ts"));
-        // A dependency's output is the test's input.
+        // A dependency's output is the test's input, and only that of the
+        // configuration it depends on.
         assert!(!others("app:test").matches("lib/dist"));
+        assert!(others("app:test").matches("lib/dist-production"));
+        let production = others("app:test:production");
+        assert!(!production.matches("lib/dist-production"));
+        assert!(production.matches("lib/dist"));
     }
 }

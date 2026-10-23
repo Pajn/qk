@@ -400,12 +400,12 @@ fn file_kind(file_type: std::fs::FileType) -> &'static str {
 /// hold it.
 #[derive(Default)]
 pub(crate) struct WorkspaceOutputs {
-    outputs: Vec<((String, String), Outputs)>,
+    outputs: Vec<(TargetOf, Outputs)>,
     by_anchor: BTreeMap<String, Vec<usize>>,
 }
 
 impl WorkspaceOutputs {
-    pub(crate) fn new(outputs: Vec<((String, String), Outputs)>) -> Self {
+    pub(crate) fn new(outputs: Vec<(TargetOf, Outputs)>) -> Self {
         let mut by_anchor: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         for (index, (_, declared)) in outputs.iter().enumerate() {
             for anchor in declared.anchors() {
@@ -416,10 +416,7 @@ impl WorkspaceOutputs {
     }
 
     /// The outputs whose anchor is `path` or a directory holding it.
-    fn holding<'a>(
-        &'a self,
-        path: &'a str,
-    ) -> impl Iterator<Item = &'a ((String, String), Outputs)> {
+    fn holding<'a>(&'a self, path: &'a str) -> impl Iterator<Item = &'a (TargetOf, Outputs)> {
         std::iter::once(path)
             .chain(path.match_indices('/').map(|(at, _)| &path[..at]))
             .filter_map(|anchor| self.by_anchor.get(anchor))
@@ -428,20 +425,33 @@ impl WorkspaceOutputs {
     }
 }
 
+/// A target by project, target and configuration, whose options can move
+/// its outputs.
+pub(crate) type TargetOf = (String, String, Option<String>);
+
 /// Other targets' outputs a recording's listings leave out: every target's
 /// in the workspace but the task's own and those it depends on, whose
 /// outputs are its inputs.
 pub(crate) struct Others<'a> {
     pub outputs: &'a WorkspaceOutputs,
-    /// The task's target and its upstream, by project and target.
-    pub upstream: BTreeSet<(String, String)>,
+    /// The task's target and its upstream.
+    pub upstream: BTreeSet<TargetOf>,
 }
 
 impl Others<'_> {
+    /// Whether `path` is another target's output, and none of the
+    /// upstream's: an output both declare is the task's input.
     pub(crate) fn matches(&self, path: &str) -> bool {
-        self.outputs
-            .holding(path)
-            .any(|(target, outputs)| !self.upstream.contains(target) && outputs.matches(path))
+        let mut other = false;
+        for (target, outputs) in self.outputs.holding(path) {
+            if outputs.matches(path) {
+                if self.upstream.contains(target) {
+                    return false;
+                }
+                other = true;
+            }
+        }
+        other
     }
 }
 
@@ -968,11 +978,16 @@ mod tests {
         std::fs::write(root.join("app/kept.txt"), "").unwrap();
         let outputs = WorkspaceOutputs::new(vec![
             (
-                ("app".into(), "tsc".into()),
+                ("app".into(), "tsc".into(), None),
                 Outputs::from_patterns(&["app/.syb-ts"]),
             ),
             (
-                ("app".into(), "codegen".into()),
+                ("app".into(), "codegen".into(), None),
+                Outputs::from_patterns(&["app/generated"]),
+            ),
+            // Another target declaring the dependency's output too.
+            (
+                ("app".into(), "package".into(), None),
                 Outputs::from_patterns(&["app/generated"]),
             ),
         ]);
@@ -983,8 +998,8 @@ mod tests {
                 outputs: &outputs,
                 // It depends on codegen, whose output is its input.
                 upstream: [
-                    ("app".into(), "build".into()),
-                    ("app".into(), "codegen".into()),
+                    ("app".into(), "build".into(), None),
+                    ("app".into(), "codegen".into(), None),
                 ]
                 .into(),
             }),
