@@ -137,6 +137,30 @@ describe("warm records", () => {
   });
 });
 
+describe("expectations", () => {
+  it("are replaced by the newest save under their name alone", async () => {
+    const name = hash().slice(0, 32);
+    const record = (millis: number) =>
+      bytes(JSON.stringify({ version: 1, name, tasks: { "app:test": { millis, cores: 4, updated: 1 } } }));
+    expect((await request("GET", `expectations/${name}`)).status).toBe(404);
+    expect((await request("PUT", `expectations/${name}`, { body: upload(record(1), []) })).status).toBe(204);
+    expect((await request("PUT", `expectations/${name}`, { body: upload(record(2), []) })).status).toBe(204);
+    expect(await pack(`expectations/${name}`)).toEqual(expectedPack(record(2), [], () => true));
+    expect((await request("HEAD", `expectations/${name}`)).status).toBe(200);
+    expect((await request("PUT", `expectations/${hash().slice(0, 32)}`, { body: upload(record(3), []) })).status).toBe(400);
+    expect((await request("PUT", `expectations/${hash()}`, { body: upload(record(3), []) })).status).toBe(404);
+    const cited = [blob("cited", true)];
+    expect((await request("PUT", `expectations/${name}`, { body: upload(record(4), cited) })).status).toBe(400);
+    expect((await request("PUT", `expectations/${name}`, { token: READ, body: upload(record(5), []) })).status).toBe(403);
+  });
+
+  it("are refused past their size", async () => {
+    const name = hash().slice(0, 32);
+    const large = bytes(JSON.stringify({ version: 1, name, tasks: {}, padding: "x".repeat(4 << 20) }));
+    expect((await request("PUT", `expectations/${name}`, { body: upload(large, []) })).status).toBe(413);
+  });
+});
+
 describe("path sets", () => {
   it("are replaced by the newest save for their weak key alone", async () => {
     const weak = hash();
