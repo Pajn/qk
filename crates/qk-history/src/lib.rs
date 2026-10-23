@@ -942,6 +942,16 @@ pub fn diff(before: &Value, after: &Value) -> Cause {
             inferred_after.get("lockfile"),
         ));
     }
+    let (old, new) = (
+        object(&inferred_before, "settings"),
+        object(&inferred_after, "settings"),
+    );
+    for key in old.keys().chain(new.keys()).collect::<BTreeSet<_>>() {
+        if old.get(key) != new.get(key) {
+            changed.insert("configuration".to_owned());
+            values.push(format!("nx.json {key}"));
+        }
+    }
     if inferred_before.get("workspaceFile") != inferred_after.get("workspaceFile") {
         changed.insert("configuration".to_owned());
         values.push("pnpm-workspace.yaml outside its resolution keys".to_owned());

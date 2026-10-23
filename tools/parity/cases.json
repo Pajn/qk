@@ -57,7 +57,34 @@
       "change": {}
     },
     "nx-json": {
-      "change": {}
+      "change": {},
+      "accepted": {
+        "nxOnly": [
+          "@fixture/native",
+          "scripts"
+        ],
+        "qkOnly": [],
+        "reason": "Nx affects every project on any nx.json change; qk affects what the change resolves differently, here the projects with format, typecheck or migrate targets, whose targetDefaults it removes, and their dependents; parallel changes no task's work"
+      },
+      "acceptedTasks": {
+        "nxOnly": [
+          "@fixture/native:build",
+          "@fixture/utils:test",
+          "mobile:build",
+          "mobile:lint",
+          "scripts:lint",
+          "tooling:lint",
+          "ui:build",
+          "ui:lint",
+          "ui:test",
+          "web-e2e:lint",
+          "web:build:production",
+          "web:lint",
+          "web:test"
+        ],
+        "qkOnly": [],
+        "reason": "Nx hashes nx.json into every task, so any change to it selects every task; qk selects the tasks whose key the change moves, here the format and typecheck tasks whose definitions lose their targetDefaults"
+      }
     },
     "tsconfig-paths": {
       "change": {}

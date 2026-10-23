@@ -6,9 +6,11 @@
 //! change under `projectsAffectedByDependencyUpdates: "auto"`, a project is
 //! touched when what its importer installs differs between the revisions.
 //! Nx diffs versions by package name, so it also reports projects that install
-//! exactly what they did before.
+//! exactly what they did before. An nx.json change likewise touches only
+//! what it changes, where Nx touches every project; see `nx_json`.
 
 mod json_diff;
+mod nx_json;
 mod projections;
 mod reachability;
 mod subprocess;
@@ -143,8 +145,19 @@ pub enum Cause {
 pub enum Reason {
     /// A changed file lies under the project's root.
     File { file: String },
-    /// `nx.json` changed, which touches every project.
-    NxJson,
+    /// `nx.json`, the file it extends or `nx.local.json` changed what every
+    /// task's key holds, or could not be compared, which touches every
+    /// project.
+    NxJson { file: String, detail: String },
+    /// `targetDefaults` or `namedInputs` changed, and with them these targets
+    /// and named inputs of the project.
+    NxJsonConfiguration {
+        file: String,
+        settings: Vec<String>,
+        targets: Vec<String>,
+        #[serde(rename = "namedInputs")]
+        named_inputs: Vec<String>,
+    },
     /// A changed file matches a `{workspaceRoot}` input of one of its targets.
     WorkspaceInput {
         file: String,
@@ -196,7 +209,30 @@ impl std::fmt::Display for Reason {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             Self::File { file } => write!(f, "{file} changed"),
-            Self::NxJson => write!(f, "nx.json changed, which affects every project"),
+            Self::NxJson { file, detail } => {
+                write!(f, "{file} {detail}, which affects every project")
+            }
+            Self::NxJsonConfiguration {
+                file,
+                settings,
+                targets,
+                named_inputs,
+            } => {
+                let mut changed = Vec::new();
+                for (noun, names) in [("target", targets), ("named input", named_inputs)] {
+                    match names.as_slice() {
+                        [] => {}
+                        [name] => changed.push(format!("{noun} {name}")),
+                        names => changed.push(format!("{noun}s {}", names.join(", "))),
+                    }
+                }
+                write!(
+                    f,
+                    "{file} changed {}, which changes its {}",
+                    settings.join(" and "),
+                    changed.join(" and ")
+                )
+            }
             Self::WorkspaceInput {
                 file,
                 target,
@@ -268,6 +304,7 @@ pub fn analyse(workspace: &Workspace, graph: &ProjectGraph, options: &Options) -
     let mut touches = Touches::default();
     for locator in [
         touched_by_path,
+        touched_by_nx_json,
         touched_implicitly,
         touched_by_deleted_manifests,
         touched_by_lockfile,
@@ -898,25 +935,80 @@ fn touched_by_path(workspace: &Workspace, changes: &Changes, touches: &mut Touch
     Ok(())
 }
 
-/// `nx.json`, or the file it extends, touches every project; a file named by
-/// a `{workspaceRoot}` input touches the projects declaring it.
-///
-/// Nx 24 leaves out the file `nx.json` extends, although what it holds is
-/// as much the workspace's configuration as `nx.json` itself; qk counts it.
+/// `nx.json`, the file it extends or `nx.local.json` touches what it
+/// changes: every project when it changed what every task's key holds, and
+/// otherwise the projects whose targets or named inputs `targetDefaults` and
+/// `namedInputs` resolve differently. Nx 24 touches every project for any
+/// change to `nx.json`, and none for the file it extends.
+fn touched_by_nx_json(
+    workspace: &Workspace,
+    changes: &Changes,
+    touches: &mut Touches,
+) -> Result<()> {
+    match nx_json::NxJsonChange::new(workspace, changes) {
+        nx_json::NxJsonChange::None => {}
+        nx_json::NxJsonChange::All { file, detail } => {
+            touches.all(workspace, Reason::NxJson { file, detail });
+        }
+        nx_json::NxJsonChange::Resolved {
+            file,
+            settings,
+            base,
+        } => {
+            for project in workspace.projects.values() {
+                let before = base.projects.get(&project.name);
+                let targets = changed_names(&project.targets, before.map(|before| &before.targets));
+                let named_inputs = changed_names(
+                    &project.named_inputs,
+                    before.map(|before| &before.named_inputs),
+                );
+                if targets.is_empty() && named_inputs.is_empty() {
+                    continue;
+                }
+                touches.touch(
+                    &project.name,
+                    Reason::NxJsonConfiguration {
+                        file: file.clone(),
+                        settings: settings
+                            .iter()
+                            .map(|setting| (*setting).to_owned())
+                            .collect(),
+                        targets,
+                        named_inputs,
+                    },
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The names whose entries differ between `after` and `before`, every name
+/// of `after` when there is no `before`.
+fn changed_names<T: Serialize>(
+    after: &BTreeMap<String, T>,
+    before: Option<&BTreeMap<String, T>>,
+) -> Vec<String> {
+    let value = |entry: Option<&T>| entry.map(|entry| serde_json::to_value(entry).ok());
+    let empty = BTreeMap::new();
+    let before = before.unwrap_or(&empty);
+    after
+        .keys()
+        .chain(before.keys())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|name| value(after.get(*name)) != value(before.get(*name)))
+        .cloned()
+        .collect()
+}
+
+/// A file named by a `{workspaceRoot}` input touches the projects declaring
+/// it, `nx.json` among them.
 fn touched_implicitly(
     workspace: &Workspace,
     changes: &Changes,
     touches: &mut Touches,
 ) -> Result<()> {
-    if changes.changed("nx.json")
-        || workspace
-            .extended
-            .as_ref()
-            .is_some_and(|extended| changes.changed(extended))
-    {
-        touches.all(workspace, Reason::NxJson);
-        return Ok(());
-    }
     // Each glob with the targets declaring it, in the order Nx finds them.
     let mut patterns: BTreeMap<String, Vec<(&str, &str)>> = BTreeMap::new();
     for project in workspace.projects.values() {

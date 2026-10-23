@@ -38,9 +38,22 @@ the range is its own history, and nothing is flagged.
 ## How changes reach projects
 
 A changed file touches the project whose root most specifically contains it.
-`nx.json` touches every project. A file named by a `{workspaceRoot}` input
-touches the projects declaring it; an input without glob syntax, such as
-`{workspaceRoot}/generated`, names that file or everything under it.
+A file named by a `{workspaceRoot}` input touches the projects declaring it;
+an input without glob syntax, such as `{workspaceRoot}/generated`, names that
+file or everything under it.
+
+A change to `nx.json`, the file it `extends` or `nx.local.json` touches
+projects by what it changes. qk reads the configuration at both revisions,
+merged as qk loads it, and compares the values, so a change to comments or
+formatting touches nothing. A change to a setting every task's cache key
+holds, such as `plugins`, `pluginsConfig` or `workspaceLayout`, touches every
+project (see [What changes the key](cache.md#what-changes-the-key)). A change
+to `targetDefaults` or `namedInputs` touches the projects whose targets or
+named inputs it resolves differently: qk resolves every project with the base
+revision's configuration and the head's manifests, and compares. A change
+only to settings that change no task's work, such as `defaultBase`,
+`parallel` or `release`, touches nothing. Where a revision cannot be read or
+parsed, or the files were named with `--files`, every project is touched.
 
 A deleted `project.json` or `package.json` that removes a project touches the
 projects that depended on it. Nx touches every project instead, having no way
@@ -93,9 +106,12 @@ Some rules deliberately differ from Nx:
 - A list of selectors touches its projects only when a lockfile changed. Nx
   touches them on every change, lockfile or not, which reads as a bug; its
   task selection checks for a lockfile change, as qk does.
-- A change to the file nx.json `extends` touches every project, as a change to
-  nx.json does. Nx does not look at that file, although it configures the
-  workspace as much as nx.json does.
+- A change to nx.json touches only what it changes, by the rule above. Nx
+  hashes nx.json whole into every task, so any change to it, even a comment,
+  touches every project.
+- A change to the file nx.json `extends` counts as a change to nx.json does.
+  Nx does not look at that file, although it configures the workspace as much
+  as nx.json does.
 
 `show projects --affected` prints projects in graph order; Nx prints its
 traversal order, so compare the two as sets.
@@ -129,9 +145,10 @@ ui is touched:
 
 With `--granularity task`, `qk affected` selects tasks instead of projects. A
 task is affected when Nx 24 would select it, or when its cache key changed,
-except that qk narrows a lockfile change, as below, and a deleted manifest, as
-in [How changes reach projects](#how-changes-reach-projects). As in Nx, that
-is when:
+except that qk narrows a lockfile change, as below, and a deleted manifest and
+an nx.json change, as in
+[How changes reach projects](#how-changes-reach-projects). As in Nx, that is
+when:
 
 - a changed file is one of its resolved inputs, a declared output included:
   a tracked output is a file like any other;
@@ -148,6 +165,14 @@ is when:
   tasks of the projects it names are affected;
 - the root `package.json` moved an installed package the task hashes, by
   the rules above, or named the task's project as a dependency.
+
+Where Nx selects every task on any nx.json change, qk selects a task when the
+change moves its key: when it changed a setting every key holds, or when,
+resolved with the base revision's `targetDefaults` and `namedInputs`, the
+task's definition differs, or what its inputs select does, its own or a
+dependency's through `^` inputs. A named input that selects the same files
+leaves the task alone. A task declaring `{workspaceRoot}/nx.json` as an input
+is affected by any change to the file, as its key holds it whole.
 
 Beyond those, qk's key also reads what its lockfile importers or
 `externalDependencies` install, `pnpm-workspace.yaml` outside its resolution

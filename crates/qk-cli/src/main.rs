@@ -1656,11 +1656,7 @@ fn execute_narrowed(
     }
     options.export();
     let graph = if requests.is_empty() && options.graph_target().is_some() {
-        TaskGraph {
-            roots: Default::default(),
-            tasks: Default::default(),
-            cycles: Default::default(),
-        }
+        TaskGraph::default()
     } else {
         TaskGraph::build_with(
             workspace,

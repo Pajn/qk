@@ -127,11 +127,281 @@ fn a_changed_file_affects_its_project_and_dependents() {
     assert_eq!(repo.committed(), names(&["app", "lib"]));
 }
 
+/// Workspace settings for the nx.json tests: `build` reads production files,
+/// its dependencies' too, and `lint` every file.
+const SETTINGS: &str = r#"{
+    "namedInputs": {
+        "default": ["{projectRoot}/**/*"],
+        "production": ["default", "!{projectRoot}/**/*.test.ts"]
+    },
+    "targetDefaults": {
+        "build": {"command": "echo build", "inputs": ["production", "^production"]},
+        "lint": {"command": "echo lint", "inputs": ["default"]}
+    },
+    "pluginsConfig": {"@nx/js": {"projectsAffectedByDependencyUpdates": "auto"}}
+}"#;
+
+/// `app` builds and depends on `lib`, which builds and lints; `tool` lints.
+fn settings_repo(files: &[(&str, &str)]) -> Repo {
+    let mut all = vec![
+        ("nx.json", SETTINGS),
+        (
+            "apps/app/project.json",
+            r#"{"name": "app", "implicitDependencies": ["lib"], "targets": {"build": {}}}"#,
+        ),
+        (
+            "libs/lib/project.json",
+            r#"{"name": "lib", "targets": {"build": {}, "lint": {}}}"#,
+        ),
+        ("libs/lib/README.md", "lib"),
+        (
+            "tools/tool/project.json",
+            r#"{"name": "tool", "targets": {"lint": {}}}"#,
+        ),
+    ];
+    all.extend_from_slice(files);
+    Repo::new(&all)
+}
+
+/// What committing the working tree touches: the touched projects, every
+/// affected project, and the affected tasks.
+struct Effect {
+    touched: Vec<String>,
+    projects: Vec<String>,
+    tasks: Vec<String>,
+    analysis: qk_affected::Analysis,
+    causes: BTreeMap<String, qk_affected::TaskCause>,
+}
+
+fn effect(repo: &Repo) -> Effect {
+    let analysis = analyse(repo, &repo.base, &commit(&repo.root));
+    let causes = affected_tasks_of(repo, &["app:build", "lib:build", "lib:lint", "tool:lint"]);
+    Effect {
+        touched: analysis
+            .projects
+            .iter()
+            .filter(|(_, cause)| matches!(cause, qk_affected::Cause::Touched { .. }))
+            .map(|(name, _)| name.clone())
+            .collect(),
+        projects: analysis.projects.keys().cloned().collect(),
+        tasks: causes.keys().cloned().collect(),
+        analysis,
+        causes,
+    }
+}
+
 #[test]
-fn nx_json_affects_every_project() {
-    let repo = Repo::new(&[]);
-    write(&repo.root, "nx.json", r#"{"namedInputs": {"shared": []}}"#);
-    assert_eq!(repo.committed(), names(&["app", "lib", "tool"]));
+fn nx_json_comments_and_formatting_affect_nothing() {
+    let repo = settings_repo(&[]);
+    let reformatted = format!(
+        "// Workspace settings.\n{}\n",
+        SETTINGS.replace("    ", "\t").replace(": ", ":")
+    );
+    write(&repo.root, "nx.json", &reformatted);
+    let effect = effect(&repo);
+    assert!(effect.projects.is_empty(), "{:?}", effect.projects);
+    assert!(effect.tasks.is_empty(), "{:?}", effect.tasks);
+}
+
+#[test]
+fn nx_json_settings_that_change_no_task_affect_nothing() {
+    let repo = settings_repo(&[]);
+    let changed = SETTINGS.replacen(
+        '{',
+        r#"{"defaultBase": "trunk", "parallel": 8, "tui": {"enabled": false},
+            "cli": {"defaultProjectName": "app"},"#,
+        1,
+    );
+    write(&repo.root, "nx.json", &changed);
+    let effect = effect(&repo);
+    assert!(effect.projects.is_empty(), "{:?}", effect.projects);
+    assert!(effect.tasks.is_empty(), "{:?}", effect.tasks);
+}
+
+#[test]
+fn nx_json_target_defaults_affect_the_projects_and_tasks_they_change() {
+    use qk_affected::{Cause, Reason, TaskCause, TaskReason};
+    let repo = settings_repo(&[]);
+    write(
+        &repo.root,
+        "nx.json",
+        &SETTINGS.replace("echo lint", "echo lint --fix"),
+    );
+    let effect = effect(&repo);
+    assert_eq!(effect.touched, names(&["lib", "tool"]));
+    // app is affected as lib's dependent, as for any touched project.
+    assert_eq!(effect.projects, names(&["app", "lib", "tool"]));
+    assert_eq!(effect.tasks, names(&["lib:lint", "tool:lint"]));
+    let Cause::Touched { reasons } = &effect.analysis.projects["lib"] else {
+        panic!("lib is touched");
+    };
+    assert_eq!(
+        reasons[0].to_string(),
+        "nx.json changed targetDefaults, which changes its target lint"
+    );
+    assert!(matches!(
+        &reasons[..],
+        [Reason::NxJsonConfiguration { targets, named_inputs, .. }]
+            if targets == &["lint"] && named_inputs.is_empty()
+    ));
+    assert!(matches!(
+        &effect.causes["tool:lint"],
+        TaskCause::Touched { reasons } if matches!(&reasons[..], [TaskReason::Definition { .. }])
+    ));
+}
+
+#[test]
+fn nx_json_named_inputs_affect_the_tasks_whose_inputs_use_them() {
+    use qk_affected::{TaskCause, TaskReason};
+    let repo = settings_repo(&[]);
+    write(
+        &repo.root,
+        "nx.json",
+        &SETTINGS.replace(
+            r#""!{projectRoot}/**/*.test.ts""#,
+            r#""!{projectRoot}/**/*.test.ts", "!{projectRoot}/**/*.md""#,
+        ),
+    );
+    let effect = effect(&repo);
+    // Every project has the named input, so each one's configuration moved.
+    assert_eq!(effect.touched, names(&["app", "lib", "tool"]));
+    // lib's README.md left its production files, and app's build reads them
+    // through ^production. Nothing that lints reads production files.
+    assert_eq!(effect.tasks, names(&["app:build", "lib:build"]));
+    assert!(matches!(
+        &effect.causes["app:build"],
+        TaskCause::Touched { reasons } if matches!(&reasons[..], [TaskReason::ResolvedInputs { .. }])
+    ));
+}
+
+#[test]
+fn nx_json_settings_every_key_holds_affect_everything() {
+    use qk_affected::{Cause, Reason};
+    let repo = settings_repo(&[]);
+    write(
+        &repo.root,
+        "nx.json",
+        &SETTINGS.replacen('{', r#"{"plugins": [],"#, 1),
+    );
+    let effect = effect(&repo);
+    assert_eq!(effect.touched, names(&["app", "lib", "tool"]));
+    assert_eq!(
+        effect.tasks,
+        names(&["app:build", "lib:build", "lib:lint", "tool:lint"])
+    );
+    let Cause::Touched { reasons } = &effect.analysis.projects["tool"] else {
+        panic!("tool is touched");
+    };
+    assert!(matches!(&reasons[..], [Reason::NxJson { .. }]));
+    assert_eq!(
+        reasons[0].to_string(),
+        "nx.json changed plugins, which affects every project"
+    );
+}
+
+#[test]
+fn nx_json_named_rather_than_compared_affects_everything() {
+    let repo = settings_repo(&[]);
+    assert_eq!(
+        repo.affected(Options {
+            files: vec!["nx.json".into()],
+            ..Options::default()
+        }),
+        names(&["app", "lib", "tool"])
+    );
+}
+
+#[test]
+fn the_file_nx_json_extends_counts_by_what_it_changes() {
+    let repo = settings_repo(&[
+        ("nx.json", r#"{"extends": "./nx.base.json"}"#),
+        ("nx.base.json", SETTINGS),
+    ]);
+    write(
+        &repo.root,
+        "nx.base.json",
+        &format!("// Shared.\n{SETTINGS}"),
+    );
+    let unchanged = effect(&repo);
+    assert!(unchanged.projects.is_empty(), "{:?}", unchanged.projects);
+    assert!(unchanged.tasks.is_empty(), "{:?}", unchanged.tasks);
+
+    write(
+        &repo.root,
+        "nx.base.json",
+        &SETTINGS.replace("echo lint", "echo lint --fix"),
+    );
+    let changed = effect(&repo);
+    assert_eq!(changed.touched, names(&["lib", "tool"]));
+    assert_eq!(changed.tasks, names(&["lib:lint", "tool:lint"]));
+    let qk_affected::Cause::Touched { reasons } = &changed.analysis.projects["tool"] else {
+        panic!("tool is touched");
+    };
+    assert_eq!(
+        reasons[0].to_string(),
+        "nx.base.json changed targetDefaults, which changes its target lint"
+    );
+
+    write(
+        &repo.root,
+        "nx.base.json",
+        &SETTINGS.replacen('{', r#"{"plugins": [],"#, 1),
+    );
+    assert_eq!(effect(&repo).touched, names(&["app", "lib", "tool"]));
+}
+
+#[test]
+fn a_declared_nx_json_input_counts_the_file_whole() {
+    use qk_affected::{TaskCause, TaskReason};
+    let repo = settings_repo(&[(
+        "tools/tool/project.json",
+        r#"{"name": "tool", "targets": {"lint": {"inputs": ["default", "{workspaceRoot}/nx.json"]}}}"#,
+    )]);
+    write(&repo.root, "nx.json", &format!("// Settings.\n{SETTINGS}"));
+    let effect = effect(&repo);
+    assert_eq!(effect.touched, names(&["tool"]));
+    assert_eq!(effect.tasks, names(&["tool:lint"]));
+    assert!(matches!(
+        &effect.causes["tool:lint"],
+        TaskCause::Touched { reasons } if matches!(&reasons[..], [TaskReason::Input { file }] if file == "nx.json")
+    ));
+}
+
+/// A named input that comes to read a dependency's outputs changes the key
+/// once the outputs are written, though none is there to select yet.
+#[test]
+fn nx_json_named_inputs_reading_dependency_outputs_affect_the_task() {
+    use qk_affected::{TaskCause, TaskReason};
+    let settings = |sources: &str| {
+        format!(
+            r#"{{"namedInputs": {{"sources": [{sources}]}},
+                "targetDefaults": {{"build": {{"command": "echo build", "dependsOn": ["^build"],
+                    "inputs": ["sources"], "outputs": ["{{projectRoot}}/dist"]}}}}}}"#
+        )
+    };
+    let repo = Repo::new(&[
+        ("nx.json", &settings(r#""{projectRoot}/src/**/*""#)),
+        (
+            "apps/app/project.json",
+            r#"{"name": "app", "implicitDependencies": ["lib"], "targets": {"build": {}}}"#,
+        ),
+        (
+            "libs/lib/project.json",
+            r#"{"name": "lib", "targets": {"build": {}}}"#,
+        ),
+    ]);
+    write(
+        &repo.root,
+        "nx.json",
+        &settings(r#""{projectRoot}/src/**/*", "{workspaceRoot}/libs/lib/dist/**/*""#),
+    );
+    let tasks = affected_tasks_of(&repo, &["app:build", "lib:build"]);
+    // lib's own outputs are no input of its own build.
+    assert_eq!(tasks.keys().collect::<Vec<_>>(), ["app:build"]);
+    assert!(matches!(
+        &tasks["app:build"],
+        TaskCause::Touched { reasons } if matches!(&reasons[..], [TaskReason::ResolvedInputs { .. }])
+    ));
 }
 
 #[test]

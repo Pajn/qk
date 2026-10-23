@@ -5,11 +5,14 @@
 //! and the installed packages it hashes, which a lockfile change moves under
 //! `projectsAffectedByDependencyUpdates: "all"`. qk's key adds the lockfile
 //! installs of its importers and `externalDependencies`, `pnpm-workspace.yaml`
-//! outside its resolution keys and dependency manifests. A task reading the
-//! declared outputs of an affected task is affected too; as in Nx, depending
-//! on a task without reading its outputs carries nothing. Env and runtime
-//! inputs count as unchanged, since the base revision's environment is
-//! unknowable.
+//! outside its resolution keys and dependency manifests. Nx hashes nx.json
+//! whole into every task; qk's key does not, so a change to it reaches a task
+//! only as the key holds it: through the settings every key holds, or through
+//! the task's definition and resolved inputs, which `targetDefaults` and
+//! `namedInputs` decide. A task reading the declared outputs of an affected
+//! task is affected too; as in Nx, depending on a task without reading its
+//! outputs carries nothing. Env and runtime inputs count as unchanged, since
+//! the base revision's environment is unknowable.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
@@ -17,9 +20,10 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
 use anyhow::Result;
 use qk_config::Workspace;
 use qk_lockfile::Lockfile;
-use qk_taskgraph::TaskGraph;
+use qk_taskgraph::{Request, TaskGraph};
 use serde::Serialize;
 
+use crate::nx_json::NxJsonChange;
 use crate::reachability::{self, Configs, TaskDecision};
 use crate::{Changes, FileChange, Options, projections};
 
@@ -93,6 +97,14 @@ pub enum TaskReason {
     /// The root `package.json` changed in a way that moves every installed
     /// package.
     RootPackage { detail: String },
+    /// `nx.json`, the file it extends or `nx.local.json` changed what every
+    /// task's key holds, or could not be compared.
+    NxJson { file: String, detail: String },
+    /// `targetDefaults` or `namedInputs` changed the task's definition.
+    Definition { file: String, settings: Vec<String> },
+    /// `targetDefaults` or `namedInputs` changed what the task's inputs
+    /// select, its own or a dependency's through `^`.
+    ResolvedInputs { file: String, settings: Vec<String> },
 }
 
 impl std::fmt::Display for TaskReason {
@@ -132,6 +144,17 @@ impl std::fmt::Display for TaskReason {
                 write!(f, "package.json changed {path}, which moves {name}")
             }
             Self::RootPackage { detail } => write!(f, "package.json {detail}"),
+            Self::NxJson { file, detail } => write!(f, "{file} {detail}"),
+            Self::Definition { file, settings } => write!(
+                f,
+                "{file} changed {}, which changes this task's definition",
+                settings.join(" and ")
+            ),
+            Self::ResolvedInputs { file, settings } => write!(
+                f,
+                "{file} changed {}, which changes what this task's inputs select",
+                settings.join(" and ")
+            ),
         }
     }
 }
@@ -211,6 +234,7 @@ pub(crate) fn analyse(
         .transpose()?;
     let npm = crate::root_package_changes(workspace, &changes);
     let resolved = qk_cache::resolve_tasks(workspace, graph, &changes.files)?;
+    let nx_json = nx_json_reasons(workspace, graph, &changes, &resolved);
     // The lockfile at both revisions, when it changed and both can be read.
     let lockfiles = if changes.files.iter().any(|file| file == "pnpm-lock.yaml") {
         match changes.change("pnpm-lock.yaml") {
@@ -404,6 +428,11 @@ pub(crate) fn analyse(
         if let Some(file) = relinked.get(&task.project) {
             reasons.push(TaskReason::Relinked { file: file.clone() });
         }
+        match &nx_json {
+            NxJsonReasons::None => {}
+            NxJsonReasons::All(reason) => reasons.push(reason.clone()),
+            NxJsonReasons::Tasks(tasks) => reasons.extend(tasks.get(id).cloned()),
+        }
         if !reasons.is_empty() {
             touched.insert(id.clone(), reasons);
         }
@@ -445,6 +474,110 @@ pub(crate) fn analyse(
         tasks,
         reachability: decisions,
     })
+}
+
+/// What an nx.json change does to the tasks of a graph.
+enum NxJsonReasons {
+    None,
+    /// Every task, for this reason.
+    All(TaskReason),
+    /// The tasks whose keys it moves, each with its reason.
+    Tasks(BTreeMap<String, TaskReason>),
+}
+
+/// The tasks an nx.json change reaches, as their keys hold it: every task
+/// when it changed what every key holds, and otherwise each task whose
+/// definition or resolved inputs differ under the base revision's
+/// `targetDefaults` and `namedInputs`. The base graph is built from the same
+/// requests, so that dependents forward the same options; a task only the
+/// head graph reaches is requested on its own there.
+fn nx_json_reasons(
+    workspace: &Workspace,
+    graph: &TaskGraph,
+    changes: &Changes,
+    resolved: &BTreeMap<String, qk_cache::Resolved>,
+) -> NxJsonReasons {
+    let (file, settings, base) = match NxJsonChange::new(workspace, changes) {
+        NxJsonChange::None => return NxJsonReasons::None,
+        NxJsonChange::All { file, detail } => {
+            return NxJsonReasons::All(TaskReason::NxJson { file, detail });
+        }
+        NxJsonChange::Resolved {
+            file,
+            settings,
+            base,
+        } => (file, settings, base),
+    };
+    let settings: Vec<String> = settings
+        .iter()
+        .map(|setting| (*setting).to_owned())
+        .collect();
+    let compared = (|| -> Result<_> {
+        let mut before = graph.rebuild(&base, &[])?;
+        let missing: Vec<Request> = graph
+            .tasks
+            .values()
+            .filter(|task| !before.tasks.contains_key(&task.id))
+            .map(|task| Request {
+                project: task.project.clone(),
+                target: task.target.clone(),
+                configuration: task.configuration.clone(),
+                requested_configuration: task.configuration.clone(),
+                args: task.args.clone(),
+            })
+            .collect();
+        if !missing.is_empty() {
+            before = graph.rebuild(&base, &missing)?;
+        }
+        let inputs = qk_cache::resolve_tasks(&base, &before, &changes.files)?;
+        Ok((before, inputs))
+    })();
+    let (before, inputs) = match compared {
+        Ok(compared) => compared,
+        Err(error) => {
+            return NxJsonReasons::All(TaskReason::NxJson {
+                file,
+                detail: format!(
+                    "changed and the base revision's tasks could not be resolved ({error:#})"
+                ),
+            });
+        }
+    };
+    let definition =
+        |task: &qk_taskgraph::Task| serde_json::to_value(qk_cache::keyed_definition(task)).ok();
+    let mut tasks = BTreeMap::new();
+    for (id, task) in &graph.tasks {
+        let reason = match (before.tasks.get(id), inputs.get(id)) {
+            (Some(old), Some(old_inputs)) => {
+                let inputs = &resolved[id];
+                if definition(task) != definition(old) {
+                    Some(TaskReason::Definition {
+                        file: file.clone(),
+                        settings: settings.clone(),
+                    })
+                } else if !inputs.selects_alike(old_inputs, workspace)
+                    // Dependencies' outputs are keyed by the task each came from.
+                    || (task.dependencies != old.dependencies
+                        && inputs.dependency_output_inputs().next().is_some())
+                {
+                    Some(TaskReason::ResolvedInputs {
+                        file: file.clone(),
+                        settings: settings.clone(),
+                    })
+                } else {
+                    None
+                }
+            }
+            _ => Some(TaskReason::Definition {
+                file: file.clone(),
+                settings: settings.clone(),
+            }),
+        };
+        if let Some(reason) = reason {
+            tasks.insert(id.clone(), reason);
+        }
+    }
+    NxJsonReasons::Tasks(tasks)
 }
 
 /// Which tasks' `TsConfiguration` a root tsconfig change reaches, as Nx's
@@ -665,8 +798,6 @@ mod tests {
 
     fn graph(edges: &[(&str, &[&str])]) -> TaskGraph {
         TaskGraph {
-            roots: BTreeSet::new(),
-            cycles: Vec::new(),
             tasks: edges
                 .iter()
                 .map(|(id, dependencies)| {
@@ -685,6 +816,7 @@ mod tests {
                     )
                 })
                 .collect(),
+            ..TaskGraph::default()
         }
     }
 

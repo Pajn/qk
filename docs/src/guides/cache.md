@@ -45,7 +45,7 @@ selects a whole file qk would add, the file counts whole, as the input says. A
 `json` input on such a file adds its fields beside qk's copy rather than
 narrowing it.
 
-Root workspace files (`nx.json`, `.gitignore`, `.nxignore`,
+Root workspace files (`.gitignore`, `.nxignore`,
 `pnpm-workspace.yaml`, lockfiles) and the manifests of the task's project
 (`project.json`, `project.local.json` and `package.json`) are always included,
 its scripts and dependency declarations with them. The root tsconfig
@@ -62,6 +62,26 @@ below, and the rest of it is the root project's own manifest, so editing a root
 script misses only the root project's tasks. Dotenv files are not, as in Nx: they hold
 per-machine values and credentials, so keying them would keep machines from
 sharing entries; `env` inputs key the variables a task declares.
+
+`nx.json` counts through what it changes rather than by its content, unlike
+in Nx, which hashes it into every task. Merged with the file it `extends` and
+`nx.local.json`, it reaches a task through the task's resolved
+configuration, which the key holds already: `targetDefaults` through its
+definition, and `namedInputs` through what its inputs select, the files, env
+and runtime inputs, `externalDependencies` and dependency outputs they name,
+a dependency's through `^` inputs included. Beside that, the key holds the
+merged settings without `targetDefaults` and `namedInputs`, and without those
+that change no task's work: `$schema`, `extends`, `defaultBase`, `affected`,
+`parallel`, `tui`, `cli` other than `cli.packageManager`, `generators`,
+`release`, `sync`, `s3`, `nxCloudId`, `nxCloudAccessToken`, `nxCloudUrl`,
+`nxCloudEncryptionKey`, `neverConnectToCloud`, `defaultProject`,
+`qk:storeServer`, `qk:affectedProfiles`, `qk:reachability`, and the
+workspace-wide `implicitDependencies`, which Nx no longer supports. Every other
+setting, such as `plugins`, `pluginsConfig`, `workspaceLayout` or one qk does
+not know, changes every task's key. Comments and formatting change none, and
+neither does a named input edited to select the same files. A tool that reads
+`nx.json` itself declares `{workspaceRoot}/nx.json` as an input, which keys
+the file whole.
 
 The `package.json` of each project the task's project depends on, directly or
 not, counts by what it decides for its dependents, such as where their imports
