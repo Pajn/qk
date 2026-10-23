@@ -4814,6 +4814,108 @@ fn a_task_expected_to_do_most_of_the_work_gets_most_of_the_cores() {
     assert!(threads > 4 && threads <= 10, "{threads}");
 }
 
+/// Records an earlier run in the fixture's history in which each of `tasks`,
+/// `app:<target>`, ran for its milliseconds on its cores.
+#[cfg(unix)]
+fn earlier_run(fixture: &Fixture, tasks: &[(&str, u64, u64)]) {
+    let task = |&(target, millis, cores): &(&str, u64, u64)| qk_history::TaskReport {
+        id: format!("app:{target}"),
+        project: "app".into(),
+        target: target.into(),
+        configuration: None,
+        status: "success".into(),
+        cache: Some("uncached".into()),
+        key: None,
+        started: Some(1_000),
+        ended: Some(1_000 + millis),
+        dependencies: Vec::new(),
+        cause: None,
+        warm: None,
+        threads: Some(cores),
+        memory: None,
+        recorded: None,
+        cores: Some(cores),
+        cpu: None,
+        shadow: None,
+    };
+    qk_history::History::open(&fixture.root.join(".git/qk/history.db"))
+        .unwrap()
+        .record(
+            qk_history::RunReport {
+                schema_version: qk_history::SCHEMA_VERSION,
+                id: "earlier".into(),
+                command: Vec::new(),
+                sha: None,
+                worktree: None,
+                started: 1_000,
+                ended: 100_000,
+                exit_code: 0,
+                tasks: tasks.iter().map(task).collect(),
+                critical_path: Default::default(),
+            },
+            &Default::default(),
+        )
+        .unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn short_tasks_leave_the_cores_to_a_long_one_still_waiting_for_its_dependencies() {
+    // As in a CI run: short suites ready at once, and a long one behind a
+    // chain that becomes ready while they still run.
+    let short = |name: &str| {
+        threaded(
+            &format!("echo $QK_THREADS > dist/{name}; sleep 1.5"),
+            json!(true),
+        )
+    };
+    let mut long = threaded("echo $QK_THREADS > dist/long", json!(true));
+    long["dependsOn"] = json!(["codegen"]);
+    let fixture = Fixture::with_targets(json!({
+        "codegen": {"command": "sleep 0.5"},
+        "long": long,
+        "short1": short("short1"),
+        "short2": short("short2"),
+        "short3": short("short3"),
+    }));
+    earlier_run(
+        &fixture,
+        &[
+            ("codegen", 3_000, 1),
+            ("long", 14_000, 8),
+            ("short1", 1_000, 10),
+            ("short2", 1_000, 10),
+            ("short3", 1_000, 10),
+        ],
+    );
+    success(fixture.qk(
+        &fixture.root,
+        &[
+            "run-many",
+            "-t",
+            "long,short1,short2,short3",
+            "--parallel",
+            "4",
+            "--cores",
+            "16",
+        ],
+    ));
+    let threads = |name: &str| -> usize {
+        fs::read_to_string(fixture.root.join("dist").join(name))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    // Each short suite is a small part of the work beside it, and is given
+    // as small a part of the cores, rather than an even split of them.
+    for name in ["short1", "short2", "short3"] {
+        assert_eq!(threads(name), 2, "{name}");
+    }
+    // The long one finds most of the cores free when it starts.
+    assert!(threads("long") >= 10, "{}", threads("long"));
+}
+
 #[cfg(unix)]
 #[test]
 fn a_known_long_task_leaves_cores_for_tasks_without_history() {

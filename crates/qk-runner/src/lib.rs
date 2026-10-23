@@ -573,18 +573,19 @@ pub fn run(
                         (finite_pending - ready_threaded).min(slots.saturating_sub(sharing));
                     Threads::even(cores.saturating_sub(held.values().sum()), sharing, reserved)
                 };
-                // The core-milliseconds the run has left: what pending tasks are
-                // expected to take, and what running ones have still to go.
+                // The core-milliseconds each finite task still to finish is
+                // expected to take: what a pending one takes, and what a
+                // running one has still to go.
                 let now = SystemTime::now();
-                let remaining_work: u64 = pending
+                let work_left: Vec<(String, u64)> = pending
                     .iter()
-                    .filter_map(|id| expected.get(id))
-                    .map(Expected::work)
+                    .filter(|id| !continuous.contains(*id))
+                    .filter_map(|id| Some((id.clone(), expected.get(id)?.work())))
                     .chain(held.iter().filter_map(|(id, cores)| {
                         let elapsed = now.duration_since(started[id]).unwrap_or_default();
-                        Some(expected.get(id)?.remaining(elapsed, *cores))
+                        Some((id.clone(), expected.get(id)?.remaining(elapsed, *cores)))
                     }))
-                    .sum();
+                    .collect();
                 // After a failure under --nx-bail, what has not started is skipped
                 // and what runs finishes.
                 if bailed && !pending.is_empty() {
@@ -667,11 +668,14 @@ pub fn run(
                         let cores_for = match threads.get(&id) {
                             Some(config) => {
                                 // Alone, nothing else can take a share. A task
-                                // expected to do much of what is left gets as
-                                // much of the cores, so that it is not left
-                                // running once the rest is done.
-                                // The even split was made before this pass
-                                // started tasks; it cannot exceed what they left.
+                                // with an expectation gets the part of the cores
+                                // that its work is of the work that can run
+                                // beside it, so that a short one leaves cores
+                                // for longer ones and a long one is not left
+                                // running once the rest is done. One without
+                                // takes the even split, which was made before
+                                // this pass started tasks; neither can exceed
+                                // what they left.
                                 let even = if alone.contains(&id) {
                                     cores
                                 } else {
@@ -707,8 +711,15 @@ pub fn run(
                                         )
                                         .take(slots)
                                         .fold(0usize, usize::saturating_add);
-                                    even.max(proportion(expected.get(&id), remaining_work, cores))
-                                        .min(free.saturating_sub(reserved))
+                                    let sized = match expected.get(&id) {
+                                        Some(own) => proportion(
+                                            own.work(),
+                                            beside(&id, &work_left, &dependents, parallel),
+                                            cores,
+                                        ),
+                                        None => even,
+                                    };
+                                    sized.min(free.saturating_sub(reserved))
                                 };
                                 config.share(cores, even, free, held.is_empty())
                             }
@@ -1193,15 +1204,48 @@ fn by_path(
     order
 }
 
-/// The share of `cores` matching the share of `remaining` work a task is
-/// expected to do, or none for a task without an expectation.
-fn proportion(expected: Option<&Expected>, remaining: u64, cores: usize) -> usize {
-    match expected {
-        Some(expected) if remaining > 0 => {
-            (expected.work() as u128 * cores as u128).div_ceil(remaining as u128) as usize
-        }
-        _ => 0,
+/// The share of `cores` matching the share `work` is of `concurrent` work,
+/// rounded up; none when there is no work.
+fn proportion(work: u64, concurrent: u64, cores: usize) -> usize {
+    if concurrent == 0 {
+        return 0;
     }
+    (work as u128 * cores as u128).div_ceil(concurrent as u128) as usize
+}
+
+/// The work that can run beside task `id`, its own included: of the tasks
+/// still to finish, `work_left`, those that do not depend on it, which wait
+/// for it to end, and of those the most that the other `parallel` slots can
+/// hold at once, the largest first.
+fn beside(
+    id: &str,
+    work_left: &[(String, u64)],
+    dependents: &BTreeMap<&str, Vec<&str>>,
+    parallel: usize,
+) -> u64 {
+    let mut after = BTreeSet::new();
+    let mut next = vec![id];
+    while let Some(task) = next.pop() {
+        for dependent in dependents.get(task).into_iter().flatten() {
+            if after.insert(*dependent) {
+                next.push(dependent);
+            }
+        }
+    }
+    let mut others: Vec<u64> = work_left
+        .iter()
+        .filter(|(other, _)| other != id && !after.contains(other.as_str()))
+        .map(|(_, work)| *work)
+        .collect();
+    others.sort_unstable_by(|a, b| b.cmp(a));
+    let own = work_left
+        .iter()
+        .find(|(other, _)| other == id)
+        .map_or(0, |(_, work)| *work);
+    others
+        .into_iter()
+        .take(parallel.saturating_sub(1))
+        .fold(own, u64::saturating_add)
 }
 
 #[cfg(test)]
@@ -1214,6 +1258,26 @@ mod tests {
         assert_ne!(super::log_name("a:b_c"), super::log_name("a_b:c"));
         assert_eq!(super::log_name("app:build"), "app_3abuild.log");
     }
+    #[test]
+    fn work_beside_a_task_leaves_out_what_waits_for_it() {
+        // `lib` feeds `test`; `other` and `small` are independent of both.
+        let dependents = [("lib", vec!["test"])].into_iter().collect();
+        let work_left: Vec<(String, u64)> =
+            [("lib", 10), ("test", 1_000), ("other", 50), ("small", 5)]
+                .into_iter()
+                .map(|(id, work)| (id.to_owned(), work))
+                .collect();
+        // What depends on it cannot run beside it.
+        assert_eq!(super::beside("lib", &work_left, &dependents, 4), 65);
+        assert_eq!(super::beside("other", &work_left, &dependents, 4), 1_065);
+        // The other slots hold the largest of the rest.
+        assert_eq!(super::beside("other", &work_left, &dependents, 2), 1_050);
+        assert_eq!(super::beside("other", &work_left, &dependents, 1), 50);
+        assert_eq!(super::proportion(50, 1_065, 16), 1);
+        assert_eq!(super::proportion(1_000, 1_065, 16), 16);
+        assert_eq!(super::proportion(0, 0, 16), 0);
+    }
+
     #[test]
     fn remaining_work_accounts_for_the_current_allocation() {
         let expected = Expected {
