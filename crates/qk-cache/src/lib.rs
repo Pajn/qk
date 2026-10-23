@@ -1128,8 +1128,9 @@ fn workspace_outputs(workspace: &Workspace) -> recorded::WorkspaceOutputs {
     recorded::WorkspaceOutputs::new(outputs, &roots)
 }
 
-/// `task`'s target and those of every task it depends on, each with the
-/// configuration it runs with.
+/// The targets of every task `task` depends on, each with the configuration
+/// it runs with. Its own target is not among them: its outputs are left out
+/// of its listings as other targets' are.
 fn upstream(graph: &TaskGraph, task: &Task) -> BTreeSet<recorded::TargetOf> {
     let of = |task: &Task| {
         (
@@ -1138,7 +1139,7 @@ fn upstream(graph: &TaskGraph, task: &Task) -> BTreeSet<recorded::TargetOf> {
             task.configuration.clone(),
         )
     };
-    let mut targets = BTreeSet::from([of(task)]);
+    let mut targets = BTreeSet::new();
     let mut seen = BTreeSet::new();
     let mut pending: Vec<&String> = task.dependencies.iter().collect();
     while let Some(id) = pending.pop() {
@@ -1373,6 +1374,8 @@ mod tests {
                   "options":{"outputPath":"app/dist"},
                   "configurations":{"production":{"outputPath":"app/dist-production"}}},
                 "lint":{"command":"true"},
+                "cover":{"command":"true","outputs":["{projectRoot}/.coverage/unit"]},
+                "cover-browser":{"command":"true","outputs":["{projectRoot}/.coverage/browser"]},
                 "wasm":{"command":"true","outputs":["{projectRoot}/target/wasm/release/*.wasm"]},
                 "test":{"command":"true","dependsOn":[{"projects":["lib"],"target":"build"}],
                   "configurations":{"production":{}}}}}"#,
@@ -1390,6 +1393,7 @@ mod tests {
             &workspace,
             &[
                 qk_taskgraph::Request::parse("app:lint").unwrap(),
+                qk_taskgraph::Request::parse("app:cover").unwrap(),
                 qk_taskgraph::Request::parse("app:test").unwrap(),
                 qk_taskgraph::Request::parse("app:test:production").unwrap(),
             ],
@@ -1428,6 +1432,9 @@ mod tests {
         // configuration it depends on.
         assert!(!others("app:test").matches("lib/dist"));
         assert!(others("app:test").matches("lib/dist-production"));
+        // A folder holding the task's own output and another target's is
+        // left out, as both are.
+        assert!(others("app:cover").matches("app/.coverage"));
         let production = others("app:test:production");
         assert!(!production.matches("lib/dist-production"));
         assert!(production.matches("lib/dist"));
