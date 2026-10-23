@@ -1358,6 +1358,14 @@ mod tests {
         std::fs::write(root.join("nx.json"), "{}").unwrap();
         std::fs::create_dir_all(root.join("app")).unwrap();
         std::fs::create_dir_all(root.join("lib")).unwrap();
+        // A project at the workspace root, with an output in a folder of its
+        // own and one inside another project.
+        std::fs::write(
+            root.join("project.json"),
+            r#"{"name":"workspace","targets":{"cache":{"command":"true",
+                "outputs":["{projectRoot}/.cache/build","{projectRoot}/app/extra/out"]}}}"#,
+        )
+        .unwrap();
         std::fs::write(
             root.join("app/project.json"),
             r#"{"name":"app","targets":{
@@ -1401,6 +1409,10 @@ mod tests {
         assert!(lint.matches("app/target"));
         assert!(lint.matches("app/target/wasm"));
         assert!(!lint.matches("app"));
+        // A root project's folders are top-level, but never another project.
+        assert!(lint.matches(".cache"));
+        assert!(lint.matches("app/extra"));
+        assert!(!lint.matches("lib"));
         // A dependency's output is the test's input, and only that of the
         // configuration it depends on.
         assert!(!others("app:test").matches("lib/dist"));

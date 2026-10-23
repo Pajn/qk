@@ -257,7 +257,9 @@ impl PathSet {
             }
             return None;
         }
-        let entries = std::fs::read_dir(&absolute).ok()?;
+        let Ok(entries) = std::fs::read_dir(&absolute) else {
+            return Some(Some("it was removed or could no longer be read".to_owned()));
+        };
         // Each entry, whether listings leave it out, and whether the task
         // wrote it or it is among the task's own outputs.
         let entries: Vec<(std::fs::DirEntry, bool, bool)> = entries
@@ -469,20 +471,44 @@ impl WorkspaceOutputs {
         let mut by_folder: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         let mut folders = Vec::new();
         let mut project_roots = Vec::new();
+        // No project's root, nor a directory holding one, is a folder an
+        // output owns.
+        let projects: BTreeSet<&str> = roots
+            .values()
+            .flat_map(|root| {
+                std::iter::once(root.as_str())
+                    .chain(root.match_indices('/').map(|(at, _)| &root[..at]))
+            })
+            .collect();
         for (index, ((project, _, _), declared)) in outputs.iter().enumerate() {
-            let root = roots.get(project).map_or("", String::as_str);
+            let root = roots
+                .get(project)
+                .map_or("", String::as_str)
+                .trim_start_matches("./");
+            let root = if root == "." { "" } else { root };
             let mut held = Vec::new();
             for anchor in declared.anchors() {
                 by_anchor.entry(anchor.to_owned()).or_default().push(index);
-                let Some(rest) = (!root.is_empty())
-                    .then(|| anchor.strip_prefix(root)?.strip_prefix('/'))
-                    .flatten()
-                else {
+                let rest = if root.is_empty() {
+                    Some(anchor)
+                } else {
+                    anchor
+                        .strip_prefix(root)
+                        .and_then(|rest| rest.strip_prefix('/'))
+                };
+                let Some(rest) = rest else {
                     continue;
                 };
                 // Each directory below the root that holds the anchor.
                 for (at, _) in rest.match_indices('/') {
-                    let folder = format!("{root}/{}", &rest[..at]);
+                    let folder = if root.is_empty() {
+                        rest[..at].to_owned()
+                    } else {
+                        format!("{root}/{}", &rest[..at])
+                    };
+                    if projects.contains(folder.as_str()) {
+                        continue;
+                    }
                     by_folder.entry(folder.clone()).or_default().push(index);
                     held.push(folder);
                 }
@@ -1173,6 +1199,18 @@ mod tests {
         );
         // The project's root is no folder holding its outputs.
         assert!(!unlisted.matches("app"));
+        // A listed directory removed as it ran, with no listing from before.
+        std::fs::create_dir(root.join("app/gone")).unwrap();
+        let gone = PathSet {
+            listings: ["app/gone".to_owned()].into(),
+            ..PathSet::default()
+        };
+        std::fs::remove_dir(root.join("app/gone")).unwrap();
+        assert_eq!(
+            gone.changed_since(root, started, &unlisted, &Before::default())
+                .map(|changed| changed.path),
+            Some("app/gone")
+        );
         // An output appearing in a listed directory a glob declares it in.
         std::fs::write(root.join("app/out/new.js"), "").unwrap();
         let out = PathSet {
