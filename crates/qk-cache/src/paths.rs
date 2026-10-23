@@ -352,7 +352,7 @@ impl Outputs {
                 .collect(),
             anchors: patterns
                 .iter()
-                .map(|pattern| (*pattern).to_owned())
+                .map(|pattern| crate::ignored::partition(pattern).0)
                 .collect(),
             complete: patterns
                 .iter()

@@ -483,7 +483,8 @@ impl Unlisted<'_> {
     }
 
     /// Where other targets' outputs and ignored paths come and go while the
-    /// task runs: the directories holding those outputs, and the root of the
+    /// task runs: the directories holding those outputs, and their anchors,
+    /// where an output a glob declares comes and goes, and the root of the
     /// task's project, where a tool's `ignoreReads` state usually sits.
     pub(crate) fn directories(&self, project_root: &str) -> BTreeSet<String> {
         let project_root = if project_root.is_empty() {
@@ -501,7 +502,7 @@ impl Unlisted<'_> {
                     .filter(|(target, _)| !others.upstream.contains(target))
                     .flat_map(|(_, outputs)| outputs.anchors())
             })
-            .map(|anchor| parent(anchor).to_owned())
+            .flat_map(|anchor| [anchor.to_owned(), parent(anchor).to_owned()])
             .chain([project_root.to_owned()])
             .collect()
     }
@@ -976,6 +977,7 @@ mod tests {
             ..PathSet::default()
         };
         std::fs::write(root.join("app/kept.txt"), "").unwrap();
+        std::fs::create_dir(root.join("app/out")).unwrap();
         let outputs = WorkspaceOutputs::new(vec![
             (
                 ("app".into(), "tsc".into(), None),
@@ -984,6 +986,11 @@ mod tests {
             (
                 ("app".into(), "codegen".into(), None),
                 Outputs::from_patterns(&["app/generated"]),
+            ),
+            // An output a glob declares, inside a directory the task lists.
+            (
+                ("app".into(), "bundle".into(), None),
+                Outputs::from_patterns(&["app/out/*.js"]),
             ),
             // Another target declaring the dependency's output too.
             (
@@ -1005,7 +1012,16 @@ mod tests {
             }),
             ignore: &ignore,
         };
-        assert_eq!(unlisted.directories("app"), ["app".to_owned()].into());
+        assert_eq!(
+            unlisted.directories("app"),
+            [
+                "app".to_owned(),
+                "app/.syb-ts".to_owned(),
+                "app/generated".to_owned(),
+                "app/out".to_owned()
+            ]
+            .into()
+        );
         let snapshot = Snapshot::new(&workspace, &graph, &root.join("cache")).unwrap();
         let key = || strong_key("weak", &set, &snapshot, root, &unlisted).unwrap();
         let before = key();
@@ -1018,6 +1034,17 @@ mod tests {
         std::fs::create_dir(root.join("app/.fallow")).unwrap();
         assert_eq!(key(), before);
         assert_eq!(changed(&taken), None);
+        // An output appearing in a listed directory a glob declares it in.
+        std::fs::write(root.join("app/out/new.js"), "").unwrap();
+        let out = PathSet {
+            listings: ["app/out".to_owned()].into(),
+            ..PathSet::default()
+        };
+        assert_eq!(out.changed_since(root, started, &unlisted, &taken), None);
+        assert_eq!(
+            out.changed_since(root, started, &unlisted, &Before::default()),
+            Some("app/out")
+        );
         // A dependency's output is the task's input, and stays listed.
         assert!(!unlisted.matches("app/generated"));
         assert!(unlisted.matches("app/.syb-ts/index.js"));
