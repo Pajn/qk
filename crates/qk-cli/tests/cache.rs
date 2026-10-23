@@ -1280,7 +1280,7 @@ fn a_store_server_leaves_out_the_blobs_a_client_holds() {
     let (fixture, _) = large_outputs(1);
     with_store_server(&fixture, &server);
     success(server_build(&fixture, store_server::WRITE_TOKEN, &[]));
-    assert_eq!(server.state.lock().unwrap().records.len(), 1);
+    assert_eq!(server.state.lock().unwrap().entries(), 1);
     // A machine holding the files, but not the entry, receives only the
     // record and the table.
     fs::remove_dir_all(cache_path(&fixture).join("entries")).unwrap();
@@ -1352,7 +1352,7 @@ fn a_commit_a_store_server_refuses_for_lost_blobs_is_made_again() {
         stderr(&output)
     );
     let state = server.state.lock().unwrap();
-    assert_eq!(state.records.len(), 1);
+    assert_eq!(state.entries(), 1);
     assert_eq!(state.blobs.len(), 1);
     let puts = state
         .requests
@@ -1408,7 +1408,7 @@ fn a_qk_store_server_is_used_beside_the_s3_key_nx_reads() {
     .unwrap();
     let output = success(server_build(&fixture, store_server::WRITE_TOKEN, &[]));
     assert!(!stderr(&output).contains("not both"), "{}", stderr(&output));
-    assert_eq!(server.state.lock().unwrap().records.len(), 1);
+    assert_eq!(server.state.lock().unwrap().entries(), 1);
 }
 
 #[test]
@@ -1431,7 +1431,7 @@ fn background_uploads_go_where_the_run_was_told_to_send_them() {
     ));
     let log = wait_for_detached_uploads(&detached_log(&output));
     assert!(log.contains("0 failure(s)"), "{log}");
-    assert_eq!(server.state.lock().unwrap().records.len(), 1);
+    assert_eq!(server.state.lock().unwrap().entries(), 1);
 }
 
 #[test]
@@ -1448,7 +1448,7 @@ fn uploads_to_a_store_server_continue_in_the_background() {
     assert!(log.contains("0 failure(s)"), "{log}");
     assert!(!log.contains(store_server::WRITE_TOKEN), "{log}");
     let state = server.state.lock().unwrap();
-    assert_eq!(state.records.len(), 1);
+    assert_eq!(state.entries(), 1);
     assert!(
         state
             .requests
@@ -1457,6 +1457,147 @@ fn uploads_to_a_store_server_continue_in_the_background() {
         "{:?}",
         state.requests
     );
+}
+
+// The targets are POSIX shell commands.
+#[cfg(unix)]
+#[test]
+fn a_machine_without_history_takes_expectations_from_the_remote_store() {
+    for store in ["s3", "server"] {
+        let s3 = s3::FakeS3::start();
+        let server = store_server::FakeStoreServer::start();
+        let task = |name: &str, seconds: &str| json!({"command": format!("echo {name} >> started; sleep {seconds}")});
+        let fixture = Fixture::with_targets(json!({
+            "a-fast": task("a-fast", "0.1"), "b-slow": task("b-slow", "0.6")
+        }));
+        match store {
+            "s3" => {
+                with_remote(&fixture, &s3, json!({}));
+            }
+            _ => with_store_server(&fixture, &server),
+        }
+        let history = fixture.root.join(".git/qk/history.db");
+        let order = || {
+            let _ = fs::remove_file(fixture.root.join("started"));
+            let mut command = fixture.command(
+                &fixture.root,
+                &["run-many", "-t", "a-fast,b-slow", "--parallel", "1"],
+            );
+            command
+                .env("AWS_ACCESS_KEY_ID", "key")
+                .env("AWS_SECRET_ACCESS_KEY", "secret")
+                .env("QK_STORE_SERVER_TOKEN", store_server::WRITE_TOKEN)
+                .env_remove("NX_POWERPACK_CACHE_MODE");
+            let output = success(command.output().unwrap());
+            assert!(
+                !stderr(&output).contains("upload failed"),
+                "{}",
+                stderr(&output)
+            );
+            fs::read_to_string(fixture.root.join("started")).unwrap()
+        };
+        // Without earlier runs, in the order of their ids.
+        assert_eq!(order(), "a-fast\nb-slow\n", "{store}");
+        match store {
+            "s3" => assert_eq!(s3.objects(&s3::path("expectations/")).len(), 1),
+            _ => assert_eq!(
+                server
+                    .state
+                    .lock()
+                    .unwrap()
+                    .records
+                    .keys()
+                    .filter(|path| path.starts_with("expectations/"))
+                    .count(),
+                1
+            ),
+        }
+        // A fresh clone has no history; the store says which takes longer.
+        fs::remove_file(&history).unwrap();
+        assert_eq!(order(), "b-slow\na-fast\n", "{store}");
+        // Local history wins for a task it has, and the store fills the rest.
+        fs::remove_file(&history).unwrap();
+        earlier_run(&fixture, &[("b-slow", 1, 1)]);
+        assert_eq!(order(), "a-fast\nb-slow\n", "{store}");
+    }
+}
+
+#[test]
+fn a_variable_keeps_a_run_from_writing_or_reading_expectations() {
+    let server = s3::FakeS3::start();
+    let fixture = Fixture::new(target("build", json!({})));
+    with_remote(&fixture, &server, json!({}));
+    let expectations = || server.requests(&s3::path("expectations/"));
+    // Read: looked up, never written.
+    success(remote_build(
+        &fixture,
+        &[("QK_REMOTE_EXPECTATIONS", "read")],
+    ));
+    assert!(!expectations().is_empty());
+    assert!(server.objects(&s3::path("expectations/")).is_empty());
+    assert_eq!(server.objects(&s3::path("entries/")).len(), 1);
+    // Off: not asked for at all.
+    clear_local_cache(&fixture);
+    fs::remove_file(fixture.root.join(".git/qk/history.db")).unwrap();
+    let before = expectations().len();
+    success(remote_build(&fixture, &[("QK_REMOTE_EXPECTATIONS", "off")]));
+    assert_eq!(expectations().len(), before);
+    assert!(server.objects(&s3::path("expectations/")).is_empty());
+    // Anything else is reported, and reads nothing.
+    let output = success(remote_build(&fixture, &[("QK_REMOTE_EXPECTATIONS", "on")]));
+    assert!(
+        stderr(&output).contains("unknown QK_REMOTE_EXPECTATIONS \"on\""),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(expectations().len(), before);
+}
+
+#[test]
+fn a_run_with_every_task_in_local_history_does_not_wait_for_the_remote_store() {
+    let server = s3::FakeS3::start();
+    let fixture = Fixture::new(target("build", json!({})));
+    with_remote(&fixture, &server, json!({}));
+    success(remote_build(&fixture, &[]));
+    // Local history now has the task, so a fetch of expectations that never
+    // ends neither holds up the run nor reports anything.
+    server.state.lock().unwrap().hold_get = [".json".to_owned()].into();
+    let started = std::time::Instant::now();
+    let output = success(remote_build(&fixture, &[]));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(
+        !stderr(&output).contains("remote task expectations"),
+        "{}",
+        stderr(&output)
+    );
+    server.state.lock().unwrap().hold_get.clear();
+}
+
+#[test]
+fn expectations_the_remote_store_cannot_give_do_not_fail_the_run() {
+    let server = s3::FakeS3::start();
+    let fixture = Fixture::new(target("build", json!({})));
+    with_remote(&fixture, &server, json!({}));
+    // Of what this run reads, only expectations are stored as JSON.
+    server.state.lock().unwrap().fail_get = [".json".to_owned()].into();
+    let output = success(remote_build(&fixture, &[]));
+    assert!(
+        stderr(&output).contains("qk: remote task expectations unavailable"),
+        "{}",
+        stderr(&output)
+    );
+    // Nor is what the store holds replaced while it cannot be read.
+    assert!(
+        stderr(&output).contains("qk: remote cache upload failed for task expectations"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(server.objects(&s3::path("expectations/")).is_empty());
+    assert_eq!(server.objects(&s3::path("entries/")).len(), 1);
 }
 
 /// Points the fixture at the fake S3 store and returns a command runner with
@@ -1684,11 +1825,12 @@ fn remote_cache_restores_what_another_machine_uploaded() {
         "{}",
         stderr(&first)
     );
-    // The entry and its outputs are one object. The final run listing
-    // replaces its write-ahead announcement.
+    // The entry and its outputs are one object, and what the task took
+    // another. The final run listing replaces its write-ahead announcement.
     assert_eq!(server.objects(&s3::path("entries/")).len(), 1);
     assert_eq!(server.objects(&s3::path("index/")).len(), 1);
-    assert_eq!(server.objects(&s3::path("")).len(), 2);
+    assert_eq!(server.objects(&s3::path("expectations/")).len(), 1);
+    assert_eq!(server.objects(&s3::path("")).len(), 3);
 
     // A machine with an empty local cache restores from the remote store, in
     // one request.

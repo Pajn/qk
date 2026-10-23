@@ -47,8 +47,8 @@ Saved file or log content identified by its content hash. Several result
 records or warm-state records can cite the same blob.
 
 **Remote store**:
-Shared storage of result records, warm-state records and blobs, through which
-one machine reuses what another saved.
+Shared storage of result records, warm-state records, what tasks are expected
+to take and blobs, through which one machine reuses what another saved.
 
 **Run listing**:
 The cache keys one run found in or added to the remote store. It tells readers

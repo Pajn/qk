@@ -193,6 +193,57 @@ pub fn expected(workspace: &Workspace) -> std::collections::BTreeMap<String, qk_
         .unwrap_or_default()
 }
 
+/// Adds to `expected` what the remote store holds, as `fetching` fetches it,
+/// for each task in `graph` that local history has nothing for, when any
+/// lacks it: local history wins for a task that has it. Otherwise the fetch
+/// is left to end as the run goes on.
+pub fn fill_from_remote(
+    graph: &TaskGraph,
+    fetching: &mut Option<qk_cache::expectations::Fetching>,
+    expected: &mut BTreeMap<String, qk_runner::Expected>,
+) {
+    if graph.tasks.keys().all(|id| expected.contains_key(id)) {
+        return;
+    }
+    let Some(fetching) = fetching.take() else {
+        return;
+    };
+    for (id, shared) in fetching.wait() {
+        if graph.tasks.contains_key(&id) {
+            expected.entry(id).or_insert(qk_runner::Expected {
+                millis: shared.millis,
+                cores: shared.cores,
+                memory: shared.memory,
+            });
+        }
+    }
+}
+
+/// Shares through the remote store the runs of `report` that executed their
+/// task, those local history draws expectations from, for machines without
+/// it.
+pub fn share(
+    workspace: &Workspace,
+    report: &RunReport,
+    environment: &BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+) {
+    let runs = report
+        .tasks
+        .iter()
+        .filter(|task| matches!(task.cache.as_deref(), Some("miss" | "uncached")))
+        .filter(|task| matches!(task.status.as_str(), "success" | "failure"))
+        .filter_map(|task| {
+            let run = qk_cache::expectations::Expectation {
+                millis: task.ended?.saturating_sub(task.started?),
+                cores: task.cores.or(task.threads).unwrap_or(1).max(1),
+                memory: task.memory,
+            };
+            Some((task.id.clone(), run))
+        })
+        .collect();
+    qk_cache::expectations::share(workspace, environment, runs);
+}
+
 pub fn open(workspace: &Workspace) -> Result<History> {
     let path = path(workspace);
     if !path.exists() {

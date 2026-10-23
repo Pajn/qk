@@ -24,6 +24,9 @@ pub(super) enum Object<'a> {
     Blob(&'a str),
     /// The path sets recorded for a weak key, a pack citing no blob.
     PathSets(&'a str),
+    /// What tasks are expected to take, saved for a branch, a pack citing no
+    /// blob.
+    Expectations(&'a str),
 }
 
 /// How a store wants a record and the blobs it carries sent.
@@ -45,6 +48,18 @@ pub(super) fn warm_names(identity: &str, branch: &str) -> (String, String) {
         std::env::consts::ARCH
     );
     (hash(&identity), hash(branch))
+}
+
+/// The name tasks' expectations saved for `branch` are stored under, as 32
+/// hex digits: the branch on this platform, since its machines take their own
+/// time.
+pub(crate) fn expectations_name(branch: &str) -> String {
+    let named = format!(
+        "{branch}\0{}\0{}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+    blake3::hash(named.as_bytes()).to_hex()[..32].to_owned()
 }
 
 /// A commit the store refused because it lacks these blobs stored apart.

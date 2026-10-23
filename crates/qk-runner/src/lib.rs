@@ -1191,7 +1191,11 @@ fn by_path(
             .map(|dependent| path(dependent, dependents, expected, paths))
             .max()
             .unwrap_or(0);
-        let path = expected.get(id).map_or(0, |expected| expected.millis) + after;
+        // Saturating: a shared record can name any time.
+        let path = expected
+            .get(id)
+            .map_or(0, |expected| expected.millis)
+            .saturating_add(after);
         paths.insert(id, path);
         path
     }

@@ -31,8 +31,10 @@ split the free cores evenly, after a core for each task slot other pending
 tasks could take, so two get half each and three a third, and one starting
 alone leaves room for what follows.
 
-A task with an expectation, its time in recent runs on the cores it held
-then, is given the part of the cores that its work is of the work that can
+A task's expectation is its time in its recent runs, those that executed it,
+on the cores it held then: from local history, which lives beside the cache,
+or for a task local history lacks, from the [remote store](remote-cache.md),
+which shares what other machines ran. A task with an expectation is given the part of the cores that its work is of the work that can
 run beside it: its own, and the largest of what the other task slots can hold
 of the tasks still to finish, leaving out those that depend on it, which wait
 for it to end. A running task counts what it has still to do, its expected
