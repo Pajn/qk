@@ -110,10 +110,7 @@ pub fn record(
         id: format!("{started}-{}", std::process::id()),
         command: std::env::args().collect(),
         worktree: Some(worktree(workspace)),
-        sha: std::process::Command::new("git")
-            .current_dir(&workspace.root)
-            .args(["rev-parse", "HEAD"])
-            .output()
+        sha: qk_cache::workspace_git(&workspace.root, &["rev-parse", "HEAD"])
             .ok()
             .filter(|output| output.status.success())
             .and_then(|output| String::from_utf8(output.stdout).ok())
