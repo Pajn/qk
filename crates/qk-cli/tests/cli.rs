@@ -17,7 +17,9 @@ fn isolated_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
             if cfg!(windows) { "NUL" } else { "/dev/null" },
         )
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env_remove("NX_WORKSPACE_ROOT_PATH");
+        .env_remove("NX_WORKSPACE_ROOT_PATH")
+        // Affected selection follows nx.json unless a test sets it.
+        .env_remove("NX_LEGACY_AFFECTED");
     command
 }
 
@@ -657,12 +659,19 @@ fn show_affected_explains_why() {
     assert_eq!(report["affected"], true);
     assert_eq!(report["chain"][0]["dependsOn"], "codegen");
     assert_eq!(report["chain"][1]["reasons"][0]["reason"], "file");
+    assert_eq!(report["granularity"], "task");
+    assert_eq!(report["granularityFrom"], "default");
 
     // A root file touches no project here.
     let output = qk(&["show", "affected", "--files", "README.md"]);
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(text.starts_with("1 changed file between"), "{text}");
-    assert_eq!(text.lines().count(), 1, "{text}");
+    // Then only the granularity `qk affected` selects by.
+    assert_eq!(text.lines().count(), 2, "{text}");
+    assert!(
+        text.ends_with("\nGranularity: task (the default).\n"),
+        "{text}"
+    );
     let output = qk(&["show", "affected", "core", "--files", "README.md"]);
     assert!(
         String::from_utf8(output.stdout)
@@ -727,6 +736,218 @@ fn task_granularity_selects_tasks_whose_inputs_changed() {
         "--json",
     ]));
     assert_eq!(report["tasks"], json!({}));
+}
+
+/// A workspace whose `lib:build` reads only `src`, so a change to its
+/// README affects the project but not the task, and nx.json with `affected`.
+fn granularity_workspace(affected: Option<Value>) -> TempDir {
+    let temp = TempDir::new().unwrap();
+    let mut nx_json = json!({});
+    if let Some(affected) = affected {
+        nx_json["affected"] = affected;
+    }
+    std::fs::write(temp.path().join("nx.json"), nx_json.to_string()).unwrap();
+    std::fs::create_dir_all(temp.path().join("lib/src")).unwrap();
+    std::fs::write(temp.path().join("lib/README.md"), "lib").unwrap();
+    std::fs::write(
+        temp.path().join("lib/project.json"),
+        json!({"name": "lib", "targets": {"build": {
+            "executor": "nx:noop", "inputs": ["{projectRoot}/src/**"]
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    temp
+}
+
+#[test]
+fn affected_granularity_is_the_flag_then_nx_legacy_affected_then_nx_json_then_task() {
+    let legacy = || Some(json!({"legacy": true}));
+    for (affected, env, flag, projects) in [
+        (None, None, None, false),
+        (legacy(), None, None, true),
+        (Some(json!({"legacy": false})), None, None, false),
+        (legacy(), Some("false"), None, false),
+        (Some(json!({"legacy": false})), Some("true"), None, true),
+        (None, Some("true"), None, true),
+        // Nx reads only `true` and `false`.
+        (legacy(), Some("1"), None, true),
+        (None, Some("1"), None, false),
+        (legacy(), Some("true"), Some("task"), false),
+        (None, Some("false"), Some("project"), true),
+    ] {
+        let temp = granularity_workspace(affected.clone());
+        let mut command = isolated_command(env!("CARGO_BIN_EXE_qk"));
+        command.arg("--workspace").arg(temp.path()).args([
+            "affected",
+            "-t",
+            "build",
+            "--files",
+            "lib/README.md",
+            "--dry-run",
+        ]);
+        if let Some(flag) = flag {
+            command.args(["--granularity", flag]);
+        }
+        if let Some(env) = env {
+            command.env("NX_LEGACY_AFFECTED", env);
+        }
+        let output = command.output().unwrap();
+        let case = format!("{affected:?} {env:?} {flag:?}");
+        assert!(
+            output.status.success(),
+            "{case}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if projects {
+            assert_eq!(planned(output), ["lib:build"], "{case}");
+        } else {
+            assert!(output.stdout.is_empty(), "{case}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("no affected tasks"),
+                "{case}"
+            );
+        }
+    }
+}
+
+#[test]
+fn show_projects_affected_selects_by_the_tasks_of_its_targets_as_nx_24() {
+    let readme = "packages/core/README.md";
+    let listed = |args: &[&str]| {
+        let mut all = vec![
+            "show",
+            "projects",
+            "--affected",
+            "--files",
+            readme,
+            "--json",
+        ];
+        all.extend(args);
+        successful_json(qk(&all))
+    };
+    // Without targets, projects are selected.
+    assert_eq!(listed(&[]), json!(["worker", "core", "web"]));
+    // No build reads the README.
+    assert_eq!(listed(&["-t", "build"]), json!([]));
+    assert_eq!(listed(&["-t", "build", "--granularity", "task"]), json!([]));
+    assert_eq!(
+        listed(&["-t", "build", "--granularity", "project"]),
+        json!(["core", "web"])
+    );
+    // As in Nx, named projects are selected as projects, unless asked.
+    assert_eq!(listed(&["-t", "build", "-p", "core"]), json!(["core"]));
+    assert_eq!(
+        listed(&["-t", "build", "-p", "core", "--granularity", "task"]),
+        json!([])
+    );
+    let output = qk(&[
+        "show",
+        "projects",
+        "--affected",
+        "--files",
+        readme,
+        "--granularity",
+        "task",
+    ]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("add -t"));
+    let output = qk(&["show", "projects", "-t", "build", "--granularity", "task"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("add --affected"));
+
+    for (affected, env, projects) in [
+        (None, None, false),
+        (Some(json!({"legacy": true})), None, true),
+        (Some(json!({"legacy": true})), Some("false"), false),
+        (None, Some("true"), true),
+    ] {
+        let temp = granularity_workspace(affected.clone());
+        let listed = |targets: &[&str]| {
+            let mut command = isolated_command(env!("CARGO_BIN_EXE_qk"));
+            command.arg("--workspace").arg(temp.path()).args([
+                "show",
+                "projects",
+                "--affected",
+                "--files",
+                "lib/README.md",
+                "--json",
+            ]);
+            command.args(targets);
+            if let Some(env) = env {
+                command.env("NX_LEGACY_AFFECTED", env);
+            }
+            successful_json(command.output().unwrap())
+        };
+        let case = format!("{affected:?} {env:?}");
+        assert_eq!(listed(&[]), json!(["lib"]), "{case}");
+        assert_eq!(
+            listed(&["-t", "build"]),
+            if projects { json!(["lib"]) } else { json!([]) },
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn show_affected_says_which_granularity_qk_affected_selects_by_and_why() {
+    let legacy = || Some(json!({"legacy": true}));
+    for (affected, env, text, granularity, from) in [
+        (None, None, "task (the default)", "task", "default"),
+        (
+            legacy(),
+            None,
+            "project (nx.json affected.legacy)",
+            "project",
+            "affected.legacy",
+        ),
+        (
+            legacy(),
+            Some("false"),
+            "task (NX_LEGACY_AFFECTED=false)",
+            "task",
+            "NX_LEGACY_AFFECTED",
+        ),
+        (
+            None,
+            Some("true"),
+            "project (NX_LEGACY_AFFECTED=true)",
+            "project",
+            "NX_LEGACY_AFFECTED",
+        ),
+    ] {
+        let temp = granularity_workspace(affected.clone());
+        let show = |args: &[&str]| {
+            let mut command = isolated_command(env!("CARGO_BIN_EXE_qk"));
+            command.arg("--workspace").arg(temp.path()).args([
+                "show",
+                "affected",
+                "--files",
+                "lib/README.md",
+            ]);
+            command.args(args);
+            if let Some(env) = env {
+                command.env("NX_LEGACY_AFFECTED", env);
+            }
+            command.output().unwrap()
+        };
+        let case = format!("{affected:?} {env:?}");
+        for project in [&[][..], &["lib"]] {
+            let output = show(project);
+            assert!(output.status.success(), "{case}");
+            let shown = String::from_utf8(output.stdout).unwrap();
+            assert_eq!(
+                shown.lines().nth(1),
+                Some(format!("Granularity: {text}.").as_str()),
+                "{case}: {shown}"
+            );
+            let mut json = project.to_vec();
+            json.push("--json");
+            let report = successful_json(show(&json));
+            assert_eq!(report["granularity"], granularity, "{case}");
+            assert_eq!(report["granularityFrom"], from, "{case}");
+        }
+    }
 }
 
 #[test]
@@ -1618,10 +1839,12 @@ fn reachability_profile_runs_only_the_cases_a_change_reaches() {
     );
     git(&["add", "."]);
     git(&["commit", "--quiet", "-m", "head"]);
-    let run = || {
+    // Reachability narrows task selection, the default.
+    let run = |granularity: &[&str]| {
         let output = isolated_command(env!("CARGO_BIN_EXE_qk"))
             .current_dir(root)
-            .args(["affected", "-t", "visual", "--granularity", "task"])
+            .args(["affected", "-t", "visual"])
+            .args(granularity)
             .args([
                 "--affected-profile",
                 "reach",
@@ -1642,8 +1865,8 @@ fn reachability_profile_runs_only_the_cases_a_change_reaches() {
             + &String::from_utf8_lossy(&output.stderr)
     };
     // Twice: a run of some cases is never cached, so it never stands for all.
-    for _ in 0..2 {
-        let output = run();
+    for granularity in [&["--granularity", "task"][..], &[]] {
+        let output = run(granularity);
         assert!(
             output.contains("apps/app/visual/cases/second.ts"),
             "{output}"
@@ -1657,7 +1880,7 @@ fn reachability_profile_runs_only_the_cases_a_change_reaches() {
     write("apps/app/visual/shell.ts", "export const shell = 2;\n");
     git(&["add", "."]);
     git(&["commit", "--quiet", "-m", "shell"]);
-    let output = run();
+    let output = run(&[]);
     assert!(output.contains("every case"), "{output}");
 }
 
@@ -1792,6 +2015,10 @@ fn affected_profile_lists_projects_explains_projection_and_rejects_task_selectio
     assert!(text.contains("1 changed file between"));
     assert!(text.contains("0 files after projection."));
     assert!(text.contains("1 source change, 0 artifact changes"));
+    assert!(text.contains("Granularity: project (the affected profile has projections)."));
+    // The text says why; there is no notice.
+    assert!(output.stderr.is_empty());
+    assert_eq!(explanation["granularityFrom"], "projections");
     let output = run(&[
         "show",
         "projects",
@@ -1809,6 +2036,59 @@ fn affected_profile_lists_projects_explains_projection_and_rejects_task_selectio
     assert!(String::from_utf8_lossy(&output.stderr).contains("--affected-profile"));
     let mut args = vec!["affected", "-t", "build", "--granularity", "task"];
     args.extend(comparison);
+    let output = run(&args);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("applies to project selection"));
+    // Without --granularity, projections select projects, and say so once.
+    let notice = "notice: affected profile runtime has projections";
+    let mut args = vec!["affected", "-t", "build"];
+    args.extend(comparison);
+    let output = run(&args);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr.matches(notice).count(), 1, "{stderr}");
+    assert!(stderr.contains("no affected tasks"), "{stderr}");
+    for (variable, value) in [
+        ("NX_LEGACY_AFFECTED", "false"),
+        ("NX_LEGACY_AFFECTED", "true"),
+    ] {
+        let output = isolated_command(env!("CARGO_BIN_EXE_qk"))
+            .current_dir(root)
+            .env(variable, value)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        // Only where tasks would have been selected.
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr).contains(notice),
+            value == "false"
+        );
+    }
+    let mut args = vec!["affected", "-t", "build", "--granularity", "project"];
+    args.extend(comparison);
+    let output = run(&args);
+    assert!(output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(notice));
+    let mut args = vec!["show", "projects", "--affected", "-t", "build", "--json"];
+    args.extend(comparison);
+    let output = run(&args);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr)
+            .matches(notice)
+            .count(),
+        1
+    );
+    assert!(output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        json!([])
+    );
+    args.extend(["--granularity", "task"]);
     let output = run(&args);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("applies to project selection"));

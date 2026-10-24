@@ -153,12 +153,15 @@ without settings keeps it. To ask about the targets a job runs, such as which
 apps' builds a pull request needs, select projects by those targets instead:
 
 ```sh
-qk show projects --affected --affected-targets build,export --affected-profile reach --json
+qk show projects --affected -t build,export --affected-profile reach --json
 ```
 
-This lists the projects where a task of one of the targets is affected, by
-its inputs and then by the profile. A profile with projections cannot be used
-here, since task selection reads declared inputs.
+Under task selection, the default, this lists the projects where a task of
+one of the targets is affected, by its inputs and then by the profile.
+`--affected-targets` in place of `-t` does so under project selection too.
+A profile with projections selects projects instead (see
+[Tasks or projects](affected.md#tasks-or-projects)), and cannot be used with
+`--affected-targets`, since task selection reads declared inputs.
 
 ## Cases
 
@@ -191,8 +194,8 @@ object with each task's decision.
 
 ### Running only the selected cases
 
-`qk affected -t <targets> --granularity task --affected-profile <name>` runs
-the affected tasks. A task narrowed to some of its cases receives
+`qk affected -t <targets> --affected-profile <name>` runs the affected tasks,
+under task selection, the default. A task narrowed to some of its cases receives
 `QK_AFFECTED_CASES`, the absolute path of a temporary file naming those cases
 one per line, each relative to the workspace root. Read the file at that path
 as it is, from any working directory. The variable is absent when the whole task
@@ -241,6 +244,7 @@ that reached one. `--json` adds a `reachability` object with each decision.
 ```text
 $ qk show affected --affected-profile reach --base main --head HEAD
 1 changed file between 3f1c0a9e2b7d and HEAD.
+Granularity: task (the default).
 other  depends on lib
 lib    touched: libs/lib/src/unused.ts changed
 Left out by import reachability:

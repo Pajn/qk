@@ -11,6 +11,7 @@
 //! every project or every project reading the file; see `nx_json` and
 //! `manifests`.
 
+mod granularity;
 mod json_diff;
 mod manifests;
 mod nx_json;
@@ -19,6 +20,7 @@ mod reachability;
 mod subprocess;
 mod tasks;
 
+pub use granularity::{Granularity, Selection, Source, granularity};
 pub use projections::{ProjectionFallbackKind, ProjectionFallbackPolicy, ProjectionReport};
 pub use reachability::{Decision, Kept, TaskDecision};
 pub use tasks::{TaskAnalysis, TaskCause, TaskReason, affected_tasks};

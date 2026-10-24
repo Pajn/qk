@@ -31,6 +31,7 @@ fn command(root: &Path, args: &[&str]) -> Command {
         .args(args);
     command.env_remove("NX_PARALLEL");
     command.env_remove("NX_CACHE_DIRECTORY");
+    command.env_remove("NX_LEGACY_AFFECTED");
     // Output styles follow CI; tests that want it set it themselves.
     command.env_remove("CI");
     command.env_remove("GITHUB_ACTIONS");

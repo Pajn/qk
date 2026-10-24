@@ -7,6 +7,7 @@
 | `qk show projects [--json]` | Project names in Nx graph order, one per line or as a compact JSON array |
 | `qk show projects -p 'web,tag:library' --exclude 'experimental-*'` | Matching names, globs, tags and roots, minus exclusions |
 | `qk show projects --with-target e2e --type app [--sep ,]` | Projects with one of the targets, of a type (`app`, `lib` or `e2e`, as Nx types them), joined by a separator |
+| `qk show projects --affected -t build,export` | Projects owning an affected task of one of the targets, or under project selection the affected projects with one of them, as `qk affected` selects them |
 | `qk show projects --affected --affected-targets build,export` | Affected projects where a task of one of the targets is affected, as task selection decides it |
 | `qk show project [name] [--json]` | A project's graph node, as Nx's summary or one line of JSON; the current directory's project by default, and a name that is no project matches as a pattern, as in Nx |
 | `qk graph --file <path>.json` | Workspace project graph in a `{ "graph": { "nodes": ..., "dependencies": ... } }` envelope |
@@ -19,9 +20,9 @@
 | `qk exec -p web -- <command>` | Run a command in projects, or as a package script's target, as `nx exec` does |
 | `qk run web:build --dry-run` | Prepare every planned task without running it, and print the task graph as JSON |
 | `qk show projects --affected [--base <rev>] [--head <rev>]` | Projects affected by the changes, in graph order |
-| `qk affected -t build,test [--base <rev>] [--head <rev>]` | Execute targets on the affected projects |
-| `qk show affected [project] [--json]` | Why projects are affected, or why one project is |
-| `qk affected -t build --granularity task` | Execute only the tasks whose inputs changed |
+| `qk affected -t build,test [--base <rev>] [--head <rev>]` | Execute the affected tasks of the targets, and the tasks they depend on |
+| `qk show affected [project] [--json]` | Why projects are affected, or why one project is, and the granularity `qk affected` selects by |
+| `qk affected -t build --granularity project` | Execute the targets of the affected projects, as `affected.legacy` does |
 | `qk show tasks -t build,test --affected [--json]` | The affected tasks and why |
 | `qk show runs`, `qk show run [id]` | Recent runs; one run's tasks, cache results and critical path |
 | `qk show flaky [task]` | Mixed successful/failed executions for identical declared inputs |
@@ -201,7 +202,10 @@ different work.
 `--base`, `--head` and each other, except that the paths `--stdin` reads are
 added to `--files`. `--stdin` preserves spaces in paths. For `show tasks`, use
 `--affected` to filter the planned tasks. `affected --granularity task`
-selects by task inputs; `project` is the default.
+selects tasks by their inputs and `--granularity project` the targets of
+affected projects; without it, `NX_LEGACY_AFFECTED`, then nx.json
+`affected.legacy`, decide, and tasks are the default, as in Nx 24. See
+[Tasks or projects](../guides/affected.md#tasks-or-projects).
 See [Affected selection](../guides/affected.md) for merge-base behavior.
 
 ## Selection and inspection
@@ -212,9 +216,12 @@ spaces or repeated flags. `run-many` accepts Nx's deprecated `--all`, the
 default; `--all=false` without `--projects` selects nothing, as in Nx.
 `show projects` accepts `-p/--projects`, `--exclude`, `-t/--with-target`,
 `--type app|lib|e2e`, and `--sep`. `--sep` conflicts with `--json`. With
-`--affected`, `--affected-targets` lists the projects where a task of one of
-the targets is affected by its inputs, narrowed by `--affected-profile`, in
-place of project selection; it has no Nx equivalent.
+`--affected` and `-t`, it lists the projects owning an affected task of the
+targets under task selection, which `--granularity` decides as for
+`affected`, except that, as in Nx, `-p` selects projects unless given
+`--granularity task`. `--affected-targets` lists the projects where a task
+of one of the targets is affected by its inputs, narrowed by
+`--affected-profile`, whatever the granularity; it has no Nx equivalent.
 Quote name/tag globs so the shell does not expand them.
 
 `show runs --limit` defaults to `20`, and `show task <id> --limit` to `10`.

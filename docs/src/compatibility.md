@@ -82,8 +82,9 @@ edges off.
 - Deleting a project's manifests affects the projects that depended on it,
   read from its manifests at the base revision, where Nx affects every
   project. See [How changes reach projects](guides/affected.md#how-changes-reach-projects).
-- `qk affected` selects projects unless given `--granularity task`. Nx 24
-  selects tasks unless nx.json sets `affected.legacy: true`.
+- `qk affected` takes `--granularity task|project`, which comes before
+  `NX_LEGACY_AFFECTED` and nx.json `affected.legacy`. Nx has no such option.
+  See [Tasks or projects](guides/affected.md#tasks-or-projects).
 - Nx's Ultracache keys tasks by recordings Nx Cloud makes, which qk cannot
   read. qk's `qk:ultracache` records tasks itself, with `--record` on Linux,
   and keys them by the files they read, the directories they listed and the

@@ -96,7 +96,8 @@ enum Command {
         #[command(flatten)]
         options: RunOptions,
     },
-    /// Execute targets on the projects affected by changes, and their dependencies.
+    /// Execute the tasks of targets affected by changes, or the targets of
+    /// affected projects, and their dependencies.
     Affected {
         #[arg(short = 't', long, alias = "target", required = true, value_delimiter = ',', num_args = 1..)]
         targets: Vec<String>,
@@ -106,10 +107,12 @@ enum Command {
         exclude: Vec<String>,
         #[command(flatten)]
         changes: ChangeOptions,
-        /// `project` selects the targets of affected projects, as Nx does;
-        /// `task` selects the tasks whose inputs changed.
-        #[arg(long, value_enum, default_value = "project")]
-        granularity: Granularity,
+        /// `task` selects the tasks whose inputs changed; `project` selects
+        /// the targets of affected projects. Defaults to `project` for
+        /// NX_LEGACY_AFFECTED=true or nx.json `affected.legacy`, and to
+        /// `task` otherwise, as in Nx 24.
+        #[arg(long, value_enum)]
+        granularity: Option<Granularity>,
         #[command(flatten)]
         options: RunOptions,
     },
@@ -346,6 +349,27 @@ impl ChangeOptions {
         }
     }
 
+    /// The granularity selection uses, with a notice when the profile's
+    /// projections select projects in place of tasks.
+    fn granularity(
+        &self,
+        workspace: &Workspace,
+        explicit: Option<Granularity>,
+    ) -> Result<qk_affected::Selection> {
+        let selection = qk_affected::granularity(
+            workspace,
+            explicit.map(Into::into),
+            self.affected_profile.as_deref(),
+        )?;
+        if selection.from == qk_affected::Source::Projections {
+            eprintln!(
+                "qk: notice: affected profile {} has projections, which apply to project selection; selecting projects rather than tasks",
+                self.affected_profile.as_deref().unwrap_or_default()
+            );
+        }
+        Ok(selection)
+    }
+
     fn affected(&self, workspace: &Workspace) -> Result<std::collections::BTreeSet<String>> {
         let analysis = self.analyse(workspace)?;
         warn_landed(analysis.range.as_ref());
@@ -527,6 +551,15 @@ enum Granularity {
     Task,
 }
 
+impl From<Granularity> for qk_affected::Granularity {
+    fn from(granularity: Granularity) -> Self {
+        match granularity {
+            Granularity::Project => Self::Project,
+            Granularity::Task => Self::Task,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum OutputStyle {
     Tui,
@@ -675,9 +708,17 @@ enum ShowCommand {
     },
     /// List project names in Nx's graph order.
     Projects {
-        /// Only projects affected by changes, as `qk affected` selects them.
+        /// Only projects affected by changes; with `-t` under task
+        /// selection, those owning an affected task of the targets, as
+        /// `qk affected` selects them.
         #[arg(long)]
         affected: bool,
+        /// With `--affected` and `-t`: `task` lists the projects owning an
+        /// affected task of the targets, `project` the affected projects
+        /// with one of them. Defaults as for `qk affected`, except that, as
+        /// in Nx, `-p` selects projects.
+        #[arg(long, value_enum, conflicts_with = "affected_targets")]
+        granularity: Option<Granularity>,
         #[command(flatten)]
         changes: ChangeOptions,
         /// Select names, globs or tag:<tag>; comma-separated or repeated.
@@ -1240,9 +1281,11 @@ fn run(mut cli: Cli) -> Result<i32> {
             projects,
             exclude,
             changes,
-            granularity: Granularity::Task,
+            granularity,
             options,
-        } => {
+        } if changes.granularity(&workspace, granularity)?.granularity
+            == qk_affected::Granularity::Task =>
+        {
             let selected = select_projects(&workspace.projects, &projects, &exclude)?;
             let candidates = requests(
                 &workspace,
@@ -1321,6 +1364,7 @@ fn run(mut cli: Cli) -> Result<i32> {
             command:
                 ShowCommand::Projects {
                     affected,
+                    granularity,
                     changes,
                     projects,
                     exclude,
@@ -1351,12 +1395,34 @@ fn run(mut cli: Cli) -> Result<i32> {
             }
             // As in Nx, naming what changed implies --affected.
             let affected = affected || changes.given();
-            if !affected_targets.is_empty() {
-                anyhow::ensure!(
-                    affected,
-                    "--affected-targets selects affected projects; add --affected"
-                );
-                let requests = requests(&workspace, selected.clone(), &affected_targets, None, &[]);
+            anyhow::ensure!(
+                affected || granularity.is_none(),
+                "--granularity decides how affected projects are selected; add --affected"
+            );
+            anyhow::ensure!(
+                granularity != Some(Granularity::Task) || !with_target.is_empty(),
+                "--granularity task selects projects by the affected tasks of -t targets; add -t"
+            );
+            anyhow::ensure!(
+                affected || affected_targets.is_empty(),
+                "--affected-targets selects affected projects; add --affected"
+            );
+            // As in Nx, by the tasks of `-t` targets under task selection,
+            // unless projects are named; `--affected-targets` always does.
+            let by_tasks = if !affected_targets.is_empty() {
+                Some(&affected_targets)
+            } else if affected
+                && !with_target.is_empty()
+                && (granularity.is_some() || projects.is_empty())
+                && changes.granularity(&workspace, granularity)?.granularity
+                    == qk_affected::Granularity::Task
+            {
+                Some(&with_target)
+            } else {
+                None
+            };
+            if let Some(targets) = by_tasks {
+                let requests = requests(&workspace, selected.clone(), targets, None, &[]);
                 let mut running = std::collections::BTreeSet::new();
                 if !requests.is_empty() {
                     let graph = TaskGraph::build(&workspace, &requests)?;
@@ -1399,9 +1465,13 @@ fn run(mut cli: Cli) -> Result<i32> {
                 },
         } => {
             let analysis = changes.analyse(&workspace)?;
+            // What `qk affected` would select by; the text says why.
+            let granularity =
+                qk_affected::granularity(&workspace, None, changes.affected_profile.as_deref())?;
             explain::explain(
                 &workspace,
                 &analysis,
+                granularity,
                 project.as_deref(),
                 json,
                 &mut io::stdout().lock(),
