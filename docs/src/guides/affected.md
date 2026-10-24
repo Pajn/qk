@@ -59,11 +59,17 @@ workspace, set `affected.legacy` in nx.json:
 }
 ```
 
+`show projects --affected -t <targets>` decides the same way, as in Nx 24:
+under task selection it lists the projects owning an affected task of the
+targets, and under project selection the affected projects with one of the
+targets. Without `-t` it lists the affected projects, and with `-p`, unless
+given `--granularity task`, it selects projects, as Nx does.
+
 Change projections apply to project selection only (see
 [Project change projections](affected-projections.md)). Under an affected
-profile with projections, `qk affected` selects projects where it would
-select tasks, and says so on stderr; with `--granularity task` it fails
-instead.
+profile with projections, `qk affected` and `show projects --affected -t`
+select projects where they would select tasks, and say so on stderr; with
+`--granularity task` they fail instead.
 
 ## How changes reach projects
 

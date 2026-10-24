@@ -153,12 +153,15 @@ without settings keeps it. To ask about the targets a job runs, such as which
 apps' builds a pull request needs, select projects by those targets instead:
 
 ```sh
-qk show projects --affected --affected-targets build,export --affected-profile reach --json
+qk show projects --affected -t build,export --affected-profile reach --json
 ```
 
-This lists the projects where a task of one of the targets is affected, by
-its inputs and then by the profile. A profile with projections cannot be used
-here, since task selection reads declared inputs.
+Under task selection, the default, this lists the projects where a task of
+one of the targets is affected, by its inputs and then by the profile.
+`--affected-targets` in place of `-t` does so under project selection too.
+A profile with projections selects projects instead (see
+[Tasks or projects](affected.md#tasks-or-projects)), and cannot be used with
+`--affected-targets`, since task selection reads declared inputs.
 
 ## Cases
 

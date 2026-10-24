@@ -7,6 +7,7 @@
 | `qk show projects [--json]` | Project names in Nx graph order, one per line or as a compact JSON array |
 | `qk show projects -p 'web,tag:library' --exclude 'experimental-*'` | Matching names, globs, tags and roots, minus exclusions |
 | `qk show projects --with-target e2e --type app [--sep ,]` | Projects with one of the targets, of a type (`app`, `lib` or `e2e`, as Nx types them), joined by a separator |
+| `qk show projects --affected -t build,export` | Projects owning an affected task of one of the targets, or under project selection the affected projects with one of them, as `qk affected` selects them |
 | `qk show projects --affected --affected-targets build,export` | Affected projects where a task of one of the targets is affected, as task selection decides it |
 | `qk show project [name] [--json]` | A project's graph node, as Nx's summary or one line of JSON; the current directory's project by default, and a name that is no project matches as a pattern, as in Nx |
 | `qk graph --file <path>.json` | Workspace project graph in a `{ "graph": { "nodes": ..., "dependencies": ... } }` envelope |
@@ -215,9 +216,12 @@ spaces or repeated flags. `run-many` accepts Nx's deprecated `--all`, the
 default; `--all=false` without `--projects` selects nothing, as in Nx.
 `show projects` accepts `-p/--projects`, `--exclude`, `-t/--with-target`,
 `--type app|lib|e2e`, and `--sep`. `--sep` conflicts with `--json`. With
-`--affected`, `--affected-targets` lists the projects where a task of one of
-the targets is affected by its inputs, narrowed by `--affected-profile`, in
-place of project selection; it has no Nx equivalent.
+`--affected` and `-t`, it lists the projects owning an affected task of the
+targets under task selection, which `--granularity` decides as for
+`affected`, except that, as in Nx, `-p` selects projects unless given
+`--granularity task`. `--affected-targets` lists the projects where a task
+of one of the targets is affected by its inputs, narrowed by
+`--affected-profile`, whatever the granularity; it has no Nx equivalent.
 Quote name/tag globs so the shell does not expand them.
 
 `show runs --limit` defaults to `20`, and `show task <id> --limit` to `10`.

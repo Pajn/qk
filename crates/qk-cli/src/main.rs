@@ -708,9 +708,17 @@ enum ShowCommand {
     },
     /// List project names in Nx's graph order.
     Projects {
-        /// Only projects affected by changes, as `qk affected` selects them.
+        /// Only projects affected by changes; with `-t` under task
+        /// selection, those owning an affected task of the targets, as
+        /// `qk affected` selects them.
         #[arg(long)]
         affected: bool,
+        /// With `--affected` and `-t`: `task` lists the projects owning an
+        /// affected task of the targets, `project` the affected projects
+        /// with one of them. Defaults as for `qk affected`, except that, as
+        /// in Nx, `-p` selects projects.
+        #[arg(long, value_enum, conflicts_with = "affected_targets")]
+        granularity: Option<Granularity>,
         #[command(flatten)]
         changes: ChangeOptions,
         /// Select names, globs or tag:<tag>; comma-separated or repeated.
@@ -1356,6 +1364,7 @@ fn run(mut cli: Cli) -> Result<i32> {
             command:
                 ShowCommand::Projects {
                     affected,
+                    granularity,
                     changes,
                     projects,
                     exclude,
@@ -1386,12 +1395,34 @@ fn run(mut cli: Cli) -> Result<i32> {
             }
             // As in Nx, naming what changed implies --affected.
             let affected = affected || changes.given();
-            if !affected_targets.is_empty() {
-                anyhow::ensure!(
-                    affected,
-                    "--affected-targets selects affected projects; add --affected"
-                );
-                let requests = requests(&workspace, selected.clone(), &affected_targets, None, &[]);
+            anyhow::ensure!(
+                affected || granularity.is_none(),
+                "--granularity decides how affected projects are selected; add --affected"
+            );
+            anyhow::ensure!(
+                granularity != Some(Granularity::Task) || !with_target.is_empty(),
+                "--granularity task selects projects by the affected tasks of -t targets; add -t"
+            );
+            anyhow::ensure!(
+                affected || affected_targets.is_empty(),
+                "--affected-targets selects affected projects; add --affected"
+            );
+            // As in Nx, by the tasks of `-t` targets under task selection,
+            // unless projects are named; `--affected-targets` always does.
+            let by_tasks = if !affected_targets.is_empty() {
+                Some(&affected_targets)
+            } else if affected
+                && !with_target.is_empty()
+                && (granularity.is_some() || projects.is_empty())
+                && changes.granularity(&workspace, granularity)?.granularity
+                    == qk_affected::Granularity::Task
+            {
+                Some(&with_target)
+            } else {
+                None
+            };
+            if let Some(targets) = by_tasks {
+                let requests = requests(&workspace, selected.clone(), targets, None, &[]);
                 let mut running = std::collections::BTreeSet::new();
                 if !requests.is_empty() {
                     let graph = TaskGraph::build(&workspace, &requests)?;

@@ -805,6 +805,84 @@ fn affected_granularity_is_the_flag_then_nx_legacy_affected_then_nx_json_then_ta
 }
 
 #[test]
+fn show_projects_affected_selects_by_the_tasks_of_its_targets_as_nx_24() {
+    let readme = "packages/core/README.md";
+    let listed = |args: &[&str]| {
+        let mut all = vec![
+            "show",
+            "projects",
+            "--affected",
+            "--files",
+            readme,
+            "--json",
+        ];
+        all.extend(args);
+        successful_json(qk(&all))
+    };
+    // Without targets, projects are selected.
+    assert_eq!(listed(&[]), json!(["worker", "core", "web"]));
+    // No build reads the README.
+    assert_eq!(listed(&["-t", "build"]), json!([]));
+    assert_eq!(listed(&["-t", "build", "--granularity", "task"]), json!([]));
+    assert_eq!(
+        listed(&["-t", "build", "--granularity", "project"]),
+        json!(["core", "web"])
+    );
+    // As in Nx, named projects are selected as projects, unless asked.
+    assert_eq!(listed(&["-t", "build", "-p", "core"]), json!(["core"]));
+    assert_eq!(
+        listed(&["-t", "build", "-p", "core", "--granularity", "task"]),
+        json!([])
+    );
+    let output = qk(&[
+        "show",
+        "projects",
+        "--affected",
+        "--files",
+        readme,
+        "--granularity",
+        "task",
+    ]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("add -t"));
+    let output = qk(&["show", "projects", "-t", "build", "--granularity", "task"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("add --affected"));
+
+    for (affected, env, projects) in [
+        (None, None, false),
+        (Some(json!({"legacy": true})), None, true),
+        (Some(json!({"legacy": true})), Some("false"), false),
+        (None, Some("true"), true),
+    ] {
+        let temp = granularity_workspace(affected.clone());
+        let listed = |targets: &[&str]| {
+            let mut command = isolated_command(env!("CARGO_BIN_EXE_qk"));
+            command.arg("--workspace").arg(temp.path()).args([
+                "show",
+                "projects",
+                "--affected",
+                "--files",
+                "lib/README.md",
+                "--json",
+            ]);
+            command.args(targets);
+            if let Some(env) = env {
+                command.env("NX_LEGACY_AFFECTED", env);
+            }
+            successful_json(command.output().unwrap())
+        };
+        let case = format!("{affected:?} {env:?}");
+        assert_eq!(listed(&[]), json!(["lib"]), "{case}");
+        assert_eq!(
+            listed(&["-t", "build"]),
+            if projects { json!(["lib"]) } else { json!([]) },
+            "{case}"
+        );
+    }
+}
+
+#[test]
 fn graph_can_include_the_packages_the_lockfile_installs() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/parity/fixture");
     let output = isolated_command(env!("CARGO_BIN_EXE_qk"))
@@ -1924,6 +2002,24 @@ fn affected_profile_lists_projects_explains_projection_and_rejects_task_selectio
     let output = run(&args);
     assert!(output.status.success());
     assert!(!String::from_utf8_lossy(&output.stderr).contains(notice));
+    let mut args = vec!["show", "projects", "--affected", "-t", "build", "--json"];
+    args.extend(comparison);
+    let output = run(&args);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr)
+            .matches(notice)
+            .count(),
+        1
+    );
+    assert!(output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        json!([])
+    );
+    args.extend(["--granularity", "task"]);
+    let output = run(&args);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("applies to project selection"));
     let output = run(&[
         "show",
         "tasks",
