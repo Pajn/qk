@@ -40,7 +40,9 @@ node tools/parity/parity.mjs compare --qk target/release/qk
 Each run builds a scratch git repository from the fixture. The cases in
 `tools/parity/cases.json` compare task graphs, `show projects --affected`
 for a change applied on a branch (the files in `tools/parity/changes/<case>`,
-plus any deletions the case lists), and runs, which execute tasks without
+plus any deletions the case lists), with the affected tasks of
+`affectedTargets` and the projects `show projects --affected -t` lists for
+them, by default and with nx.json `affected.legacy`, and runs, which execute tasks without
 cache and compare whether the run failed and which tasks ran. The comparison
 requires byte-identical `show projects --json`, a `graph --file` equal after
 normalisation, and `--graph` task graphs with the same tasks, with the same

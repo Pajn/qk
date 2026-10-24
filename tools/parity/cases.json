@@ -87,6 +87,25 @@
         ],
         "qkOnly": [],
         "reason": "Nx hashes nx.json into every task, so any change to it selects every task; qk selects the tasks whose key the change moves, here the format and typecheck tasks whose definitions lose their targetDefaults"
+      },
+      "acceptedOwners": {
+        "nxOnly": [
+          "@fixture/native",
+          "mobile",
+          "scripts",
+          "tooling",
+          "web-e2e"
+        ],
+        "qkOnly": [],
+        "reason": "Nx hashes nx.json into every task, so any change to it selects every task and every project owning one; qk selects the tasks whose key the change moves"
+      },
+      "acceptedLegacyOwners": {
+        "nxOnly": [
+          "@fixture/native",
+          "scripts"
+        ],
+        "qkOnly": [],
+        "reason": "Nx affects every project on any nx.json change; qk affects what the change resolves differently, here the projects with format, typecheck or migrate targets, whose targetDefaults it removes, and their dependents; parallel changes no task's work"
       }
     },
     "tsconfig-paths": {
@@ -135,6 +154,32 @@
         ],
         "qkOnly": [],
         "reason": "Nx selects every task when a project's manifest is deleted; qk selects the tasks of what depended on the removed project, here none"
+      },
+      "acceptedOwners": {
+        "nxOnly": [
+          "@fixture/native",
+          "@fixture/utils",
+          "mobile",
+          "tooling",
+          "ui",
+          "web",
+          "web-e2e"
+        ],
+        "qkOnly": [],
+        "reason": "Nx selects every task when a project's manifest is deleted, so every project owning one; qk selects the tasks of what depended on the removed project, here none"
+      },
+      "acceptedLegacyOwners": {
+        "nxOnly": [
+          "@fixture/native",
+          "@fixture/utils",
+          "mobile",
+          "tooling",
+          "ui",
+          "web",
+          "web-e2e"
+        ],
+        "qkOnly": [],
+        "reason": "Nx affects every project when a project's manifest is deleted; qk affects what depended on the removed project, here nothing"
       }
     },
     "catalog-only": {
@@ -167,6 +212,13 @@
         ],
         "qkOnly": [],
         "reason": "Nx keys a task of a project with no package dependencies by the whole lockfile, so any lockfile change selects it; qk keys what the task's importers install, which this change leaves alone"
+      },
+      "acceptedOwners": {
+        "nxOnly": [
+          "@fixture/native"
+        ],
+        "qkOnly": [],
+        "reason": "Nx keys a task of a project with no package dependencies by the whole lockfile, so any lockfile change selects it and lists its project; qk keys what the task's importers install, which this change leaves alone"
       }
     },
     "root-dependency": {
@@ -181,6 +233,14 @@
         ],
         "qkOnly": [],
         "reason": "Nx keys a task of a project with no package dependencies by the whole lockfile, so any lockfile change selects it; qk keys what the task's importers install, which this change leaves alone"
+      },
+      "acceptedOwners": {
+        "nxOnly": [
+          "@fixture/native",
+          "scripts"
+        ],
+        "qkOnly": [],
+        "reason": "Nx keys a task of a project with no package dependencies by the whole lockfile, so any lockfile change selects it and lists its project; qk keys what the task's importers install, which this change leaves alone"
       }
     }
   },

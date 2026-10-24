@@ -35,7 +35,13 @@
 // `affectedTargets`, the affected tasks of those targets: the tasks Nx 24's
 // `show projects --affected -t <targets> --explain --json` lists as affected,
 // against the tasks of those targets `qk show tasks --affected --json` lists.
-// A case accepts a difference in tasks with `acceptedTasks`. Runs execute the
+// A case accepts a difference in tasks with `acceptedTasks`. They also compare
+// `show projects --affected -t <targets>`, which follows the granularity Nx 24
+// selects by: the workspace's own, which for the fixture is the default, task
+// selection, and in the fixture also with nx.json `affected.legacy: true`,
+// project selection, written into the case's checkout for the run. A case
+// accepts a difference in these with `acceptedOwners` and
+// `acceptedLegacyOwners`. NX_LEGACY_AFFECTED is unset for every run. Runs execute the
 // tasks without cache and compare whether the run failed and which tasks ran,
 // as recorded by the fixture's tasks. An affected or run case whose results
 // differ fails unless it carries the difference it accepts and why:
@@ -153,6 +159,10 @@ function onCase(name, spec, body) {
   }
 }
 
+// Affected selection follows the workspace, never the caller's environment.
+const inherited = { ...process.env };
+delete inherited.NX_LEGACY_AFFECTED;
+
 // Runs a command three times and reports the median wall time, so a cold
 // file system cache on the first run does not skew the timings.
 function run(binary, args, { times = 3, allowFailure = false, env = {} } = {}) {
@@ -164,7 +174,7 @@ function run(binary, args, { times = 3, allowFailure = false, env = {} } = {}) {
       cwd: workspace,
       encoding: "utf8",
       maxBuffer: 1 << 30,
-      env: { ...process.env, NX_DAEMON: "false", NX_NO_CLOUD: "true", NX_TUI: "false", FIXTURE_ROOT: workspace, ...env },
+      env: { ...inherited, NX_DAEMON: "false", NX_NO_CLOUD: "true", NX_TUI: "false", FIXTURE_ROOT: workspace, ...env },
     });
     durations.push(performance.now() - started);
     if (result.status !== 0 && !allowFailure) {
@@ -186,6 +196,32 @@ const nxAffectedTaskArgs = ({ base, head }) => [
 const qkAffectedTaskArgs = ({ base, head }) => [
   "show", "tasks", "-t", affectedTargets.join(","), "--affected", "--base", base, "--head", head, "--json",
 ];
+const ownerArgs = ({ base, head }) => [
+  "show", "projects", "--affected", "-t", affectedTargets.join(","), "--base", base, "--head", head, "--json",
+];
+
+/// Runs `body` with nx.json setting `affected.legacy: true`, restoring the
+/// file after. Nx and qk read the setting from the checkout, and with `--head`
+/// compare only committed revisions, so the edit is no change of the case.
+function withLegacy(body) {
+  const file = join(workspace, "nx.json");
+  const original = readFileSync(file, "utf8");
+  writeFileSync(file, original.replace("{", '{\n  "affected": { "legacy": true },'));
+  try {
+    return body();
+  } finally {
+    writeFileSync(file, original);
+  }
+}
+
+/// The nx.json settings `show projects --affected -t` is compared under: the
+/// workspace's own and, for the fixture, `affected.legacy`. An external
+/// workspace is left as it is.
+const ownerVariants = [
+  { prefix: "", accepted: "acceptedOwners", within: (body) => body() },
+  ...(external ? [] : [{ prefix: "legacy-", accepted: "acceptedLegacyOwners", within: withLegacy }]),
+];
+
 /// The tasks of the requested targets in qk's answer, which also lists the
 /// tasks they depend on.
 const requestedTasks = (tasks) => Object.keys(tasks).filter((id) => affectedTargets.includes(id.split(":")[1]));
@@ -249,6 +285,13 @@ if (command === "capture") {
     );
     const ids = Object.keys(JSON.parse(tasks.stdout).affected).sort();
     writeFileSync(join(goldens, `affected-tasks-${name}.json`), `${JSON.stringify(ids, null, 2)}\n`);
+    for (const { prefix, within } of ownerVariants) {
+      const owners = onCase(name, spec, (revisions) => within(() => run(nx, ownerArgs(revisions), { times: 1 })));
+      writeFileSync(
+        join(goldens, `affected-${prefix}owners-${name}.json`),
+        `${JSON.stringify(JSON.parse(lastLine(owners.stdout)).sort())}\n`,
+      );
+    }
   }
   for (const [name, spec] of Object.entries(runCases)) {
     const result = onCase(name, spec, () => execute(nx, spec.args, "--skip-nx-cache"));
@@ -345,6 +388,15 @@ for (const [name, spec] of Object.entries(affectedCases)) {
     new Set(requestedTasks(JSON.parse(tasks.stdout).tasks)),
     spec.acceptedTasks,
   );
+  for (const { prefix, accepted, within } of ownerVariants) {
+    const owners = onCase(name, spec, (revisions) => within(() => run(qk, ownerArgs(revisions), { times: 1 })));
+    checkSets(
+      `affected ${prefix}owners ${name}`,
+      new Set(readJson(join(goldens, `affected-${prefix}owners-${name}.json`))),
+      new Set(JSON.parse(owners.stdout)),
+      spec[accepted],
+    );
+  }
 }
 
 // Runs: the same outcome and the same tasks run.
