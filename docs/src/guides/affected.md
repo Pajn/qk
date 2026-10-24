@@ -10,7 +10,7 @@ cache keys retain the behavior described here.
 qk show projects --affected --base main
 qk show affected web --base main
 qk affected -t build,test --base main
-qk affected -t build,test --granularity task --base main
+qk affected -t build,test --granularity project --base main
 ```
 
 As in Nx, changed files are those between the merge base of `--base` and
@@ -34,6 +34,36 @@ changes. When the compared commits still include some already on the default
 branch's upstream, as with an explicit `--base` older than where the head
 branched, `affected` and `show affected` warn. On the default branch itself
 the range is its own history, and nothing is flagged.
+
+## Tasks or projects
+
+As in Nx 24, `qk affected` selects the tasks a change reaches, by the rules
+in [Selecting affected tasks by inputs](#selecting-affected-tasks-by-inputs),
+and runs them with the tasks they depend on. Project selection, Nx's
+behavior before 24, runs the targets of every affected project instead, by
+the rules in [How changes reach projects](#how-changes-reach-projects). The
+first of these that is set decides:
+
+1. `--granularity task` or `--granularity project`;
+2. `NX_LEGACY_AFFECTED`: `true` selects projects and `false` tasks; as in Nx,
+   other values are ignored;
+3. nx.json `affected.legacy`: `true` selects projects;
+4. otherwise, tasks are selected.
+
+To keep selecting projects, as Nx's migration to 24 does for an existing
+workspace, set `affected.legacy` in nx.json:
+
+```json
+{
+  "affected": { "legacy": true }
+}
+```
+
+Change projections apply to project selection only (see
+[Project change projections](affected-projections.md)). Under an affected
+profile with projections, `qk affected` selects projects where it would
+select tasks, and says so on stderr; with `--granularity task` it fails
+instead.
 
 ## How changes reach projects
 
@@ -161,10 +191,9 @@ ui is touched:
 
 ## Selecting affected tasks by inputs
 
-With `--granularity task`, `qk affected` selects tasks instead of projects. A
-task is affected when Nx 24 would select it, or when its cache key changed,
-except that qk narrows a lockfile change, as below, and a deleted manifest, an
-nx.json change and a `project.json` change, as in
+Under task selection, a task is affected when Nx 24 would select it, or when
+its cache key changed, except that qk narrows a lockfile change, as below,
+and a deleted manifest, an nx.json change and a `project.json` change, as in
 [How changes reach projects](#how-changes-reach-projects). As in Nx, that is
 when:
 
@@ -233,10 +262,8 @@ against, counts its inputs as the task's own instead, and so do those of
 the continuous tasks it depends on in turn. A `dependsOn` entry with
 `inputs: false` leaves them out, unless another entry names the same task
 without it.
-`project` stays the default, where Nx 24 selects tasks; see
-[Nx compatibility](../compatibility.md). `qk show tasks -t <targets> --affected`
-lists the affected tasks with their first reason, or the whole analysis with
-`--json`.
+`qk show tasks -t <targets> --affected` lists the affected tasks with their
+first reason, or the whole analysis with `--json`, whatever the granularity.
 
 `--json` gives the whole analysis, or for one project its path with the
 typed reasons, including the snapshot keys a lockfile change added,

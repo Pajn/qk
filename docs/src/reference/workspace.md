@@ -79,6 +79,12 @@ A revision string for affected selection and remote warm state's default
 branch. The fallback is `main`. Affected selection resolves `--base`, then
 `NX_BASE`, then this setting. See [Affected selection](../guides/affected.md).
 
+## `affected`
+
+`affected.legacy: true` makes affected selection select projects rather
+than tasks, as in Nx 24. `NX_LEGACY_AFFECTED` and `--granularity` override
+it. See [Tasks or projects](../guides/affected.md#tasks-or-projects).
+
 ## `qk:affectedProfiles`
 
 Named, opt-in refinements of affected project selection. Each profile

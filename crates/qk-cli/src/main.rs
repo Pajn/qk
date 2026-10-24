@@ -96,7 +96,8 @@ enum Command {
         #[command(flatten)]
         options: RunOptions,
     },
-    /// Execute targets on the projects affected by changes, and their dependencies.
+    /// Execute the tasks of targets affected by changes, or the targets of
+    /// affected projects, and their dependencies.
     Affected {
         #[arg(short = 't', long, alias = "target", required = true, value_delimiter = ',', num_args = 1..)]
         targets: Vec<String>,
@@ -106,10 +107,12 @@ enum Command {
         exclude: Vec<String>,
         #[command(flatten)]
         changes: ChangeOptions,
-        /// `project` selects the targets of affected projects, as Nx does;
-        /// `task` selects the tasks whose inputs changed.
-        #[arg(long, value_enum, default_value = "project")]
-        granularity: Granularity,
+        /// `task` selects the tasks whose inputs changed; `project` selects
+        /// the targets of affected projects. Defaults to `project` for
+        /// NX_LEGACY_AFFECTED=true or nx.json `affected.legacy`, and to
+        /// `task` otherwise, as in Nx 24.
+        #[arg(long, value_enum)]
+        granularity: Option<Granularity>,
         #[command(flatten)]
         options: RunOptions,
     },
@@ -346,6 +349,27 @@ impl ChangeOptions {
         }
     }
 
+    /// The granularity selection uses, with a notice when the profile's
+    /// projections select projects in place of tasks.
+    fn granularity(
+        &self,
+        workspace: &Workspace,
+        explicit: Option<Granularity>,
+    ) -> Result<qk_affected::Selection> {
+        let selection = qk_affected::granularity(
+            workspace,
+            explicit.map(Into::into),
+            self.affected_profile.as_deref(),
+        )?;
+        if selection.from == qk_affected::Source::Projections {
+            eprintln!(
+                "qk: notice: affected profile {} has projections, which apply to project selection; selecting projects rather than tasks",
+                self.affected_profile.as_deref().unwrap_or_default()
+            );
+        }
+        Ok(selection)
+    }
+
     fn affected(&self, workspace: &Workspace) -> Result<std::collections::BTreeSet<String>> {
         let analysis = self.analyse(workspace)?;
         warn_landed(analysis.range.as_ref());
@@ -525,6 +549,15 @@ enum ProjectKind {
 enum Granularity {
     Project,
     Task,
+}
+
+impl From<Granularity> for qk_affected::Granularity {
+    fn from(granularity: Granularity) -> Self {
+        match granularity {
+            Granularity::Project => Self::Project,
+            Granularity::Task => Self::Task,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -1240,9 +1273,11 @@ fn run(mut cli: Cli) -> Result<i32> {
             projects,
             exclude,
             changes,
-            granularity: Granularity::Task,
+            granularity,
             options,
-        } => {
+        } if changes.granularity(&workspace, granularity)?.granularity
+            == qk_affected::Granularity::Task =>
+        {
             let selected = select_projects(&workspace.projects, &projects, &exclude)?;
             let candidates = requests(
                 &workspace,

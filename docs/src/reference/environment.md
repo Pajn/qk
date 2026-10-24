@@ -65,6 +65,7 @@ similar patterns in a value it substitutes, is not reproduced.
 | `NX_WORKSPACE_ROOT_PATH` | Workspace root, unless `--workspace` names one |
 | `NX_INFER_ALL_PACKAGE_JSONS=true` | Every package.json is a project, in a workspace without a root package.json |
 | `NX_BASE`, `NX_HEAD` | Affected comparison revisions; CLI overrides them |
+| `NX_LEGACY_AFFECTED` | `true` makes affected selection select projects, `false` tasks; overrides nx.json `affected.legacy`, and `--granularity` overrides it |
 | `NX_PARALLEL` | Task concurrency, overridden by `--parallel` |
 | `QK_CORES` | Core budget, overridden by `--cores` |
 | `QK_RECORD=true` | Record tasks with `qk:ultracache` that execute, as `--record` does |

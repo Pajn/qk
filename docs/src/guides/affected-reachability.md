@@ -191,8 +191,8 @@ object with each task's decision.
 
 ### Running only the selected cases
 
-`qk affected -t <targets> --granularity task --affected-profile <name>` runs
-the affected tasks. A task narrowed to some of its cases receives
+`qk affected -t <targets> --affected-profile <name>` runs the affected tasks,
+under task selection, the default. A task narrowed to some of its cases receives
 `QK_AFFECTED_CASES`, the absolute path of a temporary file naming those cases
 one per line, each relative to the workspace root. Read the file at that path
 as it is, from any working directory. The variable is absent when the whole task

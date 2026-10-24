@@ -269,9 +269,12 @@ JSON includes `originalFiles` and `files` when a profile is selected, including
 when explaining a single project. `files` contains the paths used for selection.
 Project-list JSON stays a plain array.
 
-`--affected-profile` is rejected by task-level affected selection and
-`show tasks --affected`. Task dependency propagation and cache inputs keep
-their ordinary meanings.
+A profile with projections is rejected by task-level affected selection:
+`qk affected --granularity task` and `show tasks --affected`. Without
+`--granularity`, where `qk affected` would select tasks, as it does by
+default, it selects projects under such a profile and says so on stderr (see
+[Tasks or projects](affected.md#tasks-or-projects)). Task dependency
+propagation and cache inputs keep their ordinary meanings.
 
 ## Try the example
 
