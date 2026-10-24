@@ -1,11 +1,14 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use qk_affected::{Analysis, Decision, Kept, Options, TaskDecision, analyse};
 use qk_config::Workspace;
 use qk_graph::ProjectGraph;
 use tempfile::TempDir;
+
+#[path = "support/git.rs"]
+mod git_support;
+use git_support::fixture_command;
 
 /// `app` imports one of `lib`'s two modules, and its `build` names the `app`
 /// config. `app-e2e` drives `app` through `app`'s entry point, and `other`
@@ -135,7 +138,7 @@ fn write(root: &Path, path: &str, text: &str) {
 }
 
 fn git(root: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
+    let output = fixture_command("git")
         .current_dir(root)
         .args(["-c", "user.name=qk", "-c", "user.email=qk@example.com"])
         .args(["-c", "commit.gpgsign=false", "-c", "core.autocrlf=false"])

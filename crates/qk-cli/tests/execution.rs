@@ -7,6 +7,10 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+#[path = "support/git.rs"]
+mod git_support;
+use git_support::fixture_command;
+
 fn fixture(targets: Value) -> TempDir {
     let temp = TempDir::new().unwrap();
     fs::write(temp.path().join("nx.json"), "{}").unwrap();
@@ -2863,6 +2867,68 @@ fn nx_run_flags_work_as_in_nx() {
     );
 }
 
+/// A Git hook exports `GIT_DIR` for the repository it runs in, which need not
+/// be the workspace's; a run's commit is the workspace's own.
+#[test]
+fn a_run_reports_the_workspace_commit_whatever_git_dir_names() {
+    let commit = |root: &Path| {
+        for args in [
+            vec!["init", "--quiet"],
+            vec!["add", "."],
+            vec![
+                "-c",
+                "user.name=qk",
+                "-c",
+                "user.email=qk@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "fixture",
+            ],
+        ] {
+            success(
+                fixture_command("git")
+                    .current_dir(root)
+                    .args(args)
+                    .output()
+                    .unwrap(),
+            );
+        }
+        let head = success(
+            fixture_command("git")
+                .current_dir(root)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap(),
+        );
+        String::from_utf8(head.stdout).unwrap().trim().to_owned()
+    };
+    let temp = fixture(json!({"build": {"command": "echo built"}}));
+    let head = commit(temp.path());
+    let other = TempDir::new().unwrap();
+    assert_ne!(commit(other.path()), head);
+    success(
+        command(
+            temp.path(),
+            &[
+                "run",
+                "app:build",
+                "--skip-nx-cache",
+                "--report",
+                "run.json",
+            ],
+        )
+        .env("GIT_DIR", other.path().join(".git"))
+        .output()
+        .unwrap(),
+    );
+    let report: Value =
+        serde_json::from_slice(&fs::read(temp.path().join("run.json")).unwrap()).unwrap();
+    assert_eq!(report["sha"], head);
+}
+
 #[test]
 fn empty_selections_write_machine_readable_task_graphs() {
     let temp = fixture(json!({"build": {"command": "echo executed > marker"}}));
@@ -2882,7 +2948,7 @@ fn empty_selections_write_machine_readable_task_graphs() {
         ],
     ] {
         success(
-            Command::new("git")
+            fixture_command("git")
                 .current_dir(temp.path())
                 .args(args)
                 .output()
@@ -3547,7 +3613,7 @@ fn warm_suggest_lists_the_directories_a_task_wrote_outside_its_outputs() {
     fs::write(temp.path().join(".gitignore"), "dist/\n.tool/\n").unwrap();
     let git = |args: &[&str]| {
         assert!(
-            Command::new("git")
+            fixture_command("git")
                 .current_dir(temp.path())
                 .args(args)
                 .env("GIT_CONFIG_NOSYSTEM", "1")

@@ -10,6 +10,10 @@ use std::process::{Command, Output};
 use serde_json::Value;
 use tempfile::TempDir;
 
+#[path = "support/git.rs"]
+mod git_support;
+use git_support::fixture_command;
+
 /// `tools/ultracache/fixture`, copied into a git repository of its own.
 fn fixture() -> TempDir {
     let temp = TempDir::new().unwrap();
@@ -40,7 +44,7 @@ fn fixture() -> TempDir {
         ],
     ] {
         assert!(
-            Command::new("git")
+            fixture_command("git")
                 .current_dir(temp.path())
                 .args(args)
                 .env("GIT_CONFIG_NOSYSTEM", "1")

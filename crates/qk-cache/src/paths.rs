@@ -6,16 +6,31 @@ use anyhow::{Context, Result, bail};
 use qk_config::Workspace;
 use qk_taskgraph::Task;
 
+/// Git run at `root`, which must not inherit repository selection from a Git
+/// hook: Git's `rev-parse --local-env-vars` are removed.
 pub fn git(root: &Path, args: &[&str]) -> std::io::Result<Output> {
-    Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_COMMON_DIR")
-        .output()
+    let mut command = Command::new("git");
+    command.arg("-C").arg(root).args(args);
+    for name in [
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_GRAFT_FILE",
+        "GIT_INDEX_FILE",
+        "GIT_NO_REPLACE_OBJECTS",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_PREFIX",
+        "GIT_SHALLOW_FILE",
+        "GIT_COMMON_DIR",
+    ] {
+        command.env_remove(name);
+    }
+    command.output()
 }
 
 pub fn git_path(root: &Path, flag: &str) -> Option<PathBuf> {

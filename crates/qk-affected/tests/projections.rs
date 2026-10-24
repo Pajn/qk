@@ -9,34 +9,19 @@ use qk_graph::ProjectGraph;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+#[path = "support/git.rs"]
+mod git_support;
+use git_support::fixture_command;
+
 // Fixture repositories must not inherit hook locations, signing or global hooks.
 fn isolated_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
-    let mut command = Command::new(program);
+    let mut command = fixture_command(program);
     command
         .env(
             "GIT_CONFIG_GLOBAL",
             if cfg!(windows) { "NUL" } else { "/dev/null" },
         )
         .env("GIT_CONFIG_NOSYSTEM", "1");
-    for name in [
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_CONFIG",
-        "GIT_CONFIG_PARAMETERS",
-        "GIT_CONFIG_COUNT",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_IMPLICIT_WORK_TREE",
-        "GIT_GRAFT_FILE",
-        "GIT_INDEX_FILE",
-        "GIT_NO_REPLACE_OBJECTS",
-        "GIT_REPLACE_REF_BASE",
-        "GIT_PREFIX",
-        "GIT_SHALLOW_FILE",
-        "GIT_COMMON_DIR",
-    ] {
-        command.env_remove(name);
-    }
     command
 }
 

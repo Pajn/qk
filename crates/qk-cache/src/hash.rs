@@ -3821,17 +3821,7 @@ mod tests {
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(old))
             .unwrap();
-        let git = |args: &[&str]| {
-            assert!(
-                std::process::Command::new("git")
-                    .args(args)
-                    .current_dir(root.path())
-                    .output()
-                    .unwrap()
-                    .status
-                    .success()
-            )
-        };
+        let git = |args: &[&str]| assert!(paths::git(root.path(), args).unwrap().status.success());
         git(&["init", "--quiet"]);
         let workspace = Workspace::load(root.path()).unwrap();
         let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
