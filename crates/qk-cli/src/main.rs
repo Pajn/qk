@@ -1465,9 +1465,13 @@ fn run(mut cli: Cli) -> Result<i32> {
                 },
         } => {
             let analysis = changes.analyse(&workspace)?;
+            // What `qk affected` would select by; the text says why.
+            let granularity =
+                qk_affected::granularity(&workspace, None, changes.affected_profile.as_deref())?;
             explain::explain(
                 &workspace,
                 &analysis,
+                granularity,
                 project.as_deref(),
                 json,
                 &mut io::stdout().lock(),

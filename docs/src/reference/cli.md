@@ -21,7 +21,7 @@
 | `qk run web:build --dry-run` | Prepare every planned task without running it, and print the task graph as JSON |
 | `qk show projects --affected [--base <rev>] [--head <rev>]` | Projects affected by the changes, in graph order |
 | `qk affected -t build,test [--base <rev>] [--head <rev>]` | Execute the affected tasks of the targets, and the tasks they depend on |
-| `qk show affected [project] [--json]` | Why projects are affected, or why one project is |
+| `qk show affected [project] [--json]` | Why projects are affected, or why one project is, and the granularity `qk affected` selects by |
 | `qk affected -t build --granularity project` | Execute the targets of the affected projects, as `affected.legacy` does |
 | `qk show tasks -t build,test --affected [--json]` | The affected tasks and why |
 | `qk show runs`, `qk show run [id]` | Recent runs; one run's tasks, cache results and critical path |

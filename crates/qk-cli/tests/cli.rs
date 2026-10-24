@@ -659,12 +659,19 @@ fn show_affected_explains_why() {
     assert_eq!(report["affected"], true);
     assert_eq!(report["chain"][0]["dependsOn"], "codegen");
     assert_eq!(report["chain"][1]["reasons"][0]["reason"], "file");
+    assert_eq!(report["granularity"], "task");
+    assert_eq!(report["granularityFrom"], "default");
 
     // A root file touches no project here.
     let output = qk(&["show", "affected", "--files", "README.md"]);
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(text.starts_with("1 changed file between"), "{text}");
-    assert_eq!(text.lines().count(), 1, "{text}");
+    // Then only the granularity `qk affected` selects by.
+    assert_eq!(text.lines().count(), 2, "{text}");
+    assert!(
+        text.ends_with("\nGranularity: task (the default).\n"),
+        "{text}"
+    );
     let output = qk(&["show", "affected", "core", "--files", "README.md"]);
     assert!(
         String::from_utf8(output.stdout)
@@ -879,6 +886,67 @@ fn show_projects_affected_selects_by_the_tasks_of_its_targets_as_nx_24() {
             if projects { json!(["lib"]) } else { json!([]) },
             "{case}"
         );
+    }
+}
+
+#[test]
+fn show_affected_says_which_granularity_qk_affected_selects_by_and_why() {
+    let legacy = || Some(json!({"legacy": true}));
+    for (affected, env, text, granularity, from) in [
+        (None, None, "task (the default)", "task", "default"),
+        (
+            legacy(),
+            None,
+            "project (nx.json affected.legacy)",
+            "project",
+            "affected.legacy",
+        ),
+        (
+            legacy(),
+            Some("false"),
+            "task (NX_LEGACY_AFFECTED=false)",
+            "task",
+            "NX_LEGACY_AFFECTED",
+        ),
+        (
+            None,
+            Some("true"),
+            "project (NX_LEGACY_AFFECTED=true)",
+            "project",
+            "NX_LEGACY_AFFECTED",
+        ),
+    ] {
+        let temp = granularity_workspace(affected.clone());
+        let show = |args: &[&str]| {
+            let mut command = isolated_command(env!("CARGO_BIN_EXE_qk"));
+            command.arg("--workspace").arg(temp.path()).args([
+                "show",
+                "affected",
+                "--files",
+                "lib/README.md",
+            ]);
+            command.args(args);
+            if let Some(env) = env {
+                command.env("NX_LEGACY_AFFECTED", env);
+            }
+            command.output().unwrap()
+        };
+        let case = format!("{affected:?} {env:?}");
+        for project in [&[][..], &["lib"]] {
+            let output = show(project);
+            assert!(output.status.success(), "{case}");
+            let shown = String::from_utf8(output.stdout).unwrap();
+            assert_eq!(
+                shown.lines().nth(1),
+                Some(format!("Granularity: {text}.").as_str()),
+                "{case}: {shown}"
+            );
+            let mut json = project.to_vec();
+            json.push("--json");
+            let report = successful_json(show(&json));
+            assert_eq!(report["granularity"], granularity, "{case}");
+            assert_eq!(report["granularityFrom"], from, "{case}");
+        }
     }
 }
 
@@ -1947,6 +2015,10 @@ fn affected_profile_lists_projects_explains_projection_and_rejects_task_selectio
     assert!(text.contains("1 changed file between"));
     assert!(text.contains("0 files after projection."));
     assert!(text.contains("1 source change, 0 artifact changes"));
+    assert!(text.contains("Granularity: project (the affected profile has projections)."));
+    // The text says why; there is no notice.
+    assert!(output.stderr.is_empty());
+    assert_eq!(explanation["granularityFrom"], "projections");
     let output = run(&[
         "show",
         "projects",

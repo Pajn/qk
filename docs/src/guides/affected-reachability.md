@@ -244,6 +244,7 @@ that reached one. `--json` adds a `reachability` object with each decision.
 ```text
 $ qk show affected --affected-profile reach --base main --head HEAD
 1 changed file between 3f1c0a9e2b7d and HEAD.
+Granularity: task (the default).
 other  depends on lib
 lib    touched: libs/lib/src/unused.ts changed
 Left out by import reachability:

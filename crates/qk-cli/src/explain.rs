@@ -3,17 +3,31 @@
 use std::io::Write;
 
 use anyhow::{Result, bail};
-use qk_affected::{Analysis, Cause, Decision, Kept, Reason, TaskDecision};
+use qk_affected::{
+    Analysis, Cause, Decision, Granularity, Kept, Reason, Selection, Source, TaskDecision,
+};
 use qk_config::Workspace;
 use qk_graph::graph_order;
+use serde::Serialize;
 use serde_json::json;
 
 /// Packages listed per lockfile reason before summarising the rest.
 const LISTED: usize = 20;
 
+/// The analysis with the granularity `qk affected` selects by.
+#[derive(Serialize)]
+struct Report<'a> {
+    #[serde(flatten)]
+    analysis: &'a Analysis,
+    granularity: Granularity,
+    #[serde(rename = "granularityFrom")]
+    from: Source,
+}
+
 pub fn explain(
     workspace: &Workspace,
     analysis: &Analysis,
+    granularity: Selection,
     project: Option<&str>,
     json: bool,
     out: &mut impl Write,
@@ -25,7 +39,12 @@ pub fn explain(
     }
     match (project, json) {
         (None, true) => {
-            serde_json::to_writer_pretty(&mut *out, analysis)?;
+            let report = Report {
+                analysis,
+                granularity: granularity.granularity,
+                from: granularity.from,
+            };
+            serde_json::to_writer_pretty(&mut *out, &report)?;
             writeln!(out)?;
         }
         (Some(project), true) => {
@@ -50,6 +69,8 @@ pub fn explain(
                 "base": analysis.base,
                 "head": analysis.head,
                 "chain": steps,
+                "granularity": granularity.granularity,
+                "granularityFrom": granularity.from,
             });
             if let Some(decision) = analysis.reachability.get(project) {
                 report["reachability"] = serde_json::to_value(decision)?;
@@ -64,6 +85,7 @@ pub fn explain(
         }
         (None, false) => {
             writeln!(out, "{}", comparison(analysis))?;
+            writeln!(out, "Granularity: {granularity}.")?;
             explain_projections(analysis, out)?;
             let names = graph_order(&workspace.projects, analysis.projects.keys().cloned());
             let width = names.iter().map(String::len).max().unwrap_or(0);
@@ -102,6 +124,7 @@ pub fn explain(
         }
         (Some(project), false) => {
             writeln!(out, "{}", comparison(analysis))?;
+            writeln!(out, "Granularity: {granularity}.")?;
             explain_projections(analysis, out)?;
             let Some(chain) = analysis.chain(project) else {
                 match analysis.reachability.get(project) {

@@ -180,12 +180,15 @@ affected dependencies, and every reason the touched project is touched. For
 a lockfile reason it lists what the importer installs differently, by
 package: versions that moved first, then packages added or removed, then
 those that kept their version but resolved different peers or patch, then
-those whose dependencies changed as a consequence.
+those whose dependencies changed as a consequence. After what was compared,
+it says which granularity `qk affected` selects by and what decided it (see
+[Tasks or projects](#tasks-or-projects)).
 
 ```text
 $ qk show affected web --base HEAD^ --head HEAD
 2 changed files between 3f1c0a9e2b7d and HEAD.
 The base is where HEAD left HEAD^, 1 commit back.
+Granularity: task (the default).
 web is affected because it depends on ui:
   web -> ui (static)
 ui is touched:
@@ -273,7 +276,9 @@ first reason, or the whole analysis with `--json`, whatever the granularity.
 
 `--json` gives the whole analysis, or for one project its path with the
 typed reasons, including the snapshot keys a lockfile change added,
-removed or changed.
+removed or changed. Both carry `granularity`, `task` or `project`, and
+`granularityFrom`: `--granularity`, `NX_LEGACY_AFFECTED`, `affected.legacy`,
+`projections` or `default`.
 
 ## Project selectors
 
