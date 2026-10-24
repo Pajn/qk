@@ -13,7 +13,8 @@ pub const WRITE_TOKEN: &str = "write-token";
 
 #[derive(Default)]
 pub struct State {
-    /// Upload bodies by `entries/<key>`, `warm/<a>/<b>` or `pathsets/<weak>`.
+    /// Upload bodies by `entries/<key>`, `warm/<a>/<b>`, `pathsets/<weak>` or
+    /// `expectations/<name>`.
     pub records: BTreeMap<String, Vec<u8>>,
     /// Blobs stored apart, each one zstd frame, by hash.
     pub blobs: BTreeMap<String, Vec<u8>>,
@@ -30,6 +31,17 @@ pub struct State {
     /// forgetting them, as a store that lost them would.
     pub fail_commit_once: bool,
     pub latency: Duration,
+}
+
+impl State {
+    /// The result entries committed, leaving out warm records, path sets and
+    /// expectations.
+    pub fn entries(&self) -> usize {
+        self.records
+            .keys()
+            .filter(|path| path.starts_with("entries/"))
+            .count()
+    }
 }
 
 pub struct FakeStoreServer {
@@ -308,7 +320,8 @@ fn handle(
         (method, path)
             if path.starts_with("entries/")
                 || path.starts_with("warm/")
-                || path.starts_with("pathsets/") =>
+                || path.starts_with("pathsets/")
+                || path.starts_with("expectations/") =>
         {
             let entry = path.starts_with("entries/");
             match method {

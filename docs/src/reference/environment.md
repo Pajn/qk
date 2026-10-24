@@ -95,6 +95,7 @@ similar patterns in a value it substitutes, is not reproduced.
 | `QK_REMOTE_UPLOAD_MODE` | Override the remote store's `uploadMode`: `wait` or `background` |
 | `QK_REMOTE_BLOB_THRESHOLD` | The compressed size from which an output is stored apart, such as `256KB`, or `off`; 1 MiB by default |
 | `QK_REMOTE_PREFETCH=off` | Do not fetch entries ahead of the tasks that need them |
+| `QK_REMOTE_EXPECTATIONS` | What a run does with the [task expectations](../guides/remote-cache.md) the remote store holds: `read-write` (the default, as the store's mode allows), `read` or `off` |
 | `QK_STORE_SERVER_TOKEN` | The [store server](../guides/remote-cache.md#store-server)'s token |
 | `QK_STORE_SERVER_URL` | Override `storeServer.url` |
 | `QK_PROFILE_CACHE=1` | Enable [cache phase timings](cli.md#profiling-cache-operations), as `--profile` does |

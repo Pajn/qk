@@ -928,7 +928,7 @@ fn locations(workspace: &Workspace, task: &Task, warm: &Warm) -> Result<Vec<Loca
 
 /// The branch being built: from CI when it checks out a detached head, else
 /// from git. `None` when there is no branch to name.
-fn current_branch(workspace: &Workspace) -> Option<String> {
+pub(crate) fn current_branch(workspace: &Workspace) -> Option<String> {
     for name in ["GITHUB_HEAD_REF", "GITHUB_REF_NAME"] {
         if let Ok(value) = std::env::var(name)
             && !value.is_empty()
@@ -943,7 +943,7 @@ fn current_branch(workspace: &Workspace) -> Option<String> {
 
 /// The branches to take warm state from, in order: the current one, then the
 /// workspace's default branch.
-fn branches(workspace: &Workspace) -> Vec<String> {
+pub(crate) fn branches(workspace: &Workspace) -> Vec<String> {
     let default = workspace
         .config
         .default_base

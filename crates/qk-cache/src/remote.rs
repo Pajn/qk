@@ -4,8 +4,9 @@
 //!
 //! Objects live under `<cacheKeyPrefix>qk/v4/`, so a bucket shared with Nx never
 //! mixes the two: `entries/<key>` for results, `warm/<task>/<branch>` for warm
-//! records, `pathsets/<weak>` for recorded path sets and `blobs/<hash>` for
-//! large blobs. Each entry or record is a
+//! records, `pathsets/<weak>` for recorded path sets, `expectations/<branch>`
+//! for what tasks are expected to take ([`crate::expectations`]) and
+//! `blobs/<hash>` for large blobs. Each entry or record is a
 //! Zstandard level 3 [`pack`] holding it with the small blobs it cites, so one
 //! request reads or writes it whole; the store's latency is per request, and
 //! an entry can cite thousands of blobs. A blob whose compressed size reaches
@@ -43,6 +44,7 @@ use ureq::unversioned::transport::{
     TcpConnector, Transport,
 };
 
+pub(crate) use store::expectations_name;
 use store::{Object, Store};
 
 /// Uploads in flight at once.
@@ -197,6 +199,19 @@ struct Upload {
     /// The path sets to write for a weak key, instead of the entry.
     #[serde(default)]
     path_sets: Option<PathSets>,
+    /// Tasks' runs to add to the expectations the store holds, instead of
+    /// the entry.
+    #[serde(default)]
+    expectations: Option<Expectations>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct Expectations {
+    /// The branch to save for, then the one to start from when it has none.
+    branches: Vec<String>,
+    runs: BTreeMap<String, crate::expectations::Expectation>,
+    /// When the runs ended, in milliseconds since the epoch.
+    now: u64,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -659,6 +674,7 @@ impl Remote {
             local: root.to_owned(),
             warm: None,
             path_sets: None,
+            expectations: None,
         });
     }
 
@@ -673,6 +689,7 @@ impl Remote {
                 weak: weak.to_owned(),
                 record,
             }),
+            expectations: None,
         });
     }
 
@@ -709,7 +726,57 @@ impl Remote {
                 record,
             }),
             path_sets: None,
+            expectations: None,
         });
+    }
+
+    /// Queues tasks' `runs`, ended at `now`, to be added to the expectations
+    /// the store holds and saved for the first of `branches`.
+    pub(crate) fn upload_expectations(
+        self: &Arc<Self>,
+        root: &Path,
+        branches: Vec<String>,
+        runs: BTreeMap<String, crate::expectations::Expectation>,
+        now: u64,
+    ) {
+        self.enqueue(Upload {
+            key: "task expectations".to_owned(),
+            local: root.to_owned(),
+            warm: None,
+            path_sets: None,
+            expectations: Some(Expectations {
+                branches,
+                runs,
+                now,
+            }),
+        });
+    }
+
+    /// The record of tasks' expectations the store holds for `branch`, or
+    /// `None` when it holds none.
+    pub(crate) fn fetch_expectations(&self, root: &Path, branch: &str) -> Result<Option<Vec<u8>>> {
+        let received = AtomicU64::new(0);
+        let object = Object::Expectations(branch);
+        let fetched = self.fetch_pack(root, object, "run", &received, &[], |_| Ok(()))?;
+        Ok(fetched.map(|(record, _, _)| record))
+    }
+
+    /// The first of `branches` whose record of tasks' expectations can be
+    /// read, with the branch it was saved for: one missing, or one that is
+    /// not a record for its branch, gives way to the next.
+    pub(crate) fn fetch_usable_expectations(
+        &self,
+        root: &Path,
+        branches: &[String],
+    ) -> Result<Option<(Vec<u8>, String)>> {
+        for branch in branches {
+            if let Some(record) = self.fetch_expectations(root, branch)?
+                && crate::expectations::usable(&record, branch)
+            {
+                return Ok(Some((record, branch.clone())));
+            }
+        }
+        Ok(None)
     }
 
     /// The task's warm record saved on `branch`, with every blob it cites
@@ -901,6 +968,22 @@ impl Remote {
         if let Some(sets) = &job.path_sets {
             // As with warm records, the newest save replaces the last one.
             return self.put_pack(&job.local, Object::PathSets(&sets.weak), &sets.record);
+        }
+        if let Some(shared) = &job.expectations {
+            let Some(branch) = shared.branches.first() else {
+                return Ok(());
+            };
+            // The runs join what the store holds now, so the tasks they leave
+            // out keep theirs; a store that cannot say is not overwritten.
+            let base = self.fetch_usable_expectations(&job.local, &shared.branches)?;
+            let record = crate::expectations::merge(
+                base.as_ref()
+                    .map(|(record, from)| (record.as_slice(), from.as_str())),
+                branch,
+                &shared.runs,
+                shared.now,
+            );
+            return self.put_pack(&job.local, Object::Expectations(branch), &record);
         }
         let object = Object::Entry(&job.key);
         let exists = self.store.has(object)?;
@@ -1410,6 +1493,7 @@ mod flight_tests {
             Object::Warm { identity, branch } => format!("warm/{identity}/{branch}"),
             Object::Blob(hash) => format!("blobs/{hash}"),
             Object::PathSets(weak) => format!("pathsets/{weak}"),
+            Object::Expectations(branch) => format!("expectations/{branch}"),
         }
     }
 
@@ -1521,6 +1605,105 @@ mod flight_tests {
             .unwrap();
         assert_eq!(placements[&blobs[0]], pack::Placement::Inline);
         assert_eq!(placements[&blobs[1]], pack::Placement::Apart);
+    }
+
+    #[test]
+    fn expectations_saved_for_a_branch_start_from_the_default_branch() {
+        let root = cache();
+        let remote = Arc::new(Remote::new(
+            Box::new(Memory::default()),
+            Mode::ReadWrite,
+            None,
+            u64::MAX,
+        ));
+        let run = |millis| crate::expectations::Expectation {
+            millis,
+            cores: 4,
+            memory: None,
+        };
+        let runs = |list: &[(&str, u64)]| {
+            list.iter()
+                .map(|(id, millis)| (id.to_string(), run(*millis)))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let branches = |list: &[&str]| list.iter().map(|branch| branch.to_string()).collect();
+        remote.upload_expectations(
+            root.path(),
+            branches(&["main"]),
+            runs(&[("app:a", 10), ("app:b", 20)]),
+            1_000,
+        );
+        assert!(remote.finish().is_empty());
+        assert!(
+            remote
+                .fetch_expectations(root.path(), "feature")
+                .unwrap()
+                .is_none()
+        );
+        remote.upload_expectations(
+            root.path(),
+            branches(&["feature", "main"]),
+            runs(&[("app:a", 30)]),
+            2_000,
+        );
+        assert!(remote.finish().is_empty());
+        let saved = remote
+            .fetch_expectations(root.path(), "feature")
+            .unwrap()
+            .unwrap();
+        let expected = crate::expectations::read(&saved, "feature");
+        // Of a's runs, 30 and 10, the median is the later.
+        assert_eq!(expected["app:a"].millis, 30);
+        assert_eq!(expected["app:b"].millis, 20);
+        // A record that cannot be read gives way to the default branch's,
+        // when fetching and when adding to it.
+        remote
+            .put_pack(root.path(), Object::Expectations("broken"), b"{}")
+            .unwrap();
+        let (fallback, from) = remote
+            .fetch_usable_expectations(root.path(), &branches(&["broken", "main"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(from, "main");
+        assert_eq!(
+            crate::expectations::read(&fallback, &from)["app:b"].millis,
+            20
+        );
+        remote.upload_expectations(
+            root.path(),
+            branches(&["broken", "main"]),
+            runs(&[("app:a", 40)]),
+            3_000,
+        );
+        assert!(remote.finish().is_empty());
+        let repaired = remote
+            .fetch_expectations(root.path(), "broken")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            crate::expectations::read(&repaired, "broken")["app:b"].millis,
+            20
+        );
+        // The default branch's record is left as it was.
+        let main = remote
+            .fetch_expectations(root.path(), "main")
+            .unwrap()
+            .unwrap();
+        assert_eq!(crate::expectations::read(&main, "main")["app:a"].millis, 10);
+        // A store that may only be read is not written.
+        let read = Arc::new(Remote::new(
+            Box::new(Memory::default()),
+            Mode::Read,
+            None,
+            u64::MAX,
+        ));
+        read.upload_expectations(root.path(), branches(&["main"]), runs(&[("app:a", 1)]), 1);
+        assert!(read.finish().is_empty());
+        assert!(
+            read.fetch_expectations(root.path(), "main")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

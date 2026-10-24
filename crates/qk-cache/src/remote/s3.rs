@@ -87,6 +87,10 @@ impl S3 {
             }
             Object::Blob(hash) => self.object("blobs", hash),
             Object::PathSets(weak) => self.object("pathsets", &format!("{weak}.json")),
+            Object::Expectations(branch) => self.object(
+                "expectations",
+                &format!("{}.json", super::store::expectations_name(branch)),
+            ),
         }
     }
 

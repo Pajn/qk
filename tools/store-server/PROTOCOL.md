@@ -129,6 +129,15 @@ pack, or `404`; `HEAD` answers `200` or `404`. `PUT` needs a write token and
 an upload body of at most 16 MiB whose record's `weak` is `<weak>` and which
 cites no blob; the newest save replaces the last. Answer: `204`, or `400`.
 
+### `GET expectations/<name>`, `HEAD expectations/<name>`, `PUT expectations/<name>`
+
+What tasks are expected to take, from the runs that last ran them, saved under
+a name of 32 hex digits that clients derive from a branch, as a record citing
+no blob: `{"version": 1, "name": <name>, "tasks": {…}}`. `GET` answers `200`, a
+pack, or `404`; `HEAD` answers `200` or `404`. `PUT` needs a write token and an
+upload body of at most 4 MiB whose record's `name` is `<name>` and which cites
+no blob; the newest save replaces the last. Answer: `204`, or `400`.
+
 ### `GET index[?since=<cursor>]`
 
 Answer: `200`, text, with the header `Qk-Index-Cursor: <cursor>`. Lines are

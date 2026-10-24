@@ -21,6 +21,25 @@ outputs the local cache lacks, verifying each against its hash, and shows
 `[remote cache]`; any failure is a miss. The path sets of tasks with
 [`qk:ultracache`](ultracache.md) are stored as `pathsets/<weak>`.
 
+What tasks are expected to take, which orders them and sizes their
+[shares of the cores](threads.md), is stored as `expectations/<name>`, one
+record per branch and platform. It holds each task's last five runs that
+executed it: their time, the cores they held and the memory they used. A run
+that executed tasks adds them to the record of its branch, starting from the
+default branch's when its branch has none, and saves it for its branch; the
+newest save replaces the last, and a task no run has executed for 30 days is
+dropped. A run whose local history lacks a task reads the record of its
+branch, else of the default branch, so that a machine without history, such
+as a CI job on a fresh clone, still knows which tasks take long. Local history
+wins for a task it has. A record that cannot be read leaves the run without
+it, and is not replaced. The record is fetched while the run gets ready to
+start its tasks, and waited for only when local history lacks one of them.
+
+Expectations are read and written as the store's mode allows.
+`QK_REMOTE_EXPECTATIONS` narrows that: `read` (also spelled `read-only`) reads
+them without adding to them, `off` neither reads nor writes them, and
+`read-write`, the default, changes nothing.
+
 An output whose compressed size reaches 1 MiB is stored apart, as
 `blobs/<hash>`, uploaded once for every entry that has it and only when the
 store lacks it. A machine fetches it only when its local cache lacks it, so a

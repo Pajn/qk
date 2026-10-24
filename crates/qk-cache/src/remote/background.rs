@@ -128,6 +128,13 @@ fn snapshot(jobs: &[Upload]) -> Result<(tempfile::TempDir, Vec<Upload>)> {
     }
     let mut pinned = Vec::with_capacity(jobs.len());
     for job in jobs {
+        // Expectations cite no blob, and are composed as they are sent.
+        if job.expectations.is_some() {
+            let mut job = job.clone();
+            job.local = root.to_owned();
+            pinned.push(job);
+            continue;
+        }
         let record = match (&job.warm, &job.path_sets) {
             (Some(warm), _) => warm.record.clone(),
             (None, Some(sets)) => sets.record.clone(),
@@ -372,6 +379,7 @@ mod tests {
                 local: root.clone(),
                 warm: None,
                 path_sets: None,
+                expectations: None,
             },
             Upload {
                 key: "warm state".into(),
@@ -385,6 +393,7 @@ mod tests {
                     .unwrap(),
                 }),
                 path_sets: None,
+                expectations: None,
             },
         ];
         let (pinned, jobs) = snapshot(&jobs).unwrap();

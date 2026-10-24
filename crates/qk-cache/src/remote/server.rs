@@ -64,6 +64,9 @@ impl Server {
             }
             Object::Blob(hash) => format!("blobs/{hash}"),
             Object::PathSets(weak) => format!("pathsets/{weak}"),
+            Object::Expectations(branch) => {
+                format!("expectations/{}", super::store::expectations_name(branch))
+            }
         }
     }
 
@@ -190,7 +193,7 @@ impl Store for Server {
                 let (identity, branch) = warm_names(identity, branch);
                 format!("warm={identity}/{branch}")
             }
-            Object::Blob(_) | Object::PathSets(_) => String::new(),
+            Object::Blob(_) | Object::PathSets(_) | Object::Expectations(_) => String::new(),
         };
         self.read(&format!("blobs/{hash}?{owner}"), task)
     }

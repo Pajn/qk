@@ -1655,6 +1655,18 @@ fn execute_narrowed(
         qk_cache::profile::enable();
     }
     options.export();
+    // A sandboxed task has to run to be observed.
+    let skip_cache =
+        options.skips_cache() || options.sandbox.is_some() || options.input_analysis.is_some();
+    // The root dotenv files can hold the remote store's credentials.
+    let environment = qk_executor::environment(&workspace.root);
+    // What tasks are expected to take is fetched while the run gets ready to
+    // start them, and kept only when local history lacks a task.
+    let mut fetching = environment
+        .as_ref()
+        .ok()
+        .filter(|_| !skip_cache && !options.dry_run && options.graph_target().is_none())
+        .map(|environment| qk_cache::expectations::fetch(workspace, environment));
     let graph = if requests.is_empty() && options.graph_target().is_some() {
         TaskGraph {
             roots: Default::default(),
@@ -1720,9 +1732,6 @@ fn execute_narrowed(
     }
     let cancelled = Arc::new(AtomicBool::new(false));
     signals::install(cancelled.clone())?;
-    // A sandboxed task has to run to be observed.
-    let skip_cache =
-        options.skips_cache() || options.sandbox.is_some() || options.input_analysis.is_some();
     let verbose = options.verbose();
     let specified = specified_output_style(options);
     let rendered = specified.map_or_else(
@@ -1793,7 +1802,9 @@ fn execute_narrowed(
         },
         std::num::NonZeroUsize::get,
     );
-    let expected = history::expected(workspace);
+    let environment = environment?;
+    let mut expected = history::expected(workspace);
+    history::fill_from_remote(&graph, &mut fetching, &mut expected);
     let title = ui::Title::new(&graph, single);
     if matches!(sink, ui::SinkKind::Static) {
         qk_executor::report::write_all(true, title.start(ui::Paint::log()).as_bytes());
@@ -1834,6 +1845,9 @@ fn execute_narrowed(
         started,
         options.report.as_deref(),
     );
+    if !skip_cache && result.exit_code != 130 {
+        history::share(workspace, &report, &environment);
+    }
     if !skip_cache {
         let cache = qk_cache::cache_location(workspace);
         // Entries unused for a week go even without a size limit, as in Nx.

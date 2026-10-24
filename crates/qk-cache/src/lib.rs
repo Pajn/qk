@@ -1,6 +1,7 @@
 //! Local content-addressed cache shared by linked Git worktrees.
 
 mod evict;
+pub mod expectations;
 mod glob;
 mod hash;
 mod ignored;
@@ -39,6 +40,18 @@ pub use paths::{
     Outputs, cache_directory, cache_location, clear_worktree_state, resolved_outputs,
     worktree_state,
 };
+
+/// The nx.json settings of the workspace's remote store: its `s3`, and its
+/// `storeServer` or `qk:storeServer`. Nx never reads `qk:storeServer`, so a
+/// workspace can name a store server for qk while Nx's own cache plugin keeps
+/// `s3`.
+fn remote_settings(workspace: &Workspace) -> (Option<&Value>, Option<&Value>) {
+    let extra = &workspace.config.extra;
+    match extra.get("qk:storeServer") {
+        Some(server) => (None, Some(server)),
+        None => (extra.get("s3"), extra.get("storeServer")),
+    }
+}
 
 /// The cache for one run; its workspace snapshot is taken on first use.
 pub struct Cache {
@@ -172,13 +185,7 @@ impl Cache {
         environment: &BTreeMap<std::ffi::OsString, std::ffi::OsString>,
     ) -> Self {
         let root = paths::cache_location(workspace);
-        let extra = &workspace.config.extra;
-        // Nx never reads `qk:storeServer`, so a workspace can name a store
-        // server for qk while Nx's own cache plugin keeps `s3`.
-        let (s3, server) = match extra.get("qk:storeServer") {
-            Some(server) => (None, Some(server)),
-            None => (extra.get("s3"), extra.get("storeServer")),
-        };
+        let (s3, server) = remote_settings(workspace);
         let remote = match remote::configure(s3, server, environment) {
             Ok(remote) => remote.map(std::sync::Arc::new),
             Err(error) => {

@@ -974,6 +974,14 @@ fn details(
             paint.dim(&format!("Threads of {cores} cores:")),
             threaded.join(", ")
         ));
+        if result.unexpected {
+            lines.push(format!(
+                "  {}",
+                paint.dim(
+                    "none had run before, here or in the remote store, so each was given an even split"
+                )
+            ));
+        }
     }
     if let Some(memory) = result.memory {
         let mut tasks: Vec<(&str, u64)> = report
@@ -1401,6 +1409,7 @@ mod tests {
             ]),
             load: vec![(load, true), (load, false)],
             memory: None,
+            unexpected: false,
         };
         let tasks = vec![
             report("app:a", 0, 1_000, &[]),

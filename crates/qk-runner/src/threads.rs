@@ -4,7 +4,9 @@
 //! target with `qk:threads` its share, fixed when it starts, since a tool
 //! cannot give up workers it has started. The share is what is free, divided
 //! among the threaded tasks ready to start, after a core for each task slot
-//! other pending tasks could take, and kept within `min` and `max`. It reaches the task,
+//! other pending tasks could take, or for a task expected from earlier runs to
+//! take some time, the part of the cores its work is of the work that can run
+//! beside it, and kept within `min` and `max`. It reaches the task,
 //! times `scale`, as `QK_THREADS` and through the `env` variables naming
 //! `{threads}`.
 //!

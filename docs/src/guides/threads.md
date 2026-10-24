@@ -26,21 +26,34 @@ one core. Continuous tasks are outside the core budget: `qk:threads` does
 not allocate a share or set these environment variables for them.
 
 A share is fixed when the task starts, since a tool cannot give up workers
-it has started. Threaded tasks starting together split the free cores
-evenly, after a core for each task slot other pending tasks could take, so
-two get half each and three a third, and one starting alone leaves room for
-what follows. A task expected to do a larger part of the work left in the
-run, from its recent runs and the threads it had in them, gets that part of
-the cores instead, so that it does not keep running once the rest is done.
-This larger share leaves capacity for other task slots, including tasks without
-history, and respects the minimum of other ready threaded tasks when the budget
-can accommodate them. Remaining work subtracts the work already done with each
-running task's current thread allocation from its historical core-milliseconds.
+it has started. Threaded tasks without an expectation, from earlier runs,
+split the free cores evenly, after a core for each task slot other pending
+tasks could take, so two get half each and three a third, and one starting
+alone leaves room for what follows.
+
+A task's expectation is its time in its recent runs, those that executed it,
+on the cores it held then: from local history, which lives beside the cache,
+or for a task local history lacks, from the [remote store](remote-cache.md),
+which shares what other machines ran. A task with an expectation is given the part of the cores that its work is of the work that can
+run beside it: its own, and the largest of what the other task slots can hold
+of the tasks still to finish, leaving out those that depend on it, which wait
+for it to end. A running task counts what it has still to do, its expected
+core-milliseconds less what it has done on the cores it holds. A short suite
+thus takes a few cores, finishes, and leaves the rest free for a long one
+still waiting for its dependencies, rather than holding an even split of them
+when the long one starts; and a long task is given most of the cores, so that
+it does not keep running once the rest is done. Either share leaves a core
+for each other task slot, including tasks without history, and the minimum of
+other ready threaded tasks when the budget can accommodate them.
+
 Cores come back as tasks finish and go to the next to start. A
 share stays within `min` (default 1) and `max` (default the budget); a task
 waits until `min` cores are free, unless nothing else runs. The thread count
 is not part of the cache key, and neither is `qk:threads`. The summary lists
-what each threaded task was given, and `qk show task` records it.
+what each threaded task was given, and `qk show task` records it. When none of
+the threaded tasks that ran had an expectation, the summary says so below
+them: every share was then an even split, as on a CI job with neither local
+history nor a remote store to read one from.
 
 ## Threads that wait
 
