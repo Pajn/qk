@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Behavioral oracle for cache reuse, stdin selection and queued watch callbacks.
+// Behavioral oracle for cache reuse, stdin selection, readiness and queued watch callbacks.
 // Each scenario gets its own repository and cache; records live outside inputs.
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, existsSync, symlinkSync, utimesSync } from 'node:fs';
@@ -184,6 +184,19 @@ else {mkdirSync('app/dist',{recursive:true});writeFileSync('app/dist/result',rea
     result['stdin-spaces'] = JSON.parse(run(root, ['show', 'projects', '--affected', '--stdin', '--json'], { input: 'app/input with spaces.txt\r\n\r\n' }).trim().split('\n').pop()).sort();
     result['stdin-empty'] = JSON.parse(run(root, ['show', 'projects', '--affected', '--stdin', '--json'], { input: '' }).trim().split('\n').pop()).sort();
   }
+  {
+    // The run-commands readyWhen option: every ready string counts, on
+    // stderr too, even when one chunk holds them all.
+    const { root, records } = workspace();
+    write(root, 'record.mjs', `import {writeFileSync} from 'node:fs';import {join} from 'node:path';writeFileSync(join(process.env.BEHAVIOR_RECORDS,process.argv[2]+'.ran'),'ran');
+if(process.argv[2]==='serve'){console.error('READY foo');setTimeout(()=>{},2000);}`);
+    write(root, 'app/project.json', { name: 'app', targets: {
+      serve: { executor: 'nx:run-commands', options: { command: 'node record.mjs serve', readyWhen: ['READY', 'foo'] } },
+      e2e: { command: 'node record.mjs e2e', dependsOn: ['serve'] },
+    } });
+    run(root, ['run', 'app:e2e'], { env: { BEHAVIOR_RECORDS: records } });
+    result['ready-when-stderr'] = tasks(records);
+  }
   for (const [name, ignoredParent] of [['excluded-parent', true], ['git-negation', false]]) {
     const { root, records } = workspace();
     const input = ignoredParent ? 'app/ignored/keep.txt' : 'app/keep.txt';
@@ -258,5 +271,5 @@ else {mkdirSync('app/dist',{recursive:true});writeFileSync('app/dist/result',rea
   const text = JSON.stringify(result, null, 2) + '\n';
   if (mode === 'capture') writeFileSync(goldenArg, text);
   else if (text !== readFileSync(goldenArg, 'utf8')) throw new Error(`behavior differs from Nx golden:\n${text}`);
-  console.log(`ok   behavioral ${mode}: configurations, cache, ignore rules, stdin and watch`);
+  console.log(`ok   behavioral ${mode}: configurations, cache, ignore rules, stdin, readiness and watch`);
 } finally { rmSync(scratch, { recursive: true, force: true }); }

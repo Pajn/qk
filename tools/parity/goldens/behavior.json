@@ -212,6 +212,10 @@
     "app"
   ],
   "stdin-empty": [],
+  "ready-when-stderr": [
+    "e2e.ran",
+    "serve.ran"
+  ],
   "cache-excluded-parent": [
     [
       "consumer.ran"

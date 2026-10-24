@@ -323,6 +323,32 @@ pub fn run(
         .then(|| attach_recordings(graph, &mut prepared))
         .transpose()?
         .flatten();
+    // As in Nx 24.0.1, a task waiting for a server with a `signal` check may
+    // learn its address in NX_READY_URL, and resolves its own readyWhen once
+    // that server is ready. Until then, its readyWhen counts as invalid only
+    // when it is invalid both without an address and with a stand-in one,
+    // which then says why. Only a signal check reports an address.
+    let signalled: BTreeSet<String> = graph
+        .tasks
+        .iter()
+        .filter(|(_, task)| {
+            task.dependencies.iter().any(|dependency| {
+                task.edge(dependency).wait_for == qk_taskgraph::WaitFor::Ready
+                    && graph.tasks[dependency].definition.continuous == Some(true)
+                    && matches!(
+                        &prepared[dependency].ready_check,
+                        Some(Ok(check)) if check.probe == qk_executor::readiness::Probe::Signal
+                    )
+            })
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in &signalled {
+        let task = prepared.get_mut(id).unwrap();
+        if matches!(task.ready_check, Some(Err(_))) {
+            task.ready_check = task.resolve_ready_check(Some("http://localhost/"));
+        }
+    }
     let prepared = prepared;
     let threads: BTreeMap<String, Threads> = graph
         .tasks
@@ -434,6 +460,8 @@ pub fn run(
     let mut not_ready_failed: BTreeSet<String> = BTreeSet::new();
     // Tasks that exited before the check something waits for passed.
     let mut exited_unready: BTreeSet<String> = BTreeSet::new();
+    // Tasks that started with a valid check, as resolved when they started.
+    let mut checked: BTreeSet<String> = BTreeSet::new();
     let mut outcomes = BTreeMap::new();
     let warm = graph
         .tasks
@@ -756,9 +784,18 @@ pub fn run(
                         .filter(|dependency| waits(&id, dependency))
                         .filter_map(|dependency| prepared[dependency].verdict.url())
                         .collect();
-                    if let [url] = &urls[..] {
+                    let url = match &urls[..] {
+                        [url] => Some(url.as_str()),
+                        _ => None,
+                    };
+                    if let Some(url) = url {
                         task.execution
                             .insert(qk_executor::ready_signal::URL_ENV.into(), url.into());
+                    }
+                    // Its own readyWhen, with the address it learnt, unless
+                    // it is invalid whatever the address.
+                    if signalled.contains(&id) && !matches!(task.ready_check, Some(Err(_))) {
+                        task.ready_check = task.resolve_ready_check(url);
                     }
                     let sender = sender.clone();
                     if serving.contains(&id) {
@@ -769,6 +806,14 @@ pub fn run(
                         let stop = Arc::new(AtomicBool::new(false));
                         stops.insert(id.clone(), stop.clone());
                         let waited = waiters.contains_key(id.as_str());
+                        // A port the server picks leaves nothing to check:
+                        // it is ready once started.
+                        if waited && task.ready_check.is_none() {
+                            task.verdict.set_ready();
+                        }
+                        if matches!(task.ready_check, Some(Ok(_))) {
+                            checked.insert(id.clone());
+                        }
                         // A `signal` check's socket, kept while the task runs,
                         // or why it could not be opened.
                         let mut listener = None;
@@ -947,7 +992,7 @@ pub fn run(
                             {
                                 // Only a task that started with a valid check
                                 // exited early; an invalid one never ran.
-                                if matches!(prepared[&id].ready_check, Some(Ok(_)))
+                                if checked.contains(&id)
                                     && !stopping.contains(&id)
                                     && !cancelled.load(Ordering::SeqCst)
                                 {

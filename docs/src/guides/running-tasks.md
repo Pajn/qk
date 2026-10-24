@@ -278,15 +278,15 @@ ready, as in Nx, unless it is also continuous. Such a task holds a
 hold its dependents back until then. A task whose commands exit before it is
 ready ends with their status. With `commands`, `readyWhen` requires
 `parallel`. These tasks are not cached, since their commands outlive any
-result. Unlike Nx, which counts text on stderr as a failure, either stream
-makes a task ready.
+result.
 
 A continuous target's own [`readyWhen`](../reference/targets.md#readywhen),
 an object, is a check for the tasks that depend on it with
 `waitFor: "ready"`, as in Nx 24: they start once a url answers, a port
 accepts a connection, a command succeeds, text appears in the output or the
 task signals that it is ready. A task that waited gets the address of the
-one server it waited for that reported one, in `NX_READY_URL`.
+one server it waited for that reported one, in `NX_READY_URL`, and its own
+check, resolved once those servers are ready, can read it too.
 Waiting holds no `--parallel` slot. qk checks only while a task in the run
 waits. A check that times out fails the task, and the tasks waiting for it
 are skipped. A task that exits before its check passes keeps its own status,
