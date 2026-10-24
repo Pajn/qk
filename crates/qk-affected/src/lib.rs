@@ -6,9 +6,14 @@
 //! change under `projectsAffectedByDependencyUpdates: "auto"`, a project is
 //! touched when what its importer installs differs between the revisions.
 //! Nx diffs versions by package name, so it also reports projects that install
-//! exactly what they did before.
+//! exactly what they did before. A change to nx.json or to a project's
+//! `project.json` likewise touches only what it changes, where Nx touches
+//! every project or every project reading the file; see `nx_json` and
+//! `manifests`.
 
 mod json_diff;
+mod manifests;
+mod nx_json;
 mod projections;
 mod reachability;
 mod subprocess;
@@ -74,6 +79,15 @@ const PLUGIN_LOCKFILES: &[&str] = &[
 /// not package discovery then applies to it, or a root lockfile.
 pub(crate) fn is_project_config(file: &str) -> bool {
     is_manifest(file) || PLUGIN_LOCKFILES.contains(&file)
+}
+
+/// Whether `file` is a `project.json` or `project.local.json`, which counts
+/// by what it changes.
+pub(crate) fn is_project_file(file: &str) -> bool {
+    matches!(
+        file.rsplit('/').next().unwrap_or(file),
+        "project.json" | qk_config::LOCAL_OVERRIDES
+    )
 }
 
 /// Whether `file` is a `project.json` or `package.json`.
@@ -143,8 +157,29 @@ pub enum Cause {
 pub enum Reason {
     /// A changed file lies under the project's root.
     File { file: String },
-    /// `nx.json` changed, which touches every project.
-    NxJson,
+    /// `nx.json`, the file it extends or `nx.local.json` changed what every
+    /// task's key holds, or could not be compared, which touches every
+    /// project.
+    NxJson { file: String, detail: String },
+    /// `targetDefaults` or `namedInputs` changed, and with them these targets
+    /// and named inputs of the project.
+    NxJsonConfiguration {
+        file: String,
+        settings: Vec<String>,
+        targets: Vec<String>,
+        #[serde(rename = "namedInputs")]
+        named_inputs: Vec<String>,
+    },
+    /// A `project.json` or `project.local.json` changed the project's
+    /// configuration: these targets and named inputs, these other keys, or
+    /// what its dependencies or inputs naming projects select.
+    ProjectConfiguration {
+        files: Vec<String>,
+        targets: Vec<String>,
+        #[serde(rename = "namedInputs")]
+        named_inputs: Vec<String>,
+        fields: Vec<String>,
+    },
     /// A changed file matches a `{workspaceRoot}` input of one of its targets.
     WorkspaceInput {
         file: String,
@@ -196,7 +231,31 @@ impl std::fmt::Display for Reason {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             Self::File { file } => write!(f, "{file} changed"),
-            Self::NxJson => write!(f, "nx.json changed, which affects every project"),
+            Self::NxJson { file, detail } => {
+                write!(f, "{file} {detail}, which affects every project")
+            }
+            Self::NxJsonConfiguration {
+                file,
+                settings,
+                targets,
+                named_inputs,
+            } => write!(
+                f,
+                "{file} changed {}, which changes its {}",
+                settings.join(" and "),
+                changed_parts(targets, named_inputs, &[])
+            ),
+            Self::ProjectConfiguration {
+                files,
+                targets,
+                named_inputs,
+                fields,
+            } => write!(
+                f,
+                "{} changed, which changes its {}",
+                files.join(", "),
+                changed_parts(targets, named_inputs, fields)
+            ),
             Self::WorkspaceInput {
                 file,
                 target,
@@ -263,11 +322,28 @@ impl std::fmt::Display for Reason {
     }
 }
 
+/// What changed of a project's configuration, as a reason names it: its
+/// targets and named inputs by name, then its other keys.
+fn changed_parts(targets: &[String], named_inputs: &[String], fields: &[String]) -> String {
+    let mut changed = Vec::new();
+    for (noun, names) in [("target", targets), ("named input", named_inputs)] {
+        match names {
+            [] => {}
+            [name] => changed.push(format!("{noun} {name}")),
+            names => changed.push(format!("{noun}s {}", names.join(", "))),
+        }
+    }
+    changed.extend(fields.iter().cloned());
+    changed.join(" and ")
+}
+
 pub fn analyse(workspace: &Workspace, graph: &ProjectGraph, options: &Options) -> Result<Analysis> {
     let changes = Changes::new(workspace, options)?;
     let mut touches = Touches::default();
     for locator in [
         touched_by_path,
+        touched_by_manifests,
+        touched_by_nx_json,
         touched_implicitly,
         touched_by_deleted_manifests,
         touched_by_lockfile,
@@ -463,6 +539,7 @@ struct Changes<'a> {
     workspace: &'a Workspace,
     before_lockfile: OnceCell<std::result::Result<Lockfile, String>>,
     after_lockfile: OnceCell<std::result::Result<Lockfile, String>>,
+    manifests: OnceCell<manifests::ManifestChange>,
     files: Vec<String>,
     /// The files were named rather than compared, as with `--files`: each
     /// counts as changed whole, as in Nx.
@@ -623,6 +700,7 @@ impl<'a> Changes<'a> {
             workspace,
             before_lockfile: OnceCell::new(),
             after_lockfile: OnceCell::new(),
+            manifests: OnceCell::new(),
             files,
             whole,
             base,
@@ -633,6 +711,12 @@ impl<'a> Changes<'a> {
 
     fn changed(&self, file: &str) -> bool {
         self.files.iter().any(|changed| changed == file)
+    }
+
+    /// The changed project manifests counted by what they change.
+    fn manifests(&self) -> &manifests::ManifestChange {
+        self.manifests
+            .get_or_init(|| manifests::ManifestChange::new(self.workspace, self))
     }
 
     /// Nx's `calculateFileChanges` for one file.
@@ -887,36 +971,186 @@ impl<'w> ProjectRoots<'w> {
     }
 }
 
-/// Each file touches the project whose root most specifically contains it.
+/// Each file touches the project whose root most specifically contains it,
+/// but for a project manifest counted by what it changes, which touches its
+/// project so only where a task of the project reads it, as a target's
+/// default inputs do.
 fn touched_by_path(workspace: &Workspace, changes: &Changes, touches: &mut Touches) -> Result<()> {
     let roots = ProjectRoots::new(workspace);
+    let compared = &changes.manifests().files;
+    let read = manifests_read(workspace, &roots, compared);
     for file in &changes.files {
-        if let Some(project) = roots.owner(file) {
-            touches.touch(project, Reason::File { file: file.clone() });
+        let Some(project) = roots.owner(file) else {
+            continue;
+        };
+        if compared.contains(file) && !read.contains(file) {
+            continue;
+        }
+        touches.touch(project, Reason::File { file: file.clone() });
+    }
+    Ok(())
+}
+
+/// The manifests of `compared` a task of their own project reads, with its
+/// inputs resolved as its cache key resolves them; all of them where the
+/// tasks cannot be resolved.
+fn manifests_read(
+    workspace: &Workspace,
+    roots: &ProjectRoots,
+    compared: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let owners: BTreeMap<&String, &str> = compared
+        .iter()
+        .filter_map(|file| Some((file, roots.owner(file)?)))
+        .collect();
+    let projects: BTreeSet<&str> = owners.values().copied().collect();
+    let requests: Vec<qk_taskgraph::Request> = projects
+        .iter()
+        .flat_map(|project| {
+            workspace.projects[*project]
+                .targets
+                .keys()
+                .map(|target| qk_taskgraph::Request {
+                    project: (*project).to_owned(),
+                    target: target.clone(),
+                    configuration: None,
+                    requested_configuration: None,
+                    args: Vec::new(),
+                })
+        })
+        .collect();
+    if requests.is_empty() {
+        return BTreeSet::new();
+    }
+    let resolved = (|| -> Result<_> {
+        let graph = qk_taskgraph::TaskGraph::build_with(
+            workspace,
+            &requests,
+            qk_taskgraph::BuildOptions {
+                exclude_task_dependencies: true,
+                ..Default::default()
+            },
+        )?;
+        let inputs = qk_cache::resolve_tasks(workspace, &graph, &[])?;
+        Ok((graph, inputs))
+    })();
+    let Ok((graph, inputs)) = resolved else {
+        return compared.clone();
+    };
+    owners
+        .into_iter()
+        .filter(|(file, owner)| {
+            inputs.iter().any(|(id, resolved)| {
+                graph.tasks[id].project == *owner
+                    && resolved.file_inputs().any(|input| input == file.as_str())
+            })
+        })
+        .map(|(file, _)| file.clone())
+        .collect()
+}
+
+/// A `project.json` or `project.local.json` present at both revisions
+/// touches the projects whose configuration it changes, any project's, since
+/// tags and names decide what other projects' inputs and dependencies
+/// select. One that cannot be compared touches its project as any file does.
+fn touched_by_manifests(
+    workspace: &Workspace,
+    changes: &Changes,
+    touches: &mut Touches,
+) -> Result<()> {
+    let change = changes.manifests();
+    let Some(base) = &change.base else {
+        return Ok(());
+    };
+    let files: Vec<String> = change.files.iter().cloned().collect();
+    for (project, difference) in manifests::differences(workspace, base) {
+        touches.touch(
+            &project,
+            Reason::ProjectConfiguration {
+                files: files.clone(),
+                targets: difference.targets,
+                named_inputs: difference.named_inputs,
+                fields: difference.fields,
+            },
+        );
+    }
+    Ok(())
+}
+
+/// `nx.json`, the file it extends or `nx.local.json` touches what it
+/// changes: every project when it changed what every task's key holds, and
+/// otherwise the projects whose targets or named inputs `targetDefaults` and
+/// `namedInputs` resolve differently. Nx 24 touches every project for any
+/// change to `nx.json`, and none for the file it extends.
+fn touched_by_nx_json(
+    workspace: &Workspace,
+    changes: &Changes,
+    touches: &mut Touches,
+) -> Result<()> {
+    match nx_json::NxJsonChange::new(workspace, changes) {
+        nx_json::NxJsonChange::None => {}
+        nx_json::NxJsonChange::All { file, detail } => {
+            touches.all(workspace, Reason::NxJson { file, detail });
+        }
+        nx_json::NxJsonChange::Resolved {
+            file,
+            settings,
+            base,
+        } => {
+            for project in workspace.projects.values() {
+                let before = base.projects.get(&project.name);
+                let targets = changed_names(&project.targets, before.map(|before| &before.targets));
+                let named_inputs = changed_names(
+                    &project.named_inputs,
+                    before.map(|before| &before.named_inputs),
+                );
+                if targets.is_empty() && named_inputs.is_empty() {
+                    continue;
+                }
+                touches.touch(
+                    &project.name,
+                    Reason::NxJsonConfiguration {
+                        file: file.clone(),
+                        settings: settings
+                            .iter()
+                            .map(|setting| (*setting).to_owned())
+                            .collect(),
+                        targets,
+                        named_inputs,
+                    },
+                );
+            }
         }
     }
     Ok(())
 }
 
-/// `nx.json`, or the file it extends, touches every project; a file named by
-/// a `{workspaceRoot}` input touches the projects declaring it.
-///
-/// Nx 24 leaves out the file `nx.json` extends, although what it holds is
-/// as much the workspace's configuration as `nx.json` itself; qk counts it.
+/// The names whose entries differ between `after` and `before`, every name
+/// of `after` when there is no `before`.
+fn changed_names<T: Serialize>(
+    after: &BTreeMap<String, T>,
+    before: Option<&BTreeMap<String, T>>,
+) -> Vec<String> {
+    let value = |entry: Option<&T>| entry.map(|entry| serde_json::to_value(entry).ok());
+    let empty = BTreeMap::new();
+    let before = before.unwrap_or(&empty);
+    after
+        .keys()
+        .chain(before.keys())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|name| value(after.get(*name)) != value(before.get(*name)))
+        .cloned()
+        .collect()
+}
+
+/// A file named by a `{workspaceRoot}` input touches the projects declaring
+/// it, `nx.json` among them.
 fn touched_implicitly(
     workspace: &Workspace,
     changes: &Changes,
     touches: &mut Touches,
 ) -> Result<()> {
-    if changes.changed("nx.json")
-        || workspace
-            .extended
-            .as_ref()
-            .is_some_and(|extended| changes.changed(extended))
-    {
-        touches.all(workspace, Reason::NxJson);
-        return Ok(());
-    }
     // Each glob with the targets declaring it, in the order Nx finds them.
     let mut patterns: BTreeMap<String, Vec<(&str, &str)>> = BTreeMap::new();
     for project in workspace.projects.values() {

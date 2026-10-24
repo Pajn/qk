@@ -34,8 +34,29 @@ edges off.
 - `projectsAffectedByDependencyUpdates` as a list of selectors touches its
   projects only when a lockfile changed; Nx's project selection touches them on
   every change, which reads as a bug, since its task selection checks.
-- A change to the file nx.json `extends` affects every project and task, as a
-  change to nx.json does; Nx does not look at it.
+- nx.json counts through what it changes. Nx hashes it whole into every task,
+  so any change to it, even a comment, misses every task's cache and affects
+  every project and task. qk keys each task by its resolved configuration,
+  which `targetDefaults` and `namedInputs` reach it through, and by the
+  remaining settings that can change a task's work. A change affects every
+  project and task only where it changes those settings; one to
+  `targetDefaults` or `namedInputs` affects the projects whose configuration
+  it changes and the tasks whose key it changes; and one to comments,
+  formatting or settings such as `defaultBase` affects nothing. A tool that
+  reads nx.json declares it as an input. See
+  [What changes the key](guides/cache.md#what-changes-the-key).
+- A change to the file nx.json `extends` counts as a change to nx.json does;
+  Nx does not look at it.
+- Where no input selects a project's `project.json` or `project.local.json`,
+  they count through what they change. Nx hashes the whole configuration of
+  every project whose inputs a task reads, so editing one target misses and
+  affects every task of the project and of its dependents reading it through
+  `^` inputs. qk keys each task by its resolved configuration and what
+  remains of its own project's, such as its root and output paths, so the
+  edit misses and affects the tasks of that target. An input selecting the
+  file, as `{projectRoot}/**/*` does, keys it as in Nx; a workspace opts in
+  by leaving the files out of `default`. See
+  [What changes the key](guides/cache.md#what-changes-the-key).
 - Task selection adds to what Nx selects every task whose qk key changed, by
   the parts of the key Nx does not hash (see below). Nx selects some tasks
   whose qk key is unchanged, such as for a changed tracked output or a
@@ -49,9 +70,10 @@ edges off.
 - The `pnpm-workspace.yaml` qk adds to every key leaves out its resolution
   keys, which reach tasks through the lockfile. A task whose inputs select the
   file keys it whole, as in Nx.
-- Cache keys always include the task's project manifests, and each dependency
-  project's `package.json` without its version, scripts and other metadata,
-  even when the task's inputs leave them out. Nx keys these files only through
+- Cache keys always include the task's project's `package.json`, what its
+  `project.json` decides for the task, and each dependency project's
+  `package.json` without its version, scripts and other metadata, even when
+  the task's inputs leave them out. Nx keys these files only through
   declared inputs. qk keeps them so that a task's scripts, and where a
   dependency's imports resolve, cannot change without a cache miss. See
   [What changes the key](guides/cache.md#what-changes-the-key).

@@ -45,10 +45,10 @@ selects a whole file qk would add, the file counts whole, as the input says. A
 `json` input on such a file adds its fields beside qk's copy rather than
 narrowing it.
 
-Root workspace files (`nx.json`, `.gitignore`, `.nxignore`,
-`pnpm-workspace.yaml`, lockfiles) and the manifests of the task's project
-(`project.json`, `project.local.json` and `package.json`) are always included,
-its scripts and dependency declarations with them. The root tsconfig
+Root workspace files (`.gitignore`, `.nxignore`,
+`pnpm-workspace.yaml`, lockfiles) and the `package.json` of the task's
+project are always included, its scripts and dependency declarations with
+it. The root tsconfig
 (`tsconfig.base.json`, or else `tsconfig.json`) is included as Nx hashes it:
 without `compilerOptions.paths`, so adding or moving a path mapping leaves
 every key as it was. With `selectivelyHashTsConfig: true` in the options of
@@ -62,6 +62,68 @@ below, and the rest of it is the root project's own manifest, so editing a root
 script misses only the root project's tasks. Dotenv files are not, as in Nx: they hold
 per-machine values and credentials, so keying them would keep machines from
 sharing entries; `env` inputs key the variables a task declares.
+
+`nx.json` counts through what it changes rather than by its content, unlike
+in Nx, which hashes it into every task. Merged with the file it `extends` and
+`nx.local.json`, it reaches a task through the task's resolved
+configuration, which the key holds already: `targetDefaults` through its
+definition, and `namedInputs` through what its inputs select, the files, env
+and runtime inputs, `externalDependencies` and dependency outputs they name,
+a dependency's through `^` inputs included. Beside that, the key holds the
+merged settings without `targetDefaults` and `namedInputs`, and without those
+that change no task's work: `$schema`, `extends`, `defaultBase`, `affected`,
+`parallel`, `tui`, `cli` other than `cli.packageManager`, `generators`,
+`release`, `sync`, `s3`, `nxCloudId`, `nxCloudAccessToken`, `nxCloudUrl`,
+`nxCloudEncryptionKey`, `neverConnectToCloud`, `defaultProject`,
+`cacheDirectory`, `maxCacheSize`, `qk:storeServer` and `storeServer`,
+`qk:affectedProfiles` and `affectedProfiles`, `qk:reachability`, and the
+workspace-wide `implicitDependencies`, which Nx no longer supports. Every
+other setting, such as `plugins`, `pluginsConfig`, `workspaceLayout`,
+`tasksRunnerOptions`, which can set `selectivelyHashTsConfig`, or one qk does
+not know, changes every task's key. Comments and formatting change none, and
+neither does a named input edited to select the same files. A tool that reads
+`nx.json` itself declares `{workspaceRoot}/nx.json` as an input, which keys
+the file whole.
+
+A project's `project.json` and `project.local.json` are not added to its
+tasks' keys either. An input that selects one, such as `{projectRoot}/**/*`,
+which `default` holds unless the workspace names it otherwise, keys it as
+the input says, as for any file and as in Nx: whole for a fileset, by its
+fields for a `json` input. Where no input selects them, they count through
+what they change. Their targets reach a task through its definition, and
+their named inputs through what its inputs select. Tags, the project's name
+and `implicitDependencies` reach a task through which projects its inputs
+and dependencies select, and `sourceRoot` through the output paths
+`{project.sourceRoot}` names: the key holds each task's resolved output
+paths. Beside those, a task's key holds what is left of its own project's
+configuration without `name`, `targets`, `namedInputs`, `tags`,
+`implicitDependencies`, `sourceRoot`, `metadata`, `projectType`, `$schema`,
+`generators`, `release` and `qk:reachability`, such as its `root`, and all
+of it when a forwarded argument holds a `{project.*}` token.
+
+To have tasks keyed by their resolved configuration rather than by the
+files, leave the files out of the inputs that select them, as `default`
+does here:
+
+```jsonc
+{
+  "namedInputs": {
+    "default": [
+      "{projectRoot}/**/*",
+      "!{projectRoot}/project.json",
+      "!{projectRoot}/project.local.json"
+    ],
+    "production": ["default", "!{projectRoot}/**/*.spec.ts"]
+  }
+}
+```
+
+A comment, or an edit to one target, then misses only the tasks whose keys
+it changes. The negations hold for every named input built on `default`, such
+as `production`, and for a dependency's files read through `^production`. As
+in Nx, a negation leaves the file out of all of the task's filesets, so a
+target that also names `{projectRoot}/project.json` does not read it back;
+one whose inputs do not build on `default` names it to key it whole.
 
 The `package.json` of each project the task's project depends on, directly or
 not, counts by what it decides for its dependents, such as where their imports

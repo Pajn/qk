@@ -1668,11 +1668,7 @@ fn execute_narrowed(
         .filter(|_| !skip_cache && !options.dry_run && options.graph_target().is_none())
         .map(|environment| qk_cache::expectations::fetch(workspace, environment));
     let graph = if requests.is_empty() && options.graph_target().is_some() {
-        TaskGraph {
-            roots: Default::default(),
-            tasks: Default::default(),
-            cycles: Default::default(),
-        }
+        TaskGraph::default()
     } else {
         TaskGraph::build_with(
             workspace,

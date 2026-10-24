@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::minimatch::Minimatch;
-use crate::{read_optional_json, relative_path};
+use crate::{ConfigReader, parse_json, read_optional_json, relative_path};
 
 /// Find the workspace containing `start`, as Nx's `workspaceRoot` does
 /// first: `NX_WORKSPACE_ROOT_PATH`, else the nearest directory with an
@@ -88,7 +88,12 @@ impl Workspaces {
     /// `workspaces`, `pnpm-workspace.yaml` and `lerna.json` together, each
     /// naming package.json files, and the root package.json when it has an
     /// `nx` object.
-    fn read(root: &Path, package: Option<&Value>, warnings: &mut Vec<String>) -> Result<Self> {
+    fn read(
+        root: &Path,
+        read: ConfigReader,
+        package: Option<&Value>,
+        warnings: &mut Vec<String>,
+    ) -> Result<Self> {
         // Nx only reads the variable when the workspace has no root
         // package.json.
         let all = package.is_none()
@@ -111,9 +116,7 @@ impl Workspaces {
         // Nx reads these only beside a root package.json; qk reads them
         // without one too.
         let pnpm_path = root.join("pnpm-workspace.yaml");
-        if pnpm_path.is_file() {
-            let text = std::fs::read_to_string(&pnpm_path)
-                .with_context(|| format!("cannot read {}", pnpm_path.display()))?;
+        if let Some(text) = read(&pnpm_path)? {
             match serde_yaml_ng::from_str::<Option<PnpmWorkspace>>(&text) {
                 Ok(workspace) => patterns.extend(
                     workspace
@@ -123,8 +126,9 @@ impl Workspaces {
                 Err(error) => warnings.push(format!("cannot parse pnpm-workspace.yaml: {error}")),
             }
         }
-        if root.join("lerna.json").is_file() {
-            match read_optional_json(&root.join("lerna.json")) {
+        let lerna_path = root.join("lerna.json");
+        if let Some(text) = read(&lerna_path)? {
+            match parse_json(&text, &lerna_path.display().to_string()).map(Some) {
                 Ok(lerna) => {
                     let packages: Vec<String> = lerna
                         .as_ref()
@@ -229,11 +233,18 @@ type Found = std::sync::Mutex<Result<BTreeMap<PathBuf, (bool, Option<bool>)>>>;
 /// Each directory holding a project, and whether the package manager's
 /// workspaces take in its package.json. As in Nx, a package.json is a
 /// project when the workspaces take it in or a project.json is beside it.
+///
+/// The workspace files are read with `read`, so that another revision's
+/// package.json, pnpm-workspace.yaml and lerna.json decide what is a project.
 pub(crate) fn project_directories(
     root: &Path,
+    read: ConfigReader,
     warnings: &mut Vec<String>,
 ) -> Result<BTreeMap<PathBuf, bool>> {
-    let package = read_optional_json(&root.join("package.json"))?;
+    let package_path = root.join("package.json");
+    let package = read(&package_path)?
+        .map(|text| parse_json(&text, &package_path.display().to_string()))
+        .transpose()?;
     if package.is_none()
         && !root.join("pnpm-workspace.yaml").is_file()
         && !root.join("nx.json").is_file()
@@ -244,7 +255,7 @@ pub(crate) fn project_directories(
             root.display()
         );
     }
-    let workspaces = Workspaces::read(root, package.as_ref(), warnings)?;
+    let workspaces = Workspaces::read(root, read, package.as_ref(), warnings)?;
     let mut walker = WalkBuilder::new(root);
     walker
         // Nx reads .nxignore with gitignore semantics, alongside .gitignore,

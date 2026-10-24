@@ -172,6 +172,16 @@ fn names_the_definition_fields_that_differ() {
 }
 
 #[test]
+fn names_the_nx_json_settings_that_differ() {
+    let inputs = |settings: Value| json!({"inferred": {"files": {}, "settings": settings}});
+    let before = inputs(json!({"plugins": [], "workspaceLayout": {"appsDir": "apps"}}));
+    let after = inputs(json!({"plugins": ["@nx/js"], "workspaceLayout": {"appsDir": "apps"}}));
+    let cause = diff(&before, &after);
+    assert_eq!(cause.changed, ["configuration"]);
+    assert_eq!(cause.values, ["nx.json plugins"]);
+}
+
+#[test]
 fn critical_path_follows_the_longest_dependency_chain() {
     let tasks = vec![
         task("lib:build", None, 0, 50, &[]),

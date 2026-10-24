@@ -1435,3 +1435,85 @@ fn finds_the_workspace_root_as_nx_does() {
         root.join("repo")
     );
 }
+
+#[test]
+fn a_workspace_of_another_revision_reads_its_package_json_files_through_the_reader() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    write(root, "nx.json", "{}");
+    write(root, "package.json", r#"{"name": "root"}"#);
+    write(
+        root,
+        "libs/lib/package.json",
+        r#"{"name": "lib", "scripts": {"build": "echo head"}, "nx": {"tags": ["head"]}}"#,
+    );
+    // The package.json files as another revision held them. That revision's
+    // workspaces take in libs; the one on disk takes in nothing.
+    let read = |path: &Path| -> anyhow::Result<Option<String>> {
+        let text = match path.file_name().and_then(|name| name.to_str()) {
+            Some("package.json") if path.ends_with("libs/lib/package.json") => {
+                r#"{"name": "lib", "scripts": {"build": "echo base"}, "nx": {"tags": ["base"]}}"#
+                    .to_owned()
+            }
+            Some("package.json") => {
+                r#"{"name": "root", "packageManager": "npm@10.0.0", "workspaces": ["libs/*"]}"#
+                    .to_owned()
+            }
+            _ => return Ok(std::fs::read_to_string(path).ok()),
+        };
+        Ok(Some(text))
+    };
+    let workspace = Workspace::load_with(root, &read).unwrap();
+    let lib = &workspace.projects["lib"];
+    assert!(lib.tags.contains(&"base".to_owned()), "{:?}", lib.tags);
+    assert_eq!(workspace.packages["lib"].scripts["build"], "echo base");
+    assert_eq!(workspace.package_manager.as_deref(), Some("npm@10.0.0"));
+}
+
+#[test]
+fn a_workspace_of_another_revision_extends_a_file_only_that_revision_holds() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    write(root, "nx.json", "{}");
+    write(
+        root,
+        "libs/lib/project.json",
+        r#"{"name": "lib", "targets": {"build": {}}}"#,
+    );
+    // That revision's nx.json extends a file the working tree no longer has.
+    let read = |path: &Path| -> anyhow::Result<Option<String>> {
+        Ok(match path.file_name().and_then(|name| name.to_str()) {
+            Some("nx.json") => Some(r#"{"extends": "./presets/base.json"}"#.to_owned()),
+            Some("base.json") => {
+                Some(r#"{"targetDefaults": {"build": {"command": "echo base"}}}"#.to_owned())
+            }
+            _ => std::fs::read_to_string(path).ok(),
+        })
+    };
+    let workspace = Workspace::load_with(root, &read).unwrap();
+    assert_eq!(
+        workspace.projects["lib"].targets["build"].options["command"],
+        json!("echo base")
+    );
+}
+
+#[test]
+fn an_extended_file_another_revision_cannot_read_fails_the_load() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    write(root, "nx.json", "{}");
+    write(root, "presets/base.json", r#"{"targetDefaults": {}}"#);
+    let read = |path: &Path| -> anyhow::Result<Option<String>> {
+        match path.file_name().and_then(|name| name.to_str()) {
+            Some("nx.json") => Ok(Some(r#"{"extends": "./presets/base"}"#.to_owned())),
+            // Neither a file nor no file: the revision cannot be read.
+            Some(name) if name.starts_with("base") => anyhow::bail!("revision unreadable"),
+            _ => Ok(std::fs::read_to_string(path).ok()),
+        }
+    };
+    let error = Workspace::load_with(root, &read).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("revision unreadable"),
+        "{error:#}"
+    );
+}

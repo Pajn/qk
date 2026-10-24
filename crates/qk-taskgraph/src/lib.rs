@@ -151,13 +151,19 @@ impl Dependencies {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 pub struct TaskGraph {
     pub roots: BTreeSet<String>,
     pub tasks: BTreeMap<String, Task>,
     /// The cycles broken under `ignore_cycles`, each as the tasks around it.
     #[serde(skip)]
     pub cycles: Vec<Vec<String>>,
+    /// What the graph was built from, so that [`TaskGraph::rebuild`] can
+    /// build it again from another configuration.
+    #[serde(skip)]
+    pub requests: Vec<Request>,
+    #[serde(skip)]
+    pub options: BuildOptions,
 }
 
 /// Nx's options for building a task graph.
@@ -213,6 +219,8 @@ impl TaskGraph {
             roots,
             tasks: builder.tasks,
             cycles: builder.cycles,
+            requests: requests.to_vec(),
+            options,
         };
         if !graph.cycles.is_empty() {
             graph.make_acyclic();
@@ -226,6 +234,14 @@ impl TaskGraph {
             }
         }
         Ok(graph)
+    }
+
+    /// The graph the same requests make of `workspace`, with `extra`
+    /// requested beside them.
+    pub fn rebuild(&self, workspace: &Workspace, extra: &[Request]) -> Result<Self> {
+        let mut requests = self.requests.clone();
+        requests.extend_from_slice(extra);
+        Self::build_with(workspace, &requests, self.options)
     }
 
     /// Nx's `makeAcyclic`: from each task, depth first, a dependency on a

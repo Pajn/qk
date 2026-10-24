@@ -33,10 +33,9 @@ order they are declared. A bare package name without `exports` resolves to
 its `main`, else `index`. As in Nx, each setting
 nx.json declares replaces the extended file's whole, and the extended file's
 own `extends` is not followed. `nx.local.json` merges over the result. A
-change to an extended file inside the workspace affects every project and
-every task's key, as a change to nx.json does. It is keyed by its real path,
-so a package linked into `node_modules`, as pnpm links them, is keyed where
-it is installed.
+change to the extended file counts as a change to nx.json does: through what
+it changes, by the merged settings (see
+[What changes the key](../guides/cache.md#what-changes-the-key)).
 
 ## `namedInputs`
 
@@ -249,4 +248,5 @@ and ignores `s3` and `storeServer`, so `s3` can stay for Nx's own cache plugin.
 A machine-specific overlay on `nx.json`. `targetDefaults` merge per entry,
 `namedInputs` merge by name, and other settings replace their checked-in
 values. Add the file to your workspace's `.gitignore`. Nx does not read it.
-Every run reports the overlay and every task's key includes it.
+Every run reports the overlay, and every task's key includes what it changes,
+as for nx.json.

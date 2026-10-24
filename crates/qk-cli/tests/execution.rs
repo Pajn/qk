@@ -3090,6 +3090,103 @@ fn the_sandbox_reports_and_refuses_what_a_task_does_not_declare() {
     assert!(temp.path().join("dist/out.txt").is_file());
 }
 
+/// Configuration files a key holds by what they change, or not at all, are
+/// read only as declared: as a file input, or a `json` input selecting the
+/// fields the task reads.
+#[cfg(unix)]
+#[test]
+fn the_sandbox_lets_a_task_read_configuration_only_as_declared() {
+    let sources = json!("{projectRoot}/src/**/*");
+    let temp = fixture(json!({
+        "lock": {"command": "cat pnpm-lock.yaml", "inputs": [sources]},
+        "lockDeclared": {
+            "command": "cat pnpm-lock.yaml",
+            "inputs": [sources, "{workspaceRoot}/pnpm-lock.yaml"]
+        },
+        "manifest": {"command": "cat package.json", "inputs": [sources]},
+        "settings": {"command": "cat nx.json", "inputs": [sources]},
+        "settingsDeclared": {
+            "command": "cat nx.json",
+            "inputs": [sources, {"json": "{workspaceRoot}/nx.json", "fields": ["namedInputs"]}]
+        },
+    }));
+    fs::create_dir_all(temp.path().join("src")).unwrap();
+    fs::write(temp.path().join("src/in.txt"), "in").unwrap();
+    fs::write(
+        temp.path().join("pnpm-lock.yaml"),
+        "lockfileVersion: '9.0'\n",
+    )
+    .unwrap();
+    fs::write(temp.path().join("package.json"), r#"{"name": "root"}"#).unwrap();
+    let enforced = |target: &str| {
+        run(
+            temp.path(),
+            &["run", &format!("app:{target}"), "--sandbox=enforce"],
+        )
+        .status
+        .success()
+    };
+    assert!(!enforced("lock"));
+    assert!(enforced("lockDeclared"));
+    assert!(!enforced("settings"));
+    assert!(enforced("settingsDeclared"));
+    // The root project's own package.json is keyed whole, so its tasks may
+    // read it.
+    assert!(enforced("manifest"));
+    #[cfg(target_os = "macos")]
+    {
+        let _audit = AUDIT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let report = temp.path().join("sandbox.json");
+        let args = [
+            "run",
+            "app:settings",
+            "--sandbox",
+            "--sandbox-report",
+            report.to_str().unwrap(),
+        ];
+        success(run(temp.path(), &args));
+        let findings: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+        assert_eq!(
+            findings["tasks"]["app:settings"]["undeclaredReads"],
+            json!(["nx.json"])
+        );
+    }
+}
+
+/// An ignored `project.local.json` is no file a fileset selects, so the
+/// directory holding it is not allowed whole for a task reading every other
+/// file in it.
+#[cfg(unix)]
+#[test]
+fn the_sandbox_keeps_an_ignored_project_local_json_out_of_whole_directories() {
+    let temp = fixture(json!({}));
+    fs::write(temp.path().join(".gitignore"), "project.local.json\n").unwrap();
+    let lib = temp.path().join("libs/lib");
+    fs::create_dir_all(lib.join("src")).unwrap();
+    fs::write(lib.join("src/index.ts"), "export {};\n").unwrap();
+    let project = |inputs: Value| {
+        json!({"name": "lib", "targets": {"read": {
+            "command": "cat libs/lib/project.local.json",
+            "inputs": inputs
+        }}})
+        .to_string()
+    };
+    fs::write(lib.join("project.local.json"), "{}").unwrap();
+    for (inputs, allowed) in [
+        (json!(["{projectRoot}/**/*"]), false),
+        (
+            json!(["{projectRoot}/**/*", {"fileset": "{projectRoot}/project.local.json", "includeIgnored": true}]),
+            true,
+        ),
+    ] {
+        fs::write(lib.join("project.json"), project(inputs.clone())).unwrap();
+        let output = run(temp.path(), &["run", "lib:read", "--sandbox=enforce"]);
+        assert_eq!(output.status.success(), allowed, "{inputs}");
+    }
+}
+
 /// Only a task that started is listed as running unsandboxed: one skipped
 /// after its dependency failed never ran.
 #[cfg(target_os = "macos")]

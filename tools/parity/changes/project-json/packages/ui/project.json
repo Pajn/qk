@@ -1,0 +1,23 @@
+{
+  // A comment, and one target edited: the test task declares its coverage.
+  "name": "ui",
+  "tags": [
+    "scope:shared",
+    "type:ui"
+  ],
+  "targets": {
+    "build": {
+      "configurations": {
+        "production": {}
+      }
+    },
+    "test": {
+      "outputs": ["{projectRoot}/coverage"]
+    },
+    "lint": {},
+    "check": {},
+    "format": {
+      "executor": "nx:noop"
+    }
+  }
+}

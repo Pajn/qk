@@ -158,6 +158,10 @@ pub struct Workspace {
     /// The `nx.local.json` and `project.local.json` files merged in,
     /// workspace-relative.
     pub local_overrides: Vec<String>,
+    /// Each project's configuration directory, workspace-relative, `.` for
+    /// the root: where its `project.json` and `project.local.json` are read,
+    /// which a `root` it gives can move away from its root.
+    pub configuration_directories: BTreeMap<String, String>,
     /// What Nx would warn about while reading the workspace.
     pub warnings: Vec<String>,
 }
@@ -171,8 +175,213 @@ pub const LOCAL_OVERRIDES: &str = "project.local.json";
 /// Merged over nx.json in the same way, for the workspace.
 pub const LOCAL_WORKSPACE: &str = "nx.local.json";
 
+/// Reads the workspace and project configuration files for
+/// [`Workspace::load_with`]: the text of a file by its absolute path, or
+/// `None` when it is absent.
+pub type ConfigReader<'a> = &'a dyn Fn(&Path) -> Result<Option<String>>;
+
+/// The files `load` reads, from disk.
+fn read_disk(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("cannot read {}", path.display())),
+    }
+}
+
+/// The nx.json keys [`WorkspaceConfig::keyed_settings`] leaves out. Two reach
+/// a task only through its resolved configuration, which its key holds:
+/// `targetDefaults` through its definition, and `namedInputs` through what
+/// its inputs select. The rest change no task's work: where changes are
+/// compared from, how many tasks run at once and how they are shown,
+/// generators, releases, sync, the remote cache, Nx Cloud, the default
+/// project, and qk's own affected selection.
+pub const UNKEYED_SETTINGS: &[&str] = &[
+    "targetDefaults",
+    "namedInputs",
+    "$schema",
+    "extends",
+    "defaultBase",
+    "affected",
+    "parallel",
+    "tui",
+    "cli",
+    "generators",
+    "release",
+    "sync",
+    "s3",
+    "nxCloudId",
+    "nxCloudAccessToken",
+    "nxCloudUrl",
+    "nxCloudEncryptionKey",
+    "neverConnectToCloud",
+    "defaultProject",
+    "qk:storeServer",
+    "qk:affectedProfiles",
+    "qk:reachability",
+    "storeServer",
+    "affectedProfiles",
+    "cacheDirectory",
+    "maxCacheSize",
+    // No longer supported, as in Nx, and ignored with a warning.
+    "implicitDependencies",
+];
+
+/// nx.json, the file it extends and nx.local.json together, and where the
+/// extended file is.
+struct ConfigFiles {
+    config: WorkspaceConfig,
+    extended: Option<PathBuf>,
+    extended_specifier: Option<String>,
+    extended_candidate: Option<PathBuf>,
+    has_local: bool,
+}
+
+/// nx.json with the file it extends and nx.local.json merged in, each read
+/// with `read`, under the canonical `root`.
+fn read_config(root: &Path, read: ConfigReader) -> Result<ConfigFiles> {
+    let json = |path: &Path| -> Result<Option<Value>> {
+        read(path)?
+            .map(|text| parse_json(&text, &path.display().to_string()))
+            .transpose()
+    };
+    let mut nx_json = json(&root.join("nx.json"))?;
+    // As in Nx, the extended file's settings are replaced, not merged, by
+    // nx.json's own, and its own `extends` is not followed.
+    let mut extended = None;
+    let mut extended_specifier = None;
+    let mut extended_candidate = None;
+    if let Some(Value::Object(own)) = &mut nx_json
+        && let Some(specifier) = own.get("extends")
+    {
+        let specifier = specifier
+            .as_str()
+            .context("nx.json: extends must be a string")?;
+        let exists = |path: &Path| read(path).map(|text| text.is_some());
+        let resolved = extends::resolve(root, specifier, &exists)?;
+        let path = resolved.path;
+        extended_candidate = Some(resolved.candidate);
+        extended_specifier = Some(specifier.to_owned());
+        let Some(Value::Object(mut base)) = json(&path)? else {
+            bail!("cannot read {}", path.display());
+        };
+        base.extend(std::mem::take(own));
+        *own = base;
+        extended = Some(path);
+    }
+    let local = json(&root.join(LOCAL_WORKSPACE))?;
+    let has_local = local.is_some();
+    let nx_json = match (nx_json, local) {
+        (base, Some(local)) => Some(
+            normalize::workspace(
+                base.unwrap_or_else(|| Value::Object(Default::default())),
+                local,
+            )
+            .with_context(|| format!("invalid {LOCAL_WORKSPACE}"))?,
+        ),
+        (base, None) => base,
+    };
+    let config: WorkspaceConfig = match nx_json {
+        Some(value) => serde_json::from_value(value).context("invalid nx.json configuration")?,
+        None => WorkspaceConfig::default(),
+    };
+    for (name, defaults) in &config.target_defaults {
+        let valid = match defaults {
+            Value::Object(_) => true,
+            Value::Array(entries) => entries.iter().all(Value::is_object),
+            _ => false,
+        };
+        if !valid {
+            bail!("nx.json: targetDefaults.{name} must be an object or an array of objects");
+        }
+    }
+    Ok(ConfigFiles {
+        config,
+        extended,
+        extended_specifier,
+        extended_candidate,
+        has_local,
+    })
+}
+
+impl WorkspaceConfig {
+    /// The configuration of the workspace at the canonical `root`, with
+    /// nx.json, the file it extends and nx.local.json each read with `read`
+    /// and merged as [`Workspace::load`] merges them.
+    pub fn read(root: &Path, read: ConfigReader) -> Result<Self> {
+        Ok(read_config(root, read)?.config)
+    }
+
+    /// The settings that can change a task's work other than through its
+    /// resolved configuration: every key but [`UNKEYED_SETTINGS`], and of
+    /// `cli` its `packageManager`, which decides how package scripts run.
+    pub fn keyed_settings(&self) -> Map<String, Value> {
+        let mut settings: Map<String, Value> = self
+            .extra
+            .iter()
+            .filter(|(key, _)| !UNKEYED_SETTINGS.contains(&key.as_str()))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        if let Some(manager) = self
+            .extra
+            .get("cli")
+            .and_then(|cli| cli.get("packageManager"))
+        {
+            settings.insert(
+                "cli".into(),
+                serde_json::json!({ "packageManager": manager }),
+            );
+        }
+        settings
+    }
+}
+
+/// The project keys [`Project::keyed_settings`] leaves out, each of which
+/// reaches a task only through what its key holds otherwise or changes no
+/// task's work: the name is in its id; `targets` reach it through its
+/// definition and `namedInputs` through what its inputs select; `tags` and
+/// `implicitDependencies` through which projects its inputs and dependencies
+/// select; `sourceRoot` through the output paths `{project.sourceRoot}`
+/// names; the rest describe the project, or configure qk's affected
+/// selection.
+pub const UNKEYED_PROJECT_SETTINGS: &[&str] = &[
+    "name",
+    "targets",
+    "namedInputs",
+    "tags",
+    "implicitDependencies",
+    "sourceRoot",
+    "metadata",
+    "projectType",
+    "$schema",
+    "generators",
+    "release",
+    "qk:reachability",
+];
+
+impl Project {
+    /// The configuration that can change a task of the project other than
+    /// through its resolved configuration: every key but
+    /// [`UNKEYED_PROJECT_SETTINGS`], such as its `root`.
+    pub fn keyed_settings(&self) -> Map<String, Value> {
+        let Ok(Value::Object(mut settings)) = serde_json::to_value(self) else {
+            unreachable!("a project serializes as an object");
+        };
+        settings.retain(|key, _| !UNKEYED_PROJECT_SETTINGS.contains(&key.as_str()));
+        settings
+    }
+}
+
 impl Workspace {
     pub fn load(root: &Path) -> Result<Self> {
+        Self::load_with(root, &read_disk)
+    }
+
+    /// As [`Workspace::load`], with nx.json, the file it extends,
+    /// nx.local.json, each project's `project.json` and `project.local.json`
+    /// and every package.json read with `read`: the workspace another revision
+    /// of those files makes.
+    pub fn load_with(root: &Path, read: ConfigReader) -> Result<Self> {
         let root = root
             .canonicalize()
             .map(simplified)
@@ -180,59 +389,22 @@ impl Workspace {
         if !root.is_dir() {
             bail!("workspace is not a directory: {}", root.display());
         }
-        let mut nx_json = read_optional_json(&root.join("nx.json"))?;
-        // As in Nx, the extended file's settings are replaced, not merged, by
-        // nx.json's own, and its own `extends` is not followed.
-        let mut extended = None;
-        let mut extended_specifier = None;
-        let mut extended_candidate = None;
-        if let Some(Value::Object(own)) = &mut nx_json
-            && let Some(specifier) = own.get("extends")
-        {
-            let specifier = specifier
-                .as_str()
-                .context("nx.json: extends must be a string")?;
-            let resolved = extends::resolve(&root, specifier)?;
-            let path = resolved.path;
-            extended_candidate = Some(resolved.candidate);
-            extended_specifier = Some(specifier.to_owned());
-            let Some(Value::Object(mut base)) = read_optional_json(&path)? else {
-                bail!("cannot read {}", path.display());
-            };
-            base.extend(std::mem::take(own));
-            *own = base;
-            extended = Some(path);
-        }
-        let local = read_optional_json(&root.join(LOCAL_WORKSPACE))?;
-        let has_local = local.is_some();
-        let nx_json = match (nx_json, local) {
-            (base, Some(local)) => Some(
-                normalize::workspace(
-                    base.unwrap_or_else(|| Value::Object(Default::default())),
-                    local,
-                )
-                .with_context(|| format!("invalid {LOCAL_WORKSPACE}"))?,
-            ),
-            (base, None) => base,
+        let ConfigFiles {
+            config,
+            extended,
+            extended_specifier,
+            extended_candidate,
+            has_local,
+        } = read_config(&root, read)?;
+        // Every manifest through `read`, so that a workspace of another
+        // revision is made of that revision's package.json files too.
+        let package_json = |path: &Path| -> Result<Option<Value>> {
+            read(path)?
+                .map(|text| parse_json(&text, &path.display().to_string()))
+                .transpose()
         };
-        let config: WorkspaceConfig = match nx_json {
-            Some(value) => {
-                serde_json::from_value(value).context("invalid nx.json configuration")?
-            }
-            None => WorkspaceConfig::default(),
-        };
-        for (name, defaults) in &config.target_defaults {
-            let valid = match defaults {
-                Value::Object(_) => true,
-                Value::Array(entries) => entries.iter().all(Value::is_object),
-                _ => false,
-            };
-            if !valid {
-                bail!("nx.json: targetDefaults.{name} must be an object or an array of objects");
-            }
-        }
         let mut workspace = Self {
-            package_manager: read_optional_json(&root.join("package.json"))?
+            package_manager: package_json(&root.join("package.json"))?
                 .and_then(|value| value.get("packageManager").cloned())
                 .map(serde_json::from_value)
                 .transpose()
@@ -266,6 +438,7 @@ impl Workspace {
             } else {
                 Vec::new()
             },
+            configuration_directories: BTreeMap::new(),
             warnings: Vec::new(),
         };
         if workspace
@@ -284,14 +457,25 @@ impl Workspace {
         let package_manager = workspace.package_manager_name().unwrap_or("npm");
         let mut roots = BTreeMap::new();
         for (directory, in_workspaces) in
-            discovery::project_directories(&root, &mut workspace.warnings)?
+            discovery::project_directories(&root, read, &mut workspace.warnings)?
         {
-            let project_json = read_optional_json(&directory.join("project.json"))?;
-            let local = read_optional_json(&directory.join(LOCAL_OVERRIDES))?;
-            let package: Option<Package> = read_optional_json(&directory.join("package.json"))?
+            let manifest = |name: &str| -> Result<Option<Value>> {
+                let path = directory.join(name);
+                read(&path)?
+                    .map(|text| parse_json(&text, &path.display().to_string()))
+                    .transpose()
+            };
+            let project_json = manifest("project.json")?;
+            let local = manifest(LOCAL_OVERRIDES)?;
+            let package: Option<Package> = package_json(&directory.join("package.json"))?
                 .map(serde_json::from_value)
                 .transpose()
                 .with_context(|| format!("invalid {}", directory.join("package.json").display()))?;
+            // A project.json `read` holds absent, as at a revision before it
+            // was added, makes no project of a directory with nothing else.
+            if project_json.is_none() && package.is_none() {
+                continue;
+            }
             let project = normalize::project(
                 &normalize::Origin {
                     root: &root,
@@ -330,7 +514,7 @@ impl Workspace {
                 package
             } else {
                 let manifest = root.join(&project.root).join("package.json");
-                read_optional_json(&manifest)?
+                package_json(&manifest)?
                     .map(serde_json::from_value)
                     .transpose()
                     .with_context(|| format!("invalid {}", manifest.display()))?
@@ -338,6 +522,9 @@ impl Workspace {
             if let Some(package) = package {
                 workspace.packages.insert(project.name.clone(), package);
             }
+            workspace
+                .configuration_directories
+                .insert(project.name.clone(), relative_path(&root, &directory)?);
             if local.is_some() {
                 let root = match relative_path(&root, &directory)?.as_str() {
                     "." => String::new(),

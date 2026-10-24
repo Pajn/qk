@@ -5,7 +5,12 @@
 //! and the installed packages it hashes, which a lockfile change moves under
 //! `projectsAffectedByDependencyUpdates: "all"`. qk's key adds the lockfile
 //! installs of its importers and `externalDependencies`, `pnpm-workspace.yaml`
-//! outside its resolution keys and dependency manifests. A task reading the
+//! outside its resolution keys and dependency manifests. Nx hashes nx.json
+//! whole into every task; qk's key does not, so a change to it reaches a task
+//! only as the key holds it: through the settings every key holds, or through
+//! the task's definition and resolved inputs, which `targetDefaults` and
+//! `namedInputs` decide. A project's `project.json`, which Nx hashes as a
+//! file wherever a glob selects it, counts the same way. A task reading the
 //! declared outputs of an affected task is affected too; as in Nx, depending
 //! on a task without reading its outputs carries nothing. Env and runtime
 //! inputs count as unchanged, since the base revision's environment is
@@ -17,9 +22,10 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
 use anyhow::Result;
 use qk_config::Workspace;
 use qk_lockfile::Lockfile;
-use qk_taskgraph::TaskGraph;
+use qk_taskgraph::{Request, TaskGraph};
 use serde::Serialize;
 
+use crate::nx_json::NxJsonChange;
 use crate::reachability::{self, Configs, TaskDecision};
 use crate::{Changes, FileChange, Options, projections};
 
@@ -93,6 +99,25 @@ pub enum TaskReason {
     /// The root `package.json` changed in a way that moves every installed
     /// package.
     RootPackage { detail: String },
+    /// `nx.json`, the file it extends or `nx.local.json` changed what every
+    /// task's key holds, or could not be compared.
+    NxJson { file: String, detail: String },
+    /// nx.json's `targetDefaults` or `namedInputs`, which `settings` names,
+    /// or a project manifest, with `settings` empty, changed the task's
+    /// definition or what its key holds of its project's configuration.
+    Definition { file: String, settings: Vec<String> },
+    /// As for `Definition`, a change to what the task's inputs select, its
+    /// own or a dependency's through `^`, or to the files qk adds for it.
+    ResolvedInputs { file: String, settings: Vec<String> },
+}
+
+/// The settings a reason names, after the file, if any.
+fn changed(settings: &[String]) -> String {
+    if settings.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", settings.join(" and "))
+    }
 }
 
 impl std::fmt::Display for TaskReason {
@@ -132,6 +157,17 @@ impl std::fmt::Display for TaskReason {
                 write!(f, "package.json changed {path}, which moves {name}")
             }
             Self::RootPackage { detail } => write!(f, "package.json {detail}"),
+            Self::NxJson { file, detail } => write!(f, "{file} {detail}"),
+            Self::Definition { file, settings } => write!(
+                f,
+                "{file} changed{}, which changes this task's configuration",
+                changed(settings)
+            ),
+            Self::ResolvedInputs { file, settings } => write!(
+                f,
+                "{file} changed{}, which changes what this task's inputs select",
+                changed(settings)
+            ),
         }
     }
 }
@@ -182,19 +218,21 @@ pub(crate) fn analyse(
     let ignore = qk_cache::SourceIgnore::new(&workspace.root)?;
     // Changed files projects are created from, by whether they still exist:
     // a deleted one touches the tasks reading what depended on the project it
-    // removed, a changed project.json or package.json the configuration of
-    // the project owning it. A changed lockfile configures no project;
-    // dependency updates decide what it affects.
+    // removed, a changed manifest the configuration of the project owning
+    // it, unless its project.json or project.local.json counts by what it
+    // changes. A changed lockfile configures no project; dependency updates
+    // decide what it affects.
     let roots = crate::ProjectRoots::new(workspace);
     let mut deleted = Vec::new();
     let mut reconfigured: BTreeMap<&str, &String> = BTreeMap::new();
     for file in &changes.files {
-        if !crate::is_project_config(file) || ignore.matches(file) {
+        let config = crate::is_project_config(file);
+        if !(config || crate::is_project_file(file)) || ignore.matches(file) {
             continue;
         }
-        if !workspace.root.join(file).exists() {
+        if config && !workspace.root.join(file).exists() {
             deleted.push(file.clone());
-        } else if crate::is_manifest(file)
+        } else if (crate::is_manifest(file) || crate::is_project_file(file))
             && let Some(project) = roots.owner(file)
         {
             reconfigured.entry(project).or_insert(file);
@@ -211,6 +249,12 @@ pub(crate) fn analyse(
         .transpose()?;
     let npm = crate::root_package_changes(workspace, &changes);
     let resolved = qk_cache::resolve_tasks(workspace, graph, &changes.files)?;
+    let nx_json = nx_json_reasons(workspace, graph, &changes, &resolved);
+    let project_files = manifest_reasons(workspace, graph, &changes, &resolved);
+    if project_files.is_some() {
+        let compared = &changes.manifests().files;
+        reconfigured.retain(|_, file| !compared.contains(*file));
+    }
     // The lockfile at both revisions, when it changed and both can be read.
     let lockfiles = if changes.files.iter().any(|file| file == "pnpm-lock.yaml") {
         match changes.change("pnpm-lock.yaml") {
@@ -404,6 +448,8 @@ pub(crate) fn analyse(
         if let Some(file) = relinked.get(&task.project) {
             reasons.push(TaskReason::Relinked { file: file.clone() });
         }
+        reasons.extend(nx_json.of(id));
+        reasons.extend(project_files.as_ref().and_then(|reasons| reasons.of(id)));
         if !reasons.is_empty() {
             touched.insert(id.clone(), reasons);
         }
@@ -445,6 +491,167 @@ pub(crate) fn analyse(
         tasks,
         reachability: decisions,
     })
+}
+
+/// What a configuration change does to the tasks of a graph.
+enum ConfigurationReasons {
+    None,
+    /// Every task, for this reason.
+    All(TaskReason),
+    /// The tasks whose keys it moves, each with its reason.
+    Tasks(BTreeMap<String, TaskReason>),
+}
+
+impl ConfigurationReasons {
+    fn of(&self, id: &str) -> Option<TaskReason> {
+        match self {
+            Self::None => None,
+            Self::All(reason) => Some(reason.clone()),
+            Self::Tasks(tasks) => tasks.get(id).cloned(),
+        }
+    }
+}
+
+/// How a task's key differs under another configuration.
+enum Reconfigured {
+    /// Its definition, or what it holds of its project's configuration.
+    Definition,
+    /// What its inputs select, or the files qk adds for it.
+    Inputs,
+}
+
+/// The tasks of `graph` whose keys differ when `base`, the workspace another
+/// configuration makes of the same files, replaces `workspace`. The base
+/// graph is built from the same requests, so that dependents forward the
+/// same options; a task only the head graph reaches is requested on its own
+/// there, and a task it cannot make differs.
+fn reconfigured(
+    workspace: &Workspace,
+    graph: &TaskGraph,
+    changes: &Changes,
+    resolved: &BTreeMap<String, qk_cache::Resolved>,
+    base: &Workspace,
+) -> Result<BTreeMap<String, Reconfigured>> {
+    let mut before = graph.rebuild(base, &[])?;
+    let missing: Vec<Request> = graph
+        .tasks
+        .values()
+        .filter(|task| !before.tasks.contains_key(&task.id))
+        .map(|task| Request {
+            project: task.project.clone(),
+            target: task.target.clone(),
+            configuration: task.configuration.clone(),
+            requested_configuration: task.configuration.clone(),
+            args: task.args.clone(),
+        })
+        .collect();
+    if !missing.is_empty() {
+        before = graph.rebuild(base, &missing)?;
+    }
+    let inputs = qk_cache::resolve_tasks(base, &before, &changes.files)?;
+    let definition = |workspace: &Workspace, task: &qk_taskgraph::Task| {
+        serde_json::json!([
+            qk_cache::keyed_definition(task),
+            qk_cache::task_configuration(workspace, task),
+        ])
+    };
+    let mut tasks = BTreeMap::new();
+    for (id, task) in &graph.tasks {
+        let (Some(old), Some(old_inputs)) = (before.tasks.get(id), inputs.get(id)) else {
+            tasks.insert(id.clone(), Reconfigured::Definition);
+            continue;
+        };
+        let inputs = &resolved[id];
+        if definition(workspace, task) != definition(base, old) {
+            tasks.insert(id.clone(), Reconfigured::Definition);
+        } else if !inputs.selects_alike(old_inputs, workspace)
+            // Dependencies' outputs are keyed by the task each came from.
+            || (task.dependencies != old.dependencies
+                && inputs.dependency_output_inputs().next().is_some())
+        {
+            tasks.insert(id.clone(), Reconfigured::Inputs);
+        }
+    }
+    Ok(tasks)
+}
+
+/// Each reconfigured task's reason: a change by `file` to `settings`.
+fn reasons_of(
+    tasks: BTreeMap<String, Reconfigured>,
+    file: &str,
+    settings: &[String],
+) -> ConfigurationReasons {
+    ConfigurationReasons::Tasks(
+        tasks
+            .into_iter()
+            .map(|(id, how)| {
+                let (file, settings) = (file.to_owned(), settings.to_vec());
+                let reason = match how {
+                    Reconfigured::Definition => TaskReason::Definition { file, settings },
+                    Reconfigured::Inputs => TaskReason::ResolvedInputs { file, settings },
+                };
+                (id, reason)
+            })
+            .collect(),
+    )
+}
+
+/// The tasks an nx.json change reaches, as their keys hold it: every task
+/// when it changed what every key holds, and otherwise each task whose key
+/// differs under the base revision's `targetDefaults` and `namedInputs`.
+fn nx_json_reasons(
+    workspace: &Workspace,
+    graph: &TaskGraph,
+    changes: &Changes,
+    resolved: &BTreeMap<String, qk_cache::Resolved>,
+) -> ConfigurationReasons {
+    let (file, settings, base) = match NxJsonChange::new(workspace, changes) {
+        NxJsonChange::None => return ConfigurationReasons::None,
+        NxJsonChange::All { file, detail } => {
+            return ConfigurationReasons::All(TaskReason::NxJson { file, detail });
+        }
+        NxJsonChange::Resolved {
+            file,
+            settings,
+            base,
+        } => (file, settings, base),
+    };
+    let settings: Vec<String> = settings
+        .iter()
+        .map(|setting| (*setting).to_owned())
+        .collect();
+    match reconfigured(workspace, graph, changes, resolved, &base) {
+        Ok(tasks) => reasons_of(tasks, &file, &settings),
+        Err(error) => ConfigurationReasons::All(TaskReason::NxJson {
+            file,
+            detail: format!(
+                "changed and the base revision's tasks could not be resolved ({error:#})"
+            ),
+        }),
+    }
+}
+
+/// The tasks a change to project manifests reaches, as their keys hold it:
+/// each task whose key differs under the base revision's manifests. `None`
+/// when they could not be compared, and count as changed files instead.
+fn manifest_reasons(
+    workspace: &Workspace,
+    graph: &TaskGraph,
+    changes: &Changes,
+    resolved: &BTreeMap<String, qk_cache::Resolved>,
+) -> Option<ConfigurationReasons> {
+    let change = changes.manifests();
+    let Some(base) = &change.base else {
+        return Some(ConfigurationReasons::None);
+    };
+    let file = change
+        .files
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let tasks = reconfigured(workspace, graph, changes, resolved, base).ok()?;
+    Some(reasons_of(tasks, &file, &[]))
 }
 
 /// Which tasks' `TsConfiguration` a root tsconfig change reaches, as Nx's
@@ -665,8 +872,6 @@ mod tests {
 
     fn graph(edges: &[(&str, &[&str])]) -> TaskGraph {
         TaskGraph {
-            roots: BTreeSet::new(),
-            cycles: Vec::new(),
             tasks: edges
                 .iter()
                 .map(|(id, dependencies)| {
@@ -685,6 +890,7 @@ mod tests {
                     )
                 })
                 .collect(),
+            ..TaskGraph::default()
         }
     }
 

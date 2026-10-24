@@ -34,13 +34,18 @@ impl From<JsonValue<'_>> for Export {
     }
 }
 
-/// The file `specifier` names: a path relative to the workspace root, or a
+/// The file `specifier` names: a path relative to the workspace root, which
+/// `exists` says is there, so that another revision's file can be named, or a
 /// package subpath such as `nx/presets/npm.json`, found in the `node_modules`
 /// of the root or its ancestors through the package's `exports`.
-pub fn resolve(root: &Path, specifier: &str) -> Result<Resolved> {
+pub fn resolve(
+    root: &Path,
+    specifier: &str,
+    exists: &dyn Fn(&Path) -> Result<bool>,
+) -> Result<Resolved> {
     let relative = specifier.starts_with("./") || specifier.starts_with("../");
     if relative || Path::new(specifier).is_absolute() {
-        return file(&root.join(specifier))
+        return file_where(&root.join(specifier), exists)?
             .with_context(|| format!("nx.json extends {specifier:?}, which does not exist"));
     }
     // A scoped package's name has a slash of its own.
@@ -97,6 +102,14 @@ pub fn resolve(root: &Path, specifier: &str) -> Result<Resolved> {
 /// The path, or the path with `.json` appended, as `require.resolve` tries it,
 /// with `.` and `..` segments resolved.
 fn file(path: &Path) -> Option<Resolved> {
+    file_where(path, &|path: &Path| Ok(path.is_file()))
+        .ok()
+        .flatten()
+}
+
+/// As [`file`], with `exists` saying whether a file is there, or why that
+/// cannot be told.
+fn file_where(path: &Path, exists: &dyn Fn(&Path) -> Result<bool>) -> Result<Option<Resolved>> {
     let mut normal = PathBuf::new();
     for component in path.components() {
         match component {
@@ -108,19 +121,19 @@ fn file(path: &Path) -> Option<Resolved> {
         }
     }
     let path = normal.as_path();
-    if path.is_file() {
-        return Some(Resolved {
+    if exists(path)? {
+        return Ok(Some(Resolved {
             path: path.to_owned(),
             candidate: normal,
-        });
+        }));
     }
     let mut with_extension = path.as_os_str().to_owned();
     with_extension.push(".json");
     let with_extension = PathBuf::from(with_extension);
-    with_extension.is_file().then_some(Resolved {
+    Ok(exists(&with_extension)?.then_some(Resolved {
         path: with_extension,
         candidate: normal,
-    })
+    }))
 }
 
 /// The selected file and exact path tried before a possible `.json` fallback.

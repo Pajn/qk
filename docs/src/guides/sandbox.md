@@ -8,11 +8,23 @@ temporary files and tool caches.
 
 Inside the workspace, a task may:
 
-- read the files in its cache key, any `node_modules`, the lockfile, its own
-  outputs, its dependencies' outputs and its warm paths, though audit reports
-  reading an installed package its key leaves out;
+- read the files its cache key holds whole, such as its declared inputs, its
+  project's `package.json` and the root `.gitignore`, any `node_modules`,
+  its own outputs, its dependencies' outputs and its warm paths, though
+  audit reports reading an installed package its key leaves out;
 - list any directory;
 - write its outputs and warm paths.
+
+A file the key holds only by what it changes or resolves to is not one of
+them, unless the task's inputs select it: `nx.json`, the file it extends
+and `nx.local.json`, the task's project's `project.json` and
+`project.local.json`, a pnpm lockfile qk reads, `pnpm-workspace.yaml`, and
+the root `package.json` outside the root project. A tool that reads one,
+such as a package manager running a script or a nested `qk`, could act on
+what the key leaves out, so the task declares the file: as a file input,
+which keys it whole, or as a `json` input selecting the fields the tool
+reads. `default`'s `{projectRoot}/**/*` selects the project's own
+`project.json` and `project.local.json`, and a root project's `nx.json`.
 
 Structured JSON inputs permit reading their declared JSON file, including
 its symlink target. Declared directory symlinks permit reading the whole
@@ -20,7 +32,10 @@ linked tree and its nested link targets, matching the content in the cache
 key. These read permissions do not allow writing input files.
 
 A directory whose every tracked file is an input is allowed whole, so
-untracked files in it can be read too.
+untracked files in it can be read too, unless it holds one of the
+configuration files above that the task does not declare, such as an
+ignored `project.local.json`: Landlock cannot allow a directory less a file
+in it, so its inputs are then allowed one by one.
 
 ## Audit
 
@@ -112,7 +127,8 @@ reported.
 `--sandbox=enforce` refuses those reads and writes instead, so a task that
 depends on what it does not declare fails, and only its declared outputs can
 change in the workspace. Reading and writing `.git` and reading dotenv files
-stay allowed.
+stay allowed, and so do reading and writing qk's own state for the
+worktree, where warm state lives.
 
 Reading an installed package the key leaves out stays allowed too, and is
 not listed: Landlock grants a directory with everything beneath it, so on

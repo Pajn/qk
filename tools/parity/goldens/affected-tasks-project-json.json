@@ -1,0 +1,9 @@
+[
+  "ui:build",
+  "ui:format",
+  "ui:lint",
+  "ui:test",
+  "web:build:production",
+  "web:format",
+  "web:test"
+]

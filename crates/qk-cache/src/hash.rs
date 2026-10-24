@@ -2404,11 +2404,20 @@ fn infer(snapshot: &Snapshot, workspace: &Workspace, task: &Task) -> Result<Infe
         .into_iter()
         .find(|name| exists(name))
         .map(str::to_owned);
+    // nx.json counts through what it changes: through the task's resolved
+    // configuration, and by the settings that reach tasks otherwise. A tool
+    // reading it itself declares it as an input, which keys the file whole.
+    for path in ["nx.json", qk_config::LOCAL_WORKSPACE] {
+        if exists(path) {
+            inferred.settings.insert(path.into());
+        }
+    }
+    if let Some(extended) = &workspace.extended {
+        inferred.settings.insert(extended.clone());
+    }
     for path in [
-        "nx.json",
         ".gitignore",
         ".nxignore",
-        qk_config::LOCAL_WORKSPACE,
         "package-lock.json",
         "yarn.lock",
         "bun.lock",
@@ -2416,9 +2425,6 @@ fn infer(snapshot: &Snapshot, workspace: &Workspace, task: &Task) -> Result<Infe
         if exists(path) {
             inferred.files.insert(path.into());
         }
-    }
-    if let Some(extended) = &workspace.extended {
-        inferred.files.insert(extended.clone());
     }
     // A pnpm lockfile qk can read is keyed by what the task's projects
     // install, and the workspace file without the resolution keys whose effect
@@ -2433,8 +2439,8 @@ fn infer(snapshot: &Snapshot, workspace: &Workspace, task: &Task) -> Result<Infe
     if exists("pnpm-lock.yaml") && !readable {
         inferred.files.insert("pnpm-lock.yaml".into());
     }
-    // The task's own manifests count whole, its package scripts and dependency
-    // declarations with them. A dependency's package.json counts by what it
+    // The task's own package.json counts whole, its package scripts and
+    // dependency declarations with it. A dependency's package.json counts by what it
     // decides for dependents, such as where their imports of it resolve; its
     // installs count through the lockfile.
     let mut packages = BTreeSet::from([task.project.clone()]);
@@ -2461,6 +2467,14 @@ fn infer(snapshot: &Snapshot, workspace: &Workspace, task: &Task) -> Result<Infe
                 .to_str()
                 .context("project path must be UTF-8")?
                 .replace('\\', "/");
+            // Its project.json and project.local.json are not added: what
+            // they decide for the task counts through its resolved
+            // configuration, and an input selecting them keys them as it
+            // says.
+            if own && name != "package.json" {
+                inferred.project.insert(path);
+                continue;
+            }
             if own {
                 inferred.files.insert(path);
                 continue;
@@ -2571,7 +2585,11 @@ pub fn inputs(
         }
     }
     let mut values = declared.values;
-    let mut configuration = json!({ "files": file_values(&inferred.files)? });
+    let mut configuration = json!({
+        "files": file_values(&inferred.files)?,
+        "settings": workspace.config.keyed_settings(),
+        "project": task_configuration(workspace, task),
+    });
     let installed = snapshot.installed(&workspace.root, &task.id)?;
     if let (Some(importers), Some(installed)) = (&inferred.lockfile, &installed)
         && let Some(lockfile) = &installed.lockfile
@@ -2633,15 +2651,7 @@ pub fn inputs(
             None => snapshot.file_value(&workspace.root, path)?,
         };
     }
-    // Warm state configuration never changes a result, and as in Nx a
-    // target's metadata, such as the run command shown for a script, is
-    // description only.
-    let mut definition = task.definition.clone();
-    definition.extra.remove("qk:warm");
-    definition.extra.remove("qk:threads");
-    definition.extra.remove("metadata");
-    // What a recording keys is the recording's own concern.
-    definition.extra.remove("qk:ultracache");
+    let definition = keyed_definition(task);
     let hash = json!({
         "schema":"qk-local-v4", "qk":env!("CARGO_PKG_VERSION"),
         "platform":[std::env::consts::OS, std::env::consts::ARCH], "workspace":snapshot.workspace_prefix,
@@ -2649,6 +2659,36 @@ pub fn inputs(
         "files":files, "values":values, "inferred":configuration, "dependencies":dependencies,
     });
     Ok(hash)
+}
+
+/// A task's definition as its key holds it. Warm state configuration never
+/// changes a result, and as in Nx a target's metadata, such as the run
+/// command shown for a script, is description only.
+pub fn keyed_definition(task: &Task) -> qk_config::Target {
+    let mut definition = task.definition.clone();
+    definition.extra.remove("qk:warm");
+    definition.extra.remove("qk:threads");
+    definition.extra.remove("metadata");
+    // What a recording keys is the recording's own concern.
+    definition.extra.remove("qk:ultracache");
+    definition
+}
+
+/// What a task's key holds of its project's configuration beside its
+/// definition and resolved inputs: the project's keyed settings, such as its
+/// root, the paths its outputs resolve to, which `{project.*}` tokens can
+/// read from anywhere in the configuration, and all of the configuration
+/// when a forwarded argument holds such a token, as the task reads it then.
+pub fn task_configuration(workspace: &Workspace, task: &Task) -> Value {
+    let project = &workspace.projects[&task.project];
+    let mut value = json!({ "settings": project.keyed_settings() });
+    if let Ok((outputs, _)) = paths::resolved_outputs(workspace, task) {
+        value["outputs"] = json!(outputs);
+    }
+    if task.args.iter().any(|arg| arg.contains("{project")) {
+        value["configuration"] = serde_json::to_value(project).unwrap_or_default();
+    }
+    value
 }
 
 /// The key for a task's inputs. Objects are keyed with their fields sorted,
@@ -3349,8 +3389,6 @@ mod tests {
         let expected = |name: &str| {
             BTreeSet::from([
                 ".nxignore".into(),
-                "nx.json".into(),
-                "project.json".into(),
                 format!("src/{name}.txt"),
                 format!("generated/{name}.txt"),
             ])

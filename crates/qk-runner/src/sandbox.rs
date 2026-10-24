@@ -2,10 +2,13 @@
 //! what it declares inside the workspace. Everything outside the workspace
 //! stays open.
 //!
-//! Inside it, a task may read its cache key's files, `node_modules`, the
-//! lockfile, the outputs of its own and its dependencies' tasks and its
-//! warm paths, and list any directory; it may write its outputs and warm
-//! paths. In audit mode anything else is allowed and reported; in enforce
+//! Inside it, a task may read the files its cache key holds whole or by the
+//! fields its `json` inputs select, `node_modules`, the outputs of its own
+//! and its dependencies' tasks and its warm paths, and list any directory;
+//! it may write its outputs and warm paths. A file its key holds by what it
+//! changes or resolves to, such as nx.json, project.json or the pnpm
+//! lockfile, is read only as declared, since what the task reads of it
+//! could change without its key. In audit mode anything else is allowed and reported; in enforce
 //! mode it is refused, except reading and writing `.git` and reading dotenv
 //! files, which a task may need although they are not keyed.
 //!
@@ -205,7 +208,7 @@ impl Sandbox {
         let directory = state.join("sandbox").join(std::process::id().to_string());
         std::fs::create_dir_all(&directory)?;
         let resolution = qk_cache::resolve_each(workspace, graph)?;
-        let tree = Tree::new(&resolution.candidates);
+        let tree = Tree::new(&resolution.candidates).protecting(protected(workspace));
         let installs = (mode == Mode::Audit)
             .then(|| Installs::load(&root))
             .flatten();
@@ -680,6 +683,10 @@ fn compiles(profile: &Path) -> std::result::Result<(), String> {
 struct Tree {
     /// Files under each directory, the root being `""`.
     counts: BTreeMap<String, usize>,
+    /// Configuration files a task reads only as declared, which the files
+    /// counted can leave out, as Git leaves out an ignored
+    /// `project.local.json`.
+    protected: BTreeSet<String>,
 }
 
 impl Tree {
@@ -690,11 +697,23 @@ impl Tree {
                 *counts.entry(directory.to_owned()).or_insert(0) += 1;
             }
         }
-        Self { counts }
+        Self {
+            counts,
+            protected: BTreeSet::new(),
+        }
+    }
+
+    /// With `protected`, the configuration files no directory holding one is
+    /// allowed whole for, unless the task's inputs hold it: Landlock grants a
+    /// directory with everything beneath it, so it cannot leave one out.
+    fn protecting(mut self, protected: BTreeSet<String>) -> Self {
+        self.protected = protected;
+        self
     }
 
     /// The inputs as the fewest paths: each outermost directory whose every
-    /// file is an input, and the other inputs one by one.
+    /// file is an input, and holding no protected file that is not, and the
+    /// other inputs one by one.
     fn cover<'a>(&self, inputs: &'a BTreeSet<String>) -> (Vec<String>, Vec<&'a str>) {
         let mut covered: BTreeMap<&str, usize> = BTreeMap::new();
         for input in inputs {
@@ -702,10 +721,18 @@ impl Tree {
                 *covered.entry(directory).or_insert(0) += 1;
             }
         }
+        let held: BTreeSet<&str> = self
+            .protected
+            .iter()
+            .filter(|path| !inputs.contains(*path))
+            .flat_map(|path| parents(path))
+            .collect();
         let whole: BTreeSet<&str> = covered
             .iter()
             .filter(|(directory, count)| {
-                !directory.is_empty() && self.counts.get(**directory) == Some(count)
+                !directory.is_empty()
+                    && self.counts.get(**directory) == Some(count)
+                    && !held.contains(**directory)
             })
             .map(|(directory, _)| *directory)
             .collect();
@@ -722,6 +749,49 @@ impl Tree {
             .collect();
         (outermost, singles)
     }
+}
+
+/// The configuration files of `workspace` a task reads only as declared,
+/// workspace-relative, those that exist: nx.json, the file it extends and
+/// nx.local.json, each project's `project.json` and `project.local.json`,
+/// the pnpm lockfile, `pnpm-workspace.yaml` and the root `package.json`.
+fn protected(workspace: &Workspace) -> BTreeSet<String> {
+    // A project's manifests where its root is and where they were read,
+    // which a `root` they give can move apart. A configured root keeps its
+    // spelling, such as `./libs/lib/`, where candidates are normalized.
+    let directories = workspace.projects.values().flat_map(|project| {
+        [
+            Some(project.root.as_str()),
+            workspace
+                .configuration_directories
+                .get(&project.name)
+                .map(String::as_str),
+        ]
+    });
+    let manifests = directories.flatten().flat_map(|directory| {
+        let directory = directory
+            .split('/')
+            .filter(|part| !part.is_empty() && *part != ".")
+            .collect::<Vec<_>>()
+            .join("/");
+        ["project.json", qk_config::LOCAL_OVERRIDES].map(move |name| match directory.as_str() {
+            "" => name.to_owned(),
+            directory => format!("{directory}/{name}"),
+        })
+    });
+    [
+        "nx.json",
+        qk_config::LOCAL_WORKSPACE,
+        "pnpm-lock.yaml",
+        "pnpm-workspace.yaml",
+        "package.json",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .chain(workspace.extended.clone())
+    .chain(manifests)
+    .filter(|path| workspace.root.join(path).is_file())
+    .collect()
 }
 
 /// The directories above a path, innermost first, ending with the root `""`.
@@ -759,11 +829,6 @@ fn plan(
     };
     let (whole, singles) = tree.cover(files);
     let mut read_files: Vec<PathBuf> = singles.iter().map(|file| path(file)).collect();
-    // Package managers and Node read these in every task. What they install is
-    // keyed through the lockfile rather than as files.
-    for file in ["pnpm-lock.yaml", "pnpm-workspace.yaml", "package.json"] {
-        read_files.push(path(file));
-    }
     let mut read_trees = BTreeSet::new();
     for file in files {
         for target in linked_targets(root, &root.join(file)) {
@@ -1146,6 +1211,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn protects_the_manifests_of_a_root_spelled_with_dots() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(root.join("nx.json"), "{}").unwrap();
+        std::fs::create_dir_all(root.join("config/lib")).unwrap();
+        std::fs::create_dir_all(root.join("libs/lib")).unwrap();
+        std::fs::write(
+            root.join("config/lib/project.json"),
+            r#"{"name":"lib","root":"./libs/lib/"}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("libs/lib/project.local.json"), "{}").unwrap();
+        let workspace = qk_config::Workspace::load(root).unwrap();
+        let protected = protected(&workspace);
+        assert!(
+            protected.contains("libs/lib/project.local.json"),
+            "{protected:?}"
+        );
+        // And where it was read, which its `root` moved away from.
+        assert!(
+            protected.contains("config/lib/project.json"),
+            "{protected:?}"
+        );
+    }
+
+    #[test]
     fn reads_reports() {
         let report =
             parse("Sandbox: cat(51583) allow file-read-data /repo/src/a b.ts\nqk-task:web:build")
@@ -1193,6 +1284,18 @@ mod tests {
         let (whole, singles) = tree.cover(&inputs);
         assert_eq!(whole, ["app/lib", "app/src/deep"]);
         assert_eq!(singles, ["app/src/a.ts"]);
+
+        // A configuration file the files leave out, such as an ignored
+        // project.local.json, keeps its directories from being allowed
+        // whole, unless the inputs hold it.
+        let tree =
+            Tree::new(&files).protecting(BTreeSet::from(["app/lib/project.local.json".into()]));
+        let (whole, singles) = tree.cover(&inputs);
+        assert_eq!(whole, ["app/src/deep"]);
+        assert_eq!(singles, ["app/lib/d.ts", "app/lib/e.ts", "app/src/a.ts"]);
+        let mut declared = inputs.clone();
+        declared.insert("app/lib/project.local.json".into());
+        assert!(!tree.cover(&declared).1.contains(&"app/lib/d.ts"));
     }
 
     #[cfg(unix)]

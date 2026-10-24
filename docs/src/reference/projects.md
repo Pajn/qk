@@ -159,5 +159,6 @@ your workspace's `.gitignore`. Nx does not read it.
 }
 ```
 
-qk reports each overlay used. It is included in cache keys, so overridden
-tasks do not reuse the checked-in definition's cache entries.
+qk reports each overlay used. What it changes is included in cache keys, as
+for `project.json`, so overridden tasks do not reuse the checked-in
+definition's cache entries, and the project's other tasks keep theirs.

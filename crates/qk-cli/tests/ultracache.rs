@@ -180,14 +180,15 @@ fn a_task_turned_off_or_never_recorded_keeps_its_declared_key() {
     );
     write(root, "app/README.md", "edited\n");
     assert_eq!(build(root, false), "miss");
-    // Turned off, its recordings are not read.
+    // Turned off, its recordings are not read. It keeps the declared key it
+    // had before, since what a recording keys is no part of it.
     let nx = fs::read_to_string(root.join("nx.json")).unwrap();
     write(
         root,
         "nx.json",
         &nx.replace(r#""ignoreReads""#, r#""mode": "off", "ignoreReads""#),
     );
-    assert_eq!(build_keyed(root, true), ("miss".into(), "none".into()));
+    assert_eq!(build_keyed(root, true), ("local-hit".into(), "none".into()));
     write(root, "app/README.md", "edited again\n");
     assert_eq!(build(root, false), "miss");
 }

@@ -6513,3 +6513,247 @@ fn show_hash_keys_a_task_as_a_run_would_and_compares_keys() {
         "{text}"
     );
 }
+
+/// `build` and `lint` reading only `src`, so that nx.json, at the root of
+/// the fixture's project, is none of their files: `build` through the
+/// `sources` named input, `lint` directly. `lint` declares no outputs, which
+/// `targetDefaults` can give it.
+fn settings_fixture(nx_json: &Value) -> Fixture {
+    let mut lint = target("lint", json!({"inputs": ["{projectRoot}/src/**/*"]}));
+    lint.as_object_mut().unwrap().remove("outputs");
+    let fixture = Fixture::with_targets(json!({
+        "build": target("build", json!({"inputs": ["sources"]})),
+        "lint": lint,
+    }));
+    fs::write(fixture.root.join("nx.json"), nx_json.to_string()).unwrap();
+    fixture
+}
+
+/// Whether running `target` of `app` was a cache hit.
+fn hit_of(fixture: &Fixture, target: &str) -> bool {
+    let output = success(fixture.qk(&fixture.root, &["run", &format!("app:{target}")]));
+    let diagnostics = stderr(&output);
+    let hit = diagnostics.contains(&format!("qk: cache hit app:{target}"));
+    assert!(
+        hit || diagnostics.contains(&format!("qk: cache miss app:{target}")),
+        "{diagnostics}"
+    );
+    hit
+}
+
+fn settings() -> Value {
+    json!({
+        "namedInputs": {"sources": ["{projectRoot}/src/**/*"]},
+        "targetDefaults": {"lint": {"outputs": []}},
+        "pluginsConfig": {"@nx/js": {"analyzeLockfile": true}},
+    })
+}
+
+/// Whether `build` and then `lint` were cache hits.
+fn both(fixture: &Fixture) -> (bool, bool) {
+    (hit_of(fixture, "build"), hit_of(fixture, "lint"))
+}
+
+#[test]
+fn nx_json_keys_tasks_by_what_it_changes() {
+    let fixture = settings_fixture(&settings());
+    assert_eq!(both(&fixture), (false, false));
+    assert_eq!(both(&fixture), (true, true));
+
+    // Comments and formatting change nothing.
+    let path = fixture.root.join("nx.json");
+    let pretty = serde_json::to_string_pretty(&settings()).unwrap();
+    fs::write(&path, format!("// Workspace settings.\n{pretty}\n")).unwrap();
+    assert_eq!(both(&fixture), (true, true));
+
+    // Nor do settings that change no task's work.
+    let mut config = settings();
+    config["defaultBase"] = json!("trunk");
+    config["parallel"] = json!(8);
+    // Ignored, with a warning, as Nx no longer supports it.
+    config["implicitDependencies"] = json!({"package.json": "*"});
+    fs::write(&path, config.to_string()).unwrap();
+    assert_eq!(both(&fixture), (true, true));
+
+    // targetDefaults reach the tasks whose definitions they change.
+    config["targetDefaults"]["lint"]["outputs"] = json!(["{projectRoot}/lint"]);
+    fs::write(&path, config.to_string()).unwrap();
+    assert_eq!(both(&fixture), (true, false));
+
+    // namedInputs reach the tasks whose inputs they change, by what the
+    // inputs select: one selecting the same files keys the same.
+    config["namedInputs"]["sources"] = json!(["{projectRoot}/src/*"]);
+    fs::write(&path, config.to_string()).unwrap();
+    assert_eq!(both(&fixture), (true, true));
+    fs::create_dir_all(fixture.root.join("extra")).unwrap();
+    fs::write(fixture.root.join("extra/data.txt"), "data").unwrap();
+    config["namedInputs"]["sources"] = json!(["{projectRoot}/src/*", "{projectRoot}/extra/*"]);
+    fs::write(&path, config.to_string()).unwrap();
+    assert_eq!(both(&fixture), (false, true));
+    config["namedInputs"]["sources"] = json!([
+        "{projectRoot}/src/*",
+        "{projectRoot}/extra/*",
+        {"env": "QK_CACHE_TEST_FLAVOR"}
+    ]);
+    fs::write(&path, config.to_string()).unwrap();
+    assert_eq!(both(&fixture), (false, true));
+
+    // A setting no resolved configuration holds keys every task.
+    config["pluginsConfig"]["@nx/js"]["analyzeLockfile"] = json!(false);
+    fs::write(&path, config.to_string()).unwrap();
+    assert_eq!(both(&fixture), (false, false));
+}
+
+#[test]
+fn moving_or_resizing_the_cache_keys_no_task() {
+    let fixture = settings_fixture(&settings());
+    let path = fixture.root.join("nx.json");
+    let mut config = settings();
+    config["cacheDirectory"] = json!("first-cache");
+    fs::write(&path, config.to_string()).unwrap();
+    assert_eq!(both(&fixture), (false, false));
+    assert_eq!(both(&fixture), (true, true));
+
+    // Another cache holds none of the results, so the tasks run again, and
+    // keep their results there.
+    config["cacheDirectory"] = json!("second-cache");
+    fs::write(&path, config.to_string()).unwrap();
+    assert_eq!(both(&fixture), (false, false));
+    assert!(fixture.root.join("second-cache/qk/v1").is_dir());
+    assert_eq!(both(&fixture), (true, true));
+
+    // The first still holds its results under the same keys.
+    config["cacheDirectory"] = json!("first-cache");
+    fs::write(&path, config.to_string()).unwrap();
+    assert_eq!(both(&fixture), (true, true));
+
+    // A size limit decides what is kept, not how a task is keyed.
+    config["maxCacheSize"] = json!("10GB");
+    fs::write(&path, config.to_string()).unwrap();
+    assert_eq!(both(&fixture), (true, true));
+}
+
+#[test]
+fn the_file_nx_json_extends_keys_tasks_by_what_it_changes() {
+    let fixture = settings_fixture(&json!({"extends": "./nx.base.json"}));
+    let path = fixture.root.join("nx.base.json");
+    fs::write(&path, settings().to_string()).unwrap();
+    assert_eq!(both(&fixture), (false, false));
+    fs::write(&path, format!("// Shared settings.\n{}", settings())).unwrap();
+    assert_eq!(both(&fixture), (true, true));
+    let mut config = settings();
+    config["targetDefaults"]["lint"]["outputs"] = json!(["{projectRoot}/lint"]);
+    fs::write(&path, config.to_string()).unwrap();
+    assert_eq!(both(&fixture), (true, false));
+    config["pluginsConfig"]["@nx/js"]["analyzeLockfile"] = json!(false);
+    fs::write(&path, config.to_string()).unwrap();
+    assert_eq!(both(&fixture), (false, false));
+}
+
+#[test]
+fn a_declared_nx_json_input_keys_the_file_whole() {
+    let mut config = settings();
+    config["namedInputs"]["sources"] = json!(["{projectRoot}/src/**/*", "{workspaceRoot}/nx.json"]);
+    let fixture = settings_fixture(&config);
+    assert_eq!(both(&fixture), (false, false));
+    fs::write(
+        fixture.root.join("nx.json"),
+        format!("// A tool reads this file.\n{config}"),
+    )
+    .unwrap();
+    assert_eq!(both(&fixture), (false, true));
+}
+
+/// The fixture's root project with `build` reading its default inputs and
+/// `lint` reading `lint_inputs` with no outputs. With `narrowed`, nx.json's
+/// `default` leaves out the project's `project.json` and
+/// `project.local.json`; otherwise `default` selects them.
+fn manifest_fixture(lint_inputs: Value, narrowed: bool) -> Fixture {
+    let mut lint = target("lint", json!({ "inputs": lint_inputs }));
+    lint.as_object_mut().unwrap().remove("outputs");
+    let fixture = Fixture::with_targets(json!({"build": target("build", json!({})), "lint": lint}));
+    if narrowed {
+        let settings = json!({"namedInputs": {"default": [
+            "{projectRoot}/**/*",
+            "!{projectRoot}/project.json",
+            "!{projectRoot}/project.local.json"
+        ]}});
+        fs::write(fixture.root.join("nx.json"), settings.to_string()).unwrap();
+    }
+    fixture
+}
+
+fn project_json(fixture: &Fixture) -> Value {
+    serde_json::from_str(&fs::read_to_string(fixture.root.join("project.json")).unwrap()).unwrap()
+}
+
+#[test]
+fn a_project_json_its_inputs_select_keys_it_whole() {
+    let fixture = manifest_fixture(json!(["{projectRoot}/src/**/*"]), false);
+    assert_eq!(both(&fixture), (false, false));
+    let project = project_json(&fixture);
+    fs::write(
+        fixture.root.join("project.json"),
+        format!("// The project.\n{project}"),
+    )
+    .unwrap();
+    // `default` selects it, as in Nx; `lint` reads only `src`.
+    assert_eq!(both(&fixture), (false, true));
+}
+
+#[test]
+fn project_json_keys_tasks_by_what_it_changes() {
+    let fixture = manifest_fixture(json!(["{projectRoot}/src/**/*"]), true);
+    let path = fixture.root.join("project.json");
+    assert_eq!(both(&fixture), (false, false));
+    assert_eq!(both(&fixture), (true, true));
+
+    // Comments and formatting change nothing.
+    let mut project = project_json(&fixture);
+    let pretty = serde_json::to_string_pretty(&project).unwrap();
+    fs::write(&path, format!("// The project.\n{pretty}\n")).unwrap();
+    assert_eq!(both(&fixture), (true, true));
+
+    // Nor does a tag nothing selects by.
+    project["tags"] = json!(["scope:app"]);
+    fs::write(&path, project.to_string()).unwrap();
+    assert_eq!(both(&fixture), (true, true));
+
+    // A target reaches only its own tasks.
+    project["targets"]["lint"]["outputs"] = json!(["{projectRoot}/lint"]);
+    fs::write(&path, project.to_string()).unwrap();
+    assert_eq!(both(&fixture), (true, false));
+
+    // A named input reaches the tasks whose inputs it changes.
+    project["namedInputs"] = json!({"default": ["{projectRoot}/src/**/*"]});
+    fs::write(&path, project.to_string()).unwrap();
+    assert_eq!(both(&fixture), (false, true));
+}
+
+#[test]
+fn a_project_json_input_named_exactly_keys_the_file_whole() {
+    let fixture = manifest_fixture(
+        json!(["{projectRoot}/src/**/*", "{projectRoot}/project.json"]),
+        true,
+    );
+    assert_eq!(both(&fixture), (false, false));
+    let project = project_json(&fixture);
+    fs::write(
+        fixture.root.join("project.json"),
+        format!("// A tool reads this file.\n{project}"),
+    )
+    .unwrap();
+    assert_eq!(both(&fixture), (true, false));
+}
+
+#[test]
+fn project_local_json_keys_tasks_by_what_it_changes() {
+    let fixture = manifest_fixture(json!(["{projectRoot}/src/**/*"]), true);
+    let path = fixture.root.join("project.local.json");
+    assert_eq!(both(&fixture), (false, false));
+    let local = json!({"targets": {"lint": {"outputs": ["{projectRoot}/lint"]}}});
+    fs::write(&path, local.to_string()).unwrap();
+    assert_eq!(both(&fixture), (true, false));
+    fs::write(&path, format!("// Mine.\n{local}")).unwrap();
+    assert_eq!(both(&fixture), (true, true));
+}
