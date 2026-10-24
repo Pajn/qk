@@ -7,6 +7,10 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+#[path = "support/git.rs"]
+mod git_support;
+use git_support::fixture_command;
+
 fn fixture(targets: Value) -> TempDir {
     let temp = TempDir::new().unwrap();
     fs::write(temp.path().join("nx.json"), "{}").unwrap();
@@ -2882,7 +2886,7 @@ fn empty_selections_write_machine_readable_task_graphs() {
         ],
     ] {
         success(
-            Command::new("git")
+            fixture_command("git")
                 .current_dir(temp.path())
                 .args(args)
                 .output()
@@ -3547,7 +3551,7 @@ fn warm_suggest_lists_the_directories_a_task_wrote_outside_its_outputs() {
     fs::write(temp.path().join(".gitignore"), "dist/\n.tool/\n").unwrap();
     let git = |args: &[&str]| {
         assert!(
-            Command::new("git")
+            fixture_command("git")
                 .current_dir(temp.path())
                 .args(args)
                 .env("GIT_CONFIG_NOSYSTEM", "1")

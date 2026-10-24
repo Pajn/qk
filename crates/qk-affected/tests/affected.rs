@@ -1,11 +1,14 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use qk_affected::{Options, affected_projects};
 use qk_config::Workspace;
 use qk_graph::ProjectGraph;
 use tempfile::TempDir;
+
+#[path = "support/git.rs"]
+mod git_support;
+use git_support::fixture_command;
 
 /// A git repository whose first commit is the base revision.
 struct Repo {
@@ -81,7 +84,7 @@ fn write(root: &Path, path: &str, text: &str) {
 }
 
 fn git(root: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
+    let output = fixture_command("git")
         .current_dir(root)
         .args(args)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")

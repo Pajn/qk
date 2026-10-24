@@ -5,6 +5,10 @@ use std::process::{Command, Output};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+#[path = "support/git.rs"]
+mod git_support;
+use git_support::fixture_command;
+
 // Spawn the test binary itself as a portable build step, without Python or Node.
 #[test]
 fn process_helper() {
@@ -222,7 +226,7 @@ impl Fixture {
     }
 
     fn git(&self, cwd: &Path, args: &[&str]) {
-        let output = Command::new("git")
+        let output = fixture_command("git")
             .current_dir(cwd)
             .args(args)
             .env("GIT_CONFIG_GLOBAL", &self.git_config)
