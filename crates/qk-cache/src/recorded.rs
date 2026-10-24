@@ -543,12 +543,12 @@ impl WorkspaceOutputs {
 /// its outputs.
 pub(crate) type TargetOf = (String, String, Option<String>);
 
-/// Other targets' outputs a recording's listings leave out: every target's
-/// in the workspace but the task's own and those it depends on, whose
-/// outputs are its inputs.
+/// The outputs a recording's listings leave out: those of every target in
+/// the workspace, the task's own included, except the targets the task
+/// depends on, whose outputs are its inputs.
 pub(crate) struct Others<'a> {
     pub outputs: &'a WorkspaceOutputs,
-    /// The task's target and its upstream.
+    /// The targets the task depends on.
     pub upstream: BTreeSet<TargetOf>,
 }
 
