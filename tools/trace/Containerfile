@@ -1,0 +1,7 @@
+# Builds qk's eBPF recorder program: clang and libbpf's headers, pinned to
+# Debian bookworm, so that the objects it builds are the same everywhere.
+FROM docker.io/library/debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends clang llvm libbpf-dev linux-libc-dev \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /qk

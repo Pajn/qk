@@ -7,7 +7,7 @@ cargo test --workspace --locked
 cargo build --release --locked
 ```
 
-The Cargo workspace contains eleven crates:
+The Cargo workspace contains twelve crates:
 
 | Crate | Responsibility |
 | --- | --- |
@@ -21,6 +21,7 @@ The Cargo workspace contains eleven crates:
 | `qk-affected` | Git change analysis and project/task affected selection |
 | `qk-history` | SQLite run history, task records and cache-key explanations |
 | `qk-input-analysis` | File-access report schema, conservative suggestions and compatible observation unions |
+| `qk-trace` | The eBPF recorder: its kernel program, privileged helper and strace-format traces |
 | `qk-cli` | Argument parsing and output; produces the `qk` binary |
 
 Fixture and CLI tests use self-contained workspaces.
