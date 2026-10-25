@@ -11,9 +11,15 @@
 // the architecture it runs on.
 //
 // A recorded call is one event, sent as it returns: its arguments, as they
-// were when it entered, the paths they name, and its result. The paths are
-// read on return because a program on entry cannot fault in user memory, and
-// a path's page may not be resident until the kernel has read it.
+// were when it entered, the paths they name, its result, and when it entered
+// and returned. Events come in the order calls return, which is not the order
+// they took effect in: a close frees its descriptor as it enters, so another
+// thread can open the same number and return first. Both times let user
+// space tell.
+//
+// The paths are read on return because a program on entry cannot fault in
+// user memory, and a path's page may not be resident until the kernel has
+// read it.
 //
 // The kernel's own types are declared here as far as this program reads
 // them, and relocated against the running kernel's BTF as it loads.
@@ -129,6 +135,8 @@ struct call_event {
 	struct header header;
 	__u64 args[6];
 	__s64 result;
+	/* When it returned; the header's time is when it entered. */
+	__u64 exited;
 	/* Each path's length, its terminating NUL included; 0 for none, and
 	 * PATH_BYTES + 1 for one that could not be read. */
 	__u16 lengths[2];
@@ -328,6 +336,8 @@ int BPF_PROG(on_exit, struct pt_regs *regs, long result)
 	struct entered *entered = bpf_map_lookup_elem(&inflight, &tid);
 	if (!entered)
 		return 0;
+	/* As soon as can be: a later close of what it opened must enter after. */
+	__u64 exited = bpf_ktime_get_boot_ns();
 	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
 	__u32 *group = bpf_map_lookup_elem(&groups, &tgid);
 	struct call_event *event = bpf_map_lookup_elem(&scratch, &zero);
@@ -343,6 +353,7 @@ int BPF_PROG(on_exit, struct pt_regs *regs, long result)
 		event->args[index] = entered->args[index];
 	bpf_map_delete_elem(&inflight, &tid);
 	event->result = result;
+	event->exited = exited;
 	if (call->flags_at < 6) {
 		__u64 flags = 0;
 		bpf_probe_read_user(&flags, sizeof(flags),
