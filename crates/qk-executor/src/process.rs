@@ -353,7 +353,7 @@ fn spawn(
         _ => shell(text),
     };
     if let Some(recording) = &task.recording {
-        command = recording.command(index, text);
+        command = recording.command(index, text, &task.cwd);
     }
     #[cfg(target_os = "linux")]
     if let Some(crate::Confinement::Landlock(ruleset)) = task.sandbox {

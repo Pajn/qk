@@ -1101,6 +1101,7 @@ impl Cache {
             accesses: 500_000,
             keep: Some(&keep),
         };
+        recording.settle().map_err(failed)?;
         let (accesses, diagnostics) =
             qk_input_analysis::strace::collect_within(&recording.directory, &prepared.cwd, &limits)
                 .map_err(failed)?;

@@ -212,17 +212,87 @@ pub enum Confinement {
 /// An external syscall recorder wrapping each command, with separate trace files.
 #[derive(Clone, Debug)]
 pub struct Recording {
+    /// The recorder's program: strace, or qk itself, whose helper loads the
+    /// eBPF recorder.
     pub program: PathBuf,
     pub directory: PathBuf,
     /// Whether strace filters the traced calls in the kernel, with seccomp,
     /// so untraced calls run at full speed. strace 5.3 and later can.
     pub seccomp: bool,
+    /// The eBPF recorder, and the recordings of this task's commands it has
+    /// begun; `None` when strace records.
+    #[cfg(target_os = "linux")]
+    ebpf: Option<Ebpf>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+struct Ebpf {
+    recorder: std::sync::Arc<qk_trace::Recorder>,
+    sessions: std::sync::Arc<std::sync::Mutex<Vec<qk_trace::Session>>>,
+    /// Whether an opened file's path is recorded with what its links lead
+    /// to, as strace records it, which costs a lookup an open.
+    resolve: bool,
+}
+
+/// The eBPF recorder, its helper started once a process: as qk itself when
+/// qk runs as root, else through `sudo -n`, so that it is never asked for a
+/// password.
+#[cfg(target_os = "linux")]
+fn ebpf_recorder() -> Result<std::sync::Arc<qk_trace::Recorder>, String> {
+    static RECORDER: std::sync::OnceLock<Result<std::sync::Arc<qk_trace::Recorder>, String>> =
+        std::sync::OnceLock::new();
+    RECORDER
+        .get_or_init(|| {
+            let qk = std::env::current_exe().map_err(|error| error.to_string())?;
+            // SAFETY: geteuid has no preconditions.
+            let helper = if unsafe { libc::geteuid() } == 0 {
+                let mut helper = std::process::Command::new(qk);
+                helper.arg("__trace-helper");
+                helper
+            } else {
+                let mut helper = std::process::Command::new("sudo");
+                helper.args(["-n", "--"]).arg(qk).arg("__trace-helper");
+                helper
+            };
+            qk_trace::Recorder::start(helper).map_err(|error| format!("{error:#}"))
+        })
+        .clone()
 }
 
 impl Recording {
-    /// strace on `PATH`, checked to record child processes, with seccomp
-    /// filtering where it supports it. Its trial traces go in `directory`.
+    /// The recorder `QK_RECORDER` picks: by default eBPF, where its helper
+    /// can load it, else strace on `PATH`, checked to record child
+    /// processes, with seccomp filtering where it supports it. Its trial
+    /// traces go in `directory`.
     pub fn probe(directory: &Path) -> anyhow::Result<Self> {
+        let choice = std::env::var("QK_RECORDER").unwrap_or_default();
+        match choice.as_str() {
+            "" | "auto" | "ebpf" =>
+            {
+                #[cfg(target_os = "linux")]
+                match ebpf_recorder() {
+                    Ok(recorder) => {
+                        return Ok(Self {
+                            program: std::env::current_exe()?,
+                            directory: directory.to_owned(),
+                            seccomp: false,
+                            ebpf: Some(Ebpf {
+                                recorder,
+                                sessions: Default::default(),
+                                resolve: false,
+                            }),
+                        });
+                    }
+                    Err(error) if choice == "ebpf" => {
+                        anyhow::bail!("cannot record with eBPF: {error}")
+                    }
+                    Err(_) => {}
+                }
+            }
+            "strace" => {}
+            other => anyhow::bail!("unknown QK_RECORDER {other:?}; use auto, ebpf or strace"),
+        }
         let path = std::env::var_os("PATH").context("recording needs strace on PATH")?;
         let program = std::env::split_paths(&path)
             .map(|directory| directory.join("strace"))
@@ -235,9 +305,11 @@ impl Recording {
                 program: program.clone(),
                 directory: directory.to_owned(),
                 seccomp,
+                #[cfg(target_os = "linux")]
+                ebpf: None,
             };
             let probe = recording
-                .command(0, "exec /bin/true")
+                .command(0, "exec /bin/true", Path::new("/"))
                 .output()
                 .context("cannot probe strace")?;
             if probe.status.success() {
@@ -249,15 +321,84 @@ impl Recording {
     }
 
     /// The same settings, with traces in `directory`.
+    /// The recorder's name, as reports give it: `ebpf` or `strace`.
+    pub fn backend(&self) -> &'static str {
+        #[cfg(target_os = "linux")]
+        if self.ebpf.is_some() {
+            return "ebpf";
+        }
+        "strace"
+    }
+
     pub fn in_directory(&self, directory: PathBuf) -> Self {
         Self {
             directory,
+            #[cfg(target_os = "linux")]
+            ebpf: self.ebpf.as_ref().map(|ebpf| Ebpf {
+                recorder: ebpf.recorder.clone(),
+                sessions: Default::default(),
+                resolve: ebpf.resolve,
+            }),
             ..self.clone()
         }
     }
 
-    /// The same invocation is used by preflight and actual task commands.
-    pub fn command(&self, index: usize, text: &str) -> std::process::Command {
+    /// The same, recording an opened file's path with what its links lead
+    /// to, as a report of what a task read shows it. strace always does.
+    pub fn resolving(self) -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            let mut recording = self;
+            if let Some(ebpf) = &mut recording.ebpf {
+                ebpf.resolve = true;
+            }
+            recording
+        }
+        #[cfg(not(target_os = "linux"))]
+        self
+    }
+
+    /// Ends the recordings of the commands that have run, once they have
+    /// finished, so that their traces are whole. strace's are as soon as it
+    /// exits; the eBPF recorder's once its helper has sent every event.
+    pub fn settle(&self) -> anyhow::Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Some(ebpf) = &self.ebpf {
+            let sessions = std::mem::take(&mut *ebpf.sessions.lock().unwrap());
+            let mut sessions = sessions.into_iter();
+            while let Some(session) = sessions.next() {
+                if let Err(error) = ebpf.recorder.finish(session) {
+                    // The rest without waiting again: a helper that did not
+                    // answer once will not now.
+                    sessions
+                        .by_ref()
+                        .for_each(|rest| ebpf.recorder.abandon(rest));
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The same invocation is used by preflight and actual task commands,
+    /// which start in `cwd`.
+    pub fn command(&self, index: usize, text: &str, cwd: &Path) -> std::process::Command {
+        #[cfg(target_os = "linux")]
+        if let Some(ebpf) = &self.ebpf {
+            use std::os::unix::process::CommandExt;
+            let session = ebpf.recorder.begin(
+                &self.directory,
+                &format!("command-{index}"),
+                cwd,
+                ebpf.resolve,
+            );
+            ebpf.sessions.lock().unwrap().push(session);
+            let mut command = crate::process::shell(text);
+            // SAFETY: the hook makes one system call.
+            unsafe { command.pre_exec(ebpf.recorder.join(session)) };
+            return command;
+        }
+        let _ = cwd;
         let mut command = std::process::Command::new(&self.program);
         // No read/write buffers or exec argument/environment arrays.
         if self.seccomp {

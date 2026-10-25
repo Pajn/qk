@@ -22,10 +22,9 @@ qk records tasks itself, and keeps the recordings in its cache.
 ## Recording
 
 A run with `--record`, or with `QK_RECORD=true`, records each task with
-`qk:ultracache` that it executes. Recording uses `strace`, so it needs Linux
-with `strace` on `PATH`; it filters the traced calls in the kernel with
-seccomp where strace can, which strace 5.3 and later do. On other systems
-`--record` records nothing and says so. A task taken from the cache is not
+`qk:ultracache` that it executes. Recording needs Linux, with eBPF or strace
+as [Recorders](#recorders) describes. On other systems `--record` records
+nothing and says so. A task taken from the cache is not
 recorded, since nothing runs.
 
 A recording keeps a path set: what the task did to each path in the
@@ -104,6 +103,27 @@ yet. `--report` writes which of these each task's recordings did as
 `recorded`, and the [run history](history.md) keeps it, so `qk show run --json`
 prints it too.
 
+## Recorders
+
+qk records a task on Linux in one of two ways, and a recording is kept or
+refused alike whichever made it.
+
+- **eBPF**, by default. A program in the kernel notes the file calls of the
+  task's processes and passes them to qk, so a recorded task runs at close to
+  its usual speed. Loading the program takes root, so qk starts a helper,
+  `qk __trace-helper`: itself when it runs as root, otherwise through
+  `sudo -n`, which never asks for a password. It needs Linux 5.8 or later
+  built with BTF, as distributions build it, on x86-64 or arm64; in a
+  container, it also needs the `CAP_BPF` and `CAP_PERFMON` capabilities.
+- **strace**, on `PATH`, where eBPF cannot load. strace stops the task at
+  each call it records, so a task that opens many files takes noticeably
+  longer. It filters the calls it records in the kernel with seccomp where it
+  can, which strace 5.3 and later do, so that other calls run at full speed.
+
+`QK_RECORDER` picks one: `auto`, the default, records with eBPF where it
+loads and with strace otherwise; `ebpf` or `strace` records only with that
+one, and a run that cannot record with it fails.
+
 ## What a recording cannot see
 
 - Reads by processes outside the task, such as a build daemon started before
@@ -112,8 +132,8 @@ prints it too.
 - A compiled program in the workspace that the task runs directly. A script it
   runs is read by its interpreter, and so recorded.
 - Files opened before the task started, and reads through `io_uring`.
-- A recording a task's trace was too large for, or that strace could not
-  decode wholly, is not kept, and the summary says so. Neither is one that
+- A recording a task's trace was too large for, that could not be decoded
+  wholly, or that lost calls the recorder had no room for, is not kept, and the summary says so. Neither is one that
   names no path in the workspace, which would match any workspace, nor one
   whose task changed a file it read or found while it ran: keyed by the file
   as the task left it, it would be keyed by the task's own write. Nor is one
@@ -175,4 +195,11 @@ cache: that is where a stale hit would show. Switching to `"on"` keys it by them
 `tools/ultracache/fixture` is a workspace whose build reads, lists and looks
 for files, and `crates/qk-cli/tests/ultracache.rs` follows it through edits. The
 tests need Linux and `strace`; `tools/ultracache/podman.sh` runs them, or any
-other `cargo test` arguments, in a Linux container from another system.
+other `cargo test` arguments, in a Linux container from another system. With
+`QK_RECORDER=ebpf` it runs them with the eBPF recorder, in a container with the
+capabilities it needs.
+
+The kernel program is `crates/qk-trace/bpf/trace.bpf.c`, and the objects built
+from it are committed beside it, so that building qk needs no BPF toolchain.
+After changing it, rebuild them with `tools/trace/build.sh`, which needs
+Podman; CI checks that they match.

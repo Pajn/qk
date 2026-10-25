@@ -19,7 +19,8 @@ exporting graphs reads configuration without running executor commands.
    optional JSON reports.
 
 `inputs analyze` attaches a per-task recorder at command launch. The runner
-collects macOS Seatbelt reports or Linux strace output and classifies observations
+collects macOS Seatbelt reports or Linux traces, from `qk-trace`'s eBPF recorder
+or strace, and classifies observations
 using the cache's input resolver. `qk-input-analysis` owns the report model and
 observation unions. Analysis never substitutes observations into cache keys.
 

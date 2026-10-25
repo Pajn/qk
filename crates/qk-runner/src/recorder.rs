@@ -19,7 +19,8 @@ pub struct Recorder {
     root: PathBuf,
     directory: tempfile::TempDir,
     watcher: Option<Watcher>,
-    program: Option<PathBuf>,
+    /// The Linux recorder's name; `None` where Seatbelt records.
+    backend: Option<&'static str>,
     declared: qk_cache::Resolution,
     installs: Option<Installs>,
     started: std::time::SystemTime,
@@ -56,7 +57,7 @@ impl Recorder {
             root: root.clone(),
             directory,
             watcher: None,
-            program: None,
+            backend: None,
             declared: qk_cache::resolve_each(workspace, graph)?,
             installs: Installs::load(&root),
             started: std::time::SystemTime::now(),
@@ -112,13 +113,14 @@ impl Recorder {
             }
             recorder.watcher = Some(Watcher::start(recorder.directory.path())?);
         } else {
-            let recording = qk_executor::Recording::probe(recorder.directory.path())?;
+            // What links lead to is part of the report.
+            let recording = qk_executor::Recording::probe(recorder.directory.path())?.resolving();
             for (index, task) in prepared.values_mut().enumerate() {
                 let directory = recorder.directory.path().join(format!("task-{index}"));
                 std::fs::create_dir(&directory)?;
                 task.recording = Some(recording.in_directory(directory));
             }
-            recorder.program = Some(recording.program);
+            recorder.backend = Some(recording.backend());
         }
         Ok(recorder)
     }
@@ -194,6 +196,13 @@ impl Recorder {
                 let Some(recording) = &task.recording else {
                     continue;
                 };
+                if let Err(error) = recording.settle() {
+                    diagnostics
+                        .entry(id.clone())
+                        .or_default()
+                        .push(format!("recording incomplete: {error:#}"));
+                    continue;
+                }
                 match strace::collect(&recording.directory, &task.cwd) {
                     Ok((events, issues)) => {
                         observed.insert(id.clone(), events);
@@ -407,9 +416,9 @@ impl Recorder {
     }
 
     fn coverage(&self) -> Coverage {
-        let macos = self.program.is_none();
+        let macos = self.backend.is_none();
         Coverage {
-            backend: if macos { "seatbelt" } else { "strace" }.into(),
+            backend: self.backend.unwrap_or("seatbelt").into(),
             partial: true,
             limitations: if macos {
                 vec![

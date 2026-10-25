@@ -50,3 +50,6 @@ custom = { publishConfig = { access = "public" } }
 
 [dev-dependencies]
 zstd.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+qk-trace.workspace = true
