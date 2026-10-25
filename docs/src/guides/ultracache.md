@@ -75,7 +75,9 @@ declared key when recorded, so runs without its recordings find them.
 
 The run summary names the tasks taken from the cache by what they read, those
 recorded, those that missed what they read when recorded, and those with no
-recording yet. `--report` writes each task's as `recorded`.
+recording yet. `--report` writes which of these each task's recordings did as
+`recorded`, and the [run history](history.md) keeps it, so `qk show run --json`
+prints it too.
 
 ## What a recording cannot see
 
@@ -128,7 +130,9 @@ while a run with `--record` records it and keeps and shares its recordings as
 with `"on"`. Every run also looks the task up by its recordings without
 restoring anything, and says what they would have done: `--report` writes it
 as `shadow`, `wouldHit` with the key that had a result, `wouldMiss`, or
-`unrecorded` without path sets. The run summary names the tasks where the two
+`unrecorded` without path sets, and the run history keeps it, so runs can be
+counted afterwards: a task its declared inputs missed with `wouldHit` is a run
+its recordings would have saved. The run summary names the tasks where the two
 disagree:
 
 - a task its declared inputs missed where its recordings had a result: a

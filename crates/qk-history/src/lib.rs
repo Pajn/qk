@@ -16,7 +16,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
 /// Runs kept in the database.
 pub const KEPT_RUNS: usize = 200;
 
@@ -79,12 +79,11 @@ pub struct TaskReport {
     pub memory: Option<u64>,
     /// For a task with `qk:ultracache`, how it was keyed: `{"kind": "hit" |
     /// "saved", "key"}`, `missed`, `unrecorded` or `failed` with a `reason`.
-    /// In the run's report, not in the history database.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recorded: Option<Value>,
     /// For a task with `qk:ultracache` mode `"record"`, what its recordings
     /// would have done: `{"kind": "wouldHit", "key"}`, `wouldMiss` or
-    /// `unrecorded`. In the run's report, not in the history database.
+    /// `unrecorded`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shadow: Option<Value>,
 }
@@ -284,6 +283,8 @@ impl History {
                          memory INTEGER,
                          cores INTEGER,
                          cpu INTEGER,
+                         recorded TEXT,
+                         shadow TEXT,
                          PRIMARY KEY (run_id, task_id)
                      );
                      CREATE INDEX tasks_by_task ON tasks (task_id, started);
@@ -298,8 +299,10 @@ impl History {
             // Version 2 added what warm state did for each task, version 3
             // the threads it was given, version 4 execution logs, version 5
             // the memory it used, version 6 the worktree a run ran in and
-            // version 7 the cores a task held and the CPU time it used.
-            Some(version @ 1..=6) => {
+            // version 7 the cores a task held and the CPU time it used, and
+            // version 8 how a task with `qk:ultracache` was keyed and what its
+            // recordings would have done.
+            Some(version @ 1..=7) => {
                 let added: &[(u32, &str)] = &[
                     (2, "ALTER TABLE tasks ADD COLUMN warm TEXT;"),
                     (3, "ALTER TABLE tasks ADD COLUMN threads INTEGER;"),
@@ -309,6 +312,11 @@ impl History {
                         7,
                         "ALTER TABLE tasks ADD COLUMN cores INTEGER;
                          ALTER TABLE tasks ADD COLUMN cpu INTEGER;",
+                    ),
+                    (
+                        8,
+                        "ALTER TABLE tasks ADD COLUMN recorded TEXT;
+                         ALTER TABLE tasks ADD COLUMN shadow TEXT;",
                     ),
                 ];
                 for (since, statement) in added {
@@ -330,9 +338,9 @@ impl History {
                  inputs_unchanged INTEGER NOT NULL,
                  PRIMARY KEY (run_id, task_id),
                  FOREIGN KEY (run_id, task_id) REFERENCES tasks(run_id, task_id) ON DELETE CASCADE
-             );
-             UPDATE schema_version SET version = 7;",
+             );",
         )?;
+        transaction.execute("UPDATE schema_version SET version = ?1", [SCHEMA_VERSION])?;
         transaction.commit()?;
         connection.execute_batch("PRAGMA foreign_keys = ON;")?;
         Ok(Self { connection })
@@ -382,9 +390,10 @@ impl History {
             transaction.execute(
                 "INSERT OR REPLACE INTO tasks
                      (run_id, task_id, project, target, configuration, status, cache, key,
-                      started, ended, dependencies, cause, warm, threads, memory, cores, cpu)
+                      started, ended, dependencies, cause, warm, threads, memory, cores, cpu,
+                      recorded, shadow)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                         ?16, ?17)",
+                         ?16, ?17, ?18, ?19)",
                 params![
                     run.id,
                     task.id,
@@ -403,6 +412,14 @@ impl History {
                     task.memory,
                     task.cores,
                     task.cpu,
+                    task.recorded
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()?,
+                    task.shadow
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()?,
                 ],
             )?;
         }
@@ -727,7 +744,8 @@ impl History {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut statement = self.connection.prepare(&format!(
             "SELECT run_id, task_id, project, target, configuration, status, cache, key,
-                    started, ended, dependencies, cause, warm, threads, memory, cores, cpu
+                    started, ended, dependencies, cause, warm, threads, memory, cores, cpu,
+                    recorded, shadow
              FROM tasks WHERE {filter}
              ORDER BY started IS NULL, started DESC, task_id LIMIT ?2"
         ))?;
@@ -751,6 +769,8 @@ impl History {
                     row.get::<_, Option<u64>>(14)?,
                     row.get::<_, Option<u64>>(15)?,
                     row.get::<_, Option<u64>>(16)?,
+                    row.get::<_, Option<String>>(17)?,
+                    row.get::<_, Option<String>>(18)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -774,6 +794,8 @@ impl History {
                     memory,
                     cores,
                     cpu,
+                    recorded,
+                    shadow,
                 )| {
                     Ok((
                         run,
@@ -794,11 +816,14 @@ impl History {
                             warm: warm.map(|warm| serde_json::from_str(&warm)).transpose()?,
                             threads,
                             memory,
-                            // Not kept in the history database.
-                            recorded: None,
+                            recorded: recorded
+                                .map(|recorded| serde_json::from_str(&recorded))
+                                .transpose()?,
                             cores,
                             cpu,
-                            shadow: None,
+                            shadow: shadow
+                                .map(|shadow| serde_json::from_str(&shadow))
+                                .transpose()?,
                         },
                     ))
                 },
