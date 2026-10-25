@@ -122,6 +122,18 @@ describe("blobs", () => {
   });
 });
 
+describe("pack timing", () => {
+  it("says what the server spent before the pack began", async () => {
+    const name = hash().slice(0, 32);
+    const record = bytes(JSON.stringify({ version: 1, name, tasks: {} }));
+    expect((await request("PUT", `expectations/${name}`, { body: upload(record, []) })).status).toBe(204);
+    const response = await request("GET", `expectations/${name}`, { token: READ });
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Server-Timing")).toMatch(/^session;dur=\d+, object;dur=\d+, compose;dur=\d+$/);
+    await response.arrayBuffer();
+  });
+});
+
 describe("warm records", () => {
   it("are replaced by the newest save", async () => {
     const name = `${hash().slice(0, 32)}/${hash().slice(0, 32)}`;

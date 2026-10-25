@@ -371,6 +371,11 @@ fn decode(process: u32, call: &str, cwd: &Path) -> Option<Decoded> {
         | "setxattr" | "lsetxattr" | "removexattr" | "lremovexattr" => {
             emit(path(0, None)?, Operation::Write)
         }
+        // `futimens` is `utimensat` with a null path: the descriptor's own
+        // file.
+        "utimensat" if args.get(1).is_some_and(|path| *path == "NULL") => {
+            emit(normalize(&descriptor(args[0])?), Operation::Write)
+        }
         "mkdirat" | "fchmodat" | "fchmodat2" | "fchownat" | "utimensat" | "mknodat"
         | "futimesat" => emit(path(1, Some(0))?, Operation::Write),
         "symlink" => emit(path(1, None)?, Operation::Write),
@@ -533,6 +538,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(events[0].operation, Operation::ListDirectory);
+    }
+
+    #[test]
+    fn decodes_futimens_as_a_write_to_the_descriptors_file() {
+        let (events, _, _) = decode(
+            1,
+            concat!(
+                "utimensat(23</repo/build/browserconfig.xml>, NULL, ",
+                "[{tv_sec=1792930995, tv_nsec=88344326} /* 2026-10-25T12:23:15.088344326+0000 */, ",
+                "{tv_sec=1792930966, tv_nsec=7823650} /* 2026-10-25T12:22:46.007823650+0000 */], 0) = 0",
+            ),
+            Path::new("/repo"),
+        )
+        .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].path, "/repo/build/browserconfig.xml");
+        assert_eq!(events[0].operation, Operation::Write);
     }
 
     #[test]

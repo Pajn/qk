@@ -117,6 +117,38 @@ pub enum Shadow {
     Unrecorded,
 }
 
+/// A lookup by a task's recordings in mode `"record"`, started before its
+/// lookup by its declared key so that the two wait on the remote store
+/// together rather than one after the other.
+enum Shadowing {
+    /// Answered without the store: a recording's result is held here, or
+    /// there is no store to ask.
+    Settled(Shadow),
+    /// Waiting for the path sets the store holds, with the keys of the path
+    /// sets held here, none of which has a result here.
+    Fetching {
+        keys: Vec<String>,
+        fetch: std::thread::JoinHandle<Result<Option<Vec<u8>>>>,
+    },
+}
+
+/// The key of one of a task's path sets, or none, said, when the path set
+/// cannot key it.
+fn recording_key(
+    weak: &str,
+    set: &recorded::PathSet,
+    snapshot: &hash::Snapshot,
+    workspace: &Workspace,
+    unlisted: &recorded::Unlisted,
+    task: &Task,
+) -> Option<String> {
+    recorded::strong_key(weak, set, snapshot, &workspace.root, unlisted)
+        .inspect_err(|error| {
+            qk_executor::status!("qk: {}: ignoring a path set ({error:#})", task.id);
+        })
+        .ok()
+}
+
 /// What a lookup by a task's recordings found.
 enum Found {
     /// A result under this key in the local cache.
@@ -139,6 +171,9 @@ pub enum Recorded {
     /// It has no path set yet, and this run did not record one: it was keyed
     /// by its declared inputs.
     Unrecorded,
+    /// None of its path sets' keys had a result, and its declared key, which
+    /// covers what each of them read, did: restored under that key.
+    Declared { key: String },
     /// Recording it failed, with why.
     Failed { reason: String },
 }
@@ -516,17 +551,20 @@ impl Cache {
                 }
             }
         });
-        let mut shadow = None;
+        let mut shadowing = None;
         if let Some((sets, weak, settings)) = &mut recordings {
-            let recorded_profile = profile::span(&task.id, "recorded_restore");
-            let keyed_by = settings.mode == ultracache::Mode::On;
-            let found = self.by_recordings(
-                workspace, task, prepared, snapshot, &outputs, &unlisted, sets, weak, &key,
-                keyed_by, cancelled,
-            );
-            drop(recorded_profile);
-            match (keyed_by, found) {
-                (true, found @ (Found::Local(_) | Found::Remote(_))) => {
+            if settings.mode == ultracache::Mode::Record {
+                let _lookup = profile::span(&task.id, "recorded_lookup");
+                shadowing =
+                    Some(self.start_shadow(workspace, task, snapshot, &unlisted, sets, weak));
+            } else {
+                let recorded_profile = profile::span(&task.id, "recorded_restore");
+                let found = self.by_recordings(
+                    workspace, task, prepared, snapshot, &outputs, &unlisted, sets, weak, &key,
+                    cancelled,
+                );
+                drop(recorded_profile);
+                if let found @ (Found::Local(_) | Found::Remote(_)) = found {
                     let (strong, remote) = match found {
                         Found::Local(strong) => {
                             if let Some(remote) = &self.remote {
@@ -560,25 +598,44 @@ impl Cache {
                         shadow: None,
                     });
                 }
-                (true, Found::Nothing) => {}
-                (false, Found::Local(strong) | Found::Remote(strong)) => {
-                    shadow = Some(Shadow::WouldHit { key: strong });
-                }
-                (false, Found::Nothing) if sets.is_empty() => shadow = Some(Shadow::Unrecorded),
-                (false, Found::Nothing) => shadow = Some(Shadow::WouldMiss),
             }
         }
-        // A task with path sets is keyed by them alone: its declared inputs
-        // are what a recording found wanting. In mode "record" it is keyed by
-        // its declared inputs all the same.
+        // What its recordings would have done, once the store has said.
+        let mut settle = |recordings: &mut Option<(Vec<recorded::PathSet>, String, _)>| {
+            let shadowing = shadowing.take()?;
+            let (sets, weak, _) = recordings.as_mut()?;
+            let _wait = profile::span(&task.id, "recorded_wait");
+            Some(self.settle_shadow(shadowing, workspace, task, snapshot, &unlisted, sets, weak))
+        };
+        // A task with path sets is keyed by them alone, unless its declared
+        // inputs, as they are now, cover what each of them read: otherwise
+        // its declared inputs are what a recording found wanting. In mode
+        // "record" it is keyed by its declared inputs all the same.
         let declared = recordings.as_ref().is_none_or(|(sets, _, settings)| {
-            sets.is_empty() || settings.mode == ultracache::Mode::Record
+            settings.mode == ultracache::Mode::Record
+                || sets.is_empty()
+                || hash::coverage(snapshot, workspace, graph, task, prepared, cancelled).is_ok_and(
+                    |coverage| {
+                        let outputs = self
+                            .workspace_outputs
+                            .get_or_init(|| workspace_outputs(workspace));
+                        let output = |path: &str| outputs.matches(path);
+                        sets.iter()
+                            .all(|set| coverage.covers(snapshot, &workspace.root, set, &output))
+                    },
+                )
         });
         // How its recordings keyed it, unless it runs and records.
         let unrecorded = recordings
             .as_ref()
             .filter(|(_, _, settings)| settings.mode == ultracache::Mode::On)
-            .map(|_| Recorded::Unrecorded);
+            .map(|(sets, _, _)| {
+                if sets.is_empty() {
+                    Recorded::Unrecorded
+                } else {
+                    Recorded::Declared { key: key.clone() }
+                }
+            });
         // An entry fetched ahead of this task is local, but it came from the
         // remote store, and is reported as such.
         let prefetched = declared
@@ -633,7 +690,7 @@ impl Cache {
                     warm: None,
                     execution: None,
                     recorded: unrecorded,
-                    shadow,
+                    shadow: settle(&mut recordings),
                 });
             }
             Ok(false) => {}
@@ -673,7 +730,7 @@ impl Cache {
                         warm: None,
                         execution: None,
                         recorded: unrecorded,
-                        shadow,
+                        shadow: settle(&mut recordings),
                     });
                 }
                 Ok(false) => {}
@@ -682,6 +739,8 @@ impl Cache {
                 }
             }
         }
+        // Settled before it runs: recording it merges the path sets fetched.
+        let shadow = settle(&mut recordings);
         qk_executor::report::event(qk_executor::report::Event::Cache {
             id: task.id.clone(),
             cached: qk_executor::report::Cached::Miss,
@@ -800,11 +859,10 @@ impl Cache {
         })
     }
 
-    /// Looks a task up by its recordings: by each path set's key in the local
-    /// cache, then, with none there, among the path sets and results the
-    /// remote store holds, adding its path sets to `sets`. With `restore`, a
-    /// result found is restored; without, the lookup only says whether there
-    /// is one.
+    /// Looks a task up by its recordings and restores what it finds: by each
+    /// path set's key in the local cache, then, with none there, among the
+    /// path sets and results the remote store holds, adding its path sets to
+    /// `sets`.
     #[allow(clippy::too_many_arguments)]
     fn by_recordings(
         &self,
@@ -817,16 +875,10 @@ impl Cache {
         sets: &mut Vec<recorded::PathSet>,
         weak: &str,
         declared: &str,
-        restore: bool,
         cancelled: &AtomicBool,
     ) -> Found {
-        let strong = |set: &recorded::PathSet| {
-            recorded::strong_key(weak, set, snapshot, &workspace.root, unlisted)
-                .inspect_err(|error| {
-                    qk_executor::status!("qk: {}: ignoring a path set ({error:#})", task.id);
-                })
-                .ok()
-        };
+        let strong =
+            |set: &recorded::PathSet| recording_key(weak, set, snapshot, workspace, unlisted, task);
         let restored = |strong: &str, shown| {
             self.restore(
                 &workspace.root,
@@ -842,16 +894,7 @@ impl Cache {
                 false
             })
         };
-        let local = |strong: &str| {
-            if restore {
-                restored(strong, qk_executor::Shown::LocalCache)
-            } else {
-                self.root
-                    .join("entries")
-                    .join(format!("{strong}.json"))
-                    .is_file()
-            }
-        };
+        let local = |strong: &str| restored(strong, qk_executor::Shown::LocalCache);
         let mut keys = Vec::new();
         for set in sets.iter() {
             if let Some(strong) = strong(set) {
@@ -866,10 +909,8 @@ impl Cache {
         };
         // Without path sets here, a result here under the declared key is
         // the task's, and asking the store for path sets would only delay
-        // it, run after run, and have them shadow it. Looking up without
-        // restoring, for mode "record", the lookup is all there is to do.
-        if restore
-            && sets.is_empty()
+        // it, run after run, and have them shadow it.
+        if sets.is_empty()
             && self
                 .root
                 .join("entries")
@@ -903,25 +944,127 @@ impl Cache {
             }
         }
         for strong in keys {
-            let found = if restore {
-                remote
-                    .fetch(&self.root, &strong, &task.id, cancelled)
-                    .unwrap_or_else(|error| {
-                        qk_executor::status!(
-                            "qk: {}: remote cache unavailable ({error:#})",
-                            task.id
-                        );
-                        false
-                    })
-                    && restored(&strong, qk_executor::Shown::RemoteCache)
-            } else {
-                remote.holds(&strong).unwrap_or(false)
-            };
+            let found = remote
+                .fetch(&self.root, &strong, &task.id, cancelled)
+                .unwrap_or_else(|error| {
+                    qk_executor::status!("qk: {}: remote cache unavailable ({error:#})", task.id);
+                    false
+                })
+                && restored(&strong, qk_executor::Shown::RemoteCache);
             if found {
                 return Found::Remote(strong);
             }
         }
         Found::Nothing
+    }
+
+    /// Starts looking a task in mode `"record"` up by its recordings, without
+    /// restoring anything: by each path set's key in the local cache, and with
+    /// none there, by fetching the path sets the remote store holds on a
+    /// thread of its own, for [`Self::settle_shadow`] to finish.
+    fn start_shadow(
+        &self,
+        workspace: &Workspace,
+        task: &Task,
+        snapshot: &hash::Snapshot,
+        unlisted: &recorded::Unlisted,
+        sets: &[recorded::PathSet],
+        weak: &str,
+    ) -> Shadowing {
+        let mut keys = Vec::new();
+        for set in sets {
+            if let Some(strong) = recording_key(weak, set, snapshot, workspace, unlisted, task) {
+                if self.holds_entry(&strong) {
+                    return Shadowing::Settled(Shadow::WouldHit { key: strong });
+                }
+                keys.push(strong);
+            }
+        }
+        let Some(remote) = &self.remote else {
+            return Shadowing::Settled(if sets.is_empty() {
+                Shadow::Unrecorded
+            } else {
+                Shadow::WouldMiss
+            });
+        };
+        let (remote, root, weak, id) = (
+            std::sync::Arc::clone(remote),
+            self.root.clone(),
+            weak.to_owned(),
+            task.id.clone(),
+        );
+        Shadowing::Fetching {
+            keys,
+            fetch: std::thread::spawn(move || remote.fetch_path_sets(&root, &weak, &id)),
+        }
+    }
+
+    /// What a task's recordings would have done: [`Self::start_shadow`]'s
+    /// lookup, finished with the path sets the store held, which are added
+    /// to `sets`, and the results it holds.
+    #[allow(clippy::too_many_arguments)]
+    fn settle_shadow(
+        &self,
+        shadowing: Shadowing,
+        workspace: &Workspace,
+        task: &Task,
+        snapshot: &hash::Snapshot,
+        unlisted: &recorded::Unlisted,
+        sets: &mut Vec<recorded::PathSet>,
+        weak: &str,
+    ) -> Shadow {
+        let (mut keys, fetch) = match shadowing {
+            Shadowing::Settled(shadow) => return shadow,
+            Shadowing::Fetching { keys, fetch } => (keys, fetch),
+        };
+        let fetched = fetch
+            .join()
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("fetching them panicked")))
+            .and_then(|record| match record {
+                Some(record) => recorded::merge(&self.root, weak, &record),
+                None => Ok(Vec::new()),
+            });
+        match fetched {
+            Ok(added) => {
+                for set in added {
+                    if let Some(strong) =
+                        recording_key(weak, &set, snapshot, workspace, unlisted, task)
+                    {
+                        if self.holds_entry(&strong) {
+                            sets.push(set);
+                            return Shadow::WouldHit { key: strong };
+                        }
+                        keys.push(strong);
+                    }
+                    sets.push(set);
+                }
+            }
+            Err(error) => {
+                qk_executor::status!("qk: {}: remote path sets unavailable ({error:#})", task.id)
+            }
+        }
+        let remote = self
+            .remote
+            .as_ref()
+            .expect("only a remote store is fetched from");
+        keys.into_iter()
+            .find(|strong| remote.holds(strong).unwrap_or(false))
+            .map_or(
+                if sets.is_empty() {
+                    Shadow::Unrecorded
+                } else {
+                    Shadow::WouldMiss
+                },
+                |key| Shadow::WouldHit { key },
+            )
+    }
+
+    /// Whether the local cache holds a result under `key`.
+    fn holds_entry(&self, key: &str) -> bool {
+        self.root
+            .join("entries")
+            .join(format!("{key}.json"))
+            .is_file()
     }
 
     /// The path set of a task's recording, or why there is none.

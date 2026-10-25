@@ -15,7 +15,7 @@ pub(crate) struct Span<'a> {
     task: &'a str,
     stage: &'static str,
     started: Option<Instant>,
-    counts: Vec<(&'static str, u64)>,
+    counts: Vec<(&'static str, String)>,
 }
 
 pub(crate) fn span<'a>(task: &'a str, stage: &'static str) -> Span<'a> {
@@ -33,6 +33,15 @@ impl Span<'_> {
     /// Adds a count to the span's line, such as the bytes it received.
     pub(crate) fn count(&mut self, name: &'static str, value: u64) {
         if self.started.is_some() {
+            self.counts.push((name, value.to_string()));
+        }
+    }
+
+    /// Adds text to the span's line, such as how a server says it spent the
+    /// time; whitespace is left out, so the line still splits on spaces.
+    pub(crate) fn note(&mut self, name: &'static str, value: &str) {
+        if self.started.is_some() {
+            let value: String = value.chars().filter(|ch| !ch.is_whitespace()).collect();
             self.counts.push((name, value));
         }
     }

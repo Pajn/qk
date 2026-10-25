@@ -50,6 +50,8 @@ pub struct Declared {
     /// `dependentTasksOutputFiles` or a fileset selecting them. As in Nx, a
     /// change carries from such a task to this one, and from no other.
     pub producers: BTreeSet<String>,
+    /// The patterns the declared filesets select files by.
+    pub selection: hash::Selection,
 }
 
 /// What qk adds to every task's key on its own, each part by its own rule.

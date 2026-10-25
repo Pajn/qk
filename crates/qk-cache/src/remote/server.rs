@@ -91,12 +91,21 @@ impl Server {
 
     /// A GET of `path` that answers with a body, or `None` on 404.
     fn read(&self, path: &str, task: &str) -> Result<Option<Body>> {
-        let waiting = crate::profile::span(task, "remote_response");
+        let mut waiting = crate::profile::span(task, "remote_response");
         let response = self
             .agent
             .get(self.url(path))
             .header("Authorization", self.authorization())
             .call()?;
+        // What of the wait the server spent, as it says: the rest is the
+        // network and what is in front of it.
+        if let Some(timing) = response
+            .headers()
+            .get("server-timing")
+            .and_then(|value| value.to_str().ok())
+        {
+            waiting.note("server", timing);
+        }
         drop(waiting);
         match response.status().as_u16() {
             200 => Ok(Some(Box::new(io::BufReader::new(

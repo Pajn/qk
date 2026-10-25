@@ -90,6 +90,12 @@ unknown or expired one, nothing is taken as held.
 A client that lacks a blob the pack marks apart fetches it by hash. The filter
 can be wrong, so a client checks what it holds and asks for the rest.
 
+A pack's `Server-Timing` header says how long the server took before it began
+sending it, in milliseconds: `session`, reading the session's filter;
+`object`, reading the stored upload; and `compose`, placing its blobs. This is
+also true of the packs of path sets and expectations. A client can tell the
+server's part of a wait from the network's by it.
+
 ### `GET blobs/<hash>[?entry=<key>|?warm=<a>/<b>]`, `HEAD blobs/<hash>`
 
 Answer: `200`, the blob as one zstd frame; or `404`. With `entry` or `warm`, a

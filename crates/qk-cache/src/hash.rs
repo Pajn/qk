@@ -1455,9 +1455,192 @@ fn remove_json_path(target: &mut Value, path: &str) {
 struct FilePattern {
     matcher: Arc<Pattern>,
     prefix: String,
+    /// The glob after `prefix`, the literal directory it starts with; `None`
+    /// when the pattern names one path.
+    rest: Option<String>,
     excluded: bool,
     /// The project a project fileset selects the files of.
     owner: Option<String>,
+}
+
+/// The patterns of a task's declared filesets, by the scope they select in:
+/// kept to tell whether a file where there is none would be selected, as
+/// [`Coverage`] asks.
+#[derive(Default)]
+pub struct Selection {
+    scopes: Vec<Vec<FilePattern>>,
+}
+
+impl Selection {
+    /// Whether a file at `path` would be selected, gitignore aside: an
+    /// included pattern of a scope matches it, and none of that scope's
+    /// exclusions does.
+    fn selects(&self, snapshot: &Snapshot, path: &str) -> bool {
+        let applies = |pattern: &FilePattern| {
+            pattern.matcher.is_match(path)
+                && (pattern.owner.is_none() || snapshot.owner(path) == pattern.owner.as_deref())
+        };
+        self.scopes.iter().any(|patterns| {
+            patterns
+                .iter()
+                .any(|pattern| !pattern.excluded && applies(pattern))
+                && !patterns
+                    .iter()
+                    .any(|pattern| pattern.excluded && applies(pattern))
+        })
+    }
+
+    /// Whether every entry `directory` could hold, at any depth, would be
+    /// selected, gitignore aside: an included pattern of a scope takes all of
+    /// what is under a directory at or above it, and none of that scope's
+    /// exclusions reaches into it. `""` is the workspace root.
+    fn selects_every_entry(&self, snapshot: &Snapshot, directory: &str) -> bool {
+        let within = |prefix: &str| {
+            prefix.is_empty()
+                || directory == prefix
+                || directory
+                    .strip_prefix(prefix)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        };
+        let reaches = |prefix: &str| {
+            within(prefix)
+                || directory.is_empty()
+                || prefix
+                    .strip_prefix(directory)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        };
+        let owner = snapshot.owner(if directory.is_empty() { "." } else { directory });
+        self.scopes.iter().any(|patterns| {
+            patterns.iter().any(|pattern| {
+                !pattern.excluded
+                    && within(&pattern.prefix)
+                    && matches!(pattern.rest.as_deref(), Some("**" | "**/*"))
+                    && (pattern.owner.is_none() || owner == pattern.owner.as_deref())
+            }) && !patterns
+                .iter()
+                .any(|pattern| pattern.excluded && reaches(&pattern.prefix))
+        })
+    }
+}
+
+/// What a task's declared key holds of the workspace's files, to tell
+/// whether it keys everything a recording says the task read, looked for
+/// and listed: when it does, a result under the declared key is as sound as
+/// qk's keys are without recordings. A file qk keys by part of its content,
+/// such as a dependency's `package.json` or a `json` input, counts as keyed,
+/// as it does for every task's key.
+pub(crate) struct Coverage {
+    resolved: Resolved,
+    /// Each `dependentTasksOutputFiles` glob, with the declared outputs of
+    /// the tasks it reads.
+    dependency_outputs: Vec<(Arc<Pattern>, Vec<Outputs>)>,
+}
+
+/// What `task`'s declared key covers: see [`Coverage`].
+pub(crate) fn coverage(
+    snapshot: &Snapshot,
+    workspace: &Workspace,
+    graph: &TaskGraph,
+    task: &Task,
+    prepared: &PreparedTask,
+    cancelled: &AtomicBool,
+) -> Result<Coverage> {
+    let resolved = resolve(snapshot, workspace, task, Some(prepared), cancelled)?;
+    let selections: Vec<(String, bool)> = resolved
+        .dependency_output_inputs()
+        .map(|(pattern, transitive)| (pattern.to_owned(), transitive))
+        .collect();
+    let mut dependency_outputs = Vec::new();
+    for (pattern, transitive) in selections {
+        let matcher = snapshot.pattern(&pattern, false)?;
+        let mut selected = task.dependencies.clone();
+        if transitive {
+            let mut pending = selected.clone();
+            while let Some(id) = pending.pop_first() {
+                for dependency in &graph.tasks[&id].dependencies {
+                    if selected.insert(dependency.clone()) {
+                        pending.insert(dependency.clone());
+                    }
+                }
+            }
+        }
+        let mut outputs = Vec::new();
+        for id in selected {
+            let declared = Outputs::new(workspace, &graph.tasks[&id])?;
+            if declared.declared() {
+                outputs.push(declared);
+            }
+        }
+        dependency_outputs.push((matcher, outputs));
+    }
+    Ok(Coverage {
+        resolved,
+        dependency_outputs,
+    })
+}
+
+impl Coverage {
+    /// Whether the declared key holds the content of the file at `path`, or
+    /// what of it reaches tasks, by its declared inputs or by what qk adds.
+    fn keyed(&self, path: &str) -> bool {
+        let inferred = &self.resolved.inferred;
+        self.resolved.is_whole_file(path)
+            || self.resolved.is_json_input(path)
+            || inferred.manifests.contains_key(path)
+            || inferred.tsconfig.as_deref() == Some(path)
+            || inferred.settings.contains(path)
+            || inferred.project.contains(path)
+            || (inferred.workspace_file && path == "pnpm-workspace.yaml")
+            || (inferred.lockfile.is_some() && path == "pnpm-lock.yaml")
+            || self.dependency_outputs.iter().any(|(matcher, outputs)| {
+                matcher.is_match(path) && outputs.iter().any(|outputs| outputs.matches(path))
+            })
+    }
+
+    /// Whether the declared key covers every path of `set`: each file read
+    /// or found is keyed, or a directory found holds a keyed file, so that
+    /// its going changes the key; a file created where one was looked for
+    /// would be selected, and is neither gitignored nor a declared output;
+    /// and every entry a listed directory could gain or lose that is not
+    /// gitignored would be selected, the directory being no declared output.
+    /// A declared output never enters the declared files, unless a
+    /// `dependentTasksOutputFiles` input keys it.
+    /// `output` says whether a path is a declared output of any target.
+    pub(crate) fn covers(
+        &self,
+        snapshot: &Snapshot,
+        root: &Path,
+        set: &crate::recorded::PathSet,
+        output: &dyn Fn(&str) -> bool,
+    ) -> bool {
+        let selection = &self.resolved.declared.selection;
+        fn directory(path: &str) -> &str {
+            if path == "." { "" } else { path }
+        }
+        let holds_keyed = |path: &str| {
+            let path = directory(path);
+            if path.is_empty() {
+                return self.resolved.whole_files().next().is_some();
+            }
+            under(&self.resolved.declared.files, path).next().is_some()
+                || under(&self.resolved.inferred.files, path).next().is_some()
+        };
+        set.reads.iter().all(|path| self.keyed(path))
+            && set
+                .present
+                .iter()
+                .all(|path| self.keyed(path) || (root.join(path).is_dir() && holds_keyed(path)))
+            && set.absent.iter().all(|path| {
+                self.keyed(path)
+                    || (!snapshot.source_ignore.matches(path)
+                        && !output(path)
+                        && selection.selects(snapshot, path))
+            })
+            && set.listings.iter().all(|path| {
+                let path = directory(path);
+                (path.is_empty() || !output(path)) && selection.selects_every_entry(snapshot, path)
+            })
+    }
 }
 
 /// A `json` glob, kept to select dependency outputs once they are written.
@@ -1876,7 +2059,8 @@ impl<'a> Resolver<'a> {
         };
         let pattern = paths::expand_glob(self.workspace, project, pattern)?;
         let matcher = self.snapshot.fileset_pattern(&pattern, exclude)?;
-        let (prefix, _) = crate::ignored::partition(pattern.trim_end_matches('/'));
+        let (prefix, rest) = crate::ignored::partition(pattern.trim_end_matches('/'));
+        let rest = rest.map(str::to_owned);
         let candidates: Box<dyn Iterator<Item = &String>> = if prefix.is_empty() {
             Box::new(self.candidates.iter())
         } else {
@@ -1898,6 +2082,7 @@ impl<'a> Resolver<'a> {
         selection.patterns.push(FilePattern {
             matcher,
             prefix,
+            rest,
             excluded: exclude,
             owner,
         });
@@ -2316,6 +2501,13 @@ fn resolve_candidates(
         external_declared: resolver.external_declared,
         projects: resolver.projects,
         producers,
+        selection: Selection {
+            scopes: resolver
+                .scopes
+                .into_values()
+                .map(|selection| selection.patterns)
+                .collect(),
+        },
     };
     // `dependentTasksOutputFiles` reads its direct dependencies' declared
     // outputs, or with `transitive` those of every task it depends on.
@@ -3039,6 +3231,88 @@ mod tests {
             resolved.declared.producers,
             BTreeSet::from(["lib:build".to_owned()])
         );
+    }
+
+    /// The declared key covers a recording when every file it read is keyed,
+    /// every file it looked for would be selected and not gitignored, and
+    /// every entry a directory it listed could hold would be selected.
+    #[test]
+    fn declared_inputs_cover_what_they_would_select_and_not_what_they_leave_out() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("nx.json"), "{}").unwrap();
+        std::fs::write(
+            root.path().join("project.json"),
+            json!({"name": "app", "targets": {
+                "build": {"command": "true", "inputs": [
+                    "{projectRoot}/src/**/*", "!{projectRoot}/src/skip/**/*"
+                ]},
+                "gen": {"command": "true", "outputs": ["{projectRoot}/src/gen"]}
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(root.path().join(".gitignore"), "src/secret.ts\n").unwrap();
+        for path in [
+            "src/a.ts",
+            "src/lib/b.ts",
+            "src/skip/c.ts",
+            "src/gen/d.ts",
+            "README.md",
+        ] {
+            let path = root.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "x").unwrap();
+        }
+        let workspace = Workspace::load(root.path()).unwrap();
+        let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
+        let task = &graph.tasks["app:build"];
+        let prepared = qk_executor::prepare(&workspace, task, &BTreeMap::new()).unwrap();
+        let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
+        let coverage = coverage(
+            &snapshot,
+            &workspace,
+            &graph,
+            task,
+            &prepared,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let set = |part: &str, path: &str| {
+            let mut set = crate::recorded::PathSet::default();
+            match part {
+                "read" => &mut set.reads,
+                "present" => &mut set.present,
+                "absent" => &mut set.absent,
+                _ => &mut set.listings,
+            }
+            .insert(path.to_owned());
+            set
+        };
+        for (part, path, covered) in [
+            ("read", "src/a.ts", true),
+            ("read", "README.md", false),
+            ("read", "src/skip/c.ts", false),
+            ("present", "src/lib", true),
+            ("absent", "src/new.ts", true),
+            // Excluded, or gitignored: creating it would not change the key.
+            ("absent", "src/skip/new.ts", false),
+            ("absent", "src/secret.ts", false),
+            ("absent", ".env.local", false),
+            // Another target's output, which no declared key holds.
+            ("absent", "src/gen/e.ts", false),
+            ("listing", "src/gen", false),
+            ("listing", "src/lib", true),
+            // An exclusion reaches into it, or nothing selects all of it.
+            ("listing", "src", false),
+            ("listing", ".", false),
+        ] {
+            let generated = |path: &str| path == "src/gen" || path.starts_with("src/gen/");
+            assert_eq!(
+                coverage.covers(&snapshot, root.path(), &set(part, path), &generated),
+                covered,
+                "{part} {path}"
+            );
+        }
     }
 
     #[test]

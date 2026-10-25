@@ -246,8 +246,12 @@ async function session(id: string | null, env: Env): Promise<Bloom | null> {
 // Packs.
 
 async function getPack(object: string, immutable: boolean, url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
+  // A Worker's clock moves only across I/O, which is what these time.
+  const started = Date.now();
   const held = await session(url.searchParams.get("session"), env);
+  const sessioned = Date.now();
   const stored = immutable ? await readImmutable(object, env, ctx) : await env.STORE.get(object);
+  const read = Date.now();
   if (!stored) {
     return notFound();
   }
@@ -260,7 +264,12 @@ async function getPack(object: string, immutable: boolean, url: URL, env: Env, c
     throw error;
   }
   return new Response(body, {
-    headers: { "Content-Type": "application/x-qk-pack", "Cache-Control": "no-store" },
+    headers: {
+      "Content-Type": "application/x-qk-pack",
+      "Cache-Control": "no-store",
+      // Up to the first byte of the pack, which the rest streams after.
+      "Server-Timing": `session;dur=${sessioned - started}, object;dur=${read - sessioned}, compose;dur=${Date.now() - read}`,
+    },
   });
 }
 
