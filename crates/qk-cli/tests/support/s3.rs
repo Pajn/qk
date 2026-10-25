@@ -44,6 +44,8 @@ pub struct State {
     pub fail_get: BTreeSet<String>,
     /// Hold GETs of paths ending with any of these until it is cleared.
     pub hold_get: BTreeSet<String>,
+    /// Hold GETs of paths containing any of these until it is cleared.
+    pub hold_get_containing: BTreeSet<String>,
     /// Each request's method and path, with when it arrived and when its
     /// response was sent.
     pub timed: Vec<(String, Instant, Instant)>,
@@ -180,13 +182,13 @@ fn serve(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
         state.lock().unwrap().held_puts -= 1;
     }
     let held = |state: &Mutex<State>| {
+        let state = state.lock().unwrap();
         method == "GET"
-            && state
-                .lock()
-                .unwrap()
-                .hold_get
-                .iter()
-                .any(|end| path.ends_with(end))
+            && (state.hold_get.iter().any(|end| path.ends_with(end))
+                || state
+                    .hold_get_containing
+                    .iter()
+                    .any(|part| path.contains(part.as_str())))
     };
     while held(state) {
         std::thread::sleep(Duration::from_millis(10));

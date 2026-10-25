@@ -346,6 +346,69 @@ fn a_task_without_recordings_cached_locally_asks_the_store_for_none() {
     );
 }
 
+/// In mode "record", the path sets the store holds are fetched while the
+/// task's declared result is, rather than before it, so that a cache hit
+/// waits on the store once: the declared result is asked for while the store
+/// still holds back the path sets.
+#[test]
+fn mode_record_fetches_shared_recordings_alongside_the_declared_result() {
+    if !has_strace() {
+        return;
+    }
+    let temp = fixture();
+    let root = temp.path();
+    let nx = fs::read_to_string(root.join("nx.json")).unwrap();
+    write(
+        root,
+        "nx.json",
+        &nx.replace(r#""ignoreReads""#, r#""mode": "record", "ignoreReads""#),
+    );
+    let server = s3::FakeS3::start();
+    let machine = with_remote(root, &server);
+    let (a, b) = (machine("a"), machine("b"));
+    let task = build_report(root, true, &pairs(&a));
+    assert_eq!(kind(&task["recorded"]), "saved");
+    let entry = format!("/entries/{}", task["key"].as_str().unwrap());
+    {
+        let mut state = server.state.lock().unwrap();
+        state.hold_get_containing.insert("/pathsets/".into());
+        state.requests.clear();
+    }
+    // Released once the declared result is asked for, or after a while
+    // without it, so that a run that waits for the path sets still ends.
+    let watching = {
+        let state = server.state.clone();
+        let entry = entry.clone();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            let asked = loop {
+                let asked = state
+                    .lock()
+                    .unwrap()
+                    .requests
+                    .iter()
+                    .any(|request| request.starts_with("GET ") && request.contains(&entry));
+                if asked || std::time::Instant::now() > deadline {
+                    break asked;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            };
+            state.lock().unwrap().hold_get_containing.clear();
+            asked
+        })
+    };
+    let task = build_report(root, false, &pairs(&b));
+    assert!(
+        watching.join().unwrap(),
+        "the declared result was not asked for while the path sets were held: {:?}",
+        server.state.lock().unwrap().requests
+    );
+    assert_eq!(
+        (task["cache"].as_str(), kind(&task["shadow"]).as_str()),
+        (Some("remote-hit"), "wouldHit")
+    );
+}
+
 #[test]
 fn mode_record_looks_up_shared_recordings_behind_a_local_declared_hit() {
     if !has_strace() {
