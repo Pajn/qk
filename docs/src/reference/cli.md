@@ -161,7 +161,9 @@ input recheck after it (`inputs_recheck`) and storing its result
 parsing `pnpm-lock.yaml` (`lockfile_parse`); each is charged to the task that
 needed it. A remote fetch also times waiting for the store's index
 (`remote_index_wait`), waiting for the store to respond (`remote_response`) and
-receiving the entry (`remote_body`). The last adds `bytes`, what was received,
+receiving the entry (`remote_body`). From a store server that sends a
+`Server-Timing` header, as qk's does, `remote_response` adds it as `server`:
+the part of the wait the server spent, the rest being the network. The last adds `bytes`, what was received,
 `held_bytes`, how much of the files it carried the local cache held already,
 `apart_bytes`, what was received for outputs stored apart, and
 `skipped_bytes`, the outputs stored apart that were not fetched because the
