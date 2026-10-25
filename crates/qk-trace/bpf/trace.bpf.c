@@ -240,8 +240,14 @@ static __always_inline __u16 read_path(char *into, __u64 pointer)
 	if (!pointer)
 		return 0;
 	long length = bpf_probe_read_user_str(into, PATH_BYTES, (const void *)pointer);
-	if (length <= 0)
+	if (length < 0)
 		return PATH_BYTES + 1;
+	/* Kernels before 6.16 count an empty string's NUL only when there are
+	 * other bytes: theirs is 0, where later kernels say 1. */
+	if (length == 0) {
+		into[0] = 0;
+		return 1;
+	}
 	return (__u16)length;
 }
 
