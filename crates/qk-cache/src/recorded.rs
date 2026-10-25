@@ -475,6 +475,16 @@ pub(crate) struct WorkspaceOutputs {
 }
 
 impl WorkspaceOutputs {
+    /// Whether `path`, workspace-relative, is a declared output of any
+    /// target.
+    pub(crate) fn matches(&self, path: &str) -> bool {
+        self.outputs
+            .iter()
+            .any(|(_, outputs)| outputs.matches(path))
+    }
+}
+
+impl WorkspaceOutputs {
     /// `roots` holds each project's root.
     pub(crate) fn new(outputs: Vec<(TargetOf, Outputs)>, roots: &BTreeMap<String, String>) -> Self {
         let mut by_anchor: BTreeMap<String, Vec<usize>> = BTreeMap::new();

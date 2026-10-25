@@ -171,6 +171,9 @@ pub enum Recorded {
     /// It has no path set yet, and this run did not record one: it was keyed
     /// by its declared inputs.
     Unrecorded,
+    /// None of its path sets' keys had a result, and its declared key, which
+    /// covers what each of them read, did: restored under that key.
+    Declared { key: String },
     /// Recording it failed, with why.
     Failed { reason: String },
 }
@@ -604,17 +607,35 @@ impl Cache {
             let _wait = profile::span(&task.id, "recorded_wait");
             Some(self.settle_shadow(shadowing, workspace, task, snapshot, &unlisted, sets, weak))
         };
-        // A task with path sets is keyed by them alone: its declared inputs
-        // are what a recording found wanting. In mode "record" it is keyed by
-        // its declared inputs all the same.
+        // A task with path sets is keyed by them alone, unless its declared
+        // inputs, as they are now, cover what each of them read: otherwise
+        // its declared inputs are what a recording found wanting. In mode
+        // "record" it is keyed by its declared inputs all the same.
         let declared = recordings.as_ref().is_none_or(|(sets, _, settings)| {
-            sets.is_empty() || settings.mode == ultracache::Mode::Record
+            settings.mode == ultracache::Mode::Record
+                || sets.is_empty()
+                || hash::coverage(snapshot, workspace, graph, task, prepared, cancelled).is_ok_and(
+                    |coverage| {
+                        let outputs = self
+                            .workspace_outputs
+                            .get_or_init(|| workspace_outputs(workspace));
+                        let output = |path: &str| outputs.matches(path);
+                        sets.iter()
+                            .all(|set| coverage.covers(snapshot, &workspace.root, set, &output))
+                    },
+                )
         });
         // How its recordings keyed it, unless it runs and records.
         let unrecorded = recordings
             .as_ref()
             .filter(|(_, _, settings)| settings.mode == ultracache::Mode::On)
-            .map(|_| Recorded::Unrecorded);
+            .map(|(sets, _, _)| {
+                if sets.is_empty() {
+                    Recorded::Unrecorded
+                } else {
+                    Recorded::Declared { key: key.clone() }
+                }
+            });
         // An entry fetched ahead of this task is local, but it came from the
         // remote store, and is reported as such.
         let prefetched = declared

@@ -890,6 +890,10 @@ fn details(
         ),
         (&["saved"], "recorded"),
         (
+            &["declared"],
+            "from the cache by their inputs, which cover what they read when recorded",
+        ),
+        (
             &["missed"],
             "missed what they read when recorded, and ran unrecorded",
         ),

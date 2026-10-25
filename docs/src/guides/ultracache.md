@@ -64,18 +64,43 @@ sets are kept for a weak key, the newest first. A task that reads differently
 from run to run keeps a set for each way.
 
 For each path set, qk keys the paths as they are now, and restores a result
-stored under that key. When none has one, the task runs: a task with path sets
-is keyed by them alone, never by its declared inputs, which are what a
-recording found wanting. Recorded, its new path set and result are kept; not
-recorded, its result is kept under its declared key only.
+stored under that key. When none has one, a task whose declared inputs cover
+every one of its path sets is looked up by its declared key, as without
+`qk:ultracache`; any other runs. Recorded, its new path set and result are
+kept; not recorded, its result is kept under its declared key only, which the
+next run finds when its declared inputs cover its path sets.
+
+The declared inputs cover a path set when the declared key changes with
+everything the task could notice through it:
+
+- each file it read or found is keyed, by the declared inputs or by what qk
+  keys for every task, or a directory it found holds a keyed file;
+- a file created where it looked for one and found none would be selected,
+  and is neither gitignored nor a declared output, so that, say, a missing
+  `.env.local` keeps it on its recordings;
+- every entry a directory it listed could gain or lose would be selected,
+  gitignored entries aside: a fileset takes all of what is under the
+  directory, as `{projectRoot}/**/*` takes a project's directories, no
+  exclusion of that fileset reaches into it, and the directory is no declared
+  output.
+
+A file qk keys by part of its content, such as a dependency's `package.json`
+or a `json` input, counts as keyed, as it does for every task's key: a result
+taken by the declared key is as sound as one without `qk:ultracache`.
+
+Otherwise its declared inputs are what a recording found wanting, and the task
+is keyed by its path sets alone. Coverage is judged when the task is looked
+up, by the declared inputs it is looked up with, so that a declaration changed
+since a path set was recorded, such as a narrowed named input, is what counts.
 
 A task without path sets is keyed by its declared inputs, as without
 `qk:ultracache`, until a run records it. Its results are also kept under its
 declared key when recorded, so runs without its recordings find them.
 
 The run summary names the tasks taken from the cache by what they read, those
-recorded, those that missed what they read when recorded, and those with no
-recording yet. `--report` writes which of these each task's recordings did as
+taken by their declared key in place of their recordings, those recorded,
+those that missed what they read when recorded, and those with no recording
+yet. `--report` writes which of these each task's recordings did as
 `recorded`, and the [run history](history.md) keeps it, so `qk show run --json`
 prints it too.
 
