@@ -127,8 +127,10 @@ can be ambiguous. A machine that does not expose these logs refuses analysis
 before task execution.
 Symlink accesses can be reported by target path rather than link path.
 
-On **Linux**, install `strace` and make it available on `PATH`. qk probes child
-tracing before starting tasks. The backend records path operations and directory
+On **Linux**, qk records with eBPF where it can load its recorder and with
+`strace` on `PATH` otherwise, as [Ultracache's recorders](ultracache.md#recorders)
+describes, and `QK_RECORDER` picks one. qk checks it can record before starting
+tasks. The backend records path operations and directory
 enumeration, follows descendants, tracks working-directory changes, and records
 syscall results such as `ENOENT`. Readable opens are potential content dependencies;
 write-capable opens do not prove a write, and the recorder does not inspect read

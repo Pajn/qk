@@ -40,6 +40,10 @@ struct Cli {
 enum Command {
     #[command(name = "__upload-worker", hide = true)]
     UploadWorker,
+    /// Loads the eBPF recorder's program and forwards its events; started
+    /// with the privileges that takes, by the qk that records.
+    #[command(name = "__trace-helper", hide = true)]
+    TraceHelper,
     /// Record task file accesses and review input declarations.
     Inputs {
         #[command(subcommand)]
@@ -1072,6 +1076,18 @@ fn run(mut cli: Cli) -> Result<i32> {
         qk_cache::run_upload_worker()?;
         return Ok(0);
     }
+    if matches!(cli.command, Command::TraceHelper) {
+        #[cfg(target_os = "linux")]
+        {
+            qk_trace::helper::run(
+                std::io::BufReader::new(std::io::stdin()),
+                std::io::stdout().lock(),
+            )?;
+            return Ok(0);
+        }
+        #[cfg(not(target_os = "linux"))]
+        anyhow::bail!("the eBPF recorder records only on Linux");
+    }
     match &mut cli.command {
         Command::Affected { changes, .. }
         | Command::Show {
@@ -1091,7 +1107,9 @@ fn run(mut cli: Cli) -> Result<i32> {
         eprintln!("qk: warning: {warning}");
     }
     match cli.command {
-        Command::UploadWorker => unreachable!("handled before workspace discovery"),
+        Command::UploadWorker | Command::TraceHelper => {
+            unreachable!("handled before workspace discovery")
+        }
         Command::Inputs {
             command:
                 InputsCommand::Analyze {

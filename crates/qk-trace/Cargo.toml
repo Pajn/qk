@@ -1,0 +1,19 @@
+[package]
+name = "qk-trace"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "qk's eBPF recorder of what a task reads"
+
+[dependencies]
+anyhow.workspace = true
+qk-input-analysis.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aya.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

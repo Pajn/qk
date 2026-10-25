@@ -33,6 +33,40 @@ jobs:
       # Every failing test binary, not only the first.
       - run: cargo test --workspace --locked --no-fail-fast
 
+  # The tests that record what tasks read, with each recorder. `check` records
+  # with whichever loads; these name one, so that neither goes untested.
+  # GitHub's Linux runners give the eBPF recorder's helper root through
+  # passwordless sudo, and arm64 runs the program built for it.
+  recorders:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+        recorder: [ebpf, strace]
+    runs-on: ${{ matrix.os }}
+    env:
+      QK_RECORDER: ${{ matrix.recorder }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Rust
+        run: |
+          rustup show
+      # The tests skip without strace, which also tells them recording is
+      # possible; QK_RECORDER keeps the eBPF job from falling back to it.
+      - name: Install strace
+        run: sudo apt-get update && sudo apt-get install -y strace
+      - run: cargo test --locked -p qk-cli --test ultracache --no-fail-fast
+      - run: cargo test --locked -p qk-cli --test execution --no-fail-fast -- input
+      - run: cargo test --locked -p qk-trace -p qk-executor -p qk-runner --no-fail-fast
+
+  # The committed kernel program objects are what their source builds to.
+  recorder-program:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: tools/trace/build.sh
+      - run: git diff --exit-code crates/qk-trace/bpf
+
   # qk against the committed Nx goldens of the parity fixture. Run cases
   # execute package scripts, so pnpm is needed; Nx is not.
   parity:
