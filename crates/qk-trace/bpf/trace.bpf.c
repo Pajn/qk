@@ -11,9 +11,15 @@
 // the architecture it runs on.
 //
 // A recorded call is one event, sent as it returns: its arguments, as they
-// were when it entered, the paths they name, and its result. The paths are
-// read on return because a program on entry cannot fault in user memory, and
-// a path's page may not be resident until the kernel has read it.
+// were when it entered, the paths they name, its result, and when it entered
+// and returned. Events come in the order calls return, which is not the order
+// they took effect in: a close frees its descriptor as it enters, so another
+// thread can open the same number and return first. Both times let user
+// space tell.
+//
+// The paths are read on return because a program on entry cannot fault in
+// user memory, and a path's page may not be resident until the kernel has
+// read it.
 //
 // The kernel's own types are declared here as far as this program reads
 // them, and relocated against the running kernel's BTF as it loads.
@@ -36,6 +42,7 @@ struct signal_struct {
 } __attribute__((preserve_access_index));
 
 struct task_struct {
+	int pid;
 	int tgid;
 	struct signal_struct *signal;
 } __attribute__((preserve_access_index));
@@ -128,6 +135,8 @@ struct call_event {
 	struct header header;
 	__u64 args[6];
 	__s64 result;
+	/* When it returned; the header's time is when it entered. */
+	__u64 exited;
 	/* Each path's length, its terminating NUL included; 0 for none, and
 	 * PATH_BYTES + 1 for one that could not be read. */
 	__u16 lengths[2];
@@ -165,10 +174,11 @@ struct {
 	__type(value, __u32);
 } groups SEC(".maps");
 
-/* Threads in a recorded call, by thread id. A call that never returns, its
- * process killed in it, is evicted in time. */
+/* Threads in a recorded call, by thread id. Not an LRU map, which can evict
+ * a call in flight before it is full when many CPUs add at once, losing it
+ * unnoticed; a thread that exits in a call is removed as it exits. */
 struct {
-	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 65536);
 	__type(key, __u32);
 	__type(value, struct entered);
@@ -240,8 +250,14 @@ static __always_inline __u16 read_path(char *into, __u64 pointer)
 	if (!pointer)
 		return 0;
 	long length = bpf_probe_read_user_str(into, PATH_BYTES, (const void *)pointer);
-	if (length <= 0)
+	if (length < 0)
 		return PATH_BYTES + 1;
+	/* Kernels before 6.16 count an empty string's NUL only when there are
+	 * other bytes: theirs is 0, where later kernels say 1. */
+	if (length == 0) {
+		into[0] = 0;
+		return 1;
+	}
 	return (__u16)length;
 }
 
@@ -307,7 +323,8 @@ int BPF_PROG(on_enter, struct pt_regs *regs, long id)
 	for (int index = 0; index < 6; index++)
 		entered.args[index] = argument(regs, index);
 	__u32 tid = (__u32)bpf_get_current_pid_tgid();
-	bpf_map_update_elem(&inflight, &tid, &entered, BPF_ANY);
+	if (bpf_map_update_elem(&inflight, &tid, &entered, BPF_ANY))
+		count_drop();
 	return 0;
 }
 
@@ -319,6 +336,8 @@ int BPF_PROG(on_exit, struct pt_regs *regs, long result)
 	struct entered *entered = bpf_map_lookup_elem(&inflight, &tid);
 	if (!entered)
 		return 0;
+	/* As soon as can be: a later close of what it opened must enter after. */
+	__u64 exited = bpf_ktime_get_boot_ns();
 	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
 	__u32 *group = bpf_map_lookup_elem(&groups, &tgid);
 	struct call_event *event = bpf_map_lookup_elem(&scratch, &zero);
@@ -334,6 +353,7 @@ int BPF_PROG(on_exit, struct pt_regs *regs, long result)
 		event->args[index] = entered->args[index];
 	bpf_map_delete_elem(&inflight, &tid);
 	event->result = result;
+	event->exited = exited;
 	if (call->flags_at < 6) {
 		__u64 flags = 0;
 		bpf_probe_read_user(&flags, sizeof(flags),
@@ -395,6 +415,9 @@ int BPF_PROG(on_fork, struct task_struct *parent, struct task_struct *child)
 SEC("tp_btf/sched_process_exit")
 int BPF_PROG(on_process_exit, struct task_struct *task)
 {
+	/* A thread killed in a recorded call never returns from it. */
+	__u32 tid = BPF_CORE_READ(task, pid);
+	bpf_map_delete_elem(&inflight, &tid);
 	/* The process leaves its group once its last thread exits, whichever
 	 * thread that is: the kernel counts a thread out of `live` before this
 	 * tracepoint. Two threads exiting at once may both see none left; the

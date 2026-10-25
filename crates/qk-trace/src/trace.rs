@@ -42,11 +42,12 @@ pub enum Event {
         child: u32,
         time: u64,
     },
-    /// A call, timed as it entered.
+    /// A call, timed as it entered, and when it returned.
     Call {
         group: u32,
         tgid: u32,
         time: u64,
+        exited: u64,
         call: u16,
         args: [u64; 6],
         paths: [PathArg; 2],
@@ -129,8 +130,9 @@ impl Event {
                     *arg = u64_at(HEADER + index * 8)?;
                 }
                 let result = u64_at(HEADER + 48)? as i64;
-                let lengths = [u16_at(HEADER + 56)?, u16_at(HEADER + 58)?];
-                let mut at = HEADER + 64;
+                let exited = u64_at(HEADER + 56)?;
+                let lengths = [u16_at(HEADER + 64)?, u16_at(HEADER + 66)?];
+                let mut at = HEADER + 72;
                 let mut paths = [PathArg::Null, PathArg::Null];
                 for (path, length) in paths.iter_mut().zip(lengths) {
                     let length = usize::from(length);
@@ -151,6 +153,7 @@ impl Event {
                     group,
                     tgid,
                     time,
+                    exited,
                     call,
                     args,
                     paths,
@@ -166,13 +169,30 @@ impl Event {
 struct Process {
     cwd: PathBuf,
     descriptors: HashMap<i32, PathBuf>,
+    /// The call that last gave out each descriptor number.
+    given: HashMap<i32, Given>,
+    /// When the last call seen to give out or close each number returned.
+    touched: HashMap<i32, u64>,
     file: Option<BufWriter<File>>,
 }
 
-/// A call's arguments and paths.
+/// A call that gave out a descriptor number, and when it entered and
+/// returned.
+#[derive(Clone, Copy)]
+struct Given {
+    entered: u64,
+    exited: u64,
+    /// Whether it named the number itself, as dup2 does, rather than being
+    /// given the lowest free one.
+    named: bool,
+}
+
+/// A call's arguments and paths, and when it entered and returned.
 struct Entered {
     args: [u64; 6],
     paths: [PathArg; 2],
+    time: u64,
+    exited: u64,
 }
 
 /// One command's recording: what its processes did, written as strace's
@@ -248,11 +268,18 @@ impl Trace {
             } => {
                 let inherited = {
                     let parent = self.process(parent);
-                    (parent.cwd.clone(), parent.descriptors.clone())
+                    (
+                        parent.cwd.clone(),
+                        parent.descriptors.clone(),
+                        parent.given.clone(),
+                        parent.touched.clone(),
+                    )
                 };
                 let process = self.process(child);
                 process.cwd = inherited.0;
                 process.descriptors = inherited.1;
+                process.given = inherited.2;
+                process.touched = inherited.3;
                 // As strace writes the call that made the child, which the
                 // decoder hands the parent's working directory to.
                 self.write(
@@ -271,6 +298,7 @@ impl Trace {
             Event::Call {
                 tgid,
                 time,
+                exited,
                 call,
                 args,
                 paths,
@@ -280,7 +308,12 @@ impl Trace {
                 let Some(spec) = self.arch.call(call) else {
                     return Ok(());
                 };
-                let entered = Entered { args, paths };
+                let entered = Entered {
+                    args,
+                    paths,
+                    time,
+                    exited,
+                };
                 if spec.written {
                     let (arch, resolve) = (self.arch, self.resolve);
                     let process = self.process(tgid);
@@ -293,7 +326,7 @@ impl Trace {
                 }
                 if result >= 0 {
                     let process = self.process(tgid);
-                    effect(spec, &entered, result, process);
+                    effect(spec, &entered, result, process)?;
                 }
             }
         }
@@ -339,45 +372,49 @@ fn opened(spec: &Call, entered: &Entered, process: &Process) -> Option<PathBuf> 
 }
 
 /// What a call does to its process's descriptors and working directory.
-fn effect(spec: &Call, entered: &Entered, result: i64, process: &mut Process) {
+///
+/// Events come in the order calls returned, and a call can take effect
+/// before another that returns first. A call given the lowest free number
+/// takes it as it enters, so a close that entered while it ran freed that
+/// number from its previous holder. A call that names the number, as dup2
+/// does, takes it partway through, so a close of it or another dup2 onto it
+/// that overlapped the call may have come before or after: the recording
+/// fails rather than guess.
+fn effect(spec: &Call, entered: &Entered, result: i64, process: &mut Process) -> Result<()> {
     let fd = |index: usize| entered.args[index] as i32;
     match spec.effect {
         Effect::None => {}
         Effect::Opens => {
-            if let Some(path) = opened(spec, entered, process) {
-                process.descriptors.insert(result as i32, path);
-            } else {
-                process.descriptors.remove(&(result as i32));
-            }
+            let path = opened(spec, entered, process);
+            give(process, result as i32, path, entered, false)?;
         }
-        Effect::Closes => {
-            process.descriptors.remove(&fd(0));
-        }
+        Effect::Closes => close(process, fd(0), entered)?,
         Effect::ClosesRange => {
             const CLOSE_RANGE_CLOEXEC: u64 = 4;
             if entered.args[2] & CLOSE_RANGE_CLOEXEC == 0 {
                 let (first, last) = (entered.args[0], entered.args[1]);
-                process
+                let closed: std::collections::BTreeSet<i32> = process
                     .descriptors
-                    .retain(|&fd, _| !(first..=last).contains(&(fd as u32 as u64)));
+                    .keys()
+                    .chain(process.given.keys())
+                    .copied()
+                    .filter(|&fd| (first..=last).contains(&(fd as u32 as u64)))
+                    .collect();
+                for fd in closed {
+                    close(process, fd, entered)?;
+                }
             }
         }
-        Effect::Dups => match process.descriptors.get(&fd(0)).cloned() {
-            Some(path) => {
-                process.descriptors.insert(result as i32, path);
-            }
-            None => {
-                process.descriptors.remove(&(result as i32));
-            }
-        },
-        Effect::DupsTo => match process.descriptors.get(&fd(0)).cloned() {
-            Some(path) => {
-                process.descriptors.insert(fd(1), path);
-            }
-            None => {
-                process.descriptors.remove(&fd(1));
-            }
-        },
+        Effect::Dups => {
+            let path = process.descriptors.get(&fd(0)).cloned();
+            give(process, result as i32, path, entered, false)?;
+        }
+        // dup2 onto itself gives nothing out.
+        Effect::DupsTo if fd(0) == fd(1) => {}
+        Effect::DupsTo => {
+            let path = process.descriptors.get(&fd(0)).cloned();
+            give(process, fd(1), path, entered, true)?;
+        }
         Effect::Chdir => {
             if let Some(path) = path_of(entered, 0).and_then(|path| resolve(process, None, path)) {
                 process.cwd = path;
@@ -389,6 +426,71 @@ fn effect(spec: &Call, entered: &Entered, result: i64, process: &mut Process) {
             }
         }
     }
+    Ok(())
+}
+
+/// `fd` given out by `call`, as `path` where it is a file the recorder
+/// knows; `named` when the call named the number.
+fn give(
+    process: &mut Process,
+    fd: i32,
+    path: Option<PathBuf>,
+    call: &Entered,
+    named: bool,
+) -> Result<()> {
+    let overlapped = if named {
+        process
+            .touched
+            .get(&fd)
+            .is_some_and(|&last| last > call.time)
+    } else {
+        process
+            .given
+            .get(&fd)
+            .is_some_and(|given| given.named && given.exited > call.time)
+    };
+    if overlapped {
+        bail!("calls that overlapped reassigned descriptor {fd}, so which came last is unknown");
+    }
+    match path {
+        Some(path) => process.descriptors.insert(fd, path),
+        None => process.descriptors.remove(&fd),
+    };
+    process.given.insert(
+        fd,
+        Given {
+            entered: call.time,
+            exited: call.exited,
+            named,
+        },
+    );
+    touch(process, fd, call.exited);
+    Ok(())
+}
+
+/// `fd` closed by `call`, unless it was given out again after the close
+/// entered, which then closed the number's previous holder.
+fn close(process: &mut Process, fd: i32, call: &Entered) -> Result<()> {
+    if let Some(given) = process.given.get(&fd).copied()
+        && given.exited > call.time
+    {
+        if given.named && call.time > given.entered {
+            bail!(
+                "a close overlapped the call that reassigned descriptor {fd}, so which came last is unknown"
+            );
+        }
+        touch(process, fd, call.exited);
+        return Ok(());
+    }
+    process.descriptors.remove(&fd);
+    process.given.remove(&fd);
+    touch(process, fd, call.exited);
+    Ok(())
+}
+
+fn touch(process: &mut Process, fd: i32, at: u64) {
+    let last = process.touched.entry(fd).or_default();
+    *last = (*last).max(at);
 }
 
 /// A call as strace writes it, its descriptors annotated as `-yy` does: an
@@ -574,11 +676,25 @@ mod tests {
             time.set(time.get() + 1_000_000_000);
             time.get()
         });
+        call_at(trace, tgid, name, args, paths, result, [time, time + 1000]);
+    }
+
+    /// A call that entered and returned at `times`.
+    fn call_at(
+        trace: &mut Trace,
+        tgid: u32,
+        name: &str,
+        args: [u64; 6],
+        paths: [PathArg; 2],
+        result: i64,
+        [time, exited]: [u64; 2],
+    ) {
         trace
             .apply(Event::Call {
                 group: 1,
                 tgid,
                 time,
+                exited,
                 call: number(name),
                 args,
                 paths,
@@ -664,6 +780,292 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn reads_a_call_as_the_kernel_program_lays_it_out() {
+        let mut bytes = vec![CALL, 0];
+        bytes.extend_from_slice(&257u16.to_le_bytes());
+        bytes.extend_from_slice(&7u32.to_le_bytes());
+        bytes.extend_from_slice(&10u32.to_le_bytes());
+        bytes.extend_from_slice(&11u32.to_le_bytes());
+        bytes.extend_from_slice(&100u64.to_le_bytes());
+        for arg in 1..=6u64 {
+            bytes.extend_from_slice(&arg.to_le_bytes());
+        }
+        bytes.extend_from_slice(&(-2i64).to_le_bytes());
+        bytes.extend_from_slice(&200u64.to_le_bytes());
+        bytes.extend_from_slice(&4u16.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(b"a/b\0\0");
+        assert_eq!(
+            Event::parse(&bytes).unwrap(),
+            Event::Call {
+                group: 7,
+                tgid: 10,
+                time: 100,
+                exited: 200,
+                call: 257,
+                args: [1, 2, 3, 4, 5, 6],
+                paths: [path("a/b"), path("")],
+                result: -2,
+            }
+        );
+    }
+
+    #[test]
+    fn a_close_seen_after_its_number_was_given_out_again_leaves_the_new_descriptor() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut trace = Trace::new(
+            Arch::X86,
+            directory.path(),
+            "command-0",
+            Path::new("/work/app"),
+            false,
+        );
+        trace
+            .apply(Event::Begin {
+                group: 1,
+                tgid: 10,
+                time: 0,
+            })
+            .unwrap();
+        let at = i64::from(AT_FDCWD) as u64;
+        let second = 1_000_000_000;
+        let none = || [PathArg::Null, PathArg::Null];
+        call_at(
+            &mut trace,
+            10,
+            "openat",
+            [at, 0, 0o200000, 0, 0, 0],
+            [path("a"), PathArg::Null],
+            21,
+            [second, second + 100],
+        );
+        // One thread closes `a` while another opens `b`, given the number
+        // `a` freed, and returns first.
+        call_at(
+            &mut trace,
+            10,
+            "openat",
+            [at, 0, 0o200000, 0, 0, 0],
+            [path("b"), PathArg::Null],
+            21,
+            [3 * second, 3 * second + 100],
+        );
+        call_at(
+            &mut trace,
+            10,
+            "close",
+            [21, 0, 0, 0, 0, 0],
+            none(),
+            0,
+            [2 * second, 4 * second],
+        );
+        call_at(
+            &mut trace,
+            10,
+            "getdents64",
+            [21, 0, 0, 0, 0, 0],
+            none(),
+            48,
+            [5 * second, 5 * second + 100],
+        );
+        // Closed after it was given out, `b` is gone.
+        call_at(
+            &mut trace,
+            10,
+            "close",
+            [21, 0, 0, 0, 0, 0],
+            none(),
+            0,
+            [6 * second, 6 * second + 100],
+        );
+        assert!(!trace.processes[&10].descriptors.contains_key(&21));
+        trace.finish().unwrap();
+        assert_eq!(
+            accesses(directory.path()),
+            [
+                ("OpenRead".into(), "/work/app/a".into(), "success".into()),
+                ("OpenRead".into(), "/work/app/b".into(), "success".into()),
+                (
+                    "ListDirectory".into(),
+                    "/work/app/b".into(),
+                    "success".into()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn dup2_onto_itself_leaves_a_close_seen_after_it_to_close() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut trace = Trace::new(
+            Arch::X86,
+            directory.path(),
+            "command-0",
+            Path::new("/work/app"),
+            false,
+        );
+        let at = i64::from(AT_FDCWD) as u64;
+        let second = 1_000_000_000;
+        let none = || [PathArg::Null, PathArg::Null];
+        call_at(
+            &mut trace,
+            10,
+            "openat",
+            [at, 0, 0o200000, 0, 0, 0],
+            [path("a"), PathArg::Null],
+            21,
+            [second, second + 100],
+        );
+        call_at(
+            &mut trace,
+            10,
+            "dup2",
+            [21, 21, 0, 0, 0, 0],
+            none(),
+            21,
+            [3 * second, 3 * second + 100],
+        );
+        call_at(
+            &mut trace,
+            10,
+            "close",
+            [21, 0, 0, 0, 0, 0],
+            none(),
+            0,
+            [2 * second, 4 * second],
+        );
+        assert!(!trace.processes[&10].descriptors.contains_key(&21));
+    }
+
+    /// A trace whose process 10 holds `a` at 4 and `b` at 5, for calls
+    /// onto 7 to race on.
+    fn racing_on_seven() -> (tempfile::TempDir, Trace) {
+        let directory = tempfile::tempdir().unwrap();
+        let mut trace = Trace::new(
+            Arch::X86,
+            directory.path(),
+            "command-0",
+            Path::new("/work/app"),
+            false,
+        );
+        let at = i64::from(AT_FDCWD) as u64;
+        for (name, fd, time) in [("a", 4, 1), ("b", 5, 2)] {
+            call_at(
+                &mut trace,
+                10,
+                "openat",
+                [at, 0, 0, 0, 0, 0],
+                [path(name), PathArg::Null],
+                fd,
+                [time * 1_000_000_000, time * 1_000_000_000 + 100],
+            );
+        }
+        (directory, trace)
+    }
+
+    fn try_call(
+        trace: &mut Trace,
+        name: &str,
+        args: [u64; 6],
+        result: i64,
+        [time, exited]: [u64; 2],
+    ) -> Result<()> {
+        trace.apply(Event::Call {
+            group: 1,
+            tgid: 10,
+            time,
+            exited,
+            call: number(name),
+            args,
+            paths: [PathArg::Null, PathArg::Null],
+            result,
+        })
+    }
+
+    #[test]
+    fn dup2_calls_onto_one_number_that_overlapped_fail_the_recording() {
+        let (_directory, mut trace) = racing_on_seven();
+        let second = 1_000_000_000;
+        // dup2(4, 7) enters first and returns last; dup2(5, 7) runs within.
+        try_call(
+            &mut trace,
+            "dup2",
+            [5, 7, 0, 0, 0, 0],
+            7,
+            [11 * second, 12 * second],
+        )
+        .unwrap();
+        let error = try_call(
+            &mut trace,
+            "dup2",
+            [4, 7, 0, 0, 0, 0],
+            7,
+            [10 * second, 13 * second],
+        )
+        .unwrap_err();
+        assert!(format!("{error}").contains("descriptor 7"), "{error}");
+    }
+
+    #[test]
+    fn a_close_that_overlapped_a_dup2_onto_its_number_fails_the_recording() {
+        let (_directory, mut trace) = racing_on_seven();
+        let second = 1_000_000_000;
+        try_call(
+            &mut trace,
+            "dup2",
+            [4, 7, 0, 0, 0, 0],
+            7,
+            [10 * second, 12 * second],
+        )
+        .unwrap();
+        let error = try_call(
+            &mut trace,
+            "close",
+            [7, 0, 0, 0, 0, 0],
+            0,
+            [11 * second, 13 * second],
+        )
+        .unwrap_err();
+        assert!(format!("{error}").contains("descriptor 7"), "{error}");
+    }
+
+    #[test]
+    fn calls_on_one_number_one_after_another_follow_each_other() {
+        let (_directory, mut trace) = racing_on_seven();
+        let second = 1_000_000_000;
+        try_call(
+            &mut trace,
+            "dup2",
+            [4, 7, 0, 0, 0, 0],
+            7,
+            [10 * second, 11 * second],
+        )
+        .unwrap();
+        try_call(
+            &mut trace,
+            "dup2",
+            [5, 7, 0, 0, 0, 0],
+            7,
+            [12 * second, 13 * second],
+        )
+        .unwrap();
+        assert_eq!(
+            trace.processes[&10].descriptors[&7],
+            Path::new("/work/app/b")
+        );
+        try_call(
+            &mut trace,
+            "close",
+            [7, 0, 0, 0, 0, 0],
+            0,
+            [14 * second, 15 * second],
+        )
+        .unwrap();
+        assert!(!trace.processes[&10].descriptors.contains_key(&7));
     }
 
     #[test]
