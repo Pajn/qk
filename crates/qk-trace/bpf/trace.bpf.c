@@ -36,6 +36,7 @@ struct signal_struct {
 } __attribute__((preserve_access_index));
 
 struct task_struct {
+	int pid;
 	int tgid;
 	struct signal_struct *signal;
 } __attribute__((preserve_access_index));
@@ -165,10 +166,11 @@ struct {
 	__type(value, __u32);
 } groups SEC(".maps");
 
-/* Threads in a recorded call, by thread id. A call that never returns, its
- * process killed in it, is evicted in time. */
+/* Threads in a recorded call, by thread id. Not an LRU map, which can evict
+ * a call in flight before it is full when many CPUs add at once, losing it
+ * unnoticed; a thread that exits in a call is removed as it exits. */
 struct {
-	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 65536);
 	__type(key, __u32);
 	__type(value, struct entered);
@@ -313,7 +315,8 @@ int BPF_PROG(on_enter, struct pt_regs *regs, long id)
 	for (int index = 0; index < 6; index++)
 		entered.args[index] = argument(regs, index);
 	__u32 tid = (__u32)bpf_get_current_pid_tgid();
-	bpf_map_update_elem(&inflight, &tid, &entered, BPF_ANY);
+	if (bpf_map_update_elem(&inflight, &tid, &entered, BPF_ANY))
+		count_drop();
 	return 0;
 }
 
@@ -401,6 +404,9 @@ int BPF_PROG(on_fork, struct task_struct *parent, struct task_struct *child)
 SEC("tp_btf/sched_process_exit")
 int BPF_PROG(on_process_exit, struct task_struct *task)
 {
+	/* A thread killed in a recorded call never returns from it. */
+	__u32 tid = BPF_CORE_READ(task, pid);
+	bpf_map_delete_elem(&inflight, &tid);
 	/* The process leaves its group once its last thread exits, whichever
 	 * thread that is: the kernel counts a thread out of `live` before this
 	 * tracepoint. Two threads exiting at once may both see none left; the
