@@ -370,6 +370,8 @@ fn upgrades_schema_three_without_inventing_logs() {
              ALTER TABLE tasks DROP COLUMN memory;
              ALTER TABLE tasks DROP COLUMN cores;
              ALTER TABLE tasks DROP COLUMN cpu;
+             ALTER TABLE tasks DROP COLUMN recorded;
+             ALTER TABLE tasks DROP COLUMN shadow;
              ALTER TABLE runs DROP COLUMN worktree;
              UPDATE schema_version SET version = 3;",
         )
@@ -468,6 +470,8 @@ fn records_the_memory_a_task_used_after_upgrading_schema_four() {
             "ALTER TABLE tasks DROP COLUMN memory;
              ALTER TABLE tasks DROP COLUMN cores;
              ALTER TABLE tasks DROP COLUMN cpu;
+             ALTER TABLE tasks DROP COLUMN recorded;
+             ALTER TABLE tasks DROP COLUMN shadow;
              ALTER TABLE runs DROP COLUMN worktree;
              UPDATE schema_version SET version = 4;",
         )
@@ -489,6 +493,55 @@ fn records_the_memory_a_task_used_after_upgrading_schema_four() {
         [
             ("new".to_owned(), Some(3_000_000_000)),
             ("old".to_owned(), None)
+        ]
+    );
+}
+
+/// How a task with `qk:ultracache` was keyed, and what its recordings would
+/// have done, are kept, so that a run read back says what its report said.
+/// Runs recorded before schema eight stay readable, without either.
+#[test]
+fn keeps_how_recordings_keyed_a_task_after_upgrading_schema_seven() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("history.db");
+    let mut history = History::open(&path).unwrap();
+    history
+        .record(
+            run("old", 1, vec![task("app:test", Some("k"), 1, 2, &[])]),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+    drop(history);
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "ALTER TABLE tasks DROP COLUMN recorded;
+             ALTER TABLE tasks DROP COLUMN shadow;
+             UPDATE schema_version SET version = 7;",
+        )
+        .unwrap();
+    let mut history = History::open(&path).unwrap();
+    let mut test = task("app:test", Some("k"), 10, 20, &[]);
+    test.recorded = Some(json!({"kind": "saved", "key": "r"}));
+    test.shadow = Some(json!({"kind": "wouldHit", "key": "r"}));
+    history
+        .record(run("new", 10, vec![test]), &BTreeMap::new())
+        .unwrap();
+    let kept: Vec<_> = history
+        .task("app:test", 10)
+        .unwrap()
+        .into_iter()
+        .map(|(run, task)| (run, task.recorded, task.shadow))
+        .collect();
+    assert_eq!(
+        kept,
+        [
+            (
+                "new".to_owned(),
+                Some(json!({"kind": "saved", "key": "r"})),
+                Some(json!({"kind": "wouldHit", "key": "r"}))
+            ),
+            ("old".to_owned(), None, None)
         ]
     );
 }
@@ -553,6 +606,8 @@ fn upgrades_schema_five_to_record_worktrees() {
             "ALTER TABLE runs DROP COLUMN worktree;
              ALTER TABLE tasks DROP COLUMN cores;
              ALTER TABLE tasks DROP COLUMN cpu;
+             ALTER TABLE tasks DROP COLUMN recorded;
+             ALTER TABLE tasks DROP COLUMN shadow;
              UPDATE schema_version SET version = 5;",
         )
         .unwrap();
