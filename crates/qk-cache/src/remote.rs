@@ -203,6 +203,10 @@ struct Upload {
     /// the entry.
     #[serde(default)]
     expectations: Option<Expectations>,
+    /// Where a detached worker finds the warm record or path sets, left out
+    /// of its request, which would otherwise carry them inline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    record_file: Option<PathBuf>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -675,6 +679,7 @@ impl Remote {
             warm: None,
             path_sets: None,
             expectations: None,
+            record_file: None,
         });
     }
 
@@ -690,6 +695,7 @@ impl Remote {
                 record,
             }),
             expectations: None,
+            record_file: None,
         });
     }
 
@@ -727,6 +733,7 @@ impl Remote {
             }),
             path_sets: None,
             expectations: None,
+            record_file: None,
         });
     }
 
@@ -749,6 +756,7 @@ impl Remote {
                 runs,
                 now,
             }),
+            record_file: None,
         });
     }
 
@@ -1165,30 +1173,28 @@ impl Remote {
         if let Some(configuration) = &self.background {
             let pending = std::mem::take(&mut *self.pending.lock().unwrap());
             if !pending.is_empty() {
-                match background::launch(
+                let launched = background::launch(
                     configuration,
                     &pending,
                     self.held.lock().unwrap().iter().cloned().collect(),
                     self.confirmed.lock().unwrap().iter().cloned().collect(),
                     self.order.lock().unwrap().0.clone(),
-                ) {
-                    Ok(log) => {
+                );
+                match launched {
+                    // Uploads whose files are gone could not be sent from
+                    // here either.
+                    Ok((log, skipped)) => {
                         qk_executor::status!(
                             "qk: remote uploads continuing in background; log: {}",
                             log.display()
                         );
-                        return Vec::new();
+                        return skipped;
                     }
                     Err(error) => {
                         qk_executor::status!(
                             "qk: could not detach remote uploads; waiting instead ({error:#})"
                         );
-                        let mut failures = Vec::new();
-                        for job in pending {
-                            if let Err(error) = self.send(&job) {
-                                failures.push(format!("{}: {error:#}", job.key));
-                            }
-                        }
+                        let mut failures = self.send_all(&pending);
                         if let Err(error) = self.add_listing() {
                             failures.push(format!("the index: {error:#}"));
                         }
@@ -1211,6 +1217,31 @@ impl Remote {
             failures.push(format!("the index: {error:#}"));
         }
         failures
+    }
+
+    /// Sends `jobs` from this process, as many at a time as the run's own
+    /// uploads, returning those that failed.
+    fn send_all(&self, jobs: &[Upload]) -> Vec<String> {
+        let queue = Mutex::new(jobs.iter());
+        let failures = Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            for _ in 0..UPLOADERS.min(jobs.len()) {
+                scope.spawn(|| {
+                    loop {
+                        let Some(job) = queue.lock().unwrap().next() else {
+                            return;
+                        };
+                        if let Err(error) = self.send(job) {
+                            failures
+                                .lock()
+                                .unwrap()
+                                .push(format!("{}: {error:#}", job.key));
+                        }
+                    }
+                });
+            }
+        });
+        failures.into_inner().unwrap()
     }
 
     /// Lists the entries this run found in the store or put there.
