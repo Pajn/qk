@@ -12,7 +12,7 @@ pub enum Display {
     Stream,
     /// Each non-empty line behind the given prefix: Nx's `stream`.
     Prefixed(String),
-    /// Held until the task ends, then printed under `> nx run <task>`: Nx's
+    /// Held until the task ends, then printed under `> qk run <task>`: Nx's
     /// `static`. `group` folds each task into a GitHub Actions log group, and
     /// `cached` shows a cache hit's log rather than only its header.
     /// `collapse`, for Nx's `static-failures-only`, prints a task that did not
@@ -23,7 +23,7 @@ pub enum Display {
         cached: bool,
         collapse: bool,
     },
-    /// Straight through under `> nx run <task>`: the task a static `run` is for.
+    /// Straight through under `> qk run <task>`: the task a static `run` is for.
     Headed { id: String },
     /// Held until the task ends, and printed under a header only if it
     /// failed: for the quiet and dynamic styles. With `log`, for Nx's
@@ -81,6 +81,12 @@ impl Display {
         };
         match style {
             StreamWithoutPrefixes => Self::Stream,
+            DynamicRunOne if root => Self::Stream,
+            DynamicRunOne if continuous => Self::Prefixed(prefix(project)),
+            DynamicRunOne => Self::Failures {
+                id: id.to_owned(),
+                log: None,
+            },
             _ if run_one && root && !continuous => Self::Headed { id: id.to_owned() },
             _ if held && streams && !continuous => streamed(),
             Static | RunOne | StaticFailuresOnly | RunOneFailuresOnly if !continuous => {
@@ -160,6 +166,10 @@ pub enum OutputStyle {
     Summary,
     /// Only failed tasks' output, for the quiet and dynamic styles.
     Quiet,
+    /// The live panel for one requested task: it streams once its
+    /// dependencies are done, they show only failures, and continuous ones
+    /// stream behind their project's prefix, since they never end.
+    DynamicRunOne,
 }
 
 /// `project:` in bold and in the colour Nx picks for the project, when the
@@ -431,7 +441,7 @@ impl Printer {
                 let mut held = std::mem::take(&mut *self.held.lock().unwrap());
                 if shown == Shown::Failure {
                     crate::report::output_batch(|output| -> io::Result<()> {
-                        output(false, format!("\n✖ nx run {id} failed\n\n").as_bytes());
+                        output(false, format!("\n✖ qk run {id} failed\n\n").as_bytes());
                         held.visit(|bytes| {
                             output(false, bytes);
                             Ok(())
@@ -458,7 +468,7 @@ impl Printer {
                 // Nx's `logCommandSummary`: a tick, then the task on one line.
                 drop(std::mem::take(&mut *self.held.lock().unwrap()));
                 COLLAPSED.fetch_add(1, Ordering::SeqCst);
-                let line = format!("✔  nx run {id}{}\n", status(shown));
+                let line = format!("✔  qk run {id}{}\n", status(shown));
                 crate::report::output_batch(|output| -> io::Result<()> {
                     output(false, line.as_bytes());
                     Ok(())
@@ -501,10 +511,10 @@ impl Printer {
     }
 }
 
-/// `> nx run <task>`, marked when the output came from the cache, as Nx
-/// prints it, since tools read logs by it.
+/// `> qk run <task>`, marked when the output came from the cache: Nx's
+/// header under qk's name, with the cache marks tools read logs by.
 fn header(id: &str, shown: Shown) -> String {
-    format!("> nx run {id}{}", status(shown))
+    format!("> qk run {id}{}", status(shown))
 }
 
 /// Where a task's output came from, as Nx marks it after the task.

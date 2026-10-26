@@ -52,26 +52,31 @@ requested targets and errors when nothing matches. `run`, `run-many` and
 - `dynamic`, `tui` and `dynamic-legacy` show a live panel on stderr: how many
   tasks are done, cached, running, queued and failed, and each running task
   with its time. Successful tasks' output stays hidden; a failed task's
-  output is printed above the panel. Without a terminal, under
+  output is printed above the panel. For `run`, the panel counts the
+  requested task's dependencies, prints warnings as they come, and once they
+  are done gives way to one line saying how they went and the task's own
+  output, streamed under `> qk run <task>`; continuous dependencies stream
+  behind their project prefix. A task without dependencies streams without
+  the line or the header. Without a terminal, under
   `NX_TASKS_RUNNER_DYNAMIC_OUTPUT=false` or with verbose logging they fall
   back to `static`, as in Nx.
 - `quiet` prints nothing while tasks run except a failed task's output,
-  under `✖ nx run <task> failed`, with escape sequences removed when the
+  under `✖ qk run <task> failed`, with escape sequences removed when the
   output is not a terminal and `FORCE_COLOR` is not set. It is meant for
   agents and scripts.
 - `stream` prefixes each non-empty line with the task's project, in Nx's
   colour for it; `stream-without-prefixes` passes output through untouched.
 - `static` holds each task's output until it ends and prints it under
-  `> nx run <task>`, as Nx does, with the target in quotes when its name has
-  a colon and the task's arguments after it, marked `[local cache]` for a
-  hit, and in GitHub Actions folds each task into a log group unless
-  `NX_SKIP_LOG_GROUPING=true`. As in Nx, the run opens with a banner naming
-  what it runs and ends with one saying whether it succeeded, listing failed
-  tasks and those not run because of them. For `run`, `static` follows
+  `> qk run <task>`, as Nx does under `> nx run <task>`, with the target in
+  quotes when its name has a colon and the task's arguments after it, marked
+  `[local cache]` for a hit, and in GitHub Actions folds each task into a
+  log group unless `NX_SKIP_LOG_GROUPING=true`. As in Nx, the run opens with
+  a banner naming what it runs and ends with one saying whether it
+  succeeded, listing failed tasks and those not run because of them. For `run`, `static` follows
   `nx run`: the requested task streams under its header as it runs, and its
   dependencies are held, with only the header shown for a cache hit.
 - `static-failures-only` is `static`, except that a task that did not fail
-  is one line, `✔  nx run <task>`, and the run ends saying how many tasks'
+  is one line, `✔  qk run <task>`, and the run ends saying how many tasks'
   output was left out. For `run`, the tasks of the requested task's project
   still print in full. With `--verbose`, every task prints in full, as in Nx.
 - `summary` prints no task output. The run ends with how many tasks
@@ -80,9 +85,10 @@ requested targets and errors when nothing matches. `run`, `run-many` and
   directory until `qk reset`, and how to see the logs inline.
 
 Without the option, `NX_DEFAULT_OUTPUT_STYLE` applies when it names a style;
-otherwise every command uses `static` in CI; `run` passes output through,
-and `run-many` and `affected` use the live panel on a terminal, `static` on
-a terminal where the panel is turned off, and `quiet` otherwise. These
+otherwise every command uses `static` in CI; every command uses the live
+panel on a terminal, except a `run` whose output is piped; otherwise `run`
+passes output through, and `run-many` and `affected` use `static` on a terminal and
+`quiet` otherwise. These
 defaults are qk's; Nx's is `static-failures-only` where it does not use its
 terminal UI. `stream` and `stream-without-prefixes` print `qk:` status lines
 on stderr; `static` shows each task's status in its header instead, and the
