@@ -64,7 +64,9 @@ values to interpolate. See [Forwarding arguments](../guides/running-tasks.md#for
 ### `readyWhen`
 
 A string or array of strings. The task is ready once all strings appear on
-stdout or stderr. With `commands`, it requires `parallel: true`.
+stdout or stderr, as printed or with terminal control sequences left out. If
+every command exits first, the task fails, naming the strings that did not
+appear. With `commands`, it requires `parallel: true`.
 It keeps running while dependents need it, and is not cached.
 See [Readiness](../guides/running-tasks.md#continuous-tasks-and-readiness).
 

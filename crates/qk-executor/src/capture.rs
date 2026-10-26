@@ -589,26 +589,41 @@ impl RecordedLog {
     }
 }
 
-/// Watches output for `readyWhen` text, on either stream and across reads.
+/// Watches output for `readyWhen` text, on either stream and across reads:
+/// as printed, so text that holds a control sequence matches, and as shown,
+/// so text a control sequence interrupts, such as a bold port, does too.
 struct Readiness {
     patterns: Vec<String>,
-    /// Which patterns have appeared, and each stream's last bytes, so text
-    /// split between two reads still matches.
-    state: Mutex<(Vec<bool>, [Vec<u8>; 2])>,
+    seen: Mutex<Seen>,
     ready: std::sync::Arc<AtomicBool>,
+}
+
+struct Seen {
+    /// Which patterns have appeared.
+    found: Vec<bool>,
+    /// Each stream's last bytes, so text split between two reads matches.
+    tails: [Vec<u8>; 2],
+    /// Each pattern's matcher of the text as shown.
+    shown: Vec<crate::readiness::LogMatcher>,
 }
 
 impl Readiness {
     fn see(&self, stderr: bool, bytes: &[u8]) {
-        let Ok(mut state) = self.state.lock() else {
+        let Ok(mut seen) = self.seen.lock() else {
             return;
         };
-        let (found, tails) = &mut *state;
+        let Seen {
+            found,
+            tails,
+            shown,
+        } = &mut *seen;
         let tail = &mut tails[usize::from(stderr)];
         tail.extend_from_slice(bytes);
         let text = String::from_utf8_lossy(tail);
-        for (pattern, found) in self.patterns.iter().zip(found.iter_mut()) {
-            *found |= text.contains(pattern.as_str());
+        for ((pattern, found), shown) in self.patterns.iter().zip(found.iter_mut()).zip(shown) {
+            if !*found {
+                *found = text.contains(pattern.as_str()) | shown.feed(stderr, bytes);
+            }
         }
         let keep = self.patterns.iter().map(String::len).max().unwrap_or(0);
         if tail.len() > keep {
@@ -652,7 +667,14 @@ impl Capture {
         if !patterns.is_empty() {
             self.readiness = Some(Readiness {
                 patterns: patterns.to_vec(),
-                state: Mutex::new((vec![false; patterns.len()], [Vec::new(), Vec::new()])),
+                seen: Mutex::new(Seen {
+                    found: vec![false; patterns.len()],
+                    tails: [Vec::new(), Vec::new()],
+                    shown: patterns
+                        .iter()
+                        .map(|pattern| crate::readiness::LogMatcher::new(vec![pattern.clone()]))
+                        .collect(),
+                }),
                 ready,
             });
         }
@@ -671,6 +693,28 @@ impl Capture {
             verdict,
         ));
         self
+    }
+
+    /// The `readyWhen` text that has not appeared, if any was asked for.
+    pub fn unready(&self) -> Vec<String> {
+        let Some(readiness) = &self.readiness else {
+            return Vec::new();
+        };
+        let found = readiness.seen.lock().map(|seen| seen.found.clone());
+        readiness
+            .patterns
+            .iter()
+            .zip(found.unwrap_or_default())
+            .filter(|(_, found)| !found)
+            .map(|(pattern, _)| pattern.clone())
+            .collect()
+    }
+
+    /// Adds a line of qk's own to the task's error output. It is no output
+    /// of the task's, so readiness checks never see it: a note quoting the
+    /// text one waits for must not make the task ready.
+    pub fn note(&self, text: &str) -> io::Result<()> {
+        self.write(true, format!("{text}\n").as_bytes(), false)
     }
 
     pub fn healthy(&self) -> bool {
@@ -720,6 +764,11 @@ impl Capture {
 
     /// Records, shows and watches output, in frames the log reader accepts.
     fn emit(&self, stderr: bool, bytes: &[u8]) -> io::Result<()> {
+        self.write(stderr, bytes, true)
+    }
+
+    /// Records and shows output, and with `watched`, checks it for readiness.
+    fn write(&self, stderr: bool, bytes: &[u8], watched: bool) -> io::Result<()> {
         for frame in bytes.chunks(16 * 1024) {
             // One order for retained frames, cache frames and displayed chunks.
             let mut retained = self
@@ -745,6 +794,9 @@ impl Capture {
                 }
             }
             self.printer.write(stderr, frame)?;
+            if !watched {
+                continue;
+            }
             if let Some((matcher, verdict)) = &self.log_matches
                 && !verdict.is_decided()
                 && matcher.lock().unwrap().feed(stderr, frame)
@@ -798,6 +850,35 @@ pub fn replay(reader: impl Read, display: &Display, shown: Shown) -> io::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_note_quoting_ready_when_text_does_not_make_the_task_ready() {
+        let ready = std::sync::Arc::new(AtomicBool::new(false));
+        let capture =
+            Capture::new(None, Display::Hidden).ready_when(&["READY".into()], ready.clone());
+        capture
+            .note(r#"Warning: command "true" exited before printing the readyWhen text "READY""#)
+            .unwrap();
+        assert!(!ready.load(Ordering::SeqCst));
+        assert_eq!(capture.unready(), ["READY"]);
+    }
+
+    #[test]
+    fn ready_when_text_matches_as_printed_or_as_shown_across_reads() {
+        let ready = std::sync::Arc::new(AtomicBool::new(false));
+        let capture = Capture::new(None, Display::Hidden).ready_when(
+            &["localhost:5173".into(), "\x1b[32mok".into(), "never".into()],
+            ready.clone(),
+        );
+        capture.emit(false, b"localhost:\x1b[1m51").unwrap();
+        capture.emit(false, b"73\x1b[22m and \x1b[3").unwrap();
+        capture.emit(false, b"2mok\n").unwrap();
+        assert_eq!(capture.unready(), ["never"]);
+        assert!(!ready.load(Ordering::SeqCst));
+        capture.emit(true, b"never").unwrap();
+        assert!(capture.unready().is_empty());
+        assert!(ready.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn held_output_spills_without_losing_binary_stream_order() {

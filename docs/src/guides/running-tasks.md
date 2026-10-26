@@ -276,13 +276,16 @@ on one is keyed with the continuous task's inputs as its own, unless every
 `dependsOn` entry naming it sets `inputs: false`.
 
 With `readyWhen`, a string or an array of strings, a task is ready once every
-string has appeared in its output, on stdout or stderr. Its dependents start
+string has appeared in its output, on stdout or stderr: as printed, or as a
+terminal shows it, so text that terminal control sequences break up, such as
+a port printed in bold, matches too. Its dependents start
 then, while its commands keep running, and qk stops it, as a success, once
 nothing still to run needs it. A requested task with `readyWhen` is done once
 ready, as in Nx, unless it is also continuous. Such a task holds a
 `--parallel` slot until it is ready, and a continuous one uses `readyWhen` to
 hold its dependents back until then. A task whose commands exit before it is
-ready ends with their status. With `commands`, `readyWhen` requires
+ready ends with their status, and fails, as in Nx 24.0.2, when they all
+succeed without printing it. With `commands`, `readyWhen` requires
 `parallel`. These tasks are not cached, since their commands outlive any
 result.
 

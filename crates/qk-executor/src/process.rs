@@ -293,6 +293,32 @@ pub fn execute_captured(
                 .join()
                 .map_err(|_| anyhow::anyhow!("output capture thread panicked"))??;
         }
+        // As in Nx, commands that all exit without printing their readyWhen
+        // text fail the task: it never became ready, and nothing waiting on
+        // it would have started.
+        let outcome = match (capture, outcome) {
+            (Some(capture), Ok(Outcome::Success)) => {
+                let missing = capture.unready();
+                if missing.is_empty() {
+                    Ok(Outcome::Success)
+                } else {
+                    let exited = match task.commands.as_slice() {
+                        [command] => format!("command \"{command}\""),
+                        _ => "all commands".to_owned(),
+                    };
+                    let missing = missing
+                        .iter()
+                        .map(|text| format!("\"{text}\""))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    capture.note(&format!(
+                        "Warning: {exited} exited before printing the readyWhen text {missing}"
+                    ))?;
+                    Ok(Outcome::Failed(1))
+                }
+            }
+            (_, outcome) => outcome,
+        };
         if let (Some(capture), Ok(outcome)) = (capture, &outcome) {
             capture.finish(if *outcome == Outcome::Success {
                 Shown::Success
