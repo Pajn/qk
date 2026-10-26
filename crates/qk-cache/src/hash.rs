@@ -1613,11 +1613,24 @@ impl Coverage {
         set: &crate::recorded::PathSet,
         output: &dyn Fn(&str) -> bool,
     ) -> bool {
+        self.uncovered(snapshot, root, set, output).next().is_none()
+    }
+
+    /// The paths of `set` the declared key does not cover, as
+    /// [`Self::covers`] judges them, each with what the task did to it:
+    /// `read`, `found`, `looked for` or `listed`.
+    pub(crate) fn uncovered<'a>(
+        &'a self,
+        snapshot: &'a Snapshot,
+        root: &'a Path,
+        set: &'a crate::recorded::PathSet,
+        output: &'a dyn Fn(&str) -> bool,
+    ) -> impl Iterator<Item = (&'a str, &'static str)> + 'a {
         let selection = &self.resolved.declared.selection;
         fn directory(path: &str) -> &str {
             if path == "." { "" } else { path }
         }
-        let holds_keyed = |path: &str| {
+        let holds_keyed = move |path: &str| {
             let path = directory(path);
             if path.is_empty() {
                 return self.resolved.whole_files().next().is_some();
@@ -1625,21 +1638,38 @@ impl Coverage {
             under(&self.resolved.declared.files, path).next().is_some()
                 || under(&self.resolved.inferred.files, path).next().is_some()
         };
-        set.reads.iter().all(|path| self.keyed(path))
-            && set
-                .present
-                .iter()
-                .all(|path| self.keyed(path) || (root.join(path).is_dir() && holds_keyed(path)))
-            && set.absent.iter().all(|path| {
-                self.keyed(path)
+        let reads = set
+            .reads
+            .iter()
+            .filter(move |path| !self.keyed(path))
+            .map(|path| (path.as_str(), "read"));
+        let present = set
+            .present
+            .iter()
+            .filter(move |path| {
+                !(self.keyed(path) || (root.join(path).is_dir() && holds_keyed(path)))
+            })
+            .map(|path| (path.as_str(), "found"));
+        let absent = set
+            .absent
+            .iter()
+            .filter(move |path| {
+                !(self.keyed(path)
                     || (!snapshot.source_ignore.matches(path)
                         && !output(path)
-                        && selection.selects(snapshot, path))
+                        && selection.selects(snapshot, path)))
             })
-            && set.listings.iter().all(|path| {
+            .map(|path| (path.as_str(), "looked for"));
+        let listings = set
+            .listings
+            .iter()
+            .filter(move |path| {
                 let path = directory(path);
-                (path.is_empty() || !output(path)) && selection.selects_every_entry(snapshot, path)
+                !((path.is_empty() || !output(path))
+                    && selection.selects_every_entry(snapshot, path))
             })
+            .map(|path| (path.as_str(), "listed"));
+        reads.chain(present).chain(absent).chain(listings)
     }
 }
 

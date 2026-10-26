@@ -957,6 +957,30 @@ fn details(
             ));
         }
     }
+    // Tasks that ran where a recording would have taken a result from the
+    // cache, and gave another: a recording that left out something the task
+    // read, or a flaky task.
+    for task in &report.tasks {
+        let Some(check) = task.shadow.as_ref().map(|shadow| &shadow["check"]) else {
+            continue;
+        };
+        if check["matched"] == serde_json::Value::Bool(false) {
+            let differences: Vec<&str> = check["differences"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .collect();
+            lines.push(format!(
+                "{} {}",
+                paint.dim(&format!(
+                    "{} gave another result than the one its recording would have taken:",
+                    task.id
+                )),
+                differences.join(", ")
+            ));
+        }
+    }
     let threaded: Vec<String> = report
         .tasks
         .iter()

@@ -366,6 +366,27 @@ impl Cache {
         )
     }
 
+    /// The output files of the entry for `key`, from the local store or else
+    /// the remote store's record of it, or `None` when neither holds one.
+    pub(crate) fn artifacts(
+        &self,
+        key: &str,
+        task: &str,
+    ) -> Result<Option<BTreeMap<String, Artifact>>> {
+        match fs::read(self.root.join("entries").join(format!("{key}.json"))) {
+            Ok(bytes) => return Ok(Some(ResultRecord::read(&bytes, key)?.artifacts)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let Some(remote) = &self.remote else {
+            return Ok(None);
+        };
+        let Some(bytes) = remote.fetch_record(key, task)? else {
+            return Ok(None);
+        };
+        Ok(Some(ResultRecord::read(&bytes, key)?.artifacts))
+    }
+
     /// Restores an entry's outputs and log, or returns false when there is no
     /// entry.
     ///
@@ -624,6 +645,31 @@ impl Cache {
             Ok(())
         })
     }
+}
+
+/// How the output files `ran` differ from `recorded`, as `<path> (<how>)`,
+/// at most `limit`, the last saying how many more there are.
+pub(crate) fn differences(
+    ran: &BTreeMap<String, Artifact>,
+    recorded: &BTreeMap<String, Artifact>,
+    limit: usize,
+) -> Vec<String> {
+    let paths: BTreeSet<&String> = ran.keys().chain(recorded.keys()).collect();
+    let mut differences: Vec<String> = paths
+        .into_iter()
+        .filter_map(|path| match (ran.get(path), recorded.get(path)) {
+            (Some(ran), Some(recorded)) if ran == recorded => None,
+            (Some(_), Some(_)) => Some(format!("{path} (differs)")),
+            (Some(_), None) => Some(format!("{path} (not in the recorded result)")),
+            (None, _) => Some(format!("{path} (not written)")),
+        })
+        .collect();
+    if differences.len() > limit {
+        let more = differences.len() - (limit - 1);
+        differences.truncate(limit - 1);
+        differences.push(format!("{more} more"));
+    }
+    differences
 }
 
 fn covered_by(path: &str, roots: &BTreeSet<String>) -> bool {
@@ -1011,6 +1057,34 @@ fn outputs_held(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn differences_name_each_output_that_differs_and_count_the_rest() {
+        let file = |blob: &str| Artifact::File {
+            blob: blob.repeat(64),
+            mode: 0o644,
+        };
+        let ran = BTreeMap::from([
+            ("a".to_owned(), file("1")),
+            ("b".to_owned(), file("2")),
+            ("c".to_owned(), file("3")),
+        ]);
+        let recorded = BTreeMap::from([
+            ("a".to_owned(), file("1")),
+            ("b".to_owned(), file("4")),
+            ("d".to_owned(), file("5")),
+        ]);
+        assert!(differences(&ran, &ran, 5).is_empty());
+        assert_eq!(
+            differences(&ran, &recorded, 5),
+            [
+                "b (differs)",
+                "c (not in the recorded result)",
+                "d (not written)"
+            ]
+        );
+        assert_eq!(differences(&ran, &recorded, 2), ["b (differs)", "2 more"]);
+    }
 
     #[test]
     fn sparse_repair_keeps_other_files_and_refreshes_all_timestamps() {

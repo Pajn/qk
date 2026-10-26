@@ -31,7 +31,7 @@ use crate::paths::Outputs;
 /// finds, keeps a set for each way.
 const KEPT: usize = 8;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PathSet {
     /// Files whose content the task read.
@@ -52,6 +52,62 @@ pub struct PathSet {
     /// listings: they are there after it runs, and need not be before.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub written: BTreeSet<String>,
+    /// How its paths were when it was recorded, to tell which changed once
+    /// its key no longer matches. Not part of the set, nor of its key: sets
+    /// recorded before it was kept have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded: Option<Values>,
+}
+
+/// Two path sets are the same set when they hold the same paths, however
+/// those were when each was recorded.
+impl PartialEq for PathSet {
+    fn eq(&self, other: &Self) -> bool {
+        (
+            &self.reads,
+            &self.listings,
+            &self.present,
+            &self.absent,
+            &self.written,
+        ) == (
+            &other.reads,
+            &other.listings,
+            &other.present,
+            &other.absent,
+            &other.written,
+        )
+    }
+}
+
+/// A short digest of how each of a path set's paths was: each read file's
+/// content, each listed directory's entries and each looked-up path's kind.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Values {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub reads: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub listings: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub existence: BTreeMap<String, String>,
+}
+
+impl Values {
+    /// The digests of `values`, as [`PathSet::values`] gives them.
+    fn of(values: &Value) -> Result<Self> {
+        let digests = |part: &str| -> Result<BTreeMap<String, String>> {
+            values[part]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(path, value)| Ok((path.clone(), key(value)?[..16].to_owned())))
+                .collect()
+        };
+        Ok(Self {
+            reads: digests("reads")?,
+            listings: digests("listings")?,
+            existence: digests("existence")?,
+        })
+    }
 }
 
 /// What a path set leaves out.
@@ -302,8 +358,50 @@ impl PathSet {
             .map(|(entry, _, _)| Some(format!("{} added or changed", name(entry))))
     }
 
+    /// The set's paths, as its key holds them.
     pub fn digest(&self) -> Result<String> {
-        key(&serde_json::to_value(self)?)
+        let paths = Self {
+            recorded: None,
+            ..self.clone()
+        };
+        key(&serde_json::to_value(paths)?)
+    }
+
+    /// The paths that are not as they were when it was recorded, each with
+    /// what the task did to it: `read`, `listed`, `found` or `looked for`.
+    /// None when it kept no record of them.
+    pub(crate) fn changed(
+        &self,
+        snapshot: &Snapshot,
+        root: &Path,
+        unlisted: &Unlisted,
+    ) -> Result<Vec<(&str, &'static str)>> {
+        let Some(recorded) = &self.recorded else {
+            return Ok(Vec::new());
+        };
+        let now = Values::of(&self.values(snapshot, root, unlisted)?)?;
+        let differs = |then: &BTreeMap<String, String>,
+                       now: &BTreeMap<String, String>,
+                       path: &str| { then.get(path) != now.get(path) };
+        let mut changed = Vec::new();
+        for path in &self.reads {
+            if differs(&recorded.reads, &now.reads, path) {
+                changed.push((path.as_str(), "read"));
+            }
+        }
+        for path in &self.listings {
+            if differs(&recorded.listings, &now.listings, path) {
+                changed.push((path.as_str(), "listed"));
+            }
+        }
+        for (paths, how) in [(&self.present, "found"), (&self.absent, "looked for")] {
+            for path in paths {
+                if differs(&recorded.existence, &now.existence, path) {
+                    changed.push((path.as_str(), how));
+                }
+            }
+        }
+        Ok(changed)
     }
 
     /// How the set's paths are now: each read file's content, each listed
@@ -773,12 +871,31 @@ pub(crate) fn strong_key(
     root: &Path,
     unlisted: &Unlisted,
 ) -> Result<String> {
+    keyed(weak, set, &set.values(snapshot, root, unlisted)?)
+}
+
+fn keyed(weak: &str, set: &PathSet, values: &Value) -> Result<String> {
     key(&json!({
         "schema": "qk-recorded-v1",
         "weak": weak,
         "set": set.digest()?,
-        "values": set.values(snapshot, root, unlisted)?,
+        "values": values,
     }))
+}
+
+/// `set`'s key under `weak`, from how its paths are now, and `set` with
+/// how they are kept for telling later which changed.
+pub(crate) fn with_values(
+    weak: &str,
+    mut set: PathSet,
+    snapshot: &Snapshot,
+    root: &Path,
+    unlisted: &Unlisted,
+) -> Result<(String, PathSet)> {
+    let values = set.values(snapshot, root, unlisted)?;
+    let strong = keyed(weak, &set, &values)?;
+    set.recorded = Some(Values::of(&values)?);
+    Ok((strong, set))
 }
 
 /// Now, as the file system in `directory` stamps a file it writes. The kernel
@@ -885,6 +1002,7 @@ mod tests {
                 present: ["src/b.ts".into()].into(),
                 absent: ["config.local".into()].into(),
                 written: ["icons/sprite.svg".into()].into(),
+                recorded: None,
             }
         );
     }
@@ -916,6 +1034,7 @@ mod tests {
             present: ["checked.txt".into()].into(),
             absent: ["optional.txt".into()].into(),
             written: ["icons/sprite.svg".into()].into(),
+            recorded: None,
         };
         let outputs = Outputs::from_paths(&["icons/out".into()]).unwrap();
         let unlisted = Unlisted {
@@ -925,6 +1044,27 @@ mod tests {
         };
         let strong = || strong_key("weak", &set, &snapshot, &root, &unlisted).unwrap();
         let first = strong();
+        // Kept with how its paths were, the set has the same key, and names
+        // what changes.
+        let (kept_key, kept) =
+            with_values("weak", set.clone(), &snapshot, &root, &unlisted).unwrap();
+        assert_eq!(kept_key, first);
+        assert_eq!(kept, set);
+        assert_eq!(kept.digest().unwrap(), set.digest().unwrap());
+        assert!(
+            kept.changed(&snapshot, &root, &unlisted)
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::write(root.join("a.txt"), "changed").unwrap();
+        std::fs::write(root.join("optional.txt"), "").unwrap();
+        assert_eq!(
+            kept.changed(&snapshot, &root, &unlisted).unwrap(),
+            [("a.txt", "read"), ("optional.txt", "looked for")]
+        );
+        assert!(set.changed(&snapshot, &root, &unlisted).unwrap().is_empty());
+        std::fs::write(root.join("a.txt"), "one").unwrap();
+        std::fs::remove_file(root.join("optional.txt")).unwrap();
         // What the task writes in a listed directory, or its outputs there,
         // and files it never read change nothing.
         std::fs::write(root.join("icons/sprite.svg"), "").unwrap();
