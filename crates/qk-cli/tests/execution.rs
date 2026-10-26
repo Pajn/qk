@@ -1388,13 +1388,13 @@ fn output_styles_follow_nx() {
     assert_eq!(stdout(&["run-many", "-t", "build"]), "");
     assert_eq!(
         stdout(&["run-many", "-t", "fail"]),
-        "\n✖ nx run app:fail failed\n\nbroken\n"
+        "\n✖ qk run app:fail failed\n\nbroken\n"
     );
     assert_eq!(stdout(&["run", "app:build"]), "one\ntwo\n");
     // Held output of a failing task still appears.
     assert!(
         stdout(&["run-many", "-t", "fail", "--output-style", "tui"])
-            .contains("> nx run app:fail\n\nbroken")
+            .contains("> qk run app:fail\n\nbroken")
     );
 
     // A cache hit replays its log under the same header, marked as such; with
@@ -1402,7 +1402,7 @@ fn output_styles_follow_nx() {
     stdout(&["run-many", "-t", "cached", "--output-style", "static"]);
     assert_eq!(
         stdout(&["run-many", "-t", "cached", "--output-style", "static"]),
-        "\n> nx run app:cached  [existing outputs match the cache, left as is]\n\ncached\n"
+        "\n> qk run app:cached  [existing outputs match the cache, left as is]\n\ncached\n"
     );
 
     let grouped = command(
@@ -1417,7 +1417,7 @@ fn output_styles_follow_nx() {
         .replace("\r\n", "\n")
         .replace(" \n", "\n");
     assert!(
-        grouped.starts_with("\n::group::✅ > nx run app:build\n\none\ntwo\n::endgroup::\n"),
+        grouped.starts_with("\n::group::✅ > qk run app:build\n\none\ntwo\n::endgroup::\n"),
         "{grouped}"
     );
 }
@@ -1462,9 +1462,9 @@ fn static_failures_only_collapses_what_did_not_fail_as_nx_does() {
         ],
         &[],
     );
-    assert!(stdout.contains("✔  nx run app:dep\n"), "{stdout}");
+    assert!(stdout.contains("✔  qk run app:dep\n"), "{stdout}");
     assert!(!stdout.contains("dep-output"), "{stdout}");
-    assert!(stdout.contains("> nx run app:fail\n\nbroken"), "{stdout}");
+    assert!(stdout.contains("> qk run app:fail\n\nbroken"), "{stdout}");
     assert!(
         stderr.contains(
             "Output of 1 successful task was not shown. Run with --verbose or --output-style=static to see it."
@@ -1485,7 +1485,7 @@ fn static_failures_only_collapses_what_did_not_fail_as_nx_does() {
         &[],
     );
     assert!(
-        stdout.contains("> nx run app:dep\n\ndep-output"),
+        stdout.contains("> qk run app:dep\n\ndep-output"),
         "{stdout}"
     );
     // A single task shows its own project's tasks in full, and the others
@@ -1496,10 +1496,10 @@ fn static_failures_only_collapses_what_did_not_fail_as_nx_does() {
         &[("NX_DEFAULT_OUTPUT_STYLE", "static-failures-only")],
     );
     assert!(
-        stdout.contains("> nx run app:dep\n\ndep-output"),
+        stdout.contains("> qk run app:dep\n\ndep-output"),
         "{stdout}"
     );
-    assert!(stdout.contains("> nx run app:build\n\nbuilt"), "{stdout}");
+    assert!(stdout.contains("> qk run app:build\n\nbuilt"), "{stdout}");
 }
 
 #[test]
@@ -1522,7 +1522,7 @@ fn summary_prints_counts_and_where_failed_output_is() {
         stderr.contains("3 tasks: 1 succeeded, 1 failed, 1 skipped"),
         "{stderr}"
     );
-    assert!(stderr.contains("✖ nx run app:fail\n"), "{stderr}");
+    assert!(stderr.contains("✖ qk run app:fail\n"), "{stderr}");
     let log = stderr
         .lines()
         .find_map(|line| line.trim().strip_prefix("full log: "))
@@ -1588,7 +1588,7 @@ fn ci_is_detected_as_nx_detects_it() {
     for env in [[("CI", "0")], [("BUILDKITE", "true")]] {
         let (stdout, _, _) = plain(temp.path(), &["run-many", "-t", "build"], &env);
         assert!(
-            stdout.contains("> nx run app:build\n\nbuilt"),
+            stdout.contains("> qk run app:build\n\nbuilt"),
             "{env:?}: {stdout}"
         );
     }
@@ -1631,7 +1631,7 @@ fn long_running_targets_stream_unless_a_static_style_is_named() {
         &[("CI", "true")],
     );
     assert!(stdout.lines().any(|line| line == "serving"), "{stdout}");
-    assert!(stdout.contains("> nx run app:build\n\nbuilt"), "{stdout}");
+    assert!(stdout.contains("> qk run app:build\n\nbuilt"), "{stdout}");
     let (stdout, _, _) = plain(
         temp.path(),
         &["run-many", "-t", "serve"],
@@ -1643,7 +1643,7 @@ fn long_running_targets_stream_unless_a_static_style_is_named() {
         &["run-many", "-t", "serve", "--output-style", "static"],
         &[],
     );
-    assert!(stdout.contains("> nx run app:serve\n\nserving"), "{stdout}");
+    assert!(stdout.contains("> qk run app:serve\n\nserving"), "{stdout}");
     // NX_STREAM_OUTPUT decides for every task.
     let (stdout, _, _) = plain(
         temp.path(),
@@ -1651,7 +1651,7 @@ fn long_running_targets_stream_unless_a_static_style_is_named() {
         &[("NX_STREAM_OUTPUT", "true")],
     );
     assert!(
-        stdout.contains("built") && !stdout.contains("> nx run"),
+        stdout.contains("built") && !stdout.contains("> qk run"),
         "{stdout}"
     );
 }
@@ -1693,7 +1693,7 @@ fn large_output_preserves_static_groups_quiet_failures_and_long_line_prefixes() 
     };
     let output = success(invoke("a,b", "static"));
     for id in ["a", "b"] {
-        let header = format!("::group::✅ > nx run app:{id}\n\n");
+        let header = format!("::group::✅ > qk run app:{id}\n\n");
         let start = output
             .stdout
             .windows(header.len())
@@ -1720,7 +1720,7 @@ fn large_output_preserves_static_groups_quiet_failures_and_long_line_prefixes() 
     assert!(
         failed
             .stdout
-            .starts_with("\n✖ nx run app:fail failed\n\n".as_bytes())
+            .starts_with("\n✖ qk run app:fail failed\n\n".as_bytes())
     );
     assert!(failed.stdout.ends_with(&body("fail")));
 
@@ -1762,7 +1762,7 @@ fn a_static_run_streams_its_task_between_banners_like_nx_run() {
     let (stdout, stderr) = run("app:build");
     assert_eq!(
         stdout,
-        "\n::group::✅ > nx run app:dep\n\ndep\n::endgroup::\n\n> nx run app:build\n\nbuilt\n"
+        "\n::group::✅ > qk run app:dep\n\ndep\n::endgroup::\n\n> qk run app:build\n\nbuilt\n"
     );
     assert!(
         stderr.starts_with(
@@ -1781,7 +1781,7 @@ fn a_static_run_streams_its_task_between_banners_like_nx_run() {
     let (stdout, _) = run("app:build");
     assert!(
         stdout.starts_with(
-            "\n::group::⏩ > nx run app:dep  [existing outputs match the cache, left as is]\n\n::endgroup::\n"
+            "\n::group::⏩ > qk run app:dep  [existing outputs match the cache, left as is]\n\n::endgroup::\n"
         ),
         "{stdout}"
     );
@@ -1879,7 +1879,7 @@ fn root_dotenv_files_set_run_controls_as_in_nx() {
         .output()
         .unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("> nx run app:build"), "{stdout}");
+    assert!(stdout.contains("> qk run app:build"), "{stdout}");
     // NX_LOAD_DOT_ENV_FILES=false leaves them out.
     let output = command(temp.path(), &["run-many", "-t", "build"])
         .env_remove("NX_DEFAULT_OUTPUT_STYLE")
@@ -2027,7 +2027,7 @@ fn quiet_output_is_plain_text_for_agents() {
         .unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
     // Only the failure, without escape sequences.
-    assert_eq!(stdout, "\n✖ nx run app:fail failed\n\nred failure\n");
+    assert_eq!(stdout, "\n✖ qk run app:fail failed\n\nred failure\n");
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("1 of 2 tasks failed"), "{stderr}");
     assert!(!stderr.contains("qk: checking"), "{stderr}");
@@ -2745,14 +2745,14 @@ fn a_single_run_on_a_terminal_shows_its_dependencies_in_a_panel() {
     // The dependency's output is held; the task streams under its header.
     let output = single("serve");
     assert!(output.contains("1 dependency ready"), "{output:?}");
-    assert!(output.contains("> nx run app:serve"), "{output:?}");
+    assert!(output.contains("> qk run app:serve"), "{output:?}");
     assert!(output.contains("serving\n"), "{output:?}");
     assert!(!output.contains("dependency output"), "{output:?}");
     assert!(!output.contains("qk: running"), "{output:?}");
     // A failed dependency shows its output, and the task never starts.
     let output = single("doomed");
     assert!(output.contains("broken output"), "{output:?}");
-    assert!(!output.contains("> nx run app:doomed"), "{output:?}");
+    assert!(!output.contains("> qk run app:doomed"), "{output:?}");
     assert!(!output.contains("never"), "{output:?}");
 }
 

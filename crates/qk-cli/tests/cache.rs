@@ -353,7 +353,7 @@ fn cached(output: &Output) -> bool {
         "[existing outputs match the cache",
     ]
     .iter()
-    .any(|status| stdout.contains(&format!("> nx run app:build  {status}")))
+    .any(|status| stdout.contains(&format!("> qk run app:build  {status}")))
 }
 
 fn artifact(root: &Path) -> String {

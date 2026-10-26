@@ -351,7 +351,7 @@ impl Dynamic {
     pub fn run_one(id: &str, printable: &str) -> Arc<Self> {
         Self::spawn(Some(Requested {
             id: id.to_owned(),
-            header: format!("> nx run {printable}"),
+            header: format!("> qk run {printable}"),
         }))
     }
 
@@ -1396,7 +1396,7 @@ pub fn summary_style(
     let mut lines = Vec::new();
     for task in &failed {
         lines.push(String::new());
-        lines.push(format!("{} nx run {}", paint.red("✖"), printable(&task.id)));
+        lines.push(format!("{} qk run {}", paint.red("✖"), printable(&task.id)));
         let log = logs.join(qk_runner::log_name(&task.id));
         if std::fs::metadata(&log).is_ok_and(|metadata| metadata.len() > 0) {
             lines.push(paint.dim(&format!("  full log: {}", log.display())));

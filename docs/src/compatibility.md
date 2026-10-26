@@ -109,6 +109,9 @@ edges off.
   Nx ignores the positional and uses the current directory's project.
 - Under `--nx-bail`, a run that failed and left tasks unstarted exits with 1.
   Nx counts it as interrupted and exits with 130.
+- Task headers name qk rather than Nx: `> qk run <task>`, `✔  qk run <task>`
+  and `✖ qk run <task> failed` where Nx prints `nx run`. Anything that reads
+  logs by Nx's headers has to match qk's.
 - qk's default output styles are its own: `static` in CI, the live panel on
   a terminal, and otherwise `quiet` for several tasks and raw output for one.
   Nx defaults to `static-failures-only` where it does not use its terminal UI,
