@@ -3831,6 +3831,64 @@ fn warm_state_is_shared_through_the_remote_by_branch() {
 
 #[cfg(unix)]
 #[test]
+fn another_branchs_local_save_gives_way_to_the_remotes() {
+    let server = s3::FakeS3::start();
+    let fixture = Fixture::new(json!({
+        "command": "if [ -f \"$TOOL_CACHE/seen\" ]; then cat \"$TOOL_CACHE/seen\"; else echo cold; fi; mkdir -p \"$TOOL_CACHE\" && echo \"$GITHUB_REF_NAME\" > \"$TOOL_CACHE/seen\"",
+        "qk:warm": {"portable": true, "env": {"TOOL_CACHE": "{warm}/tool"}}
+    }));
+    with_remote(&fixture, &server, json!({}));
+    // One directory building one branch after another, as a CI runner does,
+    // keeps one local save: the last branch's.
+    let on = |branch: &str, env: &[(&str, &str)]| {
+        fixture.git(&fixture.root, &["checkout", "--quiet", branch]);
+        let _ = fs::remove_dir_all(fixture.root.join(".git/qk/warm"));
+        let mut env = env.to_vec();
+        env.push(("GITHUB_REF_NAME", branch));
+        let output = success(remote_build(&fixture, &env));
+        stdout(&output)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    // Both branches use the remote.
+    fixture.git(&fixture.root, &["branch", "-M", "main"]);
+    let commit = |message: &str| {
+        fixture.git(
+            &fixture.root,
+            &[
+                "-c",
+                "user.name=qk",
+                "-c",
+                "user.email=qk@example.invalid",
+                "commit",
+                "--quiet",
+                "--all",
+                "-m",
+                message,
+            ],
+        );
+    };
+    commit("remote");
+    assert_eq!(on("main", &[]), "cold");
+    fixture.git(&fixture.root, &["checkout", "--quiet", "-b", "other"]);
+    fs::write(fixture.root.join("other.txt"), "other").unwrap();
+    fixture.git(&fixture.root, &["add", "--all"]);
+    commit("other");
+    // A branch starts from the save of the commit it branched from.
+    assert_eq!(on("other", &[]), "main");
+    // Back on main, the local save is the other branch's. With no remote, it
+    // is all there is.
+    let local_only = [("NX_SKIP_REMOTE_CACHE", "true")];
+    assert_eq!(on("main", &local_only), "other");
+    assert_eq!(on("other", &[]), "main");
+    // With one, main's own state comes from it instead.
+    assert_eq!(on("main", &[]), "main");
+}
+
+#[cfg(unix)]
+#[test]
 fn a_remote_warm_save_for_another_key_is_not_downloaded() {
     let server = s3::FakeS3::start();
     let fixture = Fixture::new(json!({

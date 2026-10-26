@@ -10,8 +10,11 @@
 //!
 //! A group already present on disk is left alone. Otherwise it is restored
 //! from this worktree's own save. `portable: true` also permits other
-//! worktrees' and remote saves. It is saved after successful runs, one record
-//! per worktree.
+//! worktrees' and remote saves. A local save made at a commit `HEAD` does not
+//! descend from, as on another branch, comes last, after the remote's: on a
+//! machine that builds many branches in one directory, as a CI runner does,
+//! another branch's state is the least like this checkout's. It is saved after
+//! successful runs, one record per worktree.
 //!
 //! `qk:warm` may also be an array of such objects, each restored and saved on
 //! its own, so state that relocates can be portable beside state that cannot.
@@ -1045,6 +1048,15 @@ fn key_match(warm: &Warm, current: &[String], saved: &[String]) -> Option<u8> {
     (saved.len() == current.len() && saved[..count] == current[..count]).then_some(1)
 }
 
+/// Whether `HEAD` descends from `commit`, or is it.
+fn descends_from(workspace: &Workspace, commit: &str) -> bool {
+    paths::git(
+        &workspace.root,
+        &["merge-base", "--is-ancestor", commit, "HEAD"],
+    )
+    .is_ok_and(|output| output.status.success())
+}
+
 /// How many commits `commit` is behind the checkout's `HEAD`, or `None` when
 /// it is not an ancestor of it.
 fn behind(workspace: &Workspace, commit: &str) -> Option<u64> {
@@ -1158,12 +1170,14 @@ impl Cache {
     /// whose key matches whole comes before one that matches in part; then
     /// this worktree's own before another's, which only a portable target
     /// restores; then the one made at the commit nearest behind `HEAD`; then
-    /// the newest.
+    /// the newest. With `related`, only saves made at a commit `HEAD`
+    /// descends from are considered, and without, only the others.
     fn choose_warm(
         &self,
         workspace: &Workspace,
         warm: &Warm,
         current: &[String],
+        related: bool,
     ) -> Option<(WarmRecord, String)> {
         let own = worktree(workspace);
         let mut candidates: Vec<(u8, bool, WarmRecord)> = self
@@ -1173,6 +1187,13 @@ impl Cache {
                 let quality = key_match(warm, current, &record.key)?;
                 let other = record.worktree != own;
                 (!other || warm.portable).then_some((quality, other, record))
+            })
+            .filter(|(_, _, record)| {
+                let descends = record
+                    .commit
+                    .as_deref()
+                    .is_some_and(|commit| descends_from(workspace, commit));
+                descends == related
             })
             .collect();
         // Newest first within each rank, as warm_records returned them.
@@ -1251,12 +1272,16 @@ impl Cache {
         }
         let choosing = profile::span(&task.id, "warm_restore_choose");
         let current = key_digests(workspace, warm, prepared)?;
-        let (record, source) = match self.choose_warm(workspace, warm, &current) {
-            Some(chosen) => chosen,
-            None => match self.remote_warm(workspace, task, warm, &current) {
-                Some((record, branch)) => (record, format!("remote {branch}")),
-                None => return Ok((restored, present)),
-            },
+        // Another branch's save, here, only when the remote has none.
+        let chosen = self
+            .choose_warm(workspace, warm, &current, true)
+            .or_else(|| {
+                self.remote_warm(workspace, task, warm, &current)
+                    .map(|(record, branch)| (record, format!("remote {branch}")))
+            })
+            .or_else(|| self.choose_warm(workspace, warm, &current, false));
+        let Some((record, source)) = chosen else {
+            return Ok((restored, present));
         };
         drop(choosing);
         let _files = profile::span(&task.id, "warm_restore_files");
