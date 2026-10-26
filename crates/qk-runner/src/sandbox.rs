@@ -23,9 +23,11 @@
 //! On macOS that is Seatbelt, through `sandbox-exec`, with a profile per
 //! task. Each report names the task through the rule's message, so the
 //! kernel's log, read while the run lasts, says which task did what. On
-//! Linux it is Landlock, which can only refuse, so only enforce mode is
-//! there; a task's rules are built as it starts, since Landlock holds paths
-//! that exist and its dependencies' outputs appear during the run.
+//! Linux enforce mode is Landlock, which can only refuse; a task's rules are
+//! built as it starts, since Landlock holds paths that exist and its
+//! dependencies' outputs appear during the run. Audit mode records each task
+//! instead, with the recorder `--record` uses, and holds what it did against
+//! the plan a profile would have allowed without a report.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader};
@@ -118,6 +120,20 @@ struct Plan {
     packages: Option<Packages>,
 }
 
+impl Plan {
+    /// Whether `path` may be read, or with `write` written, without a report:
+    /// what the audit profile allows outright.
+    fn allows(&self, path: &Path, write: bool, state: &Path) -> bool {
+        let under = |tree: &PathBuf| path.starts_with(tree);
+        path.starts_with(state)
+            || self.write_trees.iter().any(under)
+            || (!write
+                && (self.read_directories.iter().any(under)
+                    || self.read_trees.iter().any(under)
+                    || self.read_files.iter().any(|file| file == path)))
+    }
+}
+
 /// The store directories whose manifests' reads are reported.
 #[derive(Clone, Debug)]
 enum Packages {
@@ -164,6 +180,13 @@ pub struct Sandbox {
     /// workspace, since Landlock takes paths rather than patterns.
     shared: Vec<PathBuf>,
     dotenv: Vec<PathBuf>,
+    /// Linux audit: the recorder, and each task's recording with the
+    /// directory its commands start in.
+    recording: Option<qk_executor::Recording>,
+    traces: Mutex<BTreeMap<String, (qk_executor::Recording, PathBuf)>>,
+    /// The workspace root as given, which recorded paths may name rather
+    /// than `root`, its links resolved.
+    given_root: PathBuf,
     /// Linux: rule sets handed to tasks, open until the run ends, and the
     /// output directories created so their rules had a path to hold.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -193,10 +216,10 @@ impl Sandbox {
     /// starts reading the log.
     pub fn start(workspace: &Workspace, graph: &TaskGraph, mode: Mode) -> Result<Self> {
         if cfg!(target_os = "linux") {
-            if mode == Mode::Audit {
-                bail!("on Linux the sandbox can only refuse, not report; use --sandbox=enforce");
+            if mode == Mode::Enforce {
+                landlock::abi()
+                    .context("--sandbox=enforce needs Landlock, in Linux 5.13 and later")?;
             }
-            landlock::abi().context("--sandbox needs Landlock, in Linux 5.13 and later")?;
         } else if !cfg!(target_os = "macos") {
             bail!("--sandbox needs macOS or Linux");
         }
@@ -254,6 +277,9 @@ impl Sandbox {
             directory,
             shared: Vec::new(),
             dotenv: Vec::new(),
+            recording: None,
+            traces: Mutex::new(BTreeMap::new()),
+            given_root: workspace.root.clone(),
             rulesets: Mutex::new(Vec::new()),
             created: Mutex::new(Vec::new()),
         };
@@ -289,6 +315,10 @@ impl Sandbox {
                 }
                 Err(error) => return Err(error),
             }
+        } else if mode == Mode::Audit {
+            let recording = qk_executor::Recording::probe(&sandbox.directory)
+                .context("--sandbox on Linux records what each task does, with eBPF or strace")?;
+            sandbox.recording = Some(recording.resolving());
         } else {
             let (shared, dotenv) = scan(&sandbox.root);
             sandbox.shared = shared;
@@ -308,7 +338,7 @@ impl Sandbox {
     /// How a task is held to its plan, as it starts; `None` runs it
     /// unsandboxed, with the reason recorded.
     pub fn confine(&self, id: &str) -> Option<qk_executor::Confinement> {
-        if !self.plans.contains_key(id) {
+        if !self.plans.contains_key(id) || self.recording.is_some() {
             return None;
         }
         if cfg!(target_os = "macos") {
@@ -327,6 +357,118 @@ impl Sandbox {
                 None
             }
         }
+    }
+
+    /// Linux audit: the recording a task runs under, as it starts in `cwd`.
+    pub fn recording(&self, id: &str, cwd: &Path) -> Option<qk_executor::Recording> {
+        let recording = self.recording.as_ref()?;
+        if !self.plans.contains_key(id) {
+            return None;
+        }
+        let mut traces = self.traces.lock().unwrap();
+        let directory = self.directory.join(format!("trace-{}", traces.len()));
+        if let Err(error) = std::fs::create_dir_all(&directory) {
+            drop(traces);
+            self.unconfined(id, &format!("it could not be recorded: {error}"));
+            return None;
+        }
+        let recording = recording.in_directory(directory);
+        traces.insert(id.to_owned(), (recording.clone(), cwd.to_owned()));
+        Some(recording)
+    }
+
+    /// Linux audit: what each recorded task did that its plan does not
+    /// allow, as the reports Seatbelt's profile would have made. A task whose
+    /// recording is incomplete is not audited, and listed with why.
+    fn recorded(&self) -> Vec<Report> {
+        let traces = std::mem::take(&mut *self.traces.lock().unwrap());
+        let mut reports = Vec::new();
+        for (id, (recording, cwd)) in traces {
+            let collected = recording
+                .settle()
+                .and_then(|()| qk_input_analysis::strace::collect(&recording.directory, &cwd));
+            let accesses = match collected {
+                Ok((accesses, issues)) => match issues.first() {
+                    None => accesses,
+                    Some(issue) => {
+                        self.unconfined(
+                            &id,
+                            &format!("it was not audited, as its recording is incomplete: {issue}"),
+                        );
+                        continue;
+                    }
+                },
+                Err(error) => {
+                    self.unconfined(
+                        &id,
+                        &format!("it was not audited, as its recording is incomplete: {error:#}"),
+                    );
+                    continue;
+                }
+            };
+            let plan = &self.plans[&id];
+            reports.extend(
+                accesses
+                    .into_iter()
+                    .filter_map(|access| self.report(&id, plan, access)),
+            );
+        }
+        reports
+    }
+
+    /// The report Seatbelt's audit profile would make of `access`, if any:
+    /// a read of a file or a write in the workspace that `plan` does not
+    /// allow, and in `node_modules` only a read of a package's manifest, by
+    /// which a package the key leaves out is found.
+    fn report(&self, id: &str, plan: &Plan, access: qk_input_analysis::Access) -> Option<Report> {
+        use qk_input_analysis::Operation;
+        let write = access.operation.writes();
+        if write {
+            if !matches!(access.result.as_str(), "success" | "unknown") {
+                return None;
+            }
+        } else if !matches!(
+            access.operation,
+            Operation::OpenRead | Operation::ReadData | Operation::Execute
+        ) || access.result != "success"
+        {
+            return None;
+        }
+        let path = PathBuf::from(access.resolved_path.as_deref().unwrap_or(&access.path));
+        let path = if path.starts_with(&self.root) {
+            path
+        } else {
+            self.root.join(path.strip_prefix(&self.given_root).ok()?)
+        };
+        // Directories may be listed; what a listing finds is not read.
+        if !write && path.is_dir() {
+            return None;
+        }
+        let relative = path.strip_prefix(&self.root).ok()?;
+        if relative
+            .components()
+            .any(|component| component.as_os_str() == "node_modules")
+        {
+            if write
+                || plan.packages.is_none()
+                || path.file_name() != Some(std::ffi::OsStr::new("package.json"))
+            {
+                return None;
+            }
+        } else if plan.allows(&path, write, &self.state) {
+            return None;
+        }
+        Some(Report {
+            task: id.to_owned(),
+            process: access.process,
+            operation: if write {
+                "file-write-data"
+            } else {
+                "file-read-data"
+            }
+            .into(),
+            path: path.to_string_lossy().into_owned(),
+        })
     }
 
     #[cfg(target_os = "linux")]
@@ -374,7 +516,7 @@ impl Sandbox {
                 }
                 reports
             }
-            None => Vec::new(),
+            None => self.recorded(),
         };
         let _ = std::fs::remove_dir_all(&self.directory);
         for directory in std::mem::take(&mut *self.created.lock().unwrap()) {

@@ -3171,12 +3171,29 @@ fn a_target_without_a_project_finds_one_like_nx() {
 }
 
 /// Keep system-log tests serial to reduce pressure on the lossy log stream.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 static AUDIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-#[cfg(target_os = "macos")]
+/// Whether the sandbox can audit here: on Linux it records each task, with
+/// eBPF or strace, as the recording tests do where strace is installed.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn can_audit() -> bool {
+    if cfg!(target_os = "macos") {
+        return true;
+    }
+    let found = Command::new("strace").arg("-V").output().is_ok();
+    if !found {
+        eprintln!("skipped: auditing on Linux records tasks, which these tests do with strace");
+    }
+    found
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn the_sandbox_reports_and_refuses_what_a_task_does_not_declare() {
+    if !can_audit() {
+        return;
+    }
     let _audit = AUDIT
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3229,8 +3246,14 @@ fn the_sandbox_reports_and_refuses_what_a_task_does_not_declare() {
     assert!(!enforced.status.success());
     // The task `run` is for streams, so its errors stay on stderr.
     let stderr = String::from_utf8_lossy(&enforced.stderr);
+    #[cfg(target_os = "macos")]
     assert!(
         stderr.contains("other/notes.txt: Operation not permitted"),
+        "{stderr}"
+    );
+    #[cfg(target_os = "linux")]
+    assert!(
+        stderr.contains("other/notes.txt: Permission denied"),
         "{stderr}"
     );
     assert!(!temp.path().join("stray.txt").exists());
@@ -3280,8 +3303,8 @@ fn the_sandbox_lets_a_task_read_configuration_only_as_declared() {
     // The root project's own package.json is keyed whole, so its tasks may
     // read it.
     assert!(enforced("manifest"));
-    #[cfg(target_os = "macos")]
-    {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if can_audit() {
         let _audit = AUDIT
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3336,9 +3359,12 @@ fn the_sandbox_keeps_an_ignored_project_local_json_out_of_whole_directories() {
 
 /// Only a task that started is listed as running unsandboxed: one skipped
 /// after its dependency failed never ran.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn the_sandbox_lists_only_tasks_that_started() {
+    if !can_audit() {
+        return;
+    }
     let _audit = AUDIT
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3373,9 +3399,12 @@ fn the_sandbox_lists_only_tasks_that_started() {
 
 /// Reads in a project the task's project depends on are grouped by that
 /// project, apart from reads elsewhere outside its inputs.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn the_sandbox_groups_reads_in_dependency_projects() {
+    if !can_audit() {
+        return;
+    }
     let _audit = AUDIT
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3607,9 +3636,12 @@ snapshots:
     temp
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn the_sandbox_reports_a_package_read_that_the_key_leaves_out() {
+    if !can_audit() {
+        return;
+    }
     let _audit = AUDIT
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3676,9 +3708,12 @@ fn the_sandbox_reports_a_package_read_that_the_key_leaves_out() {
     assert_eq!(findings["tasks"], json!({}), "{findings}");
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn warm_suggest_lists_the_directories_a_task_wrote_outside_its_outputs() {
+    if !can_audit() {
+        return;
+    }
     let _audit = AUDIT
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3753,9 +3788,6 @@ fn the_sandbox_refuses_what_a_task_does_not_declare_on_linux() {
     assert!(String::from_utf8_lossy(&peek.stderr).contains("Permission denied"));
     assert!(!sandboxed("app:stray").status.success());
     assert!(!temp.path().join("stray.txt").exists());
-    // Audit needs reports Landlock does not give.
-    let audit = run(temp.path(), &["run", "app:build", "--sandbox"]);
-    assert!(String::from_utf8_lossy(&audit.stderr).contains("use --sandbox=enforce"));
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]

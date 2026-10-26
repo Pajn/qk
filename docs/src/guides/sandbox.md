@@ -1,8 +1,9 @@
 # Checking inputs and outputs in a sandbox
 
-`--sandbox` runs each task under the system's sandbox to check that it
-declares what it reads and writes in the workspace: Seatbelt, through
-`sandbox-exec`, on macOS, and Landlock on Linux. qk is not a hermetic build system: outside the workspace
+`--sandbox` checks that each task declares what it reads and writes in the
+workspace. On macOS it runs the task under Seatbelt, through `sandbox-exec`.
+On Linux, audit records the task, as [Ultracache](ultracache.md#recorders)
+does, and enforce runs it under Landlock. qk is not a hermetic build system: outside the workspace
 everything stays open, including system files, the home directory,
 temporary files and tool caches.
 
@@ -134,20 +135,22 @@ Reading an installed package the key leaves out stays allowed too, and is
 not listed: Landlock grants a directory with everything beneath it, so on
 Linux a store directory could not be refused while `node_modules` stays open
 for what tools create there as they run, and enforce would refuse on macOS
-what it lets through on Linux. Audit on macOS, or
-[input analysis](input-analysis.md) on either system, finds such reads.
+what it lets through on Linux. Audit, or
+[input analysis](input-analysis.md), finds such reads.
 
 ## Notes
 
 - A sandboxed run skips the cache, since a task has to run to be watched.
 - `--sandbox-report <path>` writes every finding as JSON.
-- qk reads the sandbox's reports from the system log while the run lasts;
-  each report is tagged with its task. The log can drop reports when many
-  arrive at once, so audit lists what was reported rather than proving
-  nothing else happened.
-- A task whose inputs cannot be resolved, or whose profile the sandbox
-  rejects, runs unsandboxed and is listed with the reason.
-- Seatbelt caps the paths a profile with reports may name at 64 KiB
+- On macOS, qk reads the sandbox's reports from the system log while the
+  run lasts; each report is tagged with its task. The log can drop reports
+  when many arrive at once, so audit lists what was reported rather than
+  proving nothing else happened. On Linux, audit's reports come from each
+  task's recording, and a recording that lost events or could not be decoded
+  leaves its task listed as not audited.
+- A task whose inputs cannot be resolved, or on macOS whose profile the
+  sandbox rejects, runs unsandboxed and is listed with the reason.
+- On macOS, Seatbelt caps the paths a profile with reports may name at 64 KiB
   together. A task's profile names the shorter list of pnpm's store
   directories, those to report or those not to, which fits stores of a few
   thousand directories. A task whose profile still does not fit is retried
@@ -155,7 +158,7 @@ what it lets through on Linux. Audit on macOS, or
   task runs sandboxed and is listed under `packagesUnchecked` in
   `--sandbox-report`; if not, it runs unsandboxed and is listed with the
   reason, as above. Only tasks that started are listed.
-- Seatbelt refuses to apply a sandbox inside one that restricts anything, as
+- On macOS, Seatbelt refuses to apply a sandbox inside one that restricts anything, as
   every task's profile does. A task that applies its own, as Xcode does to
   run Swift macros, fails with `sandbox_apply: Operation not permitted`.
   Audit runs it again unsandboxed and lists it with the reason, without the
@@ -167,10 +170,17 @@ what it lets through on Linux. Audit on macOS, or
 
 ## Linux
 
-Landlock, in Linux 5.13 and later, is available to any process, without
-root and inside containers. It can refuse but not report, so Linux has
-enforce mode only: `--sandbox` alone is an error there, and a refused access
-fails the task with `Permission denied` rather than being listed.
+Audit records each task with the recorder [Ultracache](ultracache.md#recorders)
+uses, eBPF where it loads and strace otherwise, as `QK_RECORDER` picks, and
+reports what the recording shows the task did beyond what it declares. A
+read is a file the task opened for reading, and a write one it opened for
+writing, created, renamed or removed. A task whose recording is incomplete
+is listed as unaudited, with why, rather than with part of its findings.
+
+Enforce uses Landlock, in Linux 5.13 and later, which is available to any
+process, without root and inside containers. It can refuse but not report:
+a refused access fails the task with `Permission denied` rather than being
+listed.
 
 Landlock holds paths that exist, so each task's rules are built as it
 starts, after its dependencies have written their outputs. An output

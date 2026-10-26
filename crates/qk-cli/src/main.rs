@@ -228,9 +228,10 @@ struct RunOptions {
     verbose: bool,
     #[arg(long, hide = true, overrides_with = "verbose")]
     no_verbose: bool,
-    /// Run each task in macOS's sandbox: `audit` (the default) reports what it
-    /// reads and writes in the workspace beyond what it declares, `enforce`
-    /// refuses it. Tasks run without the cache.
+    /// Check what each task reads and writes in the workspace beyond what it
+    /// declares: `audit` (the default) reports it, through Seatbelt on macOS
+    /// and by recording the task on Linux; `enforce` refuses it, through
+    /// Seatbelt or Landlock. Tasks run without the cache.
     #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "audit", value_name = "MODE")]
     sandbox: Option<SandboxMode>,
     /// Write every sandbox finding to this file as JSON.
@@ -691,7 +692,8 @@ enum InputsCommand {
 #[derive(Subcommand)]
 enum WarmCommand {
     /// Run a task in the sandbox and list the directories it wrote outside its
-    /// outputs, as candidates for its qk:warm paths. Needs macOS.
+    /// outputs, as candidates for its qk:warm paths. Needs macOS, or Linux
+    /// where qk can record tasks.
     Suggest {
         /// project:target[:configuration], or a target of the current directory's project.
         task: String,

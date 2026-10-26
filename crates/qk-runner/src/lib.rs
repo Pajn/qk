@@ -187,7 +187,7 @@ pub struct Settings<'a> {
     /// Whether the static styles stream long-running tasks rather than hold
     /// their output: as in Nx, unless the user named a static style.
     pub stream_long_running: bool,
-    /// Run each task in macOS's sandbox, auditing or enforcing what it declares.
+    /// Run each task sandboxed, auditing or enforcing what it declares.
     pub sandbox: Option<sandbox::Mode>,
     /// Execute finite tasks under an advisory file-access recorder.
     pub analyze_inputs: bool,
@@ -790,6 +790,9 @@ pub fn run(
                     let mut task = prepared[&id].clone();
                     if let Some(sandbox) = &sandbox {
                         task.sandbox = sandbox.confine(&id);
+                        if let Some(recording) = sandbox.recording(&id, &task.cwd) {
+                            task.recording = Some(recording);
+                        }
                     }
                     // As in Nx, a task learns the address of the one server it
                     // waited for that reported one.

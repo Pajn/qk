@@ -33,7 +33,8 @@ jobs:
       # Every failing test binary, not only the first.
       - run: cargo test --workspace --locked --no-fail-fast
 
-  # The tests that record what tasks read, with each recorder. `check` records
+  # The tests that record what tasks do, for Ultracache, input analysis and the
+  # sandbox's audit, with each recorder. `check` records
   # with whichever loads; these name one, so that neither goes untested.
   # GitHub's Linux runners give the eBPF recorder's helper root through
   # passwordless sudo, and arm64 runs the program built for it.
@@ -56,7 +57,7 @@ jobs:
       - name: Install strace
         run: sudo apt-get update && sudo apt-get install -y strace
       - run: cargo test --locked -p qk-cli --test ultracache --no-fail-fast
-      - run: cargo test --locked -p qk-cli --test execution --no-fail-fast -- input
+      - run: cargo test --locked -p qk-cli --test execution --no-fail-fast -- input sandbox warm_suggest
       - run: cargo test --locked -p qk-trace -p qk-executor -p qk-runner --no-fail-fast
 
   # The committed kernel program objects are what their source builds to.
