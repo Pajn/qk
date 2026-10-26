@@ -588,6 +588,9 @@ enum Rendered {
     Quiet,
     /// The live panel; needs stderr to be a terminal.
     Dynamic,
+    /// The live panel for a single task's dependencies, which then gives the
+    /// terminal to the task, as Nx shows `nx run`; needs a terminal too.
+    DynamicRunOne,
 }
 
 impl OutputStyle {
@@ -595,8 +598,9 @@ impl OutputStyle {
     /// terminal, and are static otherwise, as in Nx, which also leaves them
     /// for `NX_TASKS_RUNNER_DYNAMIC_OUTPUT=false` and verbose logging.
     /// `static` for a single `run` streams the requested task, as `nx run`
-    /// does, and `static-failures-only` shows every task in full under
-    /// `--verbose`, as Nx does.
+    /// does, as does the live panel once the task's dependencies are done;
+    /// `static-failures-only` shows every task in full under `--verbose`, as
+    /// Nx does.
     fn rendered(self, single: bool, verbose: bool) -> Rendered {
         use qk_executor::OutputStyle as Executor;
         let fixed = if single {
@@ -614,7 +618,9 @@ impl OutputStyle {
             Self::Summary => Rendered::Lines(Executor::Summary),
             Self::Quiet => Rendered::Quiet,
             Self::Tui | Self::Dynamic | Self::DynamicLegacy => {
-                if dynamic_output(verbose) {
+                if dynamic_output(verbose) && single {
+                    Rendered::DynamicRunOne
+                } else if dynamic_output(verbose) {
                     Rendered::Dynamic
                 } else {
                     Rendered::Lines(fixed)
@@ -644,12 +650,15 @@ fn specified_output_style(options: &RunOptions) -> Option<OutputStyle> {
     })
 }
 
-/// The output style when none is given: `static` in CI, for full logs; raw
-/// for a single `run`; and for several tasks the live panel on a terminal,
-/// and `quiet` otherwise, for agents and scripts.
+/// The output style when none is given: `static` in CI, for full logs; the
+/// live panel on a terminal, for a single `run` until its dependencies are
+/// done; otherwise raw for a single `run`, and `quiet` for several tasks,
+/// for agents and scripts.
 fn default_output_style(single: bool, verbose: bool) -> Rendered {
     if qk_executor::is_ci() {
         OutputStyle::Static.rendered(single, verbose)
+    } else if single && dynamic_output(verbose) {
+        Rendered::DynamicRunOne
     } else if single {
         Rendered::Lines(qk_executor::OutputStyle::StreamWithoutPrefixes)
     } else if dynamic_output(verbose) {
@@ -1818,10 +1827,14 @@ fn execute_narrowed(
     signals::install(cancelled.clone())?;
     let verbose = options.verbose();
     let specified = specified_output_style(options);
-    let rendered = specified.map_or_else(
+    let rendered = match specified.map_or_else(
         || default_output_style(single, verbose),
         |style| style.rendered(single, verbose),
-    );
+    ) {
+        // Only one task can be handed the terminal.
+        Rendered::DynamicRunOne if graph.roots.len() != 1 => Rendered::Dynamic,
+        rendered => rendered,
+    };
     let sink = match rendered {
         Rendered::Lines(
             qk_executor::OutputStyle::Static
@@ -1847,28 +1860,59 @@ fn execute_narrowed(
             qk_executor::report::install(Box::new(dynamic.clone()));
             ui::SinkKind::Dynamic(dynamic)
         }
+        Rendered::DynamicRunOne => {
+            let id = graph.roots.iter().next().expect("one requested task");
+            let task = &graph.tasks[id];
+            let printable = qk_executor::printable(
+                &task.project,
+                &task.target,
+                task.configuration.as_deref(),
+                &task.args,
+            );
+            let dynamic = ui::Dynamic::run_one(id, &printable);
+            qk_executor::report::install(Box::new(dynamic.clone()));
+            let banner = ui::Title::new(&graph, single).start(ui::Paint::stderr());
+            qk_executor::report::write_all(true, banner.as_bytes());
+            ui::SinkKind::Dynamic(dynamic)
+        }
     };
-    // Only the overrides of projects with a task in this run.
+    // Only the overrides of projects with a task in this run; several in
+    // one line, which `--verbose` spells out.
     let projects: std::collections::BTreeSet<&str> = graph
         .tasks
         .values()
         .map(|task| task.project.as_str())
         .collect();
-    for path in &workspace.local_overrides {
-        let root = path
-            .rsplit_once('/')
-            .map_or(".", |(directory, _)| directory);
-        if path == qk_config::LOCAL_WORKSPACE
-            || projects
-                .iter()
-                .any(|project| workspace.projects[*project].root == root)
-        {
-            qk_executor::status!("qk: using local overrides from {path}");
+    let overrides: Vec<&String> = workspace
+        .local_overrides
+        .iter()
+        .filter(|path| {
+            let root = path
+                .rsplit_once('/')
+                .map_or(".", |(directory, _)| directory);
+            *path == qk_config::LOCAL_WORKSPACE
+                || projects
+                    .iter()
+                    .any(|project| workspace.projects[*project].root == root)
+        })
+        .collect();
+    match &overrides[..] {
+        [] => {}
+        [path] => qk_executor::status!("qk: using local overrides from {path}"),
+        paths if verbose => {
+            for path in paths {
+                qk_executor::status!("qk: using local overrides from {path}");
+            }
         }
+        paths => qk_executor::status!(
+            "qk: using local overrides from {} files; --verbose lists them",
+            paths.len()
+        ),
     }
     let style = match rendered {
         Rendered::Lines(style) => style,
         Rendered::Quiet | Rendered::Dynamic => qk_executor::OutputStyle::Quiet,
+        Rendered::DynamicRunOne => qk_executor::OutputStyle::DynamicRunOne,
     };
     let parallel = options.parallel(workspace)?;
     let cores = options.cores.map_or_else(

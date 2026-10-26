@@ -81,6 +81,12 @@ impl Display {
         };
         match style {
             StreamWithoutPrefixes => Self::Stream,
+            DynamicRunOne if root => Self::Stream,
+            DynamicRunOne if continuous => Self::Prefixed(prefix(project)),
+            DynamicRunOne => Self::Failures {
+                id: id.to_owned(),
+                log: None,
+            },
             _ if run_one && root && !continuous => Self::Headed { id: id.to_owned() },
             _ if held && streams && !continuous => streamed(),
             Static | RunOne | StaticFailuresOnly | RunOneFailuresOnly if !continuous => {
@@ -160,6 +166,10 @@ pub enum OutputStyle {
     Summary,
     /// Only failed tasks' output, for the quiet and dynamic styles.
     Quiet,
+    /// The live panel for one requested task: it streams once its
+    /// dependencies are done, they show only failures, and continuous ones
+    /// stream behind their project's prefix, since they never end.
+    DynamicRunOne,
 }
 
 /// `project:` in bold and in the colour Nx picks for the project, when the

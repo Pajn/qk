@@ -323,23 +323,46 @@ struct Progress {
     frame: usize,
 }
 
+/// The task a run-one panel hands the terminal to, and its header.
+struct Requested {
+    id: String,
+    header: String,
+}
+
 /// A live panel on stderr: counts, then the running tasks with their time.
+/// For one requested task it shows only its dependencies, prints warnings as
+/// they come, and gives way to the task's output once the task starts.
 pub struct Dynamic {
     progress: Mutex<Progress>,
     warnings: Warnings,
     started: Instant,
     paint: Paint,
     done: AtomicBool,
+    requested: Option<Requested>,
 }
 
 impl Dynamic {
     pub fn start() -> Arc<Self> {
+        Self::spawn(None)
+    }
+
+    /// The panel for one requested task, `id` as the graph names it and
+    /// `printable` as its header does.
+    pub fn run_one(id: &str, printable: &str) -> Arc<Self> {
+        Self::spawn(Some(Requested {
+            id: id.to_owned(),
+            header: format!("> nx run {printable}"),
+        }))
+    }
+
+    fn spawn(requested: Option<Requested>) -> Arc<Self> {
         let dynamic = Arc::new(Self {
             progress: Mutex::default(),
             warnings: Warnings::default(),
             started: Instant::now(),
             paint: Paint::stderr(),
             done: AtomicBool::new(false),
+            requested,
         });
         let ticker = dynamic.clone();
         std::thread::spawn(move || {
@@ -349,6 +372,45 @@ impl Dynamic {
             }
         });
         dynamic
+    }
+
+    /// Whether warnings print as they come rather than in the summary.
+    pub fn prints_warnings(&self) -> bool {
+        self.requested.is_some()
+    }
+
+    /// Clears the panel for good and hands the terminal to the requested
+    /// task: how its dependencies went, then its header. A task with no
+    /// dependencies starts with neither, as it does without the panel.
+    fn hand_off(&self, progress: &mut Progress, header: &str) {
+        self.done.store(true, Ordering::Relaxed);
+        let paint = self.paint;
+        let mut text = clear(progress.drawn);
+        progress.drawn = 0;
+        let dependencies = progress.total.saturating_sub(1);
+        if dependencies > 0 {
+            let mut parts = vec![
+                format!("{} from cache", progress.from_cache),
+                format!("{} ran", progress.ran),
+            ];
+            // Continuous dependencies keep running beside the task.
+            let serving = progress.running.len();
+            if serving > 0 {
+                parts.push(format!("{serving} running"));
+            }
+            text.push_str(&format!(
+                "{} {} in {}: {}\n\n{}\n\n",
+                paint.green("✔"),
+                paint.bold(&format!(
+                    "{dependencies} dependenc{} ready",
+                    if dependencies == 1 { "y" } else { "ies" }
+                )),
+                seconds(self.started.elapsed()),
+                parts.join(", "),
+                paint.bold(header),
+            ));
+        }
+        report::write_all(true, text.as_bytes());
     }
 
     /// Clears the panel for good.
@@ -369,6 +431,14 @@ impl Dynamic {
             return;
         }
         let mut progress = self.progress.lock().unwrap();
+        // The panel may have finished while this waited for it.
+        if self.done.load(Ordering::Relaxed) {
+            drop(progress);
+            if let Some((stderr, bytes)) = output {
+                report::write_all(stderr, bytes);
+            }
+            return;
+        }
         // Nothing to show until the run is planned.
         if progress.total == 0 && output.is_none() {
             return;
@@ -382,19 +452,28 @@ impl Dynamic {
             let _ = std::io::stderr().lock().write_all(text.as_bytes());
             report::write_all(stderr, bytes);
             text.clear();
+            // Warnings can come before the run is planned.
+            if progress.total == 0 {
+                progress.drawn = 0;
+                return;
+            }
         }
         progress.frame += 1;
         let paint = self.paint;
         let spinner = SPINNER[progress.frame % SPINNER.len()];
         let finished = progress.from_cache + progress.ran + progress.failed + progress.skipped;
-        let queued = progress
-            .total
-            .saturating_sub(finished + progress.running.len());
+        // A run-one panel counts the dependencies, the requested task aside.
+        let (total, label) = if self.requested.is_some() {
+            (progress.total.saturating_sub(1), "dependencies")
+        } else {
+            (progress.total, "tasks")
+        };
+        let queued = total.saturating_sub(finished + progress.running.len());
         let mut lines = vec![format!(
             "{} {} {}  {}  {}  {}{}  {}",
             paint.cyan(spinner),
-            paint.bold(&format!("{finished}/{}", progress.total)),
-            paint.dim("tasks"),
+            paint.bold(&format!("{finished}/{total}")),
+            paint.dim(label),
             paint.cyan(&format!("{} running", progress.running.len())),
             paint.dim(&format!("{queued} queued")),
             paint.green(&format!("{} done", progress.ran)),
@@ -439,6 +518,17 @@ impl Sink for Dynamic {
         let mut progress = self.progress.lock().unwrap();
         match event {
             Event::Planned { tasks } => progress.total = *tasks,
+            Event::Started { id, .. } | Event::StartedContinuous { id }
+                if self
+                    .requested
+                    .as_ref()
+                    .is_some_and(|requested| requested.id == *id) =>
+            {
+                if !self.done.load(Ordering::Relaxed) {
+                    let header = &self.requested.as_ref().unwrap().header;
+                    self.hand_off(&mut progress, header);
+                }
+            }
             Event::Started { id, .. } | Event::StartedContinuous { id } => {
                 progress.running.insert(id.clone(), Instant::now());
             }
@@ -467,7 +557,12 @@ impl Sink for Dynamic {
     }
 
     fn warning(&self, line: &str) {
-        self.warnings.push(line);
+        if self.prints_warnings() {
+            let line = format!("{}\n", self.paint.dim(line));
+            self.redraw(Some((true, line.as_bytes())));
+        } else {
+            self.warnings.push(line);
+        }
     }
 
     fn output(&self, stderr: bool, bytes: &[u8]) {
@@ -1334,6 +1429,8 @@ pub fn warnings(sink: &SinkKind) -> Vec<String> {
     match sink {
         SinkKind::Lines | SinkKind::Static | SinkKind::Summary => Vec::new(),
         SinkKind::Quiet(quiet) => quiet.warnings.0.lock().unwrap().clone(),
+        // A run-one panel printed them as they came.
+        SinkKind::Dynamic(dynamic) if dynamic.prints_warnings() => Vec::new(),
         SinkKind::Dynamic(dynamic) => dynamic.warnings.0.lock().unwrap().clone(),
     }
 }

@@ -2724,6 +2724,40 @@ fn the_task_a_run_is_for_reads_a_pseudo_terminal_on_a_cache_miss() {
 
 #[cfg(unix)]
 #[test]
+fn a_single_run_on_a_terminal_shows_its_dependencies_in_a_panel() {
+    let temp = fixture(json!({
+        "dep": {"command": "echo dependency output"},
+        "broken": {"command": "echo broken output; exit 2"},
+        "serve": {"command": "echo serving", "dependsOn": ["dep"]},
+        "doomed": {"command": "echo never", "dependsOn": ["broken"]}
+    }));
+    let single = |target: &str| {
+        on_terminal(
+            temp.path(),
+            &format!(
+                "\"$qk\" --workspace '{}' run app:{target}",
+                temp.path().display()
+            ),
+            &[],
+            b"",
+        )
+    };
+    // The dependency's output is held; the task streams under its header.
+    let output = single("serve");
+    assert!(output.contains("1 dependency ready"), "{output:?}");
+    assert!(output.contains("> nx run app:serve"), "{output:?}");
+    assert!(output.contains("serving\n"), "{output:?}");
+    assert!(!output.contains("dependency output"), "{output:?}");
+    assert!(!output.contains("qk: running"), "{output:?}");
+    // A failed dependency shows its output, and the task never starts.
+    let output = single("doomed");
+    assert!(output.contains("broken output"), "{output:?}");
+    assert!(!output.contains("> nx run app:doomed"), "{output:?}");
+    assert!(!output.contains("never"), "{output:?}");
+}
+
+#[cfg(unix)]
+#[test]
 fn piped_input_reaches_its_end_under_a_pseudo_terminal() {
     let temp = fixture(json!({
         "cat": {

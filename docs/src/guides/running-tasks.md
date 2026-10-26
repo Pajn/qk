@@ -52,7 +52,11 @@ requested targets and errors when nothing matches. `run`, `run-many` and
 - `dynamic`, `tui` and `dynamic-legacy` show a live panel on stderr: how many
   tasks are done, cached, running, queued and failed, and each running task
   with its time. Successful tasks' output stays hidden; a failed task's
-  output is printed above the panel. Without a terminal, under
+  output is printed above the panel. For `run`, the panel counts the
+  requested task's dependencies, prints warnings as they come, and once they
+  are done gives way to one line saying how they went and the task's own
+  output, streamed under `> nx run <task>`; continuous dependencies stream
+  behind their project prefix. Without a terminal, under
   `NX_TASKS_RUNNER_DYNAMIC_OUTPUT=false` or with verbose logging they fall
   back to `static`, as in Nx.
 - `quiet` prints nothing while tasks run except a failed task's output,
@@ -80,9 +84,10 @@ requested targets and errors when nothing matches. `run`, `run-many` and
   directory until `qk reset`, and how to see the logs inline.
 
 Without the option, `NX_DEFAULT_OUTPUT_STYLE` applies when it names a style;
-otherwise every command uses `static` in CI; `run` passes output through,
-and `run-many` and `affected` use the live panel on a terminal, `static` on
-a terminal where the panel is turned off, and `quiet` otherwise. These
+otherwise every command uses `static` in CI; every command uses the live
+panel on a terminal; where the panel is turned off, `run` passes output
+through, and `run-many` and `affected` use `static` on a terminal and
+`quiet` otherwise. These
 defaults are qk's; Nx's is `static-failures-only` where it does not use its
 terminal UI. `stream` and `stream-without-prefixes` print `qk:` status lines
 on stderr; `static` shows each task's status in its header instead, and the

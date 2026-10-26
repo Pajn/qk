@@ -4612,6 +4612,23 @@ fn a_local_workspace_file_changes_every_task_and_its_key() {
         stderr.contains("qk: using local overrides from nx.local.json"),
         "{stderr}"
     );
+    // Several files are one line, which --verbose spells out.
+    fs::write(fixture.root.join("project.local.json"), "{}").unwrap();
+    let output = success(fixture.build(&fixture.root, &[]));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("qk: using local overrides from 2 files; --verbose lists them"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("from nx.local.json"), "{stderr}");
+    let output = success(fixture.build(&fixture.root, &["--verbose"]));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for path in ["nx.local.json", "project.local.json"] {
+        assert!(
+            stderr.contains(&format!("qk: using local overrides from {path}")),
+            "{stderr}"
+        );
+    }
 }
 
 #[test]

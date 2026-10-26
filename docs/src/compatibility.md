@@ -110,7 +110,7 @@ edges off.
 - Under `--nx-bail`, a run that failed and left tasks unstarted exits with 1.
   Nx counts it as interrupted and exits with 130.
 - qk's default output styles are its own: `static` in CI, the live panel on
-  a terminal and `quiet` otherwise for several tasks, and raw output for one.
+  a terminal, and otherwise `quiet` for several tasks and raw output for one.
   Nx defaults to `static-failures-only` where it does not use its terminal UI,
   and to `summary` when driven by an AI agent.
 - `--output-style=summary` writes the output of failed tasks only, to the
