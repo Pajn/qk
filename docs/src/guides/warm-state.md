@@ -38,7 +38,11 @@ from the remote store. Each worktree
 keeps its own save, and a restore takes the worktree's own before the most
 recent other worktree's; the eight most recent saves of a task are kept.
 With sharing enabled and no suitable local save, it comes from the remote store: the current branch's
-save, else the default branch's (nx.json `defaultBase`, else `main`). The
+save, else the default branch's (nx.json `defaultBase`, else `main`).
+A local save made at a commit `HEAD` does not descend from, as on another
+branch, counts as suitable only when the remote store has none: a CI runner
+that builds every branch in one directory keeps one save there, the last
+branch's, which is the least like the checkout it is restored into. The
 branch comes from `GITHUB_HEAD_REF` or `GITHUB_REF_NAME` in CI, else from
 git; a checkout with no branch reads the default branch's state but saves
 none remotely. `remote: false` keeps a target's warm state local. It is
