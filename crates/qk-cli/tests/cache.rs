@@ -1463,6 +1463,40 @@ fn uploads_to_a_store_server_continue_in_the_background() {
     );
 }
 
+// The target is a POSIX shell command.
+#[cfg(unix)]
+#[test]
+fn a_warm_record_reaches_the_store_through_a_background_upload() {
+    let server = store_server::FakeStoreServer::start();
+    let fixture = Fixture::new(scratch_target(
+        json!({"portable": true, "paths": ["{projectRoot}/scratch"]}),
+    ));
+    with_store_server(&fixture, &server);
+    let output = success(server_build(
+        &fixture,
+        store_server::WRITE_TOKEN,
+        &[("QK_REMOTE_UPLOAD_MODE", "background")],
+    ));
+    let log = wait_for_detached_uploads(&detached_log(&output));
+    assert!(log.contains("0 failure(s)"), "{log}");
+    assert!(
+        server
+            .state
+            .lock()
+            .unwrap()
+            .records
+            .keys()
+            .any(|path| path.starts_with("warm/"))
+    );
+    // A machine with neither the cache nor the warm state starts from what
+    // was uploaded.
+    clear_local_cache(&fixture);
+    let _ = fs::remove_dir_all(fixture.root.join(".git/qk/warm"));
+    fs::remove_dir_all(fixture.root.join("scratch")).unwrap();
+    let output = success(server_build(&fixture, store_server::WRITE_TOKEN, &[]));
+    assert_eq!(stdout(&output).lines().next(), Some("repo"));
+}
+
 // The targets are POSIX shell commands.
 #[cfg(unix)]
 #[test]

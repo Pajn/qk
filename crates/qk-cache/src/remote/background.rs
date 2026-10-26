@@ -110,8 +110,12 @@ fn cleanup_abandoned(parent: &std::path::Path) {
 }
 
 /// Pin immutable blobs with hard links, falling back to copies where needed.
-/// The sibling directory survives removal of the cache itself.
-fn snapshot(jobs: &[Upload]) -> Result<(tempfile::TempDir, Vec<Upload>)> {
+/// The sibling directory survives removal of the cache itself. Warm records
+/// and path sets are written into it rather than carried by the request,
+/// which they would outgrow. An upload whose entry or blobs are no longer in
+/// the cache, as when another run evicted them, is left out and returned as
+/// a failure: it could not be sent from the run either.
+fn snapshot(jobs: &[Upload]) -> Result<(tempfile::TempDir, Vec<Upload>, Vec<String>)> {
     let parent = jobs
         .first()
         .context("no queued uploads")?
@@ -123,11 +127,12 @@ fn snapshot(jobs: &[Upload]) -> Result<(tempfile::TempDir, Vec<Upload>)> {
         .prefix("qk-upload-")
         .tempdir_in(parent)?;
     let root = directory.path();
-    for name in ["entries", "blobs", "tmp", "remote"] {
+    for name in ["entries", "blobs", "tmp", "remote", "records"] {
         fs::create_dir(root.join(name))?;
     }
     let mut pinned = Vec::with_capacity(jobs.len());
-    for job in jobs {
+    let mut skipped = Vec::new();
+    for (index, job) in jobs.iter().enumerate() {
         // Expectations cite no blob, and are composed as they are sent.
         if job.expectations.is_some() {
             let mut job = job.clone();
@@ -135,39 +140,86 @@ fn snapshot(jobs: &[Upload]) -> Result<(tempfile::TempDir, Vec<Upload>)> {
             pinned.push(job);
             continue;
         }
-        let record = match (&job.warm, &job.path_sets) {
-            (Some(warm), _) => warm.record.clone(),
-            (None, Some(sets)) => sets.record.clone(),
-            (None, None) => {
-                if !crate::record::valid_hash(&job.key) {
-                    bail!("invalid upload key");
+        match pin(root, index, job)? {
+            Pinned::Job(job) => pinned.push(*job),
+            Pinned::Missing(path) => skipped.push(format!(
+                "{}: {} is no longer in the cache",
+                job.key,
+                path.display()
+            )),
+        }
+    }
+    Ok((directory, pinned, skipped))
+}
+
+enum Pinned {
+    Job(Box<Upload>),
+    /// A file the upload needs that the cache no longer holds.
+    Missing(PathBuf),
+}
+
+/// `job`, its record and blobs copied into the snapshot at `root`.
+fn pin(root: &std::path::Path, index: usize, job: &Upload) -> Result<Pinned> {
+    let mut job = job.clone();
+    let record = match (&mut job.warm, &mut job.path_sets) {
+        (Some(warm), _) => std::mem::take(&mut warm.record),
+        (None, Some(sets)) => std::mem::take(&mut sets.record),
+        (None, None) => {
+            if !crate::record::valid_hash(&job.key) {
+                bail!("invalid upload key");
+            }
+            let name = format!("{}.json", job.key);
+            let source = job.local.join("entries").join(&name);
+            let record = match fs::read(&source) {
+                Ok(record) => record,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(Pinned::Missing(source));
                 }
-                let record = fs::read(job.local.join("entries").join(format!("{}.json", job.key)))?;
-                fs::write(
-                    root.join("entries").join(format!("{}.json", job.key)),
-                    &record,
-                )?;
-                record
-            }
-        };
-        let parsed = crate::record::StoredRecord::read(&record)?;
-        for blob in parsed.blobs() {
-            if !crate::record::valid_hash(&blob) {
-                bail!("invalid upload blob");
-            }
-            let destination = root.join("blobs").join(&blob);
-            if !destination.is_file() {
-                let source = job.local.join("blobs").join(&blob);
-                if fs::hard_link(&source, &destination).is_err() {
-                    fs::copy(&source, &destination)?;
+                Err(error) => {
+                    return Err(error).with_context(|| format!("cannot read {}", source.display()));
+                }
+            };
+            let destination = root.join("entries").join(&name);
+            fs::write(&destination, &record)
+                .with_context(|| format!("cannot write {}", destination.display()))?;
+            record
+        }
+    };
+    if job.warm.is_some() || job.path_sets.is_some() {
+        let file = root.join("records").join(format!("{index}.json"));
+        fs::write(&file, &record).with_context(|| format!("cannot write {}", file.display()))?;
+        job.record_file = Some(file);
+    }
+    let parsed = crate::record::StoredRecord::read(&record)?;
+    for blob in parsed.blobs() {
+        if !crate::record::valid_hash(&blob) {
+            bail!("invalid upload blob");
+        }
+        let destination = root.join("blobs").join(&blob);
+        if destination.is_file() {
+            continue;
+        }
+        let source = job.local.join("blobs").join(&blob);
+        if fs::hard_link(&source, &destination).is_err() {
+            match fs::copy(&source, &destination) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(Pinned::Missing(source));
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "cannot copy {} to {}",
+                            source.display(),
+                            destination.display()
+                        )
+                    });
                 }
             }
         }
-        let mut job = job.clone();
-        job.local = root.to_owned();
-        pinned.push(job);
     }
-    Ok((directory, pinned))
+    job.local = root.to_owned();
+    Ok(Pinned::Job(Box::new(job)))
 }
 
 pub(super) fn launch(
@@ -176,8 +228,8 @@ pub(super) fn launch(
     held: Vec<String>,
     confirmed: Vec<String>,
     used: Vec<String>,
-) -> Result<PathBuf> {
-    let (snapshot, jobs) = snapshot(jobs)?;
+) -> Result<(PathBuf, Vec<String>)> {
+    let (snapshot, jobs, skipped) = snapshot(jobs)?;
     let lease = fs::File::create(snapshot.path().join("lease"))?;
     FileExt::lock_exclusive(&lease)?;
     let request = Request {
@@ -243,7 +295,7 @@ pub(super) fn launch(
     std::thread::spawn(move || {
         let _ = child.wait();
     });
-    Ok(log_path)
+    Ok((log_path, skipped))
 }
 
 #[cfg(unix)]
@@ -337,7 +389,16 @@ pub(crate) fn run() -> Result<()> {
     for key in request.held {
         remote.held(&key);
     }
-    for job in request.jobs {
+    for mut job in request.jobs {
+        if let Some(file) = job.record_file.take() {
+            let record =
+                fs::read(&file).with_context(|| format!("cannot read {}", file.display()))?;
+            match (&mut job.warm, &mut job.path_sets) {
+                (Some(warm), _) => warm.record = record,
+                (None, Some(sets)) => sets.record = record,
+                (None, None) => {}
+            }
+        }
         remote.enqueue(job);
     }
     let failures = remote.finish();
@@ -380,6 +441,7 @@ mod tests {
                 warm: None,
                 path_sets: None,
                 expectations: None,
+                record_file: None,
             },
             Upload {
                 key: "warm state".into(),
@@ -394,10 +456,18 @@ mod tests {
                 }),
                 path_sets: None,
                 expectations: None,
+                record_file: None,
             },
         ];
-        let (pinned, jobs) = snapshot(&jobs).unwrap();
+        let warm = jobs[1].warm.as_ref().unwrap().record.clone();
+        let (pinned, jobs, skipped) = snapshot(&jobs).unwrap();
+        assert!(skipped.is_empty());
         fs::remove_dir_all(root).unwrap();
+        // The warm record goes beside the blobs, not in the request.
+        let record = jobs[1].record_file.as_ref().unwrap();
+        assert!(record.starts_with(pinned.path()));
+        assert_eq!(fs::read(record).unwrap(), warm);
+        assert!(jobs[1].warm.as_ref().unwrap().record.is_empty());
         assert_eq!(
             fs::read(pinned.path().join("blobs").join(blob)).unwrap(),
             b"cached bytes"
@@ -410,6 +480,73 @@ mod tests {
                 .join(format!("{}.json", jobs[0].key))
                 .is_file()
         );
+    }
+
+    #[test]
+    fn a_large_warm_record_leaves_the_request_small() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("cache");
+        crate::Cache::new(root.clone()).initialize().unwrap();
+        // Carried inline, its bytes as numbers, it would pass the limit.
+        let record = serde_json::to_vec(&json!({"padding": "x".repeat(12 << 20)})).unwrap();
+        let job = Upload {
+            key: "warm state".into(),
+            local: root,
+            warm: Some(super::super::Warm {
+                identity: "app:build".into(),
+                branch: "main".into(),
+                record: record.clone(),
+            }),
+            path_sets: None,
+            expectations: None,
+            record_file: None,
+        };
+        assert!(serde_json::to_vec(&job).unwrap().len() as u64 > MAX_REQUEST);
+        let (_pinned, jobs, _) = snapshot(&[job]).unwrap();
+        assert!(serde_json::to_vec(&jobs).unwrap().len() < 4096);
+        assert_eq!(
+            fs::read(jobs[0].record_file.as_ref().unwrap()).unwrap(),
+            record
+        );
+    }
+
+    #[test]
+    fn an_upload_whose_files_left_the_cache_is_skipped_and_the_rest_pinned() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("cache");
+        let cache = crate::Cache::new(root.clone());
+        cache.initialize().unwrap();
+        let source = temporary.path().join("source");
+        fs::write(&source, "cached bytes").unwrap();
+        let blob = cache.put_blob(&source).unwrap();
+        let entry = |key: &str, blob: &str| {
+            fs::write(
+                root.join("entries").join(format!("{key}.json")),
+                json!({"log": blob}).to_string(),
+            )
+            .unwrap();
+        };
+        let (kept, evicted, unblobbed) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
+        entry(&kept, &blob);
+        entry(&unblobbed, &"d".repeat(64));
+        let job = |key: &String| Upload {
+            key: key.clone(),
+            local: root.clone(),
+            warm: None,
+            path_sets: None,
+            expectations: None,
+            record_file: None,
+        };
+        let (_pinned, jobs, skipped) =
+            snapshot(&[job(&evicted), job(&kept), job(&unblobbed)]).unwrap();
+        assert_eq!(jobs.iter().map(|job| &job.key).collect::<Vec<_>>(), [&kept]);
+        assert_eq!(skipped.len(), 2);
+        assert!(
+            skipped[0].starts_with(&format!("{evicted}: ")),
+            "{skipped:?}"
+        );
+        assert!(skipped[0].ends_with("is no longer in the cache"));
+        assert!(skipped[1].contains(&"d".repeat(64)), "{skipped:?}");
     }
 
     #[cfg(unix)]
