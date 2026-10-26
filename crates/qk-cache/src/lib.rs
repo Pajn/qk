@@ -110,11 +110,47 @@ pub struct TaskResult {
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum Shadow {
     /// One of its path sets' keys had a result, here or in the remote store.
-    WouldHit { key: String },
+    WouldHit {
+        key: String,
+        /// For a task that ran all the same, whether it gave that result.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        check: Option<Check>,
+    },
     /// None of its path sets' keys had a result.
-    WouldMiss,
+    WouldMiss {
+        /// For a task its declared inputs took from the cache, the paths of
+        /// its newest path set that are not as they were when it was
+        /// recorded, as `<path> (<how>)`, `<how>` ending in `, declared`
+        /// where its declared inputs cover the path. A change they do not
+        /// cover either matters, so they missed it, or does not, and its
+        /// recording keys what it need not. At most [`UNCOVERED`].
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        changed: Vec<String>,
+        /// Where the newest path set keeps no record of how its paths were,
+        /// what it holds that the declared inputs leave out, as
+        /// `<path> (<how>)`: one of them changed. At most [`UNCOVERED`].
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        uncovered: Vec<String>,
+    },
     /// It has no path set yet.
     Unrecorded,
+}
+
+/// How many uncovered paths a [`Shadow::WouldMiss`] names.
+pub const UNCOVERED: usize = 5;
+
+/// Whether a task that ran where a recording would have taken a result from
+/// the cache gave that result: it succeeded, with the same output files.
+/// Its terminal output is not compared, since timings and the like differ
+/// from run to run.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Check {
+    pub matched: bool,
+    /// How the run differed, as `failed (exit <code>)` or `<path> (<how>)`,
+    /// at most [`UNCOVERED`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub differences: Vec<String>,
 }
 
 /// A lookup by a task's recordings in mode `"record"`, started before its
@@ -679,6 +715,13 @@ impl Cache {
                         qk_executor::report::Cached::Hit
                     },
                 });
+                let shadow = settle(&mut recordings);
+                let shadow = self.with_changes(
+                    shadow,
+                    recordings.as_ref(),
+                    (snapshot, workspace, graph, task, prepared, &unlisted),
+                    cancelled,
+                );
                 return Ok(TaskResult {
                     outcome: Outcome::Success,
                     cache: if claimed {
@@ -690,7 +733,7 @@ impl Cache {
                     warm: None,
                     execution: None,
                     recorded: unrecorded,
-                    shadow: settle(&mut recordings),
+                    shadow,
                 });
             }
             Ok(false) => {}
@@ -723,6 +766,13 @@ impl Cache {
                         id: task.id.clone(),
                         cached: qk_executor::report::Cached::RemoteHit,
                     });
+                    let shadow = settle(&mut recordings);
+                    let shadow = self.with_changes(
+                        shadow,
+                        recordings.as_ref(),
+                        (snapshot, workspace, graph, task, prepared, &unlisted),
+                        cancelled,
+                    );
                     return Ok(TaskResult {
                         outcome: Outcome::Success,
                         cache: CacheStatus::RemoteHit,
@@ -730,7 +780,7 @@ impl Cache {
                         warm: None,
                         execution: None,
                         recorded: unrecorded,
-                        shadow: settle(&mut recordings),
+                        shadow,
                     });
                 }
                 Ok(false) => {}
@@ -806,12 +856,15 @@ impl Cache {
                 reason: reason.clone(),
             });
         }
-        if outcome == Outcome::Success && inputs_unchanged && capture.healthy() {
+        let mut published = false;
+        let kept = outcome == Outcome::Success && inputs_unchanged && capture.healthy();
+        if kept {
             let publishing = profile::span(&task.id, "publish");
-            let published = self.publish(&workspace.root, &key, &outputs, log.path());
+            let publish = self.publish(&workspace.root, &key, &outputs, log.path());
             drop(publishing);
-            match published {
+            match publish {
                 Ok(()) => {
+                    published = true;
                     store::record_outputs(&workspace.root, &task.id, &key, &outputs);
                     if let Some(remote) = &self.remote {
                         remote.upload(&self.root, &key);
@@ -821,10 +874,29 @@ impl Cache {
                     qk_executor::status!("qk: {}: could not save cache entry ({error})", task.id);
                 }
             }
+        }
+        // Ran where a recording would have taken a result from the cache:
+        // whether it gave that result, read before this run's own recording
+        // can replace it.
+        let check = match &shadow {
+            Some(Shadow::WouldHit { key: recorded, .. }) => match outcome {
+                Outcome::Failed(code) => Some(Check {
+                    matched: false,
+                    differences: vec![format!("failed (exit {code})")],
+                }),
+                Outcome::Success if published => {
+                    let _checking = profile::span(&task.id, "recorded_check");
+                    self.check(&task.id, &key, recorded)
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        if kept {
             // Its result is kept under the key of what it read, too.
             if let (Some((_, weak, _)), Some(Ok(set))) = (&recordings, path_set) {
-                let saved = recorded::strong_key(weak, &set, snapshot, &workspace.root, &unlisted)
-                    .and_then(|strong| {
+                let saved = recorded::with_values(weak, set, snapshot, &workspace.root, &unlisted)
+                    .and_then(|(strong, set)| {
                         self.publish(&workspace.root, &strong, &outputs, log.path())?;
                         recorded::save(&self.root, weak, set)?;
                         // Shared, the sets are merged with those the store
@@ -848,6 +920,13 @@ impl Cache {
                 });
             }
         }
+        let shadow = match shadow {
+            Some(Shadow::WouldHit { key: recorded, .. }) => Some(Shadow::WouldHit {
+                key: recorded,
+                check,
+            }),
+            shadow => shadow,
+        };
         Ok(TaskResult {
             outcome,
             cache: CacheStatus::Miss,
@@ -856,6 +935,100 @@ impl Cache {
             execution,
             recorded,
             shadow,
+        })
+    }
+
+    /// Whether the result just published under `ran` is the one under
+    /// `recorded`, here or in the remote store: `None` when that is not to
+    /// be had.
+    fn check(&self, task: &str, ran: &str, recorded: &str) -> Option<Check> {
+        let compared = self
+            .artifacts(ran, task)
+            .and_then(|ran| Ok(ran.zip(self.artifacts(recorded, task)?)));
+        match compared {
+            Ok(Some((ran, recorded))) => {
+                let differences = store::differences(&ran, &recorded, UNCOVERED);
+                Some(Check {
+                    matched: differences.is_empty(),
+                    differences,
+                })
+            }
+            Ok(None) => None,
+            Err(error) => {
+                qk_executor::status!(
+                    "qk: {task}: not compared with its recorded result ({error:#})"
+                );
+                None
+            }
+        }
+    }
+
+    /// `shadow`, naming what changed in the newest path set since it was
+    /// recorded, or what it holds that the declared inputs leave out, when no
+    /// recording would have hit.
+    fn with_changes(
+        &self,
+        shadow: Option<Shadow>,
+        recordings: Option<&(Vec<recorded::PathSet>, String, ultracache::Settings)>,
+        (snapshot, workspace, graph, task, prepared, unlisted): (
+            &hash::Snapshot,
+            &Workspace,
+            &TaskGraph,
+            &Task,
+            &PreparedTask,
+            &recorded::Unlisted,
+        ),
+        cancelled: &AtomicBool,
+    ) -> Option<Shadow> {
+        let (Some(Shadow::WouldMiss { .. }), Some((sets, _, _))) = (&shadow, recordings) else {
+            return shadow;
+        };
+        let Some(newest) = sets.first() else {
+            return shadow;
+        };
+        let _explaining = profile::span(&task.id, "recorded_changes");
+        let Ok(coverage) = hash::coverage(snapshot, workspace, graph, task, prepared, cancelled)
+        else {
+            return shadow;
+        };
+        let outputs = self
+            .workspace_outputs
+            .get_or_init(|| workspace_outputs(workspace));
+        let output = |path: &str| outputs.matches(path);
+        let uncovered: BTreeMap<&str, &str> = coverage
+            .uncovered(snapshot, &workspace.root, newest, &output)
+            .collect();
+        let named = |paths: Vec<String>| {
+            let more = paths.len().saturating_sub(UNCOVERED - 1);
+            let mut paths = paths;
+            if more > 1 {
+                paths.truncate(UNCOVERED - 1);
+                paths.push(format!("{more} more"));
+            }
+            paths
+        };
+        if newest.recorded.is_some() {
+            let changed = newest
+                .changed(snapshot, &workspace.root, unlisted)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(path, how)| match uncovered.contains_key(path) {
+                    true => format!("{path} ({how})"),
+                    false => format!("{path} ({how}, declared)"),
+                })
+                .collect();
+            return Some(Shadow::WouldMiss {
+                changed: named(changed),
+                uncovered: vec![],
+            });
+        }
+        let uncovered = uncovered
+            .into_iter()
+            .map(|(path, how)| format!("{path} ({how})"))
+            .collect();
+        Some(Shadow::WouldMiss {
+            changed: vec![],
+            uncovered: named(uncovered),
         })
     }
 
@@ -975,7 +1148,10 @@ impl Cache {
         for set in sets {
             if let Some(strong) = recording_key(weak, set, snapshot, workspace, unlisted, task) {
                 if self.holds_entry(&strong) {
-                    return Shadowing::Settled(Shadow::WouldHit { key: strong });
+                    return Shadowing::Settled(Shadow::WouldHit {
+                        key: strong,
+                        check: None,
+                    });
                 }
                 keys.push(strong);
             }
@@ -984,7 +1160,10 @@ impl Cache {
             return Shadowing::Settled(if sets.is_empty() {
                 Shadow::Unrecorded
             } else {
-                Shadow::WouldMiss
+                Shadow::WouldMiss {
+                    changed: vec![],
+                    uncovered: vec![],
+                }
             });
         };
         let (remote, root, weak, id) = (
@@ -1032,7 +1211,10 @@ impl Cache {
                     {
                         if self.holds_entry(&strong) {
                             sets.push(set);
-                            return Shadow::WouldHit { key: strong };
+                            return Shadow::WouldHit {
+                                key: strong,
+                                check: None,
+                            };
                         }
                         keys.push(strong);
                     }
@@ -1053,9 +1235,12 @@ impl Cache {
                 if sets.is_empty() {
                     Shadow::Unrecorded
                 } else {
-                    Shadow::WouldMiss
+                    Shadow::WouldMiss {
+                        changed: vec![],
+                        uncovered: vec![],
+                    }
                 },
-                |key| Shadow::WouldHit { key },
+                |key| Shadow::WouldHit { key, check: None },
             )
     }
 

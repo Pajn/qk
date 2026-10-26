@@ -186,6 +186,27 @@ disagree:
   none: a change to what it read that its declared inputs leave out, a hit
   that may be stale, or a recorded result never shared.
 
+Two more things tell whether `"on"` would be right:
+
+- **Whether a recorded result is the one a run gives.** A task that runs
+  where its recordings had a result is compared with that result: `shadow`
+  carries `check`, with `matched` true when the task succeeded with the same
+  output files, and otherwise the `differences`, such as `failed (exit 1)` or
+  `dist/main.js (differs)`. Its terminal output is not compared, as timings
+  and the like change from run to run. The run summary names each task that
+  gave another result: a recording that left out something the task read, or
+  a task that does not give the same result twice.
+- **What changed that the declared inputs did not see.** Where the declared
+  inputs took a task from the cache and its recordings had no result,
+  `shadow` carries `changed`: the paths of its newest path set that are not
+  as they were when it was recorded, with what the task did to each, such as
+  `package.json (read)`, and `declared` where the declared inputs cover the
+  path. A change they do not cover either matters, so their hits may be
+  stale, or does not, and `ignoreReads` keeps the recording from keying it.
+  For a path set recorded by a qk that did not keep how its paths were,
+  `uncovered` names instead what it holds that the declared inputs do not
+  cover, one of which changed.
+
 Looking a task up by its recordings costs the request for its path sets
 whenever it has none of its own, even when its declared inputs hit the local
 cache: that is where a stale hit would show. Switching to `"on"` keys it by them.

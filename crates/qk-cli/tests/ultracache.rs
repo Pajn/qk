@@ -7,7 +7,7 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 #[path = "support/git.rs"]
@@ -393,6 +393,53 @@ fn a_task_in_mode_record_is_keyed_by_its_inputs_and_says_what_its_recordings_wou
     write(root, "app/src/main.txt", "changed\n");
     assert_eq!(shadow(false), expect("miss", "none", "wouldMiss"));
     assert_eq!(shadow(false), expect("local-hit", "none", "wouldMiss"));
+}
+
+#[test]
+fn a_task_in_mode_record_checks_the_result_a_recording_would_take_and_names_what_changed() {
+    if !has_strace() {
+        return;
+    }
+    let temp = fixture();
+    let root = temp.path();
+    // Declared inputs that leave out a file the task reads.
+    let nx = fs::read_to_string(root.join("nx.json")).unwrap();
+    write(
+        root,
+        "nx.json",
+        &nx.replace(r#""ignoreReads""#, r#""mode": "record", "ignoreReads""#)
+            .replace(
+                r#""{projectRoot}/**/*","#,
+                r#""{projectRoot}/**/*", "!{projectRoot}/src/util.txt","#,
+            ),
+    );
+    let task = build_report(root, true, &[]);
+    assert_eq!(kind(&task["recorded"]), "saved");
+    // A file it never read: its declared key misses, and it gives the
+    // result its recording would have taken.
+    write(root, "app/README.md", "# app\n\nStill not read.\n");
+    let task = build_report(root, false, &[]);
+    assert_eq!(task["cache"], "miss");
+    assert_eq!(kind(&task["shadow"]), "wouldHit");
+    assert_eq!(task["shadow"]["check"], json!({"matched": true}));
+    // A file its recording ignores: another result, told apart from the
+    // recorded one even when this run records under the same key.
+    write(root, "app/src/notes.txt", "other notes\n");
+    let task = build_report(root, true, &[]);
+    assert_eq!(task["cache"], "miss");
+    assert_eq!(
+        task["shadow"]["check"],
+        json!({"matched": false, "differences": ["app/dist/out.txt (differs)"]})
+    );
+    // A file it read that its declared inputs leave out: they hit, and its
+    // recording, which misses, names the file as what changed.
+    write(root, "app/src/util.txt", "changed\n");
+    let task = build_report(root, false, &[]);
+    assert_eq!(task["cache"], "local-hit");
+    assert_eq!(
+        task["shadow"],
+        json!({"kind": "wouldMiss", "changed": ["app/src/util.txt (read)"]})
+    );
 }
 
 #[test]

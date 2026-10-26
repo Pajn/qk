@@ -177,6 +177,26 @@ pub(super) fn read(
     Ok(read)
 }
 
+/// The record at the start of the pack `input`, read without its blobs.
+pub(super) fn read_record(input: impl Read) -> Result<Vec<u8>> {
+    let mut decoder = zstd::stream::read::Decoder::new(input)?;
+    decoder.window_log_max(WINDOW_LOG_MAX)?;
+    let mut magic = [0; 4];
+    decoder
+        .read_exact(&mut magic)
+        .context("remote pack ends early")?;
+    if &magic != MAGIC {
+        bail!("not a qk remote pack");
+    }
+    let length = part_length(&mut decoder)?;
+    part_size(&mut 0, length, LARGEST_RECORD)?;
+    let mut record = Vec::new();
+    if (&mut decoder).take(length).read_to_end(&mut record)? as u64 != length {
+        bail!("remote pack ends early");
+    }
+    Ok(record)
+}
+
 fn read_parts(
     root: &Path,
     mut body: impl Read,
@@ -361,6 +381,23 @@ mod tests {
     /// Writes a pack carrying every blob inline.
     fn write(root: &Path, record: &[u8], output: impl Write) -> Result<()> {
         super::write(root, record, |_| Ok(Placement::Inline), output)
+    }
+
+    #[test]
+    fn a_record_is_read_without_the_blobs_after_it() {
+        let source = root();
+        let blob = source.path().join("blobs/a");
+        std::fs::write(&blob, "contents").unwrap();
+        let name = crate::hash::digest_file(&blob).unwrap();
+        std::fs::rename(&blob, source.path().join("blobs").join(&name)).unwrap();
+        let record = serde_json::to_vec(&serde_json::json!({
+            "artifacts": {"file": {"blob": name}}
+        }))
+        .unwrap();
+        let mut encoded = Vec::new();
+        write(source.path(), &record, &mut encoded).unwrap();
+        assert_eq!(read_record(&encoded[..]).unwrap(), record);
+        assert!(read_record(&b"not a pack"[..]).is_err());
     }
 
     #[test]

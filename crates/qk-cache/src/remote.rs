@@ -549,6 +549,17 @@ impl Remote {
         fetched
     }
 
+    /// The record of the entry for `key`, without the blobs it cites, or
+    /// `None` when the store holds no such entry.
+    pub(crate) fn fetch_record(&self, key: &str, task: &str) -> Result<Option<Vec<u8>>> {
+        let Some(body) = self.store.get(Object::Entry(key), task)? else {
+            return Ok(None);
+        };
+        let record = pack::read_record(body)?;
+        crate::record::StoredRecord::read(&record)?.check_key(key)?;
+        Ok(Some(record))
+    }
+
     /// Fetches the entry for `key` ahead of the task that needs it, unless it
     /// is being fetched already, returning whether it was fetched.
     fn fetch_ahead(&self, root: &Path, key: &str) -> bool {
