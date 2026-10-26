@@ -652,12 +652,13 @@ fn specified_output_style(options: &RunOptions) -> Option<OutputStyle> {
 
 /// The output style when none is given: `static` in CI, for full logs; the
 /// live panel on a terminal, for a single `run` until its dependencies are
-/// done; otherwise raw for a single `run`, and `quiet` for several tasks,
-/// for agents and scripts.
+/// done, unless its output is piped, where the dependencies' output is kept;
+/// otherwise raw for a single `run`, and `quiet` for several tasks, for
+/// agents and scripts.
 fn default_output_style(single: bool, verbose: bool) -> Rendered {
     if qk_executor::is_ci() {
         OutputStyle::Static.rendered(single, verbose)
-    } else if single && dynamic_output(verbose) {
+    } else if single && dynamic_output(verbose) && io::IsTerminal::is_terminal(&io::stdout()) {
         Rendered::DynamicRunOne
     } else if single {
         Rendered::Lines(qk_executor::OutputStyle::StreamWithoutPrefixes)

@@ -2749,6 +2749,18 @@ fn a_single_run_on_a_terminal_shows_its_dependencies_in_a_panel() {
     assert!(output.contains("serving\n"), "{output:?}");
     assert!(!output.contains("dependency output"), "{output:?}");
     assert!(!output.contains("qk: running"), "{output:?}");
+    // With its output piped, a run passes every task's output through.
+    let output = on_terminal(
+        temp.path(),
+        &format!(
+            "\"$qk\" --workspace '{}' run app:serve | cat",
+            temp.path().display()
+        ),
+        &[],
+        b"",
+    );
+    assert!(output.contains("dependency output"), "{output:?}");
+    assert!(!output.contains("dependency ready"), "{output:?}");
     // A failed dependency shows its output, and the task never starts.
     let output = single("doomed");
     assert!(output.contains("broken output"), "{output:?}");
