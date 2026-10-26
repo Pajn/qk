@@ -2199,6 +2199,40 @@ fn ready_when_starts_dependents_once_the_output_appears() {
 
 #[cfg(unix)]
 #[test]
+fn ready_when_text_matches_as_shown_and_commands_that_never_print_it_fail() {
+    let temp = fixture(json!({
+        // A dev server printing its port in bold, as Vite does.
+        "dev": {"command": "printf 'localhost:\\033[1m5173\\033[22m\\n'; sleep 30", "options": {"readyWhen": "localhost:5173"}},
+        "e2e": {"command": "echo e2e started", "dependsOn": ["dev"]},
+        "quiet": {"executor": "nx:run-commands", "options": {"commands": ["echo hi", "echo there"], "readyWhen": "READY", "parallel": true}},
+        "waits": {"command": "echo waited", "dependsOn": ["quiet"]}
+    }));
+    let started = Instant::now();
+    let output = success(run(
+        temp.path(),
+        &["run", "app:e2e", "--output-style", "static"],
+    ));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("e2e started"));
+    assert!(started.elapsed() < Duration::from_secs(15));
+    let quiet = run(
+        temp.path(),
+        &["run", "app:waits", "--output-style", "static"],
+    );
+    assert_eq!(quiet.status.code(), Some(1));
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&quiet.stdout),
+        String::from_utf8_lossy(&quiet.stderr)
+    );
+    assert!(
+        text.contains(r#"Warning: all commands exited before printing the readyWhen text "READY""#),
+        "{text}"
+    );
+    assert!(!text.contains("waited\n"), "{text}");
+}
+
+#[cfg(unix)]
+#[test]
 fn env_files_color_and_the_options_nx_sets_itself() {
     let temp = fixture(json!({
         "show": {"command": "echo $FROM_FILE $BOTH $SET_OUTSIDE", "options": {
