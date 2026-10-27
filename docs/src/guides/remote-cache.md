@@ -60,7 +60,11 @@ one that receives nothing from the store for 30 seconds fails: a store that
 stops answering costs a lookup a miss and an upload its failure, rather than
 holding every task that asks it. Once the store has stalled twice, the run
 asks it nothing more: each later lookup misses without asking, each later
-upload fails, and qk says so once.
+upload fails, and qk says so once. Until then, when the connection fails an
+upload, by a reset, a broken pipe or a stall, qk sends it twice more, after
+two and then four seconds, and stops trying once the store is left out. An
+upload the store refuses, or one that runs out its ten minutes, fails at
+once.
 
 For local runs, qk can hand queued uploads to a detached process after local
 cache saves finish. Set `s3.uploadMode` to `"background"` to opt in:

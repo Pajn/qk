@@ -50,6 +50,15 @@ use store::{Object, Store};
 
 /// Uploads in flight at once.
 const UPLOADERS: usize = 8;
+/// How often an upload is sent before its failure is reported, when the
+/// connection rather than the store fails it.
+const UPLOAD_ATTEMPTS: u32 = 3;
+/// The pause before an upload is sent again, doubled each time.
+const UPLOAD_PAUSE: Duration = if cfg!(test) {
+    Duration::from_millis(1)
+} else {
+    Duration::from_secs(2)
+};
 /// Connections kept open between requests to the store.
 const IDLE_CONNECTIONS: usize = 32;
 /// The most a single upload may hold, as S3 allows.
@@ -359,6 +368,22 @@ impl Transport for Restart {
     fn is_tls(&self) -> bool {
         self.inner.is_tls()
     }
+}
+
+/// Whether `error` is a connection's failure, such as a reset, a broken pipe
+/// or a stall, rather than an answer from the store. A request that ran out
+/// its whole time is not: sent again, it would take as long again.
+fn lost(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<ureq::Error>(),
+            Some(ureq::Error::Io(_) | ureq::Error::ConnectionFailed | ureq::Error::HostNotFound)
+        ) || matches!(
+            cause.downcast_ref::<ureq::Error>(),
+            Some(ureq::Error::Timeout(timeout))
+                if !matches!(timeout, ureq::Timeout::Global | ureq::Timeout::PerCall)
+        )
+    })
 }
 
 /// A request that received nothing for `stall`.
@@ -993,7 +1018,7 @@ impl Remote {
                         loop {
                             let job = receiver.lock().unwrap().recv();
                             let Ok(job) = job else { return };
-                            if let Err(error) = remote.send(&job) {
+                            if let Err(error) = remote.send_again(&job) {
                                 failures
                                     .lock()
                                     .unwrap()
@@ -1010,6 +1035,24 @@ impl Remote {
             }
         });
         let _ = uploads.sender.send(upload);
+    }
+
+    /// Sends `job`, and again after a pause while the connection fails it:
+    /// every upload replaces or adds to what it names, so sending it twice
+    /// changes nothing. An answer the store gives fails it at once.
+    fn send_again(&self, job: &Upload) -> Result<()> {
+        let mut pause = UPLOAD_PAUSE;
+        let mut attempt = 1;
+        loop {
+            match self.send(job) {
+                Err(error) if attempt < UPLOAD_ATTEMPTS && lost(&error) => {
+                    std::thread::sleep(pause);
+                    pause *= 2;
+                    attempt += 1;
+                }
+                sent => return sent,
+            }
+        }
     }
 
     fn send(&self, job: &Upload) -> Result<()> {
@@ -1279,7 +1322,7 @@ impl Remote {
                         let Some(job) = queue.lock().unwrap().next() else {
                             return;
                         };
-                        if let Err(error) = self.send(job) {
+                        if let Err(error) = self.send_again(job) {
                             failures
                                 .lock()
                                 .unwrap()
@@ -1580,6 +1623,8 @@ mod flight_tests {
         reads: Arc<AtomicUsize>,
         /// Whether it takes upload bodies, as a store server does.
         uploads: bool,
+        /// Uploads to fail as a reset connection would, before taking any.
+        resets: AtomicUsize,
     }
 
     fn name(object: Object) -> String {
@@ -1623,6 +1668,17 @@ mod flight_tests {
         }
 
         fn put(&self, object: Object, mut file: fs::File) -> Result<()> {
+            let reset = self
+                .resets
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                });
+            if reset.is_ok() {
+                return Err(ureq::Error::Io(std::io::Error::from(
+                    std::io::ErrorKind::ConnectionReset,
+                ))
+                .into());
+            }
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes)?;
             self.objects.lock().unwrap().insert(name(object), bytes);
@@ -1700,6 +1756,49 @@ mod flight_tests {
             .unwrap();
         assert_eq!(placements[&blobs[0]], pack::Placement::Inline);
         assert_eq!(placements[&blobs[1]], pack::Placement::Apart);
+    }
+
+    #[test]
+    fn a_request_that_ran_out_its_time_is_not_sent_again() {
+        let error = |timeout| anyhow::Error::from(ureq::Error::Timeout(timeout));
+        assert!(!lost(&error(ureq::Timeout::Global)));
+        assert!(!lost(&error(ureq::Timeout::PerCall)));
+        assert!(lost(&error(ureq::Timeout::Connect)));
+        assert!(lost(&error(ureq::Timeout::RecvBody)));
+    }
+
+    /// An upload the connection fails is sent again, up to its attempts.
+    #[test]
+    fn an_upload_a_connection_fails_is_sent_again() {
+        let weak = "a".repeat(64);
+        let record = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "weak": weak,
+            "sets": []
+        }))
+        .unwrap();
+        for (resets, sent) in [
+            (UPLOAD_ATTEMPTS as usize - 1, true),
+            (UPLOAD_ATTEMPTS as usize, false),
+        ] {
+            let root = cache();
+            let memory = Memory::default();
+            memory.resets.store(resets, Ordering::SeqCst);
+            let remote = Arc::new(Remote::new(
+                Box::new(memory),
+                Mode::ReadWrite,
+                None,
+                u64::MAX,
+            ));
+            remote.upload_path_sets(root.path(), &weak, record.clone());
+            let failures = remote.finish();
+            assert_eq!(failures.is_empty(), sent, "{resets}: {failures:?}");
+            assert!(
+                failures.iter().all(|failure| failure.contains("reset")),
+                "{failures:?}"
+            );
+            assert_eq!(remote.store.has(Object::PathSets(&weak)).unwrap(), sent);
+        }
     }
 
     #[test]
