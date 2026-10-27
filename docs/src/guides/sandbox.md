@@ -261,6 +261,10 @@ Sandbox audit: 1 of 4 tasks went beyond what they declare
   12 tasks restored from the cache, so not audited
 ```
 
+Where no recorder works, such a run goes on unrecorded and unaudited, and
+says so, when `QK_RECORDER` is unset or `auto`. A `QK_RECORDER` naming a
+recorder that cannot record here, or naming none, fails the run.
+
 A task without [`qk:ultracache`](ultracache.md) is recorded for the audit
 alone, as without `--record`. Only `--record` saves what a recording
 read for the cache: without it, an audit's recordings save nothing, though
