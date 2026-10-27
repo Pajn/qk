@@ -615,6 +615,20 @@ impl Sandbox {
             if package.is_none() && relative.split('/').any(|part| part == "node_modules") {
                 continue;
             }
+            // Making the directory an output lies in, as a tool writing
+            // `dist/app.js` makes `dist`, writes no output of its own: what it
+            // writes in it is reported by itself.
+            let path = Path::new(&report.path);
+            if report.operation.starts_with("file-write")
+                && path.is_dir()
+                && self.plans.get(&report.task).is_some_and(|plan| {
+                    plan.write_trees
+                        .iter()
+                        .any(|tree| tree != path && tree.starts_with(path))
+                })
+            {
+                continue;
+            }
             let dependency = self
                 .depended
                 .get(&report.task)
