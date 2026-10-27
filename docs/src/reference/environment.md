@@ -100,7 +100,7 @@ similar patterns in a value it substitutes, is not reproduced.
 | `QK_REMOTE_PREFETCH=off` | Do not fetch entries ahead of the tasks that need them |
 | `QK_REMOTE_EXPECTATIONS` | What a run does with the [task expectations](../guides/remote-cache.md) the remote store holds: `read-write` (the default, as the store's mode allows), `read` or `off` |
 | `QK_STORE_SERVER_TOKEN` | The [store server](../guides/remote-cache.md#store-server)'s token |
-| `QK_STORE_SERVER_URL` | Override `storeServer.url` |
+| `QK_STORE_SERVER_URL` | Override `qk:storeServer.url` |
 | `QK_PROFILE_CACHE=1` | Enable [cache phase timings](cli.md#profiling-cache-operations), as `--profile` does |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | Remote credentials |
 | `GITHUB_HEAD_REF`, `GITHUB_REF_NAME` | CI branch for remote warm state |

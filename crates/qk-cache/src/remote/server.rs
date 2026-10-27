@@ -1,5 +1,5 @@
 //! The remote store behind a store server, configured by nx.json's
-//! `storeServer` key. The server answers each fetch with the blobs the client
+//! `qk:storeServer` key. The server answers each fetch with the blobs the client
 //! lacks, keeps the index itself and commits entries atomically; its protocol
 //! is in `tools/store-server/PROTOCOL.md`.
 
@@ -31,7 +31,7 @@ pub(super) struct Server {
     sessioning: Mutex<Option<JoinHandle<Option<String>>>>,
 }
 
-/// The store server `config`, nx.json's `storeServer` object, names, with its
+/// The store server `config`, nx.json's `qk:storeServer` object, names, with its
 /// token from `QK_STORE_SERVER_TOKEN`.
 pub(super) fn configure(
     config: &Value,
@@ -39,10 +39,10 @@ pub(super) fn configure(
 ) -> Result<Server> {
     let url = variable("QK_STORE_SERVER_URL")
         .or_else(|| config.get("url").and_then(Value::as_str).map(str::to_owned))
-        .context("storeServer.url is required")?;
+        .context("qk:storeServer.url is required")?;
     let url = url.trim_end_matches('/').to_owned();
     if !(url.starts_with("https://") || url.starts_with("http://")) {
-        bail!("invalid storeServer.url {url:?}");
+        bail!("invalid qk:storeServer.url {url:?}");
     }
     let token = variable("QK_STORE_SERVER_TOKEN").context("no token: set QK_STORE_SERVER_TOKEN")?;
     Ok(Server {

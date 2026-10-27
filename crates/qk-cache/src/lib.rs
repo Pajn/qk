@@ -45,16 +45,12 @@ pub use paths::{
     worktree_state,
 };
 
-/// The nx.json settings of the workspace's remote store: its `s3`, and its
-/// `storeServer` or `qk:storeServer`. Nx never reads `qk:storeServer`, so a
-/// workspace can name a store server for qk while Nx's own cache plugin keeps
-/// `s3`.
+/// The nx.json settings of the workspace's remote store: its `s3`, as Nx's
+/// cache plugin reads it, and its `qk:storeServer`, which Nx never reads, so a
+/// workspace can name a store server for qk while Nx's plugin keeps `s3`.
 fn remote_settings(workspace: &Workspace) -> (Option<&Value>, Option<&Value>) {
     let extra = &workspace.config.extra;
-    match extra.get("qk:storeServer") {
-        Some(server) => (None, Some(server)),
-        None => (extra.get("s3"), extra.get("storeServer")),
-    }
+    (extra.get("s3"), extra.get("qk:storeServer"))
 }
 
 /// Runs a task the cache does not keep. A sandboxed one's log is kept, which
@@ -268,8 +264,8 @@ impl Cache {
         }
     }
 
-    /// The workspace's cache, with the remote store its nx.json `s3`,
-    /// `storeServer` or `qk:storeServer` key configures, if any. Credentials
+    /// The workspace's cache, with the remote store its nx.json `s3` or
+    /// `qk:storeServer` key configures, if any. Credentials
     /// and modes are read from `environment`, which includes the workspace's
     /// dotenv files. A remote store that cannot be used is reported and left
     /// out; the local cache still works.

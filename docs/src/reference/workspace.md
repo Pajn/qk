@@ -91,9 +91,7 @@ Named, opt-in refinements of affected project selection. Each profile
 contains a `projections` array of adapters with `name`, `command`, `sources`,
 `outputs` and optional `timeoutSeconds`, `reachability`, or both.
 `reachability` is `true`, or `{"default": "<name>"}` naming the
-`qk:reachability` config for targets that declare none. The unprefixed
-`affectedProfiles` key remains a compatibility alias; selecting a profile
-rejects configuration containing both keys.
+`qk:reachability` config for targets that declare none.
 Select a profile with `--affected-profile <name>`.
 See [Project change projections](../guides/affected-projections.md) for the
 protocol, configuration example, tool setup and conservative fallback rules,
@@ -222,16 +220,16 @@ for detached uploads, logs and lifecycle behavior.
 `encryptionKey` and SSO profiles are unsupported. Unusable remote stores
 are reported; local caching continues. See [Remote caching](../guides/remote-cache.md).
 
-## `storeServer`
+## `qk:storeServer`
 
 An optional object sending the remote cache to a
-[store server](../guides/remote-cache.md#store-server) instead of S3. It
-cannot be set together with `s3`. The token comes from
-`QK_STORE_SERVER_TOKEN`.
+[store server](../guides/remote-cache.md#store-server) instead of S3. Nx does
+not read it, so when it is set qk uses it and ignores `s3`, which can stay
+for Nx's own cache plugin. The token comes from `QK_STORE_SERVER_TOKEN`.
 
 ```jsonc
 {
-  "storeServer": { "url": "https://cache.example.com" }
+  "qk:storeServer": { "url": "https://cache.example.com" }
 }
 ```
 
@@ -243,11 +241,6 @@ cannot be set together with `s3`. The token comes from
 | `uploadMode` | string | `wait`; qk can detach uploads with `background` |
 
 Modes and upload modes, and the variables that override them, are as for `s3`.
-
-## `qk:storeServer`
-
-The same object as `storeServer`, read by qk alone. When it is set, qk uses it
-and ignores `s3` and `storeServer`, so `s3` can stay for Nx's own cache plugin.
 
 ## `nx.local.json`
 

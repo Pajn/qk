@@ -133,12 +133,12 @@ uses it. `QK_REMOTE_PREFETCH=off` turns it off.
 
 ## Store server
 
-nx.json's `storeServer` key sends the remote cache to a store server instead
-of S3, with its token in `QK_STORE_SERVER_TOKEN`:
+nx.json's `qk:storeServer` key sends the remote cache to a store server
+instead of S3, with its token in `QK_STORE_SERVER_TOKEN`:
 
 ```jsonc
 {
-  "storeServer": { "url": "https://cache.example.com" }
+  "qk:storeServer": { "url": "https://cache.example.com" }
 }
 ```
 
@@ -148,12 +148,12 @@ A run whose request to tell it fails says why, and receives entries whole,
 as does, silently, one whose local cache holds no outputs or more than two
 million. It keeps the index itself and commits each entry once, so runs
 neither write announcements nor merge listings. `localMode`, `ciMode`, `uploadMode` and
-`NX_POWERPACK_CACHE_MODE` apply as they do for `s3`; setting both `s3` and
-`storeServer` is an error. A read token fetches; a write token also uploads.
+`NX_POWERPACK_CACHE_MODE` apply as they do for `s3`. A read token fetches; a
+write token also uploads.
 
-A workspace that still runs some tasks with Nx can keep `s3` for Nx's cache
-plugin and name qk's store server as `qk:storeServer`, which Nx does not read.
-qk then uses the store server and ignores `s3` and `storeServer`.
+Nx does not read `qk:storeServer`, so a workspace that still runs some tasks
+with Nx can keep `s3` for Nx's cache plugin: qk uses the store server and
+ignores `s3`.
 `tools/store-server` in qk's repository is a reference server, a Cloudflare
 Worker over R2, and documents the protocol in its `PROTOCOL.md`.
 
