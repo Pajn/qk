@@ -19,7 +19,10 @@ entry whose outputs are all small is one request however many files the task
 wrote. A local miss fetches it, keeps the
 outputs the local cache lacks, verifying each against its hash, and shows
 `[remote cache]`; any failure is a miss. The path sets of tasks with
-[`qk:ultracache`](ultracache.md) are stored as `pathsets/<weak>`.
+[`qk:ultracache`](ultracache.md) are stored as `pathsets/<weak>`. A store
+server takes at most 16 MiB of them for one task, so a larger record is
+shared without its oldest sets; one whose newest set alone is larger is not
+shared, and its upload fails.
 
 What tasks are expected to take, which orders them and sizes their
 [shares of the cores](threads.md), is stored as `expectations/<name>`, one

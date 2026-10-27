@@ -819,6 +819,24 @@ pub(crate) fn record(cache: &Path, weak: &str) -> Option<Vec<u8>> {
     std::fs::read(location(cache, weak)).ok()
 }
 
+/// `record`, a record of path sets, in at most `largest` bytes: with its
+/// oldest sets left out until it fits, or `None` when its newest set alone
+/// does not.
+pub(crate) fn within(record: &[u8], largest: usize) -> Result<Option<Vec<u8>>> {
+    if record.len() <= largest {
+        return Ok(Some(record.to_vec()));
+    }
+    let mut stored: Stored = serde_json::from_slice(record)?;
+    while stored.sets.len() > 1 {
+        stored.sets.pop();
+        let shorter = serde_json::to_vec(&stored)?;
+        if shorter.len() <= largest {
+            return Ok(Some(shorter));
+        }
+    }
+    Ok(None)
+}
+
 /// Adds the path sets in a record the remote store held for `weak` behind
 /// those kept locally, returning the ones that are new here. A record for
 /// another weak key or another version adds nothing, and neither does a set
@@ -1141,6 +1159,32 @@ mod tests {
             6
         );
         assert_eq!(load(temp.path(), "weak").len(), KEPT);
+    }
+
+    #[test]
+    fn a_record_too_large_leaves_out_its_oldest_sets() {
+        let set = |read: &str| PathSet {
+            reads: [read.to_owned()].into(),
+            ..PathSet::default()
+        };
+        let record = |sets: Vec<PathSet>| {
+            serde_json::to_vec(&Stored {
+                version: 1,
+                weak: "weak".into(),
+                sets,
+            })
+            .unwrap()
+        };
+        let newest = "n".repeat(100);
+        let full = record(vec![
+            set(&newest),
+            set(&"o".repeat(100)),
+            set(&"p".repeat(100)),
+        ]);
+        assert_eq!(within(&full, full.len()).unwrap(), Some(full.clone()));
+        let one = record(vec![set(&newest)]);
+        assert_eq!(within(&full, one.len() + 50).unwrap(), Some(one.clone()));
+        assert_eq!(within(&full, one.len() - 1).unwrap(), None);
     }
 
     #[test]

@@ -83,6 +83,10 @@ const BLOB_THRESHOLD: u64 = 1 << 20;
 /// store that stops answering partway would otherwise hold each task asking
 /// it that long.
 const STALL: Duration = Duration::from_secs(30);
+/// The most a record of path sets may hold for a store server, which takes an
+/// upload body of at most 16 MiB for them (`tools/store-server/PROTOCOL.md`),
+/// leaving room for the body's header.
+const LARGEST_PATH_SETS: usize = (16 << 20) - 1024;
 /// The most an upload to a store server carries inline, counted raw, below the
 /// 100 MiB a server accepts in one body (`tools/store-server/PROTOCOL.md`).
 const UPLOAD_INLINE: u64 = 64 << 20;
@@ -1065,8 +1069,19 @@ impl Remote {
             return self.put_pack(&job.local, object, &warm.record);
         }
         if let Some(sets) = &job.path_sets {
+            let record = match self.store.framing() {
+                store::Framing::Pack => sets.record.clone(),
+                // Shared without its oldest sets, rather than not at all.
+                store::Framing::Upload => {
+                    crate::recorded::within(&sets.record, LARGEST_PATH_SETS)?.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "its newest path set alone is larger than the 16 MiB a store server takes"
+                        )
+                    })?
+                }
+            };
             // As with warm records, the newest save replaces the last one.
-            return self.put_pack(&job.local, Object::PathSets(&sets.weak), &sets.record);
+            return self.put_pack(&job.local, Object::PathSets(&sets.weak), &record);
         }
         if let Some(shared) = &job.expectations {
             let Some(branch) = shared.branches.first() else {
