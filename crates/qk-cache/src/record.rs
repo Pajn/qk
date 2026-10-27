@@ -142,6 +142,11 @@ impl StoredRecord {
             .collect()
     }
 
+    /// The root of the worktree a warm record was saved in.
+    pub(crate) fn warm_worktree(&self) -> Option<&str> {
+        self.0.get("worktree")?.as_str()
+    }
+
     /// Sorted, deduplicated blob names, including result logs and warm groups.
     pub(crate) fn blobs(&self) -> BTreeSet<String> {
         let mut blobs = BTreeSet::new();

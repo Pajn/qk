@@ -1639,7 +1639,12 @@ fn remote_build(fixture: &Fixture, env: &[(&str, &str)]) -> Output {
 }
 
 fn remote_build_command(fixture: &Fixture, env: &[(&str, &str)]) -> Command {
-    let mut command = fixture.command(&fixture.root, &["run", "app:build"]);
+    remote_build_command_at(fixture, &fixture.root, env)
+}
+
+/// [`remote_build_command`] in the checkout at `root`.
+fn remote_build_command_at(fixture: &Fixture, root: &Path, env: &[(&str, &str)]) -> Command {
+    let mut command = fixture.command(root, &["run", "app:build"]);
     command
         .env("AWS_ACCESS_KEY_ID", "key")
         .env("AWS_SECRET_ACCESS_KEY", "secret")
@@ -3989,6 +3994,62 @@ fn nonportable_warm_state_neither_reads_nor_writes_remote_saves() {
         assert_eq!(stdout(&output).lines().next(), Some("cold"));
         assert_eq!(server.requests(&s3::path("warm/")), requests);
     }
+}
+
+/// `portable: "path"` shares warm state through the remote between checkouts
+/// at one path, as CI runners checking out in one place are, and keeps it
+/// from a checkout anywhere else, whose path the state would not suit. Each
+/// path's saves are kept apart, so one never replaces another's.
+#[cfg(unix)]
+#[test]
+fn path_portable_warm_state_reaches_only_a_checkout_at_the_same_path() {
+    let server = s3::FakeS3::start();
+    let fixture = Fixture::new(json!({
+        "command": "if [ -f \"$TOOL_CACHE/seen\" ]; then cat \"$TOOL_CACHE/seen\"; else echo cold; fi; mkdir -p \"$TOOL_CACHE\" && echo saved > \"$TOOL_CACHE/seen\"",
+        "qk:warm": {"portable": "path", "env": {"TOOL_CACHE": "{warm}/tool"}}
+    }));
+    with_remote(&fixture, &server, json!({}));
+    let said = |root: &Path| {
+        let output = success(
+            remote_build_command_at(&fixture, root, &[("GITHUB_REF_NAME", "main")])
+                .output()
+                .unwrap(),
+        );
+        stdout(&output)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    // A fresh machine: no local cache and no warm state of its own.
+    let fresh = |root: &Path| {
+        let path = stdout(&success(fixture.qk(root, &["cache", "path"])));
+        let _ = fs::remove_dir_all(path.trim());
+        let _ = fs::remove_dir_all(root.join(".git/qk/warm"));
+    };
+    // One runner saves; the next, checked out at the same path, restores it.
+    assert_eq!(said(&fixture.root), "cold");
+    assert_eq!(server.objects(&s3::path("warm/")).len(), 1);
+    fresh(&fixture.root);
+    assert_eq!(said(&fixture.root), "saved");
+    // A checkout elsewhere, as a developer's, leaves the remote save alone.
+    let elsewhere = TempDir::new().unwrap();
+    let copy = elsewhere.path().join("checkout");
+    assert!(
+        Command::new("cp")
+            .arg("-R")
+            .arg(&fixture.root)
+            .arg(&copy)
+            .status()
+            .unwrap()
+            .success()
+    );
+    fresh(&copy);
+    assert_eq!(said(&copy), "cold");
+    // Its own save goes beside the other, which a runner still restores.
+    assert_eq!(server.objects(&s3::path("warm/")).len(), 2);
+    fresh(&fixture.root);
+    assert_eq!(said(&fixture.root), "saved");
 }
 
 /// A task that prints what its warm `scratch/state` held, then records the

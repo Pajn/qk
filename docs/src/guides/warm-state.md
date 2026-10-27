@@ -34,7 +34,8 @@ on disk is left alone, since it is the newest for that checkout; otherwise
 it comes from the worktree's own save. The task's `paths` count as one group
 unless they are [restored one by one](#restoring-paths-one-by-one). With
 `portable: true`, it can also come from the store linked worktrees share or
-from the remote store. Each worktree
+from the remote store, and with `portable: "path"` from the remote store when
+saved in a checkout at the same path. Each worktree
 keeps its own save, and a restore takes the worktree's own before the most
 recent other worktree's; the eight most recent saves of a task are kept.
 With sharing enabled and no suitable local save, it comes from the remote store: the current branch's
@@ -205,6 +206,20 @@ its own worktree. Set `portable: true` to permit another worktree's save and,
 when `remote` is enabled, remote exchange. It does not rewrite absolute paths
 inside files or make incompatible tools accept them. `remote: false` disables
 remote exchange while still permitting other worktrees when `portable` is true.
+
+State that records where it was made, as a CMake build directory, Xcode's
+intermediates or Gradle's project state do, cannot follow a checkout to
+another path, but suits another machine whose checkout is at the same path,
+as CI runners checking out in one place are. `portable: "path"` exchanges it
+through the remote store, and restores a save only when the checkout that
+made it was at the same path, resolved through links: one runner's save
+reaches the next runner, while a developer's checkout elsewhere keeps its own
+state, as with `false`. Saves from each path are stored apart, so a checkout
+elsewhere that can write to the store never replaces the save the runners
+restore. Linked worktrees, each at a path of its own, do not
+share it. What else such state depends on, as the toolchain's location or
+version, qk does not check: keep it the same where the path is, or name it
+in `key`.
 
 **Migration:** configurations that previously relied on implicit cross-worktree
 or remote warm-state sharing must now set `portable: true` explicitly. Validate
