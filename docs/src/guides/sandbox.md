@@ -105,6 +105,26 @@ names already; its installations and everything they reach then count. A
 package read by many tasks, as for paths, is listed once at the top with how
 many tasks read it.
 
+A task without `externalDependencies` keys every package its importers
+install and everything those depend on. A package it still reads outside
+that set is no dependency of any package its importers install: some package
+imports it without declaring it, and finds it through pnpm's hoisting, which links every package
+installed anywhere in the workspace where any of them can resolve it. What the
+task reads then changes with what another project installs. Audit lists such
+a package apart, as `hoistedPackages` in `--sandbox-report`:
+
+```text
+  app:build
+    1 installed package read that nothing its importers install depends on, found through pnpm's hoisting; declare it as a dependency of the package importing it:
+      phantom
+```
+
+Naming it in `externalDependencies` would key it, but in place of every other
+installed package. Declaring it as a dependency of the package importing it,
+with pnpm's `packageExtensions`, keys it with the rest. Narrowing pnpm's
+`hoist-pattern` instead makes the import fail rather than find it, which shows
+where it is missing but keys nothing.
+
 Audit finds a package by a read of its `package.json`, which Node and
 bundlers make for every package they load, rather than by each of the
 thousands of files a tool may read: reports of those would crowd the system

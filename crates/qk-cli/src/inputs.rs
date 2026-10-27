@@ -91,11 +91,22 @@ pub fn present(mut report: Report, options: &Options) -> Result<()> {
             }
         }
         if !task.unkeyed_packages.is_empty() {
+            let count = task.unkeyed_packages.len();
+            let advice = if task.names_external_dependencies {
+                format!(
+                    "name {} in the target's externalDependencies",
+                    if count == 1 { "it" } else { "them" }
+                )
+            } else {
+                format!(
+                    "no package its importers install depends on {}, found through pnpm's hoisting; declare {} as a dependency of the package importing it",
+                    if count == 1 { "it" } else { "any of them" },
+                    if count == 1 { "it" } else { "each" },
+                )
+            };
             lines.push(format!(
-                "  {} installed package{} read but not in the key; name {} in the target's externalDependencies",
-                task.unkeyed_packages.len(),
-                if task.unkeyed_packages.len() == 1 { "" } else { "s" },
-                if task.unkeyed_packages.len() == 1 { "it" } else { "them" },
+                "  {count} installed package{} read but not in the key; {advice}",
+                if count == 1 { "" } else { "s" },
             ));
             for (package, files) in &task.unkeyed_packages {
                 lines.push(format!(
@@ -192,6 +203,7 @@ pub fn present(mut report: Report, options: &Options) -> Result<()> {
                         "globs": task.glob_suggestions,
                         "uncovered": task.access_review,
                         "unkeyedPackages": task.unkeyed_packages,
+                        "namesExternalDependencies": task.names_external_dependencies,
                     }),
                 )
             })

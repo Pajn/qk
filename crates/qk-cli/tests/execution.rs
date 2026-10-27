@@ -3767,6 +3767,11 @@ importers:
       helper:
         specifier: ^1.0.0
         version: 1.0.0
+  apps/mobile:
+    dependencies:
+      phantom:
+        specifier: ^1.0.0
+        version: 1.0.0
 packages:
   fallow@1.0.0:
     resolution: {integrity: sha512-fallow}
@@ -3774,10 +3779,13 @@ packages:
     resolution: {integrity: sha512-helper}
   other@1.0.0:
     resolution: {integrity: sha512-other}
+  phantom@1.0.0:
+    resolution: {integrity: sha512-phantom}
 snapshots:
   fallow@1.0.0: {}
   helper@1.0.0: {}
   other@1.0.0: {}
+  phantom@1.0.0: {}
 ",
     )
     .unwrap();
@@ -3785,6 +3793,7 @@ snapshots:
         ("fallow@1.0.0", "fallow"),
         ("helper@1.0.0", "helper"),
         ("other@1.0.0", "other"),
+        ("phantom@1.0.0", "phantom"),
         ("stale@0.1.0", "stale"),
     ] {
         let package = root.join(format!(
@@ -3821,8 +3830,14 @@ fn the_sandbox_reports_a_package_read_that_the_key_leaves_out() {
             // Naming its external dependencies, even none, leaves the root
             // importer out of the key.
             "lint": {"command": read, "options": {"cwd": "apps/app"}, "inputs": ["default", {"externalDependencies": external}]},
-            // Without, every installed package counts.
-            "build": {"command": read, "options": {"cwd": "apps/app"}, "inputs": ["default"]}
+            // Without, every package its importers install counts, but not
+            // `phantom`, which only `apps/mobile` installs and pnpm's
+            // hoisting lets anything resolve.
+            "build": {
+                "command": format!("{read} ../../node_modules/.pnpm/phantom@1.0.0/node_modules/phantom/package.json"),
+                "options": {"cwd": "apps/app"},
+                "inputs": ["default"]
+            }
         })
     };
     let audit = |temp: &TempDir| {
@@ -3857,10 +3872,25 @@ fn the_sandbox_reports_a_package_read_that_the_key_leaves_out() {
         json!([]),
         "{findings}"
     );
-    assert!(findings["tasks"].get("app:build").is_none(), "{findings}");
+    assert_eq!(
+        findings["tasks"]["app:build"]["hoistedPackages"],
+        json!(["phantom"]),
+        "{findings}"
+    );
+    assert_eq!(
+        findings["tasks"]["app:build"]["unkeyedPackages"],
+        json!([]),
+        "{findings}"
+    );
     assert!(
         stderr.contains(
             "1 installed package read, not in its key; name it in its externalDependencies:\n      fallow\n"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "1 installed package read that nothing its importers install depends on, found through pnpm's hoisting; declare it as a dependency of the package importing it:\n      phantom\n"
         ),
         "{stderr}"
     );
@@ -3871,7 +3901,7 @@ fn the_sandbox_reports_a_package_read_that_the_key_leaves_out() {
     ));
     let named = root_tool_fixture(targets(json!(["fallow"])));
     let (findings, _) = audit(&named);
-    assert_eq!(findings["tasks"], json!({}), "{findings}");
+    assert!(findings["tasks"].get("app:lint").is_none(), "{findings}");
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -4680,6 +4710,30 @@ fn input_analysis_reports_a_package_read_that_the_key_leaves_out() {
     );
     let (packages, _) = analyze(json!(["fallow"]));
     assert_eq!(packages, json!({}));
+    // Without externalDependencies, every package its importers install
+    // counts, so one left out was found through pnpm's hoisting.
+    let temp = root_tool_fixture(json!({
+        "build": {
+            "command": "cat ../../node_modules/.pnpm/phantom@1.0.0/node_modules/phantom/package.json",
+            "options": {"cwd": "apps/app"},
+            "inputs": ["default"]
+        }
+    }));
+    let output = success(run(
+        temp.path(),
+        &[
+            "inputs",
+            "analyze",
+            "app:build",
+            "--report",
+            "analysis.json",
+        ],
+    ));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("1 installed package read but not in the key; no package its importers install depends on it, found through pnpm's hoisting; declare it as a dependency of the package importing it\n    phantom (1 file)"),
+        "{stderr}"
+    );
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
