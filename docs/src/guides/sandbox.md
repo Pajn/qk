@@ -204,7 +204,9 @@ Sandbox audit: 1 of 4 tasks went beyond what they declare
 ```
 
 A task without [`qk:ultracache`](ultracache.md) is recorded for the audit
-alone, as without `--record`. An audit costs reading each recorded task's
+alone, as without `--record`. Only `--record` saves what a recording
+read for the cache: without it, an audit's recordings save nothing, though
+recordings saved before still key results. An audit costs reading each recorded task's
 trace a second time, as the audit reads installed packages' manifests that a
 path set leaves out. `--report` gives
 each task audited its findings as `audit`, by the kinds `--sandbox-report`

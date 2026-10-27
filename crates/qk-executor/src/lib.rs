@@ -479,6 +479,9 @@ pub struct PreparedTask {
     /// What the commands run under, for `--sandbox`.
     pub sandbox: Option<Confinement>,
     pub recording: Option<Recording>,
+    /// Whether `recording` may key the task's result for `qk:ultracache`, as
+    /// `--record` gives it. A recording made only to audit the task does not.
+    pub recording_keys: bool,
     /// How the task's output is shown; the runner sets it per output style.
     pub display: Display,
 }
@@ -1012,6 +1015,7 @@ pub fn prepare(
         tty,
         sandbox: None,
         recording: None,
+        recording_keys: false,
         display: Display::default(),
     };
     prepared.ready_check = prepared.resolve_ready_check(None);

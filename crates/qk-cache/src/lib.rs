@@ -820,7 +820,13 @@ impl Cache {
         let capture =
             Capture::new(Some(log.as_file().try_clone()?), prepared.display.clone()).retain_log();
         let restored = before(running);
-        let listed = match (&recordings, &prepared.recording) {
+        // Only a recording `--record` made keys it: one made to audit the task
+        // is no decision to key results by what it read.
+        let keying = prepared
+            .recording
+            .as_ref()
+            .filter(|_| prepared.recording_keys);
+        let listed = match (&recordings, keying) {
             (Some(_), Some(_)) => {
                 let project_root = workspace
                     .projects
@@ -849,7 +855,7 @@ impl Cache {
             Some((sets, _, _)) if !sets.is_empty() => Recorded::Missed,
             _ => unrecorded,
         });
-        let path_set = match (&recordings, &prepared.recording) {
+        let path_set = match (&recordings, keying) {
             (Some((_, _, settings)), Some(recording)) => Some(
                 self.path_set(workspace, recording, prepared, settings, &own)
                     .and_then(|set| {

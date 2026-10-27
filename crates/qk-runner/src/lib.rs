@@ -116,6 +116,7 @@ fn attach_recordings(
             let traces = directory.path().join(format!("task-{index}"));
             std::fs::create_dir(&traces)?;
             prepared.recording = Some(recording.in_directory(traces));
+            prepared.recording_keys = true;
         }
     }
     Ok(Some(directory))
@@ -909,6 +910,9 @@ pub fn run(
                                 Some(reason) => Err(anyhow::anyhow!(reason)),
                                 None => execute(&task, &stop).map(qk_cache::TaskResult::uncached),
                             };
+                            if let Some(recording) = &task.recording {
+                                let _ = recording.settle();
+                            }
                             let _ = sender.send((id, result));
                         });
                         continue;
@@ -968,6 +972,13 @@ pub fn run(
                                 _ => Ok(result),
                             }
                         });
+                        // Settled as the task ends: an eBPF recording fails
+                        // when the recorder dropped events since it began, so
+                        // settled when the run ends it would fail for what
+                        // later tasks lost. A failure is kept for the audit.
+                        if let Some(recording) = &task.recording {
+                            let _ = recording.settle();
+                        }
                         let _ = sender.send((id, result));
                     });
                 }

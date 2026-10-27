@@ -625,3 +625,30 @@ fn a_recorded_run_audits_the_tasks_it_records() {
     assert_eq!(task["cache"], "local-hit");
     assert!(task.get("audit").is_none(), "{task}");
 }
+
+/// `--sandbox` records a task to audit it, but only `--record` keys results
+/// by what a recording read: an audit is no decision to.
+#[test]
+fn a_sandbox_audit_records_nothing_for_the_cache_without_record() {
+    if !has_strace() {
+        return;
+    }
+    let temp = fixture();
+    let root = temp.path();
+    let report = root.join(".git/report.json");
+    let task = |extra: &[&str]| {
+        let args = ["run", "app:build", "--report", report.to_str().unwrap()];
+        qk(root, &[&args[..], extra].concat(), &[]);
+        let run: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+        run["tasks"][0].clone()
+    };
+    let audited = task(&["--sandbox"]);
+    assert_eq!(audited["cache"], "miss");
+    assert_eq!(kind(&audited["recorded"]), "unrecorded");
+    assert_eq!(audited["audit"], json!({}));
+    // Changed, so it runs again, recorded this time.
+    write(root, "app/src/main.txt", "changed\n");
+    let recorded = task(&["--sandbox", "--record"]);
+    assert_eq!(recorded["cache"], "miss");
+    assert_eq!(kind(&recorded["recorded"]), "saved");
+}

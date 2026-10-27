@@ -454,6 +454,7 @@ fn callbacks(
                 tty: false,
                 sandbox: None,
                 recording: None,
+                recording_keys: false,
                 display: Display::Stream,
             };
             if options.verbose {
