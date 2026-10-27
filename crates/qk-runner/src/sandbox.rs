@@ -28,6 +28,10 @@
 //! dependencies' outputs appear during the run. Audit mode records each task
 //! instead, with the recorder `--record` uses, and holds what it did against
 //! the plan a profile would have allowed without a report.
+//!
+//! With `--record`, audit mode holds the recordings the cache makes against
+//! those plans instead, and the cache stays on: only the tasks that run and
+//! are recorded are audited, at no cost beyond reading their traces again.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader};
@@ -187,6 +191,9 @@ pub struct Sandbox {
     /// The workspace root as given, which recorded paths may name rather
     /// than `root`, its links resolved.
     given_root: PathBuf,
+    /// Linux audit under `--record`: tasks are audited from the cache's
+    /// recordings, handed over as they finish, rather than recorded here.
+    from_recordings: bool,
     /// Linux: rule sets handed to tasks, open until the run ends, and the
     /// output directories created so their rules had a path to hold.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -201,6 +208,9 @@ pub struct Finished {
     pub unsandboxed: BTreeMap<String, String>,
     /// Tasks sandboxed without reporting installed packages, and why.
     pub packages_unchecked: BTreeMap<String, String>,
+    /// Audit: the tasks held to their plans, whether or not they went
+    /// beyond them.
+    pub audited: BTreeSet<String>,
 }
 
 /// Tag in each rule's message: the task a report belongs to.
@@ -213,8 +223,18 @@ const PROBE_DEADLINE: Duration = Duration::from_secs(10);
 
 impl Sandbox {
     /// Works out what each task may do; on macOS writes its profile and
-    /// starts reading the log.
-    pub fn start(workspace: &Workspace, graph: &TaskGraph, mode: Mode) -> Result<Self> {
+    /// starts reading the log. With `from_recordings`, an audit on Linux
+    /// records nothing itself and audits what [`Self::audit_recorded`] hands
+    /// it.
+    pub fn start(
+        workspace: &Workspace,
+        graph: &TaskGraph,
+        mode: Mode,
+        from_recordings: bool,
+    ) -> Result<Self> {
+        if from_recordings && !(cfg!(target_os = "linux") && mode == Mode::Audit) {
+            bail!("only --sandbox=audit on Linux audits what --record records");
+        }
         if cfg!(target_os = "linux") {
             if mode == Mode::Enforce {
                 landlock::abi()
@@ -280,6 +300,7 @@ impl Sandbox {
             recording: None,
             traces: Mutex::new(BTreeMap::new()),
             given_root: workspace.root.clone(),
+            from_recordings,
             rulesets: Mutex::new(Vec::new()),
             created: Mutex::new(Vec::new()),
         };
@@ -316,9 +337,12 @@ impl Sandbox {
                 Err(error) => return Err(error),
             }
         } else if mode == Mode::Audit {
-            let recording = qk_executor::Recording::probe(&sandbox.directory)
-                .context("--sandbox on Linux records what each task does, with eBPF or strace")?;
-            sandbox.recording = Some(recording.resolving());
+            if !from_recordings {
+                let recording = qk_executor::Recording::probe(&sandbox.directory).context(
+                    "--sandbox on Linux records what each task does, with eBPF or strace",
+                )?;
+                sandbox.recording = Some(recording.resolving());
+            }
         } else {
             let (shared, dotenv) = scan(&sandbox.root);
             sandbox.shared = shared;
@@ -338,7 +362,7 @@ impl Sandbox {
     /// How a task is held to its plan, as it starts; `None` runs it
     /// unsandboxed, with the reason recorded.
     pub fn confine(&self, id: &str) -> Option<qk_executor::Confinement> {
-        if !self.plans.contains_key(id) || self.recording.is_some() {
+        if !self.plans.contains_key(id) || self.recording.is_some() || self.from_recordings {
             return None;
         }
         if cfg!(target_os = "macos") {
@@ -377,16 +401,50 @@ impl Sandbox {
         Some(recording)
     }
 
+    /// Linux audit under `--record`: audits `recording`, a task's recording
+    /// made for the cache, as it ran in `cwd`. Only a task that ran is handed
+    /// over; one restored from the cache did nothing to audit.
+    pub fn audit_recorded(&self, id: &str, recording: &qk_executor::Recording, cwd: &Path) {
+        if self.from_recordings && self.plans.contains_key(id) {
+            self.traces
+                .lock()
+                .unwrap()
+                .insert(id.to_owned(), (recording.clone(), cwd.to_owned()));
+        }
+    }
+
     /// Linux audit: what each recorded task did that its plan does not
     /// allow, as the reports Seatbelt's profile would have made. A task whose
     /// recording is incomplete is not audited, and listed with why.
-    fn recorded(&self) -> Vec<Report> {
+    fn recorded(&self) -> (Vec<Report>, BTreeSet<String>) {
         let traces = std::mem::take(&mut *self.traces.lock().unwrap());
         let mut reports = Vec::new();
+        let mut audited = BTreeSet::new();
+        // Only what a report can name is kept and counted: in the workspace,
+        // and in `node_modules` only packages' manifests. A build reads far
+        // more outside it, which within the budget `inputs analyze` keeps
+        // would leave a task the cache records unaudited.
+        let keep = |path: &Path| {
+            [&self.root, &self.given_root].iter().any(|root| {
+                path.strip_prefix(root).is_ok_and(|relative| {
+                    !relative
+                        .components()
+                        .any(|component| component.as_os_str() == "node_modules")
+                        || path.file_name() == Some(std::ffi::OsStr::new("package.json"))
+                })
+            })
+        };
+        let limits = qk_input_analysis::strace::Limits {
+            records: 1_000_000,
+            bytes: 256 * 1024 * 1024,
+            accesses: 500_000,
+            keep: Some(&keep),
+            resolved: true,
+        };
         for (id, (recording, cwd)) in traces {
-            let collected = recording
-                .settle()
-                .and_then(|()| qk_input_analysis::strace::collect(&recording.directory, &cwd));
+            let collected = recording.settle().and_then(|()| {
+                qk_input_analysis::strace::collect_within(&recording.directory, &cwd, &limits)
+            });
             let accesses = match collected {
                 Ok((accesses, issues)) => match issues.first() {
                     None => accesses,
@@ -412,8 +470,9 @@ impl Sandbox {
                     .into_iter()
                     .filter_map(|access| self.report(&id, plan, access)),
             );
+            audited.insert(id);
         }
-        reports
+        (reports, audited)
     }
 
     /// The report Seatbelt's audit profile would make of `access`, if any:
@@ -508,15 +567,16 @@ impl Sandbox {
     /// returns each task's findings, the tasks that ran unsandboxed and those
     /// whose installed packages went unchecked.
     pub fn finish(mut self) -> Result<Finished> {
-        let reports = match self.watcher.take() {
+        let (reports, audited) = match self.watcher.take() {
             Some(watcher) => {
                 let (reports, dropped) = watcher.finish(&self.directory)?;
                 if dropped > 0 {
                     bail!("sandbox log exceeded 100000 reports; {dropped} reports omitted");
                 }
-                reports
+                (reports, self.plans.keys().cloned().collect())
             }
-            None => self.recorded(),
+            None if self.mode == Mode::Audit => self.recorded(),
+            None => (Vec::new(), BTreeSet::new()),
         };
         let _ = std::fs::remove_dir_all(&self.directory);
         for directory in std::mem::take(&mut *self.created.lock().unwrap()) {
@@ -594,10 +654,15 @@ impl Sandbox {
         // A task run again unsandboxed was audited only until it failed, so it
         // is listed as unsandboxed rather than with part of its findings.
         findings.retain(|id, findings| !findings.is_empty() && !unsandboxed.contains_key(id));
+        let audited = audited
+            .into_iter()
+            .filter(|id| !unsandboxed.contains_key(id))
+            .collect();
         Ok(Finished {
             findings,
             unsandboxed,
             packages_unchecked: std::mem::take(&mut self.packages_unchecked),
+            audited,
         })
     }
 }

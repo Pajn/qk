@@ -38,6 +38,18 @@ fn scope(workspace: &Workspace, all_worktrees: bool) -> Option<String> {
     (!all_worktrees).then(|| worktree(workspace))
 }
 
+/// An audit's findings with the kinds it found nothing of left out.
+fn found(mut findings: serde_json::Value) -> serde_json::Value {
+    if let Some(kinds) = findings.as_object_mut() {
+        kinds.retain(|_, found| match found {
+            serde_json::Value::Array(found) => !found.is_empty(),
+            serde_json::Value::Object(found) => !found.is_empty(),
+            _ => true,
+        });
+    }
+    findings
+}
+
 fn millis(time: SystemTime) -> u64 {
     time.duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_millis() as u64)
@@ -101,6 +113,10 @@ pub fn record(
                 shadow: record
                     .and_then(|record| record.shadow.as_ref())
                     .and_then(|shadow| serde_json::to_value(shadow).ok()),
+                audit: record
+                    .and_then(|record| record.audit.as_ref())
+                    .and_then(|findings| serde_json::to_value(findings).ok())
+                    .map(found),
             }
         })
         .collect();

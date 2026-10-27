@@ -1285,6 +1285,8 @@ impl Cache {
             bytes: 256 * 1024 * 1024,
             accesses: 500_000,
             keep: Some(&keep),
+            // A path set names what a task read by the paths it named.
+            resolved: false,
         };
         recording.settle().map_err(failed)?;
         let (accesses, diagnostics) =

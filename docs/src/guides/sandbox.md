@@ -182,6 +182,34 @@ process, without root and inside containers. It can refuse but not report:
 a refused access fails the task with `Permission denied` rather than being
 listed.
 
+### Auditing recorded runs
+
+With `--record`, `--sandbox` audits what the cache records instead of
+recording again, and the cache stays on. `QK_RECORD=audit` does the same
+as `--record --sandbox`, for CI, which sets it once for every run:
+
+```text
+$ QK_RECORD=audit qk run-many -t build
+…
+Sandbox audit: 1 of 4 tasks went beyond what they declare
+  app:build
+    1 read outside its inputs:
+      other/notes.txt
+  12 tasks not audited, as restored from the cache or not recorded
+```
+
+Only tasks with [`qk:ultracache`](ultracache.md) are recorded, and only those
+that run are audited: a task restored from the cache did nothing. An audit
+costs reading each recorded task's trace a second time, as the audit reads
+installed packages' manifests that a path set leaves out. `--report` gives
+each task audited its findings as `audit`, by the kinds `--sandbox-report`
+names, those with nothing left out: `{}` for a task that kept to its
+declarations. A task not audited has no `audit`, and the run history keeps
+it with the rest of the task.
+
+Enforce cannot be combined with `--record`, since what it refuses would
+change the results the cache keeps.
+
 Landlock holds paths that exist, so each task's rules are built as it
 starts, after its dependencies have written their outputs. An output
 directory that does not exist yet is created then, and removed again if the

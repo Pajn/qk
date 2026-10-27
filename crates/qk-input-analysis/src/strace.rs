@@ -30,6 +30,10 @@ pub struct Limits<'a> {
     pub accesses: usize,
     /// Whether an access to an absolute path is kept; `None` keeps all.
     pub keep: Option<&'a dyn Fn(&Path) -> bool>,
+    /// Whether an access is also kept by what its path's links lead to, as
+    /// a read through a workspace package linked into `node_modules` reads
+    /// that package.
+    pub resolved: bool,
 }
 
 /// What `inputs analyze` reads of a trace: every access, within a budget
@@ -39,6 +43,7 @@ pub const ANALYSIS: Limits<'static> = Limits {
     bytes: 32 * 1024 * 1024,
     accesses: 100_000,
     keep: None,
+    resolved: false,
 };
 
 /// A cwd no path can be in, to tell a line whose paths depend on the
@@ -48,10 +53,21 @@ pub const ANALYSIS: Limits<'static> = Limits {
 static UNKNOWN_CWD: std::sync::LazyLock<PathBuf> =
     std::sync::LazyLock::new(|| std::iter::once("/").chain(["\0"; 64]).collect());
 
+/// Whether an access is kept under `keep`: by the path it names, or with
+/// `resolved` by what that path's links lead to.
+fn kept(event: &Access, keep: &dyn Fn(&Path) -> bool, resolved: bool) -> bool {
+    keep(Path::new(&event.path))
+        || (resolved
+            && event
+                .resolved_path
+                .as_deref()
+                .is_some_and(|resolved| keep(Path::new(resolved))))
+}
+
 /// Whether a trace line can matter under `keep`: it changes a process's
 /// working directory or makes a process, names a path relative to the
 /// working directory, cannot be decoded, or names a kept path.
-fn relevant(process: u32, call: &str, keep: &dyn Fn(&Path) -> bool) -> bool {
+fn relevant(process: u32, call: &str, keep: &dyn Fn(&Path) -> bool, resolved: bool) -> bool {
     let unknown = UNKNOWN_CWD.as_path();
     let Some((events, change, child)) = decode(process, call, unknown) else {
         return true;
@@ -63,7 +79,7 @@ fn relevant(process: u32, call: &str, keep: &dyn Fn(&Path) -> bool) -> bool {
             // Still somewhere below the unknown cwd, after any `..`.
             path.components()
                 .any(|component| component.as_os_str() == "\0")
-                || keep(path)
+                || kept(event, keep, resolved)
         })
 }
 
@@ -136,7 +152,7 @@ pub fn collect_within(
             };
             if limits
                 .keep
-                .is_some_and(|keep| !relevant(process, &call, keep))
+                .is_some_and(|keep| !relevant(process, &call, keep, limits.resolved))
             {
                 continue;
             }
@@ -164,11 +180,11 @@ pub fn collect_within(
             .clone();
         match decode(process, &call, &current) {
             Some((events, change, child)) => {
-                accesses.extend(
-                    events.into_iter().filter(|event| {
-                        limits.keep.is_none_or(|keep| keep(Path::new(&event.path)))
-                    }),
-                );
+                accesses.extend(events.into_iter().filter(|event| {
+                    limits
+                        .keep
+                        .is_none_or(|keep| kept(event, keep, limits.resolved))
+                }));
                 if let Some(directory) = change {
                     directories.insert(process, directory);
                 }
@@ -618,6 +634,8 @@ mod tests {
             concat!(
                 "1.000 openat(AT_FDCWD</repo>, \"node_modules/x/index.js\", O_RDONLY) = 3</repo/node_modules/x/index.js>\n",
                 "1.001 openat(AT_FDCWD</repo>, \"src/a.ts\", O_RDONLY) = 3</repo/src/a.ts>\n",
+                // A workspace package linked into node_modules.
+                "1.0015 openat(AT_FDCWD</repo>, \"node_modules/lib/index.ts\", O_RDONLY) = 3</repo/libs/lib/index.ts>\n",
                 "1.002 openat(AT_FDCWD</repo>, \"/usr/lib/libc.so\", O_RDONLY) = 3</usr/lib/libc.so>\n",
                 "1.003 chdir(\"lib\") = 0\n",
                 // Relative to the working directory, which the filter cannot
@@ -630,17 +648,38 @@ mod tests {
             |path: &Path| path.starts_with("/repo") && !path.starts_with("/repo/node_modules");
         let limits = Limits {
             keep: Some(&keep),
+            resolved: true,
             ..ANALYSIS
         };
         let (events, diagnostics) =
             collect_within(directory.path(), Path::new("/repo"), &limits).unwrap();
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         let paths: Vec<&str> = events.iter().map(|event| event.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "/repo/src/a.ts",
+                "/repo/node_modules/lib/index.ts",
+                "/repo/src/b.ts"
+            ]
+        );
+        assert_eq!(
+            events[1].resolved_path.as_deref(),
+            Some("/repo/libs/lib/index.ts")
+        );
+        // Without `resolved`, only by the path it names.
+        let named = Limits {
+            keep: Some(&keep),
+            ..ANALYSIS
+        };
+        let (events, _) = collect_within(directory.path(), Path::new("/repo"), &named).unwrap();
+        let paths: Vec<&str> = events.iter().map(|event| event.path.as_str()).collect();
         assert_eq!(paths, ["/repo/src/a.ts", "/repo/src/b.ts"]);
         // Only kept accesses count toward the budget.
         let tight = Limits {
-            accesses: 2,
+            accesses: 3,
             keep: Some(&keep),
+            resolved: true,
             ..ANALYSIS
         };
         let (_, diagnostics) =
