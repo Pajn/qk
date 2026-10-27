@@ -404,6 +404,9 @@ impl Recorder {
                 suggestion_notes: vec![],
                 access_review: Default::default(),
                 unkeyed_packages: BTreeMap::new(),
+                names_external_dependencies: self.declared.tasks[id]
+                    .as_ref()
+                    .is_ok_and(|resolved| resolved.declared.external_declared),
             };
             analysis.summarize(&run_id);
             tasks.insert(id.clone(), analysis);

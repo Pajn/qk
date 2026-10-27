@@ -42,7 +42,12 @@ naming its `externalDependencies`, even none, keys only what its projects'
 importers install and the packages it names, so a tool only the root installs
 must be named. `unkeyedPackages` lists each such package with how many of its
 files were read, and the terminal names them with the fix: add each to the
-target's `externalDependencies`. Other `node_modules` accesses are
+target's `externalDependencies`. A task without an `externalDependencies`
+input keys every package its importers install and what those depend on, so a
+package it still leaves out is one nothing they install depends on, found
+through pnpm's hoisting; `namesExternalDependencies` tells the two apart, and
+the terminal says to declare such a package as a dependency of the package
+importing it. Other `node_modules` accesses are
 `installedPackage`: in an installation the key covers, outside pnpm's store,
 or in a store directory no lockfile snapshot names.
 

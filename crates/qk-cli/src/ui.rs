@@ -653,19 +653,27 @@ pub fn sandbox_summary(sandbox: &qk_runner::SandboxResult, tasks: usize, paint: 
         .filter(|(_, count)| many(**count))
         .map(|(path, _)| *path)
         .collect();
-    let mut package_readers: BTreeMap<&str, usize> = BTreeMap::new();
-    for findings in sandbox.findings.values() {
-        for package in &findings.unkeyed_packages {
-            *package_readers.entry(package.as_str()).or_insert(0) += 1;
+    // Packages read by many tasks, of those naming their external
+    // dependencies and of those found through hoisting.
+    let readers_of = |kind: fn(&qk_runner::sandbox::Findings) -> &BTreeSet<String>| {
+        let mut readers: BTreeMap<&str, usize> = BTreeMap::new();
+        for findings in sandbox.findings.values() {
+            for package in kind(findings) {
+                *readers.entry(package.as_str()).or_insert(0) += 1;
+            }
         }
-    }
-    package_readers.retain(|_, count| many(*count));
+        readers.retain(|_, count| many(*count));
+        readers
+    };
+    let package_readers = readers_of(|findings| &findings.unkeyed_packages);
+    let hoisted_readers = readers_of(|findings| &findings.hoisted_packages);
     let mut lines = Vec::new();
     let restored = sandbox.restored.len();
     let tasks = tasks.saturating_sub(restored);
     type Own<'a> = (
         &'a String,
         &'a qk_runner::sandbox::Findings,
+        Vec<&'a String>,
         Vec<&'a String>,
         Vec<&'a String>,
     );
@@ -683,11 +691,17 @@ pub fn sandbox_summary(sandbox: &qk_runner::SandboxResult, tasks: usize, paint: 
                 .iter()
                 .filter(|package| !package_readers.contains_key(package.as_str()))
                 .collect::<Vec<_>>();
-            (id, findings, reads, packages)
+            let hoisted = findings
+                .hoisted_packages
+                .iter()
+                .filter(|package| !hoisted_readers.contains_key(package.as_str()))
+                .collect::<Vec<_>>();
+            (id, findings, reads, packages, hoisted)
         })
-        .filter(|(_, findings, reads, packages)| {
+        .filter(|(_, findings, reads, packages, hoisted)| {
             !reads.is_empty()
                 || !packages.is_empty()
+                || !hoisted.is_empty()
                 || !findings.tsconfig_reads.is_empty()
                 || !findings.dependency_reads.is_empty()
                 || !findings.unkeyed_reads.is_empty()
@@ -766,23 +780,31 @@ pub fn sandbox_summary(sandbox: &qk_runner::SandboxResult, tasks: usize, paint: 
             "  ",
         );
     }
-    if !package_readers.is_empty() {
-        let packages: Vec<String> = package_readers
+    let counted = |readers: &BTreeMap<&str, usize>| -> Vec<String> {
+        readers
             .iter()
             .map(|(package, tasks)| format!("{package} ({tasks} tasks)"))
-            .collect();
-        list(
-            &format!(
-                "installed package{} read by many tasks, not in their keys; name {} in each one's externalDependencies",
-                if packages.len() == 1 { "" } else { "s" },
-                if packages.len() == 1 { "it" } else { "them" },
-            ),
-            &packages.iter().collect::<Vec<_>>(),
-            &mut lines,
-            "  ",
-        );
-    }
-    for (id, findings, reads, packages) in own {
+            .collect()
+    };
+    let packages = counted(&package_readers);
+    list(
+        &format!(
+            "installed package{} read by many tasks, not in their keys; name {} in each one's externalDependencies",
+            if packages.len() == 1 { "" } else { "s" },
+            if packages.len() == 1 { "it" } else { "them" },
+        ),
+        &packages.iter().collect::<Vec<_>>(),
+        &mut lines,
+        "  ",
+    );
+    let hoisted = counted(&hoisted_readers);
+    list(
+        &hoisted_label(true, hoisted.len()),
+        &hoisted.iter().collect::<Vec<_>>(),
+        &mut lines,
+        "  ",
+    );
+    for (id, findings, reads, packages, hoisted) in own {
         lines.push(format!("  {id}"));
         list("read outside its inputs", &reads, &mut lines, "    ");
         // Each project's files are named in the report; here, how many.
@@ -834,6 +856,12 @@ pub fn sandbox_summary(sandbox: &qk_runner::SandboxResult, tasks: usize, paint: 
             "    ",
         );
         list(
+            &hoisted_label(false, hoisted.len()),
+            &hoisted,
+            &mut lines,
+            "    ",
+        );
+        list(
             "written outside its outputs",
             &findings.stray_writes.iter().collect::<Vec<_>>(),
             &mut lines,
@@ -876,6 +904,19 @@ pub fn sandbox_summary(sandbox: &qk_runner::SandboxResult, tasks: usize, paint: 
         )));
     }
     lines.join("\n") + "\n"
+}
+
+/// What a list of installed packages the key leaves out although it counts
+/// every installed package of its importers says: none of those depends on
+/// them, so a package found them through pnpm's hoisting.
+fn hoisted_label(by_many: bool, count: usize) -> String {
+    format!(
+        "installed package{} read {}that nothing {} importers install depends on, found through pnpm's hoisting; declare {} as a dependency of the package importing it",
+        if count == 1 { "" } else { "s" },
+        if by_many { "by many tasks, " } else { "" },
+        if by_many { "their" } else { "its" },
+        if count == 1 { "it" } else { "each" },
+    )
 }
 
 pub fn summary(

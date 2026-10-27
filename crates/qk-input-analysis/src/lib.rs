@@ -136,6 +136,12 @@ pub struct TaskAnalysis {
     /// many of their files were read.
     #[serde(default)]
     pub unkeyed_packages: BTreeMap<String, usize>,
+    /// Whether the key names its `externalDependencies`, even none, in place
+    /// of every package its importers install. Without, a package it leaves
+    /// out is one nothing they install depends on, found through pnpm's
+    /// hoisting, which naming it in `externalDependencies` would not fix.
+    #[serde(default)]
+    pub names_external_dependencies: bool,
 }
 
 /// Review groups never discard the raw uncovered accesses.
@@ -361,6 +367,7 @@ mod tests {
             suggestion_notes: vec![],
             access_review: AccessReview::default(),
             unkeyed_packages: BTreeMap::new(),
+            names_external_dependencies: false,
         };
         task.summarize(path);
         task

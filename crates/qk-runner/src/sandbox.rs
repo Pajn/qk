@@ -87,8 +87,15 @@ pub struct Findings {
     pub unkeyed_reads: BTreeSet<String>,
     /// Paths it wrote in the workspace outside its outputs.
     pub stray_writes: BTreeSet<String>,
-    /// Installed packages it read that its key leaves out, by name.
+    /// Installed packages it read that its key leaves out, by name, when
+    /// it names its `externalDependencies`: naming them there keys them.
     pub unkeyed_packages: BTreeSet<String>,
+    /// Installed packages it read that its key leaves out although it counts
+    /// every package its importers install: none of those depends on them,
+    /// so a package found them through pnpm's hoisting, which links every
+    /// installed package where any can resolve it. Declaring each as a
+    /// dependency of what imports it keys it.
+    pub hoisted_packages: BTreeSet<String>,
 }
 
 impl Findings {
@@ -101,6 +108,7 @@ impl Findings {
             && self.unkeyed_reads.is_empty()
             && self.stray_writes.is_empty()
             && self.unkeyed_packages.is_empty()
+            && self.hoisted_packages.is_empty()
     }
 }
 
@@ -172,6 +180,9 @@ pub struct Sandbox {
     /// covers, for telling which package a reported read belongs to.
     installs: Option<Installs>,
     covered: BTreeMap<String, BTreeSet<String>>,
+    /// The tasks whose key names their `externalDependencies`, even none, in
+    /// place of what their importers install.
+    naming_external: BTreeSet<String>,
     /// The projects each task's project depends on, directly or not, by name
     /// with their roots, innermost first.
     depended: BTreeMap<String, Vec<(String, String)>>,
@@ -253,6 +264,7 @@ impl Sandbox {
         let depended = depended(workspace, graph)?;
         let mut plans = BTreeMap::new();
         let mut covered = BTreeMap::new();
+        let mut naming_external = BTreeSet::new();
         let mut unsandboxed = BTreeMap::new();
         for (id, task) in &graph.tasks {
             if task.definition.extra.get("qk:sandbox") == Some(&serde_json::Value::Bool(false)) {
@@ -269,6 +281,9 @@ impl Sandbox {
                         let (keyed_directories, unkeyed) = installs.directories(&keyed);
                         plan.packages = Some(Packages::shorter(keyed_directories, unkeyed));
                         covered.insert(id.clone(), keyed);
+                        if resolved.declared.external_declared {
+                            naming_external.insert(id.clone());
+                        }
                     }
                     plans.insert(id.clone(), plan);
                 }
@@ -285,6 +300,7 @@ impl Sandbox {
             profiles: BTreeMap::new(),
             installs,
             covered,
+            naming_external,
             depended,
             unsandboxed: Mutex::new(unsandboxed),
             packages_unchecked: BTreeMap::new(),
@@ -610,9 +626,14 @@ impl Sandbox {
                 .flatten()
                 .find(|(_, root)| relative.starts_with(&format!("{root}/")))
                 .map(|(project, _)| project.clone());
+            let naming_external = self.naming_external.contains(&report.task);
             let entry = findings.entry(report.task).or_default();
             if let Some(package) = package {
-                entry.unkeyed_packages.insert(package);
+                if naming_external {
+                    entry.unkeyed_packages.insert(package);
+                } else {
+                    entry.hoisted_packages.insert(package);
+                }
             } else if report.operation.starts_with("file-write") {
                 entry.stray_writes.insert(relative);
             } else if unkeyed(&relative) {
