@@ -30,6 +30,7 @@ fn task(
         cores: None,
         cpu: None,
         shadow: None,
+        audit: None,
     }
 }
 
@@ -372,6 +373,7 @@ fn upgrades_schema_three_without_inventing_logs() {
              ALTER TABLE tasks DROP COLUMN cpu;
              ALTER TABLE tasks DROP COLUMN recorded;
              ALTER TABLE tasks DROP COLUMN shadow;
+             ALTER TABLE tasks DROP COLUMN audit;
              ALTER TABLE runs DROP COLUMN worktree;
              UPDATE schema_version SET version = 3;",
         )
@@ -472,6 +474,7 @@ fn records_the_memory_a_task_used_after_upgrading_schema_four() {
              ALTER TABLE tasks DROP COLUMN cpu;
              ALTER TABLE tasks DROP COLUMN recorded;
              ALTER TABLE tasks DROP COLUMN shadow;
+             ALTER TABLE tasks DROP COLUMN audit;
              ALTER TABLE runs DROP COLUMN worktree;
              UPDATE schema_version SET version = 4;",
         )
@@ -517,6 +520,7 @@ fn keeps_how_recordings_keyed_a_task_after_upgrading_schema_seven() {
         .execute_batch(
             "ALTER TABLE tasks DROP COLUMN recorded;
              ALTER TABLE tasks DROP COLUMN shadow;
+             ALTER TABLE tasks DROP COLUMN audit;
              UPDATE schema_version SET version = 7;",
         )
         .unwrap();
@@ -542,6 +546,51 @@ fn keeps_how_recordings_keyed_a_task_after_upgrading_schema_seven() {
                 Some(json!({"kind": "wouldHit", "key": "r"}))
             ),
             ("old".to_owned(), None, None)
+        ]
+    );
+}
+
+/// What an audit found of a task is kept, so that a run read back says what
+/// its report said. Runs recorded before schema nine stay readable, without.
+#[test]
+fn keeps_what_an_audit_found_after_upgrading_schema_eight() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("history.db");
+    let mut history = History::open(&path).unwrap();
+    history
+        .record(
+            run("old", 1, vec![task("app:test", Some("k"), 1, 2, &[])]),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+    drop(history);
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "ALTER TABLE tasks DROP COLUMN audit;
+             UPDATE schema_version SET version = 8;",
+        )
+        .unwrap();
+    let mut history = History::open(&path).unwrap();
+    let mut test = task("app:test", Some("k"), 10, 20, &[]);
+    test.audit = Some(json!({"undeclaredReads": ["notes.txt"]}));
+    history
+        .record(run("new", 10, vec![test]), &BTreeMap::new())
+        .unwrap();
+    let kept: Vec<_> = history
+        .task("app:test", 10)
+        .unwrap()
+        .into_iter()
+        .map(|(run, task)| (run, task.audit))
+        .collect();
+    assert_eq!(
+        kept,
+        [
+            (
+                "new".to_owned(),
+                Some(json!({"undeclaredReads": ["notes.txt"]}))
+            ),
+            ("old".to_owned(), None)
         ]
     );
 }
@@ -608,6 +657,7 @@ fn upgrades_schema_five_to_record_worktrees() {
              ALTER TABLE tasks DROP COLUMN cpu;
              ALTER TABLE tasks DROP COLUMN recorded;
              ALTER TABLE tasks DROP COLUMN shadow;
+             ALTER TABLE tasks DROP COLUMN audit;
              UPDATE schema_version SET version = 5;",
         )
         .unwrap();

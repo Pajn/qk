@@ -207,6 +207,11 @@ Two more things tell whether `"on"` would be right:
   `uncovered` names instead what it holds that the declared inputs do not
   cover, one of which changed.
 
+The recordings also show what a task read beyond its declared inputs at
+all: `QK_RECORD=audit` holds each task that runs against its declarations,
+as `--sandbox` does, from the recording it already made. See [Auditing
+recorded runs](sandbox.md#auditing-recorded-runs).
+
 Looking a task up by its recordings costs the request for its path sets
 whenever it has none of its own, even when its declared inputs hit the local
 cache: that is where a stale hit would show. Switching to `"on"` keys it by them.

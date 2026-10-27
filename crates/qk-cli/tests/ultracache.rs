@@ -571,3 +571,57 @@ fn mode_record_looks_up_shared_recordings_behind_a_local_declared_hit() {
         (Some("local-hit"), "wouldHit")
     );
 }
+
+/// `--record --sandbox`, or `QK_RECORD=audit`, audits each task the cache
+/// records from its recording, the cache staying on: a task that runs is
+/// audited, one restored from the cache is not.
+#[test]
+fn a_recorded_run_audits_the_tasks_it_records() {
+    if !has_strace() {
+        return;
+    }
+    let temp = fixture();
+    let root = temp.path();
+    // And a workspace package linked into node_modules, read where it leads.
+    fs::create_dir_all(root.join("libs/lib")).unwrap();
+    fs::create_dir_all(root.join("node_modules")).unwrap();
+    write(root, "libs/lib/notes.txt", "notes\n");
+    std::os::unix::fs::symlink("../libs/lib", root.join("node_modules/lib")).unwrap();
+    let project = fs::read_to_string(root.join("app/project.json")).unwrap();
+    write(
+        root,
+        "app/project.json",
+        &project.replace(
+            "mkdir -p dist && ",
+            "mkdir -p dist && cat ../README.md ../node_modules/lib/notes.txt > /dev/null && ",
+        ),
+    );
+    let report = root.join(".git/report.json");
+    let args = ["run", "app:build", "--report", report.to_str().unwrap()];
+    let first = qk(root, &[&args[..], &["--record", "--sandbox"]].concat(), &[]);
+    let stderr = String::from_utf8_lossy(&first.stderr);
+    assert!(
+        stderr.contains("Sandbox audit: 1 of 1 tasks went beyond what they declare"),
+        "{stderr}"
+    );
+    let run: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+    let task = &run["tasks"][0];
+    assert_eq!(task["cache"], "miss");
+    assert_eq!(kind(&task["recorded"]), "saved");
+    assert_eq!(
+        task["audit"],
+        json!({"undeclaredReads": ["README.md", "libs/lib/notes.txt"]})
+    );
+    let second = qk(root, &args, &[("QK_RECORD", "audit")]);
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        stderr.contains(
+            "Sandbox audit: no recorded task ran\n  1 task not audited, as restored from the cache or not recorded"
+        ),
+        "{stderr}"
+    );
+    let run: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+    let task = &run["tasks"][0];
+    assert_eq!(task["cache"], "local-hit");
+    assert!(task.get("audit").is_none(), "{task}");
+}

@@ -3188,6 +3188,48 @@ fn can_audit() -> bool {
     found
 }
 
+/// A workspace package linked into `node_modules` is read where the link
+/// leads: a file there outside the task's inputs is reported as such.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn the_sandbox_reports_a_read_through_a_linked_workspace_package() {
+    if !can_audit() {
+        return;
+    }
+    let _audit = AUDIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = fixture(json!({
+        "build": {
+            "command": "cat src/in.txt node_modules/lib/notes.txt > /dev/null",
+            "inputs": ["{projectRoot}/src/**/*"]
+        }
+    }));
+    fs::create_dir_all(temp.path().join("src")).unwrap();
+    fs::create_dir_all(temp.path().join("libs/lib")).unwrap();
+    fs::create_dir_all(temp.path().join("node_modules")).unwrap();
+    fs::write(temp.path().join("src/in.txt"), "in").unwrap();
+    fs::write(temp.path().join("libs/lib/notes.txt"), "notes").unwrap();
+    std::os::unix::fs::symlink("../libs/lib", temp.path().join("node_modules/lib")).unwrap();
+    let report = temp.path().join("sandbox.json");
+    success(run(
+        temp.path(),
+        &[
+            "run",
+            "app:build",
+            "--sandbox",
+            "--sandbox-report",
+            report.to_str().unwrap(),
+        ],
+    ));
+    let findings: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+    assert_eq!(
+        findings["tasks"]["app:build"]["undeclaredReads"],
+        json!(["libs/lib/notes.txt"]),
+        "{findings}"
+    );
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn the_sandbox_reports_and_refuses_what_a_task_does_not_declare() {

@@ -4953,6 +4953,7 @@ fn tasks_wait_for_the_memory_they_are_expected_to_use() {
         cores: None,
         cpu: None,
         shadow: None,
+        audit: None,
     };
     qk_history::History::open(&fixture.root.join(".git/qk/history.db"))
         .unwrap()
@@ -5108,6 +5109,7 @@ fn earlier_run(fixture: &Fixture, tasks: &[(&str, u64, u64)]) {
         cores: Some(cores),
         cpu: None,
         shadow: None,
+        audit: None,
     };
     qk_history::History::open(&fixture.root.join(".git/qk/history.db"))
         .unwrap()

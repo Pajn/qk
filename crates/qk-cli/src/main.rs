@@ -231,7 +231,8 @@ struct RunOptions {
     /// Check what each task reads and writes in the workspace beyond what it
     /// declares: `audit` (the default) reports it, through Seatbelt on macOS
     /// and by recording the task on Linux; `enforce` refuses it, through
-    /// Seatbelt or Landlock. Tasks run without the cache.
+    /// Seatbelt or Landlock. Tasks run without the cache, except that with
+    /// `--record` on Linux an audit is of what the cache records.
     #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "audit", value_name = "MODE")]
     sandbox: Option<SandboxMode>,
     /// Write every sandbox finding to this file as JSON.
@@ -239,8 +240,13 @@ struct RunOptions {
     sandbox_report: Option<PathBuf>,
     /// Record what each task with `qk:ultracache` reads when it executes,
     /// and key its result by that; also QK_RECORD=true. Linux only.
+    /// QK_RECORD=audit also audits what it records, as `--sandbox` would.
     #[arg(long)]
     record: bool,
+    /// Whether this run neither records nor audits whatever QK_RECORD says,
+    /// as a run that has to execute to be audited.
+    #[arg(skip)]
+    unrecorded: bool,
     /// Nx options qk has no use for, accepted so Nx commands run unchanged.
     #[command(flatten)]
     ignored: IgnoredOptions,
@@ -450,9 +456,23 @@ impl RunOptions {
         self.skip_cache || env_flag("NX_SKIP_NX_CACHE") || env_flag("NX_DISABLE_NX_CACHE")
     }
 
-    /// `--record`, else QK_RECORD=true.
+    /// `--record`, else QK_RECORD=true or QK_RECORD=audit.
     fn records(&self) -> bool {
-        self.record || env_flag("QK_RECORD")
+        !self.unrecorded
+            && (self.record
+                || env_flag("QK_RECORD")
+                || std::env::var("QK_RECORD").as_deref() == Ok("audit"))
+    }
+
+    /// `--sandbox`, else on Linux an audit of what is recorded with
+    /// QK_RECORD=audit. Elsewhere that records nothing, so audits nothing.
+    fn sandbox_mode(&self) -> Option<SandboxMode> {
+        self.sandbox.or_else(|| {
+            (cfg!(target_os = "linux")
+                && self.records()
+                && std::env::var("QK_RECORD").as_deref() == Ok("audit"))
+            .then_some(SandboxMode::Audit)
+        })
     }
 
     /// `--nx-bail`, else NX_BAIL=true, as Nx reads it.
@@ -1223,6 +1243,9 @@ fn run(mut cli: Cli) -> Result<i32> {
             let report = report_dir.path().join("report.json");
             options.sandbox = Some(options.sandbox.unwrap_or(SandboxMode::Audit));
             options.sandbox_report = Some(report.clone());
+            // Suggested from what the task does as it runs, not from the
+            // cache.
+            options.unrecorded = true;
             let code = run_task(&workspace, task.clone(), &options)?;
             if code != 0 {
                 return Ok(code);
@@ -1755,9 +1778,11 @@ fn execute_narrowed(
         qk_cache::profile::enable();
     }
     options.export();
-    // A sandboxed task has to run to be observed.
-    let skip_cache =
-        options.skips_cache() || options.sandbox.is_some() || options.input_analysis.is_some();
+    // A sandboxed task has to run to be observed, unless its audit is of
+    // what the cache records.
+    let skip_cache = options.skips_cache()
+        || (options.sandbox_mode().is_some() && !options.records())
+        || options.input_analysis.is_some();
     // The root dotenv files can hold the remote store's credentials.
     let environment = qk_executor::environment(&workspace.root);
     // What tasks are expected to take is fetched while the run gets ready to
@@ -1954,7 +1979,7 @@ fn execute_narrowed(
                 specified,
                 Some(OutputStyle::Static | OutputStyle::StaticFailuresOnly | OutputStyle::Summary)
             ),
-            sandbox: options.sandbox.map(|mode| match mode {
+            sandbox: options.sandbox_mode().map(|mode| match mode {
                 SandboxMode::Audit => qk_runner::sandbox::Mode::Audit,
                 SandboxMode::Enforce => qk_runner::sandbox::Mode::Enforce,
             }),

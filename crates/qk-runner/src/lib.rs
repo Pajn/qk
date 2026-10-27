@@ -65,6 +65,11 @@ pub struct SandboxResult {
     pub findings: BTreeMap<String, sandbox::Findings>,
     pub unsandboxed: BTreeMap<String, String>,
     pub packages_unchecked: BTreeMap<String, String>,
+    /// Audit: the tasks held to their plans.
+    pub audited: BTreeSet<String>,
+    /// Whether the audit was of what `--record` recorded, which leaves out
+    /// the tasks restored from the cache and those not recorded.
+    pub from_recordings: bool,
 }
 
 /// Runs a task without the cache, keeping its log for `qk show log` as a
@@ -87,18 +92,23 @@ fn execute_retained(
 
 /// Gives each cacheable task with `qk:ultracache` a recording, in a directory
 /// of its own: strace follows its processes, filtering in the kernel where
-/// strace can. Elsewhere than on Linux nothing is recorded, and that is said
-/// once.
+/// strace can. With `resolving`, an opened file's path is recorded with what
+/// its links lead to, as an audit reads it. Elsewhere than on Linux nothing
+/// is recorded, and that is said once.
 fn attach_recordings(
     graph: &TaskGraph,
     prepared: &mut BTreeMap<String, qk_executor::PreparedTask>,
+    resolving: bool,
 ) -> Result<Option<tempfile::TempDir>> {
     if !cfg!(target_os = "linux") {
         qk_executor::status!("qk: --record records only on Linux; this run records nothing");
         return Ok(None);
     }
     let directory = tempfile::tempdir().context("cannot create a directory for recordings")?;
-    let recording = qk_executor::Recording::probe(directory.path())?;
+    let mut recording = qk_executor::Recording::probe(directory.path())?;
+    if resolving {
+        recording = recording.resolving();
+    }
     for (index, (id, task)) in graph.tasks.iter().enumerate() {
         let opted = task.definition.cache == Some(true)
             && task.definition.continuous != Some(true)
@@ -147,6 +157,9 @@ pub struct TaskRecord {
     /// What the recordings of a task with `qk:ultracache` mode `"record"`
     /// would have done.
     pub shadow: Option<qk_cache::Shadow>,
+    /// Under `--sandbox=audit`, what an audited task did beyond its
+    /// declarations, empty when nothing.
+    pub audit: Option<sandbox::Findings>,
 }
 
 /// How long a task can be expected to run, and the memory it can be expected
@@ -192,7 +205,9 @@ pub struct Settings<'a> {
     /// Execute finite tasks under an advisory file-access recorder.
     pub analyze_inputs: bool,
     /// Record what each task with `qk:ultracache` that executes reads, and
-    /// key its result by that: see `qk_cache::recorded`. Linux only.
+    /// key its result by that: see `qk_cache::recorded`. Linux only. With
+    /// `sandbox` in audit mode, the tasks recorded are audited from their
+    /// recordings, and the cache stays on.
     pub record: bool,
     /// What each task is expected to take; a task without one is expected to
     /// take no time.
@@ -225,11 +240,13 @@ pub fn run(
     if analyze_inputs && sandbox_mode.is_some() {
         bail!("input analysis and sandbox enforcement/audit cannot be combined");
     }
-    if record && (analyze_inputs || sandbox_mode.is_some() || skip_cache) {
+    if record && (analyze_inputs || sandbox_mode == Some(sandbox::Mode::Enforce) || skip_cache) {
         bail!(
-            "--record keys results in the cache, so it cannot be combined with --sandbox, inputs analyze or skipping the cache"
+            "--record keys results in the cache, so it cannot be combined with --sandbox=enforce, inputs analyze or skipping the cache"
         );
     }
+    // Audited from what the cache records, rather than run without it.
+    let audits_recordings = record && sandbox_mode == Some(sandbox::Mode::Audit);
     let skip_cache = skip_cache || analyze_inputs;
     if parallel == 0 || cores == 0 {
         bail!("parallel and cores must be at least 1");
@@ -317,14 +334,14 @@ pub fn run(
         task.interactive = true;
     }
     let sandbox = sandbox_mode
-        .map(|mode| sandbox::Sandbox::start(workspace, graph, mode))
+        .map(|mode| sandbox::Sandbox::start(workspace, graph, mode, audits_recordings))
         .transpose()?;
     let recorder = analyze_inputs
         .then(|| recorder::Recorder::start(workspace, graph, &mut prepared))
         .transpose()?;
     // Traces of the tasks this run records, kept until it ends.
     let _recordings = record
-        .then(|| attach_recordings(graph, &mut prepared))
+        .then(|| attach_recordings(graph, &mut prepared, audits_recordings))
         .transpose()?
         .flatten();
     // As in Nx 24.0.1, a task waiting for a server with a `signal` check may
@@ -481,7 +498,7 @@ pub fn run(
     // As in Nx, every task is hashed, and sees its hash as NX_TASK_HASH,
     // whether or not anything can be cached; a run that cannot use the
     // cache only observes. A sandboxed or recorded task runs as it is.
-    let cache = if sandbox.is_some() || analyze_inputs {
+    let cache = if (sandbox.is_some() && !audits_recordings) || analyze_inputs {
         None
     } else if skip_cache || !(warm || cacheable) {
         Some(qk_cache::Cache::for_observation(workspace))
@@ -1053,6 +1070,17 @@ pub fn run(
                         } else {
                             outcome
                         };
+                        // A task restored from the cache did not run, so its
+                        // recording holds nothing to audit.
+                        if let (Some(sandbox), Some(recording)) =
+                            (&sandbox, prepared[&id].recording.as_ref())
+                            && matches!(
+                                cache,
+                                qk_cache::CacheStatus::Miss | qk_cache::CacheStatus::Uncached
+                            )
+                        {
+                            sandbox.audit_recorded(&id, recording, &prepared[&id].cwd);
+                        }
                         // Stopping a continuous task on purpose is its normal end.
                         let outcome = if stopping.contains(&id) && outcome == Outcome::Cancelled {
                             report::event(Event::Stopped { id: id.clone() });
@@ -1107,6 +1135,7 @@ pub fn run(
                                 execution,
                                 recorded,
                                 shadow,
+                                audit: None,
                             },
                         );
                         outcomes.insert(id, outcome);
@@ -1141,11 +1170,21 @@ pub fn run(
             finished
                 .packages_unchecked
                 .retain(|id, _| records.contains_key(id));
+            finished.audited.retain(|id| records.contains_key(id));
+            if mode == sandbox::Mode::Audit {
+                for id in &finished.audited {
+                    if let Some(record) = records.get_mut(id) {
+                        record.audit = Some(finished.findings.get(id).cloned().unwrap_or_default());
+                    }
+                }
+            }
             Ok(SandboxResult {
                 mode,
                 findings: finished.findings,
                 unsandboxed: finished.unsandboxed,
                 packages_unchecked: finished.packages_unchecked,
+                audited: finished.audited,
+                from_recordings: audits_recordings,
             })
         })
         .transpose()?;
