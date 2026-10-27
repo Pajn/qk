@@ -1311,6 +1311,8 @@ impl Cache {
             keep: Some(&keep),
             // A path set names what a task read by the paths it named.
             resolved: false,
+            // And names each once, whichever processes read it.
+            distinct: true,
         };
         recording.settle().map_err(failed)?;
         let (accesses, diagnostics) =

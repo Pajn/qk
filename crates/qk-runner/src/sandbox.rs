@@ -458,6 +458,8 @@ impl Sandbox {
             accesses: 500_000,
             keep: Some(&keep),
             resolved: true,
+            // A finding names each path once, whichever process read it.
+            distinct: true,
         };
         for (id, (recording, cwd)) in traces {
             let collected = recording.settle().and_then(|()| {

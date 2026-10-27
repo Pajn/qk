@@ -8,7 +8,7 @@ use serde_json::Value;
 pub mod strace;
 mod suggestions;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Operation {
     ReadData,

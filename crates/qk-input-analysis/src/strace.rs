@@ -34,6 +34,11 @@ pub struct Limits<'a> {
     /// a read through a workspace package linked into `node_modules` reads
     /// that package.
     pub resolved: bool,
+    /// Whether an access the trace already holds, by any process, is left
+    /// out: where only what was accessed matters, a tool that reads the same
+    /// files in many processes, as a test runner's workers do, then counts
+    /// each once toward `accesses`.
+    pub distinct: bool,
 }
 
 /// What `inputs analyze` reads of a trace: every access, within a budget
@@ -44,6 +49,7 @@ pub const ANALYSIS: Limits<'static> = Limits {
     accesses: 100_000,
     keep: None,
     resolved: false,
+    distinct: false,
 };
 
 /// A cwd no path can be in, to tell a line whose paths depend on the
@@ -169,6 +175,7 @@ pub fn collect_within(
     records.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
     let mut directories = BTreeMap::new();
     let mut accesses = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     let mut undecoded = 0;
     let mut undecoded_names = std::collections::BTreeSet::new();
     // The first record not decoded, quoted so that a report names it.
@@ -184,6 +191,13 @@ pub fn collect_within(
                     limits
                         .keep
                         .is_none_or(|keep| kept(event, keep, limits.resolved))
+                        && (!limits.distinct
+                            || seen.insert((
+                                event.path.clone(),
+                                event.resolved_path.clone(),
+                                event.operation.clone(),
+                                event.result.clone(),
+                            )))
                 }));
                 if let Some(directory) = change {
                     directories.insert(process, directory);
@@ -598,6 +612,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(events[0].path, "/repo/sub/file");
+    }
+
+    #[test]
+    fn distinct_accesses_count_each_once_whichever_process_made_it() {
+        let directory = tempfile::tempdir().unwrap();
+        for (process, start) in [(1, 1), (2, 2)] {
+            std::fs::write(
+                directory.path().join(format!("command-0.{process}")),
+                format!(
+                    "{start}.000 newfstatat(AT_FDCWD, \"/repo/a.ts\", {{...}}, 0) = 0\n\
+                     {start}.001 newfstatat(AT_FDCWD, \"/repo/a.ts\", {{...}}, 0) = 0\n\
+                     {start}.002 newfstatat(AT_FDCWD, \"/repo/b.ts\", {{...}}, 0) = -1 ENOENT (No such file or directory)\n"
+                ),
+            )
+            .unwrap();
+        }
+        let tight = Limits {
+            accesses: 2,
+            ..ANALYSIS
+        };
+        let (events, diagnostics) =
+            collect_within(directory.path(), Path::new("/repo"), &tight).unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(
+            diagnostics[0].contains("exceeded 2 accesses"),
+            "{diagnostics:?}"
+        );
+        let distinct = Limits {
+            distinct: true,
+            ..tight
+        };
+        let (events, diagnostics) =
+            collect_within(directory.path(), Path::new("/repo"), &distinct).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let paths: Vec<&str> = events.iter().map(|event| event.path.as_str()).collect();
+        assert_eq!(paths, ["/repo/a.ts", "/repo/b.ts"]);
     }
 
     #[test]
