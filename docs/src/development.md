@@ -116,6 +116,15 @@ The names and targets are configured in `crates/qk-cli/Cargo.toml` under
 The workflow checks that all four are present before publishing. With
 `NPM_PUBLISH` unset, GitHub binary releases still run and npm publishing is skipped.
 
+The workflow also publishes every crate to crates.io through trusted publishing,
+with `tools/release/publish-crates.sh`. It publishes only the crates whose
+version crates.io does not hold yet, in dependency order. crates.io can be
+slow to list a crate it has just accepted, which fails the publishing of the
+crates depending on it, so the script tries again, publishing what is still
+missing. If publishing still stops partway, run the workflow by hand with the
+release's tag (`gh workflow run release.yml -f tag=v<version>`): that run
+publishes the release's missing crates and nothing else.
+
 To inspect packages locally after compiling the configured release targets:
 
 ```sh
