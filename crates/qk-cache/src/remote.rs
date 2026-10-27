@@ -18,6 +18,7 @@
 
 pub(crate) mod background;
 mod bloom;
+mod breaker;
 mod index;
 mod pack;
 mod prefetch;
@@ -364,7 +365,7 @@ impl Transport for Restart {
 fn stalled(stall: Duration) -> ureq::Error {
     ureq::Error::Io(std::io::Error::new(
         std::io::ErrorKind::TimedOut,
-        format!("the store sent nothing for {}s", stall.as_secs_f64()),
+        breaker::Stalled(stall),
     ))
 }
 
@@ -470,7 +471,7 @@ impl Remote {
         threshold: u64,
     ) -> Self {
         Remote {
-            store,
+            store: Box::new(breaker::Breaker::new(store)),
             mode,
             uploads: Mutex::new(None),
             background,
