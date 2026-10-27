@@ -11,6 +11,7 @@ pub mod profile;
 mod record;
 pub mod recorded;
 mod remote;
+pub mod scratch;
 mod store;
 pub mod ultracache;
 pub mod warm;
@@ -69,6 +70,20 @@ fn execute_uncached(
         inputs_unchanged: false,
     });
     Ok((outcome, execution))
+}
+
+/// A task's scratch directories, and all beneath them, as workspace globs:
+/// emptied before each run, nothing in them keys a recording.
+fn scratch_patterns<'a>(
+    root: &'a std::path::Path,
+    prepared: &'a PreparedTask,
+) -> impl Iterator<Item = Pattern> + 'a {
+    prepared.scratch.iter().filter_map(move |scratch| {
+        let relative = scratch.directory.strip_prefix(root).ok()?.to_str()?;
+        // Named exactly, though its name may hold what a glob reads.
+        let named = glob::escape(&relative.replace('\\', "/"));
+        Pattern::fileset(&named, false).ok()
+    })
 }
 
 /// The cache for one run; its workspace snapshot is taken on first use.
@@ -574,6 +589,7 @@ impl Cache {
                     .ignore_reads
                     .iter()
                     .filter_map(|glob| Pattern::new(glob, false).ok())
+                    .chain(scratch_patterns(&workspace.root, prepared))
                     .collect()
             })
             .unwrap_or_default();
@@ -1320,12 +1336,13 @@ impl Cache {
         if let Some(diagnostic) = diagnostics.first() {
             return Err(diagnostic.clone());
         }
-        let ignore = settings
+        let mut ignore = settings
             .ignore_reads
             .iter()
             .map(|glob| Pattern::new(glob, false))
             .collect::<Result<Vec<_>>>()
             .map_err(failed)?;
+        ignore.extend(scratch_patterns(&workspace.root, prepared));
         // qk's own directories, where they lie inside the workspace.
         let state = [self.root.clone(), worktree_state(&workspace.root)]
             .iter()

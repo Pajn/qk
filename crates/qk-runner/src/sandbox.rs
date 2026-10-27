@@ -126,8 +126,12 @@ struct Plan {
     read_files: Vec<PathBuf>,
     /// Its dependencies' outputs.
     read_trees: BTreeSet<PathBuf>,
-    /// Its outputs and warm paths.
+    /// Its outputs, warm paths and scratch directories.
     write_trees: BTreeSet<PathBuf>,
+    /// Its scratch directories, which are directories whatever their names:
+    /// Landlock, which holds only paths that exist, needs them made first.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    scratch: BTreeSet<PathBuf>,
     /// Audit: the pnpm store directories whose manifests' reads are
     /// reported, as the shorter list Seatbelt takes.
     packages: Option<Packages>,
@@ -183,6 +187,9 @@ pub struct Sandbox {
     /// The tasks whose key names their `externalDependencies`, even none, in
     /// place of what their importers install.
     naming_external: BTreeSet<String>,
+    /// Each task's `qk:ultracache.ignoreReads`: reads that change nothing it
+    /// does, which are no finding either.
+    ignored: BTreeMap<String, Vec<qk_cache::Pattern>>,
     /// The projects each task's project depends on, directly or not, by name
     /// with their roots, innermost first.
     depended: BTreeMap<String, Vec<(String, String)>>,
@@ -268,16 +275,46 @@ impl Sandbox {
         let mut plans = BTreeMap::new();
         let mut covered = BTreeMap::new();
         let mut naming_external = BTreeSet::new();
+        let mut ignored = BTreeMap::new();
+        // The files each list of ignored reads matches, walked once however
+        // many tasks share it.
+        let mut walked: BTreeMap<Vec<String>, Vec<PathBuf>> = BTreeMap::new();
         let mut unsandboxed = BTreeMap::new();
         for (id, task) in &graph.tasks {
-            if task.definition.extra.get("qk:sandbox") == Some(&serde_json::Value::Bool(false)) {
-                unsandboxed.insert(id.clone(), "its target sets \"qk:sandbox\": false".into());
-                continue;
+            match qk_cache::scratch::Settings::of(task.definition.extra.get("qk:sandbox")) {
+                Ok(settings) if settings.sandboxed => {}
+                Ok(_) => {
+                    unsandboxed.insert(id.clone(), "its target sets \"qk:sandbox\": false".into());
+                    continue;
+                }
+                Err(error) => {
+                    unsandboxed.insert(id.clone(), format!("{error:#}"));
+                    continue;
+                }
+            }
+            // Reads that change nothing it does, recorded or not.
+            let mut ignored_files = Vec::new();
+            if let Ok(written) = qk_cache::ultracache::ignored_reads(task) {
+                let globs: Vec<_> = written
+                    .iter()
+                    .filter_map(|glob| qk_cache::Pattern::new(glob, false).ok())
+                    .collect();
+                if !globs.is_empty() {
+                    ignored_files = walked
+                        .entry(written.clone())
+                        .or_insert_with(|| matching_files(&root, &written, &globs))
+                        .clone();
+                    ignored.insert(id.clone(), globs);
+                }
             }
             match &resolution.tasks[id] {
                 Ok(resolved) => {
                     let files = resolved.file_inputs().map(str::to_owned).collect();
                     let mut plan = plan(workspace, graph, task, &root, &tree, &files);
+                    // The files its ignored reads name, which it may read
+                    // under enforce too: Landlock and Seatbelt hold paths,
+                    // so a file made during the run is not among them.
+                    plan.read_files.extend(std::mem::take(&mut ignored_files));
                     if let Some(installs) = &installs
                         && let Some(keyed) = installs.covered(resolved)
                     {
@@ -304,6 +341,7 @@ impl Sandbox {
             installs,
             covered,
             naming_external,
+            ignored,
             depended,
             unsandboxed: Mutex::new(unsandboxed),
             packages_unchecked: BTreeMap::new(),
@@ -572,6 +610,11 @@ impl Sandbox {
                 self.created.lock().unwrap().push(tree.clone());
             }
         }
+        // A scratch directory is one whatever its name, and is made before
+        // the task runs anyway.
+        for directory in &plan.scratch {
+            std::fs::create_dir_all(directory)?;
+        }
         let rules = landlock::rules(&landlock::Paths {
             root: &self.root,
             read_directories: &plan.read_directories,
@@ -619,6 +662,14 @@ impl Sandbox {
                 continue;
             };
             let relative = relative.to_string_lossy().replace('\\', "/");
+            if !report.operation.starts_with("file-write")
+                && self
+                    .ignored
+                    .get(&report.task)
+                    .is_some_and(|globs| globs.iter().any(|glob| glob.is_match(&relative)))
+            {
+                continue;
+            }
             let package = (!report.operation.starts_with("file-write"))
                 .then(|| {
                     let installs = self.installs.as_ref()?;
@@ -1108,6 +1159,15 @@ fn plan(
         read_trees.extend(anchors(dependency));
     }
     let mut write_trees: BTreeSet<PathBuf> = anchors(task).into_iter().collect();
+    // Its scratch directories, which it may read and write, and which keep
+    // nothing between runs.
+    let mut scratch = BTreeSet::new();
+    for directory in qk_cache::scratch::directories(workspace, task).unwrap_or_default() {
+        if let Ok(relative) = directory.strip_prefix(&workspace.root) {
+            write_trees.insert(root.join(relative));
+            scratch.insert(root.join(relative));
+        }
+    }
     if let Ok(entries) = qk_cache::warm::config(workspace, task)
         && let Ok(paths) = qk_cache::Outputs::from_paths(&qk_cache::warm::kept_paths(&entries))
     {
@@ -1118,6 +1178,7 @@ fn plan(
         read_files,
         read_trees,
         write_trees,
+        scratch,
         packages: None,
     }
 }
@@ -1265,6 +1326,67 @@ fn profile(plan: &Plan, id: &str, root: &Path, state: &Path, mode: Mode) -> Resu
         ));
     }
     Ok(rules.join("\n") + "\n")
+}
+
+/// The files below `root` that `globs` match as the run starts, whether Git
+/// ignores them or not: each of the globs as `written` is walked from the
+/// directory its leading literal parts name. `.git`, `.qk` and
+/// `node_modules` are not walked, and links are left out.
+fn matching_files(root: &Path, written: &[String], globs: &[qk_cache::Pattern]) -> Vec<PathBuf> {
+    let mut found = BTreeSet::new();
+    let mut walked = BTreeSet::new();
+    for glob in written {
+        let base: PathBuf = glob
+            .split('/')
+            .take_while(|part| !part.contains(['*', '?', '[', ']', '{', '}', '(', ')', '!', '\\']))
+            .collect();
+        // A base that leaves the workspace names nothing in it.
+        if !base.components().all(|part| {
+            matches!(
+                part,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        }) {
+            continue;
+        }
+        // A link anywhere in the base would lead the walk elsewhere.
+        let mut through = root.to_owned();
+        let linked = base.components().any(|part| {
+            through.push(part);
+            std::fs::symlink_metadata(&through).is_ok_and(|metadata| metadata.is_symlink())
+        });
+        if linked {
+            continue;
+        }
+        let mut pending = vec![root.join(base)];
+        while let Some(path) = pending.pop() {
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            // A link's target is not what the glob names, and allowing the
+            // link would allow its target.
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            if !metadata.is_dir() {
+                let relative = path.strip_prefix(root).unwrap_or(&path);
+                if globs.iter().any(|glob| glob.is_match(relative)) {
+                    found.insert(path);
+                }
+                continue;
+            }
+            let skipped = path
+                .file_name()
+                .is_some_and(|name| matches!(name.to_str(), Some(".git" | ".qk" | "node_modules")));
+            if skipped || !walked.insert(path.clone()) {
+                continue;
+            }
+            if let Ok(entries) = std::fs::read_dir(&path) {
+                pending.extend(entries.flatten().map(|entry| entry.path()));
+            }
+        }
+    }
+    found.into_iter().collect()
 }
 
 /// A report from the kernel's log.
@@ -1464,6 +1586,60 @@ fn parse(message: &str) -> Option<Report> {
         operation: operation.to_owned(),
         path: path.to_owned(),
     })
+}
+
+#[cfg(test)]
+mod matching_tests {
+    use super::*;
+
+    #[test]
+    fn finds_what_globs_match_below_their_literal_parts() {
+        let root = tempfile::tempdir().unwrap();
+        for file in [
+            "ignored/data.json",
+            "ignored/deep/more.json",
+            "ignored/node_modules/skip.json",
+            "notes.txt",
+            "other/data.json",
+        ] {
+            let path = root.path().join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                root.path().join("other/data.json"),
+                root.path().join("ignored/link.json"),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(root.path().join("other"), root.path().join("alias"))
+                .unwrap();
+        }
+        let written = [
+            "ignored/**/*.json".to_owned(),
+            "notes.txt".to_owned(),
+            "alias/data.json".to_owned(),
+            "../*".to_owned(),
+        ];
+        let globs: Vec<_> = written
+            .iter()
+            .map(|glob| qk_cache::Pattern::new(glob, false).unwrap())
+            .collect();
+        let found = matching_files(root.path(), &written, &globs);
+        let relative: Vec<_> = found
+            .iter()
+            .map(|path| path.strip_prefix(root.path()).unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            relative,
+            [
+                Path::new("ignored/data.json"),
+                Path::new("ignored/deep/more.json"),
+                Path::new("notes.txt"),
+            ]
+        );
+    }
 }
 
 #[cfg(test)]

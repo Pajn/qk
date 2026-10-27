@@ -42,8 +42,10 @@ workspace.
 
 Left out are paths outside the workspace, `node_modules`, which the lockfile
 keys, `.git`, qk's own state, the task's outputs and warm paths, files it wrote
-before reading them, and what its `ignoreReads` names. A directory's listing
-leaves out the task's outputs and what it wrote there, which are there after
+before reading them, its
+[scratch directories](sandbox.md#scratch-directories-and-ignored-reads), and
+what its `ignoreReads` names, which the sandbox's audit leaves out too. A
+directory's listing leaves out the task's outputs and what it wrote there, which are there after
 it runs and need not be before, and the declared outputs of every other
 target in the workspace, which other tasks write whether or not this one
 reads them, with the directories between an output and its project's root,

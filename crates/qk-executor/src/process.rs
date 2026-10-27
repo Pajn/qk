@@ -172,11 +172,73 @@ pub fn execute(task: &PreparedTask, cancelled: &AtomicBool) -> Result<Outcome> {
     execute_captured(task, cancelled, Some(&capture))
 }
 
+/// Empties each of `directories` before a task runs, making those that do not
+/// exist yet: a task's scratch directories, which it keeps nothing in
+/// between runs. Each is checked for links once more as it is emptied, as an
+/// earlier task may have made one since the run was prepared: emptying it
+/// could follow a link out of the workspace.
+pub fn empty_scratch(directories: &[crate::Scratch]) -> std::io::Result<()> {
+    for crate::Scratch { root, directory } in directories {
+        let relative = directory
+            .strip_prefix(root)
+            .ok()
+            .filter(|relative| {
+                relative
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_)))
+            })
+            .ok_or_else(|| {
+                std::io::Error::other(format!(
+                    "{} is no path inside {}",
+                    directory.display(),
+                    root.display()
+                ))
+            })?;
+        let mut path = root.clone();
+        for part in relative.components() {
+            path.push(part);
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_symlink() => {
+                    return Err(std::io::Error::other(format!(
+                        "{} is a symbolic link, which emptying {} could follow",
+                        path.display(),
+                        directory.display()
+                    )));
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        match std::fs::symlink_metadata(directory) {
+            Ok(metadata) if metadata.is_dir() => {
+                for entry in std::fs::read_dir(directory)? {
+                    let entry = entry?;
+                    if entry.file_type()?.is_dir() {
+                        std::fs::remove_dir_all(entry.path())?;
+                    } else {
+                        std::fs::remove_file(entry.path())?;
+                    }
+                }
+            }
+            Ok(_) => {
+                std::fs::remove_file(directory)?;
+                std::fs::create_dir_all(directory)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir_all(directory)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 pub fn execute_captured(
     task: &PreparedTask,
     cancelled: &AtomicBool,
     capture: Option<&Capture>,
 ) -> Result<Outcome> {
+    empty_scratch(&task.scratch).context("cannot empty its scratch directories")?;
     // Takes the terminal back from an interactive command, however it ends.
     let _terminal = (task.interactive && task.commands.len() == 1)
         .then(terminal::Foreground::take_back_on_drop);
@@ -536,5 +598,59 @@ mod grace_tests {
         assert_eq!(grace_period(None), Duration::from_millis(5000));
         assert_eq!(grace_period(Some("250")), Duration::from_millis(250));
         assert_eq!(grace_period(Some("soon")), Duration::from_millis(5000));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empties_scratch_and_makes_a_missing_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let kept = temp.path().join("cache");
+        std::fs::create_dir_all(kept.join("nested")).unwrap();
+        std::fs::write(kept.join("nested/entry"), "old").unwrap();
+        std::fs::write(kept.join("entry"), "old").unwrap();
+        let missing = temp.path().join("missing");
+        let scratch = |directory: &std::path::Path| crate::Scratch {
+            root: temp.path().to_owned(),
+            directory: directory.to_owned(),
+        };
+        empty_scratch(&[scratch(&kept), scratch(&missing)]).unwrap();
+        assert_eq!(std::fs::read_dir(&kept).unwrap().count(), 0);
+        assert!(missing.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leaves_scratch_behind_a_link_made_since_the_run_was_prepared() {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(outside.path().join("cache")).unwrap();
+        std::fs::write(outside.path().join("cache/kept"), "kept").unwrap();
+        std::os::unix::fs::symlink(outside.path(), temp.path().join("build")).unwrap();
+        let scratch = crate::Scratch {
+            root: temp.path().to_owned(),
+            directory: temp.path().join("build/cache"),
+        };
+        assert!(empty_scratch(&[scratch]).is_err());
+        assert!(outside.path().join("cache/kept").exists());
+    }
+
+    #[test]
+    fn leaves_scratch_that_is_no_path_inside_the_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(temp.path().join("outside")).unwrap();
+        std::fs::write(temp.path().join("outside/kept"), "kept").unwrap();
+        for directory in [workspace.join("../outside"), temp.path().join("outside")] {
+            let scratch = crate::Scratch {
+                root: workspace.clone(),
+                directory,
+            };
+            assert!(empty_scratch(&[scratch]).is_err());
+        }
+        assert!(temp.path().join("outside/kept").exists());
     }
 }

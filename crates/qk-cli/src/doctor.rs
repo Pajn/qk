@@ -71,6 +71,7 @@ pub fn show(workspace: &Workspace, json: bool, strict: bool) -> Result<i32> {
                 ("qk:warm", qk_cache::warm::FIELDS),
                 ("qk:threads", qk_runner::threads::FIELDS),
                 ("qk:ultracache", qk_cache::ultracache::FIELDS),
+                ("qk:sandbox", qk_cache::scratch::FIELDS),
             ] {
                 let objects = match definition.extra.get(key) {
                     Some(serde_json::Value::Object(object)) => vec![object],
@@ -90,13 +91,14 @@ pub fn show(workspace: &Workspace, json: bool, strict: bool) -> Result<i32> {
                 }
             }
             if let Some(value) = definition.extra.get("qk:sandbox")
-                && !value.is_boolean()
+                && let Err(error) =
+                    qk_cache::scratch::directories_of(workspace, project, Some(value))
             {
                 findings.push(Finding {
-                    severity: "warning",
+                    severity: "error",
                     code: "invalid-field",
                     location: location.clone(),
-                    message: format!("qk:sandbox is {value}, but only true or false is read, so it is ignored and the task is sandboxed."),
+                    message: format!("{error:#}"),
                 });
             }
             if definition

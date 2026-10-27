@@ -1487,9 +1487,11 @@ fn show_target_includes_ready_when() {
     );
 }
 
-/// `qk:sandbox` is read only as a boolean; doctor names any other value.
+/// `qk:sandbox` is a boolean or an object naming scratch directories; doctor
+/// names any other value, a scratch directory qk would not empty, and a field
+/// it does not know.
 #[test]
-fn doctor_names_a_qk_sandbox_that_is_not_a_boolean() {
+fn doctor_names_a_qk_sandbox_qk_cannot_read() {
     let temp = TempDir::new().unwrap();
     let root = temp.path();
     std::fs::write(root.join("nx.json"), "{}").unwrap();
@@ -1497,26 +1499,36 @@ fn doctor_names_a_qk_sandbox_that_is_not_a_boolean() {
         root.join("project.json"),
         json!({"name":"app","targets":{
             "off":{"command":"true","qk:sandbox":false},
-            "typo":{"command":"true","qk:sandbox":"false"}
+            "scratch":{"command":"true","qk:sandbox":{"scratch":["{projectRoot}/.cache/tool"]}},
+            "typo":{"command":"true","qk:sandbox":"false"},
+            "outside":{"command":"true","qk:sandbox":{"scratch":["../outside"]}},
+            "misspelled":{"command":"true","qk:sandbox":{"scratc":[]}}
         }})
         .to_string(),
     )
     .unwrap();
-    let report = successful_json(
-        isolated_command(env!("CARGO_BIN_EXE_qk"))
-            .current_dir(root)
-            .args(["doctor", "--json"])
-            .output()
-            .unwrap(),
+    let output = isolated_command(env!("CARGO_BIN_EXE_qk"))
+        .current_dir(root)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let located = |code: &str| -> Vec<String> {
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|finding| finding["code"] == code)
+            .map(|finding| finding["location"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(
+        located("invalid-field"),
+        ["app:outside", "app:typo"],
+        "{report}"
     );
-    let invalid: Vec<&Value> = report["findings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|finding| finding["code"] == "invalid-field")
-        .collect();
-    assert_eq!(invalid.len(), 1, "{report}");
-    assert_eq!(invalid[0]["location"], "app:typo");
+    assert_eq!(located("unknown-field"), ["app:misspelled"], "{report}");
 }
 
 /// A field a newer qk added is ignored, as Nx ignores keys it does not know,

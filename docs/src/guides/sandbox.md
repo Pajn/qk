@@ -160,6 +160,42 @@ for what tools create there as they run, and enforce would refuse on macOS
 what it lets through on Linux. Audit, or
 [input analysis](input-analysis.md), finds such reads.
 
+## Scratch directories and ignored reads
+
+A tool may keep a cache in the project that nothing declares, as a linter's
+results by file. Declared as [warm state](warm-state.md), qk keeps and restores
+it, which is safe only for a tool that checks each entry against what it
+read. For any other, name the directory as scratch on its target:
+
+```json
+"lint": { "qk:sandbox": { "scratch": ["{projectRoot}/.tool-cache"] } }
+```
+
+qk empties a scratch directory before the task runs, with or without
+`--sandbox`, so nothing an earlier run left there can change a result,
+whatever the tool does with it. The cache neither keeps nor restores it, a
+recording for [Ultracache](ultracache.md) leaves it out, and the sandbox lets
+the task read and write it, in audit and enforce alike. A scratch directory
+lies in the workspace, outside `.git`, `.qk` and `node_modules` however their
+names are cased, holds no project and neither qk's cache nor its state, and
+neither is nor lies under a symbolic link, which emptying it could follow out
+of the workspace; `qk doctor` reports one that breaks these rules. The
+links are checked again as each directory is emptied, in case an earlier
+task made one. Two tasks of a run cannot share a scratch directory, nor
+have one inside the other's, since each empties it before it runs: such a
+run fails before any task starts.
+
+A file a task reads that cannot change its result, as a tool reading the
+tsconfig only to print a hint, is named in its `qk:ultracache.ignoreReads`,
+whether or not the task is recorded: the globs that leave it out of
+recordings also leave it out of the audit's findings, and enforce lets the
+task read the files they match, Git-ignored ones included. Landlock and
+Seatbelt hold paths, so enforce allows the files that exist as the run
+starts, found by walking each glob from the directory its leading literal
+parts name. A symbolic link is left out, since allowing it would allow
+whatever it leads to. That is a claim qk cannot
+check, which a scratch directory does not need.
+
 ## Notes
 
 - A sandboxed run keeps the cache. A task restored from it did not run, so

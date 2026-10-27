@@ -239,11 +239,21 @@ See [Sharing cores](../guides/threads.md) for allocation examples.
 
 ## `qk:sandbox`
 
-`false` runs the task unsandboxed under `--sandbox`, listed with the reason;
-`true`, the default, sandboxes it. For a task that applies a sandbox of its
-own, which cannot run inside qk's, such as an Xcode build running Swift
-macros. See [Checking inputs and outputs in a sandbox](../guides/sandbox.md).
-`qk doctor` reports any other value.
+`false` runs the task unsandboxed under `--sandbox`, listed with the reason,
+for a task that applies a sandbox of its own, which cannot run inside qk's,
+such as an Xcode build running Swift macros. `true`, the default, sandboxes
+it. An object sandboxes it too, and names its scratch directories:
+
+| Field | Type | Default |
+| --- | --- | --- |
+| `scratch` | array of paths, with `{projectRoot}` and `{workspaceRoot}` | Empty; directories emptied before each run of the task, with or without `--sandbox`, which the task may read and write and which nothing keeps |
+
+A scratch directory lies in the workspace, outside `.git`, `.qk` and
+`node_modules` in any case, holds no project and neither qk's cache nor its
+state, and neither is nor lies under a symbolic link; a task naming another fails, and so does a run in which two
+tasks share one or have one inside the other's.
+`qk doctor` reports one, any other value, and fields it does not know. See
+[Scratch directories and ignored reads](../guides/sandbox.md#scratch-directories-and-ignored-reads).
 
 ## `qk:ultracache`
 
@@ -254,7 +264,7 @@ recorded. See [Keying tasks by what they read](../guides/ultracache.md).
 | Field | Type | Default |
 | --- | --- | --- |
 | `mode` | `"on"`, `"record"` or `"off"` | `"on"`; `"record"` records the task and reports what its recordings would have done, but keys it by its declared inputs; `"off"` keys it by its declared inputs, as without the field |
-| `ignoreReads` | array of workspace globs | Empty; files left out of recordings, whose changes cannot change the result |
+| `ignoreReads` | array of workspace globs | Empty; files left out of recordings, whose changes cannot change the result; the sandbox's audit leaves them out too, and enforce lets the task read them |
 
 Nx's `"warn"` and `"error"` modes are not supported yet. Other fields are
 ignored, as in `qk:threads`, and `qk doctor` reports them. The field does not

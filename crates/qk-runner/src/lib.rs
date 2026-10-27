@@ -287,11 +287,22 @@ pub fn run(
     // Where `summary` keeps the output of the tasks that fail.
     let logs = qk_cache::worktree_state(&workspace.root).join("terminal-outputs");
     // Validate every task before the first command can have side effects.
+    qk_cache::scratch::check_overlaps(workspace, graph)?;
     let mut prepared = graph
         .tasks
         .iter()
         .map(|(id, task)| {
             prepare(workspace, task, &process_environment)
+                .and_then(|mut prepared| {
+                    prepared.scratch = qk_cache::scratch::directories(workspace, task)?
+                        .into_iter()
+                        .map(|directory| qk_executor::Scratch {
+                            root: workspace.root.clone(),
+                            directory,
+                        })
+                        .collect();
+                    Ok(prepared)
+                })
                 .with_context(|| format!("cannot execute {id}"))
                 .map(|mut prepared| {
                     let continuous = task.definition.continuous == Some(true);

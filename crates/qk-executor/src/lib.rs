@@ -433,6 +433,14 @@ impl Recording {
     }
 }
 
+/// A scratch directory, below the workspace `root` it lies in, which the
+/// task keeps nothing in between runs.
+#[derive(Clone, Debug)]
+pub struct Scratch {
+    pub root: PathBuf,
+    pub directory: PathBuf,
+}
+
 #[derive(Clone, Debug)]
 pub struct PreparedTask {
     pub id: String,
@@ -482,6 +490,9 @@ pub struct PreparedTask {
     /// Whether `recording` may key the task's result for `qk:ultracache`, as
     /// `--record` gives it. A recording made only to audit the task does not.
     pub recording_keys: bool,
+    /// Directories emptied before its commands run, which it keeps nothing
+    /// in between runs: its target's `qk:sandbox.scratch`.
+    pub scratch: Vec<Scratch>,
     /// How the task's output is shown; the runner sets it per output style.
     pub display: Display,
 }
@@ -1016,6 +1027,7 @@ pub fn prepare(
         sandbox: None,
         recording: None,
         recording_keys: false,
+        scratch: Vec::new(),
         display: Display::default(),
     };
     prepared.ready_check = prepared.resolve_ready_check(None);

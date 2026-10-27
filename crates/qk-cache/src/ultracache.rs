@@ -59,19 +59,29 @@ impl Settings {
             }
             Some(_) => bail!("qk:ultracache.mode must be \"on\", \"record\" or \"off\""),
         };
-        let ignore_reads: Vec<String> = match object.get("ignoreReads") {
-            None => Vec::new(),
-            Some(value) => serde_json::from_value(value.clone())
-                .context("qk:ultracache.ignoreReads must be an array of globs")?,
-        };
-        // Checked before the task runs, rather than after it was traced.
-        for glob in &ignore_reads {
-            crate::glob::Pattern::new(glob, false).with_context(|| {
-                format!("qk:ultracache.ignoreReads has an invalid glob {glob:?}")
-            })?;
-        }
+        let ignore_reads = ignored_reads(task)?;
         Ok(Some(Self { mode, ignore_reads }))
     }
+}
+
+/// The target's `qk:ultracache.ignoreReads`, whatever its mode: the reads
+/// that change nothing the task does, which the sandbox leaves out of its
+/// findings and allows whether or not the task is recorded.
+pub fn ignored_reads(task: &Task) -> Result<Vec<String>> {
+    let Some(Value::Object(object)) = task.definition.extra.get("qk:ultracache") else {
+        return Ok(Vec::new());
+    };
+    let ignore_reads: Vec<String> = match object.get("ignoreReads") {
+        None => Vec::new(),
+        Some(value) => serde_json::from_value(value.clone())
+            .context("qk:ultracache.ignoreReads must be an array of globs")?,
+    };
+    // Checked before the task runs, rather than after it was traced.
+    for glob in &ignore_reads {
+        crate::glob::Pattern::new(glob, false)
+            .with_context(|| format!("qk:ultracache.ignoreReads has an invalid glob {glob:?}"))?;
+    }
+    Ok(ignore_reads)
 }
 
 #[cfg(test)]
@@ -110,6 +120,9 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        // Unrecorded, its ignored reads still hold for the sandbox.
+        let off = task(serde_json::json!({"mode": "off", "ignoreReads": ["tmp/**"]}));
+        assert_eq!(ignored_reads(&off).unwrap(), ["tmp/**"]);
         for invalid in [
             serde_json::json!(true),
             serde_json::json!({"mode": "warn"}),
