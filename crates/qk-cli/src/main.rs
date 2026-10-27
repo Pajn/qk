@@ -231,8 +231,8 @@ struct RunOptions {
     /// Check what each task reads and writes in the workspace beyond what it
     /// declares: `audit` (the default) reports it, through Seatbelt on macOS
     /// and by recording the task on Linux; `enforce` refuses it, through
-    /// Seatbelt or Landlock. Tasks run without the cache, except that with
-    /// `--record` on Linux an audit is of what the cache records.
+    /// Seatbelt or Landlock. A task restored from the cache is not checked;
+    /// `--skip-cache` runs every one.
     #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "audit", value_name = "MODE")]
     sandbox: Option<SandboxMode>,
     /// Write every sandbox finding to this file as JSON.
@@ -1245,6 +1245,7 @@ fn run(mut cli: Cli) -> Result<i32> {
             options.sandbox_report = Some(report.clone());
             // Suggested from what the task does as it runs, not from the
             // cache.
+            options.skip_cache = true;
             options.unrecorded = true;
             let code = run_task(&workspace, task.clone(), &options)?;
             if code != 0 {
@@ -1778,11 +1779,7 @@ fn execute_narrowed(
         qk_cache::profile::enable();
     }
     options.export();
-    // A sandboxed task has to run to be observed, unless its audit is of
-    // what the cache records.
-    let skip_cache = options.skips_cache()
-        || (options.sandbox_mode().is_some() && !options.records())
-        || options.input_analysis.is_some();
+    let skip_cache = options.skips_cache() || options.input_analysis.is_some();
     // The root dotenv files can hold the remote store's credentials.
     let environment = qk_executor::environment(&workspace.root);
     // What tasks are expected to take is fetched while the run gets ready to

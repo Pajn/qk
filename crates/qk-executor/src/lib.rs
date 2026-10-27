@@ -230,6 +230,9 @@ pub struct Recording {
 struct Ebpf {
     recorder: std::sync::Arc<qk_trace::Recorder>,
     sessions: std::sync::Arc<std::sync::Mutex<Vec<qk_trace::Session>>>,
+    /// Why settling failed, kept so that a later settle, as the cache's and
+    /// then an audit's of one recording, does not find it whole.
+    failure: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     /// Whether an opened file's path is recorded with what its links lead
     /// to, as strace records it, which costs a lookup an open.
     resolve: bool,
@@ -280,6 +283,7 @@ impl Recording {
                             ebpf: Some(Ebpf {
                                 recorder,
                                 sessions: Default::default(),
+                                failure: Default::default(),
                                 resolve: false,
                             }),
                         });
@@ -337,6 +341,7 @@ impl Recording {
             ebpf: self.ebpf.as_ref().map(|ebpf| Ebpf {
                 recorder: ebpf.recorder.clone(),
                 sessions: Default::default(),
+                failure: Default::default(),
                 resolve: ebpf.resolve,
             }),
             ..self.clone()
@@ -364,10 +369,14 @@ impl Recording {
     pub fn settle(&self) -> anyhow::Result<()> {
         #[cfg(target_os = "linux")]
         if let Some(ebpf) = &self.ebpf {
+            if let Some(failure) = ebpf.failure.lock().unwrap().as_ref() {
+                anyhow::bail!("{failure}");
+            }
             let sessions = std::mem::take(&mut *ebpf.sessions.lock().unwrap());
             let mut sessions = sessions.into_iter();
             while let Some(session) = sessions.next() {
                 if let Err(error) = ebpf.recorder.finish(session) {
+                    *ebpf.failure.lock().unwrap() = Some(format!("{error:#}"));
                     // The rest without waiting again: a helper that did not
                     // answer once will not now.
                     sessions

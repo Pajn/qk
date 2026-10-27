@@ -28,10 +28,11 @@
 //! dependencies' outputs appear during the run. Audit mode records each task
 //! instead, with the recorder `--record` uses, and holds what it did against
 //! the plan a profile would have allowed without a report.
+//! A task the cache records for `--record` is audited from that recording
+//! rather than recorded twice.
 //!
-//! With `--record`, audit mode holds the recordings the cache makes against
-//! those plans instead, and the cache stays on: only the tasks that run and
-//! are recorded are audited, at no cost beyond reading their traces again.
+//! The cache stays on: a task restored from it did not run, so it is neither
+//! audited nor held to its plan, and is listed as restored.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader};
@@ -188,12 +189,14 @@ pub struct Sandbox {
     /// directory its commands start in.
     recording: Option<qk_executor::Recording>,
     traces: Mutex<BTreeMap<String, (qk_executor::Recording, PathBuf)>>,
+    /// Trace directories made so far, which names the next: tasks restored
+    /// from the cache leave `traces`, so its length could repeat a name.
+    trace_count: std::sync::atomic::AtomicUsize,
     /// The workspace root as given, which recorded paths may name rather
     /// than `root`, its links resolved.
     given_root: PathBuf,
-    /// Linux audit under `--record`: tasks are audited from the cache's
-    /// recordings, handed over as they finish, rather than recorded here.
-    from_recordings: bool,
+    /// Tasks restored from the cache, which did nothing to check.
+    restored: Mutex<BTreeSet<String>>,
     /// Linux: rule sets handed to tasks, open until the run ends, and the
     /// output directories created so their rules had a path to hold.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -211,6 +214,8 @@ pub struct Finished {
     /// Audit: the tasks held to their plans, whether or not they went
     /// beyond them.
     pub audited: BTreeSet<String>,
+    /// Tasks restored from the cache, which did not run to be checked.
+    pub restored: BTreeSet<String>,
 }
 
 /// Tag in each rule's message: the task a report belongs to.
@@ -223,18 +228,8 @@ const PROBE_DEADLINE: Duration = Duration::from_secs(10);
 
 impl Sandbox {
     /// Works out what each task may do; on macOS writes its profile and
-    /// starts reading the log. With `from_recordings`, an audit on Linux
-    /// records nothing itself and audits what [`Self::audit_recorded`] hands
-    /// it.
-    pub fn start(
-        workspace: &Workspace,
-        graph: &TaskGraph,
-        mode: Mode,
-        from_recordings: bool,
-    ) -> Result<Self> {
-        if from_recordings && !(cfg!(target_os = "linux") && mode == Mode::Audit) {
-            bail!("only --sandbox=audit on Linux audits what --record records");
-        }
+    /// starts reading the log.
+    pub fn start(workspace: &Workspace, graph: &TaskGraph, mode: Mode) -> Result<Self> {
         if cfg!(target_os = "linux") {
             if mode == Mode::Enforce {
                 landlock::abi()
@@ -299,8 +294,9 @@ impl Sandbox {
             dotenv: Vec::new(),
             recording: None,
             traces: Mutex::new(BTreeMap::new()),
+            trace_count: std::sync::atomic::AtomicUsize::new(0),
             given_root: workspace.root.clone(),
-            from_recordings,
+            restored: Mutex::new(BTreeSet::new()),
             rulesets: Mutex::new(Vec::new()),
             created: Mutex::new(Vec::new()),
         };
@@ -337,12 +333,9 @@ impl Sandbox {
                 Err(error) => return Err(error),
             }
         } else if mode == Mode::Audit {
-            if !from_recordings {
-                let recording = qk_executor::Recording::probe(&sandbox.directory).context(
-                    "--sandbox on Linux records what each task does, with eBPF or strace",
-                )?;
-                sandbox.recording = Some(recording.resolving());
-            }
+            let recording = qk_executor::Recording::probe(&sandbox.directory)
+                .context("--sandbox on Linux records what each task does, with eBPF or strace")?;
+            sandbox.recording = Some(recording.resolving());
         } else {
             let (shared, dotenv) = scan(&sandbox.root);
             sandbox.shared = shared;
@@ -362,7 +355,7 @@ impl Sandbox {
     /// How a task is held to its plan, as it starts; `None` runs it
     /// unsandboxed, with the reason recorded.
     pub fn confine(&self, id: &str) -> Option<qk_executor::Confinement> {
-        if !self.plans.contains_key(id) || self.recording.is_some() || self.from_recordings {
+        if !self.plans.contains_key(id) || self.recording.is_some() {
             return None;
         }
         if cfg!(target_os = "macos") {
@@ -384,13 +377,27 @@ impl Sandbox {
     }
 
     /// Linux audit: the recording a task runs under, as it starts in `cwd`.
-    pub fn recording(&self, id: &str, cwd: &Path) -> Option<qk_executor::Recording> {
+    /// One `existing` already, as the cache records it for `--record`, is
+    /// audited instead, and `None` returned.
+    pub fn recording(
+        &self,
+        id: &str,
+        cwd: &Path,
+        existing: Option<&qk_executor::Recording>,
+    ) -> Option<qk_executor::Recording> {
         let recording = self.recording.as_ref()?;
         if !self.plans.contains_key(id) {
             return None;
         }
         let mut traces = self.traces.lock().unwrap();
-        let directory = self.directory.join(format!("trace-{}", traces.len()));
+        if let Some(existing) = existing {
+            traces.insert(id.to_owned(), (existing.clone(), cwd.to_owned()));
+            return None;
+        }
+        let number = self
+            .trace_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let directory = self.directory.join(format!("trace-{number}"));
         if let Err(error) = std::fs::create_dir_all(&directory) {
             drop(traces);
             self.unconfined(id, &format!("it could not be recorded: {error}"));
@@ -401,16 +408,11 @@ impl Sandbox {
         Some(recording)
     }
 
-    /// Linux audit under `--record`: audits `recording`, a task's recording
-    /// made for the cache, as it ran in `cwd`. Only a task that ran is handed
-    /// over; one restored from the cache did nothing to audit.
-    pub fn audit_recorded(&self, id: &str, recording: &qk_executor::Recording, cwd: &Path) {
-        if self.from_recordings && self.plans.contains_key(id) {
-            self.traces
-                .lock()
-                .unwrap()
-                .insert(id.to_owned(), (recording.clone(), cwd.to_owned()));
-        }
+    /// Records that a task was restored from the cache: it did not run, so
+    /// there is nothing to check, and its empty recording is not read.
+    pub fn restored(&self, id: &str) {
+        self.traces.lock().unwrap().remove(id);
+        self.restored.lock().unwrap().insert(id.to_owned());
     }
 
     /// Linux audit: what each recorded task did that its plan does not
@@ -654,15 +656,17 @@ impl Sandbox {
         // A task run again unsandboxed was audited only until it failed, so it
         // is listed as unsandboxed rather than with part of its findings.
         findings.retain(|id, findings| !findings.is_empty() && !unsandboxed.contains_key(id));
+        let restored = std::mem::take(&mut *self.restored.lock().unwrap());
         let audited = audited
             .into_iter()
-            .filter(|id| !unsandboxed.contains_key(id))
+            .filter(|id| !unsandboxed.contains_key(id) && !restored.contains(id))
             .collect();
         Ok(Finished {
             findings,
             unsandboxed,
             packages_unchecked: std::mem::take(&mut self.packages_unchecked),
             audited,
+            restored,
         })
     }
 }

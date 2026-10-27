@@ -632,8 +632,8 @@ fn since(later: SystemTime, earlier: SystemTime) -> Duration {
 /// tasks read it. Then each task's own: the files it read that its key leaves
 /// out, the `.git` and dotenv files it read, the installed packages it read
 /// that its key leaves out, and what it wrote outside its outputs, up to a
-/// few entries each. An audit of what `--record` recorded counts only the
-/// tasks audited, and says how many were not.
+/// few entries each. Tasks restored from the cache did not run, so they are
+/// counted apart.
 pub fn sandbox_summary(sandbox: &qk_runner::SandboxResult, tasks: usize, paint: Paint) -> String {
     use std::collections::{BTreeMap, BTreeSet};
     const SHOWN: usize = 8;
@@ -661,16 +661,8 @@ pub fn sandbox_summary(sandbox: &qk_runner::SandboxResult, tasks: usize, paint: 
     }
     package_readers.retain(|_, count| many(*count));
     let mut lines = Vec::new();
-    // Restored from the cache, or without `qk:ultracache`, so not recorded.
-    let (tasks, unaudited) = if sandbox.from_recordings {
-        let audited = sandbox.audited.len();
-        (
-            audited,
-            tasks.saturating_sub(audited + sandbox.unsandboxed.len()),
-        )
-    } else {
-        (tasks, 0)
-    };
+    let restored = sandbox.restored.len();
+    let tasks = tasks.saturating_sub(restored);
     type Own<'a> = (
         &'a String,
         &'a qk_runner::sandbox::Findings,
@@ -702,8 +694,8 @@ pub fn sandbox_summary(sandbox: &qk_runner::SandboxResult, tasks: usize, paint: 
                 || !findings.stray_writes.is_empty()
         })
         .collect();
-    if sandbox.from_recordings && tasks == 0 {
-        lines.push(format!("Sandbox {mode}: no recorded task ran"));
+    if tasks == 0 {
+        lines.push(format!("Sandbox {mode}: no task ran"));
     } else if sandbox.findings.is_empty() {
         lines.push(format!(
             "Sandbox {mode}: {tasks} task{} kept to what {} declare{}",
@@ -851,10 +843,14 @@ pub fn sandbox_summary(sandbox: &qk_runner::SandboxResult, tasks: usize, paint: 
     for (id, reason) in &sandbox.unsandboxed {
         lines.push(paint.dim(&format!("  {id} ran unsandboxed: {reason}")));
     }
-    if unaudited > 0 {
+    if restored > 0 {
         lines.push(paint.dim(&format!(
-            "  {unaudited} task{} not audited, as restored from the cache or not recorded",
-            if unaudited == 1 { "" } else { "s" },
+            "  {restored} task{} restored from the cache, so not {}",
+            if restored == 1 { "" } else { "s" },
+            match sandbox.mode {
+                qk_runner::sandbox::Mode::Audit => "audited",
+                qk_runner::sandbox::Mode::Enforce => "sandboxed",
+            },
         )));
     }
     // Many tasks of a large store may share this; the report has each
@@ -1738,7 +1734,7 @@ mod tests {
             unsandboxed: BTreeMap::new(),
             packages_unchecked: BTreeMap::new(),
             audited: BTreeSet::new(),
-            from_recordings: false,
+            restored: BTreeSet::new(),
         };
         let text = sandbox_summary(&sandbox, 3, Paint(false));
         assert_eq!(
@@ -1791,7 +1787,7 @@ mod tests {
             unsandboxed: BTreeMap::new(),
             packages_unchecked: BTreeMap::new(),
             audited: BTreeSet::new(),
-            from_recordings: false,
+            restored: BTreeSet::new(),
         };
         assert_eq!(
             sandbox_summary(&sandbox, 2, Paint(false)),
@@ -1817,7 +1813,7 @@ mod tests {
                 .map(|index| (format!("lib{index}:lint"), "too long".to_owned()))
                 .collect(),
             audited: BTreeSet::new(),
-            from_recordings: false,
+            restored: BTreeSet::new(),
         };
         let text = sandbox_summary(&sandbox, 10, Paint(false));
         assert_eq!(
@@ -1829,7 +1825,7 @@ mod tests {
     }
 
     #[test]
-    fn counts_only_the_recorded_tasks_an_audit_of_recordings_held() {
+    fn counts_the_tasks_restored_from_the_cache_apart() {
         let sandbox = qk_runner::SandboxResult {
             mode: qk_runner::sandbox::Mode::Audit,
             findings: [(
@@ -1843,15 +1839,15 @@ mod tests {
             unsandboxed: BTreeMap::new(),
             packages_unchecked: BTreeMap::new(),
             audited: ["a:build".to_owned(), "b:build".to_owned()].into(),
-            from_recordings: true,
+            restored: ["c:build".to_owned(), "d:build".to_owned()].into(),
         };
         assert_eq!(
-            sandbox_summary(&sandbox, 5, Paint(false)),
+            sandbox_summary(&sandbox, 4, Paint(false)),
             "Sandbox audit: 1 of 2 tasks went beyond what they declare
   a:build
     1 read outside its inputs:
       notes.txt
-  3 tasks not audited, as restored from the cache or not recorded
+  2 tasks restored from the cache, so not audited
 "
         );
     }

@@ -140,7 +140,12 @@ what it lets through on Linux. Audit, or
 
 ## Notes
 
-- A sandboxed run skips the cache, since a task has to run to be watched.
+- A sandboxed run keeps the cache. A task restored from it did not run, so
+  it is not checked; the summary counts it apart, and `--sandbox-report`
+  lists none of its findings. `--skip-cache` runs every task to check it.
+  Enforce caches what a task produced held to its declarations, which a run
+  without the sandbox then restores, as it restores any result of the same
+  key.
 - `--sandbox-report <path>` writes every finding as JSON.
 - On macOS, qk reads the sandbox's reports from the system log while the
   run lasts; each report is tagged with its task. The log can drop reports
@@ -184,8 +189,8 @@ listed.
 
 ### Auditing recorded runs
 
-With `--record`, `--sandbox` audits what the cache records instead of
-recording again, and the cache stays on. `QK_RECORD=audit` does the same
+With `--record`, `--sandbox` audits a task the cache records from that
+recording rather than recording it twice. `QK_RECORD=audit` does the same
 as `--record --sandbox`, for CI, which sets it once for every run:
 
 ```text
@@ -195,20 +200,19 @@ Sandbox audit: 1 of 4 tasks went beyond what they declare
   app:build
     1 read outside its inputs:
       other/notes.txt
-  12 tasks not audited, as restored from the cache or not recorded
+  12 tasks restored from the cache, so not audited
 ```
 
-Only tasks with [`qk:ultracache`](ultracache.md) are recorded, and only those
-that run are audited: a task restored from the cache did nothing. An audit
-costs reading each recorded task's trace a second time, as the audit reads
-installed packages' manifests that a path set leaves out. `--report` gives
+A task without [`qk:ultracache`](ultracache.md) is recorded for the audit
+alone, as without `--record`. An audit costs reading each recorded task's
+trace a second time, as the audit reads installed packages' manifests that a
+path set leaves out. `--report` gives
 each task audited its findings as `audit`, by the kinds `--sandbox-report`
 names, those with nothing left out: `{}` for a task that kept to its
 declarations. A task not audited has no `audit`, and the run history keeps
 it with the rest of the task.
 
-Enforce cannot be combined with `--record`, since what it refuses would
-change the results the cache keeps.
+Enforce cannot be combined with `--record` yet.
 
 Landlock holds paths that exist, so each task's rules are built as it
 starts, after its dependencies have written their outputs. An output
