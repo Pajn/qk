@@ -208,6 +208,9 @@ pub struct Sandbox {
     given_root: PathBuf,
     /// Tasks restored from the cache, which did nothing to check.
     restored: Mutex<BTreeSet<String>>,
+    /// Tasks that ran no command, such as `nx:noop`: held to their plans,
+    /// with nothing recorded to hold them to.
+    idle: Mutex<BTreeSet<String>>,
     /// Linux: rule sets handed to tasks, open until the run ends, and the
     /// output directories created so their rules had a path to hold.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -313,6 +316,7 @@ impl Sandbox {
             trace_count: std::sync::atomic::AtomicUsize::new(0),
             given_root: workspace.root.clone(),
             restored: Mutex::new(BTreeSet::new()),
+            idle: Mutex::new(BTreeSet::new()),
             rulesets: Mutex::new(Vec::new()),
             created: Mutex::new(Vec::new()),
         };
@@ -422,6 +426,14 @@ impl Sandbox {
         let recording = recording.in_directory(directory);
         traces.insert(id.to_owned(), (recording.clone(), cwd.to_owned()));
         Some(recording)
+    }
+
+    /// Records that a task runs no command: it did nothing beyond its
+    /// declarations, and has no recording to read.
+    pub fn ran_nothing(&self, id: &str) {
+        if self.plans.contains_key(id) {
+            self.idle.lock().unwrap().insert(id.to_owned());
+        }
     }
 
     /// Records that a task was restored from the cache: it did not run, so
@@ -619,6 +631,20 @@ impl Sandbox {
             if package.is_none() && relative.split('/').any(|part| part == "node_modules") {
                 continue;
             }
+            // Making the directory an output lies in, as a tool writing
+            // `dist/app.js` makes `dist`, writes no output of its own: what it
+            // writes in it is reported by itself.
+            let path = Path::new(&report.path);
+            if report.operation.starts_with("file-write")
+                && path.is_dir()
+                && self.plans.get(&report.task).is_some_and(|plan| {
+                    plan.write_trees
+                        .iter()
+                        .any(|tree| tree != path && tree.starts_with(path))
+                })
+            {
+                continue;
+            }
             let dependency = self
                 .depended
                 .get(&report.task)
@@ -678,8 +704,10 @@ impl Sandbox {
         // is listed as unsandboxed rather than with part of its findings.
         findings.retain(|id, findings| !findings.is_empty() && !unsandboxed.contains_key(id));
         let restored = std::mem::take(&mut *self.restored.lock().unwrap());
+        let idle = std::mem::take(&mut *self.idle.lock().unwrap());
         let audited = audited
             .into_iter()
+            .chain(idle.into_iter().filter(|_| self.mode == Mode::Audit))
             .filter(|id| !unsandboxed.contains_key(id) && !restored.contains(id))
             .collect();
         Ok(Finished {

@@ -64,7 +64,9 @@ configuration (`tsconfig*.json`) it read outside them, which is likely an
 input, the `.git` and dotenv files it read, which no cache key covers, and
 what it wrote outside its outputs. A file it writes there and reads, such as
 a version stamp it keeps, is listed once, as written: declaring it an output
-covers both. Reads of workspace packages'
+covers both. Creating the directory that holds a declared output is not
+listed: a tool writing `dist/app.js` creates `dist`. Another file written
+there, such as `dist/other.txt`, still is. Reads of workspace packages'
 `package.json`, which package managers and bundlers make to resolve them,
 and of version and package managers' configuration, such as
 `.tool-versions`, are counted once at the top rather than listed for each

@@ -3312,6 +3312,81 @@ fn tasks_audited_beside_a_restored_one_keep_their_own_traces() {
     assert!(findings["tasks"].get("app:a").is_none(), "{findings}");
 }
 
+/// Making the directory a declared output lies in is no write outside the
+/// outputs; another file written in it is.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn the_sandbox_lets_a_task_make_the_directory_of_its_outputs() {
+    if !can_audit() {
+        return;
+    }
+    let _audit = AUDIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = fixture(json!({
+        "build": {
+            "command": "mkdir -p dist/sprites && echo out > dist/sprites/out.svg && echo other > dist/other.txt",
+            "inputs": [],
+            "outputs": ["{projectRoot}/dist/sprites/out.svg"]
+        }
+    }));
+    let report = temp.path().join("sandbox.json");
+    success(run(
+        temp.path(),
+        &[
+            "run",
+            "app:build",
+            "--sandbox",
+            "--sandbox-report",
+            report.to_str().unwrap(),
+        ],
+    ));
+    let findings: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+    assert_eq!(
+        findings["tasks"]["app:build"]["strayWrites"],
+        json!(["dist/other.txt"]),
+        "{findings}"
+    );
+}
+
+/// A task that runs no command, as `nx:noop` does to group others, did
+/// nothing beyond its declarations: it is not listed as unaudited for having
+/// no recording.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn the_sandbox_holds_a_task_running_no_command_to_its_plan() {
+    if !can_audit() {
+        return;
+    }
+    let _audit = AUDIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = fixture(json!({
+        "build": {"command": "cat src/in.txt > /dev/null", "inputs": ["{projectRoot}/src/**/*"]},
+        "codegen": {"executor": "nx:noop", "inputs": [], "dependsOn": ["build"]}
+    }));
+    fs::create_dir_all(temp.path().join("src")).unwrap();
+    fs::write(temp.path().join("src/in.txt"), "in").unwrap();
+    let report = temp.path().join("sandbox.json");
+    let output = success(run(
+        temp.path(),
+        &[
+            "run",
+            "app:codegen",
+            "--sandbox",
+            "--sandbox-report",
+            report.to_str().unwrap(),
+        ],
+    ));
+    let findings: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+    assert_eq!(findings["unsandboxed"], json!({}), "{findings}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Sandbox audit: 2 tasks kept to what they declare"),
+        "{stderr}"
+    );
+}
+
 /// A workspace package linked into `node_modules` is read where the link
 /// leads: a file there outside the task's inputs is reported as such.
 #[cfg(any(target_os = "macos", target_os = "linux"))]

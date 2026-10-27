@@ -197,19 +197,31 @@ struct {
 	__uint(max_entries, 64 * 1024 * 1024);
 } events SEC(".maps");
 
-/* Events the ring buffer had no room for, which leave a recording
- * incomplete. */
+/* Events the ring buffer or a map had no room for, which leave a recording
+ * incomplete, by group: one recording's losses fail it alone. Group 0, which
+ * no recording has and the helper adds as it loads, counts those no group
+ * could be found room for, which fail every recording. */
 struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, 1);
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 65536);
 	__type(key, __u32);
 	__type(value, __u64);
 } dropped SEC(".maps");
 
-static __always_inline void count_drop(void)
+static __always_inline void count_drop(__u32 group)
 {
-	__u32 zero = 0;
-	__u64 *count = bpf_map_lookup_elem(&dropped, &zero);
+	__u64 *count = bpf_map_lookup_elem(&dropped, &group);
+	if (!count) {
+		__u64 one = 1;
+		if (!bpf_map_update_elem(&dropped, &group, &one, BPF_NOEXIST))
+			return;
+		/* Added by another CPU meanwhile, or no room for it. */
+		count = bpf_map_lookup_elem(&dropped, &group);
+	}
+	if (!count) {
+		__u32 unattributed = 0;
+		count = bpf_map_lookup_elem(&dropped, &unattributed);
+	}
 	if (count)
 		__sync_fetch_and_add(count, 1);
 }
@@ -270,12 +282,12 @@ static __always_inline int join(struct pt_regs *regs, struct settings *config)
 	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
 	/* A process that cannot join leaves its recording incomplete. */
 	if (bpf_map_update_elem(&groups, &tgid, &group, BPF_ANY)) {
-		count_drop();
+		count_drop(group);
 		return 0;
 	}
 	struct begin_event *event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
 	if (!event) {
-		count_drop();
+		count_drop(group);
 		return 0;
 	}
 	fill(&event->header, BEGIN, group, 0);
@@ -302,7 +314,7 @@ int BPF_PROG(on_enter, struct pt_regs *regs, long id)
 #else
 	if (BPF_CORE_READ(regs, pstate) & PSR_MODE32_BIT) {
 #endif
-		count_drop();
+		count_drop(*group);
 		return 0;
 	}
 	if (id < 0 || id >= CALLS)
@@ -324,7 +336,7 @@ int BPF_PROG(on_enter, struct pt_regs *regs, long id)
 		entered.args[index] = argument(regs, index);
 	__u32 tid = (__u32)bpf_get_current_pid_tgid();
 	if (bpf_map_update_elem(&inflight, &tid, &entered, BPF_ANY))
-		count_drop();
+		count_drop(*group);
 	return 0;
 }
 
@@ -378,7 +390,7 @@ int BPF_PROG(on_exit, struct pt_regs *regs, long result)
 	if (size > sizeof(*event))
 		return 0;
 	if (bpf_ringbuf_output(&events, event, size, 0))
-		count_drop();
+		count_drop(event->header.group);
 	return 0;
 }
 
@@ -396,12 +408,12 @@ int BPF_PROG(on_fork, struct task_struct *parent, struct task_struct *child)
 	__u32 joined = *group;
 	/* A child that cannot join leaves its recording incomplete. */
 	if (bpf_map_update_elem(&groups, &child_tgid, &joined, BPF_ANY)) {
-		count_drop();
+		count_drop(joined);
 		return 0;
 	}
 	struct fork_event *event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
 	if (!event) {
-		count_drop();
+		count_drop(joined);
 		return 0;
 	}
 	fill(&event->header, FORK, joined, 0);
@@ -433,7 +445,7 @@ int BPF_PROG(on_process_exit, struct task_struct *task)
 		return 0;
 	struct exit_event *event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
 	if (!event) {
-		count_drop();
+		count_drop(left);
 		return 0;
 	}
 	fill(&event->header, EXIT, left, 0);

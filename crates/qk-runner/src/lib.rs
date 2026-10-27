@@ -812,7 +812,9 @@ pub fn run(
                     let mut task = prepared[&id].clone();
                     if let Some(sandbox) = &sandbox {
                         task.sandbox = sandbox.confine(&id);
-                        if let Some(recording) =
+                        if task.commands.is_empty() {
+                            sandbox.ran_nothing(&id);
+                        } else if let Some(recording) =
                             sandbox.recording(&id, &task.cwd, task.recording.as_ref())
                         {
                             task.recording = Some(recording);
