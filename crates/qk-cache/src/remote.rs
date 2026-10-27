@@ -333,7 +333,8 @@ impl Transport for Restart {
 }
 
 /// The remote store for a workspace, `Ok(None)` when none is configured or the
-/// mode turns it off, or why a configured store cannot be used.
+/// mode turns it off, or why a configured store cannot be used. A store
+/// server is used over `s3`, which can stay for Nx's own cache plugin.
 pub fn configure(
     s3: Option<&Value>,
     server: Option<&Value>,
@@ -341,9 +342,8 @@ pub fn configure(
 ) -> Result<Option<Remote>> {
     let (config, kind) = match (s3, server) {
         (None, None) => return Ok(None),
+        (_, Some(config)) => (config, background::Kind::Server),
         (Some(config), None) => (config, background::Kind::S3),
-        (None, Some(config)) => (config, background::Kind::Server),
-        (Some(_), Some(_)) => bail!("configure s3 or storeServer, not both"),
     };
     let variable = |name: &str| {
         environment

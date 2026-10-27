@@ -1249,7 +1249,7 @@ mod store_server;
 fn with_store_server(fixture: &Fixture, server: &store_server::FakeStoreServer) {
     fs::write(
         fixture.root.join("nx.json"),
-        json!({"storeServer": {"url": server.url}}).to_string(),
+        json!({"qk:storeServer": {"url": server.url}}).to_string(),
     )
     .unwrap();
 }
@@ -1377,27 +1377,6 @@ fn a_read_only_store_server_token_uploads_nothing() {
 }
 
 #[test]
-fn s3_and_a_store_server_together_are_refused() {
-    let server = store_server::FakeStoreServer::start();
-    let fixture = Fixture::new(target("build", json!({})));
-    fs::write(
-        fixture.root.join("nx.json"),
-        json!({
-            "storeServer": {"url": server.url},
-            "s3": {"bucket": "cache", "region": "us-east-1"}
-        })
-        .to_string(),
-    )
-    .unwrap();
-    let output = success(server_build(&fixture, store_server::WRITE_TOKEN, &[]));
-    assert!(
-        stderr(&output).contains("configure s3 or storeServer, not both"),
-        "{}",
-        stderr(&output)
-    );
-}
-
-#[test]
 fn a_qk_store_server_is_used_beside_the_s3_key_nx_reads() {
     let server = store_server::FakeStoreServer::start();
     let fixture = Fixture::new(target("build", json!({})));
@@ -1410,8 +1389,7 @@ fn a_qk_store_server_is_used_beside_the_s3_key_nx_reads() {
         .to_string(),
     )
     .unwrap();
-    let output = success(server_build(&fixture, store_server::WRITE_TOKEN, &[]));
-    assert!(!stderr(&output).contains("not both"), "{}", stderr(&output));
+    success(server_build(&fixture, store_server::WRITE_TOKEN, &[]));
     assert_eq!(server.state.lock().unwrap().entries(), 1);
 }
 
@@ -1422,7 +1400,7 @@ fn background_uploads_go_where_the_run_was_told_to_send_them() {
     // nx.json names a server that is not there; the variable overrides it.
     fs::write(
         fixture.root.join("nx.json"),
-        json!({"storeServer": {"url": "http://127.0.0.1:9"}}).to_string(),
+        json!({"qk:storeServer": {"url": "http://127.0.0.1:9"}}).to_string(),
     )
     .unwrap();
     let output = success(server_build(

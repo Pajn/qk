@@ -322,8 +322,10 @@ fn unsupported_comparisons_and_changed_tool_metadata_remain_conservative() {
     );
 }
 
+/// qk reads only its own prefixed key, so that a key Nx adds later cannot
+/// clash with it.
 #[test]
-fn legacy_profile_key_remains_compatible() {
+fn the_unprefixed_profile_key_is_not_read() {
     let mut repo = Repo::new("ok");
     let mut config: Value =
         serde_json::from_slice(&std::fs::read(repo.root.join("nx.json")).unwrap()).unwrap();
@@ -336,24 +338,6 @@ fn legacy_profile_key_remains_compatible() {
     write(&repo.root, "nx.json", &config.to_string());
     repo.base = commit(&repo.root);
     let head = repo.changed("app=one\nother=two\ntype=after");
-    let analysis = repo.analyse(Some(head), true);
-    assert_eq!(analysis.projections[0].status, "applied");
-    assert!(analysis.projects.is_empty());
-}
-
-#[test]
-fn canonical_and_legacy_profile_keys_cannot_coexist() {
-    let repo = Repo::new("ok");
-    let head = repo.changed("app=one\nother=two\ntype=after");
-    let config: Value =
-        serde_json::from_slice(&std::fs::read(repo.root.join("nx.json")).unwrap()).unwrap();
-    // Even identical definitions are ambiguous; local overrides must not
-    // accidentally leave both key spellings active in the merged configuration.
-    write(
-        &repo.root,
-        "nx.local.json",
-        &json!({"affectedProfiles":config["qk:affectedProfiles"]}).to_string(),
-    );
     let workspace = Workspace::load(&repo.root).unwrap();
     let graph = ProjectGraph::build(&workspace).unwrap();
     let error = analyse(
@@ -368,9 +352,7 @@ fn canonical_and_legacy_profile_keys_cannot_coexist() {
     )
     .unwrap_err();
     assert!(
-        error
-            .to_string()
-            .contains("configure only qk:affectedProfiles"),
+        error.to_string().contains("unknown affected profile"),
         "{error}"
     );
 }

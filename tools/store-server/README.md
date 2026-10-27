@@ -57,7 +57,7 @@ Point qk at the Worker in `nx.json`:
 
 ```json
 {
-  "storeServer": { "url": "https://qk-store-server.<subdomain>.workers.dev" }
+  "qk:storeServer": { "url": "https://qk-store-server.<subdomain>.workers.dev" }
 }
 ```
 
@@ -68,7 +68,7 @@ upload:
 
 ```json
 {
-  "storeServer": { "url": "…", "localMode": "read", "ciMode": "read-write" }
+  "qk:storeServer": { "url": "…", "localMode": "read", "ciMode": "read-write" }
 }
 ```
 

@@ -55,7 +55,7 @@ try {
   writeFileSync(join(root, ".gitignore"), "dist/\n");
   writeFileSync(
     join(root, "nx.json"),
-    JSON.stringify({ storeServer: { url }, targetDefaults: { build: { cache: true, outputs: ["{projectRoot}/dist"] } } }),
+    JSON.stringify({ "qk:storeServer": { url }, targetDefaults: { build: { cache: true, outputs: ["{projectRoot}/dist"] } } }),
   );
   mkdirSync(join(root, "app"));
   writeFileSync(join(root, "app/large.bin"), randomBytes(2_000_000));

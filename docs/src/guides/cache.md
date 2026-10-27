@@ -75,8 +75,8 @@ that change no task's work: `$schema`, `extends`, `defaultBase`, `affected`,
 `parallel`, `tui`, `cli` other than `cli.packageManager`, `generators`,
 `release`, `sync`, `s3`, `nxCloudId`, `nxCloudAccessToken`, `nxCloudUrl`,
 `nxCloudEncryptionKey`, `neverConnectToCloud`, `defaultProject`,
-`cacheDirectory`, `maxCacheSize`, `qk:storeServer` and `storeServer`,
-`qk:affectedProfiles` and `affectedProfiles`, `qk:reachability`, and the
+`cacheDirectory`, `maxCacheSize`, `qk:storeServer`, `qk:affectedProfiles`,
+`qk:reachability`, and the
 workspace-wide `implicitDependencies`, which Nx no longer supports. Every
 other setting, such as `plugins`, `pluginsConfig`, `workspaceLayout`,
 `tasksRunnerOptions`, which can set `selectivelyHashTsConfig`, or one qk does
