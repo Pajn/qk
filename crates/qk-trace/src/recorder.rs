@@ -30,15 +30,18 @@ struct Shared {
 
 struct Recorded {
     trace: Trace,
-    /// Events dropped before it began, by the helper's last count.
-    dropped: u64,
+    /// Events of no group the program could count apart, dropped before it
+    /// began, by the helper's last count.
+    unattributed: u64,
     failure: Option<String>,
 }
 
 #[derive(Default)]
 struct Flushed {
-    done: HashMap<u64, u64>,
-    dropped: u64,
+    /// Each flush done, with how many of its group's events and how many
+    /// unattributed ones had been dropped.
+    done: HashMap<u64, (u64, u64)>,
+    unattributed: u64,
     /// Why the helper stopped, when it has.
     stopped: Option<String>,
 }
@@ -142,12 +145,14 @@ impl Recorder {
                             recorded.failure = Some(format!("{error:#}"));
                         }
                     }
-                    Ok(Some((FLUSHED, payload))) if payload.len() == 16 => {
-                        let id = u64::from_le_bytes(payload[..8].try_into().expect("eight"));
-                        let dropped = u64::from_le_bytes(payload[8..].try_into().expect("eight"));
+                    Ok(Some((FLUSHED, payload))) if payload.len() == 24 => {
+                        let word = |at: usize| {
+                            u64::from_le_bytes(payload[at..at + 8].try_into().expect("eight"))
+                        };
+                        let (id, dropped, unattributed) = (word(0), word(8), word(16));
                         let mut flushed = reading.flushed.lock().unwrap();
-                        flushed.done.insert(id, dropped);
-                        flushed.dropped = dropped;
+                        flushed.done.insert(id, (dropped, unattributed));
+                        flushed.unattributed = unattributed;
                         reading.signal.notify_all();
                     }
                     Ok(Some(_)) => {}
@@ -174,12 +179,12 @@ impl Recorder {
     /// file's path is written with what its links lead to.
     pub fn begin(&self, directory: &Path, prefix: &str, cwd: &Path, resolve: bool) -> Session {
         let group = self.next_group.fetch_add(1, Ordering::Relaxed);
-        let dropped = self.shared.flushed.lock().unwrap().dropped;
+        let unattributed = self.shared.flushed.lock().unwrap().unattributed;
         self.shared.traces.lock().unwrap().insert(
             group,
             Recorded {
                 trace: Trace::new(self.arch, directory, prefix, cwd, resolve),
-                dropped,
+                unattributed,
                 failure: None,
             },
         );
@@ -221,7 +226,7 @@ impl Recorder {
         let id = self.next_flush.fetch_add(1, Ordering::Relaxed);
         let flushed = {
             let mut input = self.input.lock().unwrap();
-            writeln!(input, "flush {id}").and_then(|()| input.flush())
+            writeln!(input, "flush {id} {}", session.0).and_then(|()| input.flush())
         };
         let recorded = || self.shared.traces.lock().unwrap().remove(&session.0);
         if let Err(error) = flushed {
@@ -229,9 +234,9 @@ impl Recorder {
             bail!("cannot ask the recorder's helper to flush: {error}");
         }
         let mut state = self.shared.flushed.lock().unwrap();
-        let dropped = loop {
-            if let Some(dropped) = state.done.remove(&id) {
-                break dropped;
+        let (dropped, unattributed) = loop {
+            if let Some(counts) = state.done.remove(&id) {
+                break counts;
             }
             if let Some(stopped) = &state.stopped {
                 let stopped = stopped.clone();
@@ -256,7 +261,8 @@ impl Recorder {
         if let Some(failure) = recorded.failure {
             bail!("{failure}");
         }
-        if dropped > recorded.dropped {
+        // Only its own, or ones it may have been among.
+        if dropped > 0 || unattributed > recorded.unattributed {
             bail!("the recorder dropped events while the command ran");
         }
         recorded.trace.finish()?;

@@ -2,7 +2,7 @@
 //! `CAP_PERFMON`, which is why only the helper loads it.
 
 use anyhow::{Context, Result};
-use aya::maps::{Array, MapData, RingBuf};
+use aya::maps::{Array, HashMap, MapData, RingBuf};
 use aya::programs::BtfTracePoint;
 use aya::{Btf, Ebpf};
 
@@ -17,6 +17,8 @@ static OBJECT: &[u8] = aya::include_bytes_aligned!("../bpf/trace.arm64.o");
 static OBJECT: &[u8] = &[];
 
 const NO_PATH: u8 = 0xff;
+/// The group the program counts dropped events of no other group under.
+const UNATTRIBUTED: u32 = 0;
 
 /// `struct settings` in the kernel program.
 #[repr(C)]
@@ -46,7 +48,7 @@ unsafe impl aya::Pod for CallSpec {}
 pub struct Program {
     _bpf: Ebpf,
     pub events: RingBuf<MapData>,
-    dropped: Array<MapData, u64>,
+    dropped: HashMap<MapData, u32, u64>,
 }
 
 impl Program {
@@ -111,7 +113,13 @@ impl Program {
                 .with_context(|| format!("cannot attach {name}"))?;
         }
         let events = RingBuf::try_from(bpf.take_map("events").context("no events map")?)?;
-        let dropped = Array::try_from(bpf.take_map("dropped").context("no dropped map")?)?;
+        let mut dropped: HashMap<_, u32, u64> =
+            HashMap::try_from(bpf.take_map("dropped").context("no dropped map")?)?;
+        // Group 0, which no recording has, counts the events of a group the
+        // map had no room for.
+        dropped
+            .insert(UNATTRIBUTED, 0, 0)
+            .context("cannot set up the count of dropped events")?;
         Ok(Self {
             _bpf: bpf,
             events,
@@ -119,10 +127,29 @@ impl Program {
         })
     }
 
-    /// How many events the ring buffer has had no room for.
-    pub fn dropped(&self) -> Result<u64> {
+    /// How many events of `group`'s recording have been dropped, and how
+    /// many of a group the program could not count apart, which any
+    /// recording may have lost.
+    pub fn dropped(&self, group: u32) -> Result<(u64, u64)> {
+        let count = |group| match self.dropped.get(&group, 0) {
+            Ok(count) => Ok(count),
+            Err(aya::maps::MapError::KeyNotFound) => Ok(0),
+            Err(error) => Err(error),
+        };
+        Ok((
+            count(group).context("cannot read how many events were dropped")?,
+            count(UNATTRIBUTED).context("cannot read how many events were dropped")?,
+        ))
+    }
+
+    /// Forgets `group`'s count of dropped events once its recording has been
+    /// flushed, so that the map holds only recordings in progress: groups are
+    /// never reused, and a full map counts every later drop against all
+    /// recordings. A process left behind that loses an event afterwards adds
+    /// the group back, which its recording, already finished, never reads.
+    pub fn forget(&mut self, group: u32) -> Result<()> {
         self.dropped
-            .get(&0, 0)
-            .context("cannot read how many events were dropped")
+            .remove(&group)
+            .context("cannot forget a recording's dropped events")
     }
 }

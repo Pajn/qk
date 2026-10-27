@@ -20,8 +20,9 @@ use crate::program::Program;
 
 pub(crate) const READY: u8 = 0;
 pub(crate) const EVENT: u8 = 1;
-/// A flush done: its id and how many events have been dropped so far, each
-/// a little-endian `u64`.
+/// A flush done: its id, how many events of the group it was asked for have
+/// been dropped, and how many of a group the program could not count apart,
+/// each a little-endian `u64`.
 pub(crate) const FLUSHED: u8 = 2;
 pub(crate) const FAILED: u8 = 3;
 
@@ -48,12 +49,16 @@ pub fn run(input: impl BufRead + Send + 'static, mut output: impl Write) -> Resu
     };
     frame(&mut output, READY, &[])?;
     output.flush()?;
-    let (flushes, requested) = mpsc::channel::<u64>();
+    let (flushes, requested) = mpsc::channel::<(u64, u32)>();
     std::thread::spawn(move || {
         for line in lines {
             let Ok(line) = line else { break };
-            if let Some(id) = line.strip_prefix("flush ").and_then(|id| id.parse().ok())
-                && flushes.send(id).is_err()
+            // `flush <id> <group>`.
+            if let Some((id, group)) = line
+                .strip_prefix("flush ")
+                .and_then(|rest| rest.split_once(' '))
+                .and_then(|(id, group)| Some((id.parse().ok()?, group.parse().ok()?)))
+                && flushes.send((id, group)).is_err()
             {
                 break;
             }
@@ -67,14 +72,22 @@ pub fn run(input: impl BufRead + Send + 'static, mut output: impl Write) -> Resu
         output.flush()?;
         loop {
             match requested.try_recv() {
-                Ok(id) => {
+                Ok((id, group)) => {
                     while let Some(event) = program.events.next() {
                         frame(&mut output, EVENT, &event)?;
                     }
                     let mut payload = id.to_le_bytes().to_vec();
                     // A count it cannot read stops it, which fails every
                     // recording still waiting.
-                    payload.extend_from_slice(&program.dropped()?.to_le_bytes());
+                    let (dropped, unattributed) = program.dropped(group)?;
+                    // Only a group that lost events has a count to forget.
+                    // One left behind costs a slot of the map, not this
+                    // flush.
+                    if dropped > 0 {
+                        let _ = program.forget(group);
+                    }
+                    payload.extend_from_slice(&dropped.to_le_bytes());
+                    payload.extend_from_slice(&unattributed.to_le_bytes());
                     frame(&mut output, FLUSHED, &payload)?;
                     output.flush()?;
                 }
