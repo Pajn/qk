@@ -68,6 +68,11 @@ const BLOB_REQUESTS: usize = 24;
 /// lower threshold restores as fast there, but that chain's large files are
 /// all 4 MiB, so it does not show what many medium blobs per entry would cost.
 const BLOB_THRESHOLD: u64 = 1 << 20;
+/// How long a request may receive nothing, whatever time it has left, before
+/// it fails. A request's whole timeout allows for the largest transfer, so a
+/// store that stops answering partway would otherwise hold each task asking
+/// it that long.
+const STALL: Duration = Duration::from_secs(30);
 /// The most an upload to a store server carries inline, counted raw, below the
 /// 100 MiB a server accepts in one body (`tools/store-server/PROTOCOL.md`).
 const UPLOAD_INLINE: u64 = 64 << 20;
@@ -244,16 +249,17 @@ fn agent() -> ureq::Agent {
         .max_idle_connections(IDLE_CONNECTIONS)
         .max_idle_connections_per_host(IDLE_CONNECTIONS)
         .build();
-    ureq::Agent::with_parts(config, connector(), DefaultResolver::default())
+    ureq::Agent::with_parts(config, connector(STALL), DefaultResolver::default())
 }
 
 /// ureq's default connections, a CONNECT proxy's included, with
 /// [`Restarting`] between the socket and TLS: rustls restarts an interrupted
-/// read itself, with the socket's whole timeout each time.
-fn connector() -> impl Connector<Out = impl Transport> {
+/// read itself, with the socket's whole timeout each time. A read that
+/// receives nothing for `stall` fails.
+fn connector(stall: Duration) -> impl Connector<Out = impl Transport> {
     ().chain(ConnectProxyConnector::default())
         .chain(TcpConnector::default())
-        .chain(Restarting)
+        .chain(Restarting { stall })
         .chain(RustlsConnector::default())
 }
 
@@ -267,8 +273,13 @@ fn connector() -> impl Connector<Out = impl Transport> {
 /// kernel queues SIGCHLD rather than drop it and wakes a thread that does not
 /// block it. qk spawns processes beside its requests, and ureq returns EINTR as
 /// the request's error; writes need nothing, as `write_all` restarts them.
+///
+/// Each read also waits at most `stall`, so that a connection the store has
+/// stopped answering on fails long before the request's own timeout.
 #[derive(Debug)]
-struct Restarting;
+struct Restarting {
+    stall: Duration,
+}
 
 impl<In: Transport> Connector<In> for Restarting {
     type Out = Box<dyn Transport>;
@@ -279,17 +290,23 @@ impl<In: Transport> Connector<In> for Restarting {
         chained: Option<In>,
     ) -> std::result::Result<Option<Self::Out>, ureq::Error> {
         Ok(chained.map(|transport| {
-            Box::new(Restart(Box::new(transport) as Box<dyn Transport>)) as Self::Out
+            Box::new(Restart {
+                inner: Box::new(transport),
+                stall: self.stall,
+            }) as Self::Out
         }))
     }
 }
 
 #[derive(Debug)]
-struct Restart(Box<dyn Transport>);
+struct Restart {
+    inner: Box<dyn Transport>,
+    stall: Duration,
+}
 
 impl Transport for Restart {
     fn buffers(&mut self) -> &mut dyn Buffers {
-        self.0.buffers()
+        self.inner.buffers()
     }
 
     fn transmit_output(
@@ -297,39 +314,58 @@ impl Transport for Restart {
         amount: usize,
         timeout: NextTimeout,
     ) -> std::result::Result<(), ureq::Error> {
-        self.0.transmit_output(amount, timeout)
+        self.inner.transmit_output(amount, timeout)
     }
 
     fn await_input(&mut self, timeout: NextTimeout) -> std::result::Result<bool, ureq::Error> {
+        use ureq::unversioned::transport::time::Duration as Wait;
         let started = std::time::Instant::now();
-        let mut next = timeout;
         loop {
-            match self.0.await_input(next) {
+            let elapsed = started.elapsed();
+            let left = match timeout.after {
+                Wait::Exact(after) => Some(after.saturating_sub(elapsed)),
+                Wait::NotHappening => None,
+            };
+            let stall = self.stall.saturating_sub(elapsed);
+            // Whether the stall, rather than the request's own time, ends
+            // this wait.
+            let stalling = left.is_none_or(|left| stall < left);
+            let wait = if stalling { stall } else { left.unwrap() };
+            if wait.is_zero() {
+                return Err(match stalling {
+                    true => stalled(self.stall),
+                    false => ureq::Error::Timeout(timeout.reason),
+                });
+            }
+            let next = NextTimeout {
+                after: Wait::Exact(wait),
+                reason: timeout.reason,
+            };
+            match self.inner.await_input(next) {
                 // Nothing was read, so reading again loses nothing, within
                 // what is left of the read's time.
-                Err(ureq::Error::Io(error)) if error.kind() == std::io::ErrorKind::Interrupted => {
-                    if let ureq::unversioned::transport::time::Duration::Exact(after) =
-                        timeout.after
-                    {
-                        let left = after.saturating_sub(started.elapsed());
-                        if left.is_zero() {
-                            return Err(ureq::Error::Timeout(timeout.reason));
-                        }
-                        next.after = ureq::unversioned::transport::time::Duration::Exact(left);
-                    }
-                }
+                Err(ureq::Error::Io(error)) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(ureq::Error::Timeout(_)) if stalling => return Err(stalled(self.stall)),
                 read => return read,
             }
         }
     }
 
     fn is_open(&mut self) -> bool {
-        self.0.is_open()
+        self.inner.is_open()
     }
 
     fn is_tls(&self) -> bool {
-        self.0.is_tls()
+        self.inner.is_tls()
     }
+}
+
+/// A request that received nothing for `stall`.
+fn stalled(stall: Duration) -> ureq::Error {
+    ureq::Error::Io(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!("the store sent nothing for {}s", stall.as_secs_f64()),
+    ))
 }
 
 /// The remote store for a workspace, `Ok(None)` when none is configured or the
@@ -1455,16 +1491,32 @@ mod agent_tests {
     #[test]
     fn signals_do_not_keep_a_stalled_request_waiting_past_its_timeout() {
         for scheme in ["http", "https"] {
-            let (elapsed, result) = stalled(scheme);
+            let (elapsed, result) = unanswered(scheme, Duration::from_millis(300), super::STALL);
             assert!(result.unwrap_err().contains("timeout"), "{scheme}");
             assert!(elapsed < Duration::from_secs(2), "{scheme}: {elapsed:?}");
         }
     }
 
+    /// A request the store stops answering fails once it has received
+    /// nothing for the stall, long before its own timeout.
+    #[test]
+    fn a_request_that_receives_nothing_fails_well_before_its_timeout() {
+        for scheme in ["http", "https"] {
+            let (elapsed, result) =
+                unanswered(scheme, Duration::from_secs(30), Duration::from_millis(300));
+            assert!(result.unwrap_err().contains("sent nothing"), "{scheme}");
+            assert!(elapsed < Duration::from_secs(2), "{scheme}: {elapsed:?}");
+        }
+    }
+
     /// A request to a server that takes the connection and never answers,
-    /// with its client signalled every 20 ms: how long it took, and how it
-    /// ended.
-    fn stalled(scheme: &str) -> (Duration, Result<(), String>) {
+    /// with its client signalled every 20 ms, made with a `timeout` and a
+    /// `stall`: how long it took, and how it ended.
+    fn unanswered(
+        scheme: &str,
+        timeout: Duration,
+        stall: Duration,
+    ) -> (Duration, Result<(), String>) {
         // SAFETY: as above; installing the same handler again is harmless.
         unsafe {
             let mut action: libc::sigaction = std::mem::zeroed();
@@ -1480,11 +1532,11 @@ mod agent_tests {
         let server = std::thread::spawn(move || listener.accept().unwrap());
         let client = std::thread::spawn(move || {
             let config = ureq::Agent::config_builder()
-                .timeout_global(Some(Duration::from_millis(300)))
+                .timeout_global(Some(timeout))
                 .build();
             let agent = ureq::Agent::with_parts(
                 config,
-                super::connector(),
+                super::connector(stall),
                 ureq::unversioned::resolver::DefaultResolver::default(),
             );
             let started = std::time::Instant::now();

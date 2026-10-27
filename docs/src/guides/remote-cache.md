@@ -55,6 +55,11 @@ for its uploads before it ends. Uploads report their failures without failing
 the run; an entry larger than 5 GiB, the most one S3 upload may hold, is not
 uploaded.
 
+A request may take ten minutes, which allows for the largest transfers, but
+one that receives nothing from the store for 30 seconds fails: a store that
+stops answering costs a lookup a miss and an upload its failure, rather than
+holding every task that asks it.
+
 For local runs, qk can hand queued uploads to a detached process after local
 cache saves finish. Set `s3.uploadMode` to `"background"` to opt in:
 
