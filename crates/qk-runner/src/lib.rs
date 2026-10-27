@@ -67,9 +67,8 @@ pub struct SandboxResult {
     pub packages_unchecked: BTreeMap<String, String>,
     /// Audit: the tasks held to their plans.
     pub audited: BTreeSet<String>,
-    /// Whether the audit was of what `--record` recorded, which leaves out
-    /// the tasks restored from the cache and those not recorded.
-    pub from_recordings: bool,
+    /// Tasks restored from the cache, which did not run to be checked.
+    pub restored: BTreeSet<String>,
 }
 
 /// Runs a task without the cache, keeping its log for `qk show log` as a
@@ -207,7 +206,7 @@ pub struct Settings<'a> {
     /// Record what each task with `qk:ultracache` that executes reads, and
     /// key its result by that: see `qk_cache::recorded`. Linux only. With
     /// `sandbox` in audit mode, the tasks recorded are audited from their
-    /// recordings, and the cache stays on.
+    /// recordings.
     pub record: bool,
     /// What each task is expected to take; a task without one is expected to
     /// take no time.
@@ -240,12 +239,16 @@ pub fn run(
     if analyze_inputs && sandbox_mode.is_some() {
         bail!("input analysis and sandbox enforcement/audit cannot be combined");
     }
-    if record && (analyze_inputs || sandbox_mode == Some(sandbox::Mode::Enforce) || skip_cache) {
+    if record && (analyze_inputs || skip_cache) {
         bail!(
-            "--record keys results in the cache, so it cannot be combined with --sandbox=enforce, inputs analyze or skipping the cache"
+            "--record keys results in the cache, so it cannot be combined with inputs analyze or skipping the cache"
         );
     }
-    // Audited from what the cache records, rather than run without it.
+    // Landlock and the recorder are not yet tried together.
+    if record && sandbox_mode == Some(sandbox::Mode::Enforce) {
+        bail!("--record cannot be combined with --sandbox=enforce yet");
+    }
+    // An audit reads what the cache records, links resolved as its own are.
     let audits_recordings = record && sandbox_mode == Some(sandbox::Mode::Audit);
     let skip_cache = skip_cache || analyze_inputs;
     if parallel == 0 || cores == 0 {
@@ -334,7 +337,7 @@ pub fn run(
         task.interactive = true;
     }
     let sandbox = sandbox_mode
-        .map(|mode| sandbox::Sandbox::start(workspace, graph, mode, audits_recordings))
+        .map(|mode| sandbox::Sandbox::start(workspace, graph, mode))
         .transpose()?;
     let recorder = analyze_inputs
         .then(|| recorder::Recorder::start(workspace, graph, &mut prepared))
@@ -497,8 +500,9 @@ pub fn run(
         .any(|task| task.definition.cache == Some(true));
     // As in Nx, every task is hashed, and sees its hash as NX_TASK_HASH,
     // whether or not anything can be cached; a run that cannot use the
-    // cache only observes. A sandboxed or recorded task runs as it is.
-    let cache = if (sandbox.is_some() && !audits_recordings) || analyze_inputs {
+    // cache only observes. A recorded task runs as it is; a sandboxed one is
+    // checked when it runs, and restored from the cache otherwise.
+    let cache = if analyze_inputs {
         None
     } else if skip_cache || !(warm || cacheable) {
         Some(qk_cache::Cache::for_observation(workspace))
@@ -807,7 +811,9 @@ pub fn run(
                     let mut task = prepared[&id].clone();
                     if let Some(sandbox) = &sandbox {
                         task.sandbox = sandbox.confine(&id);
-                        if let Some(recording) = sandbox.recording(&id, &task.cwd) {
+                        if let Some(recording) =
+                            sandbox.recording(&id, &task.cwd, task.recording.as_ref())
+                        {
                             task.recording = Some(recording);
                         }
                     }
@@ -925,40 +931,43 @@ pub fn run(
                     let cancelled = cancelled.clone();
                     let sandbox = sandbox.as_ref();
                     scope.spawn(move || {
-                        let result = if let Some(cache) = cache {
-                            cache.run(workspace, graph, definition, &task, &cancelled)
-                        } else {
-                            execute_retained(&task, &cancelled).and_then(|result| {
-                                // Seatbelt refuses a sandbox inside one that
-                                // restricts anything, as Xcode applies to
-                                // Swift macros. An audit runs such a task again
-                                // unsandboxed, as one whose profile Seatbelt
-                                // rejects; enforcing, it fails, and says how
-                                // to leave it out.
-                                match sandbox {
-                                    Some(sandbox)
-                                        if sandbox.mode == sandbox::Mode::Enforce
-                                            && sandbox::nested(&task, &result) =>
-                                    {
-                                        qk_executor::status!(
-                                            "qk: {id}: it applies a sandbox of its own, which cannot run inside qk's; set \"qk:sandbox\": false on its target to run it unsandboxed"
-                                        );
-                                        Ok(result)
-                                    }
-                                    Some(sandbox) if sandbox::nested(&task, &result) => {
-                                        let reason = "it applies a sandbox of its own, which cannot run inside qk's";
-                                        qk_executor::status!("qk: {id}: {reason}; running it again unsandboxed");
-                                        sandbox.unconfined(&id, reason);
-                                        let task = qk_executor::PreparedTask {
-                                            sandbox: None,
-                                            ..task.clone()
-                                        };
-                                        execute_retained(&task, &cancelled)
-                                    }
-                                    _ => Ok(result),
-                                }
-                            })
+                        let run = |task: &qk_executor::PreparedTask| match cache {
+                            Some(cache) => cache.run(workspace, graph, definition, task, &cancelled),
+                            None => execute_retained(task, &cancelled),
                         };
+                        let result = run(&task).and_then(|result| {
+                            // Seatbelt refuses a sandbox inside one that
+                            // restricts anything, as Xcode applies to Swift
+                            // macros. An audit runs such a task again
+                            // unsandboxed, as one whose profile Seatbelt
+                            // rejects; enforcing, it fails, and says how to
+                            // leave it out. A failure is not cached, so the
+                            // cache runs it again too.
+                            match sandbox {
+                                Some(sandbox)
+                                    if sandbox.mode == sandbox::Mode::Enforce
+                                        && sandbox::nested(&task, &result) =>
+                                {
+                                    qk_executor::status!(
+                                        "qk: {id}: it applies a sandbox of its own, which cannot run inside qk's; set \"qk:sandbox\": false on its target to run it unsandboxed"
+                                    );
+                                    Ok(result)
+                                }
+                                Some(sandbox) if sandbox::nested(&task, &result) => {
+                                    let reason =
+                                        "it applies a sandbox of its own, which cannot run inside qk's";
+                                    qk_executor::status!(
+                                        "qk: {id}: {reason}; running it again unsandboxed"
+                                    );
+                                    sandbox.unconfined(&id, reason);
+                                    run(&qk_executor::PreparedTask {
+                                        sandbox: None,
+                                        ..task.clone()
+                                    })
+                                }
+                                _ => Ok(result),
+                            }
+                        });
                         let _ = sender.send((id, result));
                     });
                 }
@@ -1070,16 +1079,15 @@ pub fn run(
                         } else {
                             outcome
                         };
-                        // A task restored from the cache did not run, so its
-                        // recording holds nothing to audit.
-                        if let (Some(sandbox), Some(recording)) =
-                            (&sandbox, prepared[&id].recording.as_ref())
+                        // A task restored from the cache did not run, so there
+                        // is nothing to check.
+                        if let Some(sandbox) = &sandbox
                             && matches!(
                                 cache,
-                                qk_cache::CacheStatus::Miss | qk_cache::CacheStatus::Uncached
+                                qk_cache::CacheStatus::LocalHit | qk_cache::CacheStatus::RemoteHit
                             )
                         {
-                            sandbox.audit_recorded(&id, recording, &prepared[&id].cwd);
+                            sandbox.restored(&id);
                         }
                         // Stopping a continuous task on purpose is its normal end.
                         let outcome = if stopping.contains(&id) && outcome == Outcome::Cancelled {
@@ -1163,13 +1171,10 @@ pub fn run(
             let mode = sandbox.mode;
             let mut finished = sandbox.finish()?;
             // How a task would have been held says nothing of one that never
-            // started.
-            finished
-                .unsandboxed
-                .retain(|id, _| records.contains_key(id));
-            finished
-                .packages_unchecked
-                .retain(|id, _| records.contains_key(id));
+            // started, or was restored from the cache.
+            let ran = |id: &String| records.contains_key(id) && !finished.restored.contains(id);
+            finished.unsandboxed.retain(|id, _| ran(id));
+            finished.packages_unchecked.retain(|id, _| ran(id));
             finished.audited.retain(|id| records.contains_key(id));
             if mode == sandbox::Mode::Audit {
                 for id in &finished.audited {
@@ -1184,7 +1189,7 @@ pub fn run(
                 unsandboxed: finished.unsandboxed,
                 packages_unchecked: finished.packages_unchecked,
                 audited: finished.audited,
-                from_recordings: audits_recordings,
+                restored: finished.restored,
             })
         })
         .transpose()?;

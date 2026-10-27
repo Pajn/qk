@@ -616,7 +616,7 @@ fn a_recorded_run_audits_the_tasks_it_records() {
     let stderr = String::from_utf8_lossy(&second.stderr);
     assert!(
         stderr.contains(
-            "Sandbox audit: no recorded task ran\n  1 task not audited, as restored from the cache or not recorded"
+            "Sandbox audit: no task ran\n  1 task restored from the cache, so not audited"
         ),
         "{stderr}"
     );

@@ -3188,6 +3188,130 @@ fn can_audit() -> bool {
     found
 }
 
+/// The sandbox keeps the cache: a task restored from it did not run, so it is
+/// neither checked nor listed with findings, and `--skip-cache` checks it.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn the_sandbox_keeps_the_cache_and_checks_only_what_runs() {
+    if !can_audit() {
+        return;
+    }
+    let _audit = AUDIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = fixture(json!({
+        "build": {
+            "command": "cat src/in.txt notes.txt > /dev/null; mkdir -p dist && echo out > dist/out.txt",
+            "inputs": ["{projectRoot}/src/**/*"],
+            "outputs": ["{projectRoot}/dist"],
+            "cache": true
+        }
+    }));
+    fs::create_dir_all(temp.path().join("src")).unwrap();
+    fs::write(temp.path().join("src/in.txt"), "in").unwrap();
+    fs::write(temp.path().join("notes.txt"), "notes").unwrap();
+    let report = temp.path().join("sandbox.json");
+    let audit = |extra: &[&str]| {
+        let output = success(run(
+            temp.path(),
+            &[
+                &[
+                    "run",
+                    "app:build",
+                    "--sandbox",
+                    "--sandbox-report",
+                    report.to_str().unwrap(),
+                ][..],
+                extra,
+            ]
+            .concat(),
+        ));
+        let findings: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+        (
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+            findings,
+        )
+    };
+    let (_, findings) = audit(&[]);
+    assert_eq!(
+        findings["tasks"]["app:build"]["undeclaredReads"],
+        json!(["notes.txt"]),
+        "{findings}"
+    );
+    let (stderr, findings) = audit(&[]);
+    assert!(
+        stderr.contains(
+            "Sandbox audit: no task ran\n  1 task restored from the cache, so not audited"
+        ),
+        "{stderr}"
+    );
+    assert!(findings["tasks"].get("app:build").is_none(), "{findings}");
+    let (_, findings) = audit(&["--skip-cache"]);
+    assert_eq!(
+        findings["tasks"]["app:build"]["undeclaredReads"],
+        json!(["notes.txt"]),
+        "{findings}"
+    );
+}
+
+/// A task restored from the cache while others run leaves the audit, and the
+/// next task's trace still goes in a directory of its own: `b` runs on while
+/// `a` is restored, and `c` starts after.
+#[cfg(target_os = "linux")]
+#[test]
+fn tasks_audited_beside_a_restored_one_keep_their_own_traces() {
+    if !can_audit() {
+        return;
+    }
+    let _audit = AUDIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let task = |command: &str| {
+        json!({
+            "command": command,
+            "inputs": ["{projectRoot}/src/**/*"],
+            "outputs": [],
+            "cache": true
+        })
+    };
+    let temp = fixture(json!({
+        "a": task("cat src/in.txt > /dev/null"),
+        "b": task("sleep 1; cat b.txt > /dev/null"),
+        "c": task("cat c.txt > /dev/null")
+    }));
+    fs::create_dir_all(temp.path().join("src")).unwrap();
+    for (path, text) in [("src/in.txt", "in"), ("b.txt", "b"), ("c.txt", "c")] {
+        fs::write(temp.path().join(path), text).unwrap();
+    }
+    success(run(temp.path(), &["run", "app:a"]));
+    let report = temp.path().join("sandbox.json");
+    success(run(
+        temp.path(),
+        &[
+            "run-many",
+            "-t",
+            "a,b,c",
+            "--parallel",
+            "2",
+            "--sandbox",
+            "--sandbox-report",
+            report.to_str().unwrap(),
+        ],
+    ));
+    let findings: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+    assert_eq!(
+        findings["tasks"]["app:b"]["undeclaredReads"],
+        json!(["b.txt"]),
+        "{findings}"
+    );
+    assert_eq!(
+        findings["tasks"]["app:c"]["undeclaredReads"],
+        json!(["c.txt"]),
+        "{findings}"
+    );
+    assert!(findings["tasks"].get("app:a").is_none(), "{findings}");
+}
+
 /// A workspace package linked into `node_modules` is read where the link
 /// leads: a file there outside the task's inputs is reported as such.
 #[cfg(any(target_os = "macos", target_os = "linux"))]

@@ -57,6 +57,24 @@ fn remote_settings(workspace: &Workspace) -> (Option<&Value>, Option<&Value>) {
     }
 }
 
+/// Runs a task the cache does not keep. A sandboxed one's log is kept, which
+/// says whether it failed applying a sandbox of its own.
+fn execute_uncached(
+    task: &PreparedTask,
+    cancelled: &AtomicBool,
+) -> Result<(Outcome, Option<Execution>)> {
+    if task.sandbox.is_none() {
+        return Ok((execute(task, cancelled)?, None));
+    }
+    let capture = Capture::new(None, task.display.clone()).retain_log();
+    let outcome = execute_captured(task, cancelled, Some(&capture))?;
+    let execution = capture.take_log().map(|log| Execution {
+        log,
+        inputs_unchanged: false,
+    });
+    Ok((outcome, execution))
+}
+
 /// The cache for one run; its workspace snapshot is taken on first use.
 pub struct Cache {
     pub root: PathBuf,
@@ -427,7 +445,11 @@ impl Cache {
                 qk_executor::status!("qk: {}: cache bypassed ({reason})", task.id);
             }
             let _profile = profile::span(&task.id, "execute");
-            execute(prepared, cancelled).map(TaskResult::uncached)
+            let (outcome, execution) = execute_uncached(prepared, cancelled)?;
+            Ok(TaskResult {
+                execution,
+                ..TaskResult::uncached(outcome)
+            })
         };
         let snapshot = match self.snapshot(workspace, graph) {
             Ok(snapshot) => snapshot,
@@ -468,7 +490,7 @@ impl Cache {
         if !cacheable {
             let restored = before(running);
             let executing = profile::span(&task.id, "execute");
-            let outcome = execute(running, cancelled)?;
+            let (outcome, execution) = execute_uncached(running, cancelled)?;
             drop(executing);
             let warm_report = after(outcome, restored, running);
             return Ok(TaskResult {
@@ -476,7 +498,7 @@ impl Cache {
                 cache: CacheStatus::Uncached,
                 key: keyed,
                 warm: warm_report,
-                execution: None,
+                execution,
                 recorded: None,
                 shadow: None,
             });
