@@ -79,6 +79,12 @@ impl Pattern {
         })
     }
 
+    /// Whether a negated group made it exclude anything: then what it matches
+    /// below a directory can depend on more than that directory.
+    pub fn excludes(&self) -> bool {
+        !self.excluded.is_empty()
+    }
+
     /// As Nx's glob sets: an including glob matches and no excluding one, or,
     /// with only excluding globs, none of them.
     pub fn is_match(&self, path: impl AsRef<std::path::Path>) -> bool {

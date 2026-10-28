@@ -187,14 +187,21 @@ run fails before any task starts.
 
 A file a task reads that cannot change its result, as a tool reading the
 tsconfig only to print a hint, is named in its `qk:ultracache.ignoreReads`,
-whether or not the task is recorded: the globs that leave it out of
-recordings also leave it out of the audit's findings, and enforce lets the
-task read the files they match, Git-ignored ones included. Landlock and
-Seatbelt hold paths, so enforce allows the files that exist as the run
-starts, found by walking each glob from the directory its leading literal
-parts name. A symbolic link is left out, since allowing it would allow
-whatever it leads to. That is a claim qk cannot
-check, which a scratch directory does not need.
+whether or not the task is recorded. That it cannot is a claim qk cannot
+check, which a scratch directory does not need. The globs that leave it out
+of recordings also leave it out of the audit's findings, and enforce lets
+the task read the files they match, Git-ignored ones included.
+
+Landlock and Seatbelt hold paths, so enforce allows the files that exist as
+the run starts, found by walking each glob from the directory its leading
+literal parts name. A glob ending in `/**`, as `**/.cache/**`, allows each
+directory it names whole, so a profile stays small however many files the
+directories hold, and a file made in one during the run may be read too.
+Any other glob, or one with a negated group such as `!(private)`, which can
+leave out a path deeper down, allows the files it matches one by one. The
+walk never enters `.git`, `.qk` or `node_modules`, and a directory holding
+one of them is not allowed whole: the directories beside it are. A symbolic
+link is left out, since allowing it would allow whatever it leads to.
 
 A glob that covers a nested workspace, a directory with a `pnpm-lock.yaml`
 importer of its own such as a project's end-to-end tests, covers what it
