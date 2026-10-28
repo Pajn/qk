@@ -70,6 +70,54 @@ fn kept(event: &Access, keep: &dyn Fn(&Path) -> bool, resolved: bool) -> bool {
                 .is_some_and(|resolved| keep(Path::new(resolved))))
 }
 
+/// Why a trace was cut short of its lines.
+fn over_budget(limits: &Limits) -> String {
+    format!(
+        "trace collection exceeded its {} MiB/{}-record budget; report truncated",
+        limits.bytes / 1024 / 1024,
+        limits.records
+    )
+}
+
+/// What makes two accesses the same one, wherever and whenever made.
+type AccessKey = (String, Option<String>, Operation, String);
+
+fn key_of(event: &Access) -> AccessKey {
+    (
+        event.path.clone(),
+        event.resolved_path.clone(),
+        event.operation.clone(),
+        event.result.clone(),
+    )
+}
+
+/// The one access a trace line makes that `keep` keeps, when the line means
+/// the same in any process: it names whole paths only, and neither changes
+/// a working directory nor makes a process.
+fn alone(
+    process: u32,
+    call: &str,
+    keep: &dyn Fn(&Path) -> bool,
+    resolved: bool,
+) -> Option<AccessKey> {
+    let (events, change, child) = decode(process, call, UNKNOWN_CWD.as_path())?;
+    if change.is_some() || child.is_some() {
+        return None;
+    }
+    if events.iter().any(|event| {
+        Path::new(&event.path)
+            .components()
+            .any(|component| component.as_os_str() == "\0")
+    }) {
+        return None;
+    }
+    let mut kept_events = events.iter().filter(|event| kept(event, keep, resolved));
+    match (kept_events.next(), kept_events.next()) {
+        (Some(event), None) => Some(key_of(event)),
+        _ => None,
+    }
+}
+
 /// Whether a trace line can matter under `keep`: it changes a process's
 /// working directory or makes a process, names a path relative to the
 /// working directory, cannot be decoded, or names a kept path.
@@ -100,7 +148,13 @@ pub fn collect_within(
     cwd: &Path,
     limits: &Limits,
 ) -> Result<(Vec<Access>, Vec<String>)> {
-    let mut records = Vec::new();
+    let mut records: Vec<(f64, u32, usize, String)> = Vec::new();
+    // With `distinct`, the record kept for each access a line alone makes,
+    // by its index in `records`: a line naming only whole paths means the
+    // same in any process, so repeating one keeps nothing new. The earliest
+    // is kept, wherever it is read, since a write before the first read of a
+    // path tells the decoding that the task made it.
+    let mut first = std::collections::HashMap::<AccessKey, usize>::new();
     let mut diagnostics = Vec::new();
     let mut pending = BTreeMap::<u32, (f64, String)>::new();
     let mut bytes_read = 0usize;
@@ -118,14 +172,11 @@ pub fn collect_within(
         let reader = BufReader::new(std::fs::File::open(entry.path())?);
         for (sequence, line) in reader.lines().enumerate() {
             let line = line?;
-            if bytes_read > limits.bytes || records.len() >= limits.records {
-                diagnostics.push(format!(
-                    "trace collection exceeded its {} MiB/{}-record budget; report truncated",
-                    limits.bytes / 1024 / 1024,
-                    limits.records
-                ));
-                break 'files;
-            }
+            // Checked as a line would be kept, so a repeat the budget would
+            // not hold does not end the trace.
+            let full = |records: &Vec<_>, bytes_read: usize| {
+                bytes_read > limits.bytes || records.len() >= limits.records
+            };
             let Some((time, call)) = line.split_once(' ') else {
                 continue;
             };
@@ -162,6 +213,39 @@ pub fn collect_within(
             {
                 continue;
             }
+            if limits.distinct
+                && let Some(keep) = limits.keep
+                && let Some(key) = alone(process, &call, keep, limits.resolved)
+            {
+                match first.get(&key) {
+                    Some(&index) => {
+                        if time < records[index].0 {
+                            bytes_read = bytes_read - records[index].3.len() + call.len();
+                            records[index] = (time, process, sequence, call);
+                            // A longer copy can take it over the budget with
+                            // no line after it to notice.
+                            if bytes_read > limits.bytes {
+                                diagnostics.push(over_budget(limits));
+                                break 'files;
+                            }
+                        }
+                    }
+                    None => {
+                        if full(&records, bytes_read) {
+                            diagnostics.push(over_budget(limits));
+                            break 'files;
+                        }
+                        first.insert(key, records.len());
+                        bytes_read = bytes_read.saturating_add(call.len());
+                        records.push((time, process, sequence, call));
+                    }
+                }
+                continue;
+            }
+            if full(&records, bytes_read) {
+                diagnostics.push(over_budget(limits));
+                break 'files;
+            }
             bytes_read = bytes_read.saturating_add(call.len());
             records.push((time, process, sequence, call));
         }
@@ -191,13 +275,7 @@ pub fn collect_within(
                     limits
                         .keep
                         .is_none_or(|keep| kept(event, keep, limits.resolved))
-                        && (!limits.distinct
-                            || seen.insert((
-                                event.path.clone(),
-                                event.resolved_path.clone(),
-                                event.operation.clone(),
-                                event.result.clone(),
-                            )))
+                        && (!limits.distinct || seen.insert(key_of(event)))
                 }));
                 if let Some(directory) = change {
                     directories.insert(process, directory);
@@ -612,6 +690,111 @@ mod tests {
         )
         .unwrap();
         assert_eq!(events[0].path, "/repo/sub/file");
+    }
+
+    #[test]
+    fn distinct_lines_count_once_toward_the_record_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        for process in 1..=4 {
+            let lines: String = (0..50)
+                .map(|n| format!("1.{n:03} newfstatat(AT_FDCWD, \"/repo/a.ts\", {{...}}, 0) = 0\n"))
+                .collect();
+            std::fs::write(directory.path().join(format!("command-0.{process}")), lines).unwrap();
+        }
+        let keep = |path: &Path| path.starts_with("/repo");
+        let tight = Limits {
+            records: 10,
+            keep: Some(&keep),
+            ..ANALYSIS
+        };
+        // At the budget exactly, a repeat is no line more.
+        let one = Limits {
+            records: 1,
+            distinct: true,
+            ..tight
+        };
+        let (_, diagnostics) = collect_within(directory.path(), Path::new("/repo"), &one).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let (_, diagnostics) =
+            collect_within(directory.path(), Path::new("/repo"), &tight).unwrap();
+        assert!(diagnostics[0].contains("record budget"), "{diagnostics:?}");
+        let distinct = Limits {
+            distinct: true,
+            ..tight
+        };
+        let (events, diagnostics) =
+            collect_within(directory.path(), Path::new("/repo"), &distinct).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(events.len(), 1);
+    }
+
+    /// An earlier copy replacing a kept line counts its own length, so a
+    /// longer one can end the trace over its budget.
+    #[test]
+    fn a_longer_earlier_copy_counts_toward_the_byte_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let short = "openat(AT_FDCWD, \"/repo/x\", O_RDONLY) = 3</repo/x>";
+        let long = "openat(AT_FDCWD, \"/repo/x\", O_RDONLY|O_CLOEXEC) = 3</repo/x>";
+        std::fs::write(
+            directory.path().join("command-0.1"),
+            format!("3.000 {short}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("command-0.2"),
+            format!("1.000 {long}\n"),
+        )
+        .unwrap();
+        let keep = |path: &Path| path.starts_with("/repo");
+        let limits = |bytes| Limits {
+            bytes,
+            keep: Some(&keep),
+            distinct: true,
+            ..ANALYSIS
+        };
+        let (_, diagnostics) =
+            collect_within(directory.path(), Path::new("/repo"), &limits(long.len())).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let (_, diagnostics) =
+            collect_within(directory.path(), Path::new("/repo"), &limits(short.len())).unwrap();
+        assert!(diagnostics[0].contains("budget"), "{diagnostics:?}");
+    }
+
+    /// The earliest of repeated lines is kept, though another process's file,
+    /// read first, holds a later one: a path read before the task wrote it
+    /// stays read first.
+    #[test]
+    fn distinct_lines_keep_the_earliest_whichever_file_holds_it() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("command-0.1"),
+            "3.000 openat(AT_FDCWD, \"/repo/x\", O_RDONLY) = 3</repo/x>\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("command-0.2"),
+            concat!(
+                "1.000 openat(AT_FDCWD, \"/repo/x\", O_RDONLY) = 3</repo/x>\n",
+                "2.000 openat(AT_FDCWD, \"/repo/x\", O_WRONLY|O_CREAT|O_TRUNC, 0666) = 4</repo/x>\n",
+            ),
+        )
+        .unwrap();
+        let keep = |path: &Path| path.starts_with("/repo");
+        let limits = Limits {
+            keep: Some(&keep),
+            distinct: true,
+            ..ANALYSIS
+        };
+        let (events, diagnostics) =
+            collect_within(directory.path(), Path::new("/repo"), &limits).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let operations: Vec<_> = events
+            .iter()
+            .filter(|event| event.path == "/repo/x")
+            .map(|event| event.operation.writes())
+            .collect();
+        assert_eq!(operations.first(), Some(&false), "{events:?}");
+        assert!(operations.contains(&true), "{events:?}");
     }
 
     #[test]
