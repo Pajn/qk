@@ -18,6 +18,7 @@
 
 pub(crate) mod background;
 mod bloom;
+mod breaker;
 mod index;
 mod pack;
 mod prefetch;
@@ -49,6 +50,15 @@ use store::{Object, Store};
 
 /// Uploads in flight at once.
 const UPLOADERS: usize = 8;
+/// How often an upload is sent before its failure is reported, when the
+/// connection rather than the store fails it.
+const UPLOAD_ATTEMPTS: u32 = 3;
+/// The pause before an upload is sent again, doubled each time.
+const UPLOAD_PAUSE: Duration = if cfg!(test) {
+    Duration::from_millis(1)
+} else {
+    Duration::from_secs(2)
+};
 /// Connections kept open between requests to the store.
 const IDLE_CONNECTIONS: usize = 32;
 /// The most a single upload may hold, as S3 allows.
@@ -68,6 +78,15 @@ const BLOB_REQUESTS: usize = 24;
 /// lower threshold restores as fast there, but that chain's large files are
 /// all 4 MiB, so it does not show what many medium blobs per entry would cost.
 const BLOB_THRESHOLD: u64 = 1 << 20;
+/// How long a request may receive nothing, whatever time it has left, before
+/// it fails. A request's whole timeout allows for the largest transfer, so a
+/// store that stops answering partway would otherwise hold each task asking
+/// it that long.
+const STALL: Duration = Duration::from_secs(30);
+/// The most a record of path sets may hold for a store server, which takes an
+/// upload body of at most 16 MiB for them (`tools/store-server/PROTOCOL.md`),
+/// leaving room for the body's header.
+const LARGEST_PATH_SETS: usize = (16 << 20) - 1024;
 /// The most an upload to a store server carries inline, counted raw, below the
 /// 100 MiB a server accepts in one body (`tools/store-server/PROTOCOL.md`).
 const UPLOAD_INLINE: u64 = 64 << 20;
@@ -244,16 +263,17 @@ fn agent() -> ureq::Agent {
         .max_idle_connections(IDLE_CONNECTIONS)
         .max_idle_connections_per_host(IDLE_CONNECTIONS)
         .build();
-    ureq::Agent::with_parts(config, connector(), DefaultResolver::default())
+    ureq::Agent::with_parts(config, connector(STALL), DefaultResolver::default())
 }
 
 /// ureq's default connections, a CONNECT proxy's included, with
 /// [`Restarting`] between the socket and TLS: rustls restarts an interrupted
-/// read itself, with the socket's whole timeout each time.
-fn connector() -> impl Connector<Out = impl Transport> {
+/// read itself, with the socket's whole timeout each time. A read that
+/// receives nothing for `stall` fails.
+fn connector(stall: Duration) -> impl Connector<Out = impl Transport> {
     ().chain(ConnectProxyConnector::default())
         .chain(TcpConnector::default())
-        .chain(Restarting)
+        .chain(Restarting { stall })
         .chain(RustlsConnector::default())
 }
 
@@ -267,8 +287,13 @@ fn connector() -> impl Connector<Out = impl Transport> {
 /// kernel queues SIGCHLD rather than drop it and wakes a thread that does not
 /// block it. qk spawns processes beside its requests, and ureq returns EINTR as
 /// the request's error; writes need nothing, as `write_all` restarts them.
+///
+/// Each read also waits at most `stall`, so that a connection the store has
+/// stopped answering on fails long before the request's own timeout.
 #[derive(Debug)]
-struct Restarting;
+struct Restarting {
+    stall: Duration,
+}
 
 impl<In: Transport> Connector<In> for Restarting {
     type Out = Box<dyn Transport>;
@@ -279,17 +304,23 @@ impl<In: Transport> Connector<In> for Restarting {
         chained: Option<In>,
     ) -> std::result::Result<Option<Self::Out>, ureq::Error> {
         Ok(chained.map(|transport| {
-            Box::new(Restart(Box::new(transport) as Box<dyn Transport>)) as Self::Out
+            Box::new(Restart {
+                inner: Box::new(transport),
+                stall: self.stall,
+            }) as Self::Out
         }))
     }
 }
 
 #[derive(Debug)]
-struct Restart(Box<dyn Transport>);
+struct Restart {
+    inner: Box<dyn Transport>,
+    stall: Duration,
+}
 
 impl Transport for Restart {
     fn buffers(&mut self) -> &mut dyn Buffers {
-        self.0.buffers()
+        self.inner.buffers()
     }
 
     fn transmit_output(
@@ -297,39 +328,74 @@ impl Transport for Restart {
         amount: usize,
         timeout: NextTimeout,
     ) -> std::result::Result<(), ureq::Error> {
-        self.0.transmit_output(amount, timeout)
+        self.inner.transmit_output(amount, timeout)
     }
 
     fn await_input(&mut self, timeout: NextTimeout) -> std::result::Result<bool, ureq::Error> {
+        use ureq::unversioned::transport::time::Duration as Wait;
         let started = std::time::Instant::now();
-        let mut next = timeout;
         loop {
-            match self.0.await_input(next) {
+            let elapsed = started.elapsed();
+            let left = match timeout.after {
+                Wait::Exact(after) => Some(after.saturating_sub(elapsed)),
+                Wait::NotHappening => None,
+            };
+            let stall = self.stall.saturating_sub(elapsed);
+            // Whether the stall, rather than the request's own time, ends
+            // this wait.
+            let stalling = left.is_none_or(|left| stall < left);
+            let wait = if stalling { stall } else { left.unwrap() };
+            if wait.is_zero() {
+                return Err(match stalling {
+                    true => stalled(self.stall),
+                    false => ureq::Error::Timeout(timeout.reason),
+                });
+            }
+            let next = NextTimeout {
+                after: Wait::Exact(wait),
+                reason: timeout.reason,
+            };
+            match self.inner.await_input(next) {
                 // Nothing was read, so reading again loses nothing, within
                 // what is left of the read's time.
-                Err(ureq::Error::Io(error)) if error.kind() == std::io::ErrorKind::Interrupted => {
-                    if let ureq::unversioned::transport::time::Duration::Exact(after) =
-                        timeout.after
-                    {
-                        let left = after.saturating_sub(started.elapsed());
-                        if left.is_zero() {
-                            return Err(ureq::Error::Timeout(timeout.reason));
-                        }
-                        next.after = ureq::unversioned::transport::time::Duration::Exact(left);
-                    }
-                }
+                Err(ureq::Error::Io(error)) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(ureq::Error::Timeout(_)) if stalling => return Err(stalled(self.stall)),
                 read => return read,
             }
         }
     }
 
     fn is_open(&mut self) -> bool {
-        self.0.is_open()
+        self.inner.is_open()
     }
 
     fn is_tls(&self) -> bool {
-        self.0.is_tls()
+        self.inner.is_tls()
     }
+}
+
+/// Whether `error` is a connection's failure, such as a reset, a broken pipe
+/// or a stall, rather than an answer from the store. A request that ran out
+/// its whole time is not: sent again, it would take as long again.
+fn lost(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<ureq::Error>(),
+            Some(ureq::Error::Io(_) | ureq::Error::ConnectionFailed | ureq::Error::HostNotFound)
+        ) || matches!(
+            cause.downcast_ref::<ureq::Error>(),
+            Some(ureq::Error::Timeout(timeout))
+                if !matches!(timeout, ureq::Timeout::Global | ureq::Timeout::PerCall)
+        )
+    })
+}
+
+/// A request that received nothing for `stall`.
+fn stalled(stall: Duration) -> ureq::Error {
+    ureq::Error::Io(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        breaker::Stalled(stall),
+    ))
 }
 
 /// The remote store for a workspace, `Ok(None)` when none is configured or the
@@ -434,7 +500,7 @@ impl Remote {
         threshold: u64,
     ) -> Self {
         Remote {
-            store,
+            store: Box::new(breaker::Breaker::new(store)),
             mode,
             uploads: Mutex::new(None),
             background,
@@ -961,7 +1027,7 @@ impl Remote {
                         loop {
                             let job = receiver.lock().unwrap().recv();
                             let Ok(job) = job else { return };
-                            if let Err(error) = remote.send(&job) {
+                            if let Err(error) = remote.send_again(&job) {
                                 failures
                                     .lock()
                                     .unwrap()
@@ -980,6 +1046,24 @@ impl Remote {
         let _ = uploads.sender.send(upload);
     }
 
+    /// Sends `job`, and again after a pause while the connection fails it:
+    /// every upload replaces or adds to what it names, so sending it twice
+    /// changes nothing. An answer the store gives fails it at once.
+    fn send_again(&self, job: &Upload) -> Result<()> {
+        let mut pause = UPLOAD_PAUSE;
+        let mut attempt = 1;
+        loop {
+            match self.send(job) {
+                Err(error) if attempt < UPLOAD_ATTEMPTS && lost(&error) => {
+                    std::thread::sleep(pause);
+                    pause *= 2;
+                    attempt += 1;
+                }
+                sent => return sent,
+            }
+        }
+    }
+
     fn send(&self, job: &Upload) -> Result<()> {
         if let Some(warm) = &job.warm {
             // The newest save for the branch replaces the last one.
@@ -990,8 +1074,19 @@ impl Remote {
             return self.put_pack(&job.local, object, &warm.record);
         }
         if let Some(sets) = &job.path_sets {
+            let record = match self.store.framing() {
+                store::Framing::Pack => sets.record.clone(),
+                // Shared without its oldest sets, rather than not at all.
+                store::Framing::Upload => {
+                    crate::recorded::within(&sets.record, LARGEST_PATH_SETS)?.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "its newest path set alone is larger than the 16 MiB a store server takes"
+                        )
+                    })?
+                }
+            };
             // As with warm records, the newest save replaces the last one.
-            return self.put_pack(&job.local, Object::PathSets(&sets.weak), &sets.record);
+            return self.put_pack(&job.local, Object::PathSets(&sets.weak), &record);
         }
         if let Some(shared) = &job.expectations {
             let Some(branch) = shared.branches.first() else {
@@ -1247,7 +1342,7 @@ impl Remote {
                         let Some(job) = queue.lock().unwrap().next() else {
                             return;
                         };
-                        if let Err(error) = self.send(job) {
+                        if let Err(error) = self.send_again(job) {
                             failures
                                 .lock()
                                 .unwrap()
@@ -1460,16 +1555,32 @@ mod agent_tests {
     #[test]
     fn signals_do_not_keep_a_stalled_request_waiting_past_its_timeout() {
         for scheme in ["http", "https"] {
-            let (elapsed, result) = stalled(scheme);
+            let (elapsed, result) = unanswered(scheme, Duration::from_millis(300), super::STALL);
             assert!(result.unwrap_err().contains("timeout"), "{scheme}");
             assert!(elapsed < Duration::from_secs(2), "{scheme}: {elapsed:?}");
         }
     }
 
+    /// A request the store stops answering fails once it has received
+    /// nothing for the stall, long before its own timeout.
+    #[test]
+    fn a_request_that_receives_nothing_fails_well_before_its_timeout() {
+        for scheme in ["http", "https"] {
+            let (elapsed, result) =
+                unanswered(scheme, Duration::from_secs(30), Duration::from_millis(300));
+            assert!(result.unwrap_err().contains("sent nothing"), "{scheme}");
+            assert!(elapsed < Duration::from_secs(2), "{scheme}: {elapsed:?}");
+        }
+    }
+
     /// A request to a server that takes the connection and never answers,
-    /// with its client signalled every 20 ms: how long it took, and how it
-    /// ended.
-    fn stalled(scheme: &str) -> (Duration, Result<(), String>) {
+    /// with its client signalled every 20 ms, made with a `timeout` and a
+    /// `stall`: how long it took, and how it ended.
+    fn unanswered(
+        scheme: &str,
+        timeout: Duration,
+        stall: Duration,
+    ) -> (Duration, Result<(), String>) {
         // SAFETY: as above; installing the same handler again is harmless.
         unsafe {
             let mut action: libc::sigaction = std::mem::zeroed();
@@ -1485,11 +1596,11 @@ mod agent_tests {
         let server = std::thread::spawn(move || listener.accept().unwrap());
         let client = std::thread::spawn(move || {
             let config = ureq::Agent::config_builder()
-                .timeout_global(Some(Duration::from_millis(300)))
+                .timeout_global(Some(timeout))
                 .build();
             let agent = ureq::Agent::with_parts(
                 config,
-                super::connector(),
+                super::connector(stall),
                 ureq::unversioned::resolver::DefaultResolver::default(),
             );
             let started = std::time::Instant::now();
@@ -1532,6 +1643,8 @@ mod flight_tests {
         reads: Arc<AtomicUsize>,
         /// Whether it takes upload bodies, as a store server does.
         uploads: bool,
+        /// Uploads to fail as a reset connection would, before taking any.
+        resets: AtomicUsize,
     }
 
     fn name(object: Object) -> String {
@@ -1575,6 +1688,17 @@ mod flight_tests {
         }
 
         fn put(&self, object: Object, mut file: fs::File) -> Result<()> {
+            let reset = self
+                .resets
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                });
+            if reset.is_ok() {
+                return Err(ureq::Error::Io(std::io::Error::from(
+                    std::io::ErrorKind::ConnectionReset,
+                ))
+                .into());
+            }
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes)?;
             self.objects.lock().unwrap().insert(name(object), bytes);
@@ -1652,6 +1776,49 @@ mod flight_tests {
             .unwrap();
         assert_eq!(placements[&blobs[0]], pack::Placement::Inline);
         assert_eq!(placements[&blobs[1]], pack::Placement::Apart);
+    }
+
+    #[test]
+    fn a_request_that_ran_out_its_time_is_not_sent_again() {
+        let error = |timeout| anyhow::Error::from(ureq::Error::Timeout(timeout));
+        assert!(!lost(&error(ureq::Timeout::Global)));
+        assert!(!lost(&error(ureq::Timeout::PerCall)));
+        assert!(lost(&error(ureq::Timeout::Connect)));
+        assert!(lost(&error(ureq::Timeout::RecvBody)));
+    }
+
+    /// An upload the connection fails is sent again, up to its attempts.
+    #[test]
+    fn an_upload_a_connection_fails_is_sent_again() {
+        let weak = "a".repeat(64);
+        let record = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "weak": weak,
+            "sets": []
+        }))
+        .unwrap();
+        for (resets, sent) in [
+            (UPLOAD_ATTEMPTS as usize - 1, true),
+            (UPLOAD_ATTEMPTS as usize, false),
+        ] {
+            let root = cache();
+            let memory = Memory::default();
+            memory.resets.store(resets, Ordering::SeqCst);
+            let remote = Arc::new(Remote::new(
+                Box::new(memory),
+                Mode::ReadWrite,
+                None,
+                u64::MAX,
+            ));
+            remote.upload_path_sets(root.path(), &weak, record.clone());
+            let failures = remote.finish();
+            assert_eq!(failures.is_empty(), sent, "{resets}: {failures:?}");
+            assert!(
+                failures.iter().all(|failure| failure.contains("reset")),
+                "{failures:?}"
+            );
+            assert_eq!(remote.store.has(Object::PathSets(&weak)).unwrap(), sent);
+        }
     }
 
     #[test]
