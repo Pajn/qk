@@ -64,6 +64,8 @@ pub struct SandboxResult {
     pub mode: sandbox::Mode,
     pub findings: BTreeMap<String, sandbox::Findings>,
     pub unsandboxed: BTreeMap<String, String>,
+    /// Enforce: tasks that could not be sandboxed, and so failed, and why.
+    pub refused: BTreeMap<String, String>,
     pub packages_unchecked: BTreeMap<String, String>,
     /// Audit: the tasks held to their plans.
     pub audited: BTreeSet<String>,
@@ -1224,6 +1226,13 @@ pub fn run(
             // started, or was restored from the cache.
             let ran = |id: &String| records.contains_key(id) && !finished.restored.contains(id);
             finished.unsandboxed.retain(|id, _| ran(id));
+            // A task that started no command was never refused.
+            finished.refused.retain(|id, _| {
+                ran(id)
+                    && records
+                        .get(id)
+                        .is_some_and(|record| matches!(record.outcome, Outcome::Failed(_)))
+            });
             finished.packages_unchecked.retain(|id, _| ran(id));
             finished.audited.retain(|id| records.contains_key(id));
             if mode == sandbox::Mode::Audit {
@@ -1237,6 +1246,7 @@ pub fn run(
                 mode,
                 findings: finished.findings,
                 unsandboxed: finished.unsandboxed,
+                refused: finished.refused,
                 packages_unchecked: finished.packages_unchecked,
                 audited: finished.audited,
                 restored: finished.restored,

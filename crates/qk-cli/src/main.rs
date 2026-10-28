@@ -2035,12 +2035,14 @@ fn execute_narrowed(
         qk_executor::report::write_all(true, format!("\n{summary}").as_bytes());
     }
     if let Some(sandbox) = &result.sandbox {
-        let text = ui::sandbox_summary(sandbox, graph.tasks.len(), ui::Paint::stderr());
+        // The tasks that ended, which a task skipped after a failure did not.
+        let text = ui::sandbox_summary(sandbox, result.tasks.len(), ui::Paint::stderr());
         qk_executor::report::write_all(true, format!("\n{text}").as_bytes());
         if let Some(path) = &options.sandbox_report {
             let mut bytes = serde_json::to_vec_pretty(&serde_json::json!({
                 "tasks": sandbox.findings,
                 "unsandboxed": sandbox.unsandboxed,
+                "refused": sandbox.refused,
                 "packagesUnchecked": sandbox.packages_unchecked,
             }))?;
             bytes.push(b'\n');

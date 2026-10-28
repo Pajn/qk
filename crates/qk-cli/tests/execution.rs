@@ -3621,7 +3621,11 @@ fn the_sandbox_reports_and_refuses_what_a_task_does_not_declare() {
             "static",
         ],
     );
-    assert!(!enforced.status.success());
+    assert!(
+        !enforced.status.success(),
+        "{}",
+        String::from_utf8_lossy(&enforced.stderr)
+    );
     // The task `run` is for streams, so its errors stay on stderr.
     let stderr = String::from_utf8_lossy(&enforced.stderr);
     #[cfg(target_os = "macos")]
@@ -3848,6 +3852,106 @@ fn the_sandbox_groups_reads_in_dependency_projects() {
     );
 }
 
+/// A task the sandbox cannot be built for, here as its inputs cannot be
+/// resolved, runs unsandboxed under audit and is listed with why. Enforcing,
+/// it fails rather than run unconfined, and says how to leave it out; left
+/// out, it runs.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn enforce_fails_a_task_it_cannot_sandbox() {
+    if !can_audit() {
+        return;
+    }
+    let _audit = AUDIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let target = |sandboxed: bool| {
+        let mut build = json!({
+            "command": "echo built > built.txt",
+            "inputs": [{"externalDependencies": ["app"]}]
+        });
+        if !sandboxed {
+            build["qk:sandbox"] = json!(false);
+        }
+        json!({
+            "build": build,
+            "after": {"command": "echo after > after.txt", "dependsOn": ["build"]},
+            "nothing": {"executor": "nx:noop", "inputs": [{"externalDependencies": ["app"]}]}
+        })
+    };
+    let temp = fixture(target(true));
+    let report = temp.path().join("sandbox.json");
+    let sandboxed_target = |task: &str, mode: &str| {
+        run(
+            temp.path(),
+            &[
+                "run",
+                task,
+                mode,
+                "--sandbox-report",
+                report.to_str().unwrap(),
+            ],
+        )
+    };
+    let sandboxed = |mode: &str| sandboxed_target("app:build", mode);
+    let read = || -> Value { serde_json::from_slice(&fs::read(&report).unwrap()).unwrap() };
+
+    success(sandboxed("--sandbox=audit"));
+    assert!(temp.path().join("built.txt").is_file());
+    let findings = read();
+    assert!(
+        findings["unsandboxed"]["app:build"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("externalDependency")),
+        "{findings}"
+    );
+
+    fs::remove_file(temp.path().join("built.txt")).unwrap();
+    let enforced = sandboxed("--sandbox=enforce");
+    assert!(
+        !enforced.status.success(),
+        "{}",
+        String::from_utf8_lossy(&enforced.stderr)
+    );
+    assert!(!temp.path().join("built.txt").exists());
+    let stderr = String::from_utf8_lossy(&enforced.stderr);
+    assert!(stderr.contains("set \"qk:sandbox\": false"), "{stderr}");
+    assert!(
+        stderr.contains("failed, as it cannot be sandboxed"),
+        "{stderr}"
+    );
+    let findings = read();
+    assert!(
+        findings["refused"]["app:build"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("externalDependency")),
+        "{findings}"
+    );
+    assert!(
+        findings["unsandboxed"].get("app:build").is_none(),
+        "{findings}"
+    );
+
+    // What depends on it is skipped, and neither counts as kept.
+    let skipped = run(temp.path(), &["run", "app:after", "--sandbox=enforce"]);
+    assert!(!skipped.status.success());
+    let stderr = String::from_utf8_lossy(&skipped.stderr);
+    assert!(stderr.contains("Sandbox enforce: no task ran"), "{stderr}");
+
+    // A task with no command to start is not refused.
+    success(sandboxed_target("app:nothing", "--sandbox=enforce"));
+    let findings = read();
+    assert_eq!(findings["refused"], json!({}), "{findings}");
+
+    fs::write(
+        temp.path().join("project.json"),
+        json!({"name": "app", "targets": target(false)}).to_string(),
+    )
+    .unwrap();
+    success(sandboxed("--sandbox=enforce"));
+    assert!(temp.path().join("built.txt").is_file());
+}
+
 /// Seatbelt refuses a sandbox inside one that restricts anything, so a task
 /// that applies its own, as Xcode does for Swift macros, runs again
 /// unsandboxed and is listed with why.
@@ -3886,7 +3990,11 @@ fn a_task_applying_its_own_sandbox_runs_again_unsandboxed() {
     // Enforcing, it fails, and says how to leave it out.
     fs::remove_file(temp.path().join("built.txt")).unwrap();
     let enforced = run(temp.path(), &["run", "app:build", "--sandbox=enforce"]);
-    assert!(!enforced.status.success());
+    assert!(
+        !enforced.status.success(),
+        "{}",
+        String::from_utf8_lossy(&enforced.stderr)
+    );
     assert!(!temp.path().join("built.txt").exists());
     let stderr = String::from_utf8_lossy(&enforced.stderr);
     assert!(stderr.contains("set \"qk:sandbox\": false"), "{stderr}");

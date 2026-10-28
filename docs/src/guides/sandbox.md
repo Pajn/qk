@@ -211,16 +211,22 @@ check, which a scratch directory does not need.
   proving nothing else happened. On Linux, audit's reports come from each
   task's recording, and a recording that lost events or could not be decoded
   leaves its task listed as not audited.
-- A task whose inputs cannot be resolved, or on macOS whose profile the
-  sandbox rejects, runs unsandboxed and is listed with the reason.
+- A task the sandbox cannot be built for, as one whose inputs cannot be
+  resolved, one whose profile Seatbelt rejects on macOS, or one whose rules
+  Landlock cannot take on Linux, runs unsandboxed under audit and is listed
+  under `unsandboxed` with the reason. Enforce does not run it unconfined: it
+  fails, is listed under `refused` in `--sandbox-report`, and says to set
+  `"qk:sandbox": false` on its target to run it unsandboxed. A task taken from
+  the cache runs nothing, so it is not refused.
 - On macOS, Seatbelt caps the paths a profile with reports may name at 64 KiB
   together. A task's profile names the shorter list of pnpm's store
   directories, those to report or those not to, which fits stores of a few
   thousand directories. A task whose profile still does not fit is retried
   without reporting installed packages: if Seatbelt takes that profile, the
   task runs sandboxed and is listed under `packagesUnchecked` in
-  `--sandbox-report`; if not, it runs unsandboxed and is listed with the
-  reason, as above. Only tasks that started are listed.
+  `--sandbox-report`; if not, it is handled as above. Only audit profiles
+  carry reports, so the cap is an audit's: an enforce profile can name far
+  more. Only tasks that started are listed.
 - On macOS, Seatbelt refuses to apply a sandbox inside one that restricts anything, as
   every task's profile does. A task that applies its own, as Xcode does to
   run Swift macros, fails with `sandbox_apply: Operation not permitted`.
