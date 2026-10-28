@@ -124,6 +124,7 @@ These options apply to `run`, `run-many` and `affected`:
 | `--parallel [value]` | Number, percentage, or `false`; `NX_PARALLEL`, then workspace `parallel`, then `3` |
 | `--cores <count>` | Positive core budget; `QK_CORES`, then `qk:cores`, then available cores |
 | `--skip-cache` | Bypass all result caching and warm state |
+| `--cold` | Run each task from scratch: restore no result and empty its warm paths rather than restore them, then save both as usual; `QK_COLD=true` too. See [Replacing a bad save](../guides/warm-state.md#replacing-a-bad-save) |
 | `--skip-remote-cache` | Keep local caching only |
 | `--nx-bail` | Stop starting tasks after the first failure; `NX_BAIL=true` too |
 | `--nx-ignore-cycles` | Drop cycle-closing dependency edges with a warning |

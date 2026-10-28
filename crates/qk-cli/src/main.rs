@@ -192,6 +192,10 @@ struct RunOptions {
     /// Bypass all cache reads and writes; also NX_SKIP_NX_CACHE=true.
     #[arg(long, aliases = ["skip-nx-cache", "disable-nx-cache"])]
     skip_cache: bool,
+    /// Run each task from scratch: restore no result and no warm state, and
+    /// save what it gives in their place; also QK_COLD=true.
+    #[arg(long)]
+    cold: bool,
     /// Use the local cache only; also NX_SKIP_REMOTE_CACHE=true.
     #[arg(long, alias = "disable-remote-cache")]
     skip_remote_cache: bool,
@@ -450,6 +454,10 @@ impl RunOptions {
 
     fn graph_target(&self) -> Option<&str> {
         self.graph.as_deref().filter(|target| *target != "false")
+    }
+
+    fn runs_cold(&self) -> bool {
+        self.cold || env_flag("QK_COLD")
     }
 
     fn skips_cache(&self) -> bool {
@@ -1779,7 +1787,12 @@ fn execute_narrowed(
         qk_cache::profile::enable();
     }
     options.export();
+    if options.cold && options.skips_cache() {
+        bail!("--cold saves what it runs, which --skip-cache does not; use one of them");
+    }
     let skip_cache = options.skips_cache() || options.input_analysis.is_some();
+    // QK_COLD gives way to a run that skips the cache, as an analysis does.
+    let cold = options.runs_cold() && !skip_cache;
     // The root dotenv files can hold the remote store's credentials.
     let environment = qk_executor::environment(&workspace.root);
     // What tasks are expected to take is fetched while the run gets ready to
@@ -1970,6 +1983,7 @@ fn execute_narrowed(
             parallel,
             cores,
             skip_cache,
+            cold,
             bail: options.bails(),
             style,
             stream_long_running: !matches!(
