@@ -731,6 +731,7 @@ impl Remote {
         self: &Arc<Self>,
         root: &Path,
         task: &str,
+        identity: &str,
         branch: &str,
         record: Vec<u8>,
     ) {
@@ -738,7 +739,7 @@ impl Remote {
             key: format!("{task} warm state"),
             local: root.to_owned(),
             warm: Some(Warm {
-                identity: task.to_owned(),
+                identity: identity.to_owned(),
                 branch: branch.to_owned(),
                 record,
             }),
@@ -800,8 +801,9 @@ impl Remote {
 
     /// The task's warm record saved on `branch`, with every blob it cites
     /// fetched into the local store and verified, or `None` when there is
-    /// none or `accept` rejects its key. The key is checked before any blob is
-    /// read, so a save that does not suit this checkout costs only its record.
+    /// none or `accept` rejects its key or the worktree root it was saved in.
+    /// Both are checked before any blob is read, so a save that does not suit
+    /// this checkout costs only its record.
     /// The pin keeps the blobs until the caller has stored the record.
     pub(crate) fn fetch_warm(
         &self,
@@ -809,12 +811,15 @@ impl Remote {
         identity: &str,
         task: &str,
         branch: &str,
-        accept: impl Fn(&[String]) -> bool,
+        accept: impl Fn(&[String], Option<&str>) -> bool,
     ) -> Result<Option<(Vec<u8>, crate::evict::Pin)>> {
         let object = Object::Warm { identity, branch };
         let received = AtomicU64::new(0);
         let fetched = self.fetch_pack(root, object, task, &received, &[], |record| {
-            if record.warm_key().is_some_and(|key| accept(&key)) {
+            if record
+                .warm_key()
+                .is_some_and(|key| accept(&key, record.warm_worktree()))
+            {
                 Ok(())
             } else {
                 Err(OtherWarmKey.into())

@@ -10,7 +10,9 @@
 //!
 //! A group already present on disk is left alone. Otherwise it is restored
 //! from this worktree's own save. `portable: true` also permits other
-//! worktrees' and remote saves. A local save made at a commit `HEAD` does not
+//! worktrees' and remote saves. `portable: "path"` permits remote saves made
+//! in a worktree at the same path, as CI runners checking out in one place
+//! share state that records where it was made. A local save made at a commit `HEAD` does not
 //! descend from, as on another branch, comes last, after the remote's: on a
 //! machine that builds many branches in one directory, as a CI runner does,
 //! another branch's state is the least like this checkout's. It is saved after
@@ -75,6 +77,22 @@ type PendingFile<'a> = (&'a String, &'a str, u32, PathBuf, SystemTime);
 /// A restored file's stamp and size.
 type RestoredFile = (Vec<i64>, u64);
 
+/// Which saves of a target's warm state, besides its own worktree's, may be
+/// restored.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Portable {
+    /// None: `portable: false`, the default.
+    #[default]
+    Own,
+    /// The remote's, when made in a worktree at the same path, and so this
+    /// worktree's own on another machine: `portable: "path"`. For state that
+    /// records where it was made, which CI runners checking out in one
+    /// place can share and other checkouts cannot use.
+    Path,
+    /// Any other worktree's and the remote's: `portable: true`.
+    Anywhere,
+}
+
 /// A target's `qk:warm`.
 #[derive(Clone, Debug, Default)]
 pub struct Warm {
@@ -92,8 +110,8 @@ pub struct Warm {
     /// Whether a worktree's own save comes back with the modification times it
     /// was saved with, rather than [`RESTORED_AT`].
     pub preserve_mtimes: bool,
-    /// Whether another worktree's save, or the remote's, may be restored.
-    pub portable: bool,
+    /// Which saves besides this worktree's own may be restored.
+    pub portable: Portable,
     /// What decides whether a save suits this checkout, in order.
     pub key: Vec<KeyPart>,
     /// How many leading parts of the key a save must match when none matches
@@ -340,7 +358,12 @@ fn entry(
         max_size,
         remote: flag("remote", true)?,
         preserve_mtimes,
-        portable: flag("portable", false)?,
+        portable: match object.get("portable") {
+            None | Some(Value::Bool(false)) => Portable::Own,
+            Some(Value::Bool(true)) => Portable::Anywhere,
+            Some(Value::String(path)) if path == "path" => Portable::Path,
+            Some(_) => bail!("qk:warm.portable must be true, false or \"path\""),
+        },
         key,
         restore_keys,
         survive,
@@ -985,6 +1008,16 @@ fn stamp(metadata: &fs::Metadata) -> Vec<i64> {
 }
 
 /// This worktree's root, as records name it.
+/// The name a remote save of `warm` from a checkout at `worktree` is stored
+/// under: path-portable saves are kept apart by path, so a checkout at
+/// another path never replaces the save the checkouts at this one restore.
+fn remote_identity(warm: &Warm, worktree: &str) -> String {
+    match warm.portable {
+        Portable::Path => format!("{}\0path\0{worktree}", warm.identity),
+        _ => warm.identity.clone(),
+    }
+}
+
 fn worktree(workspace: &Workspace) -> String {
     fs::canonicalize(&workspace.root)
         .unwrap_or_else(|_| workspace.root.clone())
@@ -1186,7 +1219,7 @@ impl Cache {
             .filter_map(|(_, record)| {
                 let quality = key_match(warm, current, &record.key)?;
                 let other = record.worktree != own;
-                (!other || warm.portable).then_some((quality, other, record))
+                (!other || warm.portable == Portable::Anywhere).then_some((quality, other, record))
             })
             .filter(|(_, _, record)| {
                 let descends = record
@@ -1461,17 +1494,26 @@ impl Cache {
         let remote = self
             .remote
             .as_ref()
-            .filter(|_| warm.remote && warm.portable)?;
+            .filter(|_| warm.remote && warm.portable != Portable::Own)?;
+        let own = worktree(workspace);
+        // Saved in a worktree at another path, it is no save for this one.
+        let placed =
+            |saved: Option<&str>| warm.portable != Portable::Path || saved == Some(own.as_str());
         for branch in branches(workspace) {
-            let suits = |saved: &[String]| key_match(warm, current, saved).is_some();
-            match remote.fetch_warm(&self.root, &warm.identity, &task.id, &branch, suits) {
+            let suits = |saved: &[String], worktree: Option<&str>| {
+                key_match(warm, current, saved).is_some() && placed(worktree)
+            };
+            let name = remote_identity(warm, &own);
+            match remote.fetch_warm(&self.root, &name, &task.id, &branch, suits) {
                 Ok(Some((bytes, _pin))) => {
                     let Some(record) = WarmRecord::read(&bytes, &warm.identity).ok() else {
                         continue;
                     };
                     // A branch's save that does not suit this checkout gives
                     // way to the next branch's.
-                    if key_match(warm, current, &record.key).is_none() {
+                    if key_match(warm, current, &record.key).is_none()
+                        || !placed(Some(&record.worktree))
+                    {
                         continue;
                     }
                     if self.store_warm(&record).is_err() {
@@ -1670,7 +1712,7 @@ impl Cache {
         }
         // Stamps describe this machine's files; the remote record goes without.
         if warm.remote
-            && warm.portable
+            && warm.portable != Portable::Own
             && let Some(remote) = &self.remote
             && let Some(branch) = &save.branch
         {
@@ -1680,6 +1722,7 @@ impl Cache {
             remote.upload_warm(
                 &self.root,
                 &warm.identity,
+                &remote_identity(warm, &save.worktree),
                 branch,
                 serde_json::to_vec(&record)?,
             );
@@ -1783,10 +1826,24 @@ mod tests {
         .unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].group(), Some("metro"));
-        assert!(entries[0].portable && entries[0].directory);
+        assert!(entries[0].portable == Portable::Anywhere && entries[0].directory);
         assert_eq!(entries[1].group(), None);
-        assert!(!entries[1].portable && entries[1].preserve_mtimes);
+        assert!(entries[1].portable == Portable::Own && entries[1].preserve_mtimes);
         assert_eq!(kept_paths(&entries), ["build"]);
+    }
+
+    #[test]
+    fn portable_is_a_boolean_or_the_same_path() {
+        let portable = |value| {
+            entries(json!({"paths": ["build"], "portable": value}))
+                .map(|entries| entries[0].portable)
+        };
+        assert_eq!(portable(json!("path")).unwrap(), Portable::Path);
+        assert_eq!(portable(json!(false)).unwrap(), Portable::Own);
+        assert_eq!(
+            format!("{:#}", portable(json!("anywhere")).unwrap_err()),
+            "qk:warm.portable must be true, false or \"path\""
+        );
     }
 
     #[test]
