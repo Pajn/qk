@@ -196,6 +196,16 @@ parts name. A symbolic link is left out, since allowing it would allow
 whatever it leads to. That is a claim qk cannot
 check, which a scratch directory does not need.
 
+A glob that covers a nested workspace, a directory with a `pnpm-lock.yaml`
+importer of its own such as a project's end-to-end tests, covers what it
+installs too. Reads of those packages reach their pnpm store directory, not
+a path under the ignored directory, so the audit leaves out a read of a
+package that the nested workspace installs, directly or not, unless the
+task's key covers it. The same goes for the workspace projects it links to,
+and what they install, unless the task's key counts them: enforce lets the
+task read their manifests, and the audit leaves those reads out. The root
+importer, and an importer the task's key counts, is never covered this way.
+
 ## Notes
 
 - A sandboxed run keeps the cache. A task restored from it did not run, so

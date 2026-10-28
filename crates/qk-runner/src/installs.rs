@@ -83,6 +83,48 @@ impl Installs {
         (paths(keyed), paths(unkeyed))
     }
 
+    /// What a task's ignored reads reach through the lockfile, beyond its key:
+    /// the snapshots installed by the nested workspaces whose manifest
+    /// `ignores` matches, and by the workspace projects they link to, that
+    /// `covered` leaves out, none when the whole lockfile is keyed; and the
+    /// manifests of those linked projects. A read of either is a read
+    /// through the ignored files. Neither the root nor an importer the key
+    /// counts, `keyed`, is followed.
+    pub(crate) fn ignored(
+        &self,
+        keyed: &BTreeSet<String>,
+        covered: Option<&BTreeSet<String>>,
+        ignores: impl Fn(&str) -> bool,
+    ) -> (BTreeSet<String>, BTreeSet<String>) {
+        let mut pending: Vec<String> = self
+            .lockfile
+            .importers()
+            .filter(|importer| *importer != "." && !keyed.contains(*importer))
+            .filter(|importer| ignores(&format!("{importer}/package.json")))
+            .map(str::to_owned)
+            .collect();
+        let mut reached: BTreeSet<String> = pending.iter().cloned().collect();
+        let mut manifests = BTreeSet::new();
+        while let Some(importer) = pending.pop() {
+            for linked in self.lockfile.linked(&importer) {
+                if linked != "." && !keyed.contains(&linked) && reached.insert(linked.clone()) {
+                    manifests.insert(format!("{linked}/package.json"));
+                    pending.push(linked);
+                }
+            }
+        }
+        let snapshots = match covered {
+            Some(covered) => self
+                .lockfile
+                .reached_snapshots(reached.iter().map(String::as_str), [])
+                .into_iter()
+                .filter(|key| !covered.contains(key))
+                .collect(),
+            None => BTreeSet::new(),
+        };
+        (snapshots, manifests)
+    }
+
     /// The package a read of `path`, absolute, belongs to when `covered`
     /// leaves out its installation. A path naming a link into the store, such
     /// as an importer's `node_modules/<name>/…`, is followed to it.
@@ -151,6 +193,19 @@ importers:
       react:
         specifier: ^19.0.0
         version: 19.0.0
+  apps/app/e2e:
+    devDependencies:
+      helper:
+        specifier: ^1.0.0
+        version: 1.0.0
+      '@example/core':
+        specifier: workspace:*
+        version: link:../../../packages/core
+  packages/core:
+    dependencies:
+      '@scope/tool':
+        specifier: ^2.0.0
+        version: 2.0.0(react@19.0.0)
 packages:
   fallow@1.0.0: {resolution: {integrity: sha512-f}}
   helper@1.0.0: {resolution: {integrity: sha512-h}}
@@ -290,6 +345,41 @@ snapshots:
                 ],
                 vec![root.join("node_modules/.pnpm/@scope+tool@2.0.0_react@19.0.0")]
             )
+        );
+    }
+
+    #[test]
+    fn permits_what_an_ignored_nested_workspace_installs_beyond_the_key() {
+        let temp = workspace();
+        let root = temp.path().canonicalize().unwrap();
+        let installs = Installs::load(&root).unwrap();
+        let none = covered(&installs, &[]);
+        let e2e = |manifest: &str| manifest.starts_with("apps/app/e2e/");
+        let keyed: BTreeSet<String> = ["apps/app".to_owned()].into();
+        // What it installs and what the project it links to installs, but
+        // not what the key already covers.
+        assert_eq!(
+            installs.ignored(&keyed, Some(&none), e2e),
+            (
+                [
+                    "@scope/tool@2.0.0(react@19.0.0)".to_owned(),
+                    "helper@1.0.0".to_owned()
+                ]
+                .into(),
+                ["packages/core/package.json".to_owned()].into()
+            )
+        );
+        // A linked project the key counts is its own.
+        let mut with_core = keyed.clone();
+        with_core.insert("packages/core".to_owned());
+        assert_eq!(
+            installs.ignored(&with_core, Some(&none), e2e),
+            (["helper@1.0.0".to_owned()].into(), BTreeSet::new())
+        );
+        // Nothing when no nested workspace is ignored, and never the root.
+        assert_eq!(
+            installs.ignored(&keyed, Some(&none), |manifest| manifest == "package.json"),
+            (BTreeSet::new(), BTreeSet::new())
         );
     }
 }

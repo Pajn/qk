@@ -444,3 +444,41 @@ fn finds_a_package_by_an_alias_it_is_installed_under() {
         ["dep".to_owned(), "typescript".to_owned()].into()
     );
 }
+
+#[test]
+fn places_workspace_links_from_the_root() {
+    let lockfile = Lockfile::parse(
+        "lockfileVersion: '9.0'
+importers:
+  .:
+    devDependencies:
+      tool:
+        specifier: workspace:*
+        version: link:tools/tool
+  apps/app/e2e:
+    devDependencies:
+      '@example/core':
+        specifier: workspace:*
+        version: link:../../../packages/core
+      outside:
+        specifier: link:../../../../elsewhere
+        version: link:../../../../elsewhere
+      plain:
+        specifier: link:../../../vendor/plain
+        version: link:../../../vendor/plain
+      absolute:
+        specifier: link:/packages/core
+        version: link:/packages/core
+  packages/core: {}
+  tools/tool: {}
+",
+    )
+    .unwrap();
+    assert_eq!(
+        lockfile.importers().collect::<Vec<_>>(),
+        [".", "apps/app/e2e", "packages/core", "tools/tool"]
+    );
+    assert_eq!(lockfile.linked("."), ["tools/tool"]);
+    assert_eq!(lockfile.linked("apps/app/e2e"), ["packages/core"]);
+    assert!(lockfile.linked("packages/core").is_empty());
+}

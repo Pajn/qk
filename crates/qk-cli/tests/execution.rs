@@ -4224,6 +4224,119 @@ fn the_sandbox_reports_a_package_read_that_the_key_leaves_out() {
     assert!(findings["tasks"].get("app:lint").is_none(), "{findings}");
 }
 
+/// A nested workspace a task's `ignoreReads` covers brings what it installs,
+/// and the workspace projects it links to, with it: reads of them go through
+/// the ignored files, wherever pnpm placed them.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn the_sandbox_ignores_what_an_ignored_nested_workspace_installs() {
+    if !can_audit() {
+        return;
+    }
+    let _audit = AUDIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let package = |name: &str| {
+        format!("../../node_modules/.pnpm/{name}@1.0.0/node_modules/{name}/package.json")
+    };
+    let read = format!(
+        "cat e2e/spec.js ../../packages/shared/package.json {} {} {}",
+        package("phantom"),
+        package("other"),
+        package("fallow")
+    );
+    let temp = root_tool_fixture(json!({
+        "check": {
+            "command": read,
+            "options": {"cwd": "apps/app"},
+            "inputs": [{"externalDependencies": []}],
+            "qk:ultracache": {"mode": "record", "ignoreReads": ["apps/app/e2e/**"]}
+        }
+    }));
+    let root = temp.path();
+    let lockfile = fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap();
+    fs::write(
+        root.join("pnpm-lock.yaml"),
+        lockfile.replace(
+            "  apps/mobile:\n",
+            "  apps/app/e2e:
+    devDependencies:
+      phantom:
+        specifier: ^1.0.0
+        version: 1.0.0
+      shared:
+        specifier: workspace:*
+        version: link:../../../packages/shared
+  packages/shared:
+    dependencies:
+      other:
+        specifier: ^1.0.0
+        version: 1.0.0
+  apps/mobile:\n",
+        ),
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("apps/app/e2e")).unwrap();
+    fs::write(root.join("apps/app/e2e/package.json"), "{}").unwrap();
+    fs::write(root.join("apps/app/e2e/spec.js"), "").unwrap();
+    fs::create_dir_all(root.join("packages/shared")).unwrap();
+    fs::write(root.join("packages/shared/package.json"), "{}").unwrap();
+    fs::write(root.join("packages/shared/index.js"), "").unwrap();
+    let report = root.join("sandbox.json");
+    success(run(
+        root,
+        &[
+            "run",
+            "app:check",
+            "--sandbox",
+            "--sandbox-report",
+            report.to_str().unwrap(),
+        ],
+    ));
+    let findings: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+    let task = &findings["tasks"]["app:check"];
+    // `fallow`, which only the root installs, is still the task's own read.
+    assert_eq!(task["unkeyedPackages"], json!(["fallow"]), "{findings}");
+    assert_eq!(task["hoistedPackages"], json!([]), "{findings}");
+    assert_eq!(task["undeclaredReads"], json!([]), "{findings}");
+    // Enforce lets it read them too, but of the linked project only its
+    // manifest.
+    let project = root.join("apps/app/project.json");
+    let enforced_with = |command: &str, inputs: Value| {
+        fs::write(
+            &project,
+            json!({"name": "app", "targets": {"check": {
+                "command": command,
+                "options": {"cwd": "apps/app"},
+                "inputs": inputs,
+                "qk:ultracache": {"mode": "record", "ignoreReads": ["apps/app/e2e/**"]}
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        run(
+            root,
+            &["run", "app:check", "--skip-cache", "--sandbox=enforce"],
+        )
+    };
+    let enforced = |command: &str| enforced_with(command, json!([{"externalDependencies": []}]));
+    success(enforced(&format!(
+        "cat e2e/spec.js ../../packages/shared/package.json {} {}",
+        package("phantom"),
+        package("other")
+    )));
+    assert!(
+        !enforced("cat ../../packages/shared/index.js")
+            .status
+            .success()
+    );
+    // Keying the whole lockfile, it reads the linked manifest all the same.
+    success(enforced_with(
+        "cat ../../packages/shared/package.json",
+        json!(["{workspaceRoot}/pnpm-lock.yaml"]),
+    ));
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn warm_suggest_lists_the_directories_a_task_wrote_outside_its_outputs() {
