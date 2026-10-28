@@ -23,9 +23,12 @@ qk records tasks itself, and keeps the recordings in its cache.
 
 A run with `--record`, or with `QK_RECORD=true`, records each task with
 `qk:ultracache` that it executes. Recording needs Linux, with eBPF or strace
-as [Recorders](#recorders) describes. On other systems `--record` records
-nothing and says so. A task taken from the cache is not
-recorded, since nothing runs.
+as [Recorders](#recorders) describes. On other systems, and on Linux where
+no recorder works, `--record` records nothing and says why, and the run goes
+on: a recording only keys what a later run may take, so CI can set
+`QK_RECORD` on any runner. A `QK_RECORDER` naming no recorder, or naming one
+that cannot record here, fails the run.
+A task taken from the cache is not recorded, since nothing runs.
 
 A recording keeps a path set: what the task did to each path in the
 workspace.
@@ -42,8 +45,10 @@ workspace.
 
 Left out are paths outside the workspace, `node_modules`, which the lockfile
 keys, `.git`, qk's own state, the task's outputs and warm paths, files it wrote
-before reading them, and what its `ignoreReads` names. A directory's listing
-leaves out the task's outputs and what it wrote there, which are there after
+before reading them, its
+[scratch directories](sandbox.md#scratch-directories-and-ignored-reads), and
+what its `ignoreReads` names, which the sandbox's audit leaves out too. A
+directory's listing leaves out the task's outputs and what it wrote there, which are there after
 it runs and need not be before, and the declared outputs of every other
 target in the workspace, which other tasks write whether or not this one
 reads them, with the directories between an output and its project's root,

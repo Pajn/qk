@@ -125,6 +125,9 @@ pub struct Snapshot {
     membership: Mutex<Option<Arc<Membership>>>,
     membership_prefixes: Mutex<HashMap<String, Arc<Vec<PathBuf>>>>,
     source_exclusions: Vec<Outputs>,
+    /// Every task's scratch directories, among `source_exclusions`, which no
+    /// input reads, `includeIgnored` ones included.
+    scratch: Vec<Outputs>,
     cache_relative: Option<PathBuf>,
     projects: ProjectGraph,
     /// Each project by its root, to find the project owning a file.
@@ -698,6 +701,27 @@ impl Snapshot {
                 source_exclusions.push(paths);
             }
         }
+        // Scratch directories, which each run empties: what is in them is no
+        // input, before or after the task runs.
+        let mut scratch_paths = Vec::new();
+        for task in graph.tasks.values() {
+            let scratch: Vec<String> = crate::scratch::directories(workspace, task)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|directory| {
+                    let relative = directory.strip_prefix(&workspace.root).ok()?.to_str()?;
+                    let named = crate::glob::escape(&relative.replace('\\', "/"));
+                    Some([named.clone(), format!("{named}/**")])
+                })
+                .flatten()
+                .collect();
+            if !scratch.is_empty()
+                && let Ok(paths) = Outputs::from_paths(&scratch)
+            {
+                source_exclusions.push(paths.clone());
+                scratch_paths.push(paths);
+            }
+        }
         exclude_artifacts(&mut files, &source_exclusions, cache_relative.as_deref());
         Ok(Self {
             files,
@@ -705,6 +729,7 @@ impl Snapshot {
             membership: Mutex::default(),
             membership_prefixes: Mutex::default(),
             source_exclusions,
+            scratch: scratch_paths,
             cache_relative,
             projects: ProjectGraph::build(workspace)?,
             roots: workspace
@@ -2508,8 +2533,10 @@ fn resolve_candidates(
                         .filter(|path| group.matches(path))
                         .cloned(),
                 )
-                // A task's own outputs are no input of it, as for any fileset.
-                .filter(|path| own_outputs.as_ref().is_none_or(|own| !own.matches(path))),
+                // A task's own outputs are no input of it, as for any fileset,
+                // and no task's scratch is any task's.
+                .filter(|path| own_outputs.as_ref().is_none_or(|own| !own.matches(path)))
+                .filter(|path| !snapshot.scratch.iter().any(|scratch| scratch.matches(path))),
         );
         for (producer, declared) in &snapshot.generated_tasks {
             if producer.id != task.id

@@ -652,3 +652,94 @@ fn a_sandbox_audit_records_nothing_for_the_cache_without_record() {
     assert_eq!(recorded["cache"], "miss");
     assert_eq!(kind(&recorded["recorded"]), "saved");
 }
+
+/// Where no recorder works, a recording run records nothing, says why once,
+/// and goes on: a recording only keys what a later run may take. An audit of
+/// what is recorded goes on unaudited the same way. A recorder named that
+/// cannot record, or one named wrong, is a mistake, and fails the run.
+#[test]
+fn a_run_where_no_recorder_works_goes_on_unrecorded() {
+    let temp = fixture();
+    let root = temp.path();
+    // The tools the build and qk run, and neither strace nor sudo, which the
+    // eBPF recorder's helper needs unless qk runs as root.
+    let bin = TempDir::new().unwrap();
+    for tool in ["git", "mkdir", "cat", "ls"] {
+        let found = Command::new("/bin/sh")
+            .args(["-c", &format!("command -v {tool}")])
+            .output()
+            .unwrap();
+        let path = String::from_utf8(found.stdout).unwrap();
+        std::os::unix::fs::symlink(path.trim(), bin.path().join(tool)).unwrap();
+    }
+    let path = bin.path().to_str().unwrap();
+    let report = root.join(".git/report.json");
+    let args = ["run", "app:build", "--report", report.to_str().unwrap()];
+    let named = Command::new(env!("CARGO_BIN_EXE_qk"))
+        .current_dir(root)
+        .arg("--workspace")
+        .arg(root)
+        .args(args)
+        .env_remove("QK_RECORD")
+        .env_remove("CI")
+        .envs([
+            ("QK_RECORD", "true"),
+            ("QK_RECORDER", "strace"),
+            ("PATH", path),
+        ])
+        .output()
+        .unwrap();
+    assert!(!named.status.success());
+    let stderr = String::from_utf8_lossy(&named.stderr);
+    assert!(stderr.contains("recording needs strace"), "{stderr}");
+    let misnamed = Command::new(env!("CARGO_BIN_EXE_qk"))
+        .current_dir(root)
+        .arg("--workspace")
+        .arg(root)
+        .args(["run", "app:build", "--record"])
+        .env("QK_RECORDER", "strase")
+        .output()
+        .unwrap();
+    assert!(!misnamed.status.success());
+    assert!(
+        String::from_utf8_lossy(&misnamed.stderr).contains("unknown QK_RECORDER \"strase\""),
+        "{}",
+        String::from_utf8_lossy(&misnamed.stderr)
+    );
+    // As root, the eBPF helper needs no sudo, so `auto` may still record.
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let output = qk(
+        root,
+        &args,
+        &[
+            ("QK_RECORD", "true"),
+            ("QK_RECORDER", "auto"),
+            ("PATH", path),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--record records nothing, as no recorder works here"),
+        "{stderr}"
+    );
+    let run: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+    assert_eq!(run["tasks"][0]["cache"], "miss");
+    write(root, "app/src/main.txt", "changed\n");
+    let output = qk(
+        root,
+        &args,
+        &[
+            ("QK_RECORD", "audit"),
+            ("QK_RECORDER", "auto"),
+            ("PATH", path),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("nothing is audited, as nothing can be recorded here"),
+        "{stderr}"
+    );
+}

@@ -3312,6 +3312,143 @@ fn tasks_audited_beside_a_restored_one_keep_their_own_traces() {
     assert!(findings["tasks"].get("app:a").is_none(), "{findings}");
 }
 
+/// A scratch directory is emptied before every run, so a task never finds
+/// what an earlier one left there; the sandbox lets it read and write there,
+/// in audit and enforce alike. A read its `qk:ultracache.ignoreReads` covers
+/// is no finding either, and enforce lets it read such a file Git ignores.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_scratch_directory_is_emptied_before_each_run_and_open_to_the_task() {
+    if !can_audit() {
+        return;
+    }
+    let _audit = AUDIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = fixture(json!({
+        "build": {
+            // Fails when it finds the state an earlier run left.
+            "command": "test ! -e tool.cache/state && echo state > tool.cache/state && cat notes.txt ignored/data.json > /dev/null",
+            "inputs": [],
+            // Named as a file might be, and still a directory to Landlock.
+            "qk:sandbox": {"scratch": ["{projectRoot}/tool.cache"]},
+            "qk:ultracache": {"mode": "record", "ignoreReads": ["notes.txt", "ignored/**"]}
+        }
+    }));
+    fs::write(temp.path().join("notes.txt"), "notes").unwrap();
+    fs::write(temp.path().join(".gitignore"), "ignored/\n").unwrap();
+    fs::create_dir(temp.path().join("ignored")).unwrap();
+    fs::write(temp.path().join("ignored/data.json"), "{}").unwrap();
+    for _ in 0..2 {
+        success(run(temp.path(), &["run", "app:build", "--skip-cache"]));
+    }
+    let report = temp.path().join("sandbox.json");
+    success(run(
+        temp.path(),
+        &[
+            "run",
+            "app:build",
+            "--skip-cache",
+            "--sandbox",
+            "--sandbox-report",
+            report.to_str().unwrap(),
+        ],
+    ));
+    let findings: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+    assert_eq!(findings["tasks"], json!({}), "{findings}");
+    success(run(
+        temp.path(),
+        &["run", "app:build", "--skip-cache", "--sandbox=enforce"],
+    ));
+}
+
+/// What a task leaves in its scratch directory is no input: a task whose
+/// inputs hold the directory is kept in the cache, and found there next run.
+#[test]
+fn a_scratch_directory_among_the_inputs_keys_nothing() {
+    let temp = fixture(json!({
+        "build": {
+            "command": "echo run >> ran && echo $$ > tool.cache/state",
+            "cache": true,
+            "outputs": ["{projectRoot}/ran"],
+            "qk:sandbox": {"scratch": ["{projectRoot}/tool.cache"]}
+        }
+    }));
+    fs::write(temp.path().join("source.txt"), "source").unwrap();
+    success(run(temp.path(), &["run", "app:build"]));
+    success(run(temp.path(), &["run", "app:build"]));
+    // Once: the second run was found in the cache.
+    let ran = fs::read_to_string(temp.path().join("ran")).unwrap();
+    assert_eq!(ran.lines().count(), 1, "{ran:?}");
+}
+
+/// An `includeIgnored` input reads the disk, and still not a scratch
+/// directory, though what a run left there is on disk until the next one.
+#[test]
+fn a_scratch_directory_an_include_ignored_input_names_keys_nothing() {
+    let temp = fixture(json!({
+        "build": {
+            "command": "echo run >> ran && echo $$ > tool.cache/state",
+            "cache": true,
+            "inputs": [
+                {"fileset": "{projectRoot}/tool.cache/**/*", "includeIgnored": true},
+                {"fileset": "{projectRoot}/source.txt", "includeIgnored": true}
+            ],
+            "outputs": ["{projectRoot}/ran"],
+            "qk:sandbox": {"scratch": ["{projectRoot}/tool.cache"]}
+        }
+    }));
+    fs::write(temp.path().join("source.txt"), "source").unwrap();
+    success(run(temp.path(), &["run", "app:build"]));
+    success(run(temp.path(), &["run", "app:build"]));
+    // Once: the second run was found in the cache.
+    let ran = fs::read_to_string(temp.path().join("ran")).unwrap();
+    assert_eq!(ran.lines().count(), 1, "{ran:?}");
+}
+
+/// Two tasks of a run cannot share a scratch directory, nor have one inside
+/// another's, and a scratch directory cannot lead through a symbolic link:
+/// emptying it could take another task's files, or files outside the
+/// workspace. Nothing runs.
+#[cfg(unix)]
+#[test]
+fn a_scratch_directory_another_task_uses_or_a_link_leads_to_is_refused() {
+    let temp = fixture(json!({
+        "build": {
+            "command": "echo built > built",
+            "dependsOn": ["lint"],
+            "qk:sandbox": {"scratch": ["{projectRoot}/.cache"]}
+        },
+        "lint": {
+            "command": "echo linted > linted",
+            "qk:sandbox": {"scratch": ["{projectRoot}/.cache/lint"]}
+        }
+    }));
+    let output = run(temp.path(), &["run", "app:build"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("both use"), "{stderr}");
+    assert!(!temp.path().join("linted").exists());
+
+    let temp = fixture(json!({
+        "build": {
+            "command": "echo built > built",
+            "qk:sandbox": {"scratch": ["{projectRoot}/link/cache"]}
+        }
+    }));
+    let outside = TempDir::new().unwrap();
+    fs::write(outside.path().join("kept"), "kept").unwrap();
+    std::os::unix::fs::symlink(outside.path(), temp.path().join("link")).unwrap();
+    fs::create_dir(outside.path().join("cache")).unwrap();
+    fs::write(outside.path().join("cache/kept"), "kept").unwrap();
+    let output = run(temp.path(), &["run", "app:build"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("symbolic link"), "{stderr}");
+    assert!(outside.path().join("cache/kept").exists());
+    assert!(!temp.path().join("built").exists());
+}
+
 /// Making the directory a declared output lies in is no write outside the
 /// outputs; another file written in it is.
 #[cfg(any(target_os = "macos", target_os = "linux"))]

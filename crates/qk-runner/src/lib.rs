@@ -92,8 +92,10 @@ fn execute_retained(
 /// Gives each cacheable task with `qk:ultracache` a recording, in a directory
 /// of its own: strace follows its processes, filtering in the kernel where
 /// strace can. With `resolving`, an opened file's path is recorded with what
-/// its links lead to, as an audit reads it. Elsewhere than on Linux nothing
-/// is recorded, and that is said once.
+/// its links lead to, as an audit reads it. Elsewhere than on Linux, or where
+/// no recorder works, nothing is recorded, and that is said once: the run
+/// goes on, as a recording only keys what a later run may take. A recorder
+/// `QK_RECORDER` names that cannot record fails the run, as asked for.
 fn attach_recordings(
     graph: &TaskGraph,
     prepared: &mut BTreeMap<String, qk_executor::PreparedTask>,
@@ -103,8 +105,24 @@ fn attach_recordings(
         qk_executor::status!("qk: --record records only on Linux; this run records nothing");
         return Ok(None);
     }
+    // A recorder named wrong is a mistake to fix, not a runner without one.
+    let choice = std::env::var("QK_RECORDER").unwrap_or_default();
+    if !matches!(choice.as_str(), "" | "auto" | "ebpf" | "strace") {
+        bail!("unknown QK_RECORDER {choice:?}; use auto, ebpf or strace");
+    }
     let directory = tempfile::tempdir().context("cannot create a directory for recordings")?;
-    let mut recording = qk_executor::Recording::probe(directory.path())?;
+    let mut recording = match qk_executor::Recording::probe(directory.path()) {
+        Ok(recording) => recording,
+        // A recorder asked for by name that cannot record is a mistake to
+        // fix, as one named wrong is.
+        Err(error) if matches!(choice.as_str(), "ebpf" | "strace") => return Err(error),
+        Err(error) => {
+            qk_executor::status!(
+                "qk: --record records nothing, as no recorder works here: {error:#}"
+            );
+            return Ok(None);
+        }
+    };
     if resolving {
         recording = recording.resolving();
     }
@@ -287,11 +305,22 @@ pub fn run(
     // Where `summary` keeps the output of the tasks that fail.
     let logs = qk_cache::worktree_state(&workspace.root).join("terminal-outputs");
     // Validate every task before the first command can have side effects.
+    qk_cache::scratch::check_overlaps(workspace, graph)?;
     let mut prepared = graph
         .tasks
         .iter()
         .map(|(id, task)| {
             prepare(workspace, task, &process_environment)
+                .and_then(|mut prepared| {
+                    prepared.scratch = qk_cache::scratch::directories(workspace, task)?
+                        .into_iter()
+                        .map(|directory| qk_executor::Scratch {
+                            root: workspace.root.clone(),
+                            directory,
+                        })
+                        .collect();
+                    Ok(prepared)
+                })
                 .with_context(|| format!("cannot execute {id}"))
                 .map(|mut prepared| {
                     let continuous = task.definition.continuous == Some(true);
@@ -337,17 +366,25 @@ pub fn run(
     {
         task.interactive = true;
     }
+    // Traces of the tasks this run records, kept until it ends.
+    let recordings = record
+        .then(|| attach_recordings(graph, &mut prepared, audits_recordings))
+        .transpose()?
+        .flatten();
+    // An audit of what is recorded needs a recorder as much: where none works,
+    // the run goes on unaudited, as it goes on unrecorded.
+    let sandbox_mode = if audits_recordings && cfg!(target_os = "linux") && recordings.is_none() {
+        qk_executor::status!("qk: nothing is audited, as nothing can be recorded here");
+        None
+    } else {
+        sandbox_mode
+    };
     let sandbox = sandbox_mode
         .map(|mode| sandbox::Sandbox::start(workspace, graph, mode))
         .transpose()?;
     let recorder = analyze_inputs
         .then(|| recorder::Recorder::start(workspace, graph, &mut prepared))
         .transpose()?;
-    // Traces of the tasks this run records, kept until it ends.
-    let _recordings = record
-        .then(|| attach_recordings(graph, &mut prepared, audits_recordings))
-        .transpose()?
-        .flatten();
     // As in Nx 24.0.1, a task waiting for a server with a `signal` check may
     // learn its address in NX_READY_URL, and resolves its own readyWhen once
     // that server is ready. Until then, its readyWhen counts as invalid only

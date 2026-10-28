@@ -353,6 +353,13 @@ fn build_segment(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_escaped_fileset_names_its_directory_exactly() {
+        let named = super::Pattern::fileset(&super::escape("tmp/a!b (1)"), false).unwrap();
+        assert!(named.is_match("tmp/a!b (1)/entry"));
+        assert!(!named.is_match("tmp/ab 1/entry"));
+    }
+
     use super::*;
 
     /// The expansion as Nx's `convert_glob` writes it, `!` for excluding.
