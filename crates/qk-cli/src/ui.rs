@@ -669,7 +669,8 @@ pub fn sandbox_summary(sandbox: &qk_runner::SandboxResult, tasks: usize, paint: 
     let hoisted_readers = readers_of(|findings| &findings.hoisted_packages);
     let mut lines = Vec::new();
     let restored = sandbox.restored.len();
-    let tasks = tasks.saturating_sub(restored);
+    // Refused tasks did not run, so none was kept to anything.
+    let tasks = tasks.saturating_sub(restored + sandbox.refused.len());
     type Own<'a> = (
         &'a String,
         &'a qk_runner::sandbox::Findings,
@@ -870,6 +871,11 @@ pub fn sandbox_summary(sandbox: &qk_runner::SandboxResult, tasks: usize, paint: 
     }
     for (id, reason) in &sandbox.unsandboxed {
         lines.push(paint.dim(&format!("  {id} ran unsandboxed: {reason}")));
+    }
+    for (id, reason) in &sandbox.refused {
+        lines.push(format!(
+            "  {id} failed, as it cannot be sandboxed: {reason}"
+        ));
     }
     if restored > 0 {
         lines.push(paint.dim(&format!(
@@ -1773,6 +1779,7 @@ mod tests {
             .map(|(id, findings)| (id.to_owned(), findings))
             .collect(),
             unsandboxed: BTreeMap::new(),
+            refused: BTreeMap::new(),
             packages_unchecked: BTreeMap::new(),
             audited: BTreeSet::new(),
             restored: BTreeSet::new(),
@@ -1826,6 +1833,7 @@ mod tests {
             .map(|(id, findings)| (id.to_owned(), findings))
             .collect(),
             unsandboxed: BTreeMap::new(),
+            refused: BTreeMap::new(),
             packages_unchecked: BTreeMap::new(),
             audited: BTreeSet::new(),
             restored: BTreeSet::new(),
@@ -1850,6 +1858,7 @@ mod tests {
             mode: qk_runner::sandbox::Mode::Audit,
             findings: BTreeMap::new(),
             unsandboxed: BTreeMap::new(),
+            refused: BTreeMap::new(),
             packages_unchecked: (0..10)
                 .map(|index| (format!("lib{index}:lint"), "too long".to_owned()))
                 .collect(),
@@ -1878,6 +1887,7 @@ mod tests {
             )]
             .into(),
             unsandboxed: BTreeMap::new(),
+            refused: BTreeMap::new(),
             packages_unchecked: BTreeMap::new(),
             audited: ["a:build".to_owned(), "b:build".to_owned()].into(),
             restored: ["c:build".to_owned(), "d:build".to_owned()].into(),

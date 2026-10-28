@@ -207,6 +207,9 @@ pub enum Confinement {
     /// Linux: a Landlock rule set's descriptor, which each command restricts
     /// itself to before it starts. It stays open while the run lasts.
     Landlock(i32),
+    /// Enforced, and could not be held to its plan, for this reason: its
+    /// commands fail rather than start unconfined.
+    Refused(String),
 }
 
 /// An external syscall recorder wrapping each command, with separate trace files.

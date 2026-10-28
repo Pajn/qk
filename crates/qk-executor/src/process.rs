@@ -429,6 +429,11 @@ fn spawn(
     if !task.cwd.is_dir() {
         anyhow::bail!("working directory does not exist: {}", task.cwd.display());
     }
+    if let Some(crate::Confinement::Refused(reason)) = &task.sandbox {
+        anyhow::bail!(
+            "--sandbox=enforce cannot sandbox it: {reason}; set \"qk:sandbox\": false on its target to run it unsandboxed"
+        );
+    }
     #[cfg(windows)]
     let mut command = shell(text);
     #[cfg(not(windows))]

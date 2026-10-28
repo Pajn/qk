@@ -195,6 +195,9 @@ pub struct Sandbox {
     depended: BTreeMap<String, Vec<(String, String)>>,
     /// Tasks that run unsandboxed, and why.
     unsandboxed: Mutex<BTreeMap<String, String>>,
+    /// Enforce: tasks that cannot be sandboxed, and why. They fail when they
+    /// would run, rather than run unconfined; a cache hit runs nothing.
+    refused: Mutex<BTreeMap<String, String>>,
     /// Audit: tasks sandboxed without reporting installed packages, and why.
     packages_unchecked: BTreeMap<String, String>,
     watcher: Option<Watcher>,
@@ -230,6 +233,8 @@ pub struct Finished {
     pub findings: BTreeMap<String, Findings>,
     /// Tasks that ran unsandboxed, and why.
     pub unsandboxed: BTreeMap<String, String>,
+    /// Enforce: tasks that could not be sandboxed, and so failed, and why.
+    pub refused: BTreeMap<String, String>,
     /// Tasks sandboxed without reporting installed packages, and why.
     pub packages_unchecked: BTreeMap<String, String>,
     /// Audit: the tasks held to their plans, whether or not they went
@@ -280,6 +285,18 @@ impl Sandbox {
         // many tasks share it.
         let mut walked: BTreeMap<Vec<String>, Vec<PathBuf>> = BTreeMap::new();
         let mut unsandboxed = BTreeMap::new();
+        let mut refused = BTreeMap::new();
+        // What keeps a task from its sandbox: audit runs it unsandboxed and
+        // lists it, enforce fails it.
+        let unconfinable = |unsandboxed: &mut BTreeMap<String, String>,
+                            refused: &mut BTreeMap<String, String>,
+                            id: &str,
+                            reason: String| {
+            match mode {
+                Mode::Enforce => refused.insert(id.to_owned(), reason),
+                Mode::Audit => unsandboxed.insert(id.to_owned(), reason),
+            };
+        };
         for (id, task) in &graph.tasks {
             match qk_cache::scratch::Settings::of(task.definition.extra.get("qk:sandbox")) {
                 Ok(settings) if settings.sandboxed => {}
@@ -288,7 +305,7 @@ impl Sandbox {
                     continue;
                 }
                 Err(error) => {
-                    unsandboxed.insert(id.clone(), format!("{error:#}"));
+                    unconfinable(&mut unsandboxed, &mut refused, id, format!("{error:#}"));
                     continue;
                 }
             }
@@ -328,7 +345,7 @@ impl Sandbox {
                     plans.insert(id.clone(), plan);
                 }
                 Err(reason) => {
-                    unsandboxed.insert(id.clone(), reason.clone());
+                    unconfinable(&mut unsandboxed, &mut refused, id, reason.clone());
                 }
             }
         }
@@ -344,6 +361,7 @@ impl Sandbox {
             ignored,
             depended,
             unsandboxed: Mutex::new(unsandboxed),
+            refused: Mutex::new(refused),
             packages_unchecked: BTreeMap::new(),
             watcher: None,
             directory,
@@ -362,8 +380,8 @@ impl Sandbox {
             for (index, id) in sandbox.plans.keys().enumerate() {
                 let path = sandbox.directory.join(format!("{index}.sb"));
                 let plan = &sandbox.plans[id];
-                // A profile Seatbelt cannot take would fail the task; it runs
-                // unsandboxed instead, with the reason.
+                // A profile Seatbelt cannot take: audit runs the task
+                // unsandboxed, with the reason, and enforce fails it.
                 match seatbelt(plan, id, &sandbox.root, &sandbox.state, mode, &path)? {
                     Fit::Whole => {
                         sandbox.profiles.insert(id.clone(), path);
@@ -371,6 +389,9 @@ impl Sandbox {
                     Fit::WithoutPackages(reason) => {
                         sandbox.profiles.insert(id.clone(), path);
                         sandbox.packages_unchecked.insert(id.clone(), reason);
+                    }
+                    Fit::Rejected(reason) if mode == Mode::Enforce => {
+                        sandbox.refused.lock().unwrap().insert(id.clone(), reason);
                     }
                     Fit::Rejected(reason) => {
                         sandbox
@@ -411,8 +432,12 @@ impl Sandbox {
     }
 
     /// How a task is held to its plan, as it starts; `None` runs it
-    /// unsandboxed, with the reason recorded.
+    /// unsandboxed, with the reason recorded. Enforced, a task that cannot be
+    /// held to it is refused instead.
     pub fn confine(&self, id: &str) -> Option<qk_executor::Confinement> {
+        if let Some(reason) = self.refused.lock().unwrap().get(id) {
+            return Some(qk_executor::Confinement::Refused(reason.clone()));
+        }
         if !self.plans.contains_key(id) || self.recording.is_some() {
             return None;
         }
@@ -424,6 +449,14 @@ impl Sandbox {
         }
         match self.landlock(id) {
             Ok(confinement) => Some(confinement),
+            Err(error) if self.mode == Mode::Enforce => {
+                let reason = format!("{error:#}");
+                self.refused
+                    .lock()
+                    .unwrap()
+                    .insert(id.to_owned(), reason.clone());
+                Some(qk_executor::Confinement::Refused(reason))
+            }
             Err(error) => {
                 self.unsandboxed
                     .lock()
@@ -766,6 +799,7 @@ impl Sandbox {
         Ok(Finished {
             findings,
             unsandboxed,
+            refused: std::mem::take(&mut *self.refused.lock().unwrap()),
             packages_unchecked: std::mem::take(&mut self.packages_unchecked),
             audited,
             restored,
