@@ -9,6 +9,22 @@ use qk_taskgraph::Task;
 /// Git run at `root`, which must not inherit repository selection from a Git
 /// hook: Git's `rev-parse --local-env-vars` are removed.
 pub fn git(root: &Path, args: &[&str]) -> std::io::Result<Output> {
+    git_command(root, args).output()
+}
+
+/// Git run at `root` for what its history holds, never fetching a missing
+/// object from a partial clone's remote. A partial clone leaves out blobs
+/// and trees, never commits, so a commit it lacks is none of `HEAD`'s
+/// ancestors, and a shallow one could not tell if it held it: asking the
+/// remote, once per question, only costs the time of a fetch. Git before
+/// 2.44 ignores the variable and fetches, which answers the same.
+pub fn git_history(root: &Path, args: &[&str]) -> std::io::Result<Output> {
+    git_command(root, args)
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .output()
+}
+
+fn git_command(root: &Path, args: &[&str]) -> Command {
     let mut command = Command::new("git");
     command.arg("-C").arg(root).args(args);
     for name in [
@@ -30,7 +46,7 @@ pub fn git(root: &Path, args: &[&str]) -> std::io::Result<Output> {
     ] {
         command.env_remove(name);
     }
-    command.output()
+    command
 }
 
 pub fn git_path(root: &Path, flag: &str) -> Option<PathBuf> {

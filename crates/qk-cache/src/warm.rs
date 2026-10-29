@@ -1083,7 +1083,7 @@ fn key_match(warm: &Warm, current: &[String], saved: &[String]) -> Option<u8> {
 
 /// Whether `HEAD` descends from `commit`, or is it.
 fn descends_from(workspace: &Workspace, commit: &str) -> bool {
-    paths::git(
+    paths::git_history(
         &workspace.root,
         &["merge-base", "--is-ancestor", commit, "HEAD"],
     )
@@ -1093,7 +1093,7 @@ fn descends_from(workspace: &Workspace, commit: &str) -> bool {
 /// How many commits `commit` is behind the checkout's `HEAD`, or `None` when
 /// it is not an ancestor of it.
 fn behind(workspace: &Workspace, commit: &str) -> Option<u64> {
-    let ancestor = paths::git(
+    let ancestor = paths::git_history(
         &workspace.root,
         &["merge-base", "--is-ancestor", commit, "HEAD"],
     )
@@ -1101,7 +1101,7 @@ fn behind(workspace: &Workspace, commit: &str) -> Option<u64> {
     if !ancestor.status.success() {
         return None;
     }
-    let output = paths::git(
+    let output = paths::git_history(
         &workspace.root,
         &["rev-list", "--count", &format!("{commit}..HEAD")],
     )
@@ -1348,8 +1348,10 @@ impl Cache {
         let current = key_digests(workspace, warm, prepared)?;
         drop(keying);
         // Another branch's save, here, only when the remote has none.
-        let chosen = self
-            .choose_warm(workspace, warm, &current, true)
+        let local = profile::span(&task.id, "warm_restore_local");
+        let chosen = self.choose_warm(workspace, warm, &current, true);
+        drop(local);
+        let chosen = chosen
             .or_else(|| {
                 let mut fetching = profile::span(&task.id, "warm_restore_remote");
                 let fetched = self
@@ -1859,6 +1861,74 @@ mod tests {
         )
         .unwrap();
         (temp, workspace, graph)
+    }
+
+    /// A save's commit that a shallow, partial clone lacks is not among its
+    /// ancestors, and asking leaves it missing: nothing is fetched for it.
+    #[test]
+    fn asks_a_partial_clone_about_ancestors_without_fetching() {
+        let temp = tempfile::tempdir().unwrap();
+        let git = |root: &std::path::Path, args: &[&str]| {
+            let output = paths::git(root, args).unwrap();
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        git(&source, &["init", "--quiet"]);
+        git(&source, &["config", "uploadpack.allowFilter", "true"]);
+        let commit = |message: &str| {
+            fs::write(source.join("file"), message).unwrap();
+            git(&source, &["add", "file"]);
+            git(
+                &source,
+                &[
+                    "-c",
+                    "user.name=qk",
+                    "-c",
+                    "user.email=qk@example.com",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    message,
+                ],
+            );
+            git(&source, &["rev-parse", "HEAD"])
+        };
+        let older = commit("older");
+        let newer = commit("newer");
+        let clone = temp.path().join("clone");
+        let url = format!("file://{}", source.display());
+        git(
+            temp.path(),
+            &[
+                "clone",
+                "--quiet",
+                "--depth",
+                "1",
+                "--filter=blob:none",
+                &url,
+                clone.to_str().unwrap(),
+            ],
+        );
+        fs::write(clone.join("nx.json"), "{}").unwrap();
+        let workspace = Workspace::load(&clone).unwrap();
+        assert!(descends_from(&workspace, &newer));
+        assert!(!descends_from(&workspace, &older));
+        assert_eq!(behind(&workspace, &older), None);
+        // Git before 2.44 ignores GIT_NO_LAZY_FETCH, and fetches.
+        let version = git(temp.path(), &["--version"]);
+        let honoured = version
+            .split_whitespace()
+            .nth(2)
+            .and_then(|version| {
+                let mut parts = version.split('.').map(|part| part.parse::<u32>().ok());
+                Some((parts.next()??, parts.next()??))
+            })
+            .is_some_and(|version| version >= (2, 44));
+        let held = paths::git_history(&clone, &["cat-file", "-e", &format!("{older}^{{commit}}")])
+            .unwrap();
+        assert!(!honoured || !held.status.success(), "fetched {older}");
     }
 
     /// The `qk:warm` entries of an `app:build` whose target declares `warm`.
