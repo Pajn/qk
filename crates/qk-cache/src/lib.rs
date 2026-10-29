@@ -87,6 +87,33 @@ fn scratch_patterns<'a>(
     })
 }
 
+impl Cache {
+    /// What a task's recordings leave out: its `ignoreReads`, and its scratch
+    /// directories. The project graph is only built for an entry naming
+    /// dependencies.
+    fn ignored_reads(
+        &self,
+        workspace: &Workspace,
+        task: &Task,
+        prepared: &PreparedTask,
+        written: &[String],
+    ) -> Result<ultracache::IgnoredReads> {
+        let projects = written
+            .iter()
+            .any(|glob| glob.starts_with('^'))
+            .then(|| {
+                self.projects
+                    .get_or_init(|| qk_graph::ProjectGraph::build(workspace).ok())
+                    .as_ref()
+            })
+            .flatten();
+        Ok(
+            ultracache::IgnoredReads::new(written, workspace, projects, &task.project)?
+                .with_patterns(scratch_patterns(&workspace.root, prepared)),
+        )
+    }
+}
+
 /// The cache for one run; its workspace snapshot is taken on first use.
 pub struct Cache {
     pub root: PathBuf,
@@ -110,6 +137,9 @@ pub struct Cache {
     cleanup: std::sync::Mutex<Option<store::Cleanup>>,
     /// Every target's declared outputs, which recordings' listings leave out.
     workspace_outputs: OnceLock<recorded::WorkspaceOutputs>,
+    /// The project graph, for `ignoreReads` entries that name dependencies;
+    /// built on first use, `None` where it cannot be.
+    projects: OnceLock<Option<qk_graph::ProjectGraph>>,
 }
 
 /// Where a task's result came from.
@@ -281,6 +311,7 @@ impl Cache {
             saves: Default::default(),
             cleanup: Default::default(),
             workspace_outputs: OnceLock::new(),
+            projects: OnceLock::new(),
         }
     }
 
@@ -621,15 +652,11 @@ impl Cache {
                 .get_or_init(|| workspace_outputs(workspace)),
             upstream: upstream(graph, task),
         });
-        let ignore: Vec<Pattern> = settings
+        let ignore = settings
             .as_ref()
-            .map(|settings| {
-                settings
-                    .ignore_reads
-                    .iter()
-                    .filter_map(|glob| Pattern::new(glob, false).ok())
-                    .chain(scratch_patterns(&workspace.root, prepared))
-                    .collect()
+            .and_then(|settings| {
+                self.ignored_reads(workspace, task, prepared, &settings.ignore_reads)
+                    .ok()
             })
             .unwrap_or_default();
         let unlisted = recorded::Unlisted {
@@ -647,6 +674,7 @@ impl Cache {
                 prepared,
                 inputs,
                 &settings.ignore_reads,
+                &ignore.scope(),
                 cancelled,
             );
             match weak {
@@ -923,7 +951,7 @@ impl Cache {
         });
         let path_set = match (&recordings, keying) {
             (Some((_, _, settings)), Some(recording)) => Some(
-                self.path_set(workspace, recording, prepared, settings, &own)
+                self.path_set(workspace, task, recording, prepared, settings, &own)
                     .and_then(|set| {
                         // Keyed by nothing, a recording would match any workspace.
                         if set.is_empty() {
@@ -1356,6 +1384,7 @@ impl Cache {
     fn path_set(
         &self,
         workspace: &Workspace,
+        task: &Task,
         recording: &qk_executor::Recording,
         prepared: &PreparedTask,
         settings: &ultracache::Settings,
@@ -1398,13 +1427,9 @@ impl Cache {
         if let Some(diagnostic) = diagnostics.first() {
             return Err(diagnostic.clone());
         }
-        let mut ignore = settings
-            .ignore_reads
-            .iter()
-            .map(|glob| Pattern::new(glob, false))
-            .collect::<Result<Vec<_>>>()
+        let ignore = self
+            .ignored_reads(workspace, task, prepared, &settings.ignore_reads)
             .map_err(failed)?;
-        ignore.extend(scratch_patterns(&workspace.root, prepared));
         // qk's own directories, where they lie inside the workspace.
         let state = [self.root.clone(), worktree_state(&workspace.root)]
             .iter()
@@ -1867,7 +1892,7 @@ mod tests {
         let unlisted = recorded::Unlisted {
             own: Vec::new(),
             others: Some(lint),
-            ignore: &[],
+            ignore: &ultracache::IgnoredReads::none(),
         };
         let directories = unlisted.directories("lib");
         for directory in [".", ".cache", "app", "app/extra"] {

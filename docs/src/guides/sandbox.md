@@ -84,6 +84,14 @@ tool: a test running a dependency's code depends on it, while a lint rule
 that only follows imports to look for a cycle through the linted file cannot
 find one through a project that cannot import back.
 
+A task whose dependencies' files cannot change its result names them in
+`qk:ultracache.ignoreReads` (see
+[ignored reads](#scratch-directories-and-ignored-reads)) with a leading `^`,
+the glob after it matched from the root of each project its project depends
+on, directly or not: `^**` matches every file in them, `^src/**` their
+sources. A file in a project nested in a dependency is that project's, and
+matches only if the task depends on it too.
+
 ### Installed packages outside the key
 
 With a pnpm v9 lockfile qk reads, a task's key counts the packages its

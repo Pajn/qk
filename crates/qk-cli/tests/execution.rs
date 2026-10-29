@@ -3852,6 +3852,90 @@ fn the_sandbox_groups_reads_in_dependency_projects() {
     );
 }
 
+/// An `ignoreReads` entry starting `^` names what a task reads in the
+/// projects it depends on: those reads are no finding, and enforce lets the
+/// task make them. A project nested in a dependency that the task does not
+/// depend on is not one of them.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn the_sandbox_ignores_the_reads_a_task_names_in_its_dependencies() {
+    if !can_audit() {
+        return;
+    }
+    let _audit = AUDIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    fs::write(root.join("nx.json"), "{}").unwrap();
+    let write_projects = |command: &str| {
+        for (directory, project) in [
+            (
+                "apps/app",
+                json!({"name": "app", "implicitDependencies": ["lib"], "targets": {"lint": {
+                    "command": command,
+                    "options": {"cwd": "apps/app"},
+                    "inputs": ["{projectRoot}/**/*"],
+                    "qk:ultracache": {"mode": "off", "ignoreReads": ["^**"]}
+                }}}),
+            ),
+            ("libs/lib", json!({"name": "lib", "targets": {}})),
+            ("libs/lib/nested", json!({"name": "nested", "targets": {}})),
+            ("libs/other", json!({"name": "other", "targets": {}})),
+        ] {
+            fs::create_dir_all(root.join(directory)).unwrap();
+            fs::write(
+                root.join(directory).join("project.json"),
+                project.to_string(),
+            )
+            .unwrap();
+        }
+    };
+    for (path, text) in [
+        ("libs/lib/src/a.ts", ""),
+        ("libs/lib/nested/c.ts", ""),
+        ("libs/other/b.ts", ""),
+    ] {
+        fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+        fs::write(root.join(path), text).unwrap();
+    }
+    write_projects(
+        "cat ../../libs/lib/src/a.ts ../../libs/lib/nested/c.ts ../../libs/other/b.ts > /dev/null",
+    );
+    let report = root.join("sandbox.json");
+    success(run(
+        root,
+        &[
+            "run",
+            "app:lint",
+            "--sandbox",
+            "--sandbox-report",
+            report.to_str().unwrap(),
+        ],
+    ));
+    let findings: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+    let lint = &findings["tasks"]["app:lint"];
+    assert_eq!(lint["dependencyReads"], json!({}), "{findings}");
+    assert_eq!(
+        lint["undeclaredReads"],
+        json!(["libs/lib/nested/c.ts", "libs/other/b.ts"]),
+        "{findings}"
+    );
+    let enforced = |command: &str| {
+        write_projects(command);
+        run(
+            root,
+            &["run", "app:lint", "--skip-cache", "--sandbox=enforce"],
+        )
+    };
+    success(enforced("cat ../../libs/lib/src/a.ts > /dev/null"));
+    assert!(
+        !enforced("cat ../../libs/lib/nested/c.ts > /dev/null")
+            .status
+            .success()
+    );
+}
+
 /// A task the sandbox cannot be built for, here as its inputs cannot be
 /// resolved, runs unsandboxed under audit and is listed with why. Enforcing,
 /// it fails rather than run unconfined, and says how to leave it out; left

@@ -22,7 +22,6 @@ use qk_input_analysis::{Access, Operation};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::glob::Pattern;
 use crate::hash::{Snapshot, key};
 use crate::paths::Outputs;
 
@@ -117,7 +116,7 @@ pub struct Exclusions<'a> {
     /// The task's outputs and warm paths.
     pub outputs: &'a [&'a Outputs],
     /// `ignoreReads`.
-    pub ignore: Vec<Pattern>,
+    pub ignore: crate::ultracache::IgnoredReads,
     /// qk's own directories inside the workspace, relative to it.
     pub state: Vec<String>,
 }
@@ -149,7 +148,7 @@ impl Exclusions<'_> {
                         .is_some_and(|rest| rest.starts_with('/'))
             })
             || self.outputs.iter().any(|outputs| outputs.matches(path))
-            || self.ignore.iter().any(|pattern| pattern.is_match(path))
+            || self.ignore.is_match(path)
     }
 }
 
@@ -701,7 +700,7 @@ impl Others<'_> {
 pub(crate) struct Unlisted<'a> {
     pub own: Vec<&'a Outputs>,
     pub others: Option<Others<'a>>,
-    pub ignore: &'a [Pattern],
+    pub ignore: &'a crate::ultracache::IgnoredReads,
 }
 
 impl Unlisted<'_> {
@@ -711,7 +710,7 @@ impl Unlisted<'_> {
                 .others
                 .as_ref()
                 .is_some_and(|others| others.matches(path))
-            || self.ignore.iter().any(|pattern| pattern.is_match(path))
+            || self.ignore.is_match(path)
     }
 
     fn own(&self, path: &str) -> bool {
@@ -951,12 +950,15 @@ fn changed(metadata: &std::fs::Metadata) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ultracache::IgnoredReads;
+
+    static IGNORE_NOTHING: IgnoredReads = IgnoredReads::none();
 
     /// Nothing left out of listings.
     const NOTHING: Unlisted<'static> = Unlisted {
         own: Vec::new(),
         others: None,
-        ignore: &[],
+        ignore: &IGNORE_NOTHING,
     };
     use qk_input_analysis::Category;
 
@@ -985,7 +987,7 @@ mod tests {
         let exclusions = Exclusions {
             roots: [&root, &root],
             outputs: &[&outputs],
-            ignore: vec![Pattern::new("src/*.log", false).unwrap()],
+            ignore: IgnoredReads::of_globs(&["src/*.log".to_owned()]).unwrap(),
             state: vec![".qk".into()],
         };
         let accesses = [
@@ -1058,7 +1060,7 @@ mod tests {
         let unlisted = Unlisted {
             own: vec![&outputs],
             others: None,
-            ignore: &[],
+            ignore: &IGNORE_NOTHING,
         };
         let strong = || strong_key("weak", &set, &snapshot, &root, &unlisted).unwrap();
         let first = strong();
@@ -1338,7 +1340,7 @@ mod tests {
             ],
             &roots,
         );
-        let ignore = [Pattern::new("**/.fallow", false).unwrap()];
+        let ignore = IgnoredReads::of_globs(&["**/.fallow".to_owned()]).unwrap();
         let unlisted = Unlisted {
             own: Vec::new(),
             others: Some(Others {

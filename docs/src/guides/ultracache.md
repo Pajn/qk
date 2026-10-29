@@ -48,6 +48,8 @@ keys, `.git`, qk's own state, the task's outputs and warm paths, files it wrote
 before reading them, its
 [scratch directories](sandbox.md#scratch-directories-and-ignored-reads), and
 what its `ignoreReads` names, which the sandbox's audit leaves out too. A
+glob there starting with `^` names files in the projects the task's project
+depends on, so which projects those are is part of its weak key. A
 directory's listing leaves out the task's outputs and what it wrote there, which are there after
 it runs and need not be before, and the declared outputs of every other
 target in the workspace, which other tasks write whether or not this one
