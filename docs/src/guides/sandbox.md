@@ -201,7 +201,12 @@ Any other glob, or one with a negated group such as `!(private)`, which can
 leave out a path deeper down, allows the files it matches one by one. The
 walk never enters `.git`, `.qk` or `node_modules`, and a directory holding
 one of them is not allowed whole: the directories beside it are. A symbolic
-link is left out, since allowing it would allow whatever it leads to.
+link is left out, since allowing it would allow whatever it leads to. Seatbelt
+matches the path a link resolves to, so a link put in place of one of these
+during the run reaches only what is allowed anyway. Landlock follows links
+as it allows a path, so on Linux each is allowed only while no link stands
+anywhere on the way to it from the workspace root: one put there by an
+earlier task of the run gets no rule.
 
 A glob that covers a nested workspace, a directory with a `pnpm-lock.yaml`
 importer of its own such as a project's end-to-end tests, covers what it

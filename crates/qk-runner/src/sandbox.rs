@@ -124,8 +124,15 @@ struct Plan {
     read_directories: Vec<PathBuf>,
     /// Input files one by one, the lockfile, and symlinked inputs' targets.
     read_files: Vec<PathBuf>,
-    /// Its dependencies' outputs.
+    /// Its dependencies' outputs, and directories its ignored reads name
+    /// whole.
     read_trees: BTreeSet<PathBuf>,
+    /// The files and directories its ignored reads name, which held no link
+    /// as the run started: Landlock, which follows links, allows each only
+    /// while that still holds, so a link an earlier task put in its place
+    /// leads nowhere new.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    unlinked: BTreeSet<PathBuf>,
     /// Its outputs, warm paths and scratch directories.
     write_trees: BTreeSet<PathBuf>,
     /// Its scratch directories, which are directories whatever their names:
@@ -337,6 +344,8 @@ impl Sandbox {
                     // in a directory allowed whole, any file, made before
                     // the run or during it.
                     let ignored_paths = std::mem::take(&mut ignored_paths);
+                    plan.unlinked.extend(ignored_paths.files.iter().cloned());
+                    plan.unlinked.extend(ignored_paths.trees.iter().cloned());
                     plan.read_files.extend(ignored_paths.files);
                     plan.read_trees.extend(ignored_paths.trees);
                     if let Some(installs) = &installs {
@@ -696,6 +705,7 @@ impl Sandbox {
             read_directories: &plan.read_directories,
             read_files: plan.read_files.iter().chain(&self.dotenv),
             read_trees: &plan.read_trees,
+            unlinked: &plan.unlinked,
             write_trees: plan
                 .write_trees
                 .iter()
@@ -1260,6 +1270,7 @@ fn plan(
         read_trees,
         write_trees,
         scratch,
+        unlinked: BTreeSet::new(),
         packages: None,
     }
 }

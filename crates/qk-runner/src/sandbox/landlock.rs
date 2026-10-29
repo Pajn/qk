@@ -112,6 +112,57 @@ impl Rules {
                 return Err(error).with_context(|| format!("cannot open {}", path.display()));
             }
         };
+        self.allow_open(&file, path, rights)
+    }
+
+    /// As [`Rules::allow`], for `path` beneath `root` reached through no
+    /// link: one where a link now stands, in any part of the way down from
+    /// `root`, is skipped as one that does not exist.
+    fn allow_unlinked(&self, root: &Path, path: &Path, rights: u64) -> Result<()> {
+        let Ok(relative) = path.strip_prefix(root) else {
+            return Ok(());
+        };
+        let root = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(root)
+            .with_context(|| format!("cannot open {}", root.display()))?;
+        let name = std::ffi::CString::new(relative.as_os_str().as_encoded_bytes())
+            .with_context(|| format!("cannot open {}", path.display()))?;
+        // SAFETY: zeroed is a valid open_how, whose fields are integers.
+        let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+        how.flags = (libc::O_PATH | libc::O_CLOEXEC) as u64;
+        how.resolve = libc::RESOLVE_BENEATH | libc::RESOLVE_NO_SYMLINKS;
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                root.as_raw_fd(),
+                name.as_ptr(),
+                &how as *const libc::open_how,
+                std::mem::size_of::<libc::open_how>(),
+            )
+        };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            return match error.raw_os_error() {
+                Some(libc::ENOENT | libc::ELOOP | libc::EXDEV | libc::ENOTDIR) => Ok(()),
+                // Where openat2 is refused, as a seccomp filter may, the
+                // path cannot be opened without following a link that may
+                // stand in it, so the task is not sandboxed and enforce
+                // fails it.
+                Some(libc::ENOSYS) => Err(error).with_context(|| {
+                    format!("cannot open {} without following links", path.display())
+                }),
+                _ => Err(error).with_context(|| format!("cannot open {}", path.display())),
+            };
+        }
+        // SAFETY: openat2 returned a new descriptor this owns.
+        let file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd as i32) });
+        self.allow_open(&file, path, rights)
+    }
+
+    /// Allows `rights` beneath the opened `file`, or on it for a file.
+    fn allow_open(&self, file: &std::fs::File, path: &Path, rights: u64) -> Result<()> {
         let directory = file.metadata().is_ok_and(|metadata| metadata.is_dir());
         let mut rights = rights & self.handled;
         if !directory {
@@ -147,6 +198,9 @@ pub struct Paths<'a, F, W> {
     pub read_directories: &'a [PathBuf],
     pub read_files: F,
     pub read_trees: &'a std::collections::BTreeSet<PathBuf>,
+    /// Paths beneath `root` allowed only through no link, the way they were
+    /// found.
+    pub unlinked: &'a std::collections::BTreeSet<PathBuf>,
     pub write_trees: W,
 }
 
@@ -181,11 +235,18 @@ where
     for directory in paths.read_directories {
         rules.allow(directory, READ_FILE | READ_DIR | EXECUTE)?;
     }
+    let read = |path: &Path, rights: u64| {
+        if paths.unlinked.contains(path) {
+            rules.allow_unlinked(paths.root, path, rights)
+        } else {
+            rules.allow(path, rights)
+        }
+    };
     for file in paths.read_files.clone() {
-        rules.allow(file, READ_FILE | EXECUTE)?;
+        read(file, READ_FILE | EXECUTE)?;
     }
     for tree in paths.read_trees {
-        rules.allow(tree, READ_FILE | READ_DIR | EXECUTE)?;
+        read(tree, READ_FILE | READ_DIR | EXECUTE)?;
     }
     for tree in paths.write_trees.clone() {
         rules.allow(tree, all)?;
