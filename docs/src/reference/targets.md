@@ -226,9 +226,13 @@ whose entries it stands for, or an object with one of these fields:
 | `inherit` | array of variable names | Passes the variables through and keys their values |
 | `pass` | array of variable names | Passes the variables through without keying their values, as for credentials and proxies |
 | `set` | object of string values | Sets the variables, keyed as written |
+| `bin` | array of command names | Puts the commands, as found on the `PATH` qk inherited, on the task's `PATH`, keyed by the files they resolve to |
+| `dirs` | array of paths, with `{projectRoot}` and `{workspaceRoot}` | Adds the directories to the task's `PATH`, after the commands, keyed as written; relative to the workspace root |
 
 A name can contain `*`, which matches any run of characters, as `LC_*`. A
-variable both inherited and passed fails the task. `false` inherits every
+variable both inherited and passed fails the task, as does a command `bin`
+names that is not on `PATH`. An environment with `bin` or `dirs` entries
+builds `PATH`, so it cannot also inherit, pass or set it. `false` inherits every
 variable, as without the field, which overrides nx.json's `qk:defaultEnv`.
 See [Declared environments](environment.md#declared-environments).
 

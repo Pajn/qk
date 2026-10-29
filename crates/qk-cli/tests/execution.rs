@@ -1909,6 +1909,105 @@ fn a_declared_environment_lets_through_only_what_it_names() {
 
 #[cfg(unix)]
 #[test]
+fn a_declared_environment_builds_path_from_the_commands_it_names() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    // Commands live outside the workspace, as installed ones do.
+    let installed = TempDir::new().unwrap();
+    let tool = |base: &Path, directory: &str, name: &str, text: &str| {
+        fs::create_dir_all(base.join(directory)).unwrap();
+        let path = base.join(directory).join(name);
+        fs::write(&path, format!("#!/bin/sh\necho {text}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    tool(installed.path(), "tools", "hello", "hello");
+    tool(installed.path(), "tools", "hidden", "hidden");
+    tool(installed.path(), "newer", "hello", "newer");
+    fs::write(
+        root.join("nx.json"),
+        json!({ "qk:environments": { "tools": [{ "bin": ["hello"] }] } }).to_string(),
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("app/scripts")).unwrap();
+    tool(root, "app/scripts", "from-project", "from-project");
+    fs::write(
+        root.join("app/project.json"),
+        json!({"name": "app", "targets": {
+            "named": {
+                "command": "hello; command -v hidden || echo no-hidden",
+                "cache": true,
+                "qk:env": ["tools"],
+            },
+            "dirs": {"command": "from-project", "qk:env": [{ "dirs": ["{projectRoot}/scripts"] }]},
+            "missing": {"command": "true", "qk:env": [{ "bin": ["absent"] }]},
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let home = root.join("home");
+    fs::create_dir_all(&home).unwrap();
+    let report = root.join("report.json");
+    let run = |target: &str, path: &str| {
+        let output = command(root, &["run", target, "--report", report.to_str().unwrap()])
+            .env("PATH", path)
+            .env("HOME", &home)
+            .env_remove("XDG_CACHE_HOME")
+            .output()
+            .unwrap();
+        let report: Value = fs::read(&report)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        let cache = report["tasks"][0]["cache"]
+            .as_str()
+            .unwrap_or("none")
+            .to_owned();
+        (output, cache)
+    };
+    let tools = format!("{}:/usr/bin:/bin", installed.path().join("tools").display());
+    // The command it names is there, and the one beside it is not.
+    let (output, cache) = run("app:named", &tools);
+    let stdout = String::from_utf8(success(output).stdout).unwrap();
+    assert!(stdout.contains("hello\nno-hidden\n"), "{stdout}");
+    assert_eq!(cache, "miss");
+    // The key follows the binary it found, not the directory linking to it,
+    // nor the rest of PATH.
+    let (_, cache) = run("app:named", &format!("{tools}:/elsewhere"));
+    assert_eq!(cache, "local-hit");
+    let newer = format!("{}:{tools}", installed.path().join("newer").display());
+    let (output, cache) = run("app:named", &newer);
+    let stdout = String::from_utf8(success(output).stdout).unwrap();
+    assert!(stdout.contains("newer\n"), "{stdout}");
+    assert_eq!(cache, "miss");
+    // Enforce lets the task run the commands linked outside the workspace.
+    let output = command(
+        root,
+        &["run", "app:named", "--skip-cache", "--sandbox=enforce"],
+    )
+    .env("PATH", &tools)
+    .env("HOME", &home)
+    .env_remove("XDG_CACHE_HOME")
+    .output()
+    .unwrap();
+    let stdout = String::from_utf8(success(output).stdout).unwrap();
+    assert!(stdout.contains("hello\nno-hidden\n"), "{stdout}");
+    // A directory it adds, from the project's root.
+    let (output, _) = run("app:dirs", &tools);
+    let stdout = String::from_utf8(success(output).stdout).unwrap();
+    assert!(stdout.contains("from-project\n"), "{stdout}");
+    // A command it names that is not on PATH fails the task.
+    let (output, _) = run("app:missing", &tools);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("the command absent of the task's environment is not on PATH"),
+        "{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn a_task_s_dotenv_files_expand_across_each_other_as_in_nx() {
     let temp = TempDir::new().unwrap();
     let root = temp.path();

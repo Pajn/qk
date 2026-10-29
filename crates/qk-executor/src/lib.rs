@@ -1,5 +1,6 @@
 //! Prepare finite tasks, then execute shell commands in managed process groups.
 
+mod bins;
 mod capture;
 pub mod dotenv;
 mod env_flags;
@@ -672,6 +673,16 @@ fn task_environment(
         environment
             .filter(&mut env)
             .with_context(|| format!("cannot build the environment of {}", task.id))?;
+        if environment.builds_path() {
+            let path = bins::path(
+                environment,
+                base_env.get(&path_key(base_env)),
+                &workspace.root,
+                &project.root,
+            )
+            .with_context(|| format!("cannot build the PATH of {}", task.id))?;
+            env.insert(path_key(&env), path);
+        }
     }
     if loads_dotenv(base_env) {
         let (target, non_atomized) = owner_target(project, &task.target);

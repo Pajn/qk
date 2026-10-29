@@ -33,14 +33,26 @@ calls the inherited process environment holds then only the variables the
 environment inherits or passes, and the ones it sets. The rest of the
 task's environment is built as before: its dotenv files, `envFile`, its
 `env` settings and the variables Nx sets apply on top, since its
-configuration declares them. `PATH` is a variable like any other, so a
-task's environment passes or inherits it; qk adds the workspace's
-`node_modules/.bin` directories and Node's directory to it, as for every
-task.
+configuration declares them.
+
+`PATH` is either a variable like any other, which the environment passes or
+inherits, or built from its `bin` and `dirs` entries. A built `PATH` holds a
+directory linking each command `bin` names, found on the `PATH` qk inherited,
+and nothing else from that directory, then the directories `dirs` names. The
+directory of links is in the user's cache directory, under
+`~/Library/Caches/qk/bin` on macOS and `$XDG_CACHE_HOME/qk/bin` or
+`~/.cache/qk/bin` elsewhere, named by the commands it links, so tasks
+linking the same commands share one. On Windows, where making a link takes a
+privilege a user may not hold, `PATH` holds the directory of each command
+instead. Either way, qk adds the workspace's `node_modules/.bin` directories
+and Node's directory to it, as for every task.
 
 The task's key holds its environment's entries, with named environments
 replaced by theirs, so a change to an environment changes the key of every
-task running in it, and the values of the variables it inherits. The values
+task running in it, the values of the variables it inherits, and the file
+each command `bin` names resolves to, whatever links lead to it. A command
+found somewhere else changes the key; the rest of the inherited `PATH`, and
+where the links are, do not. The values
 of the variables it passes are not keyed. Without a declared environment,
 keys are as before.
 

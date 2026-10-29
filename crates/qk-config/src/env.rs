@@ -34,6 +34,13 @@ pub struct Environment {
     /// key holds, rather than the values the task's own configuration
     /// gives them afterwards, which its definition keys.
     inherited: BTreeMap<String, Option<String>>,
+    /// The executables `PATH` holds, by name, in order.
+    bins: Vec<String>,
+    /// The directories `PATH` holds after them, as written.
+    dirs: Vec<String>,
+    /// Where each of `bins` resolved to, for the key: the binary itself,
+    /// whatever links led to it.
+    binaries: BTreeMap<String, String>,
 }
 
 impl Environment {
@@ -62,6 +69,20 @@ impl Environment {
         environment
             .add(entries, environments, &mut Vec::new())
             .with_context(|| format!("invalid {what}"))?;
+        if environment.builds_path() {
+            let path = if cfg!(windows) { "Path" } else { "PATH" };
+            if matches_any(&environment.inherit, path)
+                || matches_any(&environment.pass, path)
+                || environment
+                    .set
+                    .keys()
+                    .any(|name| name.eq_ignore_ascii_case("PATH"))
+            {
+                bail!(
+                    "invalid {what}: PATH is built from its bin and dirs entries, so it cannot also be inherited, passed or set"
+                );
+            }
+        }
         Ok(Some(environment))
     }
 
@@ -129,12 +150,40 @@ impl Environment {
                                 self.set.insert(name.clone(), value.to_owned());
                             }
                         }
+                        "bin" | "dirs" => {
+                            let items = value
+                                .as_array()
+                                .and_then(|items| {
+                                    items
+                                        .iter()
+                                        .map(|item| item.as_str().map(str::to_owned))
+                                        .collect::<Option<Vec<_>>>()
+                                })
+                                .with_context(|| format!("{kind} must be an array of strings"))?;
+                            for item in items {
+                                if item.is_empty() {
+                                    bail!("{kind} holds an empty string");
+                                }
+                                if kind == "bin" {
+                                    if item.contains(['/', '\\']) {
+                                        bail!(
+                                            "{item:?} is not a command name: bin names commands found on PATH, and dirs adds a directory"
+                                        );
+                                    }
+                                    if !self.bins.contains(&item) {
+                                        self.bins.push(item);
+                                    }
+                                } else if !self.dirs.contains(&item) {
+                                    self.dirs.push(item);
+                                }
+                            }
+                        }
                         other => bail!("{other:?} is not an environment entry"),
                     }
                     self.entries.push(entry.clone());
                 }
                 _ => bail!(
-                    "an environment entry is the name of an environment or an object with one of inherit, pass or set"
+                    "an environment entry is the name of an environment or an object with one of inherit, pass, set, bin or dirs"
                 ),
             }
         }
@@ -180,7 +229,33 @@ impl Environment {
     /// value each variable it inherits had, as [`Environment::filter`] found
     /// it. A passed variable is keyed by name only, as the entries hold it.
     pub fn keyed(&self) -> Value {
-        json!({ "entries": self.entries, "inherited": self.inherited })
+        let mut keyed = json!({ "entries": self.entries, "inherited": self.inherited });
+        // A binary is keyed by where it resolved to, rather than by the
+        // directory linking to it, which differs from machine to machine.
+        if !self.binaries.is_empty() {
+            keyed["binaries"] = json!(self.binaries);
+        }
+        keyed
+    }
+
+    /// Whether the environment builds `PATH` from `bin` and `dirs` entries.
+    pub fn builds_path(&self) -> bool {
+        !self.bins.is_empty() || !self.dirs.is_empty()
+    }
+
+    /// The commands `PATH` holds, by name.
+    pub fn bins(&self) -> &[String] {
+        &self.bins
+    }
+
+    /// The directories `PATH` holds after them, as written.
+    pub fn dirs(&self) -> &[String] {
+        &self.dirs
+    }
+
+    /// Notes where each of [`Environment::bins`] resolved to, for the key.
+    pub fn resolved(&mut self, binaries: BTreeMap<String, String>) {
+        self.binaries = binaries;
     }
 
     /// The patterns of the variables passed through and keyed.
@@ -396,8 +471,13 @@ mod tests {
             (json!(["loop"]), "includes itself"),
             (json!(["missing"]), "no environment \"missing\""),
             (
-                json!([{ "bin": ["node"] }]),
-                "\"bin\" is not an environment entry",
+                json!([{ "from": ["nix"] }]),
+                "\"from\" is not an environment entry",
+            ),
+            (json!([{ "bin": ["./node"] }]), "is not a command name"),
+            (
+                json!([{ "bin": ["node"] }, { "pass": ["PATH"] }]),
+                "PATH is built from its bin and dirs entries",
             ),
             (json!([{ "inherit": "HOME" }]), "must be an array"),
             (json!([{ "set": { "A": 1 } }]), "set.A must be a string"),
