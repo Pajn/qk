@@ -440,6 +440,7 @@ fn callbacks(
                 runtime_env: env.clone(),
                 node_path: None,
                 env,
+                environment: None,
                 execution: BTreeMap::new(),
                 parallel: false,
                 ready_when: Vec::new(),

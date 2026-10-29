@@ -23,6 +23,31 @@ for a `test` target, `FORCE_COLOR`, which is `true` unless already set, and
 whether or not the run uses the cache, except under `--sandbox` and input
 analysis.
 
+## Declared environments
+
+A target with [`qk:env`](targets.md#qkenv), or with nx.json's
+[`qk:defaultEnv`](workspace.md#qkenvironments-and-qkdefaultenv) when it
+names none, inherits only the variables its environment lets through. Its
+environment applies with or without `--sandbox`. What the precedence above
+calls the inherited process environment holds then only the variables the
+environment inherits or passes, and the ones it sets. The rest of the
+task's environment is built as before: its dotenv files, `envFile`, its
+`env` settings and the variables Nx sets apply on top, since its
+configuration declares them. `PATH` is a variable like any other, so a
+task's environment passes or inherits it; qk adds the workspace's
+`node_modules/.bin` directories and Node's directory to it, as for every
+task.
+
+The task's key holds its environment's entries, with named environments
+replaced by theirs, so a change to an environment changes the key of every
+task running in it, and the values of the variables it inherits. The values
+of the variables it passes are not keyed. Without a declared environment,
+keys are as before.
+
+A process reads its environment from its own memory, so the sandbox's audit
+cannot see which variables a task reads: a variable a task needs and its
+environment leaves out shows as the task failing.
+
 ## Dotenv files
 
 Dotenv files are read as Nx reads them, with npm's `dotenv` and

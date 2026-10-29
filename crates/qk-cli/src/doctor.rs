@@ -114,6 +114,21 @@ pub fn show(workspace: &Workspace, json: bool, strict: bool) -> Result<i32> {
             }
         }
     }
+    // An environment qk cannot build fails every task that runs in it.
+    let targets = workspace.projects.iter().flat_map(|(project, definition)| {
+        definition
+            .targets
+            .iter()
+            .map(move |(target, definition)| (format!("{project}:{target}"), definition))
+    });
+    for (location, message) in qk_config::env::validate(&workspace.config, targets) {
+        findings.push(Finding {
+            severity: "error",
+            code: "invalid-field",
+            location,
+            message,
+        });
+    }
     // A dependency glob that selects nothing keys nothing, so the cache
     // entries of the tasks reading it are reused whatever their dependencies
     // build. Several globs often share one named input, each for some of the

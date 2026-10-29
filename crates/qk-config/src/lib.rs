@@ -1,6 +1,7 @@
 //! Workspace discovery and normalization. Configuration is never executed.
 
 mod discovery;
+pub mod env;
 mod extends;
 mod merge;
 pub mod minimatch;
@@ -219,6 +220,8 @@ pub const UNKEYED_SETTINGS: &[&str] = &[
     "qk:storeServer",
     "qk:affectedProfiles",
     "qk:reachability",
+    "qk:environments",
+    "qk:defaultEnv",
     "cacheDirectory",
     "maxCacheSize",
     // No longer supported, as in Nx, and ignored with a warning.

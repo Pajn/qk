@@ -1531,6 +1531,62 @@ fn doctor_names_a_qk_sandbox_qk_cannot_read() {
     assert_eq!(located("unknown-field"), ["app:misspelled"], "{report}");
 }
 
+/// Doctor names an environment qk cannot build, in nx.json or on a target,
+/// and the default environment once, however many targets take it.
+#[test]
+fn doctor_names_an_environment_qk_cannot_build() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    std::fs::write(
+        root.join("nx.json"),
+        json!({
+            "qk:environments": {
+                "node": [{ "pass": ["PATH"] }],
+                "broken": [{ "from": ["nix"] }],
+            },
+            "qk:defaultEnv": ["missing"],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("project.json"),
+        json!({"name":"app","targets":{
+            "fine":{"command":"true","qk:env":["node", {"inherit":["LANG"]}]},
+            "off":{"command":"true","qk:env":false},
+            "typo":{"command":"true","qk:env":["nod"]},
+            "first":{"command":"true"},
+            "second":{"command":"true"}
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let output = isolated_command(env!("CARGO_BIN_EXE_qk"))
+        .current_dir(root)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let mut located: Vec<String> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|finding| finding["code"] == "invalid-field")
+        .map(|finding| finding["location"].as_str().unwrap().to_owned())
+        .collect();
+    located.sort();
+    assert_eq!(
+        located,
+        [
+            "app:typo",
+            "nx.json.qk:defaultEnv",
+            "nx.json.qk:environments.broken"
+        ],
+        "{report}"
+    );
+}
+
 /// A field a newer qk added is ignored, as Nx ignores keys it does not know,
 /// and doctor names it.
 #[test]

@@ -105,6 +105,16 @@ and `sources` arrays of globs. A target's `qk:reachability` names one, is
 `false`, or declares its own settings; without one, it takes its profile's
 default. See [Import reachability](../guides/affected-reachability.md).
 
+## `qk:environments` and `qk:defaultEnv`
+
+`qk:environments` names environments a target can run in, each an array of
+entries, as [`qk:env`](targets.md#qkenv) reads them. `qk:defaultEnv` is the
+environment of every target without its own `qk:env`, the same array, or
+`false`. Without it, a target with no `qk:env` inherits every variable, as
+qk's own process holds them. `[]` lets no inherited variable through to any
+task that does not name the ones it needs. See
+[Declared environments](environment.md#declared-environments).
+
 ## `parallel`
 
 A positive integer giving the default number of concurrently running tasks.

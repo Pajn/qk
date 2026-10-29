@@ -120,8 +120,9 @@ edges off.
   worktree's state directory; Nx writes every task's output to its cache
   directory.
 - `project.local.json`, `nx.local.json`, `qk:threads`, `qk:warm`,
-  `qk:affectedProfiles`, `qk:reachability` and a target-level `env` are qk
-  extensions. Nx does not apply them.
+  `qk:affectedProfiles`, `qk:reachability`, `qk:env`, `qk:environments`,
+  `qk:defaultEnv` and a target-level `env` are qk extensions. Nx does not
+  apply them: under Nx, a task inherits every variable.
 - A target default stays beneath a target the project's files replace along
   the way, for instance when `includedScripts` makes a script target that
   project.json gives a command. Nx stamps the default with the executor the

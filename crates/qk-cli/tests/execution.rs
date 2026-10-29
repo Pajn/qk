@@ -1836,6 +1836,79 @@ fn tasks_load_their_dotenv_files_and_nx_variables_like_nx() {
 
 #[cfg(unix)]
 #[test]
+fn a_declared_environment_lets_through_only_what_it_names() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    fs::write(
+        root.join("nx.json"),
+        json!({
+            "qk:environments": {
+                "shell": [{ "pass": ["PATH", "PASSED"] }],
+                "base": ["shell", { "inherit": ["KEYED_*"] }, { "set": { "FIXED": "fixed" } }],
+            },
+            "qk:defaultEnv": ["base"],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("app")).unwrap();
+    let show = "echo ${KEYED_A-unset} ${PASSED-unset} ${SECRET-unset} ${FIXED-unset} ${FROM_DOTENV-unset} ${FROM_TARGET-unset} $NX_TASK_TARGET_PROJECT";
+    fs::write(
+        root.join("app/project.json"),
+        json!({"name": "app", "targets": {
+            "show": {"command": show, "cache": true, "options": {"env": {"FROM_TARGET": "target"}}},
+            "open": {"command": "echo ${SECRET-unset}", "qk:env": false},
+            "empty": {"command": "/bin/sh -c 'echo ${PATH-unset} ${KEYED_A-unset}'", "qk:env": []},
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(root.join(".env"), "FROM_DOTENV=dotenv\n").unwrap();
+    let report = root.join("report.json");
+    let run = |target: &str, env: &[(&str, &str)]| {
+        let output = command(root, &["run", target, "--report", report.to_str().unwrap()])
+            .env("SECRET", "secret")
+            .env("KEYED_A", "a")
+            .env("PASSED", "p")
+            .envs(env.iter().copied())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(success(output).stdout).unwrap();
+        let report: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+        let cache = report["tasks"][0]["cache"]
+            .as_str()
+            .unwrap_or("none")
+            .to_owned();
+        (stdout, cache)
+    };
+    // The dotenv files and the target's own settings still apply: the
+    // configuration declares them.
+    let (stdout, cache) = run("app:show", &[]);
+    assert!(
+        stdout.contains("a p unset fixed dotenv target app\n"),
+        "{stdout}"
+    );
+    assert_eq!(cache, "miss");
+    // A passed variable is not keyed, and one left out changes nothing.
+    let (_, cache) = run("app:show", &[("PASSED", "other"), ("SECRET", "other")]);
+    assert_eq!(cache, "local-hit");
+    // An inherited one is, as is one it newly matches.
+    let (_, cache) = run("app:show", &[("KEYED_A", "b")]);
+    assert_eq!(cache, "miss");
+    let (_, cache) = run("app:show", &[("KEYED_B", "b")]);
+    assert_eq!(cache, "miss");
+    // `false` keeps every variable, and an empty environment none. Its
+    // `PATH` holds only what qk adds to every task's: the workspace's
+    // `node_modules/.bin` directories and Node's.
+    let (stdout, _) = run("app:open", &[]);
+    assert!(stdout.contains("secret\n"), "{stdout}");
+    let (stdout, _) = run("app:empty", &[("PATH", "/inherited/bin:/usr/bin:/bin")]);
+    assert!(stdout.ends_with(" unset\n"), "{stdout}");
+    assert!(!stdout.contains("/inherited/bin"), "{stdout}");
+}
+
+#[cfg(unix)]
+#[test]
 fn a_task_s_dotenv_files_expand_across_each_other_as_in_nx() {
     let temp = TempDir::new().unwrap();
     let root = temp.path();
