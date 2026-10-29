@@ -1320,10 +1320,13 @@ impl Cache {
             group: warm.group().map(str::to_owned),
             ..Restored::default()
         };
+        let locking = profile::span(&task.id, "warm_restore_lock");
         let _lock = self.lock_warm(warm)?;
+        drop(locking);
         // Local state wins: it is the newest for this checkout.
         let mut present = Vec::new();
         let mut missing = Vec::new();
+        let looking = profile::span(&task.id, "warm_restore_present");
         let locations = locations(workspace, task, warm)?;
         for location in &locations {
             if location.paths()?.is_empty() {
@@ -1336,17 +1339,29 @@ impl Cache {
                 present.push(warm.group().map_or(location.name, |group| group).to_owned());
             }
         }
+        drop(looking);
         if missing.is_empty() {
             return Ok((restored, present));
         }
         let choosing = profile::span(&task.id, "warm_restore_choose");
+        let keying = profile::span(&task.id, "warm_restore_key");
         let current = key_digests(workspace, warm, prepared)?;
+        drop(keying);
         // Another branch's save, here, only when the remote has none.
         let chosen = self
             .choose_warm(workspace, warm, &current, true)
             .or_else(|| {
-                self.remote_warm(workspace, task, warm, &current)
-                    .map(|(record, branch)| (record, format!("remote {branch}")))
+                let mut fetching = profile::span(&task.id, "warm_restore_remote");
+                let fetched = self
+                    .remote_warm(workspace, task, warm, &current)
+                    .map(|(record, branch)| (record, format!("remote {branch}")));
+                fetching.note(
+                    "source",
+                    fetched
+                        .as_ref()
+                        .map_or("none", |(_, source)| source.as_str()),
+                );
+                fetched
             })
             .or_else(|| self.choose_warm(workspace, warm, &current, false));
         let Some((record, source)) = chosen else {
@@ -1405,6 +1420,7 @@ impl Cache {
         keep_mtimes: bool,
     ) -> Result<(GroupFiles, u64)> {
         fs::create_dir_all(&location.base)?;
+        let mut laying = profile::span(task, "warm_restore_layout");
         // Validate every path and lay out directories and links first, so the
         // files, which are most of the work, can be copied in parallel.
         let mut created = BTreeSet::new();
@@ -1446,10 +1462,17 @@ impl Cache {
                 }
             }
         }
+        laying.count("directories", created.len() as u64);
+        drop(laying);
+        let mut copying = profile::span(task, "warm_restore_copy");
+        copying.count("files", pending.len() as u64);
         let copied = self
             .restore_warm_files(&pending)
             .with_context(|| format!("warm state for {task} not restored"))?;
+        copying.count("bytes", copied.iter().map(|(_, size)| size).sum());
+        drop(copying);
         // Directory modes come last, since one may forbid writing into it.
+        let _modes = profile::span(task, "warm_restore_modes");
         for (destination, mode) in directories {
             set_mode(&destination, mode)?;
         }
