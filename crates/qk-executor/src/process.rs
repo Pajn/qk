@@ -439,7 +439,9 @@ fn spawn(
     #[cfg(not(windows))]
     let mut command = match &task.sandbox {
         Some(crate::Confinement::Seatbelt(profile)) => {
-            let mut command = Command::new("sandbox-exec");
+            // By its path, which macOS fixes: the task's own PATH, which
+            // its environment can build, need not hold it.
+            let mut command = Command::new("/usr/bin/sandbox-exec");
             command.arg("-f").arg(profile).args(["/bin/sh", "-c", text]);
             command
         }
