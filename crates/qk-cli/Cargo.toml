@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage = "https://pajn.github.io/qk/"
+documentation = "https://pajn.github.io/qk/"
 description = "A fast standalone task runner that reads Nx workspaces"
 publish.workspace = true
 

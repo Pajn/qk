@@ -80,6 +80,10 @@ try {
   npm(['install', '--offline', '--ignore-scripts', '--no-audit', '--no-fund', ...packed], install);
   const installedPackage = JSON.parse(readFileSync(join(install, 'node_modules/@runqk/cli/package.json')));
   assert.equal(installedPackage.name, '@runqk/cli');
+  // The documentation of the installed version ships with it.
+  const docs = join(install, 'node_modules/@runqk/cli/docs');
+  assert.ok(existsSync(join(docs, 'SUMMARY.md')), `missing ${docs}/SUMMARY.md`);
+  assert.ok(existsSync(join(docs, 'reference/environment.md')), `missing ${docs}/reference/environment.md`);
   // Invoke the installed npm command shim with PATH, from a separate workspace.
   const bin = join(install, 'node_modules/.bin');
   const pathKey = Object.keys(env).find(key => key.toLowerCase() === 'path') ?? 'PATH';

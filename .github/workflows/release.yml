@@ -63,6 +63,7 @@ jobs:
           node-version: 24
       - run: cargo install cargo-npm --version 0.1.4 --locked
       - run: cargo npm generate -p qk-cli --target ${{ matrix.target }}
+      - run: node tools/npm/docs.mjs --packages npm
       - name: Test installed npm packages and binary archive
         shell: bash
         run: |
@@ -132,6 +133,7 @@ jobs:
       - name: Generate npm packages
         run: |
           cargo npm generate -p qk-cli
+          node tools/npm/docs.mjs --packages npm
           node --input-type=module -e '
             import { readFileSync } from "node:fs";
             const pkg = JSON.parse(readFileSync("npm/@runqk/cli/package.json", "utf8"));
