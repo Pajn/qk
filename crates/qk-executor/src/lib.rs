@@ -6,6 +6,7 @@ pub mod dotenv;
 mod env_flags;
 mod interpolate;
 mod process;
+mod providers;
 #[cfg(unix)]
 mod pty;
 pub mod readiness;
@@ -670,6 +671,15 @@ fn task_environment(
     // What the task inherits, before its own dotenv files and settings,
     // which its configuration declares.
     if let Some(environment) = environment {
+        let mut provided = BTreeMap::new();
+        let mut keys = Vec::new();
+        for provider in environment.providers() {
+            let (variables, key) = providers::load(provider, base_env, &workspace.root)
+                .with_context(|| format!("cannot build the environment of {}", task.id))?;
+            provided.extend(variables);
+            keys.push(key);
+        }
+        environment.provide(provided, keys);
         environment
             .filter(&mut env)
             .with_context(|| format!("cannot build the environment of {}", task.id))?;

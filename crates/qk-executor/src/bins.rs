@@ -47,6 +47,10 @@ pub fn path(
             .replace("{projectRoot}", project_root);
         entries.push(workspace_root.join(expanded));
     }
+    // What a from entry put on PATH comes last.
+    if let Some(provided) = environment.provided_path() {
+        entries.extend(std::env::split_paths(provided));
+    }
     environment.resolved(binaries);
     std::env::join_paths(entries).context("cannot build the task's PATH")
 }
@@ -149,7 +153,7 @@ fn links(found: &[(String, PathBuf)]) -> Result<Vec<PathBuf>> {
 /// The user's own cache directory for qk, which other users cannot write to,
 /// unlike the system's temporary directory.
 #[cfg(unix)]
-fn cache_directory() -> Result<PathBuf> {
+pub(crate) fn cache_directory() -> Result<PathBuf> {
     let home = || std::env::var_os("HOME").filter(|home| !home.is_empty());
     let base = if cfg!(target_os = "macos") {
         home().map(|home| PathBuf::from(home).join("Library/Caches"))
@@ -165,4 +169,13 @@ fn cache_directory() -> Result<PathBuf> {
             "HOME is not set, so qk has nowhere to link the commands of a task's environment"
         ),
     }
+}
+
+/// The user's own cache directory for qk.
+#[cfg(not(unix))]
+pub(crate) fn cache_directory() -> Result<PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .filter(|directory| !directory.is_empty())
+        .map(|directory| PathBuf::from(directory).join("qk"))
+        .context("LOCALAPPDATA is not set, so qk has nowhere to keep a task environment's output")
 }

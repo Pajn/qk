@@ -2028,6 +2028,122 @@ fn a_declared_environment_builds_path_from_the_commands_it_names() {
 
 #[cfg(unix)]
 #[test]
+fn a_declared_environment_sets_what_a_command_prints() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    let outside = TempDir::new().unwrap();
+    let tools = outside.path().join("tools");
+    fs::create_dir_all(&tools).unwrap();
+    fs::write(tools.join("hello"), "#!/bin/sh\necho hello\n").unwrap();
+    fs::set_permissions(tools.join("hello"), fs::Permissions::from_mode(0o755)).unwrap();
+    let runs = outside.path().join("runs");
+    // Prints the lock file's content and a PATH, and counts its runs.
+    fs::write(
+        root.join("provider.sh"),
+        format!(
+            "echo run >> '{}'\nprintf '{{\"FROM_PROVIDER\":\"%s\",\"PATH\":\"{}\",\"UNSET\":null}}' \"$(cat env.lock)\"\n",
+            runs.display(),
+            tools.display()
+        ),
+    )
+    .unwrap();
+    fs::write(root.join("env.lock"), "one").unwrap();
+    fs::write(
+        root.join("nx.json"),
+        json!({ "qk:environments": {
+            "kept": [{ "from": { "command": "sh provider.sh", "inputs": ["env.lock"] } }],
+            "each": [{ "from": { "command": "sh provider.sh" } }],
+        } })
+        .to_string(),
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("app")).unwrap();
+    fs::write(
+        root.join("app/project.json"),
+        json!({"name": "app", "targets": {
+            "kept": {"command": "echo $FROM_PROVIDER; hello", "cache": true, "qk:env": ["kept"]},
+            "each": {"command": "echo $FROM_PROVIDER", "qk:env": ["each"]},
+            "broken": {"command": "true", "qk:env": [{ "from": { "command": "echo nope >&2; exit 3" } }]},
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let home = root.join("home");
+    fs::create_dir_all(&home).unwrap();
+    let report = root.join("report.json");
+    let run = |target: &str| {
+        let output = command(root, &["run", target, "--report", report.to_str().unwrap()])
+            .env("HOME", &home)
+            .env_remove("XDG_CACHE_HOME")
+            .output()
+            .unwrap();
+        let report: Value = fs::read(&report)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        let cache = report["tasks"][0]["cache"]
+            .as_str()
+            .unwrap_or("none")
+            .to_owned();
+        (output, cache)
+    };
+    let counted = || {
+        fs::read_to_string(&runs)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let (output, cache) = run("app:kept");
+    let stdout = String::from_utf8(success(output).stdout).unwrap();
+    assert!(stdout.contains("one\nhello\n"), "{stdout}");
+    assert_eq!((cache.as_str(), counted()), ("miss", 1));
+    // Kept for its owner alone, as what it printed can hold credentials.
+    let kept: Vec<_> = walkdir::WalkDir::new(&home)
+        .into_iter()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "json")
+                && entry
+                    .path()
+                    .parent()
+                    .is_some_and(|parent| parent.ends_with("qk/env"))
+        })
+        .collect();
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(
+        kept[0].metadata().unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    // Kept until its input changes, which changes the key.
+    let (_, cache) = run("app:kept");
+    assert_eq!((cache.as_str(), counted()), ("local-hit", 1));
+    fs::write(root.join("env.lock"), "two").unwrap();
+    let (output, cache) = run("app:kept");
+    let stdout = String::from_utf8(success(output).stdout).unwrap();
+    assert!(stdout.contains("two\n"), "{stdout}");
+    assert_eq!((cache.as_str(), counted()), ("miss", 2));
+    // Without inputs, it runs again each run.
+    let (output, _) = run("app:each");
+    assert!(
+        String::from_utf8(success(output).stdout)
+            .unwrap()
+            .contains("two\n")
+    );
+    let (_, _) = run("app:each");
+    assert_eq!(counted(), 4);
+    // A command that fails fails the task, with what it said.
+    let (output, _) = run("app:broken");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("nope"), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
 fn a_task_s_dotenv_files_expand_across_each_other_as_in_nx() {
     let temp = TempDir::new().unwrap();
     let root = temp.path();

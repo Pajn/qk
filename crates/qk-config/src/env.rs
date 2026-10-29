@@ -44,6 +44,24 @@ pub struct Environment {
     /// The inherited variables it left out, by name, to name when the task
     /// fails.
     left_out: Vec<String>,
+    /// The commands whose output sets variables, in order.
+    providers: Vec<Provider>,
+    /// What they set, once run, applied over what it inherits.
+    provided: BTreeMap<String, String>,
+    /// What the key holds of each of them.
+    provided_keys: Vec<Value>,
+}
+
+/// A command printing an environment, as `nix print-dev-env --json` does,
+/// whose variables a task's environment sets.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Provider {
+    /// The command, run by `sh` in the workspace root.
+    pub command: String,
+    /// The files its output follows from, relative to the workspace root:
+    /// with them, the key holds their content rather than the output, and
+    /// the output is kept until they change.
+    pub inputs: Option<Vec<String>>,
 }
 
 impl Environment {
@@ -181,12 +199,43 @@ impl Environment {
                                 }
                             }
                         }
+                        "from" => {
+                            let object = value
+                                .as_object()
+                                .context("from must be an object with a command")?;
+                            for field in object.keys() {
+                                if !matches!(field.as_str(), "command" | "inputs") {
+                                    bail!("from.{field} is not a field qk knows");
+                                }
+                            }
+                            let command = object
+                                .get("command")
+                                .and_then(Value::as_str)
+                                .filter(|command| !command.trim().is_empty())
+                                .context("from.command must be a command")?
+                                .to_owned();
+                            let inputs = match object.get("inputs") {
+                                None => None,
+                                Some(inputs) => Some(
+                                    inputs
+                                        .as_array()
+                                        .and_then(|inputs| {
+                                            inputs
+                                                .iter()
+                                                .map(|input| input.as_str().map(str::to_owned))
+                                                .collect::<Option<Vec<_>>>()
+                                        })
+                                        .context("from.inputs must be an array of paths")?,
+                                ),
+                            };
+                            self.providers.push(Provider { command, inputs });
+                        }
                         other => bail!("{other:?} is not an environment entry"),
                     }
                     self.entries.push(entry.clone());
                 }
                 _ => bail!(
-                    "an environment entry is the name of an environment or an object with one of inherit, pass, set, bin or dirs"
+                    "an environment entry is the name of an environment or an object with one of inherit, pass, set, bin, dirs or from"
                 ),
             }
         }
@@ -218,6 +267,16 @@ impl Environment {
                 self.left_out.push(text);
             }
         }
+        for (name, value) in &self.provided {
+            if name.eq_ignore_ascii_case("PATH")
+                && (matches_any(&self.inherit, name) || matches_any(&self.pass, name))
+            {
+                bail!(
+                    "PATH is set by a from entry of the task's environment, so it cannot also be inherited or passed"
+                );
+            }
+            kept.insert(name.into(), value.into());
+        }
         for (name, value) in &self.set {
             // A name differing only in case is the same variable on Windows.
             if cfg!(windows) {
@@ -240,6 +299,9 @@ impl Environment {
         // directory linking to it, which differs from machine to machine.
         if !self.binaries.is_empty() {
             keyed["binaries"] = json!(self.binaries);
+        }
+        if !self.provided_keys.is_empty() {
+            keyed["provided"] = json!(self.provided_keys);
         }
         keyed
     }
@@ -268,6 +330,27 @@ impl Environment {
     /// The directories `PATH` holds after them, as written.
     pub fn dirs(&self) -> &[String] {
         &self.dirs
+    }
+
+    /// The commands whose output sets variables.
+    pub fn providers(&self) -> &[Provider] {
+        &self.providers
+    }
+
+    /// Notes what [`Environment::providers`] set, with what the key holds of
+    /// each; [`Environment::filter`] applies it.
+    pub fn provide(&mut self, variables: BTreeMap<String, String>, keys: Vec<Value>) {
+        self.provided = variables;
+        self.provided_keys = keys;
+    }
+
+    /// The `PATH` a from entry set, which a `PATH` built from `bin` and
+    /// `dirs` entries ends with.
+    pub fn provided_path(&self) -> Option<&str> {
+        self.provided
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("PATH"))
+            .map(|(_, value)| value.as_str())
     }
 
     /// Notes where each of [`Environment::bins`] resolved to, for the key.
@@ -488,8 +571,16 @@ mod tests {
             (json!(["loop"]), "includes itself"),
             (json!(["missing"]), "no environment \"missing\""),
             (
-                json!([{ "from": ["nix"] }]),
-                "\"from\" is not an environment entry",
+                json!([{ "path": ["nix"] }]),
+                "\"path\" is not an environment entry",
+            ),
+            (
+                json!([{ "from": { "command": "" } }]),
+                "from.command must be a command",
+            ),
+            (
+                json!([{ "from": { "command": "x", "input": [] } }]),
+                "from.input is not a field",
             ),
             (json!([{ "bin": ["./node"] }]), "is not a command name"),
             (

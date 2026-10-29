@@ -47,6 +47,25 @@ privilege a user may not hold, `PATH` holds the directory of each command
 instead. Either way, qk adds the workspace's `node_modules/.bin` directories
 and Node's directory to it, as for every task.
 
+A `from` entry runs its command in the workspace root, with every variable
+qk inherited, and sets the variables it prints as JSON: either Nix's
+`{"variables": {NAME: {"type": …, "value": …}}}`, of which the exported
+variables are taken, less those `nix develop` also leaves as they are, such
+as `HOME` and `TMPDIR`, or a flat `{NAME: value}`, in which `null` leaves a
+variable unset. What it sets takes the place of an inherited variable, and
+the environment's `set` entries take the place of what it sets. Its `PATH`
+ends a `PATH` built from `bin` and `dirs` entries, or is the task's `PATH`
+without them; the environment cannot also inherit or pass `PATH` then. The
+command runs once per run for every task sharing it. With `inputs`, files
+relative to the workspace root, such as `flake.nix` and `flake.lock`, its
+output is kept in the user's cache directory, readable by its owner alone,
+until they change, and the task's key holds the command and their content
+rather than the output, which can hold paths that differ from machine to
+machine. Without them, the key
+holds a digest of each value it printed, which changes with the value without
+keeping it, as it can be a credential. A command that fails, or prints something else, fails
+the task.
+
 The task's key holds its environment's entries, with named environments
 replaced by theirs, so a change to an environment changes the key of every
 task running in it, the values of the variables it inherits, and the file
