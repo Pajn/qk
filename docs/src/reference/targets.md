@@ -292,6 +292,7 @@ named twice and no variable is set by two entries. See
 | `survive` | array of targets, `target` or `project:target` | Empty; keep `paths` across these dependencies |
 | `save` | `"wait"` or `"background"` | `"wait"`; `"background"` saves after the task has reported |
 | `restore` | `"whole"` or `"each-path"` | `"whole"`; `"each-path"` restores each missing path from `paths` and leaves those on disk; see [Restoring paths one by one](../guides/warm-state.md#restoring-paths-one-by-one) |
+| `prefetch` | boolean | `false`; fetch the remote save as the run starts, while the task's dependencies run; see [Fetching remote state ahead](../guides/warm-state.md#fetching-remote-state-ahead) |
 
 Other fields are ignored, as in `qk:threads`, and `qk doctor` reports them.
 Put it beside `inputs` and `outputs`, rather than in executor `options`.

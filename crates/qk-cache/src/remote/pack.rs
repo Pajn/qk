@@ -128,16 +128,25 @@ pub(super) struct Transfer {
     pub(super) skipped: u64,
     /// Every blob the pack stores apart, held or not.
     pub(super) apart: Vec<String>,
+    /// How long reading waited on the body, as it arrives.
+    pub(super) waited: std::time::Duration,
+    /// The inline blobs kept, which the local store lacked.
+    pub(super) written: u64,
 }
 
 struct Counting<'a, R> {
     inner: R,
     count: &'a mut u64,
+    waited: &'a mut std::time::Duration,
 }
 
 impl<R: Read> Read for Counting<'_, R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        let read = self.inner.read(buffer)?;
+        let started = std::time::Instant::now();
+        let read = self.inner.read(buffer);
+        // A read that fails counts too: a stall often ends in an error.
+        *self.waited += started.elapsed();
+        let read = read?;
         *self.count += read as u64;
         Ok(read)
     }
@@ -160,6 +169,7 @@ pub(super) fn read(
     let input = Counting {
         inner: input,
         count: &mut transfer.received,
+        waited: &mut transfer.waited,
     };
     let mut input = input.take(super::LARGEST_UPLOAD + 1);
     let mut decoder = zstd::stream::read::Decoder::new(&mut input)?;
@@ -168,6 +178,7 @@ pub(super) fn read(
         &mut transfer.held,
         &mut transfer.skipped,
         &mut transfer.apart,
+        &mut transfer.written,
     );
     let read = read_parts(root, &mut decoder, check, counts, apart)?;
     drop(decoder);
@@ -201,7 +212,7 @@ fn read_parts(
     root: &Path,
     mut body: impl Read,
     check: impl Fn(&StoredRecord) -> Result<()>,
-    (held, skipped, listed): (&mut u64, &mut u64, &mut Vec<String>),
+    (held, skipped, listed, written): (&mut u64, &mut u64, &mut Vec<String>, &mut u64),
     apart: impl FnOnce(Vec<String>) -> Result<()> + Send,
 ) -> Result<(Vec<u8>, crate::evict::Pin)> {
     let mut magic = [0; 4];
@@ -256,7 +267,7 @@ fn read_parts(
     }
     std::thread::scope(|scope| {
         let fetching = (!missing.is_empty()).then(|| scope.spawn(move || apart(missing)));
-        let streamed = read_inline(root, &mut body, &inline, held);
+        let streamed = read_inline(root, &mut body, &inline, held, written);
         let fetched = fetching.map_or(Ok(()), |fetching| {
             fetching.join().expect("blob fetches panicked")
         });
@@ -268,37 +279,156 @@ fn read_parts(
     Ok((record, pin))
 }
 
+/// The largest inline blob handed to a writer whole; a larger one is
+/// written as it is read. The queue holds a few of them at most.
+const BUFFERED_BLOB: u64 = 1 << 20;
+const BLOB_WRITERS: usize = 8;
+
 /// Keeps each inline blob the local store lacks, verified against its hash.
+/// The pack is one stream, but a cache of many small files costs more to
+/// write than to decompress, so the blobs are hashed and written by a few
+/// threads while the stream is read on.
 fn read_inline(
     root: &Path,
     body: &mut impl Read,
     inline: &[(String, u64)],
     held: &mut u64,
+    written: &mut u64,
 ) -> Result<()> {
-    for (blob, length) in inline {
-        let length = *length;
-        let mut part = (&mut *body).take(length);
-        let target = root.join("blobs").join(blob);
-        let copied = if target.is_file() {
-            let copied = io::copy(&mut part, &mut io::sink())?;
-            *held += copied;
-            copied
-        } else {
-            let mut file = tempfile::NamedTempFile::new_in(root.join("tmp"))?;
-            let copied = io::copy(&mut part, file.as_file_mut())?;
-            if copied == length {
-                if crate::hash::digest_file(file.path())? != *blob {
+    let keep = |blob: &str, bytes: &[u8]| -> Result<()> {
+        if blake3::hash(bytes).to_hex().as_str() != blob {
+            bail!("remote blob {blob} does not match its hash");
+        }
+        let mut file = tempfile::NamedTempFile::new_in(root.join("tmp"))?;
+        file.as_file_mut().write_all(bytes)?;
+        file.persist(root.join("blobs").join(blob))?;
+        Ok(())
+    };
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<(&str, Vec<u8>)>(BLOB_WRITERS * 2);
+    let receiver = std::sync::Mutex::new(receiver);
+    let failed = std::sync::atomic::AtomicBool::new(false);
+    // After a failure the queue is still drained, so a reader waiting for
+    // room in it is never left waiting.
+    let write = || -> Result<()> {
+        let mut kept = Ok(());
+        loop {
+            let next = receiver.lock().unwrap().recv();
+            let Ok((blob, bytes)) = next else {
+                return kept;
+            };
+            if failed.load(std::sync::atomic::Ordering::Relaxed) {
+                continue;
+            }
+            if let Err(error) = keep(blob, &bytes) {
+                failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                kept = Err(error);
+            }
+        }
+    };
+    std::thread::scope(|scope| -> Result<()> {
+        // Started once a blob is to be written, which most reads of a pack
+        // whose blobs are all held never come to.
+        let mut writers = Vec::new();
+        let read = (|| -> Result<()> {
+            for (blob, length) in inline {
+                if failed.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                let length = *length;
+                // Stops reading once a writer has failed, rather than read
+                // on through a large blob the restore will not use.
+                let mut part = Stopping {
+                    inner: (&mut *body).take(length),
+                    failed: &failed,
+                };
+                let target = root.join("blobs").join(blob);
+                if target.is_file() {
+                    let copied = io::copy(&mut part, &mut io::sink())?;
+                    *held += copied;
+                    if copied != length {
+                        bail!("remote pack ends early");
+                    }
+                    continue;
+                }
+                *written += 1;
+                if length <= BUFFERED_BLOB {
+                    let mut bytes = Vec::with_capacity(length as usize);
+                    if part.read_to_end(&mut bytes)? as u64 != length {
+                        bail!("remote pack ends early");
+                    }
+                    if writers.is_empty() {
+                        writers = (0..BLOB_WRITERS).map(|_| scope.spawn(write)).collect();
+                    }
+                    if sender.send((blob, bytes)).is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                // Hashed as it is written, rather than read back.
+                let mut file = tempfile::NamedTempFile::new_in(root.join("tmp"))?;
+                let mut hashing = Hashing {
+                    inner: file.as_file_mut(),
+                    hasher: blake3::Hasher::new(),
+                };
+                if io::copy(&mut part, &mut hashing)? != length {
+                    bail!("remote pack ends early");
+                }
+                if hashing.hasher.finalize().to_hex().as_str() != blob {
                     bail!("remote blob {blob} does not match its hash");
                 }
                 file.persist(&target)?;
             }
-            copied
-        };
-        if copied != length {
-            bail!("remote pack ends early");
+            Ok(())
+        })();
+        // Nothing more of a failed read is kept.
+        if read.is_err() {
+            failed.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        drop(sender);
+        // Every writer is joined, and its error preferred: a reader stopped
+        // by a failed writer says only that it stopped.
+        let mut kept = Ok(());
+        for writer in writers {
+            let result = writer.join().expect("blob writer panicked");
+            if kept.is_ok() {
+                kept = result;
+            }
+        }
+        kept.and(read)
+    })
+}
+
+/// A reader that fails once `failed` is set.
+struct Stopping<'a, R> {
+    inner: R,
+    failed: &'a std::sync::atomic::AtomicBool,
+}
+
+impl<R: Read> Read for Stopping<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.failed.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(io::Error::other("a blob writer failed"));
+        }
+        self.inner.read(buffer)
     }
-    Ok(())
+}
+
+/// A writer that hashes what passes through it.
+struct Hashing<W> {
+    inner: W,
+    hasher: blake3::Hasher,
+}
+
+impl<W: Write> Write for Hashing<W> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buffer)?;
+        self.hasher.update(&buffer[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// The blob `hash` compressed as one frame into the local store's scratch
@@ -318,9 +448,11 @@ pub(super) fn compress(root: &Path, hash: &str) -> Result<tempfile::NamedTempFil
 /// store at `root` once it matches its hash, returning the bytes received.
 pub(super) fn read_blob(root: &Path, hash: &str, body: impl Read) -> Result<u64> {
     let mut received = 0;
+    let mut waited = std::time::Duration::ZERO;
     let input = Counting {
         inner: body,
         count: &mut received,
+        waited: &mut waited,
     };
     let mut input = input.take(super::LARGEST_UPLOAD + 1);
     let mut decoder = zstd::stream::read::Decoder::new(&mut input)?;
@@ -489,6 +621,78 @@ mod tests {
         let mut encoded = Vec::new();
         write(root, &record, &mut encoded).unwrap();
         (record, encoded)
+    }
+
+    /// Many blobs are written by several writers, and one too large to hand
+    /// over whole as it is read; every one lands verified.
+    #[test]
+    fn packs_of_many_blobs_restore_each_one() {
+        let source = root();
+        let mut artifacts = serde_json::Map::new();
+        let mut contents = Vec::new();
+        for index in 0..200 {
+            let bytes = format!("module {index}\n").repeat(if index == 0 { 200_000 } else { 50 });
+            assert_eq!(index == 0, bytes.len() as u64 > BUFFERED_BLOB);
+            let hash = blake3::hash(bytes.as_bytes()).to_hex().to_string();
+            std::fs::write(source.path().join("blobs").join(&hash), &bytes).unwrap();
+            artifacts.insert(
+                format!("cache/{index}"),
+                serde_json::json!({"type": "File", "blob": hash, "mode": 420}),
+            );
+            contents.push((hash, bytes));
+        }
+        let record = serde_json::to_vec(&serde_json::json!({ "artifacts": artifacts })).unwrap();
+        let mut encoded = Vec::new();
+        write(source.path(), &record, &mut encoded).unwrap();
+        let destination = root();
+        let mut transfer = Transfer::default();
+        super::read(
+            destination.path(),
+            &encoded[..],
+            |_| Ok(()),
+            &mut transfer,
+            no_apart,
+        )
+        .unwrap();
+        assert_eq!(transfer.written, 200);
+        for (hash, bytes) in contents {
+            let kept = std::fs::read(destination.path().join("blobs").join(hash)).unwrap();
+            assert_eq!(kept, bytes.as_bytes());
+        }
+    }
+
+    /// When every write fails, as on a full disk, the read ends in their
+    /// error. Whether the reader is waiting for room in the queue as the last
+    /// writer fails depends on timing, which this does not control.
+    #[test]
+    fn a_read_whose_writers_all_fail_ends_in_their_error() {
+        let source = root();
+        let mut artifacts = serde_json::Map::new();
+        for index in 0..100 {
+            let bytes = format!("module {index}\n").repeat(50);
+            let hash = blake3::hash(bytes.as_bytes()).to_hex().to_string();
+            std::fs::write(source.path().join("blobs").join(&hash), &bytes).unwrap();
+            artifacts.insert(
+                format!("cache/{index}"),
+                serde_json::json!({"type": "File", "blob": hash, "mode": 420}),
+            );
+        }
+        let record = serde_json::to_vec(&serde_json::json!({ "artifacts": artifacts })).unwrap();
+        let mut encoded = Vec::new();
+        write(source.path(), &record, &mut encoded).unwrap();
+        let destination = root();
+        // Without its scratch directory, no blob can be written.
+        std::fs::remove_dir(destination.path().join("tmp")).unwrap();
+        let (done, finished) = std::sync::mpsc::channel();
+        let path = destination.path().to_owned();
+        std::thread::spawn(move || {
+            let read = read(&path, &encoded[..], |_| Ok(()));
+            let _ = done.send(read.map(|_| ()));
+        });
+        let read = finished
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the read did not finish");
+        assert!(read.is_err());
     }
 
     #[test]

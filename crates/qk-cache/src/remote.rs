@@ -953,6 +953,8 @@ impl Remote {
             receiving.count("held_bytes", transfer.held);
             receiving.count("apart_bytes", apart.load(Ordering::Relaxed));
             receiving.count("skipped_bytes", transfer.skipped);
+            receiving.count("wait_ms", transfer.waited.as_millis() as u64);
+            receiving.count("blobs_written", transfer.written);
             received.fetch_add(
                 transfer.received + apart.load(Ordering::Relaxed),
                 Ordering::Relaxed,

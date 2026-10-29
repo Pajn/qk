@@ -3873,6 +3873,202 @@ fn a_cold_run_saves_no_warm_state_it_could_not_empty() {
     assert_eq!(said(&[], "").0, "bad");
 }
 
+/// A target that asks for it fetches its remote warm save as the run
+/// starts, and its restore takes what that fetched.
+#[cfg(unix)]
+#[test]
+fn warm_state_is_prefetched_for_a_target_that_asks() {
+    for prefetch in [true, false] {
+        let server = s3::FakeS3::start();
+        let fixture = Fixture::new(json!({
+            "command": "if [ -f \"$TOOL_CACHE/seen\" ]; then cat \"$TOOL_CACHE/seen\"; else echo cold; fi; mkdir -p \"$TOOL_CACHE\" && echo saved > \"$TOOL_CACHE/seen\"",
+            "qk:warm": {"portable": true, "prefetch": prefetch, "env": {"TOOL_CACHE": "{warm}/tool"}}
+        }));
+        with_remote(&fixture, &server, json!({}));
+        let report = fixture.root.join(".git/report.json");
+        let run = || {
+            let mut command = remote_build_command(&fixture, &[("GITHUB_REF_NAME", "main")]);
+            command
+                .args(["--report", report.to_str().unwrap()])
+                .env("QK_PROFILE_CACHE", "1");
+            let output = success(command.output().unwrap());
+            (
+                stdout(&output)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned(),
+                stderr(&output),
+            )
+        };
+        // Where the restore said the save came from.
+        let source = || {
+            let run: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+            run["tasks"][0]["warm"]["restored"][0]["source"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        };
+        assert_eq!(run().0, "cold");
+        // Another machine, with nothing of its own.
+        clear_local_cache(&fixture);
+        fs::remove_dir_all(fixture.root.join(".git/qk/warm")).unwrap();
+        let (said, profile) = run();
+        assert_eq!(said, "saved", "{profile}");
+        assert_eq!(
+            profile.contains("stage=warm_prefetch "),
+            prefetch,
+            "{profile}"
+        );
+        // A remote save, however soon the fetch kept it here, where it could
+        // pass for a save of this checkout's.
+        assert_eq!(
+            profile.contains("stage=warm_restore_prefetched"),
+            prefetch,
+            "{profile}"
+        );
+        assert_eq!(source(), "remote main", "prefetch={prefetch} {profile}");
+        // With its paths on disk, nothing is fetched ahead.
+        let (said, profile) = run();
+        assert_eq!(said, "saved");
+        assert!(!profile.contains("stage=warm_prefetch "), "{profile}");
+        // Where the save's commit is none of its ancestors, as in a shallow
+        // checkout, the restore takes the fetch itself.
+        fixture.git(
+            &fixture.root,
+            &["checkout", "--quiet", "--orphan", "unrelated"],
+        );
+        fixture.git(
+            &fixture.root,
+            &[
+                "-c",
+                "user.name=qk",
+                "-c",
+                "user.email=qk@example.com",
+                "commit",
+                "--quiet",
+                "-m",
+                "unrelated",
+            ],
+        );
+        clear_local_cache(&fixture);
+        fs::remove_dir_all(fixture.root.join(".git/qk/warm")).unwrap();
+        let (said, profile) = run();
+        assert_eq!(said, "saved", "{profile}");
+        assert_eq!(
+            profile.contains("stage=warm_restore_prefetched"),
+            prefetch,
+            "{profile}"
+        );
+        // A cold run restores nothing, so fetches nothing ahead.
+        clear_local_cache(&fixture);
+        fs::remove_dir_all(fixture.root.join(".git/qk/warm")).unwrap();
+        let mut cold = remote_build_command(&fixture, &[("GITHUB_REF_NAME", "main")]);
+        cold.args(["--cold"]).env("QK_PROFILE_CACHE", "1");
+        let output = success(cold.output().unwrap());
+        assert_eq!(stdout(&output).lines().next(), Some("cold"));
+        assert!(
+            !stderr(&output).contains("stage=warm_prefetch "),
+            "{}",
+            stderr(&output)
+        );
+    }
+}
+
+/// A group shared by two tasks that ask for it is fetched ahead once, and
+/// the first of them to restore takes it.
+#[cfg(unix)]
+#[test]
+fn a_shared_group_is_prefetched_once() {
+    let server = s3::FakeS3::start();
+    let tool = |name: &str, depends: Value| {
+        json!({
+            "command": format!("echo {name}:$(cat \"$TOOL_CACHE/seen\" 2>/dev/null || echo cold); mkdir -p \"$TOOL_CACHE\" && echo {name} > \"$TOOL_CACHE/seen\""),
+            "dependsOn": depends,
+            "qk:warm": {"portable": true, "prefetch": true, "group": "tool", "env": {"TOOL_CACHE": "{warm}/tool"}}
+        })
+    };
+    let fixture = Fixture::with_targets(json!({
+        "build": tool("build", json!([])),
+        "test": tool("test", json!(["build"]))
+    }));
+    with_remote(&fixture, &server, json!({}));
+    let run = || {
+        let mut command = fixture.command(&fixture.root, &["run", "app:test"]);
+        command
+            .env("AWS_ACCESS_KEY_ID", "key")
+            .env("AWS_SECRET_ACCESS_KEY", "secret")
+            .env_remove("CI")
+            .env_remove("GITHUB_ACTIONS")
+            .env_remove("NX_POWERPACK_CACHE_MODE")
+            .env("GITHUB_REF_NAME", "main")
+            .env("QK_PROFILE_CACHE", "1");
+        let output = success(command.output().unwrap());
+        (stdout(&output), stderr(&output))
+    };
+    run();
+    clear_local_cache(&fixture);
+    fs::remove_dir_all(fixture.root.join(".git/qk/warm")).unwrap();
+    fs::write(fixture.root.join("src/input.txt"), "two\n").unwrap();
+    let (said, profile) = run();
+    assert!(said.contains("build:test"), "{said}");
+    assert!(said.contains("test:build"), "{said}");
+    assert_eq!(
+        profile.matches("stage=warm_prefetch ").count(),
+        1,
+        "{profile}"
+    );
+}
+
+/// A save fetched ahead for a key the task no longer has when it runs, as
+/// when a dependency rewrites a file the key names, is left unused: the task
+/// fetches for its own key.
+#[cfg(unix)]
+#[test]
+fn a_prefetch_for_a_key_a_dependency_changed_is_left_unused() {
+    let server = s3::FakeS3::start();
+    let fixture = Fixture::with_targets(json!({
+        "prep": {"command": "echo \"${KEY_VALUE:-one}\" > src/key.txt"},
+        "build": {
+            "command": "if [ -f \"$TOOL_CACHE/seen\" ]; then cat \"$TOOL_CACHE/seen\"; else echo cold; fi; mkdir -p \"$TOOL_CACHE\" && echo saved > \"$TOOL_CACHE/seen\"",
+            "dependsOn": ["prep"],
+            "qk:warm": {"portable": true, "prefetch": true, "key": ["src/key.txt"], "env": {"TOOL_CACHE": "{warm}/tool"}}
+        }
+    }));
+    with_remote(&fixture, &server, json!({}));
+    let run = |value: &str| {
+        let mut command = fixture.command(&fixture.root, &["run", "app:build"]);
+        command
+            .env("AWS_ACCESS_KEY_ID", "key")
+            .env("AWS_SECRET_ACCESS_KEY", "secret")
+            .env_remove("CI")
+            .env_remove("GITHUB_ACTIONS")
+            .env_remove("NX_POWERPACK_CACHE_MODE")
+            .env("GITHUB_REF_NAME", "main")
+            .env("KEY_VALUE", value)
+            .env("QK_PROFILE_CACHE", "1");
+        let output = success(command.output().unwrap());
+        (
+            stdout(&output)
+                .lines()
+                .rfind(|line| *line == "cold" || *line == "saved")
+                .unwrap_or_default()
+                .to_owned(),
+            stderr(&output),
+        )
+    };
+    // Saved for the key `one`, which the file holds from then on.
+    assert_eq!(run("one").0, "cold");
+    clear_local_cache(&fixture);
+    fs::remove_dir_all(fixture.root.join(".git/qk/warm")).unwrap();
+    // Fetched ahead for `one`, but `prep` makes it `two` before it runs.
+    let (said, profile) = run("two");
+    assert_eq!(said, "cold", "{profile}");
+    assert!(profile.contains("stage=warm_prefetch "), "{profile}");
+    assert!(profile.contains("taken=nothing"), "{profile}");
+    assert!(profile.contains("stage=warm_restore_remote"), "{profile}");
+}
+
 #[cfg(unix)]
 #[test]
 fn warm_state_is_shared_through_the_remote_by_branch() {
