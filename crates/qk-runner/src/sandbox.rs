@@ -34,7 +34,7 @@
 //! The cache stays on: a task restored from it did not run, so it is neither
 //! audited nor held to its plan, and is listed as restored.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -124,8 +124,15 @@ struct Plan {
     read_directories: Vec<PathBuf>,
     /// Input files one by one, the lockfile, and symlinked inputs' targets.
     read_files: Vec<PathBuf>,
-    /// Its dependencies' outputs.
+    /// Its dependencies' outputs, and directories its ignored reads name
+    /// whole.
     read_trees: BTreeSet<PathBuf>,
+    /// The files and directories its ignored reads name, which held no link
+    /// as the run started: Landlock, which follows links, allows each only
+    /// while that still holds, so a link an earlier task put in its place
+    /// leads nowhere new.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    unlinked: BTreeSet<PathBuf>,
     /// Its outputs, warm paths and scratch directories.
     write_trees: BTreeSet<PathBuf>,
     /// Its scratch directories, which are directories whatever their names:
@@ -286,7 +293,7 @@ impl Sandbox {
         let mut ignored_manifests = BTreeMap::new();
         // The files each list of ignored reads matches, walked once however
         // many tasks share it.
-        let mut walked: BTreeMap<Vec<String>, Vec<PathBuf>> = BTreeMap::new();
+        let mut walked: BTreeMap<Vec<String>, Ignored> = BTreeMap::new();
         let mut unsandboxed = BTreeMap::new();
         let mut refused = BTreeMap::new();
         // What keeps a task from its sandbox: audit runs it unsandboxed and
@@ -313,16 +320,16 @@ impl Sandbox {
                 }
             }
             // Reads that change nothing it does, recorded or not.
-            let mut ignored_files = Vec::new();
+            let mut ignored_paths = Ignored::default();
             if let Ok(written) = qk_cache::ultracache::ignored_reads(task) {
                 let globs: Vec<_> = written
                     .iter()
                     .filter_map(|glob| qk_cache::Pattern::new(glob, false).ok())
                     .collect();
                 if !globs.is_empty() {
-                    ignored_files = walked
+                    ignored_paths = walked
                         .entry(written.clone())
-                        .or_insert_with(|| matching_files(&root, &written, &globs))
+                        .or_insert_with(|| matching_paths(&root, &written, &globs))
                         .clone();
                     ignored.insert(id.clone(), globs);
                 }
@@ -331,10 +338,16 @@ impl Sandbox {
                 Ok(resolved) => {
                     let files = resolved.file_inputs().map(str::to_owned).collect();
                     let mut plan = plan(workspace, graph, task, &root, &tree, &files);
-                    // The files its ignored reads name, which it may read
-                    // under enforce too: Landlock and Seatbelt hold paths,
-                    // so a file made during the run is not among them.
-                    plan.read_files.extend(std::mem::take(&mut ignored_files));
+                    // What its ignored reads name, which it may read under
+                    // enforce too. Landlock and Seatbelt hold paths, so of a
+                    // file a glob matches, only one there as the run starts;
+                    // in a directory allowed whole, any file, made before
+                    // the run or during it.
+                    let ignored_paths = std::mem::take(&mut ignored_paths);
+                    plan.unlinked.extend(ignored_paths.files.iter().cloned());
+                    plan.unlinked.extend(ignored_paths.trees.iter().cloned());
+                    plan.read_files.extend(ignored_paths.files);
+                    plan.read_trees.extend(ignored_paths.trees);
                     if let Some(installs) = &installs {
                         // `None` when the whole lockfile is keyed.
                         let mut keyed = installs.covered(resolved);
@@ -692,6 +705,7 @@ impl Sandbox {
             read_directories: &plan.read_directories,
             read_files: plan.read_files.iter().chain(&self.dotenv),
             read_trees: &plan.read_trees,
+            unlinked: &plan.unlinked,
             write_trees: plan
                 .write_trees
                 .iter()
@@ -1256,6 +1270,7 @@ fn plan(
         read_trees,
         write_trees,
         scratch,
+        unlinked: BTreeSet::new(),
         packages: None,
     }
 }
@@ -1405,12 +1420,38 @@ fn profile(plan: &Plan, id: &str, root: &Path, state: &Path, mode: Mode) -> Resu
     Ok(rules.join("\n") + "\n")
 }
 
-/// The files below `root` that `globs` match as the run starts, whether Git
+/// What a task's ignored reads name on disk as the run starts.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Ignored {
+    /// Files a glob matches.
+    files: Vec<PathBuf>,
+    /// Directories a glob ending in `/**` names whole: everything below one
+    /// is matched, so it is named once rather than file by file, which keeps
+    /// a profile within what Seatbelt compiles however much they hold.
+    trees: Vec<PathBuf>,
+}
+
+/// The paths below `root` that `globs` match as the run starts, whether Git
 /// ignores them or not: each of the globs as `written` is walked from the
 /// directory its leading literal parts name. `.git`, `.qk` and
 /// `node_modules` are not walked, and links are left out.
-fn matching_files(root: &Path, written: &[String], globs: &[qk_cache::Pattern]) -> Vec<PathBuf> {
-    let mut found = BTreeSet::new();
+fn matching_paths(root: &Path, written: &[String], globs: &[qk_cache::Pattern]) -> Ignored {
+    // The globs ending in `/**`, which match a directory whole when they
+    // match a name below it: matched whole, the directory is a directory
+    // segment, which an omitted group widens as it would not as the last.
+    // One that excludes, from a negated group, can leave out a path deeper
+    // down, so it is matched file by file.
+    let whole: Vec<qk_cache::Pattern> = written
+        .iter()
+        .filter(|glob| !glob.starts_with('!') && glob.ends_with("/**"))
+        .filter_map(|glob| qk_cache::Pattern::new(glob, false).ok())
+        .filter(|glob| !glob.excludes())
+        .collect();
+    // The directories the walk skips, or cannot list, below each directory
+    // scanned for them, each scanned once however deep the walk goes.
+    let mut scanned: Vec<(PathBuf, HashSet<PathBuf>)> = Vec::new();
+    let mut files = BTreeSet::new();
+    let mut trees = BTreeSet::new();
     let mut walked = BTreeSet::new();
     for glob in written {
         let base: PathBuf = glob
@@ -1445,17 +1486,24 @@ fn matching_files(root: &Path, written: &[String], globs: &[qk_cache::Pattern]) 
             if metadata.file_type().is_symlink() {
                 continue;
             }
+            let relative = path.strip_prefix(root).unwrap_or(&path);
             if !metadata.is_dir() {
-                let relative = path.strip_prefix(root).unwrap_or(&path);
                 if globs.iter().any(|glob| glob.is_match(relative)) {
-                    found.insert(path);
+                    files.insert(path);
                 }
                 continue;
             }
-            let skipped = path
-                .file_name()
-                .is_some_and(|name| matches!(name.to_str(), Some(".git" | ".qk" | "node_modules")));
-            if skipped || !walked.insert(path.clone()) {
+            if skipped(&path) || !walked.insert(path.clone()) {
+                continue;
+            }
+            // Named whole, it would allow what the walk leaves out below it.
+            if !relative.as_os_str().is_empty()
+                && whole
+                    .iter()
+                    .any(|glob| glob.is_match(relative.join("qk-tree-probe")))
+                && !holds_skipped(&mut scanned, &path)
+            {
+                trees.insert(path);
                 continue;
             }
             if let Ok(entries) = std::fs::read_dir(&path) {
@@ -1463,7 +1511,73 @@ fn matching_files(root: &Path, written: &[String], globs: &[qk_cache::Pattern]) 
             }
         }
     }
-    found.into_iter().collect()
+    Ignored {
+        files: files
+            .into_iter()
+            .filter(|file| {
+                !file
+                    .ancestors()
+                    .skip(1)
+                    .any(|ancestor| trees.contains(ancestor))
+            })
+            .collect(),
+        trees: trees.into_iter().collect(),
+    }
+}
+
+/// A directory the walk for ignored reads never enters.
+fn skipped(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| matches!(name.to_str(), Some(".git" | ".qk" | "node_modules")))
+}
+
+/// Whether `directory` holds, at any depth, one the walk never enters. A
+/// directory that cannot be listed whole counts as holding one. A scan
+/// keeps, in `scanned`, every directory below where it started that holds
+/// one, so a directory below one scanned is answered without listing it
+/// again.
+fn holds_skipped(scanned: &mut Vec<(PathBuf, HashSet<PathBuf>)>, directory: &Path) -> bool {
+    if let Some((_, holding)) = scanned.iter().find(|(top, _)| directory.starts_with(top)) {
+        return holding.contains(directory);
+    }
+    let mut holding = HashSet::new();
+    // `found` holds one, and so does each directory between it and the top.
+    let mut hold = |found: &Path| {
+        for ancestor in found.ancestors() {
+            if !ancestor.starts_with(directory) || !holding.insert(ancestor.to_owned()) {
+                break;
+            }
+        }
+    };
+    let mut pending = vec![directory.to_owned()];
+    while let Some(current) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            hold(&current);
+            continue;
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                hold(&current);
+                continue;
+            };
+            let Ok(kind) = entry.file_type() else {
+                hold(&current);
+                continue;
+            };
+            if !kind.is_dir() {
+                continue;
+            }
+            let path = entry.path();
+            if skipped(&path) {
+                hold(&current);
+            } else {
+                pending.push(path);
+            }
+        }
+    }
+    let holds = holding.contains(directory);
+    scanned.push((directory.to_owned(), holding));
+    holds
 }
 
 /// A report from the kernel's log.
@@ -1703,8 +1817,10 @@ mod matching_tests {
             .iter()
             .map(|glob| qk_cache::Pattern::new(glob, false).unwrap())
             .collect();
-        let found = matching_files(root.path(), &written, &globs);
+        let found = matching_paths(root.path(), &written, &globs);
+        assert!(found.trees.is_empty(), "{found:?}");
         let relative: Vec<_> = found
+            .files
             .iter()
             .map(|path| path.strip_prefix(root.path()).unwrap().to_owned())
             .collect();
@@ -1716,6 +1832,127 @@ mod matching_tests {
                 Path::new("notes.txt"),
             ]
         );
+    }
+
+    /// A glob ending in `/**` names each directory it matches once, however
+    /// much it holds, rather than every file in it.
+    #[test]
+    fn names_a_directory_a_glob_matches_whole_once() {
+        let root = tempfile::tempdir().unwrap();
+        for file in [
+            "a/.cache/x/1.js",
+            "a/.cache/x/2.js",
+            "b/c/.cache/3.js",
+            "b/keep.json",
+            "b/c/other.js",
+            "d/axyz/4.js",
+            "e/5.js",
+        ] {
+            let path = root.path().join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+        // An omitted group widens the directory segment, as in Nx.
+        let written = [
+            "**/.cache/**".to_owned(),
+            "b/*.json".to_owned(),
+            "d/a?(b)/**".to_owned(),
+        ];
+        let globs: Vec<_> = written
+            .iter()
+            .map(|glob| qk_cache::Pattern::new(glob, false).unwrap())
+            .collect();
+        let found = matching_paths(root.path(), &written, &globs);
+        let relative = |paths: &[PathBuf]| -> Vec<PathBuf> {
+            paths
+                .iter()
+                .map(|path| path.strip_prefix(root.path()).unwrap().to_owned())
+                .collect()
+        };
+        assert_eq!(
+            relative(&found.trees),
+            [
+                PathBuf::from("a/.cache"),
+                PathBuf::from("b/c/.cache"),
+                PathBuf::from("d/axyz")
+            ]
+        );
+        assert_eq!(relative(&found.files), [PathBuf::from("b/keep.json")]);
+    }
+
+    /// A directory holding one the walk never enters, as a nested `.git`, is
+    /// not named whole; the directories beside it still are.
+    #[test]
+    fn names_no_directory_whole_that_holds_a_skipped_one() {
+        let root = tempfile::tempdir().unwrap();
+        for file in [
+            "app/src/main.js",
+            "app/.git/HEAD",
+            "app/node_modules/dep/index.js",
+            "app/keep.json",
+            "app/lib/deep/node_modules/dep/index.js",
+            "app/lib/deep/other/x.js",
+            "app/lib/state/.qk/x",
+            "app/lib/plain/y.js",
+        ] {
+            let path = root.path().join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+        let written = ["app/**".to_owned()];
+        let globs = [qk_cache::Pattern::new(&written[0], false).unwrap()];
+        let found = matching_paths(root.path(), &written, &globs);
+        assert_eq!(
+            found.trees,
+            [
+                root.path().join("app/lib/deep/other"),
+                root.path().join("app/lib/plain"),
+                root.path().join("app/src"),
+            ]
+        );
+        assert_eq!(found.files, [root.path().join("app/keep.json")]);
+    }
+
+    /// A directory that cannot be listed may hold one the walk never
+    /// enters, so its parent is not named whole.
+    #[cfg(unix)]
+    #[test]
+    fn names_no_directory_whole_that_holds_one_it_cannot_list() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        for file in ["app/locked/x.js", "app/open/y.js"] {
+            let path = root.path().join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+        let locked = root.path().join("app/locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Where permissions do not hold, as for root, there is nothing to test.
+        let held = std::fs::read_dir(&locked).is_err();
+        let written = ["app/**".to_owned()];
+        let globs = [qk_cache::Pattern::new(&written[0], false).unwrap()];
+        let found = matching_paths(root.path(), &written, &globs);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if held {
+            assert_eq!(found.trees, [root.path().join("app/open")]);
+        }
+    }
+
+    /// A glob with a negated group names no directory whole: what it leaves
+    /// out can lie anywhere below one it matches.
+    #[test]
+    fn names_no_directory_whole_for_a_glob_that_excludes() {
+        let root = tempfile::tempdir().unwrap();
+        for file in ["public/shown.js", "public/private/hidden.js"] {
+            let path = root.path().join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+        let written = ["**/!(private)/**".to_owned()];
+        let globs = [qk_cache::Pattern::new(&written[0], false).unwrap()];
+        let found = matching_paths(root.path(), &written, &globs);
+        assert!(found.trees.is_empty(), "{found:?}");
+        assert_eq!(found.files, [root.path().join("public/shown.js")]);
     }
 }
 

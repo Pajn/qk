@@ -4419,6 +4419,56 @@ fn the_sandbox_refuses_what_a_task_does_not_declare_on_linux() {
     assert!(!temp.path().join("stray.txt").exists());
 }
 
+/// A directory an ignored read names whole is allowed only while no link
+/// stands in its place: one an earlier task puts there leads nowhere new.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_sandbox_follows_no_link_put_in_place_of_an_ignored_directory() {
+    let reading = |depends: Value| {
+        json!({
+            "command": "cat data/x.txt",
+            "dependsOn": depends,
+            "inputs": ["{projectRoot}/src/**/*"],
+            "qk:ultracache": {"mode": "off", "ignoreReads": ["data/**"]}
+        })
+    };
+    let temp = fixture(json!({
+        "swap": {"command": "rm -rf data && ln -s secret data", "qk:sandbox": false},
+        "plain": reading(json!([])),
+        "read": reading(json!(["swap"]))
+    }));
+    for (path, text) in [
+        ("src/in.txt", "in"),
+        ("data/x.txt", "data"),
+        ("secret/x.txt", "secret"),
+    ] {
+        let path = temp.path().join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+    let sandboxed = |target: &str| {
+        run(
+            temp.path(),
+            &["run", target, "--sandbox=enforce", "--skip-cache"],
+        )
+    };
+    let plain = success(sandboxed("app:plain"));
+    assert!(String::from_utf8_lossy(&plain.stdout).contains("data"));
+    let read = sandboxed("app:read");
+    // The link was made, so the read went through it.
+    assert!(
+        fs::symlink_metadata(temp.path().join("data"))
+            .unwrap()
+            .is_symlink()
+    );
+    assert!(
+        !read.status.success(),
+        "{}",
+        String::from_utf8_lossy(&read.stdout)
+    );
+    assert!(!String::from_utf8_lossy(&read.stdout).contains("secret"));
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn sandbox_allows_linked_input_trees_without_granting_unrelated_access() {
