@@ -22,6 +22,13 @@ qk run-many -t build,test --parallel 4
 qk affected -t build,test --base main
 ```
 
+## Documentation
+
+The npm package carries the documentation of its own version in `docs/`,
+with its contents in `docs/SUMMARY.md`: in a workspace, under
+`node_modules/@runqk/cli/docs/`. The site at <https://pajn.github.io/qk/>
+follows the main branch, so it can describe what a release does not have yet.
+
 ## Cargo installation
 
 ```sh

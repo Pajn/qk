@@ -191,6 +191,7 @@ jobs:
       - run: cargo build --release --locked -p qk-cli --target ${{ matrix.target }}
       - run: cargo install cargo-npm --version 0.1.4 --locked
       - run: cargo npm generate -p qk-cli --target ${{ matrix.target }}
+      - run: node tools/npm/docs.mjs --packages npm
       - name: Test installed npm packages and binary archive
         shell: bash
         run: |
