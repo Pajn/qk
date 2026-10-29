@@ -180,8 +180,9 @@ pub struct Sandbox {
     state: PathBuf,
     plans: BTreeMap<String, Plan>,
     profiles: BTreeMap<String, PathBuf>,
-    /// Audit: the installed packages, and the installations each task's key
-    /// covers, for telling which package a reported read belongs to.
+    /// The installed packages, and in audit the installations each task's key
+    /// covers, or its ignored reads reach, for telling which package a
+    /// reported read belongs to.
     installs: Option<Installs>,
     covered: BTreeMap<String, BTreeSet<String>>,
     /// The tasks whose key names their `externalDependencies`, even none, in
@@ -190,6 +191,9 @@ pub struct Sandbox {
     /// Each task's `qk:ultracache.ignoreReads`: reads that change nothing it
     /// does, which are no finding either.
     ignored: BTreeMap<String, Vec<qk_cache::Pattern>>,
+    /// The manifests of the workspace projects its ignored reads link to,
+    /// beyond its key, which are no finding either.
+    ignored_manifests: BTreeMap<String, BTreeSet<String>>,
     /// The projects each task's project depends on, directly or not, by name
     /// with their roots, innermost first.
     depended: BTreeMap<String, Vec<(String, String)>>,
@@ -273,14 +277,13 @@ impl Sandbox {
         std::fs::create_dir_all(&directory)?;
         let resolution = qk_cache::resolve_each(workspace, graph)?;
         let tree = Tree::new(&resolution.candidates).protecting(protected(workspace));
-        let installs = (mode == Mode::Audit)
-            .then(|| Installs::load(&root))
-            .flatten();
+        let installs = Installs::load(&root);
         let depended = depended(workspace, graph)?;
         let mut plans = BTreeMap::new();
         let mut covered = BTreeMap::new();
         let mut naming_external = BTreeSet::new();
         let mut ignored = BTreeMap::new();
+        let mut ignored_manifests = BTreeMap::new();
         // The files each list of ignored reads matches, walked once however
         // many tasks share it.
         let mut walked: BTreeMap<Vec<String>, Vec<PathBuf>> = BTreeMap::new();
@@ -332,14 +335,47 @@ impl Sandbox {
                     // under enforce too: Landlock and Seatbelt hold paths,
                     // so a file made during the run is not among them.
                     plan.read_files.extend(std::mem::take(&mut ignored_files));
-                    if let Some(installs) = &installs
-                        && let Some(keyed) = installs.covered(resolved)
-                    {
-                        let (keyed_directories, unkeyed) = installs.directories(&keyed);
-                        plan.packages = Some(Packages::shorter(keyed_directories, unkeyed));
-                        covered.insert(id.clone(), keyed);
-                        if resolved.declared.external_declared {
-                            naming_external.insert(id.clone());
+                    if let Some(installs) = &installs {
+                        // `None` when the whole lockfile is keyed.
+                        let mut keyed = installs.covered(resolved);
+                        // What it reaches through the nested workspaces its
+                        // ignored reads cover is permitted as they are.
+                        if let Some(globs) = ignored.get(id) {
+                            // Keyed whole, the lockfile names no importers of
+                            // its own; its project's is.
+                            let importers =
+                                resolved.inferred.lockfile.clone().unwrap_or_else(|| {
+                                    [workspace.projects[&task.project].root.clone()].into()
+                                });
+                            let (snapshots, manifests) =
+                                installs.ignored(&importers, keyed.as_ref(), |manifest| {
+                                    globs
+                                        .iter()
+                                        .any(|glob: &qk_cache::Pattern| glob.is_match(manifest))
+                                });
+                            if let Some(keyed) = &mut keyed {
+                                keyed.extend(snapshots);
+                            }
+                            plan.read_files.extend(
+                                manifests
+                                    .iter()
+                                    .map(|manifest| root.join(manifest))
+                                    .filter(|path| path.is_file()),
+                            );
+                            if !manifests.is_empty() {
+                                ignored_manifests.insert(id.clone(), manifests);
+                            }
+                        }
+                        // Enforce leaves `node_modules` open.
+                        if let Some(keyed) = keyed
+                            && mode == Mode::Audit
+                        {
+                            let (keyed_directories, unkeyed) = installs.directories(&keyed);
+                            plan.packages = Some(Packages::shorter(keyed_directories, unkeyed));
+                            covered.insert(id.clone(), keyed);
+                            if resolved.declared.external_declared {
+                                naming_external.insert(id.clone());
+                            }
                         }
                     }
                     plans.insert(id.clone(), plan);
@@ -359,6 +395,7 @@ impl Sandbox {
             covered,
             naming_external,
             ignored,
+            ignored_manifests,
             depended,
             unsandboxed: Mutex::new(unsandboxed),
             refused: Mutex::new(refused),
@@ -698,10 +735,14 @@ impl Sandbox {
             };
             let relative = relative.to_string_lossy().replace('\\', "/");
             if !report.operation.starts_with("file-write")
-                && self
+                && (self
                     .ignored
                     .get(&report.task)
                     .is_some_and(|globs| globs.iter().any(|glob| glob.is_match(&relative)))
+                    || self
+                        .ignored_manifests
+                        .get(&report.task)
+                        .is_some_and(|manifests| manifests.contains(&relative)))
             {
                 continue;
             }

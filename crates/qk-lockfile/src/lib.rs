@@ -209,6 +209,27 @@ impl Lockfile {
         self.importers.contains_key(importer)
     }
 
+    /// Every importer, by its directory from the workspace root, `.` for the
+    /// root itself.
+    pub fn importers(&self) -> impl Iterator<Item = &str> {
+        self.importers.keys().map(String::as_str)
+    }
+
+    /// The importers `importer` links as workspace dependencies, by their
+    /// directory from the workspace root. A link to a directory that is no
+    /// importer, as one out of the workspace or not in it, is left out.
+    pub fn linked(&self, importer: &str) -> Vec<String> {
+        self.importers
+            .get(importer)
+            .into_iter()
+            .flatten()
+            .filter_map(|(_, reference)| reference.strip_prefix("link:"))
+            .filter(|target| !target.starts_with('/'))
+            .filter_map(|target| join(importer, target))
+            .filter(|directory| self.importers.contains_key(directory))
+            .collect()
+    }
+
     /// Fingerprints of everything `importer` installs: each direct dependency
     /// by the name it is installed under, and each snapshot reached from them.
     /// Workspace links are left out; they are projects, not packages. `None`
@@ -402,6 +423,26 @@ impl Lockfile {
             .unwrap_or(&Value::Null);
         json!({"key": key, "resolution": resolution, "dependencies": dependencies}).to_string()
     }
+}
+
+/// `target`, relative to the importer directory `from`, as a directory from
+/// the workspace root, or `None` when it leaves the workspace.
+fn join(from: &str, target: &str) -> Option<String> {
+    let mut parts: Vec<&str> = from.split('/').filter(|part| *part != ".").collect();
+    for part in target.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            part => parts.push(part),
+        }
+    }
+    Some(if parts.is_empty() {
+        ".".to_owned()
+    } else {
+        parts.join("/")
+    })
 }
 
 /// The snapshot a dependency reference points at, or `None` for a workspace link.
