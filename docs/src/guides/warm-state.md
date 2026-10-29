@@ -57,6 +57,36 @@ warm restore does not prevent the target from running.
 The timestamp and path policies below distinguish reusable tool state from
 verified result outputs.
 
+## Replacing a bad save
+
+A save holding state a tool cannot recover from is restored by every run
+that misses, saved again once the run succeeds, and shared through the remote
+store with every machine on the branch, or on every branch that falls back
+to the default branch's. Removing the warm paths by hand, or `qk reset`,
+clears only this machine's copy, and the next run restores the save again.
+
+`--cold`, or `QK_COLD=true`, runs each task from scratch: it restores no
+result, empties the task's warm paths rather than restore them, and saves
+what the task gives as usual. Its save replaces the bad one, here and in the
+remote store, for the branch it ran on, so a bad save on the default branch
+is replaced by a cold run on that branch:
+
+```sh
+qk run app:build --cold
+```
+
+A group tasks share is emptied once a run, so a task sharing it with one
+that ran before it takes what that one left. A group qk cannot empty, as when
+a file in it cannot be removed, is not saved, so the run cannot keep what it
+was to replace; qk says so.
+
+A task's result is saved too, replacing the local entry under its key, and,
+for a task with [Ultracache](ultracache.md) recordings, the entries under the
+keys its recordings give, which a later run looks up first; the remote store
+keeps an entry it already holds. `--cold` cannot be combined
+with `--skip-cache`, which saves nothing; `QK_COLD` gives way to a run that
+skips the cache, as an input analysis does.
+
 ## Result hits and warm state
 
 A result-cache hit means qk has already verified the task's inputs and can
@@ -489,6 +519,7 @@ them are left out.
 
 Groups over their `maxSize` are not saved. Warm state counts toward the
 cache's size limit and is evicted with it. `--skip-cache` neither restores
-nor saves it, and leaves the variables unset. Two tasks in one run cannot
+nor saves it, and leaves the variables unset, so it cannot replace a bad save
+either: see [Replacing a bad save](#replacing-a-bad-save). Two tasks in one run cannot
 keep the same path. A tool must validate its own cache, as Metro, `tsc` and
 Next do: qk only guarantees that warm state never changes a key or a hit.

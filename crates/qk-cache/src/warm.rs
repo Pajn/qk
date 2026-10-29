@@ -1268,6 +1268,42 @@ impl Cache {
         record::publish(&self.root, &path, record)
     }
 
+    /// Empties each of `warm`'s groups on disk, and forgets what was last
+    /// restored into them, so the task starts from nothing and its next save
+    /// is all its own. A group is emptied once a run: another task sharing it
+    /// may be filling it already. A directory keeps what the group leaves out.
+    pub(crate) fn clear_warm(&self, workspace: &Workspace, task: &Task, warm: &Warm) -> Result<()> {
+        let _lock = self.lock_warm(warm)?;
+        let identity = self.warm_prefix(&warm.identity);
+        if self.cleared.lock().unwrap().contains(&identity) {
+            return Ok(());
+        }
+        for location in locations(workspace, task, warm)? {
+            for path in location.paths()?.iter().rev() {
+                let absolute = location.base.join(path);
+                let removed = match fs::symlink_metadata(&absolute) {
+                    Ok(metadata) if metadata.is_dir() => match fs::remove_dir(&absolute) {
+                        Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                            Ok(())
+                        }
+                        removed => removed,
+                    },
+                    Ok(_) => fs::remove_file(&absolute),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err(error),
+                };
+                removed.with_context(|| format!("removing {}", absolute.display()))?;
+            }
+        }
+        let notes = restored_files_path(workspace, warm);
+        match fs::remove_file(&notes) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+            _ => {}
+        }
+        self.cleared.lock().unwrap().insert(identity);
+        Ok(())
+    }
+
     /// Restores each warm group not already on disk from the save
     /// [`Cache::choose_warm`] picks, or the remote's, and notes what it
     /// restored so the next save can tell which files are unchanged. Files are

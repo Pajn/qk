@@ -214,6 +214,9 @@ pub struct Settings<'a> {
     /// Cores the tasks share.
     pub cores: usize,
     pub skip_cache: bool,
+    /// Run each task from scratch, restoring neither results nor warm state,
+    /// and save what it gives in their place.
+    pub cold: bool,
     /// Nx's `--nx-bail`: no task starts after one has failed.
     pub bail: bool,
     pub style: OutputStyle,
@@ -248,6 +251,7 @@ pub fn run(
         parallel,
         cores,
         skip_cache,
+        cold,
         bail: bails,
         style,
         stream_long_running,
@@ -257,6 +261,9 @@ pub fn run(
         expected,
         cases,
     } = *settings;
+    if cold && skip_cache {
+        bail!("--cold saves what it runs, which --skip-cache does not; use one of them");
+    }
     if analyze_inputs && sandbox_mode.is_some() {
         bail!("input analysis and sandbox enforcement/audit cannot be combined");
     }
@@ -546,6 +553,8 @@ pub fn run(
         None
     } else if skip_cache || !(warm || cacheable) {
         Some(qk_cache::Cache::for_observation(workspace))
+    } else if cold {
+        Some(qk_cache::Cache::for_workspace(workspace, &environment).cold())
     } else {
         Some(qk_cache::Cache::for_workspace(workspace, &environment))
     };

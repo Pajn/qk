@@ -93,6 +93,13 @@ pub struct Cache {
     remote: Option<std::sync::Arc<remote::Remote>>,
     /// Whether results and warm state may be restored or published.
     reuse: bool,
+    /// Whether each task runs from scratch: no result is restored, its warm
+    /// paths are emptied rather than restored, and what it gives is saved as
+    /// ever, replacing what was saved before.
+    cold: bool,
+    /// The warm groups `cold` emptied this run, which tasks sharing one fill
+    /// together.
+    cleared: std::sync::Mutex<std::collections::BTreeSet<String>>,
     /// The tasks whose outputs this run left exactly as they were.
     kept: std::sync::Mutex<std::collections::BTreeSet<String>>,
     /// Warm state being saved in the background.
@@ -264,6 +271,8 @@ impl Cache {
             snapshot: OnceLock::new(),
             remote: None,
             reuse: true,
+            cold: false,
+            cleared: Default::default(),
             kept: Default::default(),
             saves: Default::default(),
             cleanup: Default::default(),
@@ -304,6 +313,12 @@ impl Cache {
             remote,
             ..Self::new(root)
         }
+    }
+
+    /// This cache with every task run from scratch, as `--cold` asks: see
+    /// [`Cache::cold`]'s field.
+    pub fn cold(self) -> Self {
+        Self { cold: true, ..self }
     }
 
     /// Saves what later runs reuse and waits for background saves, uploads
@@ -393,9 +408,24 @@ impl Cache {
             }
         }
         // What each entry restored, and which groups were on disk already.
+        // Cold: the groups left as they were, whose save would keep what
+        // the run was to replace.
+        let uncleared = std::sync::Mutex::new(std::collections::BTreeSet::new());
         let before = |running: &PreparedTask| -> (Vec<warm::Restored>, Vec<String>) {
             let (mut restored, mut present) = (Vec::new(), Vec::new());
             for warm in &entries {
+                if self.cold {
+                    // Started from nothing, so its save replaces a bad one.
+                    if let Err(error) = self.clear_warm(workspace, task, warm) {
+                        qk_executor::status!(
+                            "qk: {}: warm state{} not cleared, so not saved ({error:#})",
+                            task.id,
+                            entry_label(warm)
+                        );
+                        uncleared.lock().unwrap().insert(warm.identity.clone());
+                    }
+                    continue;
+                }
                 match self
                     .initialize()
                     .and_then(|()| self.restore_warm(workspace, task, warm, running))
@@ -424,7 +454,11 @@ impl Cache {
             }
             let mut save_ms = None;
             let mut background = false;
-            for warm in entries.iter().filter(|_| outcome == Outcome::Success) {
+            let uncleared = uncleared.lock().unwrap();
+            for warm in entries
+                .iter()
+                .filter(|warm| outcome == Outcome::Success && !uncleared.contains(&warm.identity))
+            {
                 let started = std::time::Instant::now();
                 let saved = if warm.background {
                     self.save_warm_in_background(workspace, task, warm, running)
@@ -622,8 +656,19 @@ impl Cache {
             }
         });
         let mut shadowing = None;
+        // Cold: the keys this task's path sets give, whose entries a later
+        // run looks up first, so its result replaces theirs too.
+        let mut replaced = Vec::new();
         if let Some((sets, weak, settings)) = &mut recordings {
-            if settings.mode == ultracache::Mode::Record {
+            if self.cold {
+                // Nothing is restored, so there is nothing to look up.
+                replaced = sets
+                    .iter()
+                    .filter_map(|set| {
+                        recording_key(weak, set, snapshot, workspace, &unlisted, task)
+                    })
+                    .collect();
+            } else if settings.mode == ultracache::Mode::Record {
                 let _lookup = profile::span(&task.id, "recorded_lookup");
                 shadowing =
                     Some(self.start_shadow(workspace, task, snapshot, &unlisted, sets, weak));
@@ -714,7 +759,7 @@ impl Cache {
                 remote.prefetched(&key)
             });
         let local_profile = profile::span(&task.id, "local_restore");
-        let restored = if declared {
+        let restored = if declared && !self.cold {
             self.restore(
                 &workspace.root,
                 &task.id,
@@ -776,7 +821,7 @@ impl Cache {
             }
         }
         drop(local_profile);
-        if let Some(remote) = self.remote.as_ref().filter(|_| declared) {
+        if let Some(remote) = self.remote.as_ref().filter(|_| declared && !self.cold) {
             let fetch_profile = profile::span(&task.id, "remote_fetch");
             let fetched = remote.fetch(&self.root, &key, &task.id, cancelled);
             drop(fetch_profile);
@@ -908,6 +953,16 @@ impl Cache {
                     store::record_outputs(&workspace.root, &task.id, &key, &outputs);
                     if let Some(remote) = &self.remote {
                         remote.upload(&self.root, &key);
+                    }
+                    for strong in &replaced {
+                        if let Err(error) =
+                            self.publish(&workspace.root, strong, &outputs, log.path())
+                        {
+                            qk_executor::status!(
+                                "qk: {}: could not replace a recorded cache entry ({error})",
+                                task.id
+                            );
+                        }
                     }
                 }
                 Err(error) => {

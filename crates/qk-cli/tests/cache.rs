@@ -3736,6 +3736,143 @@ fn warm_entries_keep_their_own_portability() {
     assert_eq!(said(&fixture, &linked, &[]), "tool warm, scratch cold");
 }
 
+/// `--cold` runs a task its cached result would have stood in for, and keeps
+/// what it gives; the run after it is a hit again. It cannot be combined with
+/// `--skip-cache`, which keeps nothing.
+#[test]
+fn a_cold_run_runs_what_the_cache_holds_and_keeps_its_result() {
+    let fixture = Fixture::new(target("build", json!({})));
+    success(fixture.build(&fixture.root, &[]));
+    success(fixture.build(&fixture.root, &[]));
+    assert_eq!(fixture.runs(), 1);
+    success(fixture.build(&fixture.root, &["--cold"]));
+    assert_eq!(fixture.runs(), 2);
+    success(fixture.build(&fixture.root, &[]));
+    assert_eq!(fixture.runs(), 2);
+    let mut cold = fixture.command(&fixture.root, &["run", "app:build"]);
+    cold.env("QK_COLD", "true");
+    success(cold.output().unwrap());
+    assert_eq!(fixture.runs(), 3);
+    let both = fixture.build(&fixture.root, &["--cold", "--skip-cache"]);
+    assert!(!both.status.success());
+    assert!(
+        stderr(&both).contains("--cold saves what it runs"),
+        "{}",
+        stderr(&both)
+    );
+}
+
+/// A bad warm save that every run restores, and saves again, is replaced by a
+/// cold run: it empties the warm paths rather than restore them, and its save
+/// is what the next machine restores.
+#[cfg(unix)]
+#[test]
+fn a_cold_run_replaces_a_bad_warm_save() {
+    let server = s3::FakeS3::start();
+    let fixture = Fixture::new(json!({
+        "command": "if [ -f \"$TOOL_CACHE/seen\" ]; then cat \"$TOOL_CACHE/seen\"; else echo cold; fi; mkdir -p \"$TOOL_CACHE\" && echo \"${MARK:-$(cat \"$TOOL_CACHE/seen\")}\" > \"$TOOL_CACHE/seen\"",
+        "qk:warm": {"portable": true, "env": {"TOOL_CACHE": "{warm}/tool"}}
+    }));
+    with_remote(&fixture, &server, json!({}));
+    let said = |args: &[&str], mark: &str| {
+        let mut command = remote_build_command(&fixture, &[("GITHUB_REF_NAME", "main")]);
+        command.args(args);
+        if !mark.is_empty() {
+            command.env("MARK", mark);
+        }
+        let output = success(command.output().unwrap());
+        stdout(&output)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let fresh = || {
+        clear_local_cache(&fixture);
+        let _ = fs::remove_dir_all(fixture.root.join(".git/qk/warm"));
+    };
+    assert_eq!(said(&[], "bad"), "cold");
+    // Restored and saved again, the bad state reaches every machine.
+    fresh();
+    assert_eq!(said(&[], ""), "bad");
+    fresh();
+    assert_eq!(said(&[], ""), "bad");
+    // A cold run starts from nothing, though this checkout holds the state.
+    assert_eq!(said(&["--cold"], "good"), "cold");
+    fresh();
+    assert_eq!(said(&[], ""), "good");
+}
+
+/// A cold run empties a warm group once: a task sharing it with one that ran
+/// before it in the run takes what that one left.
+#[cfg(unix)]
+#[test]
+fn a_cold_run_empties_a_shared_warm_group_once() {
+    let tool = |name: &str, depends: Value| {
+        json!({
+            "command": format!("echo {name}:$(cat \"$TOOL_CACHE/seen\" 2>/dev/null || echo cold); mkdir -p \"$TOOL_CACHE\" && echo {name} > \"$TOOL_CACHE/seen\""),
+            "dependsOn": depends,
+            "qk:warm": {"portable": true, "group": "tool", "env": {"TOOL_CACHE": "{warm}/tool"}}
+        })
+    };
+    let fixture = Fixture::with_targets(json!({
+        "build": tool("build", json!([])),
+        "test": tool("test", json!(["build"]))
+    }));
+    success(fixture.qk(&fixture.root, &["run", "app:test"]));
+    let output = success(fixture.qk(&fixture.root, &["run", "app:test", "--cold"]));
+    let said = stdout(&output);
+    assert!(said.contains("build:cold"), "{said}");
+    assert!(said.contains("test:build"), "{said}");
+}
+
+/// Warm state a cold run cannot empty is not saved, so the run cannot keep
+/// what it was to replace.
+#[cfg(unix)]
+#[test]
+fn a_cold_run_saves_no_warm_state_it_could_not_empty() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new(json!({
+        "command": "if [ -f \"$TOOL_CACHE/seen\" ]; then cat \"$TOOL_CACHE/seen\"; else echo cold; fi; mkdir -p \"$TOOL_CACHE\" && echo \"${MARK:-$(cat \"$TOOL_CACHE/seen\")}\" > \"$TOOL_CACHE/seen\"",
+        "qk:warm": {"portable": true, "env": {"TOOL_CACHE": "{warm}/tool"}}
+    }));
+    let said = |args: &[&str], mark: &str| {
+        let mut command = fixture.command(&fixture.root, &["run", "app:build"]);
+        command.args(args).env("MARK", mark);
+        let output = command.output().unwrap();
+        (
+            stdout(&output)
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_owned(),
+            stderr(&output),
+        )
+    };
+    assert_eq!(said(&[], "bad").0, "cold");
+    let tool = walkdir::WalkDir::new(fixture.root.join(".git/qk/warm"))
+        .into_iter()
+        .flatten()
+        .find(|entry| entry.file_name() == "seen")
+        .unwrap()
+        .path()
+        .parent()
+        .unwrap()
+        .to_owned();
+    fs::write(tool.join("probe"), "").unwrap();
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o555)).unwrap();
+    // Where permissions do not hold, as for root, there is nothing to test.
+    let held = fs::remove_file(tool.join("probe")).is_err();
+    let (_, cold) = said(&["--cold"], "good");
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+    if !held {
+        return;
+    }
+    assert!(cold.contains("not cleared, so not saved"), "{cold}");
+    fs::remove_dir_all(fixture.root.join(".git/qk/warm")).unwrap();
+    assert_eq!(said(&[], "").0, "bad");
+}
+
 #[cfg(unix)]
 #[test]
 fn warm_state_is_shared_through_the_remote_by_branch() {

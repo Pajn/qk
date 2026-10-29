@@ -743,3 +743,31 @@ fn a_run_where_no_recorder_works_goes_on_unrecorded() {
         "{stderr}"
     );
 }
+
+/// A cold run replaces the result its recordings key too: a later run looks
+/// them up first, and would restore what the cold run was to replace.
+#[test]
+fn a_cold_run_replaces_the_result_its_recordings_key() {
+    if !has_strace() {
+        return;
+    }
+    let temp = fixture();
+    let root = temp.path();
+    // Keyed by its recordings alone, as in the first test.
+    let nx = fs::read_to_string(root.join("nx.json")).unwrap();
+    write(
+        root,
+        "nx.json",
+        &nx.replace(
+            r#"["{projectRoot}/**/*""#,
+            r#"["{projectRoot}/**/*", "!{projectRoot}/icons/unused.svg""#,
+        ),
+    );
+    assert_eq!(build_keyed(root, true), ("miss".into(), "saved".into()));
+    // An ignored read, so the recordings key it as before.
+    write(root, "app/src/notes.txt", "replaced notes\n");
+    qk(root, &["run", "app:build", "--cold"], &[]);
+    assert_eq!(build_keyed(root, false), ("local-hit".into(), "hit".into()));
+    let out = fs::read_to_string(root.join("app/dist/out.txt")).unwrap();
+    assert!(out.contains("replaced notes"), "{out}");
+}
