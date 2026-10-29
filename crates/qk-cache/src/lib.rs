@@ -1,5 +1,6 @@
 //! Local content-addressed cache shared by linked Git worktrees.
 
+mod ahead;
 mod evict;
 pub mod expectations;
 mod glob;
@@ -100,6 +101,8 @@ pub struct Cache {
     /// The warm groups `cold` emptied this run, which tasks sharing one fill
     /// together.
     cleared: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    /// Remote warm saves fetched ahead, by warm identity.
+    prefetches: OnceLock<warm::Prefetches>,
     /// The tasks whose outputs this run left exactly as they were.
     kept: std::sync::Mutex<std::collections::BTreeSet<String>>,
     /// Warm state being saved in the background.
@@ -273,6 +276,7 @@ impl Cache {
             reuse: true,
             cold: false,
             cleared: Default::default(),
+            prefetches: OnceLock::new(),
             kept: Default::default(),
             saves: Default::default(),
             cleanup: Default::default(),
@@ -330,6 +334,7 @@ impl Cache {
         if let Some(Ok(snapshot)) = self.snapshot.get() {
             snapshot.save_digests(&workspace.root);
         }
+        self.finish_prefetches();
         // Before the uploads, which a save may add to.
         for save in std::mem::take(&mut *self.saves.lock().unwrap()) {
             let _ = save.join();

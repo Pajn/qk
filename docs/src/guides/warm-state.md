@@ -287,6 +287,40 @@ Transporting state successfully is not evidence of an incremental hit or
 of cross-platform portability. A production store, credentials and tool
 configuration still need their own verification.
 
+### Fetching remote state ahead
+
+A task restores its warm state once its result has missed, so fetching a
+remote save adds a round trip to the store, and the time to receive what the
+local store lacks, before the task starts. `prefetch: true` starts that
+fetch as the run starts instead, while the task's dependencies run, and the
+restore takes what it fetched:
+
+```json
+"qk:warm": {
+  "portable": true,
+  "prefetch": true,
+  "env": {"TOOL_CACHE": "{warm}"}
+}
+```
+
+Nothing is fetched ahead when the warm paths are already on disk, when a
+save already in the local store would be restored first, or in a
+[cold](#replacing-a-bad-save) run, which restores nothing. Whether the task's
+result misses is not known until its dependencies are done, so a task whose
+result comes from the cache never uses the save fetched for it: set
+`prefetch` on a target that usually runs, as one whose inputs change in most
+pull requests.
+
+Two saves are fetched at a time, those of the tasks with the fewest
+dependencies to wait for first, and a group shared by several tasks is
+fetched once. A task that starts while its save is still waiting its turn
+fetches it itself; one that starts while it is being fetched waits for that
+fetch. A save fetched for a key the task no longer has when it runs, as when
+a dependency rewrites a file the key names, is not used, and the task fetches
+its own without waiting. Once the run's tasks are done, saves still waiting
+their turn are not fetched, and those being fetched are waited for, unless
+the run was cancelled.
+
 ### Portable transform and task caches
 
 For Metro, configure its transform cache explicitly:

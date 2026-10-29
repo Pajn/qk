@@ -558,6 +558,14 @@ pub fn run(
     } else {
         Some(qk_cache::Cache::for_workspace(workspace, &environment))
     };
+    // Warm state its tasks fetch while their dependencies run.
+    if let Some(cache) = &cache {
+        // Only those whose restore runs as they start: not a continuous
+        // task, nor one narrowed to some of its cases, which run uncached.
+        cache.prefetch_warm(workspace, graph, &prepared, |id| {
+            graph.tasks[id].definition.continuous != Some(true) && !case_files.contains_key(id)
+        });
+    }
     let mut skipped = BTreeSet::new();
     let mut exit_code = 0;
     let mut started = BTreeMap::new();
@@ -1219,6 +1227,10 @@ pub fn run(
         result
     })?;
     if let Some(cache) = &cache {
+        // What was fetched ahead for a cancelled run is of no use to it.
+        if cancelled.load(Ordering::SeqCst) {
+            cache.abandon_prefetches();
+        }
         cache.finish(workspace);
     }
     if cancelled.load(Ordering::SeqCst) {

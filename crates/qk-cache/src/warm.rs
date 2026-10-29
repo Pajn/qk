@@ -24,10 +24,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::ahead::Taken;
 use anyhow::{Context, Result, bail};
 use qk_config::Workspace;
 use qk_taskgraph::{Task, TaskGraph};
@@ -65,6 +66,7 @@ pub const FIELDS: &[&str] = &[
     "survive",
     "save",
     "restore",
+    "prefetch",
 ];
 
 /// How many saves are kept for a task, across worktrees and keys.
@@ -126,7 +128,17 @@ pub struct Warm {
     /// Whether each of `paths` is restored when it alone is missing, rather
     /// than all of them only when none is on disk.
     pub each_path: bool,
+    /// Whether its remote save is fetched as the run starts, while the
+    /// task's dependencies run, rather than once the task has missed.
+    pub prefetch: bool,
 }
+
+/// Remote saves fetched ahead, by the warm identity they were fetched for:
+/// for each, the task it was fetched as, its entry and its key.
+pub(crate) type Prefetches = crate::ahead::Ahead<(String, Warm, Vec<String>), (WarmRecord, String)>;
+
+/// Remote saves fetched ahead at once.
+const PREFETCHERS: usize = 2;
 
 /// One part of a warm key.
 #[derive(Clone, Debug)]
@@ -369,6 +381,7 @@ fn entry(
         survive,
         background,
         each_path,
+        prefetch: flag("prefetch", false)?,
     })
 }
 
@@ -1109,6 +1122,96 @@ fn behind(workspace: &Workspace, commit: &str) -> Option<u64> {
     String::from_utf8(output.stdout).ok()?.trim().parse().ok()
 }
 
+/// How many levels of dependencies `id` waits on before it can start.
+fn depth(graph: &TaskGraph, id: &str, known: &mut BTreeMap<String, usize>) -> usize {
+    if let Some(depth) = known.get(id) {
+        return *depth;
+    }
+    let depth = graph.tasks.get(id).map_or(0, |task| {
+        task.dependencies
+            .iter()
+            .map(|dependency| depth(graph, dependency, known) + 1)
+            .max()
+            .unwrap_or(0)
+    });
+    known.insert(id.to_owned(), depth);
+    depth
+}
+
+/// The prefix of a task's or group's saves on this platform.
+fn warm_prefix(identity: &str) -> String {
+    hash32(&format!(
+        "{identity}\0{}\0{}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    ))
+}
+
+fn warm_record(root: &Path, record: &WarmRecord) -> PathBuf {
+    root.join("warm").join(format!(
+        "{}-{}.json",
+        warm_prefix(&record.task),
+        hash32(&format!("{}\0{}", record.worktree, record.key.join("\0")))
+    ))
+}
+
+fn store_warm(root: &Path, record: &WarmRecord) -> Result<()> {
+    let path = warm_record(root, record);
+    let directory = path.parent().context("warm records have a directory")?;
+    fs::create_dir_all(directory)?;
+    record::publish(root, &path, record)
+}
+
+/// The task's warm state from the remote store: the first of `branches`
+/// whose save suits this checkout, kept locally from then on.
+fn remote_warm(
+    remote: &crate::remote::Remote,
+    root: &Path,
+    task: &str,
+    warm: &Warm,
+    own: &str,
+    branches: &[String],
+    current: &[String],
+) -> Option<(WarmRecord, String)> {
+    if !warm.remote || warm.portable == Portable::Own {
+        return None;
+    }
+    // Saved in a worktree at another path, it is no save for this one.
+    let placed = |saved: Option<&str>| warm.portable != Portable::Path || saved == Some(own);
+    for branch in branches {
+        let suits = |saved: &[String], worktree: Option<&str>| {
+            key_match(warm, current, saved).is_some() && placed(worktree)
+        };
+        let name = remote_identity(warm, own);
+        match remote.fetch_warm(root, &name, task, branch, suits) {
+            Ok(Some((bytes, _pin))) => {
+                let Some(record) = WarmRecord::read(&bytes, &warm.identity).ok() else {
+                    continue;
+                };
+                // A branch's save that does not suit this checkout gives
+                // way to the next branch's.
+                if key_match(warm, current, &record.key).is_none()
+                    || !placed(Some(&record.worktree))
+                {
+                    continue;
+                }
+                if store_warm(root, &record).is_err() {
+                    return None;
+                }
+                return Some((record, branch.clone()));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                qk_executor::status!("qk: {task}: remote warm state unavailable ({error:#})");
+                // An invalid record or unavailable blob on this branch
+                // does not rule out a usable default-branch save.
+                continue;
+            }
+        }
+    }
+    None
+}
+
 /// A compact stable filename component for task and group identities.
 fn hash32(text: &str) -> String {
     blake3::hash(text.as_bytes()).to_hex()[..32].to_owned()
@@ -1146,11 +1249,7 @@ fn read_restored_files(workspace: &Workspace, warm: &Warm) -> RestoredFiles {
 impl Cache {
     /// The file-name prefix every save of a task or group shares.
     fn warm_prefix(&self, identity: &str) -> String {
-        hash32(&format!(
-            "{identity}\0{}\0{}",
-            std::env::consts::OS,
-            std::env::consts::ARCH
-        ))
+        warm_prefix(identity)
     }
 
     /// Serializes restoring and saving a task's or group's state, which the
@@ -1169,11 +1268,7 @@ impl Cache {
     }
 
     fn warm_record(&self, record: &WarmRecord) -> PathBuf {
-        self.root.join("warm").join(format!(
-            "{}-{}.json",
-            self.warm_prefix(&record.task),
-            hash32(&format!("{}\0{}", record.worktree, record.key.join("\0")))
-        ))
+        warm_record(&self.root, record)
     }
 
     /// Every save of the task or group, newest first.
@@ -1262,10 +1357,7 @@ impl Cache {
     }
 
     fn store_warm(&self, record: &WarmRecord) -> Result<()> {
-        let path = self.warm_record(record);
-        let directory = path.parent().context("warm records have a directory")?;
-        fs::create_dir_all(directory)?;
-        record::publish(&self.root, &path, record)
+        store_warm(&self.root, record)
     }
 
     /// Empties each of `warm`'s groups on disk, and forgets what was last
@@ -1347,12 +1439,34 @@ impl Cache {
         let keying = profile::span(&task.id, "warm_restore_key");
         let current = key_digests(workspace, warm, prepared)?;
         drop(keying);
-        // Another branch's save, here, only when the remote has none.
+        let ahead = self.prefetches.get().map_or(Taken::Nothing, |prefetches| {
+            let mut waiting = profile::span(&task.id, "warm_restore_prefetched");
+            let taken = prefetches.take(&warm.identity, &current);
+            waiting.note(
+                "taken",
+                match taken {
+                    Taken::Found(_) => "found",
+                    Taken::Missing => "missing",
+                    Taken::Nothing => "nothing",
+                },
+            );
+            taken
+        });
         let local = profile::span(&task.id, "warm_restore_local");
-        let chosen = self.choose_warm(workspace, warm, &current, true);
+        let here = self.choose_warm(workspace, warm, &current, true);
         drop(local);
-        let chosen = chosen
-            .or_else(|| {
+        let chosen = match (ahead, here) {
+            // A save fetched ahead is kept here too, where it would pass for
+            // this checkout's own; a save made here since, as by another task
+            // of its group, is newer.
+            (Taken::Found((record, _)), Some((mine, source))) if mine.saved > record.saved => {
+                Some((mine, source))
+            }
+            (Taken::Found((record, branch)), _) => Some((record, format!("remote {branch}"))),
+            (_, Some(here)) => Some(here),
+            // Fetched ahead and found nothing: the remote has none to give.
+            (Taken::Missing, None) => None,
+            (Taken::Nothing, None) => {
                 let mut fetching = profile::span(&task.id, "warm_restore_remote");
                 let fetched = self
                     .remote_warm(workspace, task, warm, &current)
@@ -1364,8 +1478,10 @@ impl Cache {
                         .map_or("none", |(_, source)| source.as_str()),
                 );
                 fetched
-            })
-            .or_else(|| self.choose_warm(workspace, warm, &current, false));
+            }
+        }
+        // Another branch's save, here, only when the remote has none.
+        .or_else(|| self.choose_warm(workspace, warm, &current, false));
         let Some((record, source)) = chosen else {
             return Ok((restored, present));
         };
@@ -1552,49 +1668,123 @@ impl Cache {
         warm: &Warm,
         current: &[String],
     ) -> Option<(WarmRecord, String)> {
-        let remote = self
-            .remote
-            .as_ref()
-            .filter(|_| warm.remote && warm.portable != Portable::Own)?;
+        let remote = self.remote.as_ref()?;
         let own = worktree(workspace);
-        // Saved in a worktree at another path, it is no save for this one.
-        let placed =
-            |saved: Option<&str>| warm.portable != Portable::Path || saved == Some(own.as_str());
-        for branch in branches(workspace) {
-            let suits = |saved: &[String], worktree: Option<&str>| {
-                key_match(warm, current, saved).is_some() && placed(worktree)
+        remote_warm(
+            remote,
+            &self.root,
+            &task.id,
+            warm,
+            &own,
+            &branches(workspace),
+            current,
+        )
+    }
+
+    /// Starts fetching, for each task's warm entry that asks for it, the
+    /// remote save its restore would fetch, so it is here by the time the
+    /// task runs. An entry whose paths are on disk, or that a save here would
+    /// restore, fetches nothing, and a group shared by several tasks is
+    /// fetched once. A few are fetched at once, those of the tasks with the
+    /// fewest dependencies to wait for first. Only the tasks `restores`
+    /// accepts, which restore warm state as they start, are fetched for; a
+    /// task whose result is cached never uses what was fetched for it.
+    pub fn prefetch_warm(
+        &self,
+        workspace: &Workspace,
+        graph: &TaskGraph,
+        prepared: &BTreeMap<String, qk_executor::PreparedTask>,
+        restores: impl Fn(&str) -> bool,
+    ) {
+        // A cold run restores nothing.
+        let Some(remote) = self.remote.as_ref().filter(|_| self.reuse && !self.cold) else {
+            return;
+        };
+        if self.initialize().is_err() {
+            return;
+        }
+        let own = worktree(workspace);
+        let mut items = Vec::new();
+        for (id, task) in &graph.tasks {
+            let Some(prepared) = prepared.get(id).filter(|_| restores(id)) else {
+                continue;
             };
-            let name = remote_identity(warm, &own);
-            match remote.fetch_warm(&self.root, &name, &task.id, &branch, suits) {
-                Ok(Some((bytes, _pin))) => {
-                    let Some(record) = WarmRecord::read(&bytes, &warm.identity).ok() else {
-                        continue;
-                    };
-                    // A branch's save that does not suit this checkout gives
-                    // way to the next branch's.
-                    if key_match(warm, current, &record.key).is_none()
-                        || !placed(Some(&record.worktree))
-                    {
-                        continue;
-                    }
-                    if self.store_warm(&record).is_err() {
-                        return None;
-                    }
-                    return Some((record, branch));
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    qk_executor::status!(
-                        "qk: {}: remote warm state unavailable ({error:#})",
-                        task.id
-                    );
-                    // An invalid record or unavailable blob on this branch
-                    // does not rule out a usable default-branch save.
-                    continue;
+            let Ok(entries) = config(workspace, task) else {
+                continue;
+            };
+            if !entries.iter().any(|warm| warm.prefetch) {
+                continue;
+            }
+            // As the task's restore sees it, with the warm variables set.
+            // The variables a task is given as it starts, as `qk:threads`
+            // sets, are not among them, so a key naming one never matches.
+            let mut running = prepared.clone();
+            for warm in &entries {
+                for (name, value) in &warm.env {
+                    running.execution.insert(name.into(), value.into());
                 }
             }
+            for warm in entries {
+                if !warm.prefetch || !warm.remote || warm.portable == Portable::Own {
+                    continue;
+                }
+                let missing = locations(workspace, task, &warm).is_ok_and(|locations| {
+                    locations.iter().any(|location| {
+                        location.paths().map_or(true, |paths| paths.is_empty())
+                            || location.present().is_ok_and(|kept| kept.is_some())
+                    })
+                });
+                let Ok(current) = key_digests(workspace, &warm, &running) else {
+                    continue;
+                };
+                if !missing || self.choose_warm(workspace, &warm, &current, true).is_some() {
+                    continue;
+                }
+                let depth = depth(graph, id, &mut BTreeMap::new());
+                items.push((depth, warm.identity.clone(), (id.clone(), warm, current)));
+            }
         }
-        None
+        if items.is_empty() {
+            return;
+        }
+        items.sort_by(|a, b| (a.0, &(a.2).0).cmp(&(b.0, &(b.2).0)));
+        let items = items
+            .into_iter()
+            .map(|(_, identity, job)| {
+                let key = job.2.clone();
+                (identity, key, job)
+            })
+            .collect();
+        let (remote, root) = (remote.clone(), self.root.clone());
+        let branches = branches(workspace);
+        let prefetches = Prefetches::start(items, PREFETCHERS, move |(id, warm, current)| {
+            let mut fetching = profile::span(&id, "warm_prefetch");
+            let fetched = remote_warm(&remote, &root, &id, &warm, &own, &branches, &current);
+            fetching.note(
+                "branch",
+                fetched
+                    .as_ref()
+                    .map_or("none", |(_, branch)| branch.as_str()),
+            );
+            fetched
+        });
+        let _ = self.prefetches.set(prefetches);
+    }
+
+    /// Stops fetching ahead without waiting for the fetches under way, as a
+    /// cancelled run does, which no task will take.
+    pub fn abandon_prefetches(&self) {
+        if let Some(prefetches) = self.prefetches.get() {
+            prefetches.stop(false);
+        }
+    }
+
+    /// Drops the saves still queued to be fetched ahead, and waits for those
+    /// being fetched, so none writes to the cache after the run.
+    pub(crate) fn finish_prefetches(&self) {
+        if let Some(prefetches) = self.prefetches.get() {
+            prefetches.stop(true);
+        }
     }
 
     /// Saves the task's warm groups after a successful run, as this worktree's
