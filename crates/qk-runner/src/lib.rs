@@ -1170,6 +1170,9 @@ pub fn run(
                             match outcome {
                                 Outcome::Success => {}
                                 Outcome::Failed(_) => {
+                                    if let Some(hint) = prepared.get(&id).and_then(left_out) {
+                                        report::warning(&format!("qk: {id}: {hint}"));
+                                    }
                                     // As in Nx, a failure fails the run with 1,
                                     // whatever the task's own code.
                                     if exit_code == 0 {
@@ -1441,6 +1444,25 @@ fn beside(
         .into_iter()
         .take(parallel.saturating_sub(1))
         .fold(own, u64::saturating_add)
+}
+
+/// What a failed task's declared environment left out of what it inherited,
+/// which the task may have needed: a process reads its environment from its
+/// own memory, so nothing records which variables it looked for. Names only,
+/// as values can be secrets.
+fn left_out(task: &qk_executor::PreparedTask) -> Option<String> {
+    let environment = task.environment.as_ref()?;
+    let names = environment.left_out(&task.env);
+    if names.is_empty() {
+        return None;
+    }
+    // Every name, though there may be many: the one it needed could be any.
+    Some(format!(
+        "its declared environment left out {} inherited variable{}: {}. If it needs one, inherit or pass it in its qk:env.",
+        names.len(),
+        if names.len() == 1 { "" } else { "s" },
+        names.join(", "),
+    ))
 }
 
 #[cfg(test)]

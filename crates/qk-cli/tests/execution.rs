@@ -1859,6 +1859,7 @@ fn a_declared_environment_lets_through_only_what_it_names() {
             "show": {"command": show, "cache": true, "options": {"env": {"FROM_TARGET": "target"}}},
             "open": {"command": "echo ${SECRET-unset}", "qk:env": false},
             "empty": {"command": "/bin/sh -c 'echo ${PATH-unset} ${KEYED_A-unset}'", "qk:env": []},
+            "needs": {"command": "test -n \"$SECRET\"", "qk:env": []},
         }})
         .to_string(),
     )
@@ -1905,6 +1906,25 @@ fn a_declared_environment_lets_through_only_what_it_names() {
     let (stdout, _) = run("app:empty", &[("PATH", "/inherited/bin:/usr/bin:/bin")]);
     assert!(stdout.ends_with(" unset\n"), "{stdout}");
     assert!(!stdout.contains("/inherited/bin"), "{stdout}");
+    // A task that fails names what its environment left out, by name only,
+    // leaving out what its dotenv files set again.
+    let output = command(root, &["run", "app:needs"])
+        .env("SECRET", "secret-value")
+        .env("FROM_DOTENV", "process")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("its declared environment left out") && stderr.contains("SECRET"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("secret-value"), "{stderr}");
+    let hint = stderr
+        .lines()
+        .find(|line| line.contains("left out"))
+        .unwrap();
+    assert!(!hint.contains("FROM_DOTENV"), "{hint}");
 }
 
 #[cfg(unix)]

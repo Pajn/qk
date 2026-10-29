@@ -58,7 +58,10 @@ keys are as before.
 
 A process reads its environment from its own memory, so the sandbox's audit
 cannot see which variables a task reads: a variable a task needs and its
-environment leaves out shows as the task failing.
+environment leaves out shows as the task failing. When a task with a declared
+environment fails, qk names the inherited variables its environment left out
+that its dotenv files and settings do not set again, by name only, as values
+can be secrets.
 
 ## Dotenv files
 

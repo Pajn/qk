@@ -41,6 +41,9 @@ pub struct Environment {
     /// Where each of `bins` resolved to, for the key: the binary itself,
     /// whatever links led to it.
     binaries: BTreeMap<String, String>,
+    /// The inherited variables it left out, by name, to name when the task
+    /// fails.
+    left_out: Vec<String>,
 }
 
 impl Environment {
@@ -197,6 +200,7 @@ impl Environment {
     pub fn filter(&mut self, env: &mut BTreeMap<OsString, OsString>) -> Result<()> {
         let mut kept = BTreeMap::new();
         self.inherited.clear();
+        self.left_out.clear();
         for (name, value) in std::mem::take(env) {
             let text = name.to_string_lossy().into_owned();
             let inherited = matches_any(&self.inherit, &text);
@@ -206,10 +210,12 @@ impl Environment {
             }
             if inherited && !self.set.contains_key(&text) {
                 self.inherited
-                    .insert(text, value.to_str().map(str::to_owned));
+                    .insert(text.clone(), value.to_str().map(str::to_owned));
             }
             if inherited || passed {
                 kept.insert(name, value);
+            } else {
+                self.left_out.push(text);
             }
         }
         for (name, value) in &self.set {
@@ -236,6 +242,17 @@ impl Environment {
             keyed["binaries"] = json!(self.binaries);
         }
         keyed
+    }
+
+    /// The inherited variables it left out that `env`, the task's
+    /// environment once built, does not hold: those its dotenv files and
+    /// settings do not set again.
+    pub fn left_out(&self, env: &BTreeMap<OsString, OsString>) -> Vec<&str> {
+        self.left_out
+            .iter()
+            .filter(|name| !env.contains_key(std::ffi::OsStr::new(name.as_str())))
+            .map(String::as_str)
+            .collect()
     }
 
     /// Whether the environment builds `PATH` from `bin` and `dirs` entries.
