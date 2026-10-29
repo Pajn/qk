@@ -197,13 +197,13 @@ pub struct Sandbox {
     naming_external: BTreeSet<String>,
     /// Each task's `qk:ultracache.ignoreReads`: reads that change nothing it
     /// does, which are no finding either.
-    ignored: BTreeMap<String, Vec<qk_cache::Pattern>>,
+    ignored: BTreeMap<String, qk_cache::ultracache::IgnoredReads>,
     /// The manifests of the workspace projects its ignored reads link to,
     /// beyond its key, which are no finding either.
     ignored_manifests: BTreeMap<String, BTreeSet<String>>,
     /// The projects each task's project depends on, directly or not, by name
     /// with their roots, innermost first.
-    depended: BTreeMap<String, Vec<(String, String)>>,
+    depended: BTreeMap<String, Vec<(Option<String>, String)>>,
     /// Tasks that run unsandboxed, and why.
     unsandboxed: Mutex<BTreeMap<String, String>>,
     /// Enforce: tasks that cannot be sandboxed, and why. They fail when they
@@ -285,7 +285,8 @@ impl Sandbox {
         let resolution = qk_cache::resolve_each(workspace, graph)?;
         let tree = Tree::new(&resolution.candidates).protecting(protected(workspace));
         let installs = Installs::load(&root);
-        let depended = depended(workspace, graph)?;
+        let projects = qk_graph::ProjectGraph::build(workspace)?;
+        let depended = depended(workspace, graph, &projects);
         let mut plans = BTreeMap::new();
         let mut covered = BTreeMap::new();
         let mut naming_external = BTreeSet::new();
@@ -293,7 +294,7 @@ impl Sandbox {
         let mut ignored_manifests = BTreeMap::new();
         // The files each list of ignored reads matches, walked once however
         // many tasks share it.
-        let mut walked: BTreeMap<Vec<String>, Ignored> = BTreeMap::new();
+        let mut walked: BTreeMap<(Vec<String>, String), Ignored> = BTreeMap::new();
         let mut unsandboxed = BTreeMap::new();
         let mut refused = BTreeMap::new();
         // What keeps a task from its sandbox: audit runs it unsandboxed and
@@ -321,18 +322,27 @@ impl Sandbox {
             }
             // Reads that change nothing it does, recorded or not.
             let mut ignored_paths = Ignored::default();
-            if let Ok(written) = qk_cache::ultracache::ignored_reads(task) {
-                let globs: Vec<_> = written
-                    .iter()
-                    .filter_map(|glob| qk_cache::Pattern::new(glob, false).ok())
-                    .collect();
-                if !globs.is_empty() {
-                    ignored_paths = walked
-                        .entry(written.clone())
-                        .or_insert_with(|| matching_paths(&root, &written, &globs))
-                        .clone();
-                    ignored.insert(id.clone(), globs);
-                }
+            if let Ok(written) = qk_cache::ultracache::ignored_reads(task)
+                && let Ok(reads) = qk_cache::ultracache::IgnoredReads::new(
+                    &written,
+                    workspace,
+                    Some(&projects),
+                    &task.project,
+                )
+                && !reads.is_empty()
+            {
+                // What `^` entries match depends on the task's project; what
+                // the others match does not.
+                let project = if written.iter().any(|glob| glob.starts_with('^')) {
+                    task.project.clone()
+                } else {
+                    String::new()
+                };
+                ignored_paths = walked
+                    .entry((written, project))
+                    .or_insert_with(|| matching_paths(&root, &reads))
+                    .clone();
+                ignored.insert(id.clone(), reads);
             }
             match &resolution.tasks[id] {
                 Ok(resolved) => {
@@ -353,7 +363,7 @@ impl Sandbox {
                         let mut keyed = installs.covered(resolved);
                         // What it reaches through the nested workspaces its
                         // ignored reads cover is permitted as they are.
-                        if let Some(globs) = ignored.get(id) {
+                        if let Some(reads) = ignored.get(id) {
                             // Keyed whole, the lockfile names no importers of
                             // its own; its project's is.
                             let importers =
@@ -362,9 +372,7 @@ impl Sandbox {
                                 });
                             let (snapshots, manifests) =
                                 installs.ignored(&importers, keyed.as_ref(), |manifest| {
-                                    globs
-                                        .iter()
-                                        .any(|glob: &qk_cache::Pattern| glob.is_match(manifest))
+                                    reads.is_match(manifest)
                                 });
                             if let Some(keyed) = &mut keyed {
                                 keyed.extend(snapshots);
@@ -752,7 +760,7 @@ impl Sandbox {
                 && (self
                     .ignored
                     .get(&report.task)
-                    .is_some_and(|globs| globs.iter().any(|glob| glob.is_match(&relative)))
+                    .is_some_and(|reads| reads.is_match(&relative))
                     || self
                         .ignored_manifests
                         .get(&report.task)
@@ -792,7 +800,7 @@ impl Sandbox {
                 .into_iter()
                 .flatten()
                 .find(|(_, root)| relative.starts_with(&format!("{root}/")))
-                .map(|(project, _)| project.clone());
+                .and_then(|(project, _)| project.clone());
             let naming_external = self.naming_external.contains(&report.task);
             let entry = findings.entry(report.task).or_default();
             if let Some(package) = package {
@@ -987,16 +995,18 @@ fn seatbelt(
     })
 }
 
-/// For each task, the projects its project depends on, directly or not, with
-/// their roots, the deepest root first so a nested project is found before
-/// the one around it. The workspace's root project is left out: every path
-/// is beneath it.
+/// For each task, every project's root, the deepest first so a path is
+/// found in the innermost project that holds it, named where the task's
+/// project depends on it, directly or not. A path in a project nested in a
+/// dependency that is not one itself, the task's own among them, is no
+/// dependency's. The workspace's root project is left out: every path is
+/// beneath it.
 fn depended(
     workspace: &Workspace,
     graph: &TaskGraph,
-) -> Result<BTreeMap<String, Vec<(String, String)>>> {
-    let projects = qk_graph::ProjectGraph::build(workspace)?;
-    let mut by_project: BTreeMap<&str, Vec<(String, String)>> = BTreeMap::new();
+    projects: &qk_graph::ProjectGraph,
+) -> BTreeMap<String, Vec<(Option<String>, String)>> {
+    let mut by_project: BTreeMap<&str, Vec<(Option<String>, String)>> = BTreeMap::new();
     let mut found = BTreeMap::new();
     for (id, task) in &graph.tasks {
         let roots = by_project.entry(task.project.as_str()).or_insert_with(|| {
@@ -1010,20 +1020,20 @@ fn depended(
                     }
                 }
             }
-            let mut roots: Vec<(String, String)> = seen
-                .into_iter()
-                .filter_map(|name| {
+            let mut roots: Vec<(Option<String>, String)> = workspace
+                .projects
+                .iter()
+                .filter_map(|(name, config)| {
                     // A root is kept as written, so `./libs/lib/` is
                     // `libs/lib`, as reads are named.
-                    let root = workspace
-                        .projects
-                        .get(name)?
+                    let root = config
                         .root
                         .split('/')
                         .filter(|part| !part.is_empty() && *part != ".")
                         .collect::<Vec<_>>()
                         .join("/");
-                    (!root.is_empty()).then(|| (name.to_owned(), root))
+                    let depended = seen.contains(name.as_str()).then(|| name.clone());
+                    (!root.is_empty()).then_some((depended, root))
                 })
                 .collect();
             roots.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
@@ -1031,7 +1041,7 @@ fn depended(
         });
         found.insert(id.clone(), roots.clone());
     }
-    Ok(found)
+    found
 }
 
 /// Whether `task` failed because a command in it applied a sandbox of its
@@ -1431,22 +1441,39 @@ struct Ignored {
     trees: Vec<PathBuf>,
 }
 
-/// The paths below `root` that `globs` match as the run starts, whether Git
-/// ignores them or not: each of the globs as `written` is walked from the
-/// directory its leading literal parts name. `.git`, `.qk` and
-/// `node_modules` are not walked, and links are left out.
-fn matching_paths(root: &Path, written: &[String], globs: &[qk_cache::Pattern]) -> Ignored {
+/// The paths below `root` that `reads` matches as the run starts, whether
+/// Git ignores them or not: each glob is walked from the directory its
+/// leading literal parts name, a `^` entry from each root of a project it can
+/// match in. `.git`, `.qk` and `node_modules` are not walked, and links are
+/// left out.
+fn matching_paths(root: &Path, reads: &qk_cache::ultracache::IgnoredReads) -> Ignored {
+    let (plain, dependency) = reads.walks();
     // The globs ending in `/**`, which match a directory whole when they
     // match a name below it: matched whole, the directory is a directory
     // segment, which an omitted group widens as it would not as the last.
     // One that excludes, from a negated group, can leave out a path deeper
     // down, so it is matched file by file.
-    let whole: Vec<qk_cache::Pattern> = written
-        .iter()
-        .filter(|glob| !glob.starts_with('!') && glob.ends_with("/**"))
-        .filter_map(|glob| qk_cache::Pattern::new(glob, false).ok())
-        .filter(|glob| !glob.excludes())
-        .collect();
+    let whole = |written: &[String]| -> Vec<qk_cache::Pattern> {
+        written
+            .iter()
+            .filter(|glob| !glob.starts_with('!') && glob.ends_with("/**"))
+            .filter_map(|glob| qk_cache::Pattern::new(glob, false).ok())
+            .filter(|glob| !glob.excludes())
+            .collect()
+    };
+    let (whole, whole_within) = (whole(&plain), whole(&dependency));
+    // A `^` entry matches all a directory holds only where no other project
+    // has its root inside.
+    let covers = |relative: &Path| -> bool {
+        let probe = relative.join("qk-tree-probe");
+        whole.iter().any(|glob| glob.is_match(&probe))
+            || (whole_within.iter().any(|glob| glob.is_match(&probe))
+                && reads.is_match(&probe)
+                && relative
+                    .to_str()
+                    .is_some_and(|text| !reads.project_within(&text.replace('\\', "/"))))
+    };
+    let written: Vec<&String> = plain.iter().chain(&dependency).collect();
     // The directories the walk skips, or cannot list, below each directory
     // scanned for them, each scanned once however deep the walk goes.
     let mut scanned: Vec<(PathBuf, HashSet<PathBuf>)> = Vec::new();
@@ -1488,7 +1515,7 @@ fn matching_paths(root: &Path, written: &[String], globs: &[qk_cache::Pattern]) 
             }
             let relative = path.strip_prefix(root).unwrap_or(&path);
             if !metadata.is_dir() {
-                if globs.iter().any(|glob| glob.is_match(relative)) {
+                if reads.is_match(relative) {
                     files.insert(path);
                 }
                 continue;
@@ -1498,9 +1525,7 @@ fn matching_paths(root: &Path, written: &[String], globs: &[qk_cache::Pattern]) 
             }
             // Named whole, it would allow what the walk leaves out below it.
             if !relative.as_os_str().is_empty()
-                && whole
-                    .iter()
-                    .any(|glob| glob.is_match(relative.join("qk-tree-probe")))
+                && covers(relative)
                 && !holds_skipped(&mut scanned, &path)
             {
                 trees.insert(path);
@@ -1813,11 +1838,8 @@ mod matching_tests {
             "alias/data.json".to_owned(),
             "../*".to_owned(),
         ];
-        let globs: Vec<_> = written
-            .iter()
-            .map(|glob| qk_cache::Pattern::new(glob, false).unwrap())
-            .collect();
-        let found = matching_paths(root.path(), &written, &globs);
+        let reads = qk_cache::ultracache::IgnoredReads::of_globs(&written).unwrap();
+        let found = matching_paths(root.path(), &reads);
         assert!(found.trees.is_empty(), "{found:?}");
         let relative: Vec<_> = found
             .files
@@ -1858,11 +1880,8 @@ mod matching_tests {
             "b/*.json".to_owned(),
             "d/a?(b)/**".to_owned(),
         ];
-        let globs: Vec<_> = written
-            .iter()
-            .map(|glob| qk_cache::Pattern::new(glob, false).unwrap())
-            .collect();
-        let found = matching_paths(root.path(), &written, &globs);
+        let reads = qk_cache::ultracache::IgnoredReads::of_globs(&written).unwrap();
+        let found = matching_paths(root.path(), &reads);
         let relative = |paths: &[PathBuf]| -> Vec<PathBuf> {
             paths
                 .iter()
@@ -1900,8 +1919,8 @@ mod matching_tests {
             std::fs::write(path, "").unwrap();
         }
         let written = ["app/**".to_owned()];
-        let globs = [qk_cache::Pattern::new(&written[0], false).unwrap()];
-        let found = matching_paths(root.path(), &written, &globs);
+        let reads = qk_cache::ultracache::IgnoredReads::of_globs(&written).unwrap();
+        let found = matching_paths(root.path(), &reads);
         assert_eq!(
             found.trees,
             [
@@ -1930,8 +1949,8 @@ mod matching_tests {
         // Where permissions do not hold, as for root, there is nothing to test.
         let held = std::fs::read_dir(&locked).is_err();
         let written = ["app/**".to_owned()];
-        let globs = [qk_cache::Pattern::new(&written[0], false).unwrap()];
-        let found = matching_paths(root.path(), &written, &globs);
+        let reads = qk_cache::ultracache::IgnoredReads::of_globs(&written).unwrap();
+        let found = matching_paths(root.path(), &reads);
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
         if held {
             assert_eq!(found.trees, [root.path().join("app/open")]);
@@ -1949,8 +1968,8 @@ mod matching_tests {
             std::fs::write(path, "").unwrap();
         }
         let written = ["**/!(private)/**".to_owned()];
-        let globs = [qk_cache::Pattern::new(&written[0], false).unwrap()];
-        let found = matching_paths(root.path(), &written, &globs);
+        let reads = qk_cache::ultracache::IgnoredReads::of_globs(&written).unwrap();
+        let found = matching_paths(root.path(), &reads);
         assert!(found.trees.is_empty(), "{found:?}");
         assert_eq!(found.files, [root.path().join("public/shown.js")]);
     }

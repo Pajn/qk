@@ -209,6 +209,54 @@ fn a_task_turned_off_or_never_recorded_keeps_its_declared_key() {
 }
 
 #[test]
+fn a_dependency_glob_leaves_the_projects_depended_on_out_of_recordings() {
+    if !has_strace() {
+        return;
+    }
+    let temp = fixture();
+    let root = temp.path();
+    // `app` depends on `lib`, and reads a file in it and one in `other`,
+    // which it does not depend on.
+    for project in ["lib", "other"] {
+        fs::create_dir_all(root.join(project)).unwrap();
+        write(
+            root,
+            &format!("{project}/project.json"),
+            &format!(r#"{{ "name": "{project}" }}"#),
+        );
+        write(root, &format!("{project}/data.txt"), "data\n");
+    }
+    let project = fs::read_to_string(root.join("app/project.json")).unwrap();
+    write(
+        root,
+        "app/project.json",
+        &project
+            .replace(
+                r#""name": "app","#,
+                r#""name": "app", "implicitDependencies": ["lib"],"#,
+            )
+            .replace(
+                " > dist/listing.txt",
+                " > dist/listing.txt && cat ../lib/data.txt ../other/data.txt > dist/data.txt",
+            ),
+    );
+    let nx = fs::read_to_string(root.join("nx.json")).unwrap();
+    write(
+        root,
+        "nx.json",
+        &nx.replace(
+            r#"["app/src/notes.txt"]"#,
+            r#"["app/src/notes.txt", "^**"]"#,
+        ),
+    );
+    assert_eq!(build_keyed(root, true), ("miss".into(), "saved".into()));
+    write(root, "lib/data.txt", "changed\n");
+    assert_eq!(build_keyed(root, false), ("local-hit".into(), "hit".into()));
+    write(root, "other/data.txt", "changed\n");
+    assert_eq!(build_keyed(root, false), ("miss".into(), "missed".into()));
+}
+
+#[test]
 fn a_task_that_changes_what_it_read_is_not_recorded() {
     if !has_strace() {
         return;

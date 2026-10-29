@@ -2998,6 +2998,7 @@ pub(crate) fn weak_key(
     prepared: &PreparedTask,
     inputs: &Value,
     ignore_reads: &[String],
+    ignored_within: &[(&str, bool)],
     cancelled: &AtomicBool,
 ) -> Result<String> {
     let mut weak = inputs.clone();
@@ -3033,6 +3034,13 @@ pub(crate) fn weak_key(
     );
     object.insert("schema".into(), json!("qk-weak-v1"));
     object.insert("ignoreReads".into(), json!(ignore_reads));
+    // What its `^` entries match moves with the project graph, the projects
+    // depended on and those nested in them that are not, so a path set
+    // recorded under one never keys a task under another. Left out without
+    // them, so other weak keys stay as they were.
+    if !ignored_within.is_empty() {
+        object.insert("ignoredWithin".into(), json!(ignored_within));
+    }
     key(&weak)
 }
 
