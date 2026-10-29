@@ -44,6 +44,8 @@ pub struct Environment {
     /// The inherited variables it left out, by name, to name when the task
     /// fails.
     left_out: Vec<String>,
+    /// The commands of `bins` keyed by their content.
+    by_content: std::collections::BTreeSet<String>,
     /// The commands whose output sets variables, in order.
     providers: Vec<Provider>,
     /// What they set, once run, applied over what it inherits.
@@ -177,10 +179,23 @@ impl Environment {
                                 .and_then(|items| {
                                     items
                                         .iter()
-                                        .map(|item| item.as_str().map(str::to_owned))
-                                        .collect::<Option<Vec<_>>>()
+                                        .map(|item| match item {
+                                            Value::String(name) => Some(Ok(name.clone())),
+                                            // A command keyed by its content.
+                                            Value::Object(object) if kind == "bin" => {
+                                                Some(self.content_keyed(object))
+                                            }
+                                            _ => None,
+                                        })
+                                        .collect::<Option<Result<Vec<_>>>>()
                                 })
-                                .with_context(|| format!("{kind} must be an array of strings"))?;
+                                .with_context(|| {
+                                    if kind == "bin" {
+                                        "bin must be an array of command names, or objects with a name and key".to_owned()
+                                    } else {
+                                        "dirs must be an array of strings".to_owned()
+                                    }
+                                })??;
                             for item in items {
                                 if item.is_empty() {
                                     bail!("{kind} holds an empty string");
@@ -351,6 +366,35 @@ impl Environment {
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case("PATH"))
             .map(|(_, value)| value.as_str())
+    }
+
+    /// A `bin` item written as an object: `{"name", "key"}`, where `key` is
+    /// `"path"`, as for a name alone, or `"content"`.
+    fn content_keyed(&mut self, object: &serde_json::Map<String, Value>) -> Result<String> {
+        for field in object.keys() {
+            if !matches!(field.as_str(), "name" | "key") {
+                bail!("bin.{field} is not a field qk knows");
+            }
+        }
+        let name = object
+            .get("name")
+            .and_then(Value::as_str)
+            .context("a bin object needs a name")?
+            .to_owned();
+        match object.get("key").and_then(Value::as_str) {
+            Some("content") => {
+                self.by_content.insert(name.clone());
+            }
+            Some("path") | None => {}
+            Some(other) => bail!("bin key {other:?} is neither \"path\" nor \"content\""),
+        }
+        Ok(name)
+    }
+
+    /// Whether the command `name` names is keyed by its content rather than
+    /// by where it resolved to.
+    pub fn keyed_by_content(&self, name: &str) -> bool {
+        self.by_content.contains(name)
     }
 
     /// Notes where each of [`Environment::bins`] resolved to, for the key.
@@ -583,6 +627,14 @@ mod tests {
                 "from.input is not a field",
             ),
             (json!([{ "bin": ["./node"] }]), "is not a command name"),
+            (
+                json!([{ "bin": [{ "name": "node", "key": "hash" }] }]),
+                "neither \"path\" nor \"content\"",
+            ),
+            (
+                json!([{ "bin": [{ "key": "content" }] }]),
+                "a bin object needs a name",
+            ),
             (
                 json!([{ "bin": ["node"] }, { "pass": ["PATH"] }]),
                 "PATH is built from its bin and dirs entries",

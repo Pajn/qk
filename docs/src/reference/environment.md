@@ -71,7 +71,17 @@ replaced by theirs, so a change to an environment changes the key of every
 task running in it, the values of the variables it inherits, and the file
 each command `bin` names resolves to, whatever links lead to it. A command
 found somewhere else changes the key; the rest of the inherited `PATH`, and
-where the links are, do not. The values
+where the links are, do not. A command written as
+`{"name": "clang", "key": "content"}` is keyed by its content instead: the
+same command installed elsewhere keys alike, and one replaced in place, as
+some system toolchains update, changes the key. Its digest is kept in the
+user's cache directory until the file's size or modification time changes.
+
+A version manager's shim, as mise and asdf install, resolves to the version
+manager itself, whichever version it starts, so neither its path nor its
+content changes with that version. Name such a tool's directory with `dirs`,
+or set the version manager's own environment with a `from` entry, such as
+`mise env --json`, rather than naming its shim in `bin`. The values
 of the variables it passes are not keyed. Without a declared environment,
 keys are as before.
 

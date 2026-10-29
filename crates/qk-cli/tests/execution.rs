@@ -1961,6 +1961,11 @@ fn a_declared_environment_builds_path_from_the_commands_it_names() {
             },
             "dirs": {"command": "from-project", "qk:env": [{ "dirs": ["{projectRoot}/scripts"] }]},
             "missing": {"command": "true", "qk:env": [{ "bin": ["absent"] }]},
+            "content": {
+                "command": "hello",
+                "cache": true,
+                "qk:env": [{ "bin": [{ "name": "hello", "key": "content" }] }],
+            },
         }})
         .to_string(),
     )
@@ -2024,6 +2029,19 @@ fn a_declared_environment_builds_path_from_the_commands_it_names() {
         stderr.contains("the command absent of the task's environment is not on PATH"),
         "{stderr}"
     );
+    // Keyed by content, a copy installed elsewhere keys alike, and one
+    // changed in place does not.
+    tool(installed.path(), "copy", "hello", "hello");
+    let (_, cache) = run("app:content", &tools);
+    assert_eq!(cache, "miss");
+    let copy = format!("{}:/usr/bin:/bin", installed.path().join("copy").display());
+    let (_, cache) = run("app:content", &copy);
+    assert_eq!(cache, "local-hit");
+    tool(installed.path(), "copy", "hello", "changed");
+    let (output, cache) = run("app:content", &copy);
+    let stdout = String::from_utf8(success(output).stdout).unwrap();
+    assert!(stdout.contains("changed\n"), "{stdout}");
+    assert_eq!(cache, "miss");
 }
 
 #[cfg(unix)]

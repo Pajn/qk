@@ -34,7 +34,14 @@ pub fn path(
         let real = path
             .canonicalize()
             .with_context(|| format!("cannot resolve {}", path.display()))?;
-        binaries.insert(name.clone(), real.to_string_lossy().into_owned());
+        // By content, the same command keys alike wherever it is installed,
+        // and one changed in place, without moving, changes the key.
+        let keyed = if environment.keyed_by_content(name) {
+            format!("content:{}", content_digest(&real)?)
+        } else {
+            real.to_string_lossy().into_owned()
+        };
+        binaries.insert(name.clone(), keyed);
         found.push((name.clone(), path));
     }
     let mut entries = Vec::new();
@@ -53,6 +60,62 @@ pub fn path(
     }
     environment.resolved(binaries);
     std::env::join_paths(entries).context("cannot build the task's PATH")
+}
+
+/// The digest of the file at `path`, kept in the user's cache directory by
+/// its size, modification time and, on Unix, inode, so a large toolchain
+/// binary is read once per change rather than once per run.
+fn content_digest(path: &Path) -> Result<String> {
+    let metadata = path
+        .metadata()
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |modified| modified.as_nanos());
+    #[cfg(unix)]
+    let inode = std::os::unix::fs::MetadataExt::ino(&metadata);
+    #[cfg(not(unix))]
+    let inode = 0u64;
+    let stamp = format!("{} {modified} {inode}", metadata.len());
+    let kept = cache_directory().ok().map(|directory| {
+        let name = blake3::hash(path.as_os_str().as_encoded_bytes()).to_hex();
+        directory.join("digests").join(&name[..32])
+    });
+    if let Some(digest) = kept
+        .as_ref()
+        .and_then(|file| std::fs::read_to_string(file).ok())
+        .and_then(|text| {
+            let (kept_stamp, digest) = text.trim_end().rsplit_once(' ')?;
+            (kept_stamp == stamp).then(|| digest.to_owned())
+        })
+    {
+        return Ok(digest);
+    }
+    let mut hasher = blake3::Hasher::new();
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("cannot read {}", path.display()))?;
+    std::io::copy(&mut file, &mut hasher)
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    let digest = hasher.finalize().to_hex().to_string();
+    // Kept only if nothing changed it while it was read; failing to keep it
+    // only means reading it again.
+    if let Some(file) = kept
+        && path.metadata().is_ok_and(|now| {
+            now.len() == metadata.len() && now.modified().ok() == metadata.modified().ok()
+        })
+        && let Some(directory) = file.parent()
+        && std::fs::create_dir_all(directory).is_ok()
+    {
+        let partial = file.with_extension(format!("{}.partial", std::process::id()));
+        if std::fs::write(&partial, format!("{stamp} {digest}\n")).is_ok()
+            && std::fs::rename(&partial, &file).is_err()
+        {
+            let _ = std::fs::remove_file(&partial);
+        }
+    }
+    Ok(digest)
 }
 
 /// The file named `name` in `directory`, if it is one a shell would run.

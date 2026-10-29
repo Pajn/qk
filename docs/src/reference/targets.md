@@ -226,7 +226,7 @@ whose entries it stands for, or an object with one of these fields:
 | `inherit` | array of variable names | Passes the variables through and keys their values |
 | `pass` | array of variable names | Passes the variables through without keying their values, as for credentials and proxies |
 | `set` | object of string values | Sets the variables, keyed as written |
-| `bin` | array of command names | Puts the commands, as found on the `PATH` qk inherited, on the task's `PATH`, keyed by the files they resolve to |
+| `bin` | array of command names, or of objects with `name` and `key` | Puts the commands, as found on the `PATH` qk inherited, on the task's `PATH`, keyed by the files they resolve to, or with `"key": "content"` by their content |
 | `dirs` | array of paths, with `{projectRoot}` and `{workspaceRoot}` | Adds the directories to the task's `PATH`, after the commands, keyed as written; relative to the workspace root |
 | `from` | object with `command` and, optionally, `inputs`, an array of paths | Sets the variables the command prints as JSON, as `nix print-dev-env --json`, `direnv export json` or `mise env --json` print them; see [Declared environments](environment.md#declared-environments) |
 
