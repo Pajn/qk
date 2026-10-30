@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+blake3.workspace = true
 command-group.workspace = true
 ureq.workspace = true
 regex.workspace = true

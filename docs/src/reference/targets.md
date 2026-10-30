@@ -215,6 +215,28 @@ a qk extension; Nx ignores it. Executor `options.env` and selected
 configuration `env` can override it. See
 [Environment precedence](environment.md#environment-precedence).
 
+## `qk:env`
+
+The environment the task inherits: an array of entries, each the name of an
+environment in nx.json's [`qk:environments`](workspace.md#qkenvironments-and-qkdefaultenv),
+whose entries it stands for, or an object with one of these fields:
+
+| Field | Type | What it does |
+| --- | --- | --- |
+| `inherit` | array of variable names | Passes the variables through and keys their values |
+| `pass` | array of variable names | Passes the variables through without keying their values, as for credentials and proxies |
+| `set` | object of string values | Sets the variables, keyed as written |
+| `bin` | array of command names, or of objects with `name` and `key` | Puts the commands, as found on the `PATH` qk inherited, on the task's `PATH`, keyed by the files they resolve to, or with `"key": "content"` by their content |
+| `dirs` | array of paths, with `{projectRoot}` and `{workspaceRoot}` | Adds the directories to the task's `PATH`, after the commands, keyed as written; relative to the workspace root |
+| `from` | object with `command` and, optionally, `inputs`, an array of paths | Sets the variables the command prints as JSON, as `nix print-dev-env --json`, `direnv export json` or `mise env --json` print them; see [Declared environments](environment.md#declared-environments) |
+
+A name can contain `*`, which matches any run of characters, as `LC_*`. A
+variable both inherited and passed fails the task, as does a command `bin`
+names that is not on `PATH`. An environment with `bin` or `dirs` entries
+builds `PATH`, so it cannot also inherit, pass or set it. `false` inherits every
+variable, as without the field, which overrides nx.json's `qk:defaultEnv`.
+See [Declared environments](environment.md#declared-environments).
+
 ## `qk:threads`
 
 `true`, or an object containing:

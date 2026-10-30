@@ -1,10 +1,12 @@
 //! Prepare finite tasks, then execute shell commands in managed process groups.
 
+mod bins;
 mod capture;
 pub mod dotenv;
 mod env_flags;
 mod interpolate;
 mod process;
+mod providers;
 #[cfg(unix)]
 mod pty;
 pub mod readiness;
@@ -454,6 +456,9 @@ pub struct PreparedTask {
     /// Dotenv, explicit settings and local binary lookup without task metadata.
     pub runtime_env: BTreeMap<OsString, OsString>,
     pub node_path: Option<NodePath>,
+    /// The environment the task declares, `qk:env`, which its key holds;
+    /// `None` where it inherits every variable.
+    pub environment: Option<qk_config::env::Environment>,
     /// Variables set for the process after `env` that are not part of what
     /// the task is: nothing reads them to key it, such as a thread count.
     pub execution: BTreeMap<OsString, OsString>,
@@ -640,11 +645,14 @@ pub const ROOT_DOTENV_FILES: [&str; 3] = [".local.env", ".env.local", ".env"];
 /// A task's environment as Nx builds it: the process environment, without
 /// what the root dotenv files set in it at startup, then the task's dotenv
 /// files, loaded and expanded together, then the variables Nx sets for
-/// every task. A target's `env` applies on top.
+/// every task. A target's `env` applies on top. With a declared
+/// environment, `qk:env`, only what it lets through of the process
+/// environment is kept, and what it sets takes its place.
 fn task_environment(
     workspace: &Workspace,
     task: &Task,
     base_env: &BTreeMap<OsString, OsString>,
+    environment: Option<&mut qk_config::env::Environment>,
 ) -> Result<(BTreeMap<OsString, OsString>, BTreeMap<OsString, OsString>)> {
     let mut env = base_env.clone();
     let project = &workspace.projects[&task.project];
@@ -659,6 +667,34 @@ fn task_environment(
                 }
             }
         }
+    }
+    // What the task inherits, before its own dotenv files and settings,
+    // which its configuration declares.
+    if let Some(environment) = environment {
+        let mut provided = BTreeMap::new();
+        let mut keys = Vec::new();
+        for provider in environment.providers() {
+            let (variables, key) = providers::load(provider, base_env, &workspace.root)
+                .with_context(|| format!("cannot build the environment of {}", task.id))?;
+            provided.extend(variables);
+            keys.push(key);
+        }
+        environment.provide(provided, keys);
+        environment
+            .filter(&mut env)
+            .with_context(|| format!("cannot build the environment of {}", task.id))?;
+        if environment.builds_path() {
+            let path = bins::path(
+                environment,
+                base_env.get(&path_key(base_env)),
+                &workspace.root,
+                &project.root,
+            )
+            .with_context(|| format!("cannot build the PATH of {}", task.id))?;
+            env.insert(path_key(&env), path);
+        }
+    }
+    if loads_dotenv(base_env) {
         let (target, non_atomized) = owner_target(project, &task.target);
         let files: Vec<PathBuf> = dotenv_files(
             &project.root,
@@ -776,7 +812,10 @@ pub fn prepare(
     } else {
         interpolate::Interpolation::new(&[], &empty)?
     };
-    let (mut env, mut runtime_env) = task_environment(workspace, task, base_env)?;
+    let mut environment = qk_config::env::Environment::of(&workspace.config, definition)
+        .with_context(|| format!("invalid environment for {}", task.id))?;
+    let (mut env, mut runtime_env) =
+        task_environment(workspace, task, base_env, environment.as_mut())?;
     // As in Nx 24, `envFile` sets what the task's environment, dotenv files
     // included, leaves unset or empty, beneath `env`; and the task's
     // environment says whether it loads.
@@ -1015,6 +1054,7 @@ pub fn prepare(
         cwd,
         env,
         runtime_env,
+        environment,
         node_path: Some(node_path),
         execution,
         ready_when,

@@ -1848,6 +1848,7 @@ name = "qk-executor"
 version = "0.16.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "command-group",
  "libc",
  "qk-config",

@@ -23,6 +23,75 @@ for a `test` target, `FORCE_COLOR`, which is `true` unless already set, and
 whether or not the run uses the cache, except under `--sandbox` and input
 analysis.
 
+## Declared environments
+
+A target with [`qk:env`](targets.md#qkenv), or with nx.json's
+[`qk:defaultEnv`](workspace.md#qkenvironments-and-qkdefaultenv) when it
+names none, inherits only the variables its environment lets through. Its
+environment applies with or without `--sandbox`. What the precedence above
+calls the inherited process environment holds then only the variables the
+environment inherits or passes, and the ones it sets. The rest of the
+task's environment is built as before: its dotenv files, `envFile`, its
+`env` settings and the variables Nx sets apply on top, since its
+configuration declares them.
+
+`PATH` is either a variable like any other, which the environment passes or
+inherits, or built from its `bin` and `dirs` entries. A built `PATH` holds a
+directory linking each command `bin` names, found on the `PATH` qk inherited,
+and nothing else from that directory, then the directories `dirs` names. The
+directory of links is in the user's cache directory, under
+`~/Library/Caches/qk/bin` on macOS and `$XDG_CACHE_HOME/qk/bin` or
+`~/.cache/qk/bin` elsewhere, named by the commands it links, so tasks
+linking the same commands share one. On Windows, where making a link takes a
+privilege a user may not hold, `PATH` holds the directory of each command
+instead. Either way, qk adds the workspace's `node_modules/.bin` directories
+and Node's directory to it, as for every task.
+
+A `from` entry runs its command in the workspace root, with every variable
+qk inherited, and sets the variables it prints as JSON: either Nix's
+`{"variables": {NAME: {"type": …, "value": …}}}`, of which the exported
+variables are taken, less those `nix develop` also leaves as they are, such
+as `HOME` and `TMPDIR`, or a flat `{NAME: value}`, in which `null` leaves a
+variable unset. What it sets takes the place of an inherited variable, and
+the environment's `set` entries take the place of what it sets. Its `PATH`
+ends a `PATH` built from `bin` and `dirs` entries, or is the task's `PATH`
+without them; the environment cannot also inherit or pass `PATH` then. The
+command runs once per run for every task sharing it. With `inputs`, files
+relative to the workspace root, such as `flake.nix` and `flake.lock`, its
+output is kept in the user's cache directory, readable by its owner alone,
+until they change, and the task's key holds the command and their content
+rather than the output, which can hold paths that differ from machine to
+machine. Without them, the key
+holds a digest of each value it printed, which changes with the value without
+keeping it, as it can be a credential. A command that fails, or prints something else, fails
+the task.
+
+The task's key holds its environment's entries, with named environments
+replaced by theirs, so a change to an environment changes the key of every
+task running in it, the values of the variables it inherits, and the file
+each command `bin` names resolves to, whatever links lead to it. A command
+found somewhere else changes the key; the rest of the inherited `PATH`, and
+where the links are, do not. A command written as
+`{"name": "clang", "key": "content"}` is keyed by its content instead: the
+same command installed elsewhere keys alike, and one replaced in place, as
+some system toolchains update, changes the key. Its digest is kept in the
+user's cache directory until the file's size or modification time changes.
+
+A version manager's shim, as mise and asdf install, resolves to the version
+manager itself, whichever version it starts, so neither its path nor its
+content changes with that version. Name such a tool's directory with `dirs`,
+or set the version manager's own environment with a `from` entry, such as
+`mise env --json`, rather than naming its shim in `bin`. The values
+of the variables it passes are not keyed. Without a declared environment,
+keys are as before.
+
+A process reads its environment from its own memory, so the sandbox's audit
+cannot see which variables a task reads: a variable a task needs and its
+environment leaves out shows as the task failing. When a task with a declared
+environment fails, qk names the inherited variables its environment left out
+that its dotenv files and settings do not set again, by name only, as values
+can be secrets.
+
 ## Dotenv files
 
 Dotenv files are read as Nx reads them, with npm's `dotenv` and

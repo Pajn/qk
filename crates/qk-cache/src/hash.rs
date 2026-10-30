@@ -2834,6 +2834,11 @@ pub fn inputs(
         }
     }
     let mut values = declared.values;
+    // Left out without a declared environment, so other keys stay as they
+    // were.
+    if let Some(environment) = &prepared.environment {
+        values.insert("environment".into(), environment.keyed());
+    }
     let mut configuration = json!({
         "files": file_values(&inferred.files)?,
         "settings": workspace.config.keyed_settings(),

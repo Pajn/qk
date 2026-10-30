@@ -1836,6 +1836,332 @@ fn tasks_load_their_dotenv_files_and_nx_variables_like_nx() {
 
 #[cfg(unix)]
 #[test]
+fn a_declared_environment_lets_through_only_what_it_names() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    fs::write(
+        root.join("nx.json"),
+        json!({
+            "qk:environments": {
+                "shell": [{ "pass": ["PATH", "PASSED"] }],
+                "base": ["shell", { "inherit": ["KEYED_*"] }, { "set": { "FIXED": "fixed" } }],
+            },
+            "qk:defaultEnv": ["base"],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("app")).unwrap();
+    let show = "echo ${KEYED_A-unset} ${PASSED-unset} ${SECRET-unset} ${FIXED-unset} ${FROM_DOTENV-unset} ${FROM_TARGET-unset} $NX_TASK_TARGET_PROJECT";
+    fs::write(
+        root.join("app/project.json"),
+        json!({"name": "app", "targets": {
+            "show": {"command": show, "cache": true, "options": {"env": {"FROM_TARGET": "target"}}},
+            "open": {"command": "echo ${SECRET-unset}", "qk:env": false},
+            "empty": {"command": "/bin/sh -c 'echo ${PATH-unset} ${KEYED_A-unset}'", "qk:env": []},
+            "needs": {"command": "test -n \"$SECRET\"", "qk:env": []},
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(root.join(".env"), "FROM_DOTENV=dotenv\n").unwrap();
+    let report = root.join("report.json");
+    let run = |target: &str, env: &[(&str, &str)]| {
+        let output = command(root, &["run", target, "--report", report.to_str().unwrap()])
+            .env("SECRET", "secret")
+            .env("KEYED_A", "a")
+            .env("PASSED", "p")
+            .envs(env.iter().copied())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(success(output).stdout).unwrap();
+        let report: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+        let cache = report["tasks"][0]["cache"]
+            .as_str()
+            .unwrap_or("none")
+            .to_owned();
+        (stdout, cache)
+    };
+    // The dotenv files and the target's own settings still apply: the
+    // configuration declares them.
+    let (stdout, cache) = run("app:show", &[]);
+    assert!(
+        stdout.contains("a p unset fixed dotenv target app\n"),
+        "{stdout}"
+    );
+    assert_eq!(cache, "miss");
+    // A passed variable is not keyed, and one left out changes nothing.
+    let (_, cache) = run("app:show", &[("PASSED", "other"), ("SECRET", "other")]);
+    assert_eq!(cache, "local-hit");
+    // An inherited one is, as is one it newly matches.
+    let (_, cache) = run("app:show", &[("KEYED_A", "b")]);
+    assert_eq!(cache, "miss");
+    let (_, cache) = run("app:show", &[("KEYED_B", "b")]);
+    assert_eq!(cache, "miss");
+    // `false` keeps every variable, and an empty environment none. Its
+    // `PATH` holds only what qk adds to every task's: the workspace's
+    // `node_modules/.bin` directories and Node's.
+    let (stdout, _) = run("app:open", &[]);
+    assert!(stdout.contains("secret\n"), "{stdout}");
+    let (stdout, _) = run("app:empty", &[("PATH", "/inherited/bin:/usr/bin:/bin")]);
+    assert!(stdout.ends_with(" unset\n"), "{stdout}");
+    assert!(!stdout.contains("/inherited/bin"), "{stdout}");
+    // A task that fails names what its environment left out, by name only,
+    // leaving out what its dotenv files set again.
+    let output = command(root, &["run", "app:needs"])
+        .env("SECRET", "secret-value")
+        .env("FROM_DOTENV", "process")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("its declared environment left out") && stderr.contains("SECRET"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("secret-value"), "{stderr}");
+    let hint = stderr
+        .lines()
+        .find(|line| line.contains("left out"))
+        .unwrap();
+    assert!(!hint.contains("FROM_DOTENV"), "{hint}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_declared_environment_builds_path_from_the_commands_it_names() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    // Commands live outside the workspace, as installed ones do.
+    let installed = TempDir::new().unwrap();
+    let tool = |base: &Path, directory: &str, name: &str, text: &str| {
+        fs::create_dir_all(base.join(directory)).unwrap();
+        let path = base.join(directory).join(name);
+        fs::write(&path, format!("#!/bin/sh\necho {text}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    tool(installed.path(), "tools", "hello", "hello");
+    tool(installed.path(), "tools", "hidden", "hidden");
+    tool(installed.path(), "newer", "hello", "newer");
+    fs::write(
+        root.join("nx.json"),
+        json!({ "qk:environments": { "tools": [{ "bin": ["hello"] }] } }).to_string(),
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("app/scripts")).unwrap();
+    tool(root, "app/scripts", "from-project", "from-project");
+    fs::write(
+        root.join("app/project.json"),
+        json!({"name": "app", "targets": {
+            "named": {
+                "command": "hello; command -v hidden || echo no-hidden",
+                "cache": true,
+                "qk:env": ["tools"],
+            },
+            "dirs": {"command": "from-project", "qk:env": [{ "dirs": ["{projectRoot}/scripts"] }]},
+            "missing": {"command": "true", "qk:env": [{ "bin": ["absent"] }]},
+            "content": {
+                "command": "hello",
+                "cache": true,
+                "qk:env": [{ "bin": [{ "name": "hello", "key": "content" }] }],
+            },
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let home = root.join("home");
+    fs::create_dir_all(&home).unwrap();
+    let report = root.join("report.json");
+    let run = |target: &str, path: &str| {
+        let output = command(root, &["run", target, "--report", report.to_str().unwrap()])
+            .env("PATH", path)
+            .env("HOME", &home)
+            .env_remove("XDG_CACHE_HOME")
+            .output()
+            .unwrap();
+        let report: Value = fs::read(&report)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        let cache = report["tasks"][0]["cache"]
+            .as_str()
+            .unwrap_or("none")
+            .to_owned();
+        (output, cache)
+    };
+    let tools = format!("{}:/usr/bin:/bin", installed.path().join("tools").display());
+    // The command it names is there, and the one beside it is not.
+    let (output, cache) = run("app:named", &tools);
+    let stdout = String::from_utf8(success(output).stdout).unwrap();
+    assert!(stdout.contains("hello\nno-hidden\n"), "{stdout}");
+    assert_eq!(cache, "miss");
+    // The key follows the binary it found, not the directory linking to it,
+    // nor the rest of PATH.
+    let (_, cache) = run("app:named", &format!("{tools}:/elsewhere"));
+    assert_eq!(cache, "local-hit");
+    let newer = format!("{}:{tools}", installed.path().join("newer").display());
+    let (output, cache) = run("app:named", &newer);
+    let stdout = String::from_utf8(success(output).stdout).unwrap();
+    assert!(stdout.contains("newer\n"), "{stdout}");
+    assert_eq!(cache, "miss");
+    // Enforce lets the task run the commands linked outside the workspace.
+    let output = command(
+        root,
+        &["run", "app:named", "--skip-cache", "--sandbox=enforce"],
+    )
+    .env("PATH", &tools)
+    .env("HOME", &home)
+    .env_remove("XDG_CACHE_HOME")
+    .output()
+    .unwrap();
+    let stdout = String::from_utf8(success(output).stdout).unwrap();
+    assert!(stdout.contains("hello\nno-hidden\n"), "{stdout}");
+    // A directory it adds, from the project's root.
+    let (output, _) = run("app:dirs", &tools);
+    let stdout = String::from_utf8(success(output).stdout).unwrap();
+    assert!(stdout.contains("from-project\n"), "{stdout}");
+    // A command it names that is not on PATH fails the task.
+    let (output, _) = run("app:missing", &tools);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("the command absent of the task's environment is not on PATH"),
+        "{stderr}"
+    );
+    // Keyed by content, a copy installed elsewhere keys alike, and one
+    // changed in place does not.
+    tool(installed.path(), "copy", "hello", "hello");
+    let (_, cache) = run("app:content", &tools);
+    assert_eq!(cache, "miss");
+    let copy = format!("{}:/usr/bin:/bin", installed.path().join("copy").display());
+    let (_, cache) = run("app:content", &copy);
+    assert_eq!(cache, "local-hit");
+    tool(installed.path(), "copy", "hello", "changed");
+    let (output, cache) = run("app:content", &copy);
+    let stdout = String::from_utf8(success(output).stdout).unwrap();
+    assert!(stdout.contains("changed\n"), "{stdout}");
+    assert_eq!(cache, "miss");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_declared_environment_sets_what_a_command_prints() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    let outside = TempDir::new().unwrap();
+    let tools = outside.path().join("tools");
+    fs::create_dir_all(&tools).unwrap();
+    fs::write(tools.join("hello"), "#!/bin/sh\necho hello\n").unwrap();
+    fs::set_permissions(tools.join("hello"), fs::Permissions::from_mode(0o755)).unwrap();
+    let runs = outside.path().join("runs");
+    // Prints the lock file's content and a PATH, and counts its runs.
+    fs::write(
+        root.join("provider.sh"),
+        format!(
+            "echo run >> '{}'\nprintf '{{\"FROM_PROVIDER\":\"%s\",\"PATH\":\"{}\",\"UNSET\":null}}' \"$(cat env.lock)\"\n",
+            runs.display(),
+            tools.display()
+        ),
+    )
+    .unwrap();
+    fs::write(root.join("env.lock"), "one").unwrap();
+    fs::write(
+        root.join("nx.json"),
+        json!({ "qk:environments": {
+            "kept": [{ "from": { "command": "sh provider.sh", "inputs": ["env.lock"] } }],
+            "each": [{ "from": { "command": "sh provider.sh" } }],
+        } })
+        .to_string(),
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("app")).unwrap();
+    fs::write(
+        root.join("app/project.json"),
+        json!({"name": "app", "targets": {
+            "kept": {"command": "echo $FROM_PROVIDER; hello", "cache": true, "qk:env": ["kept"]},
+            "each": {"command": "echo $FROM_PROVIDER", "qk:env": ["each"]},
+            "broken": {"command": "true", "qk:env": [{ "from": { "command": "echo nope >&2; exit 3" } }]},
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let home = root.join("home");
+    fs::create_dir_all(&home).unwrap();
+    let report = root.join("report.json");
+    let run = |target: &str| {
+        let output = command(root, &["run", target, "--report", report.to_str().unwrap()])
+            .env("HOME", &home)
+            .env_remove("XDG_CACHE_HOME")
+            .output()
+            .unwrap();
+        let report: Value = fs::read(&report)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        let cache = report["tasks"][0]["cache"]
+            .as_str()
+            .unwrap_or("none")
+            .to_owned();
+        (output, cache)
+    };
+    let counted = || {
+        fs::read_to_string(&runs)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let (output, cache) = run("app:kept");
+    let stdout = String::from_utf8(success(output).stdout).unwrap();
+    assert!(stdout.contains("one\nhello\n"), "{stdout}");
+    assert_eq!((cache.as_str(), counted()), ("miss", 1));
+    // Kept for its owner alone, as what it printed can hold credentials.
+    let kept: Vec<_> = walkdir::WalkDir::new(&home)
+        .into_iter()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "json")
+                && entry
+                    .path()
+                    .parent()
+                    .is_some_and(|parent| parent.ends_with("qk/env"))
+        })
+        .collect();
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(
+        kept[0].metadata().unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    // Kept until its input changes, which changes the key.
+    let (_, cache) = run("app:kept");
+    assert_eq!((cache.as_str(), counted()), ("local-hit", 1));
+    fs::write(root.join("env.lock"), "two").unwrap();
+    let (output, cache) = run("app:kept");
+    let stdout = String::from_utf8(success(output).stdout).unwrap();
+    assert!(stdout.contains("two\n"), "{stdout}");
+    assert_eq!((cache.as_str(), counted()), ("miss", 2));
+    // Without inputs, it runs again each run.
+    let (output, _) = run("app:each");
+    assert!(
+        String::from_utf8(success(output).stdout)
+            .unwrap()
+            .contains("two\n")
+    );
+    let (_, _) = run("app:each");
+    assert_eq!(counted(), 4);
+    // A command that fails fails the task, with what it said.
+    let (output, _) = run("app:broken");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("nope"), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
 fn a_task_s_dotenv_files_expand_across_each_other_as_in_nx() {
     let temp = TempDir::new().unwrap();
     let root = temp.path();
