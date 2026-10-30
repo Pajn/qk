@@ -34,7 +34,7 @@
 //! The cache stays on: a task restored from it did not run, so it is neither
 //! audited nor held to its plan, and is listed as restored.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -500,6 +500,7 @@ impl Sandbox {
             return None;
         }
         if cfg!(target_os = "macos") {
+            self.make_outputs(id);
             return self
                 .profiles
                 .get(id)
@@ -538,6 +539,7 @@ impl Sandbox {
         if !self.plans.contains_key(id) {
             return None;
         }
+        self.make_outputs(id);
         let mut traces = self.traces.lock().unwrap();
         if let Some(existing) = existing {
             traces.insert(id.to_owned(), (existing.clone(), cwd.to_owned()));
@@ -691,12 +693,39 @@ impl Sandbox {
         })
     }
 
+    /// Creates the directories a task's outputs lie in that do not exist
+    /// yet, to be removed again if the task leaves them empty, as it starts
+    /// under the sandbox in either mode. A tool that makes a directory by
+    /// renaming one it built beside it, as cargo makes `target` for an output
+    /// in `target/release`, then finds it there rather than writing outside
+    /// its outputs. An output itself is not made, as a path names a file or a
+    /// directory alike. Failing to create one leaves the task to.
+    fn make_outputs(&self, id: &str) {
+        let Some(plan) = self.plans.get(id) else {
+            return;
+        };
+        for tree in &plan.write_trees {
+            let Some(parent) = tree.parent() else {
+                continue;
+            };
+            let missing: Vec<PathBuf> = parent
+                .ancestors()
+                .take_while(|directory| !directory.exists())
+                .map(Path::to_owned)
+                .collect();
+            if !missing.is_empty() && std::fs::create_dir_all(parent).is_ok() {
+                self.created.lock().unwrap().extend(missing);
+            }
+        }
+    }
+
     #[cfg(target_os = "linux")]
     fn landlock(&self, id: &str) -> Result<qk_executor::Confinement> {
         use std::os::fd::AsRawFd;
         let plan = &self.plans[id];
-        // Landlock holds paths that exist: an output directory that does not
-        // yet is created, and removed again if the task leaves it empty.
+        // Landlock holds paths that exist: an output without an extension is
+        // taken for a directory and made too.
+        self.make_outputs(id);
         for tree in &plan.write_trees {
             if !tree.exists() && tree.extension().is_none() {
                 std::fs::create_dir_all(tree)?;
@@ -734,22 +763,40 @@ impl Sandbox {
     /// returns each task's findings, the tasks that ran unsandboxed and those
     /// whose installed packages went unchecked.
     pub fn finish(mut self) -> Result<Finished> {
+        // Every task has ended, so what they left empty goes, the deepest
+        // first, whether or not the reports can be read.
+        let mut created = std::mem::take(&mut *self.created.lock().unwrap());
+        created.sort_by_key(|directory| std::cmp::Reverse(directory.components().count()));
+        created.dedup();
+        for directory in created {
+            let _ = std::fs::remove_dir(directory);
+        }
         let (reports, audited) = match self.watcher.take() {
             Some(watcher) => {
-                let (reports, dropped) = watcher.finish(&self.directory)?;
-                if dropped > 0 {
-                    bail!("sandbox log exceeded 100000 reports; {dropped} reports omitted");
+                let (mut reports, over) = watcher.finish(&self.directory)?;
+                // Its reports are incomplete, so it is listed as unaudited
+                // rather than with some of what it did.
+                for (task, count) in &over {
+                    self.unconfined(
+                        task,
+                        &format!(
+                            "it was not audited, as it made {count} sandbox reports, more than the {TASK_REPORTS} kept of one task"
+                        ),
+                    );
                 }
-                (reports, self.plans.keys().cloned().collect())
+                reports.retain(|report| !over.contains_key(&report.task));
+                let audited = self
+                    .plans
+                    .keys()
+                    .filter(|id| !over.contains_key(*id))
+                    .cloned()
+                    .collect();
+                (reports, audited)
             }
             None if self.mode == Mode::Audit => self.recorded(),
             None => (Vec::new(), BTreeSet::new()),
         };
         let _ = std::fs::remove_dir_all(&self.directory);
-        for directory in std::mem::take(&mut *self.created.lock().unwrap()) {
-            // Only if the task left it empty.
-            let _ = std::fs::remove_dir(directory);
-        }
         let mut findings: BTreeMap<String, Findings> = BTreeMap::new();
         for report in reports {
             let Ok(relative) = Path::new(&report.path).strip_prefix(&self.root) else {
@@ -1627,9 +1674,15 @@ pub(crate) struct Watcher {
     /// Probes made so far.
     probes: std::sync::atomic::AtomicU64,
     marker: String,
-    dropped: Arc<std::sync::atomic::AtomicUsize>,
+    /// How many reports each task made, kept or not.
+    counts: Arc<Mutex<HashMap<String, usize>>>,
     reader: Option<std::thread::JoinHandle<()>>,
 }
+
+/// The reports kept of one task: beyond them, a task that makes many, as a
+/// package manager installing thousands of files outside its outputs, is not
+/// audited, rather than crowding out every other task's reports.
+pub(crate) const TASK_REPORTS: usize = 100_000;
 
 impl Watcher {
     pub(crate) fn start(directory: &Path) -> Result<Self> {
@@ -1652,13 +1705,13 @@ impl Watcher {
         let reports = Arc::new(Mutex::new(Vec::new()));
         let sentinel = Arc::new(Mutex::new(0));
         let marker = format!("{SENTINEL}:{}", directory.canonicalize()?.display());
-        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counts = Arc::new(Mutex::new(HashMap::new()));
         let (ready, started) = std::sync::mpsc::channel();
         let reader = {
             let reports = reports.clone();
             let sentinel = sentinel.clone();
             let marker = marker.clone();
-            let dropped = dropped.clone();
+            let counts = counts.clone();
             std::thread::spawn(move || {
                 for line in BufReader::new(stdout).lines() {
                     let Ok(line) = line else { break };
@@ -1680,11 +1733,11 @@ impl Watcher {
                         continue;
                     }
                     if let Some(report) = parse(message) {
-                        let mut reports = reports.lock().unwrap();
-                        if reports.len() < 100_000 {
-                            reports.push(report);
-                        } else {
-                            dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let mut counts = counts.lock().unwrap();
+                        let count = counts.entry(report.task.clone()).or_insert(0);
+                        *count += 1;
+                        if *count <= TASK_REPORTS {
+                            reports.lock().unwrap().push(report);
                         }
                     }
                 }
@@ -1696,7 +1749,7 @@ impl Watcher {
             sentinel,
             probes: std::sync::atomic::AtomicU64::new(0),
             marker,
-            dropped,
+            counts,
             reader: Some(reader),
         };
         // The stream's first line says it has started filtering.
@@ -1761,7 +1814,12 @@ impl Watcher {
         }
     }
 
-    pub(crate) fn finish(mut self, directory: &Path) -> Result<(Vec<Report>, usize)> {
+    /// The reports kept, and each task that made more than could be kept,
+    /// with how many it made.
+    pub(crate) fn finish(
+        mut self,
+        directory: &Path,
+    ) -> Result<(Vec<Report>, BTreeMap<String, usize>)> {
         let probed = self.probe(directory, "finish");
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -1769,10 +1827,15 @@ impl Watcher {
             let _ = reader.join();
         }
         probed?;
-        Ok((
-            std::mem::take(&mut *self.reports.lock().unwrap()),
-            self.dropped.load(std::sync::atomic::Ordering::Relaxed),
-        ))
+        let over = self
+            .counts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, count)| **count > TASK_REPORTS)
+            .map(|(task, count)| (task.clone(), *count))
+            .collect();
+        Ok((std::mem::take(&mut *self.reports.lock().unwrap()), over))
     }
 }
 
