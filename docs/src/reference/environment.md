@@ -140,6 +140,7 @@ similar patterns in a value it substitutes, is not reproduced.
 | `QK_COLD=true` | Run each task from scratch and save what it gives, as `--cold` does; ignored by a run that skips the cache |
 | `QK_RECORD=true` | Record tasks with `qk:ultracache` that execute, as `--record` does |
 | `QK_RECORD=audit` | Record them and audit what they did beyond their declarations, as `--record --sandbox` does |
+| `QK_SANDBOX_OVERLAY` | `0` holds Linux [enforce](../guides/sandbox.md#linux) by Landlock alone, rather than running each task over an overlay that keeps what it writes outside its outputs from the workspace |
 | `QK_RECORDER` | How Linux [records](../guides/ultracache.md#recorders) tasks: `auto` (the default) uses eBPF where it loads and strace otherwise; `ebpf` or `strace` uses only that one |
 | `NX_BAIL=true` | Stop starting tasks after a failure, unless `--nx-bail=false` |
 | `NX_IGNORE_CYCLES=true` | Break dependency cycles with a warning |

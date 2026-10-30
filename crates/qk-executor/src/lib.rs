@@ -5,6 +5,8 @@ mod capture;
 pub mod dotenv;
 mod env_flags;
 mod interpolate;
+#[cfg(target_os = "linux")]
+pub mod overlay;
 mod process;
 mod providers;
 #[cfg(unix)]
@@ -212,6 +214,70 @@ pub enum Confinement {
     /// Enforced, and could not be held to its plan, for this reason: its
     /// commands fail rather than start unconfined.
     Refused(String),
+    /// Linux: each command runs in its own user and mount namespace over an
+    /// overlay of the workspace, whose upper layer the sandbox reads when the
+    /// task ends.
+    Overlay(std::sync::Arc<Overlay>),
+}
+
+/// Where a task's overlays live, and what passes through them to the
+/// workspace.
+#[derive(Debug)]
+pub struct Overlay {
+    /// The workspace, which the overlay is mounted over.
+    pub workspace: PathBuf,
+    /// The task's directory: each command's layers in `command-<index>`.
+    pub directory: PathBuf,
+    /// Paths in the workspace bound through, so that what a command writes
+    /// there reaches the workspace directly.
+    pub passthrough: Vec<PathBuf>,
+    /// The Landlock rules each command restricts itself to once the overlay
+    /// is mounted, which reads must keep to.
+    pub rules: OverlayRules,
+    /// Where the task may write: what its commands wrote beneath these is
+    /// applied to the workspace as they end, and the rest is not.
+    pub keep: Vec<PathBuf>,
+    /// Set once the commands' writes are applied: the workspace paths left
+    /// out, as they lay outside `keep`.
+    pub discarded: std::sync::OnceLock<std::collections::BTreeSet<String>>,
+}
+
+impl Overlay {
+    /// Applies what the task's commands wrote within `keep` to the
+    /// workspace, once, as they end: before the cache reads its outputs and
+    /// before any task depending on it starts. Returns the paths left out.
+    pub fn settle(&self) -> &std::collections::BTreeSet<String> {
+        self.discarded.get_or_init(|| {
+            #[cfg(target_os = "linux")]
+            {
+                overlay::settle(self)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                std::collections::BTreeSet::new()
+            }
+        })
+    }
+}
+
+/// A Landlock rule set to build in a command's namespace. Paths outside the
+/// workspace, which the overlay leaves as they are, are opened beforehand;
+/// those in it are opened there, as the overlay's.
+#[derive(Debug, Default)]
+pub struct OverlayRules {
+    /// The rights the rule set handles, and those that apply to a file.
+    pub handled: u64,
+    pub file_rights: u64,
+    /// Opened outside the namespace: descriptors, held open until the task
+    /// ends, with the rights beneath each.
+    #[cfg(unix)]
+    pub outside: Vec<(std::os::fd::OwnedFd, u64)>,
+    /// The rights everywhere in the workspace, where writes reach the overlay
+    /// and are judged as the task ends.
+    pub workspace: u64,
+    /// Paths in the workspace with the rights beneath each, and whether to
+    /// reach it through no link.
+    pub inside: Vec<(PathBuf, u64, bool)>,
 }
 
 /// An external syscall recorder wrapping each command, with separate trace files.

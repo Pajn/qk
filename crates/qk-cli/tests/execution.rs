@@ -3514,6 +3514,329 @@ fn can_audit() -> bool {
     found
 }
 
+/// Linux enforce over an overlay: what a task writes within its outputs is
+/// applied as it ends, before its dependents start, however it made them; what
+/// it writes elsewhere is listed and not kept; `.git` and `node_modules` pass
+/// through.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_overlay_sandbox_keeps_only_what_a_task_declares() {
+    if !can_overlay() {
+        return;
+    }
+    let _audit = AUDIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = fixture(json!({
+        "build": {
+            // As cargo makes `target` where it is missing, which the
+            // directory made for its output keeps it from, a file output
+            // without an extension, and a write outside the outputs.
+            "command": "{ [ -d target ] || { mkdir target.partial && echo tag > target.partial/TAG && mv target.partial target; }; } && mkdir -p target/release dist && echo out > target/release/app && echo d > dist/d.txt && mkdir -p bin && echo bin > bin/app && echo stray > stray.txt && echo git > .git/marker && mkdir -p node_modules/.cache && echo cache > node_modules/.cache/kept",
+            "inputs": [],
+            "outputs": ["{projectRoot}/target/release", "{projectRoot}/dist", "{projectRoot}/bin/app"]
+        },
+        "use": {
+            "command": "cat target/release/app dist/d.txt bin/app > used.txt",
+            "dependsOn": ["build"],
+            "inputs": [],
+            "outputs": ["{projectRoot}/used.txt"]
+        }
+    }));
+    fs::create_dir_all(temp.path().join(".git")).unwrap();
+    fs::create_dir_all(temp.path().join("node_modules")).unwrap();
+    let report = temp.path().join("report.json");
+    success(
+        command(
+            temp.path(),
+            &[
+                "run",
+                "app:use",
+                "--skip-cache",
+                "--sandbox=enforce",
+                "--sandbox-report",
+                report.to_str().unwrap(),
+            ],
+        )
+        .output()
+        .unwrap(),
+    );
+    let root = temp.path();
+    assert_eq!(
+        fs::read_to_string(root.join("used.txt")).unwrap(),
+        "out\nd\nbin\n"
+    );
+    assert!(root.join("bin/app").is_file());
+    assert!(!root.join("stray.txt").exists());
+    assert!(!root.join("target/TAG").exists());
+    assert_eq!(
+        fs::read_to_string(root.join(".git/marker")).unwrap(),
+        "git\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("node_modules/.cache/kept")).unwrap(),
+        "cache\n"
+    );
+    let findings: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+    assert_eq!(
+        findings["tasks"]["app:build"]["strayWrites"],
+        json!(["stray.txt"]),
+        "{findings}"
+    );
+    assert!(findings["tasks"].get("app:use").is_none(), "{findings}");
+    // The layers are gone once the tasks have settled.
+    let left: Vec<_> = walkdir::WalkDir::new(root)
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry.file_name() == "command-0")
+        .map(|entry| entry.path().to_owned())
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+/// Whether Linux enforce can run tasks over overlays here, which needs
+/// unprivileged user namespaces; where `QK_TEST_REQUIRE_OVERLAY` is set, as CI
+/// sets it, a test that would skip fails instead.
+#[cfg(target_os = "linux")]
+fn can_overlay() -> bool {
+    let probe = Command::new("unshare").args(["-Urm", "true"]).status();
+    let found = probe.is_ok_and(|status| status.success());
+    if !found {
+        assert!(
+            std::env::var_os("QK_TEST_REQUIRE_OVERLAY").is_none_or(|value| value != "1"),
+            "the overlay sandbox needs unprivileged user namespaces"
+        );
+        eprintln!("skipped: the overlay sandbox needs unprivileged user namespaces");
+    }
+    found
+}
+
+/// Over an overlay, a task's commands run one after another see what those
+/// before them wrote, and ones run side by side keep theirs apart; what they
+/// remove from or replace in their outputs is removed or replaced in the
+/// workspace.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_overlay_sandbox_applies_what_each_command_did() {
+    if !can_overlay() {
+        return;
+    }
+    let _audit = AUDIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = fixture(json!({
+        "sequence": {
+            "executor": "nx:run-commands",
+            "options": {
+                "commands": ["mkdir -p seq && echo one > seq/a", "cat seq/a > seq/b"],
+                "parallel": false
+            },
+            "inputs": [],
+            "outputs": ["{projectRoot}/seq"]
+        },
+        "side": {
+            "executor": "nx:run-commands",
+            "options": {
+                "commands": ["mkdir -p par && echo left > par/left", "mkdir -p par && echo right > par/right"],
+                "parallel": true
+            },
+            "inputs": [],
+            "outputs": ["{projectRoot}/par"]
+        },
+        "replace": {
+            // Removes an output file, makes an output directory anew, and
+            // puts a directory in place of an output file.
+            "command": "rm gone.txt && rm -rf dist && mkdir dist && echo new > dist/new.txt && rm swap && mkdir swap && echo in > swap/in.txt",
+            "inputs": [],
+            "outputs": ["{projectRoot}/gone.txt", "{projectRoot}/dist", "{projectRoot}/swap"]
+        },
+        "clean": {
+            // Removes the parent of its output and builds it again, as
+            // `rm -rf out && tsc` would, with a mode of its own.
+            "command": "rm -rf out && mkdir -p out/types && echo new > out/types/new.d.ts && chmod 750 out/types",
+            "inputs": [],
+            "outputs": ["{projectRoot}/out/types", "{projectRoot}/out/map.json"]
+        }
+    }));
+    let root = temp.path();
+    fs::write(root.join("gone.txt"), "old").unwrap();
+    fs::write(root.join("swap"), "file").unwrap();
+    fs::create_dir_all(root.join("out/types")).unwrap();
+    fs::write(root.join("out/types/stale.d.ts"), "old").unwrap();
+    fs::write(root.join("out/other.js"), "kept").unwrap();
+    fs::write(root.join("out/map.json"), "old").unwrap();
+    fs::create_dir_all(root.join("dist")).unwrap();
+    fs::write(root.join("dist/old.txt"), "old").unwrap();
+    success(run(
+        root,
+        &[
+            "run-many",
+            "-t",
+            "sequence,side,replace,clean",
+            "--skip-cache",
+            "--sandbox=enforce",
+        ],
+    ));
+    assert_eq!(fs::read_to_string(root.join("seq/b")).unwrap(), "one\n");
+    assert_eq!(fs::read_to_string(root.join("par/left")).unwrap(), "left\n");
+    assert_eq!(
+        fs::read_to_string(root.join("par/right")).unwrap(),
+        "right\n"
+    );
+    assert!(!root.join("gone.txt").exists());
+    assert!(!root.join("dist/old.txt").exists());
+    assert_eq!(
+        fs::read_to_string(root.join("dist/new.txt")).unwrap(),
+        "new\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("swap/in.txt")).unwrap(),
+        "in\n"
+    );
+    // What it did not build again goes; what lay outside its outputs stays.
+    assert!(!root.join("out/types/stale.d.ts").exists());
+    assert!(!root.join("out/map.json").exists());
+    assert_eq!(
+        fs::read_to_string(root.join("out/types/new.d.ts")).unwrap(),
+        "new\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("out/other.js")).unwrap(),
+        "kept"
+    );
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        fs::metadata(root.join("out/types"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o750
+    );
+}
+
+/// Over an overlay, the cache stores a task's outputs once its writes reach
+/// the workspace, so a later hit restores them.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_overlay_sandbox_caches_the_outputs_its_task_wrote() {
+    if !can_overlay() {
+        return;
+    }
+    let _audit = AUDIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = fixture(json!({
+        "build": {
+            "command": "mkdir -p dist && echo built > dist/out.txt",
+            "cache": true,
+            "inputs": [],
+            "outputs": ["{projectRoot}/dist"]
+        }
+    }));
+    let root = temp.path();
+    let report = root.join("report.json");
+    let build = || {
+        success(run(
+            root,
+            &[
+                "run",
+                "app:build",
+                "--sandbox=enforce",
+                "--report",
+                report.to_str().unwrap(),
+            ],
+        ));
+        let report: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+        report["tasks"][0]["cache"]
+            .as_str()
+            .unwrap_or("none")
+            .to_owned()
+    };
+    build();
+    fs::remove_dir_all(root.join("dist")).unwrap();
+    let cache = build();
+    assert_eq!(cache, "local-hit");
+    assert_eq!(
+        fs::read_to_string(root.join("dist/out.txt")).unwrap(),
+        "built\n"
+    );
+}
+
+/// Over an overlay, a link one command leaves in an output is replaced, not
+/// followed, by a directory another command makes there: applying it never
+/// writes outside the workspace.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_overlay_sandbox_applies_nothing_through_a_link() {
+    if !can_overlay() {
+        return;
+    }
+    let _audit = AUDIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let outside = TempDir::new().unwrap();
+    let temp = fixture(json!({
+        "build": {
+            "executor": "nx:run-commands",
+            "options": {
+                "commands": [
+                    format!("mkdir -p dist && ln -s {} dist/link", outside.path().display()),
+                    "mkdir -p dist/link && echo planted > dist/link/planted.txt"
+                ],
+                "parallel": true
+            },
+            "inputs": [],
+            "outputs": ["{projectRoot}/dist"]
+        }
+    }));
+    let root = temp.path();
+    success(run(
+        root,
+        &["run", "app:build", "--skip-cache", "--sandbox=enforce"],
+    ));
+    assert!(!outside.path().join("planted.txt").exists());
+    assert!(
+        fs::symlink_metadata(root.join("dist/link"))
+            .unwrap()
+            .is_dir()
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("dist/link/planted.txt")).unwrap(),
+        "planted\n"
+    );
+}
+
+/// `QK_SANDBOX_OVERLAY=0` holds Linux enforce by Landlock, which refuses a
+/// write outside the outputs as it happens rather than discarding it.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_sandbox_holds_enforce_by_landlock_without_overlays() {
+    if !can_audit() {
+        return;
+    }
+    let _audit = AUDIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = fixture(json!({
+        "build": {
+            "command": "echo out > out.txt && echo stray > stray.txt",
+            "inputs": [],
+            "outputs": ["{projectRoot}/out.txt"]
+        }
+    }));
+    fs::write(temp.path().join("out.txt"), "").unwrap();
+    let output = command(
+        temp.path(),
+        &["run", "app:build", "--skip-cache", "--sandbox=enforce"],
+    )
+    .env("QK_SANDBOX_OVERLAY", "0")
+    .output()
+    .unwrap();
+    assert!(!output.status.success());
+    assert!(!temp.path().join("stray.txt").exists());
+}
+
 /// Enforce lets a task read a file its `ignoreReads` names whole though a
 /// task it depends on makes it only as the run goes.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -4895,7 +5218,7 @@ fn warm_suggest_lists_the_directories_a_task_wrote_outside_its_outputs() {
 fn the_sandbox_refuses_what_a_task_does_not_declare_on_linux() {
     let temp = fixture(json!({
         "build": {
-            "command": "cat src/in.txt .env node_modules/dep/index.js /etc/hostname > /dev/null && ls other > /dev/null && echo out > dist/out.txt && echo ok",
+            "command": "cat src/in.txt .env node_modules/dep/index.js /etc/hostname > /dev/null && ls other > /dev/null && mkdir -p dist && echo out > dist/out.txt && echo ok",
             "inputs": ["{projectRoot}/src/**/*"],
             "outputs": ["{projectRoot}/dist"]
         },
@@ -4930,7 +5253,9 @@ fn the_sandbox_refuses_what_a_task_does_not_declare_on_linux() {
     assert!(!peek.status.success());
     // The task `run` is for streams, so its errors stay on stderr.
     assert!(String::from_utf8_lossy(&peek.stderr).contains("Permission denied"));
-    assert!(!sandboxed("app:stray").status.success());
+    // A write outside its outputs is not kept: over an overlay the task ends
+    // and the write is discarded, and by Landlock alone it is refused.
+    let _ = sandboxed("app:stray");
     assert!(!temp.path().join("stray.txt").exists());
 }
 
@@ -5030,7 +5355,9 @@ fn sandbox_allows_linked_input_trees_without_granting_unrelated_access() {
         "direct\nignored\nfile\nnested\nfile\n"
     );
     assert!(!enforced("app:peek").status.success());
-    assert!(!enforced("app:write").status.success());
+    // A write through the link is not kept: refused by Seatbelt and Landlock,
+    // discarded over an overlay.
+    let _ = enforced("app:write");
     assert_eq!(
         fs::read_to_string(temp.path().join("shared/value.txt")).unwrap(),
         "direct\n"

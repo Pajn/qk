@@ -244,6 +244,13 @@ pub struct Sandbox {
     /// Tasks that ran no command, such as `nx:noop`: held to their plans,
     /// with nothing recorded to hold them to.
     idle: Mutex<BTreeSet<String>>,
+    /// Linux enforce: whether tasks run over overlays, why they are held by
+    /// Landlock instead where they cannot, each task's overlay until it
+    /// settles, and what each wrote outside its outputs, which was not kept.
+    overlay: bool,
+    fallback: Option<String>,
+    overlays: Mutex<BTreeMap<String, std::sync::Arc<qk_executor::Overlay>>>,
+    discarded: Mutex<BTreeMap<String, BTreeSet<String>>>,
     /// Linux: rule sets handed to tasks, open until the run ends, and the
     /// output directories created so their rules had a path to hold.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -265,6 +272,9 @@ pub struct Finished {
     pub audited: BTreeSet<String>,
     /// Tasks restored from the cache, which did not run to be checked.
     pub restored: BTreeSet<String>,
+    /// Linux enforce: why tasks were held by Landlock rather than run over
+    /// overlays, where they were.
+    pub fallback: Option<String>,
 }
 
 /// Tag in each rule's message: the task a report belongs to.
@@ -443,9 +453,25 @@ impl Sandbox {
             given_root: workspace.root.clone(),
             restored: Mutex::new(BTreeSet::new()),
             idle: Mutex::new(BTreeSet::new()),
+            overlay: false,
+            fallback: None,
+            overlays: Mutex::new(BTreeMap::new()),
+            discarded: Mutex::new(BTreeMap::new()),
             rulesets: Mutex::new(Vec::new()),
             created: Mutex::new(Vec::new()),
         };
+        // Linux enforce runs each task over an overlay where a command can
+        // have one, and holds it by Landlock alone where not, saying why.
+        #[cfg(target_os = "linux")]
+        if mode == Mode::Enforce
+            && std::env::var_os("QK_SANDBOX_OVERLAY").is_none_or(|value| value != "0")
+        {
+            let probe = sandbox.directory.join("overlay-probe");
+            match qk_executor::overlay::probe(&probe) {
+                Ok(()) => sandbox.overlay = true,
+                Err(error) => sandbox.fallback = Some(format!("{error:#}")),
+            }
+        }
         if cfg!(target_os = "macos") {
             for (index, id) in sandbox.plans.keys().enumerate() {
                 let path = sandbox.directory.join(format!("{index}.sb"));
@@ -511,6 +537,22 @@ impl Sandbox {
         if !self.plans.contains_key(id) || self.recording.is_some() {
             return None;
         }
+        if self.overlay {
+            // As for Seatbelt: the overlay's lower layer is the workspace, so
+            // a missing output's directories made in it are there to build in.
+            self.make_outputs(id);
+            return match self.overlaid(id) {
+                Ok(confinement) => Some(confinement),
+                Err(error) => {
+                    let reason = format!("{error:#}");
+                    self.refused
+                        .lock()
+                        .unwrap()
+                        .insert(id.to_owned(), reason.clone());
+                    Some(qk_executor::Confinement::Refused(reason))
+                }
+            };
+        }
         if cfg!(target_os = "macos") {
             self.make_outputs(id);
             return self
@@ -535,6 +577,93 @@ impl Sandbox {
                     .insert(id.to_owned(), format!("{error:#}"));
                 None
             }
+        }
+    }
+
+    /// Linux enforce over an overlay: where the task's layers go, what
+    /// passes through to the workspace, `.git`, qk's state where it lies in
+    /// the workspace, every `node_modules` and the task's scratch
+    /// directories, and the Landlock rules reads keep to.
+    #[cfg(target_os = "linux")]
+    fn overlaid(&self, id: &str) -> Result<qk_executor::Confinement> {
+        let plan = &self.plans[id];
+        let number = self
+            .trace_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut passthrough: Vec<PathBuf> = vec![self.root.join(".git")];
+        if self.state.starts_with(&self.root) && !self.state.starts_with(self.root.join(".git")) {
+            passthrough.push(self.state.clone());
+        }
+        passthrough.extend(self.shared.iter().cloned());
+        for directory in &plan.scratch {
+            std::fs::create_dir_all(directory)?;
+            passthrough.push(directory.clone());
+        }
+        passthrough.retain(|path| path.exists());
+        let mut through = passthrough.clone();
+        // qk's state, beneath the workspace or not.
+        through.push(self.state.clone());
+        let rules = landlock::overlay_rules(
+            &landlock::Paths {
+                root: &self.root,
+                read_directories: &plan.read_directories,
+                read_files: plan.read_files.iter().chain(&self.dotenv),
+                read_trees: &plan.read_trees,
+                unlinked: &plan.unlinked,
+                write_trees: plan.write_trees.iter(),
+            },
+            &through,
+        )?;
+        // In this run's own directory: another run in the workspace numbers
+        // its tasks' overlays from 0 too. One a run of the same process ID
+        // left behind is cleared, never mounted again.
+        let directory = self.directory.join(format!("overlay-{number}"));
+        qk_executor::overlay::clear(&directory);
+        let overlay = std::sync::Arc::new(qk_executor::Overlay {
+            workspace: self.root.clone(),
+            directory,
+            passthrough,
+            rules,
+            keep: plan
+                .write_trees
+                .iter()
+                .chain([&self.state])
+                .cloned()
+                .collect(),
+            discarded: std::sync::OnceLock::new(),
+        });
+        self.overlays
+            .lock()
+            .unwrap()
+            .insert(id.to_owned(), overlay.clone());
+        Ok(qk_executor::Confinement::Overlay(overlay))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn overlaid(&self, _: &str) -> Result<qk_executor::Confinement> {
+        bail!("overlays are Linux's")
+    }
+
+    /// As a task ends, over an overlay: applies its commands' writes, if the
+    /// executor has not as they ended, removes its layers, and keeps what
+    /// lay outside its outputs, warm paths and scratch directories as
+    /// findings.
+    pub fn settle(&self, id: &str) {
+        let Some(overlay) = self.overlays.lock().unwrap().remove(id) else {
+            return;
+        };
+        let discarded = overlay.settle().clone();
+        #[cfg(target_os = "linux")]
+        qk_executor::overlay::clear(&overlay.directory);
+        #[cfg(not(target_os = "linux"))]
+        let _ = std::fs::remove_dir_all(&overlay.directory);
+        if !discarded.is_empty() {
+            self.discarded
+                .lock()
+                .unwrap()
+                .entry(id.to_owned())
+                .or_default()
+                .extend(discarded);
         }
     }
 
@@ -810,6 +939,11 @@ impl Sandbox {
         };
         let _ = std::fs::remove_dir_all(&self.directory);
         let mut findings: BTreeMap<String, Findings> = BTreeMap::new();
+        // Over an overlay, what a task wrote outside its outputs was not
+        // kept: a finding as audit would report it.
+        for (id, paths) in std::mem::take(&mut *self.discarded.lock().unwrap()) {
+            findings.entry(id).or_default().stray_writes.extend(paths);
+        }
         for report in reports {
             let Ok(relative) = Path::new(&report.path).strip_prefix(&self.root) else {
                 continue;
@@ -925,6 +1059,7 @@ impl Sandbox {
             packages_unchecked: std::mem::take(&mut self.packages_unchecked),
             audited,
             restored,
+            fallback: self.fallback.take(),
         })
     }
 }
@@ -964,6 +1099,10 @@ impl Drop for Sandbox {
         if let Some(mut watcher) = self.watcher.take() {
             let _ = watcher.child.kill();
         }
+        // An overlay's work directory is one only its owner may enter.
+        #[cfg(target_os = "linux")]
+        qk_executor::overlay::clear(&self.directory);
+        #[cfg(not(target_os = "linux"))]
         let _ = std::fs::remove_dir_all(&self.directory);
     }
 }
