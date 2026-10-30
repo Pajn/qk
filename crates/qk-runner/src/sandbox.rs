@@ -1568,7 +1568,14 @@ fn matching_paths(root: &Path, reads: &qk_cache::ultracache::IgnoredReads) -> Ig
         if linked {
             continue;
         }
-        let mut pending = vec![root.join(base)];
+        let mut pending = vec![root.join(&base)];
+        // A path named whole, which a task it depends on may make as the run
+        // goes: allowed as it starts, when its rules are opened, if it is
+        // there then.
+        if base.as_os_str() == glob.as_str() && !root.join(&base).exists() && reads.is_match(&base)
+        {
+            files.insert(root.join(&base));
+        }
         while let Some(path) = pending.pop() {
             let Ok(metadata) = std::fs::symlink_metadata(&path) else {
                 continue;

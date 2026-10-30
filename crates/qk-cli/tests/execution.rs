@@ -3514,6 +3514,37 @@ fn can_audit() -> bool {
     found
 }
 
+/// Enforce lets a task read a file its `ignoreReads` names whole though a
+/// task it depends on makes it only as the run goes.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn the_sandbox_lets_a_task_read_an_ignored_file_its_dependency_makes() {
+    if !can_audit() {
+        return;
+    }
+    let _audit = AUDIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = fixture(json!({
+        "gen": {
+            "command": "mkdir -p generated && echo names > generated/names.ts",
+            "inputs": [],
+            "outputs": ["{projectRoot}/generated"]
+        },
+        "lint": {
+            "command": "cat generated/names.ts",
+            "dependsOn": ["gen"],
+            "inputs": [],
+            "qk:ultracache": { "mode": "off", "ignoreReads": ["generated/names.ts"] }
+        }
+    }));
+    let output = success(run(
+        temp.path(),
+        &["run", "app:lint", "--skip-cache", "--sandbox=enforce"],
+    ));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("names"));
+}
+
 /// The sandbox keeps the cache: a task restored from it did not run, so it is
 /// neither checked nor listed with findings, and `--skip-cache` checks it.
 #[cfg(any(target_os = "macos", target_os = "linux"))]

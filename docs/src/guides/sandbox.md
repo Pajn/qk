@@ -221,7 +221,10 @@ literal parts name. A glob ending in `/**`, as `**/.cache/**`, allows each
 directory it names whole, so a profile stays small however many files the
 directories hold, and a file made in one during the run may be read too.
 Any other glob, or one with a negated group such as `!(private)`, which can
-leave out a path deeper down, allows the files it matches one by one. The
+leave out a path deeper down, allows the files it matches one by one. A path
+named whole, with no pattern in it, is allowed as the task starts though it
+did not exist as the run started, so a file a task it depends on makes, as
+code it generates, may be read. The
 walk never enters `.git`, `.qk` or `node_modules`, and a directory holding
 one of them is not allowed whole: the directories beside it are. A symbolic
 link is left out, since allowing it would allow whatever it leads to. Seatbelt
