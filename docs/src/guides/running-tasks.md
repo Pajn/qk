@@ -303,8 +303,18 @@ and the tasks waiting for it fail, naming it, as in Nx. An invalid check
 fails the task only when something waits for it; otherwise qk warns and runs
 it unchecked. A `port` of `0` or `auto` is one the server picks, so there is
 nothing to check and the task is ready once started. A request to this
-machine skips proxies and accepts a self-signed certificate; other hosts use
-the proxy environment and verify certificates.
+machine skips proxies and accepts a self-signed certificate.
+
+A request to another host goes through the proxy that `HTTP_PROXY` or
+`HTTPS_PROXY`, by the url's scheme, or else `ALL_PROXY` names, unless
+`NO_PROXY` covers the host. As in Nx 24.0.3, a `NO_PROXY` entry is `*` for
+every host, a domain that also covers its subdomains (`example.com` or
+`.example.com`), `*.example.com` for the subdomains only, an IP address, or a
+CIDR range such as `10.0.0.0/8`. Any entry except a range can end in a port,
+such as `staging.internal:8080` or `[fd00::1]:8080`, to match only that port.
+The request trusts the certificates in the operating system's store, which
+`SSL_CERT_FILE` or `SSL_CERT_DIR` replaces, and in the file that
+`NODE_EXTRA_CA_CERTS` names. A file qk can't read adds nothing.
 
 A target with `parallelism: false` runs alone, as in Nx: it waits until no
 other task runs, continuous ones included, and nothing starts while it runs.
