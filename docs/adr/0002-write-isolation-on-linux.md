@@ -12,7 +12,9 @@ promise:
 - **Rules attach to paths that exist.** qk creates an output before the task
   runs so that Landlock can grant it, and has to guess what kind of path it
   is. A missing output without an extension is taken for a directory, so a
-  task declaring a file such as `target/release/app` cannot write it.
+  task declaring a file such as `target/release/app` cannot write it, and a
+  missing file output with one, such as `dist/sprite.svg`, cannot be granted
+  at all: the task is refused when it creates it.
 - **A grant covers everything below it.** Allowing a file to be created in a
   directory means allowing every file there; nothing narrower can be said.
 - **Writes are judged as they happen.** A tool that builds a directory beside
@@ -89,7 +91,8 @@ after listing it, so the workspace ends as it would without the sandbox.
   directories, or applying outputs only between tasks.
 - **When outputs are applied.** Today a failed task leaves what it wrote. The
   backend can apply a failed task's outputs too, which keeps that behaviour,
-  or none of them, which keeps the workspace as it was.
+  or none of them, which keeps the workspace as it was. The prototype applies
+  them.
 - **What it costs.** Mounting is cheap, but applying a large output tree is a
   walk of the upper layer and a rename per entry. The prototype is measured on
   a workspace's checks, against Landlock enforce.
@@ -98,6 +101,46 @@ after listing it, so the workspace ends as it would without the sandbox.
   overlay rather than the workspace. Tools that build in place, such as
   incremental compilers keeping state in their outputs, should behave as on
   the workspace.
+
+## What the prototype found
+
+A prototype behind `QK_SANDBOX_OVERLAY=1` runs each command in its own user
+and mount namespace over an overlay of the workspace, with `.git`, qk's
+state, every `node_modules` and the task's scratch directories bound through,
+and applies its upper layer when the task ends. Reads are not restricted in
+it. Measured on Linux 7.2, unprivileged, in a container:
+
+- **The mechanism works without privileges.** overlayfs mounts in a user
+  namespace with `userxattr`. The upper layer records writes, removals as
+  whiteouts, and only where a renamed directory ends up. The layers can live
+  in qk's state inside the workspace: the workspace bound aside is reached
+  through a descriptor held while the overlay is mounted over it.
+- **Changes to the lower layer.** New files and directories, and files
+  changed in place, are seen by a task already running. A directory the task
+  has looked up and that is then replaced whole, by renaming another into its
+  place, is not: the task keeps seeing the old one. Outputs are therefore
+  applied entry by entry, never by swapping a directory in. qk's cache
+  restores swap directories, so a running task that read a restored
+  directory before the restore keeps the old one; the task graph keeps
+  declared inputs out of that, as it already must.
+- **Applying outputs.** A failed task's outputs are applied too, as today.
+- **Cost.** Entering the namespaces and mounting the overlay costs about 4ms
+  per command. Applying 10,000 output files takes 60ms. On a workspace's
+  checks, 69 tasks of tests, type checks and linters across ten projects ran
+  in 13.4–13.6s unsandboxed and 13.9–14.7s over the overlay, all passing,
+  with nothing discarded. Landlock enforce failed one of them, a build
+  creating a declared file output that did not exist yet, and skipped the 19
+  tasks depending on it.
+- **What tools notice.** cargo, fresh and incremental, git through the bound
+  `.git`, Node tools, `mv` and hard links work. `rename(2)` of a directory the
+  lower layer holds fails with `EXDEV`, as unprivileged overlays cannot
+  redirect directories; `mv` falls back to copying, but a tool calling
+  `rename` on an existing directory must too.
+
+What remains for adoption: restricting reads inside the namespace, which
+needs Landlock's rules built there, after the overlay is mounted, as rules
+built outside name the lower layer's files; and a decision on what
+continuous tasks, which may never end, apply and when.
 
 ## Requirements
 
