@@ -66,7 +66,14 @@ what it wrote outside its outputs. A file it writes there and reads, such as
 a version stamp it keeps, is listed once, as written: declaring it an output
 covers both. Creating the directory that holds a declared output is not
 listed: a tool writing `dist/app.js` creates `dist`. Another file written
-there, such as `dist/other.txt`, still is. Reads of workspace packages'
+there, such as `dist/other.txt`, still is. The directories an output lies in
+that do not exist yet are created as the task starts, in audit as in
+enforce, and removed again if the task leaves them empty: a tool that makes
+one by renaming a directory it built beside it, as cargo makes `target` for
+an output in `target/release`, then finds it there rather than writing
+outside its outputs. The output itself is not created, as its path may name
+a file, except by enforce on Linux, which takes a missing output without an
+extension for a directory (see [Linux](#linux)). Reads of workspace packages'
 `package.json`, which package managers and bundlers make to resolve them,
 and of version and package managers' configuration, such as
 `.tool-versions`, are counted once at the top rather than listed for each
@@ -238,7 +245,10 @@ importer, and an importer the task's key counts, is never covered this way.
 - On macOS, qk reads the sandbox's reports from the system log while the
   run lasts; each report is tagged with its task. The log can drop reports
   when many arrive at once, so audit lists what was reported rather than
-  proving nothing else happened. On Linux, audit's reports come from each
+  proving nothing else happened. A task that makes more than 100000 reports,
+  as a package manager installing thousands of files outside its outputs, is
+  listed as not audited, with how many it made, and the other tasks keep
+  theirs. On Linux, audit's reports come from each
   task's recording, and a recording that lost events or could not be decoded
   leaves its task listed as not audited.
 - A task the sandbox cannot be built for, as one whose inputs cannot be
@@ -315,9 +325,9 @@ it with the rest of the task.
 Enforce cannot be combined with `--record` yet.
 
 Landlock holds paths that exist, so each task's rules are built as it
-starts, after its dependencies have written their outputs. An output
-directory that does not exist yet is created then, and removed again if the
-task leaves it empty. A task may write beneath its outputs, but not remove
+starts, after its dependencies have written their outputs. An output that
+does not exist yet and has no extension is taken for a directory and created
+then too, and removed again if the task leaves it empty. A task may write beneath its outputs, but not remove
 or rename an output directory itself, which would need rights over its
 parent: a tool should clear an output directory rather than delete and
 recreate it. Outside the workspace, Landlock allows what exists when the

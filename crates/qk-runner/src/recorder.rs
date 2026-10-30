@@ -143,13 +143,17 @@ impl Recorder {
         let mut diagnostics = BTreeMap::<String, Vec<String>>::new();
         if let Some(watcher) = self.watcher.take() {
             match watcher.finish(self.directory.path()) {
-                Ok((reports, dropped)) => {
-                    if dropped > 0 {
-                        for id in graph.tasks.keys() {
-                            diagnostics.entry(id.clone()).or_default().push(format!(
-                                "system log exceeded 100000 events; {dropped} events omitted"
-                            ));
-                        }
+                Ok((reports, over)) => {
+                    // Only the task that made more than could be kept lost
+                    // events.
+                    for (tag, count) in over {
+                        let Some(task) = tag.strip_prefix(&self.tag_prefix) else {
+                            continue;
+                        };
+                        diagnostics.entry(task.to_owned()).or_default().push(format!(
+                            "it made {count} sandbox events, more than the {} kept of one task; the rest are omitted",
+                            crate::sandbox::TASK_REPORTS
+                        ));
                     }
                     for event in reports {
                         let Some(task) = event.task.strip_prefix(&self.tag_prefix) else {

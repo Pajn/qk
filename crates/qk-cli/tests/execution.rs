@@ -3812,6 +3812,80 @@ fn the_sandbox_lets_a_task_make_the_directory_of_its_outputs() {
     );
 }
 
+/// The missing directories an output lies in are there as the task starts,
+/// in audit and enforce alike: a tool that makes one by renaming a directory
+/// it built beside it, as cargo makes `target`, writes nothing outside its
+/// outputs. Those the task leaves empty are removed again, and under audit a
+/// file output without an extension stays a file.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn the_sandbox_makes_missing_output_directories_before_a_task_runs() {
+    if !can_audit() {
+        return;
+    }
+    let _audit = AUDIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = fixture(json!({
+        "build": {
+            // As cargo: the directory is made beside it and renamed into place
+            // only when it is missing.
+            "command": "test -d target || exit 1; [ -d target ] || { mkdir target.partial && echo tag > target.partial/TAG && mv target.partial target; }; mkdir -p target/release && echo out > target/release/app",
+            "inputs": [],
+            "outputs": ["{projectRoot}/target/release"]
+        },
+        "idle": {
+            "command": "true",
+            "inputs": [],
+            "outputs": ["{projectRoot}/out/nested/dir", "{projectRoot}/out/nested"]
+        },
+        // A file output without an extension stays a path to write a file to.
+        "binary": {
+            "command": "echo bin > bin/app",
+            "inputs": [],
+            "outputs": ["{projectRoot}/bin/app"]
+        }
+    }));
+    for mode in ["--sandbox=audit", "--sandbox=enforce"] {
+        let _ = fs::remove_dir_all(temp.path().join("target"));
+        let report = temp.path().join("sandbox.json");
+        success(run(
+            temp.path(),
+            &[
+                "run-many",
+                "-t",
+                "build,idle",
+                "--skip-cache",
+                mode,
+                "--sandbox-report",
+                report.to_str().unwrap(),
+            ],
+        ));
+        let findings: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+        assert!(
+            findings["tasks"].get("app:build").is_none(),
+            "{mode}: {findings}"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("target/release/app")).unwrap(),
+            "out\n"
+        );
+        assert!(!temp.path().join("target/TAG").exists(), "{mode}");
+        // Left empty, the directories it was given are gone again.
+        assert!(!temp.path().join("out").exists(), "{mode}");
+    }
+    // Under audit, an output without an extension is not taken for a
+    // directory. Landlock, which holds only paths that exist, still makes one.
+    success(run(
+        temp.path(),
+        &["run", "app:binary", "--skip-cache", "--sandbox=audit"],
+    ));
+    assert_eq!(
+        fs::read_to_string(temp.path().join("bin/app")).unwrap(),
+        "bin\n"
+    );
+}
+
 /// A task that runs no command, as `nx:noop` does to group others, did
 /// nothing beyond its declarations: it is not listed as unaudited for having
 /// no recording.
