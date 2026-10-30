@@ -99,6 +99,18 @@ pub struct Findings {
 }
 
 impl Findings {
+    /// Whether it did anything enforce would refuse: beyond reading `.git` and
+    /// dotenv files and installed packages its key leaves out, and writing in
+    /// `.git`, which enforce allows.
+    pub fn went_beyond(&self) -> bool {
+        !self.undeclared_reads.is_empty()
+            || !self.manifest_reads.is_empty()
+            || !self.toolchain_reads.is_empty()
+            || !self.tsconfig_reads.is_empty()
+            || !self.dependency_reads.is_empty()
+            || self.stray_writes.iter().any(|path| !in_git(path))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.undeclared_reads.is_empty()
             && self.manifest_reads.is_empty()
@@ -954,6 +966,12 @@ impl Drop for Sandbox {
         }
         let _ = std::fs::remove_dir_all(&self.directory);
     }
+}
+
+/// Whether `path` is `.git` or lies in it, which enforce lets a task read and
+/// write.
+pub fn in_git(path: &str) -> bool {
+    path == ".git" || path.starts_with(".git/")
 }
 
 /// `.git` and dotenv files, which tasks read outside their keys by design.

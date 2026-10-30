@@ -4688,13 +4688,13 @@ fn the_sandbox_reports_a_package_read_that_the_key_leaves_out() {
     );
     assert!(
         stderr.contains(
-            "1 installed package read, not in its key; name it in its externalDependencies:\n      fallow\n"
+            "1 installed package read, which the sandbox allows, but not in its key; name it in its externalDependencies:\n      fallow\n"
         ),
         "{stderr}"
     );
     assert!(
         stderr.contains(
-            "1 installed package read that nothing its importers install depends on, found through pnpm's hoisting; declare it as a dependency of the package importing it:\n      phantom\n"
+            "1 installed package read that nothing its importers install depends on, which the sandbox allows, found through pnpm's hoisting; declare it as a dependency of the package importing it:\n      phantom\n"
         ),
         "{stderr}"
     );

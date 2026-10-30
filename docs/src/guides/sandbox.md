@@ -53,16 +53,22 @@ Sandbox audit: 1 of 2 tasks went beyond what they declare
   app:build
     1 read outside its inputs:
       other/notes.txt
-    1 read, not in any key:
-      .env
     1 written outside its outputs:
       stray.txt
+  read, which the sandbox allows, but not in their keys: .env (1 task)
 ```
 
 For each task it lists the files read outside its inputs, the TypeScript
 configuration (`tsconfig*.json`) it read outside them, which is likely an
-input, the `.git` and dotenv files it read, which no cache key covers, and
-what it wrote outside its outputs. A file it writes there and reads, such as
+input, and what it wrote outside its outputs. The count of tasks that went
+beyond what they declare leaves out what enforce allows: the `.git` and
+dotenv files tasks read, what they wrote in `.git`, and the installed
+packages their keys leave out, listed below. The `.git` and dotenv files are
+not listed for each task either: the summary ends with each, once, and how
+many tasks read it, then how many wrote in `.git`, and `--sandbox-report`
+lists them for each task, as `unkeyedReads` and among `strayWrites`. A task
+that reads one its inputs do not declare can be restored from the cache
+unchanged when it differs, as one stamping the commit it was built from. A file it writes there and reads, such as
 a version stamp it keeps, is listed once, as written: declaring it an output
 covers both. Creating the directory that holds a declared output is not
 listed: a tool writing `dist/app.js` creates `dist`. Another file written
@@ -78,9 +84,9 @@ extension for a directory (see [Linux](#linux)). Reads of workspace packages'
 and of version and package managers' configuration, such as
 `.tool-versions`, are counted once at the top rather than listed for each
 task; `--sandbox-report` lists them as `manifestReads` and `toolchainReads`.
-Other paths read by many tasks, at least a quarter of those with findings,
-are listed once at the top, under `read by many tasks, likely by the tools
-their commands start through`.
+Other paths read by many tasks, at least three and at least a quarter of
+those that went beyond what they declare, are listed once at the top, under
+`read by many tasks, likely by the tools their commands start through`.
 
 Files read in a project the task's project depends on, directly or not, are
 grouped by that project, as `dependencyReads` in `--sandbox-report`, with how
@@ -111,14 +117,16 @@ an installed package the key leaves out, by name:
 ```text
 $ qk run-many -t lint --sandbox
 …
-Sandbox audit: 1 of 3 tasks went beyond what they declare
+Sandbox audit: 3 tasks kept to what they declare
   app:lint
-    1 installed package read, not in its key; name it in its externalDependencies:
+    1 installed package read, which the sandbox allows, but not in its key; name it in its externalDependencies:
       fallow
 ```
 
-Name the package in the task's `externalDependencies` input, beside any it
-names already; its installations and everything they reach then count. A
+Enforce allows the read, so it does not count the task as going beyond what
+it declares, but no key holds the package: name it in the task's
+`externalDependencies` input, beside any it names already; its installations
+and everything they reach then count. A
 package read by many tasks, as for paths, is listed once at the top with how
 many tasks read it.
 
@@ -132,7 +140,7 @@ a package apart, as `hoistedPackages` in `--sandbox-report`:
 
 ```text
   app:build
-    1 installed package read that nothing its importers install depends on, found through pnpm's hoisting; declare it as a dependency of the package importing it:
+    1 installed package read that nothing its importers install depends on, which the sandbox allows, found through pnpm's hoisting; declare it as a dependency of the package importing it:
       phantom
 ```
 
