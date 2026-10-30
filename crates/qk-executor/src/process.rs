@@ -355,6 +355,7 @@ pub fn execute_captured(
                 .join()
                 .map_err(|_| anyhow::anyhow!("output capture thread panicked"))??;
         }
+        let outcome = outcome.and_then(|outcome| settled(task, capture, outcome));
         // As in Nx, commands that all exit without printing their readyWhen
         // text fail the task: it never became ready, and nothing waiting on
         // it would have started.
@@ -389,6 +390,33 @@ pub fn execute_captured(
             })?;
         }
         outcome
+    })
+}
+
+/// Over an overlay, applies the commands' writes to the workspace as they
+/// end: before the outcome is shown and before the cache stores the task's
+/// outputs from it. What could not be applied is noted in the task's output,
+/// and a task that succeeded fails, as its outputs may be missing; one that
+/// failed, or that was stopped, as a continuous task is, keeps its outcome.
+fn settled(task: &PreparedTask, capture: Option<&Capture>, outcome: Outcome) -> Result<Outcome> {
+    let Some(crate::Confinement::Overlay(overlay)) = &task.sandbox else {
+        return Ok(outcome);
+    };
+    let failed = &overlay.settle().failed;
+    if failed.is_empty() {
+        return Ok(outcome);
+    }
+    let message = format!(
+        "cannot apply what its commands wrote to the workspace: {}",
+        failed.join("; ")
+    );
+    match capture {
+        Some(capture) => capture.note(&format!("Error: {message}"))?,
+        None => crate::status!("qk: {message}"),
+    }
+    Ok(match outcome {
+        Outcome::Success => Outcome::Failed(1),
+        outcome => outcome,
     })
 }
 
@@ -449,6 +477,18 @@ fn spawn(
     };
     if let Some(recording) = &task.recording {
         command = recording.command(index, text, &task.cwd);
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(crate::Confinement::Overlay(overlay)) = &task.sandbox {
+        use std::os::unix::process::CommandExt;
+        // Commands run one after another share an upper layer, so each sees
+        // what those before it wrote; ones run side by side each have their
+        // own, as two overlays cannot share one.
+        let slot = if task.parallel { index } else { 0 };
+        let setup = crate::overlay::Setup::new(overlay, slot, &task.cwd)?;
+        unsafe {
+            command.pre_exec(move || setup.enter());
+        }
     }
     #[cfg(target_os = "linux")]
     if let Some(crate::Confinement::Landlock(ruleset)) = task.sandbox {
