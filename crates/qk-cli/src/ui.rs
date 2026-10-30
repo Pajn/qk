@@ -625,15 +625,18 @@ fn since(later: SystemTime, earlier: SystemTime) -> Duration {
 /// The lines a run ends with: the result, the critical path, and whether a
 /// higher `--parallel` could have helped, judged by how busy the machine was
 /// while ready tasks waited for a slot.
-/// What the sandbox found. Paths read by many tasks, at least a quarter of
-/// those with findings, come first, once: the
+/// What the sandbox found. Paths read by many tasks, at least three and at
+/// least a quarter of those that went beyond what they declare, come first,
+/// once: the
 /// package manager and version manager a command starts through read them,
 /// not the task. Packages read by as many come next, once, each with how many
 /// tasks read it. Then each task's own: the files it read that its key leaves
-/// out, the `.git` and dotenv files it read, the installed packages it read
-/// that its key leaves out, and what it wrote outside its outputs, up to a
-/// few entries each. Tasks restored from the cache did not run, so they are
-/// counted apart.
+/// out, the installed packages it read that its key leaves out, and what it
+/// wrote outside its outputs, up to a few entries each. The `.git` and dotenv
+/// files tasks read, and what they wrote in `.git`, which enforce allows,
+/// neither count a task nor are listed for it: they come last, once, with how
+/// many tasks did each.
+/// Tasks restored from the cache did not run, so they are counted apart.
 pub fn sandbox_summary(sandbox: &qk_runner::SandboxResult, tasks: usize, paint: Paint) -> String {
     use std::collections::{BTreeMap, BTreeSet};
     const SHOWN: usize = 8;
@@ -641,13 +644,19 @@ pub fn sandbox_summary(sandbox: &qk_runner::SandboxResult, tasks: usize, paint: 
         qk_runner::sandbox::Mode::Audit => "audit",
         qk_runner::sandbox::Mode::Enforce => "enforce",
     };
+    // The tasks that did more than read what enforce allows.
+    let beyond = sandbox
+        .findings
+        .values()
+        .filter(|findings| findings.went_beyond())
+        .count();
     let mut readers: BTreeMap<&str, usize> = BTreeMap::new();
     for findings in sandbox.findings.values() {
         for path in &findings.undeclared_reads {
             *readers.entry(path.as_str()).or_insert(0) += 1;
         }
     }
-    let many = |count: usize| count >= 3 && count * 4 >= sandbox.findings.len();
+    let many = |count: usize| count >= 3 && count * 4 >= beyond;
     let shared: BTreeSet<&str> = readers
         .iter()
         .filter(|(_, count)| many(**count))
@@ -705,13 +714,15 @@ pub fn sandbox_summary(sandbox: &qk_runner::SandboxResult, tasks: usize, paint: 
                 || !hoisted.is_empty()
                 || !findings.tsconfig_reads.is_empty()
                 || !findings.dependency_reads.is_empty()
-                || !findings.unkeyed_reads.is_empty()
-                || !findings.stray_writes.is_empty()
+                || findings
+                    .stray_writes
+                    .iter()
+                    .any(|path| !qk_runner::sandbox::in_git(path))
         })
         .collect();
     if tasks == 0 {
         lines.push(format!("Sandbox {mode}: no task ran"));
-    } else if sandbox.findings.is_empty() {
+    } else if beyond == 0 {
         lines.push(format!(
             "Sandbox {mode}: {tasks} task{} kept to what {} declare{}",
             if tasks == 1 { "" } else { "s" },
@@ -720,8 +731,7 @@ pub fn sandbox_summary(sandbox: &qk_runner::SandboxResult, tasks: usize, paint: 
         ));
     } else {
         lines.push(format!(
-            "Sandbox {mode}: {} of {tasks} tasks went beyond what they declare",
-            sandbox.findings.len()
+            "Sandbox {mode}: {beyond} of {tasks} tasks went beyond what they declare"
         ));
     }
     let list = |label: &str, paths: &[&String], lines: &mut Vec<String>, indent: &str| {
@@ -790,7 +800,7 @@ pub fn sandbox_summary(sandbox: &qk_runner::SandboxResult, tasks: usize, paint: 
     let packages = counted(&package_readers);
     list(
         &format!(
-            "installed package{} read by many tasks, not in their keys; name {} in each one's externalDependencies",
+            "installed package{} read by many tasks, which the sandbox allows, but not in their keys; name {} in each one's externalDependencies",
             if packages.len() == 1 { "" } else { "s" },
             if packages.len() == 1 { "it" } else { "them" },
         ),
@@ -841,14 +851,8 @@ pub fn sandbox_summary(sandbox: &qk_runner::SandboxResult, tasks: usize, paint: 
             "    ",
         );
         list(
-            "read, not in any key",
-            &findings.unkeyed_reads.iter().collect::<Vec<_>>(),
-            &mut lines,
-            "    ",
-        );
-        list(
             &format!(
-                "installed package{} read, not in its key; name {} in its externalDependencies",
+                "installed package{} read, which the sandbox allows, but not in its key; name {} in its externalDependencies",
                 if packages.len() == 1 { "" } else { "s" },
                 if packages.len() == 1 { "it" } else { "them" },
             ),
@@ -864,10 +868,59 @@ pub fn sandbox_summary(sandbox: &qk_runner::SandboxResult, tasks: usize, paint: 
         );
         list(
             "written outside its outputs",
-            &findings.stray_writes.iter().collect::<Vec<_>>(),
+            &findings
+                .stray_writes
+                .iter()
+                .filter(|path| !qk_runner::sandbox::in_git(path))
+                .collect::<Vec<_>>(),
             &mut lines,
             "    ",
         );
+    }
+    // Allowed, but a task whose result follows from one, as one stamping the
+    // commit it was built from, can be restored stale: said once, by path.
+    let mut unkeyed: BTreeMap<&str, usize> = BTreeMap::new();
+    for findings in sandbox.findings.values() {
+        for path in &findings.unkeyed_reads {
+            *unkeyed.entry(path.as_str()).or_insert(0) += 1;
+        }
+    }
+    if !unkeyed.is_empty() {
+        let paths: Vec<String> = unkeyed
+            .iter()
+            .map(|(path, tasks)| {
+                format!(
+                    "{path} ({tasks} task{})",
+                    if *tasks == 1 { "" } else { "s" }
+                )
+            })
+            .collect();
+        let shown = paths.len().min(SHOWN);
+        let more = if paths.len() > shown {
+            format!(", and {} more", paths.len() - shown)
+        } else {
+            String::new()
+        };
+        lines.push(paint.dim(&format!(
+            "  read, which the sandbox allows, but not in their keys: {}{more}",
+            paths[..shown].join(", ")
+        )));
+    }
+    let git_writers = sandbox
+        .findings
+        .values()
+        .filter(|findings| {
+            findings
+                .stray_writes
+                .iter()
+                .any(|path| qk_runner::sandbox::in_git(path))
+        })
+        .count();
+    if git_writers > 0 {
+        lines.push(paint.dim(&format!(
+            "  written in .git, which the sandbox allows: {git_writers} task{}",
+            if git_writers == 1 { "" } else { "s" },
+        )));
     }
     for (id, reason) in &sandbox.unsandboxed {
         lines.push(paint.dim(&format!("  {id} ran unsandboxed: {reason}")));
@@ -917,7 +970,7 @@ pub fn sandbox_summary(sandbox: &qk_runner::SandboxResult, tasks: usize, paint: 
 /// them, so a package found them through pnpm's hoisting.
 fn hoisted_label(by_many: bool, count: usize) -> String {
     format!(
-        "installed package{} read {}that nothing {} importers install depends on, found through pnpm's hoisting; declare {} as a dependency of the package importing it",
+        "installed package{} read {}that nothing {} importers install depends on, which the sandbox allows, found through pnpm's hoisting; declare {} as a dependency of the package importing it",
         if count == 1 { "" } else { "s" },
         if by_many { "by many tasks, " } else { "" },
         if by_many { "their" } else { "its" },
@@ -1787,12 +1840,72 @@ mod tests {
         let text = sandbox_summary(&sandbox, 3, Paint(false));
         assert_eq!(
             text,
-            "Sandbox audit: 3 of 3 tasks went beyond what they declare
-  1 installed package read by many tasks, not in their keys; name it in each one's externalDependencies:
+            "Sandbox audit: 3 tasks kept to what they declare
+  1 installed package read by many tasks, which the sandbox allows, but not in their keys; name it in each one's externalDependencies:
     eslint (3 tasks)
   a:lint
-    1 installed package read, not in its key; name it in its externalDependencies:
+    1 installed package read, which the sandbox allows, but not in its key; name it in its externalDependencies:
       fallow
+"
+        );
+    }
+
+    #[test]
+    fn counts_reads_enforce_allows_apart_from_what_went_beyond() {
+        let findings = |unkeyed: &[&str], reads: &[&str]| {
+            let set = |paths: &[&str]| paths.iter().map(|path| path.to_string()).collect();
+            qk_runner::sandbox::Findings {
+                unkeyed_reads: set(unkeyed),
+                undeclared_reads: set(reads),
+                ..Default::default()
+            }
+        };
+        let sandbox = |tasks: Vec<(&str, qk_runner::sandbox::Findings)>| qk_runner::SandboxResult {
+            mode: qk_runner::sandbox::Mode::Audit,
+            findings: tasks
+                .into_iter()
+                .map(|(id, findings)| (id.to_owned(), findings))
+                .collect(),
+            unsandboxed: BTreeMap::new(),
+            refused: BTreeMap::new(),
+            packages_unchecked: BTreeMap::new(),
+            audited: BTreeSet::new(),
+            restored: BTreeSet::new(),
+        };
+        let text = sandbox_summary(
+            &sandbox(vec![
+                (
+                    "a:build",
+                    qk_runner::sandbox::Findings {
+                        stray_writes: [".git/index".to_owned()].into(),
+                        ..findings(&[".git"], &[])
+                    },
+                ),
+                ("b:build", findings(&[".env", ".git"], &["notes.txt"])),
+            ]),
+            3,
+            Paint(false),
+        );
+        assert_eq!(
+            text,
+            "Sandbox audit: 1 of 3 tasks went beyond what they declare
+  b:build
+    1 read outside its inputs:
+      notes.txt
+  read, which the sandbox allows, but not in their keys: .env (1 task), .git (2 tasks)
+  written in .git, which the sandbox allows: 1 task
+"
+        );
+        // Reading only what enforce allows, the tasks kept to what they declare.
+        let text = sandbox_summary(
+            &sandbox(vec![("a:build", findings(&[".git"], &[]))]),
+            2,
+            Paint(false),
+        );
+        assert_eq!(
+            text,
+            "Sandbox audit: 2 tasks kept to what they declare
+  read, which the sandbox allows, but not in their keys: .git (1 task)
 "
         );
     }
