@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # Write isolation for the Linux sandbox
@@ -47,8 +47,8 @@ are never kept.
 
 ## Decision
 
-We will try an overlay backend for Linux enforce that isolates writes, and
-adopt it if the prototype below meets its criteria:
+Linux enforce runs tasks over overlays that isolate their writes, as the
+prototype below showed it can:
 
 1. **Each task runs in its own mount namespace**, inside an unprivileged user
    namespace, with the workspace mounted as overlayfs: the workspace as the
@@ -137,10 +137,18 @@ it. Measured on Linux 7.2, unprivileged, in a container:
   redirect directories; `mv` falls back to copying, but a tool calling
   `rename` on an existing directory must too.
 
-What remains for adoption: restricting reads inside the namespace, which
-needs Landlock's rules built there, after the overlay is mounted, as rules
-built outside name the lower layer's files; and a decision on what
-continuous tasks, which may never end, apply and when.
+What the prototype left, the backend now does: reads are held by Landlock,
+its rules built in each command's namespace once the overlay is mounted, as
+rules built outside would name the lower layer's files, with paths outside
+the workspace opened beforehand and passed down; a continuous task's writes
+are applied when it stops; commands run one after another share an upper
+layer, so each sees what those before it wrote. qk probes for an overlay as
+the run starts and holds tasks by Landlock alone, saying why, where it cannot
+have one, or with `QK_SANDBOX_OVERLAY=0`. With reads restricted, the same
+checks ran in 13.9–14.3s over the overlay, all passing, once a file named
+whole in `ignoreReads` and made by a task depended on during the run was
+allowed as its task starts rather than only if it existed as the run
+started, which Landlock alone needed too.
 
 ## Requirements
 
