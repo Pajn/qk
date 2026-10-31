@@ -253,3 +253,88 @@ where
     }
     Ok(rules.fd)
 }
+
+/// Opens `path` for a rule, or `None` where it does not exist.
+fn open_path(path: &Path) -> Result<Option<OwnedFd>> {
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(file) => Ok(Some(file.into())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("cannot open {}", path.display())),
+    }
+}
+
+/// A task's rule set over an overlay, as [`rules`] builds it, but for a
+/// command to build in its own namespace once the overlay is mounted: paths
+/// outside the workspace are opened now, as the overlay leaves them as they
+/// are, and those in it are listed for the command to open, as the
+/// overlay's. Writes anywhere in the workspace reach the overlay, to be
+/// judged as the task ends, so the workspace may be written everywhere but
+/// read only where `rules` would allow it. `through` lists the paths bound
+/// through the overlay, which may be read and written.
+pub fn overlay_rules<'a, F, W>(
+    paths: &Paths<'a, F, W>,
+    through: &[PathBuf],
+) -> Result<qk_executor::OverlayRules>
+where
+    F: Iterator<Item = &'a PathBuf> + Clone,
+    W: Iterator<Item = &'a PathBuf> + Clone,
+{
+    let handled = handled(abi()?);
+    let all = u64::MAX;
+    let mut outside = Vec::new();
+    let mut inside = Vec::new();
+    let mut add = |path: &Path, rights: u64, unlinked: bool| -> Result<()> {
+        if path.starts_with(paths.root) {
+            inside.push((path.to_owned(), rights, unlinked));
+        } else if let Some(fd) = open_path(path)? {
+            outside.push((fd, rights));
+        }
+        Ok(())
+    };
+    add(Path::new("/"), READ_DIR, false)?;
+    let mut ancestor = PathBuf::from("/");
+    for component in paths.root.components().skip(1) {
+        let next = ancestor.join(component);
+        let entries = std::fs::read_dir(&ancestor)
+            .with_context(|| format!("cannot list {}", ancestor.display()))?;
+        for entry in entries.flatten() {
+            if entry.path() != next {
+                add(&entry.path(), all, false)?;
+            }
+        }
+        ancestor = next;
+    }
+    if ancestor != paths.root {
+        bail!("cannot walk down to {}", paths.root.display());
+    }
+    for directory in paths.read_directories {
+        add(directory, READ_FILE | READ_DIR | EXECUTE, false)?;
+    }
+    for file in paths.read_files.clone() {
+        add(file, READ_FILE | EXECUTE, paths.unlinked.contains(file))?;
+    }
+    for tree in paths.read_trees {
+        add(
+            tree,
+            READ_FILE | READ_DIR | EXECUTE,
+            paths.unlinked.contains(tree),
+        )?;
+    }
+    for tree in paths.write_trees.clone() {
+        add(tree, all, false)?;
+    }
+    for tree in through {
+        add(tree, all, false)?;
+    }
+    Ok(qk_executor::OverlayRules {
+        handled,
+        file_rights: FILE_RIGHTS,
+        outside,
+        workspace: handled & !(READ_FILE | READ_DIR | EXECUTE),
+        inside,
+    })
+}

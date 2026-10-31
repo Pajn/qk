@@ -170,9 +170,10 @@ reported.
 
 ## Enforce
 
-`--sandbox=enforce` refuses those reads and writes instead, so a task that
-depends on what it does not declare fails, and only its declared outputs can
-change in the workspace. Reading and writing `.git` and reading dotenv files
+`--sandbox=enforce` refuses those reads instead, so a task that depends on
+what it does not declare fails, and only its declared outputs can change in
+the workspace. A write outside them is refused as it happens on macOS, and
+on Linux is discarded when the task ends, and listed (see [Linux](#linux)). Reading and writing `.git` and reading dotenv files
 stay allowed, and so do reading and writing qk's own state for the
 worktree, where warm state lives.
 
@@ -221,7 +222,10 @@ literal parts name. A glob ending in `/**`, as `**/.cache/**`, allows each
 directory it names whole, so a profile stays small however many files the
 directories hold, and a file made in one during the run may be read too.
 Any other glob, or one with a negated group such as `!(private)`, which can
-leave out a path deeper down, allows the files it matches one by one. The
+leave out a path deeper down, allows the files it matches one by one. A path
+named whole, with no pattern in it, is allowed as the task starts though it
+did not exist as the run started, so a file a task it depends on makes, as
+code it generates, may be read. The
 walk never enters `.git`, `.qk` or `node_modules`, and a directory holding
 one of them is not allowed whole: the directories beside it are. A symbolic
 link is left out, since allowing it would allow whatever it leads to. Seatbelt
@@ -294,10 +298,43 @@ read is a file the task opened for reading, and a write one it opened for
 writing, created, renamed or removed. A task whose recording is incomplete
 is listed as unaudited, with why, rather than with part of its findings.
 
-Enforce uses Landlock, in Linux 5.13 and later, which is available to any
-process, without root and inside containers. It can refuse but not report:
-a refused access fails the task with `Permission denied` rather than being
-listed.
+Enforce runs each of a task's commands in a user and mount namespace of its
+own, over an overlay of the workspace, as
+[ADR 0002](https://github.com/Pajn/qk/blob/main/docs/adr/0002-write-isolation-on-linux.md)
+lays out. What a command writes in the workspace lands in an upper layer of
+the overlay, which qk reads as the task ends: what lies within its outputs,
+warm paths and scratch directories, written, created or removed, is applied
+to the workspace before the cache stores its outputs and before any task
+depending on it starts; anything else is listed as written outside its
+outputs and not kept. Nothing is applied through a symbolic link in the
+workspace: a directory a command made where another left a link replaces
+the link. Writes are judged by
+what the task leaves, not as they happen: a tool may write a temporary file
+anywhere, or make a directory beside its output and rename it into place.
+Commands run one after another share an upper layer, and ones run side by
+side each have their own. A continuous task's writes are applied when it
+stops. `.git`, qk's state, every `node_modules` and the
+task's scratch directories are bound through the overlay, so what a task
+writes there reaches the workspace at once, as without enforce. Reads are
+held by Landlock, built in each command's namespace once the overlay is
+mounted; a refused read fails the task with `Permission denied`.
+
+The overlay needs unprivileged user namespaces, which Linux 5.11 and later
+offer to any process where the system allows them; some distributions keep
+them from unprivileged processes, as Ubuntu does through AppArmor from
+24.04. Where a command cannot run over an overlay, enforce holds tasks by
+Landlock alone, in Linux 5.13 and later, and the summary says why; so does
+`QK_SANDBOX_OVERLAY=0`. Landlock refuses a write outside the outputs as it
+happens, failing the task.
+
+An overlay keeps a task from seeing what another task running beside it
+writes until that task ends. A directory another task replaces whole while
+it runs, as a restore from the cache does, may still look to it as it was if
+it looked at it before; a task does not depend on what a task running beside
+it writes, so this matters only for what it reads undeclared. Renaming a
+directory that was there as the task started, rather than one it made, fails
+with `Invalid cross-device link` under an unprivileged overlay; `mv` copies
+instead, and a tool calling `rename` must too.
 
 ### Auditing recorded runs
 
@@ -333,12 +370,13 @@ it with the rest of the task.
 Enforce cannot be combined with `--record` yet.
 
 Landlock holds paths that exist, so each task's rules are built as it
-starts, after its dependencies have written their outputs. An output that
-does not exist yet and has no extension is taken for a directory and created
-then too, and removed again if the task leaves it empty. A task may write beneath its outputs, but not remove
-or rename an output directory itself, which would need rights over its
-parent: a tool should clear an output directory rather than delete and
-recreate it. Outside the workspace, Landlock allows what exists when the
-task starts; an entry created later directly in a directory above the
-workspace, such as a new file in the home directory when the workspace is
-below it, is refused.
+starts, after its dependencies have written their outputs. Held by Landlock
+alone, an output that does not exist yet and has no extension is taken for a
+directory and created then too, and removed again if the task leaves it
+empty, and a file output that does not exist yet cannot be created. A task
+may write beneath its outputs, but not remove or rename an output directory
+itself, which would need rights over its parent: a tool should clear an
+output directory rather than delete and recreate it. Outside the workspace,
+Landlock allows what exists when the task starts; an entry created later
+directly in a directory above the workspace, such as a new file in the home
+directory when the workspace is below it, is refused.
