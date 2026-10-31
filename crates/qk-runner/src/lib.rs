@@ -71,6 +71,9 @@ pub struct SandboxResult {
     pub audited: BTreeSet<String>,
     /// Tasks restored from the cache, which did not run to be checked.
     pub restored: BTreeSet<String>,
+    /// Linux enforce: why tasks were held by Landlock rather than run over
+    /// overlays, where they were.
+    pub fallback: Option<String>,
 }
 
 /// Runs a task without the cache, keeping its log for `qk show log` as a
@@ -1094,6 +1097,12 @@ pub fn run(
                         active.remove(&id);
                         stops.remove(&id);
                         held.remove(&id);
+                        // Over an overlay, what it wrote within its outputs
+                        // reaches the workspace now, before any task that
+                        // depends on it starts.
+                        if let Some(sandbox) = &sandbox {
+                            sandbox.settle(&id);
+                        }
                         // A task that ends before its check passes cannot
                         // serve the tasks waiting for it.
                         if waiters.contains_key(id.as_str()) {
@@ -1274,6 +1283,7 @@ pub fn run(
                 packages_unchecked: finished.packages_unchecked,
                 audited: finished.audited,
                 restored: finished.restored,
+                fallback: finished.fallback,
             })
         })
         .transpose()?;

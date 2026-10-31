@@ -867,7 +867,11 @@ pub fn sandbox_summary(sandbox: &qk_runner::SandboxResult, tasks: usize, paint: 
             "    ",
         );
         list(
-            "written outside its outputs",
+            match sandbox.mode {
+                qk_runner::sandbox::Mode::Audit => "written outside its outputs",
+                // Over an overlay, enforce lets it finish and keeps none of it.
+                qk_runner::sandbox::Mode::Enforce => "written outside its outputs, not kept",
+            },
             &findings
                 .stray_writes
                 .iter()
@@ -920,6 +924,11 @@ pub fn sandbox_summary(sandbox: &qk_runner::SandboxResult, tasks: usize, paint: 
         lines.push(paint.dim(&format!(
             "  written in .git, which the sandbox allows: {git_writers} task{}",
             if git_writers == 1 { "" } else { "s" },
+        )));
+    }
+    if let Some(reason) = &sandbox.fallback {
+        lines.push(paint.dim(&format!(
+            "  held by Landlock rather than run over overlays: {reason}"
         )));
     }
     for (id, reason) in &sandbox.unsandboxed {
@@ -1836,6 +1845,7 @@ mod tests {
             packages_unchecked: BTreeMap::new(),
             audited: BTreeSet::new(),
             restored: BTreeSet::new(),
+            fallback: None,
         };
         let text = sandbox_summary(&sandbox, 3, Paint(false));
         assert_eq!(
@@ -1871,6 +1881,7 @@ mod tests {
             packages_unchecked: BTreeMap::new(),
             audited: BTreeSet::new(),
             restored: BTreeSet::new(),
+            fallback: None,
         };
         let text = sandbox_summary(
             &sandbox(vec![
@@ -1950,6 +1961,7 @@ mod tests {
             packages_unchecked: BTreeMap::new(),
             audited: BTreeSet::new(),
             restored: BTreeSet::new(),
+            fallback: None,
         };
         assert_eq!(
             sandbox_summary(&sandbox, 2, Paint(false)),
@@ -1977,6 +1989,7 @@ mod tests {
                 .collect(),
             audited: BTreeSet::new(),
             restored: BTreeSet::new(),
+            fallback: None,
         };
         let text = sandbox_summary(&sandbox, 10, Paint(false));
         assert_eq!(
@@ -2004,6 +2017,7 @@ mod tests {
             packages_unchecked: BTreeMap::new(),
             audited: ["a:build".to_owned(), "b:build".to_owned()].into(),
             restored: ["c:build".to_owned(), "d:build".to_owned()].into(),
+            fallback: None,
         };
         assert_eq!(
             sandbox_summary(&sandbox, 4, Paint(false)),

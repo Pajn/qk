@@ -28,10 +28,18 @@ jobs:
       - name: Install input recorder
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y strace
+      # Linux enforce runs tasks over overlays in user namespaces, which
+      # Ubuntu's AppArmor keeps from unprivileged processes by default.
+      - name: Allow unprivileged user namespaces
+        if: runner.os == 'Linux'
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      # Every failing test binary, not only the first.
+      # Every failing test binary, not only the first. On Linux, the overlay
+      # tests fail rather than skip where overlays cannot be had.
       - run: cargo test --workspace --locked --no-fail-fast
+        env:
+          QK_TEST_REQUIRE_OVERLAY: ${{ runner.os == 'Linux' && '1' || '' }}
 
   # The tests that record what tasks do, for Ultracache, input analysis and the
   # sandbox's audit, with each recorder. `check` records
@@ -56,8 +64,12 @@ jobs:
       # possible; QK_RECORDER keeps the eBPF job from falling back to it.
       - name: Install strace
         run: sudo apt-get update && sudo apt-get install -y strace
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: cargo test --locked -p qk-cli --test ultracache --no-fail-fast
       - run: cargo test --locked -p qk-cli --test execution --no-fail-fast -- input sandbox warm_suggest
+        env:
+          QK_TEST_REQUIRE_OVERLAY: "1"
       - run: cargo test --locked -p qk-trace -p qk-executor -p qk-runner --no-fail-fast
 
   # The committed kernel program objects are what their source builds to.

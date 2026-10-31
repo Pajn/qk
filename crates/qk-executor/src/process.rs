@@ -242,7 +242,7 @@ pub fn execute_captured(
     // Takes the terminal back from an interactive command, however it ends.
     let _terminal = (task.interactive && task.commands.len() == 1)
         .then(terminal::Foreground::take_back_on_drop);
-    std::thread::scope(|scope| {
+    let outcome = std::thread::scope(|scope| {
         let mut readers = Vec::new();
         let outcome = (|| {
             // Dropped after `children`, once the interactive command is gone.
@@ -389,7 +389,13 @@ pub fn execute_captured(
             })?;
         }
         outcome
-    })
+    });
+    // Over an overlay, the commands' writes reach the workspace as they end:
+    // before the cache stores the task's outputs from it.
+    if let Some(crate::Confinement::Overlay(overlay)) = &task.sandbox {
+        overlay.settle();
+    }
+    outcome
 }
 
 /// A command running `text` in the shell tasks run in: `/bin/sh` on Unix,
@@ -449,6 +455,18 @@ fn spawn(
     };
     if let Some(recording) = &task.recording {
         command = recording.command(index, text, &task.cwd);
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(crate::Confinement::Overlay(overlay)) = &task.sandbox {
+        use std::os::unix::process::CommandExt;
+        // Commands run one after another share an upper layer, so each sees
+        // what those before it wrote; ones run side by side each have their
+        // own, as two overlays cannot share one.
+        let slot = if task.parallel { index } else { 0 };
+        let setup = crate::overlay::Setup::new(overlay, slot, &task.cwd)?;
+        unsafe {
+            command.pre_exec(move || setup.enter());
+        }
     }
     #[cfg(target_os = "linux")]
     if let Some(crate::Confinement::Landlock(ruleset)) = task.sandbox {
