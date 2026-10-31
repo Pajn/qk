@@ -41,6 +41,9 @@ tempfile = "3"
 rusty-s3 = "0.10"
 rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }
 ureq = "3"
+rustls-native-certs = "0.8"
+# ureq builds it with ring; the default provider, aws-lc-rs, would add a C build.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 terminal_size = "0.4"
 url = "2"

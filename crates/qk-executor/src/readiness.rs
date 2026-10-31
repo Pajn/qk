@@ -585,24 +585,41 @@ fn probe_url(url: &str, deadline: Instant) -> bool {
     let Some((url, local)) = target(url) else {
         return false;
     };
+    // A request to this machine skips proxies and accepts a self-signed
+    // development certificate.
+    let (proxy, tls) = if local {
+        (
+            None,
+            ureq::tls::TlsConfig::builder().disable_verification(true),
+        )
+    } else {
+        (
+            proxy_for(&url, &env_var),
+            ureq::tls::TlsConfig::builder().root_certs(roots().clone()),
+        )
+    };
+    answers(&url, proxy, tls.build(), deadline)
+}
+
+/// Whether the url answers ready, through `proxy`, with `tls` deciding which
+/// certificates to trust.
+fn answers(
+    url: &str,
+    proxy: Option<ureq::Proxy>,
+    tls: ureq::tls::TlsConfig,
+    deadline: Instant,
+) -> bool {
     let status = |url: &str| -> Option<u16> {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return None;
         }
-        let mut config = ureq::Agent::config_builder()
+        let config = ureq::Agent::config_builder()
             .max_redirects(0)
             .http_status_as_error(false)
-            .timeout_global(Some(left));
-        if local {
-            // A request to this machine skips proxies and accepts a
-            // self-signed development certificate.
-            config = config.proxy(None).tls_config(
-                ureq::tls::TlsConfig::builder()
-                    .disable_verification(true)
-                    .build(),
-            );
-        }
+            .timeout_global(Some(left))
+            .proxy(proxy.clone())
+            .tls_config(tls.clone());
         let agent: ureq::Agent = config.build().into();
         agent
             .get(url)
@@ -611,7 +628,7 @@ fn probe_url(url: &str, deadline: Instant) -> bool {
             .map(|response| response.status().as_u16())
     };
     let ready = |status: u16| (200..=403).contains(&status);
-    match status(&url) {
+    match status(url) {
         Some(404) => {
             let uri: Option<ureq::http::Uri> = url.parse().ok();
             if uri.as_ref().is_some_and(|uri| uri.path() == "/") {
@@ -624,6 +641,142 @@ fn probe_url(url: &str, deadline: Instant) -> bool {
         Some(found) => ready(found),
         None => false,
     }
+}
+
+fn env_var(names: &[&str]) -> String {
+    names
+        .iter()
+        .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
+        .unwrap_or_default()
+}
+
+/// The proxy the environment sets for the url's scheme, unless `NO_PROXY`
+/// covers its host. qk matches `NO_PROXY` itself, since ureq's match misses
+/// ports, IP ranges and a domain's subdomains, and it ignores the scheme
+/// when it picks a proxy.
+fn proxy_for(url: &str, var: &dyn Fn(&[&str]) -> String) -> Option<ureq::Proxy> {
+    let uri: ureq::http::Uri = url.parse().ok()?;
+    let https = uri.scheme_str() == Some("https");
+    let port = uri.port_u16().unwrap_or(if https { 443 } else { 80 });
+    if no_proxy_matches(&var(&["NO_PROXY", "no_proxy"]), uri.host()?, port) {
+        return None;
+    }
+    let proxy = if https {
+        var(&["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"])
+    } else {
+        var(&["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"])
+    };
+    ureq::Proxy::new(&proxy).ok()
+}
+
+/// Whether an entry of `NO_PROXY` covers the host: `*`, a domain with its
+/// subdomains (`example.com` or `.example.com`), only the subdomains
+/// (`*.example.com`), an IP address, or a CIDR range. Any entry but a range
+/// can end in a port, to match only that port.
+fn no_proxy_matches(no_proxy: &str, host: &str, port: u16) -> bool {
+    let host = unbracketed(host).trim_end_matches('.');
+    let ip = host.parse::<IpAddr>().ok();
+    no_proxy.split(',').map(str::trim).any(|entry| {
+        if let Some((network, bits)) = entry.split_once('/') {
+            return ip.is_some_and(|ip| in_range(ip, network, bits));
+        }
+        let (pattern, entry_port) = split_port(entry);
+        if entry_port.is_some_and(|entry_port| entry_port != port) {
+            return false;
+        }
+        if pattern == "*" {
+            return true;
+        }
+        match ip {
+            Some(ip) => unbracketed(pattern)
+                .parse::<IpAddr>()
+                .is_ok_and(|entry| entry.to_canonical() == ip.to_canonical()),
+            None => match pattern.strip_prefix("*.") {
+                Some(domain) => is_subdomain(host, domain),
+                None => {
+                    let domain = pattern.strip_prefix('.').unwrap_or(pattern);
+                    !domain.is_empty()
+                        && (host.eq_ignore_ascii_case(domain) || is_subdomain(host, domain))
+                }
+            },
+        }
+    })
+}
+
+/// An unbracketed IPv6 address has no port: its last group would read as one.
+fn split_port(entry: &str) -> (&str, Option<u16>) {
+    match entry.rsplit_once(':') {
+        Some((host, port)) if host.starts_with('[') || !host.contains(':') => match port.parse() {
+            Ok(port) => (host, Some(port)),
+            Err(_) => (entry, None),
+        },
+        _ => (entry, None),
+    }
+}
+
+fn is_subdomain(host: &str, domain: &str) -> bool {
+    let (host, domain) = (host.to_ascii_lowercase(), domain.to_ascii_lowercase());
+    !domain.is_empty()
+        && host
+            .strip_suffix(&domain)
+            .is_some_and(|rest| rest.ends_with('.'))
+}
+
+fn in_range(ip: IpAddr, network: &str, bits: &str) -> bool {
+    let (Ok(network), Ok(bits)) = (unbracketed(network).parse::<IpAddr>(), bits.parse::<u32>())
+    else {
+        return false;
+    };
+    match (ip.to_canonical(), network.to_canonical()) {
+        (IpAddr::V4(ip), IpAddr::V4(network)) if bits <= 32 => {
+            let mask = u32::MAX.checked_shl(32 - bits).unwrap_or(0);
+            u32::from(ip) & mask == u32::from(network) & mask
+        }
+        (IpAddr::V6(ip), IpAddr::V6(network)) if bits <= 128 => {
+            let mask = u128::MAX.checked_shl(128 - bits).unwrap_or(0);
+            u128::from(ip) & mask == u128::from(network) & mask
+        }
+        _ => false,
+    }
+}
+
+/// The certificates a url probe trusts: the operating system's, which
+/// `SSL_CERT_FILE` or `SSL_CERT_DIR` replace, and those in the file that
+/// `NODE_EXTRA_CA_CERTS` names, as Node reads it. A file that can't be read
+/// adds none. With no certificate from either, the roots built into qk.
+/// Loaded once per run, as Node reads them once per process.
+fn roots() -> &'static ureq::tls::RootCerts {
+    static ROOTS: std::sync::OnceLock<ureq::tls::RootCerts> = std::sync::OnceLock::new();
+    ROOTS.get_or_init(|| {
+        let mut certs: Vec<ureq::tls::Certificate<'static>> =
+            rustls_native_certs::load_native_certs()
+                .certs
+                .iter()
+                .map(|der| ureq::tls::Certificate::from_der(der).to_owned())
+                .collect();
+        if let Some(path) = std::env::var_os("NODE_EXTRA_CA_CERTS") {
+            certs.extend(extra_roots(Path::new(&path)));
+        }
+        if certs.is_empty() {
+            ureq::tls::RootCerts::WebPki
+        } else {
+            ureq::tls::RootCerts::new_with_certs(&certs)
+        }
+    })
+}
+
+/// The certificates in a PEM file, up to a section that doesn't parse.
+fn extra_roots(path: &Path) -> Vec<ureq::tls::Certificate<'static>> {
+    let Ok(pem) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    ureq::tls::parse_pem(&pem)
+        .map_while(Result::ok)
+        .filter_map(|item| match item {
+            ureq::tls::PemItem::Certificate(cert) => Some(cert),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Runs the command through the shell at the workspace root, with `env` in
@@ -1005,5 +1158,205 @@ mod tests {
             &format!("http://127.0.0.1:{port}/missing"),
             deadline
         ));
+    }
+
+    #[test]
+    fn no_proxy_takes_every_form_nx_documents() {
+        for (no_proxy, host, port, matches) in [
+            ("*", "app.example.com", 80, true),
+            ("*", "10.0.0.5", 80, true),
+            ("example.com", "example.com", 80, true),
+            ("example.com", "a.b.example.com", 80, true),
+            (".Example.COM", "app.example.com", 80, true),
+            ("example.com", "badexample.com", 80, false),
+            ("*.example.com", "app.example.com", 80, true),
+            ("*.example.com", "example.com", 80, false),
+            ("localhost, *.example.com", "app.example.com.", 80, true),
+            ("app.example.com:8080", "app.example.com", 8080, true),
+            ("app.example.com:8080", "app.example.com", 9090, false),
+            ("*.example.com:443", "app.example.com", 443, true),
+            ("10.0.0.5", "10.0.0.5", 80, true),
+            ("10.0.0.5:8080", "10.0.0.6", 8080, false),
+            ("[fd00::1]:8080", "[fd00::1]", 8080, true),
+            ("fd00::1", "[fd00::1]", 80, true),
+            ("fd00::1:2:3", "[fd00::1:2]", 3, false),
+            ("10.0.0.0/8", "10.200.3.4", 80, true),
+            ("10.0.0.0/8", "11.0.0.1", 80, false),
+            ("10.0.0.0/8", "ten.example.com", 80, false),
+            ("fd00::/16", "[fd00:1::5]", 80, true),
+            ("0.0.0.0/0", "192.0.2.1", 80, true),
+            ("", "example.com", 80, false),
+            ("a.test, ", "example.com", 80, false),
+        ] {
+            assert_eq!(
+                no_proxy_matches(no_proxy, host, port),
+                matches,
+                "{no_proxy:?} {host}:{port}"
+            );
+        }
+    }
+
+    fn vars<'a>(set: &'a [(&'a str, &'a str)]) -> impl Fn(&[&str]) -> String + 'a {
+        move |names: &[&str]| {
+            names
+                .iter()
+                .find_map(|name| set.iter().find(|(set, _)| set == name))
+                .map(|(_, value)| value.to_string())
+                .unwrap_or_default()
+        }
+    }
+
+    #[test]
+    fn a_url_takes_the_proxy_for_its_scheme_unless_no_proxy_covers_it() {
+        let proxy = |url: &str, set: &[(&str, &str)]| {
+            proxy_for(url, &vars(set)).map(|proxy| proxy.uri().to_string())
+        };
+        let both = [
+            ("HTTP_PROXY", "http://plain:3128"),
+            ("https_proxy", "http://secure:3128"),
+        ];
+        assert_eq!(
+            proxy("http://app.example.com/", &both).as_deref(),
+            Some("http://plain:3128/")
+        );
+        assert_eq!(
+            proxy("https://app.example.com/", &both).as_deref(),
+            Some("http://secure:3128/")
+        );
+        assert_eq!(
+            proxy(
+                "https://app.example.com/",
+                &[("HTTP_PROXY", "http://plain:3128")]
+            ),
+            None
+        );
+        assert_eq!(
+            proxy(
+                "https://app.example.com/",
+                &[("ALL_PROXY", "http://any:3128")]
+            )
+            .as_deref(),
+            Some("http://any:3128/")
+        );
+        let skipped = [
+            ("HTTP_PROXY", "http://plain:3128"),
+            ("NO_PROXY", "*.example.com"),
+        ];
+        assert_eq!(proxy("http://app.example.com/", &skipped), None);
+        let other_port = [
+            ("HTTP_PROXY", "http://plain:3128"),
+            ("no_proxy", "app.example.com:8080"),
+        ];
+        assert!(proxy("http://app.example.com/", &other_port).is_some());
+    }
+
+    /// A proxy that opens every tunnel asked of it, answers the request sent
+    /// through it with 200 itself, and counts the connections.
+    fn proxy_server(connections: std::sync::Arc<AtomicU8>) -> u16 {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                connections.fetch_add(1, Ordering::SeqCst);
+                let head = |stream: &mut std::net::TcpStream| {
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while stream.read(&mut byte).is_ok_and(|n| n == 1) {
+                        head.push(byte[0]);
+                        if head.ends_with(b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    head
+                };
+                if head(&mut stream).starts_with(b"CONNECT ") {
+                    let _ = stream.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n");
+                    head(&mut stream);
+                }
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n");
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn a_remote_url_is_requested_through_the_proxy() {
+        let requests = std::sync::Arc::new(AtomicU8::new(0));
+        let port = proxy_server(requests.clone());
+        let proxy = format!("http://127.0.0.1:{port}");
+        // Only the proxy can answer: the name never resolves.
+        let url = "http://app.example.invalid:8080/";
+        let deadline = || Instant::now() + Duration::from_secs(5);
+        let tls = || ureq::tls::TlsConfig::builder().build();
+        let through = proxy_for(url, &vars(&[("HTTP_PROXY", &proxy)]));
+        assert!(answers(url, through, tls(), deadline()));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        let around = proxy_for(
+            url,
+            &vars(&[("HTTP_PROXY", &proxy), ("NO_PROXY", "*.example.invalid")]),
+        );
+        assert!(!answers(url, around, tls(), deadline()));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_url_trusts_the_certificates_node_extra_ca_certs_names() {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        use std::io::{Read, Write};
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/readiness/fixtures");
+        let config = std::sync::Arc::new(
+            rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from_pem_file(fixtures.join("server.pem")).unwrap()],
+                PrivateKeyDer::from_pem_file(fixtures.join("server.key")).unwrap(),
+            )
+            .unwrap(),
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let Ok(connection) = rustls::ServerConnection::new(config.clone()) else {
+                    continue;
+                };
+                let mut tls = rustls::StreamOwned::new(connection, &mut stream);
+                let mut request = Vec::new();
+                let mut byte = [0u8; 1];
+                while tls.read(&mut byte).is_ok_and(|n| n == 1) {
+                    request.push(byte[0]);
+                    if request.ends_with(b"\r\n\r\n") {
+                        let _ = tls.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n");
+                        let _ = tls.flush();
+                        break;
+                    }
+                }
+            }
+        });
+        let url = format!("https://127.0.0.1:{port}/");
+        let deadline = || Instant::now() + Duration::from_secs(5);
+        let trusting =
+            |roots: ureq::tls::RootCerts| ureq::tls::TlsConfig::builder().root_certs(roots).build();
+        let extra = extra_roots(&fixtures.join("ca.pem"));
+        assert_eq!(extra.len(), 1);
+        assert!(answers(
+            &url,
+            None,
+            trusting(ureq::tls::RootCerts::new_with_certs(&extra)),
+            deadline()
+        ));
+        assert!(!answers(
+            &url,
+            None,
+            trusting(ureq::tls::RootCerts::WebPki),
+            deadline()
+        ));
+        assert!(extra_roots(&fixtures.join("absent.pem")).is_empty());
     }
 }
