@@ -177,6 +177,41 @@ fn copy_blob(source: &Path, destination: &Path) -> Result<String> {
     Ok(hash)
 }
 
+/// Whether a blob stands at `target` after replacing it went as `renamed`
+/// says. Where an open blob cannot be replaced, it is kept only if it holds
+/// its content: a restore may take a blob verified earlier this boot without
+/// hashing it.
+fn kept_or_replaced(renamed: std::io::Result<()>, target: &Path, hash: &str) -> Result<()> {
+    match renamed {
+        Ok(()) => Ok(()),
+        Err(_) if target.is_file() && digest_file(target).is_ok_and(|held| held == hash) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Copies `blob` from the cache to where a restore puts it, and says whether
+/// the copy holds the blob's contents. The copy is hashed unless the blob has
+/// hashed right since the machine started: a clone shares the blob's data, so
+/// hashing it again reads the blob again for nothing.
+pub(crate) fn restore_blob(
+    source: &Path,
+    destination: &Path,
+    blob: &str,
+    verified: &crate::verified::Verified,
+) -> Result<bool> {
+    let large = fs::metadata(source)?.len() > SMALL_BLOB_LIMIT as u64;
+    if large && verified.contains(blob) {
+        fs::copy(source, destination)?;
+        return Ok(true);
+    }
+    let matches = copy_blob_contents(source, destination)? == blob;
+    // A small blob is hashed from memory as it is copied, at no cost to note.
+    if matches && large {
+        verified.record(blob);
+    }
+    Ok(matches)
+}
+
 pub(crate) fn copy_blob_contents(source: &Path, destination: &Path) -> Result<String> {
     let bytes = if fs::metadata(source)?.len() <= SMALL_BLOB_LIMIT as u64 {
         small_blob_snapshot(File::open(source)?)?
@@ -265,13 +300,8 @@ impl Cache {
         let temporary = staging.as_ref().unwrap().path().join(index.to_string());
         let hash = copy_blob(source, &temporary)?;
         let target = self.root.join("blobs").join(&hash);
-        // Replacing is atomic and cheaper than re-reading an existing blob. Where an
-        // open blob cannot be replaced, keep it: restores verify it before use.
-        if let Err(error) = fs::rename(&temporary, &target)
-            && !target.is_file()
-        {
-            return Err(error.into());
-        }
+        // Replacing is atomic and cheaper than re-reading an existing blob.
+        kept_or_replaced(fs::rename(&temporary, &target), &target, &hash)?;
         Ok(hash)
     }
 
@@ -615,7 +645,7 @@ impl Cache {
         let stage = |files: &[(&str, u32, PathBuf)]| -> Result<()> {
             for (blob, mode, destination) in files {
                 let source = self.root.join("blobs").join(blob);
-                if copy_blob_contents(&source, destination)? != *blob {
+                if !restore_blob(&source, destination, blob, self.verified())? {
                     bail!("corrupt cached artifact");
                 }
                 // Before its mode, which may prevent opening the file.
@@ -1057,6 +1087,99 @@ fn outputs_held(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_replacement_keeps_only_a_blob_that_holds_its_content() {
+        let cache = tempfile::tempdir().unwrap();
+        let hash = blake3::hash(b"contents").to_hex().to_string();
+        let target = cache.path().join(&hash);
+        let failed = || Err(std::io::Error::other("cannot replace an open file"));
+        assert!(kept_or_replaced(Ok(()), &target, &hash).is_ok());
+        // Nothing there, a damaged blob, or a directory in its place: the error.
+        assert!(kept_or_replaced(failed(), &target, &hash).is_err());
+        fs::write(&target, b"damaged").unwrap();
+        assert!(kept_or_replaced(failed(), &target, &hash).is_err());
+        fs::remove_file(&target).unwrap();
+        fs::create_dir(&target).unwrap();
+        assert!(kept_or_replaced(failed(), &target, &hash).is_err());
+        fs::remove_dir(&target).unwrap();
+        // One that holds its content is kept.
+        fs::write(&target, b"contents").unwrap();
+        assert!(kept_or_replaced(failed(), &target, &hash).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_blob_that_cannot_be_replaced_is_kept_only_if_it_holds_its_content() {
+        use std::os::unix::fs::PermissionsExt;
+        // A read-only directory is what stops the replacement, and root
+        // writes in it regardless.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let cache = tempfile::tempdir().unwrap();
+        let store = Cache::new(cache.path().to_owned());
+        store.initialize().unwrap();
+        let source = cache.path().join("output");
+        fs::write(&source, b"contents").unwrap();
+        let blob = blake3::hash(b"contents").to_hex().to_string();
+        let blobs = cache.path().join("blobs");
+        let target = blobs.join(&blob);
+        let read_only = |blobs: &Path, read_only: bool| {
+            fs::set_permissions(
+                blobs,
+                fs::Permissions::from_mode(if read_only { 0o555 } else { 0o755 }),
+            )
+            .unwrap()
+        };
+        // A damaged blob the store cannot replace fails the save.
+        fs::write(&target, b"damaged").unwrap();
+        read_only(&blobs, true);
+        let damaged = store.put_blob(&source);
+        read_only(&blobs, false);
+        assert!(damaged.is_err());
+        // One that holds its content needs no replacing.
+        fs::write(&target, b"contents").unwrap();
+        read_only(&blobs, true);
+        let kept = store.put_blob(&source);
+        read_only(&blobs, false);
+        assert_eq!(kept.unwrap(), blob);
+    }
+
+    #[test]
+    fn a_large_blob_is_hashed_on_its_first_restore_of_a_boot_only() {
+        let cache = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let contents = vec![7u8; SMALL_BLOB_LIMIT * 4];
+        let blob = blake3::hash(&contents).to_hex().to_string();
+        let source = cache.path().join(&blob);
+        fs::write(&source, &contents).unwrap();
+        let verified = crate::verified::Verified::load(cache.path());
+        let restore = |name: &str, verified: &crate::verified::Verified| {
+            restore_blob(&source, &out.path().join(name), &blob, verified).unwrap()
+        };
+        // A blob the disk damaged is caught on its first restore.
+        fs::write(&source, vec![8u8; SMALL_BLOB_LIMIT * 4]).unwrap();
+        assert!(!restore("damaged", &verified));
+        fs::write(&source, &contents).unwrap();
+        assert!(restore("first", &verified));
+        if !verified.available() {
+            // Where the boot cannot be told, every restore hashes.
+            assert!(!verified.contains(&blob));
+            return;
+        }
+        assert!(verified.contains(&blob));
+        // Verified once, it is not hashed again until the next boot: a change
+        // to it since, which only the disk could make, goes unnoticed.
+        fs::write(&source, vec![9u8; SMALL_BLOB_LIMIT * 4]).unwrap();
+        assert!(restore("second", &verified));
+        // A new boot's list starts empty, and hashes it again.
+        fs::remove_dir_all(cache.path().join("verified")).unwrap();
+        assert!(!restore(
+            "after boot",
+            &crate::verified::Verified::load(cache.path())
+        ));
+    }
 
     #[test]
     fn differences_name_each_output_that_differs_and_count_the_rest() {

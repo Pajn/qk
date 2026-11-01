@@ -37,7 +37,7 @@ use serde_json::Value;
 
 use crate::paths::{self, Outputs};
 use crate::record::{self, Artifact, WarmGroup, WarmRecord, validate_link};
-use crate::store::{copy_blob_contents, mode, set_mode, set_modified, symlink};
+use crate::store::{mode, restore_blob, set_mode, set_modified, symlink};
 use crate::{Cache, hash::digest_file, profile};
 
 /// When restored files say they were written. Warm state comes from another
@@ -1639,7 +1639,7 @@ impl Cache {
         let restore =
             |(_, blob, mode, destination, modified): &PendingFile| -> Result<RestoredFile> {
                 let source = self.root.join("blobs").join(blob);
-                if copy_blob_contents(&source, destination)? != *blob {
+                if !restore_blob(&source, destination, blob, self.verified())? {
                     // A corrupt copy must not stay where the tool would use it.
                     let _ = fs::remove_file(destination);
                     bail!("corrupt blob {blob}");
