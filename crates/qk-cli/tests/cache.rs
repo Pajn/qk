@@ -151,6 +151,82 @@ fn a_warm_save_over_its_max_size_is_not_restored() {
     assert_eq!(run("8", "100").0, "");
 }
 
+/// `qk:warm.configurations` keeps warm state only in the configurations it
+/// names: elsewhere nothing is restored or saved, and `{warm}` is not set.
+#[cfg(unix)]
+#[test]
+fn warm_state_applies_only_in_the_configurations_it_names() {
+    let fixture = Fixture::new(json!({
+        "executor": "nx:run-commands",
+        "options": {
+            "command": "echo \"[$TOOL_CACHE] $(cat tool/marker 2>/dev/null || echo none)\"; mkdir -p tool && echo \"$NAME\" > tool/marker",
+        },
+        "cache": false,
+        "qk:warm": {
+            "paths": ["{projectRoot}/tool"],
+            "env": {"TOOL_CACHE": "{warm}/tool"},
+            "configurations": ["kept"]
+        },
+        "configurations": {
+            "kept": {"env": {"NAME": "kept"}},
+            "skipped": {"env": {"NAME": "skipped"}}
+        }
+    }));
+    // Each run starts without the path, so what it finds was restored, and
+    // reports `{warm}` and what it found.
+    let run = |configuration: Option<&str>| {
+        let _ = fs::remove_dir_all(fixture.root.join("tool"));
+        let mut args = vec!["run", "app:build"];
+        args.extend(configuration.map_or_else(Vec::new, |name| vec!["-c", name]));
+        // What `{warm}` sets, never what the test inherits.
+        let output = success(
+            fixture
+                .command(&fixture.root, &args)
+                .env_remove("TOOL_CACHE")
+                .output()
+                .unwrap(),
+        );
+        let line = stdout(&output)
+            .lines()
+            .find(|line| line.contains('['))
+            .unwrap()
+            .to_owned();
+        let (warm, found) = line.split_once("] ").unwrap();
+        let warm = warm.rsplit_once('[').unwrap().1;
+        (warm.to_owned(), found.trim().to_owned())
+    };
+    let (warm, found) = run(Some("kept"));
+    assert!(warm.ends_with("/tool"), "{warm}");
+    assert_eq!(found, "none");
+    // Saved, and restored on the next run of that configuration.
+    assert_eq!(run(Some("kept")).1, "kept");
+    // Elsewhere nothing is restored, `{warm}` is unset, and nothing is saved:
+    // a second run of `skipped` would otherwise restore what the first wrote.
+    assert_eq!(run(Some("skipped")), (String::new(), "none".to_owned()));
+    assert_eq!(run(Some("skipped")), (String::new(), "none".to_owned()));
+    assert_eq!(run(None), (String::new(), "none".to_owned()));
+    assert_eq!(run(None), (String::new(), "none".to_owned()));
+    assert_eq!(run(Some("kept")).1, "kept");
+    // A malformed list is an error in every configuration.
+    fs::write(
+        fixture.root.join("project.json"),
+        json!({"name": "app", "targets": {"build": {
+            "command": "true",
+            "qk:warm": {"env": {"TOOL_CACHE": "{warm}"}, "configurations": "kept"},
+            "configurations": {"kept": {}, "skipped": {}}
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    let output = fixture.build(&fixture.root, &["-c", "skipped"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("qk:warm.configurations must be an array"),
+        "{}",
+        stderr(&output)
+    );
+}
+
 #[test]
 fn warm_environment_paths_are_absolute_in_each_worktree() {
     let fixture = Fixture::new(json!({

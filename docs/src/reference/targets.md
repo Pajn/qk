@@ -288,8 +288,9 @@ change the task's key; `ignoreReads` changes what its recordings key.
 ## `qk:warm`
 
 An object describing reusable scratch state, or an array of them restored and
-saved separately. In an array, at most one entry omits `group`, no group is
-named twice and no variable is set by two entries. See
+saved separately. In an array, among the entries that apply in a
+configuration, at most one omits `group`, no group is named twice and no
+variable is set by two. See
 [Several entries](../guides/warm-state.md#several-entries). Each object has:
 
 | Field | Type | Default |
@@ -308,6 +309,7 @@ named twice and no variable is set by two entries. See
 | `save` | `"wait"` or `"background"` | `"wait"`; `"background"` saves after the task has reported |
 | `restore` | `"whole"` or `"each-path"` | `"whole"`; `"each-path"` restores each missing path from `paths` and leaves those on disk; see [Restoring paths one by one](../guides/warm-state.md#restoring-paths-one-by-one) |
 | `prefetch` | boolean | `false`; fetch the remote save as the run starts, while the task's dependencies run; see [Fetching remote state ahead](../guides/warm-state.md#fetching-remote-state-ahead) |
+| `configurations` | array of configuration names | Every configuration; otherwise only those named keep this entry's state, and a run in another configuration, or none, neither restores nor saves it; see [Only some configurations](../guides/warm-state.md#only-some-configurations) |
 
 Other fields are ignored, as in `qk:threads`, and `qk doctor` reports them.
 Put it beside `inputs` and `outputs`, rather than in executor `options`.
