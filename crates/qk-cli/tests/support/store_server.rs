@@ -30,6 +30,8 @@ pub struct State {
     /// Answer the next entry commit with 422 for its blobs stored apart,
     /// forgetting them, as a store that lost them would.
     pub fail_commit_once: bool,
+    /// Answer every write with 503, as a store that cannot take them now.
+    pub refuse_writes: bool,
     pub latency: Duration,
 }
 
@@ -198,6 +200,12 @@ fn serve(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
                     Vec::new(),
                     br#"{"error":"unauthorized","message":"no"}"#.to_vec(),
                 )
+            } else if writes && state.refuse_writes {
+                (
+                    503,
+                    Vec::new(),
+                    br#"{"error":"busy","message":"not now"}"#.to_vec(),
+                )
             } else if writes && token != WRITE_TOKEN {
                 (
                     403,
@@ -283,6 +291,18 @@ fn handle(
                 }
             }
             done()
+        }
+        ("POST", "blobs/missing") => {
+            let asked: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            let missing: Vec<&str> = asked["blobs"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .filter(|hash| !state.blobs.contains_key(*hash))
+                .collect();
+            let answer = serde_json::json!({ "missing": missing });
+            (200, Vec::new(), answer.to_string().into_bytes())
         }
         (method, path) if path.starts_with("blobs/") => {
             let hash = &path["blobs/".len()..];
