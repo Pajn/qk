@@ -378,7 +378,9 @@ fn missing_working_directory_fails_its_task_when_it_runs() {
 fn configuration_cwd_tokens_and_environment_precedence() {
     let mut target = helper_target("record", "result");
     target["options"]["cwd"] = json!("{workspaceRoot}/working directory");
-    target["env"] = json!({"QK_TEST_TARGET":"top", "QK_TEST_OVERRIDE":"top"});
+    // An `env` beside `options` is not Nx's, so it neither sets a variable nor
+    // replaces an inherited one.
+    target["env"] = json!({"QK_TEST_TARGET":"top", "QK_TEST_PARENT":"top"});
     target["options"]["env"]["QK_TEST_OVERRIDE"] = json!("options");
     target["options"]["env"]["QK_TEST_BASE_ONLY"] = json!("base");
     target["configurations"] = json!({"prod":{"env":{
@@ -401,6 +403,7 @@ fn configuration_cwd_tokens_and_environment_precedence() {
             .env("QK_TEST_MODE", "record")
             .env("QK_TEST_ID", "result")
             .env_remove("QK_TEST_BASE_ONLY")
+            .env_remove("QK_TEST_TARGET")
             .env("QK_TEST_PARENT", "parent")
             .output()
             .unwrap(),
@@ -422,13 +425,13 @@ fn configuration_cwd_tokens_and_environment_precedence() {
         ("QK_TEST_FILE", "base"),
         ("QK_TEST_LOCAL", "local"),
         ("QK_TEST_PARENT", "parent"),
-        ("QK_TEST_TARGET", "top"),
         ("QK_TEST_OVERRIDE", "configuration"),
         ("QK_TEST_PROJECT", "app:."),
     ] {
         assert_eq!(result["env"][key], expected, "{key}");
     }
     assert!(result["env"].get("QK_TEST_BASE_ONLY").is_none());
+    assert!(result["env"].get("QK_TEST_TARGET").is_none());
 }
 
 #[test]
@@ -544,16 +547,22 @@ fn script_executor_reads_only_its_script_like_nx() {
     )
     .unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-    success(run(temp.path(), &["run", "app:test"]));
+    success(
+        command(temp.path(), &["run", "app:test"])
+            .env_remove("FROM_OPTION")
+            .env_remove("FROM_TARGET")
+            .output()
+            .unwrap(),
+    );
     let cwd = fs::read_to_string(temp.path().join("manager-cwd")).unwrap();
     assert_eq!(
         Path::new(cwd.trim()).canonicalize().unwrap(),
         project.canonicalize().unwrap()
     );
-    // Its options' env is not read; the target-level env is qk's own.
+    // Neither its options' env nor an `env` beside them is read.
     assert_eq!(
         fs::read_to_string(temp.path().join("manager-env")).unwrap(),
-        "[] [set]\n"
+        "[] []\n"
     );
 }
 

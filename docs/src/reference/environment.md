@@ -3,7 +3,7 @@
 ## Environment precedence
 
 Environment precedence, highest first: `FORCE_COLOR` from `color: true`,
-configuration `env`, `options.env`, target-level `env` (a qk extension), the variables Nx sets
+configuration `env`, `options.env`, the variables Nx sets
 for every task, the inherited process environment, the task's dotenv files
 in Nx's order: in the
 project root and then the workspace root, `.env.<target>.<configuration>`,

@@ -208,13 +208,6 @@ A boolean, default `true`. `false` runs the task alone, waiting for all
 other tasks, including continuous ones. No other task starts while it runs.
 Graphs requiring it to overlap a continuous dependency are rejected.
 
-## `env`
-
-A target-level object of environment variables, for every executor. This is
-a qk extension; Nx ignores it. Executor `options.env` and selected
-configuration `env` can override it. See
-[Environment precedence](environment.md#environment-precedence).
-
 ## `qk:env`
 
 The environment the task inherits: an array of entries, each the name of an

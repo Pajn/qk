@@ -905,12 +905,7 @@ pub fn prepare(
             dotenv::load(std::slice::from_ref(&path), &mut env)?;
         }
     }
-    // A target-level `env` is a qk extension, for every executor.
-    let option_env = options.get("env").filter(|_| run_commands);
-    for values in [definition.extra.get("env"), option_env]
-        .into_iter()
-        .flatten()
-    {
+    if let Some(values) = options.get("env").filter(|_| run_commands) {
         for (name, value) in values.as_object().context("env must be an object")? {
             if name.is_empty() || name.contains(['=', '\0']) {
                 bail!("invalid environment variable name");
