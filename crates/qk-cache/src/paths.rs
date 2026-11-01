@@ -137,13 +137,18 @@ pub fn clear_worktree_state(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Where the cache is: as in Nx, `NX_CACHE_DIRECTORY`, then nx.json
-/// `cacheDirectory`, then the default runner's
-/// `tasksRunnerOptions.default.options.cacheDirectory`, relative to the
-/// workspace root, with qk's entries in
-/// `qk/v1` inside so they never mix with Nx's; otherwise
-/// [`cache_directory`], shared by the repository's worktrees.
+/// Where the cache is: `QK_CACHE_DIRECTORY`, qk's alone, with its entries in
+/// `v1` inside; then, as in Nx, `NX_CACHE_DIRECTORY`, nx.json
+/// `cacheDirectory` and the default runner's
+/// `tasksRunnerOptions.default.options.cacheDirectory`, with qk's entries in
+/// `qk/v1` inside so they never mix with Nx's; each relative to the workspace
+/// root. Otherwise [`cache_directory`], shared by the repository's worktrees.
 pub fn cache_location(workspace: &Workspace) -> PathBuf {
+    if let Some(directory) =
+        std::env::var_os("QK_CACHE_DIRECTORY").filter(|value| !value.is_empty())
+    {
+        return resolved(&workspace.root.join(directory).join("v1"));
+    }
     let configured = std::env::var_os("NX_CACHE_DIRECTORY")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
@@ -161,9 +166,30 @@ pub fn cache_location(workspace: &Workspace) -> PathBuf {
                 .map(PathBuf::from)
         });
     match configured {
-        Some(directory) => workspace.root.join(directory).join("qk/v1"),
+        Some(directory) => resolved(&workspace.root.join(directory).join("qk/v1")),
         None => cache_directory(&workspace.root),
     }
+}
+
+/// `path` with its `.` and `..` resolved by name, so that it compares equal to
+/// the workspace's own paths: a snapshot leaves the cache out by its path.
+fn resolved(path: &Path) -> PathBuf {
+    let mut resolved = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir
+                if matches!(
+                    resolved.components().next_back(),
+                    Some(Component::Normal(_))
+                ) =>
+            {
+                resolved.pop();
+            }
+            part => resolved.push(part),
+        }
+    }
+    resolved
 }
 
 /// The cache's default place, in the repository's common git directory.
@@ -1286,6 +1312,20 @@ fn join_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{Outputs, Pattern, dot_git, normalize, resolved_outputs, verbatim_free};
+
+    #[test]
+    fn a_cache_location_has_its_dot_segments_resolved() {
+        use std::path::{Path, PathBuf};
+        assert_eq!(
+            super::resolved(Path::new("/work/repo/elsewhere/../qk-cache/./v1")),
+            PathBuf::from("/work/repo/qk-cache/v1")
+        );
+        // Above where it starts there is nothing to go back to; `..` is kept.
+        assert_eq!(
+            super::resolved(Path::new("../cache")),
+            PathBuf::from("../cache")
+        );
+    }
     use qk_config::Workspace;
     use qk_taskgraph::{Request, TaskGraph};
     use serde_json::{Value, json};

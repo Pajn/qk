@@ -236,7 +236,8 @@ See [Run history](../guides/history.md) for retention limits and interpretation.
 ## Cache administration
 
 `cache path` prints the location without creating it. `cache prune` uses
-`--max-size`, else `NX_MAX_CACHE_SIZE`, else `maxCacheSize`, else the default
+`--max-size`, else `QK_MAX_CACHE_SIZE`, else `NX_MAX_CACHE_SIZE`, else
+`maxCacheSize`, else the default
 disk fraction. See [Storage limits](../guides/remote-cache.md).
 
 `reset`, or its alias `clear-cache`, removes the local cache and this

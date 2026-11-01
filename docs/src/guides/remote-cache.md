@@ -173,7 +173,8 @@ Worker over R2, and documents the protocol in its `PROTOCOL.md`.
 
 ## Storage limits
 
-The cache stays under a size limit: `NX_MAX_CACHE_SIZE`, else nx.json
+The cache stays under a size limit: `QK_MAX_CACHE_SIZE`, else
+`NX_MAX_CACHE_SIZE`, else nx.json
 `maxCacheSize`, else a tenth of the disk holding it (100GB when the disk's
 size cannot be read), as in Nx's code; its documentation's 10GB cap is not
 in the code. Sizes are a number of bytes with an optional `KB`, `MB` or `GB`,
@@ -194,3 +195,8 @@ Nx: a path relative to the workspace root, with qk's entries in `qk/v1`
 inside it so they never mix with Nx's, and so CI steps that save and restore
 that directory keep working. A relative path gives each worktree its own
 cache; the run history and each worktree's state stay in the git directory.
+
+`QK_CACHE_DIRECTORY` and `QK_MAX_CACHE_SIZE` set the same for qk alone, ahead
+of the Nx settings, so a machine running both can give each its own place and
+limit. `QK_CACHE_DIRECTORY` is qk's own, so its entries go in `v1` directly
+inside it.

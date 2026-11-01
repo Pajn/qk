@@ -31,6 +31,8 @@ fn command(root: &Path, args: &[&str]) -> Command {
         .args(args);
     command.env_remove("NX_PARALLEL");
     command.env_remove("NX_CACHE_DIRECTORY");
+    command.env_remove("QK_CACHE_DIRECTORY");
+    command.env_remove("QK_MAX_CACHE_SIZE");
     command.env_remove("NX_LEGACY_AFFECTED");
     // Output styles follow CI; tests that want it set it themselves.
     command.env_remove("CI");
@@ -2976,6 +2978,8 @@ fn on_terminal(root: &Path, line: &str, env: &[(&str, &str)], input: &[u8]) -> S
         .current_dir(root)
         .env_remove("NX_PARALLEL")
         .env_remove("NX_CACHE_DIRECTORY")
+        .env_remove("QK_CACHE_DIRECTORY")
+        .env_remove("QK_MAX_CACHE_SIZE")
         .env_remove("CI")
         .env_remove("GITHUB_ACTIONS")
         .envs(env.iter().copied());
