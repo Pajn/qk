@@ -15,6 +15,7 @@ mod remote;
 pub mod scratch;
 mod store;
 pub mod ultracache;
+mod verified;
 pub mod warm;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -130,6 +131,9 @@ pub struct Cache {
     cleared: std::sync::Mutex<std::collections::BTreeSet<String>>,
     /// Remote warm saves fetched ahead, by warm identity.
     prefetches: OnceLock<warm::Prefetches>,
+    /// The blobs hashed since the machine started, which restores need not
+    /// hash again.
+    verified: OnceLock<verified::Verified>,
     /// The tasks whose outputs this run left exactly as they were.
     kept: std::sync::Mutex<std::collections::BTreeSet<String>>,
     /// Warm state being saved in the background.
@@ -307,12 +311,19 @@ impl Cache {
             cold: false,
             cleared: Default::default(),
             prefetches: OnceLock::new(),
+            verified: OnceLock::new(),
             kept: Default::default(),
             saves: Default::default(),
             cleanup: Default::default(),
             workspace_outputs: OnceLock::new(),
             projects: OnceLock::new(),
         }
+    }
+
+    /// The blobs hashed since the machine started, read on first use.
+    pub(crate) fn verified(&self) -> &verified::Verified {
+        self.verified
+            .get_or_init(|| verified::Verified::load(&self.root))
     }
 
     /// Records verified executions without configuring or using result stores.
