@@ -72,6 +72,8 @@ fn qk(root: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
         .arg(root)
         .args(args)
         .env_remove("NX_CACHE_DIRECTORY")
+        .env_remove("QK_CACHE_DIRECTORY")
+        .env_remove("QK_MAX_CACHE_SIZE")
         .env_remove("QK_RECORD")
         .env_remove("CI")
         // Only a test's own credentials reach the store.

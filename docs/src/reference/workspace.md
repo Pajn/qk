@@ -164,7 +164,8 @@ The settings Nx's JavaScript support reads, which qk reads too:
 ## `cacheDirectory`
 
 A path relative to the workspace root, or an absolute path, overriding the
-default cache location. `NX_CACHE_DIRECTORY` takes precedence; without either,
+default cache location. `QK_CACHE_DIRECTORY`, then `NX_CACHE_DIRECTORY`, take
+precedence; without any of them,
 `tasksRunnerOptions.default.options.cacheDirectory` is read, as in Nx. qk stores its
 entries in `qk/v1` beneath this directory so it can coexist with Nx.
 History and worktree state keep their default locations. A relative override
@@ -184,7 +185,8 @@ Nx nor qk: Nx's own `parallel` setting replaces it.
 ## `maxCacheSize`
 
 A byte count or size such as `"2GB"`. Units `KB`, `MB` and `GB` use powers of
-1024; `0` means unlimited. `NX_MAX_CACHE_SIZE` takes precedence. The default
+1024; `0` means unlimited. `QK_MAX_CACHE_SIZE`, then `NX_MAX_CACHE_SIZE`, take
+precedence. The default
 is a tenth of the disk holding the cache. Entries unused for a week are
 evicted whatever the limit. See [Storage limits](../guides/remote-cache.md).
 

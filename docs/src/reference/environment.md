@@ -165,6 +165,8 @@ similar patterns in a value it substitutes, is not reproduced.
 | `NX_SKIP_REMOTE_CACHE=true`, `NX_DISABLE_REMOTE_CACHE=true` | Local cache only |
 | `NX_CACHE_DIRECTORY` | Override `nx.json`'s `cacheDirectory` |
 | `NX_MAX_CACHE_SIZE` | Override `nx.json`'s `maxCacheSize` |
+| `QK_CACHE_DIRECTORY` | Move qk's cache alone, ahead of `NX_CACHE_DIRECTORY` and `cacheDirectory`; its entries go in `v1` inside |
+| `QK_MAX_CACHE_SIZE` | qk's cache limit alone, ahead of `NX_MAX_CACHE_SIZE` and `maxCacheSize` |
 | `NX_POWERPACK_CACHE_MODE` | Override the remote store's `localMode`/`ciMode` |
 | `QK_REMOTE_UPLOAD_MODE` | Override the remote store's `uploadMode`: `wait` or `background` |
 | `QK_REMOTE_BLOB_THRESHOLD` | The compressed size from which an output is stored apart, such as `256KB`, or `off`; 1 MiB by default |

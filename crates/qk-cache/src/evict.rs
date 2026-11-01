@@ -60,17 +60,19 @@ pub fn parse_size(text: &str) -> Result<u64> {
     Ok((number * factor as f64) as u64)
 }
 
-/// The size limit: `NX_MAX_CACHE_SIZE`, then nx.json `maxCacheSize`, then, as
-/// in Nx, a tenth of the disk holding the cache, or 100GB when the disk's
-/// size cannot be read. `None` when the limit is 0, which means unlimited.
+/// The size limit: `QK_MAX_CACHE_SIZE`, qk's alone, then `NX_MAX_CACHE_SIZE`,
+/// then nx.json `maxCacheSize`, then, as in Nx, a tenth of the disk holding the
+/// cache, or 100GB when the disk's size cannot be read. `None` when the limit
+/// is 0, which means unlimited.
 pub fn max_size(configured: Option<&Value>, cache: &Path) -> Result<Option<u64>> {
-    let configured = match std::env::var("NX_MAX_CACHE_SIZE") {
-        Ok(value) => Some(value),
-        Err(_) => configured.map(|value| match value {
-            Value::String(text) => text.clone(),
-            other => other.to_string(),
-        }),
-    };
+    let configured =
+        match std::env::var("QK_MAX_CACHE_SIZE").or_else(|_| std::env::var("NX_MAX_CACHE_SIZE")) {
+            Ok(value) => Some(value),
+            Err(_) => configured.map(|value| match value {
+                Value::String(text) => text.clone(),
+                other => other.to_string(),
+            }),
+        };
     let limit = match configured {
         Some(text) => parse_size(&text)?,
         None => cache

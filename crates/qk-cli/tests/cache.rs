@@ -326,6 +326,8 @@ impl Fixture {
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env_remove("NX_PARALLEL")
             .env_remove("NX_CACHE_DIRECTORY")
+            .env_remove("QK_CACHE_DIRECTORY")
+            .env_remove("QK_MAX_CACHE_SIZE")
             // Output styles follow CI; tests that want it set it themselves.
             .env_remove("CI")
             .env_remove("GITHUB_ACTIONS")
@@ -1288,6 +1290,17 @@ fn eviction_removes_least_recently_used_entries() {
     fs::write(fixture.root.join("src/input.txt"), "two\n").unwrap();
     assert!(stderr(&success(fixture.build(&fixture.root, &[]))).contains("cache miss"));
     assert_eq!(fixture.runs(), 3);
+
+    // QK_MAX_CACHE_SIZE, qk's alone, takes precedence over NX_MAX_CACHE_SIZE:
+    // unlimited here, so nothing is evicted.
+    let output = fixture
+        .command(&fixture.root, &["run", "app:build"])
+        .env("QK_MAX_CACHE_SIZE", "0")
+        .env("NX_MAX_CACHE_SIZE", "1")
+        .output()
+        .unwrap();
+    assert!(!stderr(&success(output)).contains("evicted"));
+    assert!(cache_size(&fixture) > 0);
 
     // Runs keep the cache under NX_MAX_CACHE_SIZE.
     let output = fixture
@@ -6124,6 +6137,25 @@ fn the_cache_directory_can_be_set_as_in_nx() {
         }
         success(command.output().unwrap())
     };
+    // QK_CACHE_DIRECTORY, qk's alone, takes precedence, with the cache in v1
+    // inside it. Its `..` is resolved, so the cache stays out of the task's
+    // own inputs and the second run is a hit.
+    let qk_env = [
+        ("QK_CACHE_DIRECTORY", "elsewhere/../qk-cache"),
+        ("NX_CACHE_DIRECTORY", "shared-cache"),
+    ];
+    run(&qk_env);
+    assert!(cached(&run(&qk_env)));
+    assert!(fixture.root.join("qk-cache/v1").is_dir());
+    assert!(!fixture.root.join("shared-cache").exists());
+    let path = stdout(&success(
+        fixture
+            .command(&fixture.root, &["cache", "path"])
+            .envs(qk_env)
+            .output()
+            .unwrap(),
+    ));
+    assert!(Path::new(path.trim()).ends_with("qk-cache/v1"), "{path}");
     let env = [("NX_CACHE_DIRECTORY", "shared-cache")];
     run(&env);
     // The cache inside the workspace is not an input of the task it caches.

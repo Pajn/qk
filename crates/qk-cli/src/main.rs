@@ -736,7 +736,7 @@ enum CacheCommand {
     Path,
     /// Evict least recently used entries until the cache fits its size limit.
     Prune {
-        /// Size limit for this prune, as NX_MAX_CACHE_SIZE takes it; 0 removes
+        /// Size limit for this prune, as QK_MAX_CACHE_SIZE takes it; 0 removes
         /// everything. Defaults to the configured limit.
         #[arg(long)]
         max_size: Option<String>,
