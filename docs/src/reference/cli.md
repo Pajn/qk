@@ -235,6 +235,10 @@ See [Run history](../guides/history.md) for retention limits and interpretation.
 
 ## Cache administration
 
+`store proxy --upstream <url> --dir <path> [--listen <address>] [--max-size <size>]`
+serves a store server's protocol to nearby machines, keeping outputs on its
+disk. Experimental; see [Store proxy](../guides/remote-cache.md#store-proxy).
+
 `cache path` prints the location without creating it. `cache prune` uses
 `--max-size`, else `QK_MAX_CACHE_SIZE`, else `NX_MAX_CACHE_SIZE`, else
 `maxCacheSize`, else the default
