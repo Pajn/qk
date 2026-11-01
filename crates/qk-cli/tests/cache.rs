@@ -92,6 +92,65 @@ fn warm_environment_helper() {
     std::process::exit(0);
 }
 
+/// A save over `maxSize` is not stored, and the save before it is not
+/// restored either: where the paths are missing, the next run starts cold and
+/// saves again from there; where they are on disk, they stay and are not
+/// saved until removed.
+#[cfg(unix)]
+#[test]
+fn a_warm_save_over_its_max_size_is_not_restored() {
+    let fixture = Fixture::new(json!({
+        "command": "ls .tool 2>/dev/null | tr '\\n' ' '; echo; mkdir -p .tool && head -c $SIZE /dev/zero > .tool/run-$RUN",
+        "cache": false,
+        "inputs": [],
+        "qk:warm": {"paths": ["{projectRoot}/.tool"], "maxSize": "10KB"}
+    }));
+    let root = &fixture.root;
+    let run_keeping = |number: &str, size: &str, keep: bool| {
+        if !keep {
+            let _ = fs::remove_dir_all(root.join(".tool"));
+        }
+        let output = success(
+            fixture
+                .command(root, &["run", "app:build", "--output-style", "stream"])
+                .env("RUN", number)
+                .env("SIZE", size)
+                .output()
+                .unwrap(),
+        );
+        let text = stdout(&output);
+        let restored = text
+            .lines()
+            .find_map(|line| line.strip_prefix("app: "))
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        (
+            restored,
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    let run = |number: &str, size: &str| run_keeping(number, size, false);
+    assert_eq!(run("1", "2000").0, "");
+    assert_eq!(run("2", "3000").0, "run-1");
+    let (restored, stderr) = run("3", "9000");
+    assert_eq!(restored, "run-1 run-2");
+    assert!(
+        stderr.contains("over its maxSize and was not saved"),
+        "{stderr}"
+    );
+    assert_eq!(run("4", "1000").0, "");
+    assert_eq!(run("5", "1000").0, "run-4");
+    // Left on disk, the paths over the limit stay and are not saved.
+    let (restored, stderr) = run_keeping("6", "9000", true);
+    assert_eq!(restored, "run-4 run-5");
+    assert!(stderr.contains("over its maxSize"), "{stderr}");
+    let (restored, stderr) = run_keeping("7", "100", true);
+    assert_eq!(restored, "run-4 run-5 run-6");
+    assert!(stderr.contains("over its maxSize"), "{stderr}");
+    assert_eq!(run("8", "100").0, "");
+}
+
 #[test]
 fn warm_environment_paths_are_absolute_in_each_worktree() {
     let fixture = Fixture::new(json!({

@@ -551,8 +551,17 @@ save before it ends. Other tasks may change the paths meanwhile, so the save
 can hold files from after the task ran, and files removed before it reads
 them are left out.
 
-Groups over their `maxSize` are not saved. Warm state counts toward the
-cache's size limit and is evicted with it. `--skip-cache` neither restores
+`maxSize` caps a group by the total size of the files it holds. A save
+that would go over it is not stored, and the save it would have replaced
+is not restored either. Where the group's paths are missing, as on a fresh
+CI runner, the next run starts cold and saves again from there, so a cache
+that keeps growing is reset whenever it outgrows its limit. Where they are
+still on disk, as in a developer's checkout, they stay as they are and keep
+growing, and no save is stored until they are removed or `--cold` is used.
+A remote save is replaced the same way only where the run may write to the
+remote cache; otherwise the last one stays. Without `maxSize` a group has no
+limit of its own. Warm state counts
+toward the cache's size limit and is evicted with it. `--skip-cache` neither restores
 nor saves it, and leaves the variables unset, so it cannot replace a bad save
 either: see [Replacing a bad save](#replacing-a-bad-save). Two tasks in one run cannot
 keep the same path. A tool must validate its own cache, as Metro, `tsc` and
