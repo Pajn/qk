@@ -304,7 +304,7 @@ named twice and no variable is set by two entries. See
 | `outputs` | boolean | `false`; restore previous outputs before execution |
 | `paths` | array of workspace paths and globs | Empty; `!` excludes; `{warm}` is not allowed here |
 | `env` | object of strings | Empty; `{warm}`, `{workspaceRoot}`, `{projectRoot}` expand to absolute directories |
-| `maxSize` | bytes or size string | No per-group limit |
+| `maxSize` | bytes or size string | No per-group limit; a save over it is not stored, and the save before it is not restored; see [Warm state](../guides/warm-state.md) |
 | `remote` | boolean | `true`; permit remote exchange when `portable` is `true` or `"path"` |
 | `portable` | `true`, `false` or `"path"` | `false`; `true` permits another worktree's save and remote exchange; `"path"` permits remote exchange, restoring a save only when made in a checkout at the same path |
 | `mtimes` | `"epoch"` or `"preserve"` | `"epoch"`; `"preserve"` keeps a worktree's own save's modification times |
