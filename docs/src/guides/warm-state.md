@@ -495,11 +495,40 @@ wrote it:
 }
 ```
 
-At most one entry goes without a `group`: it is the task's own and the only
-one that can hold `outputs` and `paths`. No group may be named twice, and no
-variable set by two entries. Each entry's `portable`, `remote`, `key`,
+At most one entry that applies goes without a `group`: it is the task's own
+and the only one that can hold `outputs` and `paths`. No group may be named
+twice, and no variable set by two entries, among the entries that apply in a
+configuration: see [Only some configurations](#only-some-configurations). Each entry's `portable`, `remote`, `key`,
 `maxSize`, `mtimes` and `save` apply to that entry alone, and each restore
 is reported with the group it belongs to.
+
+## Only some configurations
+
+`configurations` names the configurations an entry keeps state in. A run in
+any other configuration, or in none, neither restores nor saves that entry's
+state, and the entry sets none of its variables, so a target whose
+configurations build very different things can keep state for the ones that
+run often:
+
+```jsonc
+"dist": {
+  "qk:warm": {
+    "paths": ["{projectRoot}/build"],
+    "configurations": ["preview", "nightly"]
+  },
+  "configurations": { "preview": {}, "nightly": {}, "release": {} }
+}
+```
+
+An entry without a `group` already keeps its own saves for each
+configuration, since its saves belong to the task and a configuration is part
+of it; `configurations` decides whether there are any. A group's saves belong
+to the group, so the configurations that select it share them and its
+`{warm}` directory. Entries left out still have to be valid. The rules for
+[several entries](#several-entries) apply among the entries that apply in a
+configuration, so two entries of one target may go without a `group`, name
+the same group or set the same variable as long as no configuration selects
+both.
 
 ## Matching toolchains and configurations
 

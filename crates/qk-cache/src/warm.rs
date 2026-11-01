@@ -67,6 +67,7 @@ pub const FIELDS: &[&str] = &[
     "save",
     "restore",
     "prefetch",
+    "configurations",
 ];
 
 /// How many saves are kept for a task, across worktrees and keys.
@@ -168,6 +169,11 @@ pub fn config(workspace: &Workspace, task: &Task) -> Result<Vec<Warm>> {
     let mut entries: Vec<Warm> = Vec::new();
     for object in objects {
         let warm = entry(workspace, task, object)?;
+        // Checked after the rest, so that an entry this configuration leaves
+        // out is still validated.
+        if !selected(object, task)? {
+            continue;
+        }
         if entries.iter().any(|other| other.identity == warm.identity) {
             bail!(match warm.group() {
                 Some(group) => format!("qk:warm names group {group:?} twice"),
@@ -182,6 +188,26 @@ pub fn config(workspace: &Workspace, task: &Task) -> Result<Vec<Warm>> {
         entries.push(warm);
     }
     Ok(entries)
+}
+
+/// Whether a `qk:warm` object applies in the task's configuration: every
+/// configuration without `configurations`, else only those it names, and a
+/// task run in none of them keeps no warm state from it.
+fn selected(object: &serde_json::Map<String, Value>, task: &Task) -> Result<bool> {
+    const SHAPE: &str = "qk:warm.configurations must be an array of configuration names";
+    let Some(configurations) = object.get("configurations") else {
+        return Ok(true);
+    };
+    let names = configurations
+        .as_array()
+        .context(SHAPE)?
+        .iter()
+        .map(|name| name.as_str().context(SHAPE))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(task
+        .configuration
+        .as_deref()
+        .is_some_and(|configuration| names.contains(&configuration)))
 }
 
 /// One `qk:warm` object.
@@ -2123,17 +2149,70 @@ mod tests {
 
     /// The `qk:warm` entries of an `app:build` whose target declares `warm`.
     fn entries(warm: Value) -> Result<Vec<Warm>> {
+        entries_in(warm, None)
+    }
+
+    /// The entries that apply when the target runs in `configuration`, one
+    /// of `kept` and `skipped`, or in none.
+    fn entries_in(warm: Value, configuration: Option<&str>) -> Result<Vec<Warm>> {
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join("nx.json"), "{}").unwrap();
         fs::write(
             temp.path().join("project.json"),
-            json!({"name": "app", "targets": {"build": {"command": "true", "qk:warm": warm}}})
-                .to_string(),
+            json!({"name": "app", "targets": {"build": {
+                "command": "true",
+                "qk:warm": warm,
+                "configurations": {"kept": {}, "skipped": {}}
+            }}})
+            .to_string(),
         )
         .unwrap();
         let workspace = Workspace::load(temp.path()).unwrap();
-        let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
-        config(&workspace, &graph.tasks["app:build"])
+        let id = configuration.map_or_else(
+            || "app:build".to_owned(),
+            |name| format!("app:build:{name}"),
+        );
+        let graph = TaskGraph::build(&workspace, &[Request::parse(&id).unwrap()]).unwrap();
+        config(&workspace, &graph.tasks[&id])
+    }
+
+    #[test]
+    fn entries_conflict_only_where_a_configuration_selects_both() {
+        // Two entries without a group, each for its own configuration.
+        let apart = json!([
+            {"paths": ["one"], "env": {"CACHE": "{warm}/one"}, "configurations": ["kept"]},
+            {"paths": ["two"], "env": {"CACHE": "{warm}/two"}, "configurations": ["skipped"]}
+        ]);
+        let kept = entries_in(apart.clone(), Some("kept")).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert!(kept[0].env["CACHE"].ends_with("/one"));
+        let skipped = entries_in(apart.clone(), Some("skipped")).unwrap();
+        assert_eq!(skipped.len(), 1);
+        assert!(skipped[0].env["CACHE"].ends_with("/two"));
+        assert!(entries_in(apart, None).unwrap().is_empty());
+        // A configuration that selects both has two entries without a group.
+        let both = json!([
+            {"paths": ["one"], "configurations": ["kept"]},
+            {"paths": ["two"], "configurations": ["kept", "skipped"]}
+        ]);
+        assert_eq!(entries_in(both.clone(), Some("skipped")).unwrap().len(), 1);
+        assert_eq!(
+            format!("{:#}", entries_in(both, Some("kept")).unwrap_err()),
+            "only one qk:warm entry may go without a group"
+        );
+        // Groups setting one variable, likewise.
+        let shared = json!([
+            {"group": "one", "env": {"CACHE": "{warm}"}, "configurations": ["kept"]},
+            {"group": "two", "env": {"CACHE": "{warm}"}, "configurations": ["kept", "skipped"]}
+        ]);
+        assert_eq!(
+            entries_in(shared.clone(), Some("skipped")).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            format!("{:#}", entries_in(shared, Some("kept")).unwrap_err()),
+            "qk:warm sets CACHE in more than one entry"
+        );
     }
 
     #[test]
