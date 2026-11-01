@@ -401,6 +401,7 @@ fn configuration_cwd_tokens_and_environment_precedence() {
             .env("QK_TEST_MODE", "record")
             .env("QK_TEST_ID", "result")
             .env_remove("QK_TEST_BASE_ONLY")
+            .env_remove("QK_TEST_TARGET")
             .env("QK_TEST_PARENT", "parent")
             .output()
             .unwrap(),
@@ -544,7 +545,13 @@ fn script_executor_reads_only_its_script_like_nx() {
     )
     .unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-    success(run(temp.path(), &["run", "app:test"]));
+    success(
+        command(temp.path(), &["run", "app:test"])
+            .env_remove("FROM_OPTION")
+            .env_remove("FROM_TARGET")
+            .output()
+            .unwrap(),
+    );
     let cwd = fs::read_to_string(temp.path().join("manager-cwd")).unwrap();
     assert_eq!(
         Path::new(cwd.trim()).canonicalize().unwrap(),
