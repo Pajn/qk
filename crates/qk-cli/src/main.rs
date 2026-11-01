@@ -6,6 +6,7 @@ mod history;
 mod inputs;
 mod inspect;
 mod signals;
+mod store_proxy;
 mod ui;
 mod warm_suggest;
 mod watch;
@@ -61,6 +62,11 @@ enum Command {
     Cache {
         #[command(subcommand)]
         command: CacheCommand,
+    },
+    /// Serve a remote store for nearby machines (experimental).
+    Store {
+        #[command(subcommand)]
+        command: StoreCommand,
     },
     /// Help configure warm state.
     Warm {
@@ -744,6 +750,27 @@ enum CacheCommand {
 }
 
 #[derive(Subcommand)]
+enum StoreCommand {
+    /// Serve another store server's protocol to machines on this network:
+    /// blobs are kept here and served from disk, everything else goes to the
+    /// upstream as it came.
+    Proxy {
+        /// The store server to stand in front of, such as https://store.example.com.
+        #[arg(long)]
+        upstream: String,
+        /// Where to keep blobs.
+        #[arg(long)]
+        dir: std::path::PathBuf,
+        /// The address to listen on.
+        #[arg(long, default_value = "0.0.0.0:7077")]
+        listen: String,
+        /// Evict the least recently used blobs past this size, such as 200GB.
+        #[arg(long)]
+        max_size: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum ShowCommand {
     /// Inspect a resolved target, its inputs or its outputs.
     Target {
@@ -1112,6 +1139,28 @@ fn current_project(workspace: &Workspace) -> Result<String> {
 }
 
 fn run(mut cli: Cli) -> Result<i32> {
+    if let Command::Store {
+        command:
+            StoreCommand::Proxy {
+                upstream,
+                dir,
+                listen,
+                max_size,
+            },
+    } = &cli.command
+    {
+        store_proxy::serve(store_proxy::Options {
+            upstream: upstream.clone(),
+            directory: dir.clone(),
+            listen: listen.clone(),
+            max_size: max_size
+                .as_deref()
+                .map(qk_cache::parse_size)
+                .transpose()?
+                .filter(|size| *size > 0),
+        })?;
+        return Ok(0);
+    }
     if matches!(cli.command, Command::UploadWorker) {
         qk_cache::run_upload_worker()?;
         return Ok(0);
@@ -1147,7 +1196,7 @@ fn run(mut cli: Cli) -> Result<i32> {
         eprintln!("qk: warning: {warning}");
     }
     match cli.command {
-        Command::UploadWorker | Command::TraceHelper => {
+        Command::UploadWorker | Command::TraceHelper | Command::Store { .. } => {
             unreachable!("handled before workspace discovery")
         }
         Command::Inputs {

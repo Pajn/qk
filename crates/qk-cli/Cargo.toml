@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+blake3.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
 notify.workspace = true
@@ -32,6 +33,8 @@ terminal_size.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 walkdir.workspace = true
+ureq.workspace = true
+zstd.workspace = true
 
 tempfile.workspace = true
 

@@ -171,6 +171,29 @@ ignores `s3`.
 `tools/store-server` in qk's repository is a reference server, a Cloudflare
 Worker over R2, and documents the protocol in its `PROTOCOL.md`.
 
+### Store proxy
+
+Experimental. `qk store proxy` serves a store server's protocol to machines
+on one network, in front of the real one, so that what they fetch often
+travels over the local network rather than from the store server:
+
+```sh
+qk store proxy --upstream https://cache.example.com --dir /var/cache/qk-proxy --max-size 200GB
+```
+
+Machines point `QK_STORE_SERVER_URL` at it, `http://<host>:7077` by default,
+and keep their own tokens. Outputs never change once stored, so the proxy
+keeps those that pass through it on its disk: those it fetches for a
+machine, those a machine uploads, and those an uploaded entry or warm state
+carries inline. It checks each against its hash before keeping it, and
+serves it again to any machine whose token the store server has accepted.
+Everything else, entries, warm state records, writes and the index, goes to
+the store server as it came, so what a machine finds is what the store
+server holds. Past `--max-size` the proxy removes the outputs used least
+recently. `GET /proxy/stats` reports how much it served itself and how much
+it fetched. While the proxy does not answer, runs on those machines get no
+remote cache.
+
 ## Storage limits
 
 The cache stays under a size limit: `NX_MAX_CACHE_SIZE`, else nx.json

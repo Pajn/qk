@@ -1369,6 +1369,167 @@ fn a_store_server_leaves_out_the_blobs_a_client_holds() {
     assert_eq!(executions(&fixture), 1);
 }
 
+/// `qk store proxy`, started on a free port in front of `upstream`, and
+/// stopped when dropped.
+#[cfg(unix)]
+struct StoreProxy {
+    child: std::process::Child,
+    url: String,
+    log: PathBuf,
+}
+
+#[cfg(unix)]
+impl StoreProxy {
+    fn start(upstream: &str, directory: &Path) -> Self {
+        use std::io::BufRead;
+        let mut child = Command::new(env!("CARGO_BIN_EXE_qk"))
+            .args([
+                "store",
+                "proxy",
+                "--upstream",
+                upstream,
+                "--listen",
+                "127.0.0.1:0",
+                "--dir",
+            ])
+            .arg(directory)
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+        let mut line = String::new();
+        stderr.read_line(&mut line).unwrap();
+        let url = line
+            .split_once("listening on ")
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .unwrap_or_else(|| panic!("{line}"))
+            .trim_end_matches(',')
+            .to_owned();
+        // The rest of its log, kept for a failure to show.
+        let log = directory.join("proxy.log");
+        let mut file = fs::File::create(&log).unwrap();
+        std::thread::spawn(move || std::io::copy(&mut stderr, &mut file));
+        Self { child, url, log }
+    }
+
+    fn log(&self) -> String {
+        fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    fn stats(&self) -> serde_json::Value {
+        let body = ureq::get(&format!("{}/proxy/stats", self.url))
+            .call()
+            .unwrap()
+            .body_mut()
+            .read_to_string()
+            .unwrap();
+        serde_json::from_str(&body).unwrap()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for StoreProxy {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+// The target is a POSIX shell command.
+#[cfg(unix)]
+#[test]
+fn a_store_proxy_serves_the_blobs_it_holds_and_passes_on_the_rest() {
+    let server = store_server::FakeStoreServer::start();
+    let (fixture, _) = large_outputs(1);
+    with_store_server(&fixture, &server);
+    let blobs = TempDir::new().unwrap();
+    let proxy = StoreProxy::start(&server.url, blobs.path());
+    // Outputs stored apart, as large ones are, so that blobs travel by hash.
+    let env = [
+        ("QK_STORE_SERVER_URL", proxy.url.as_str()),
+        ("QK_REMOTE_BLOB_THRESHOLD", "1KB"),
+    ];
+    success(server_build(&fixture, store_server::WRITE_TOKEN, &env));
+    assert_eq!(server.state.lock().unwrap().entries(), 1);
+    let uploaded = server.requests("blobs/");
+    assert!(
+        uploaded
+            .iter()
+            .any(|(request, _)| request.starts_with("PUT ")),
+        "{uploaded:?}"
+    );
+    // Kept: the blob uploaded on its own, and those the entry carried inline.
+    let stored = proxy.stats()["stored"].as_u64().unwrap();
+    let alone = uploaded
+        .iter()
+        .filter(|(request, _)| request.starts_with("PUT "))
+        .count() as u64;
+    assert!(stored > alone, "{stored} stored, {alone} uploaded alone");
+
+    // Another machine fetches every blob by hash: the proxy has those it passed
+    // on, so none of them reaches the upstream.
+    server.state.lock().unwrap().omit_all = true;
+    let fetch = || {
+        clear_local_cache(&fixture);
+        fs::remove_dir_all(fixture.root.join("dist")).unwrap();
+        let output = success(server_build(&fixture, store_server::READ_TOKEN, &env));
+        assert!(
+            stderr(&output).contains("qk: remote cache hit app:build"),
+            "{}",
+            stderr(&output)
+        );
+        assert_eq!(
+            fs::read(fixture.root.join("dist/0.bin")).unwrap(),
+            incompressible(8 << 10, 0)
+        );
+    };
+    fetch();
+    let fetched = |server: &store_server::FakeStoreServer| {
+        server
+            .requests("blobs/")
+            .iter()
+            .filter(|(request, _)| request.starts_with("GET "))
+            .count()
+    };
+    assert_eq!(
+        fetched(&server),
+        0,
+        "{:?}\n{}",
+        server.requests("blobs/"),
+        proxy.log()
+    );
+    assert!(
+        proxy.stats()["localHits"].as_u64().unwrap() > 0,
+        "{}",
+        proxy.stats()
+    );
+
+    // A proxy without them fetches each from the upstream once, and keeps it.
+    drop(proxy);
+    let empty = TempDir::new().unwrap();
+    let proxy = StoreProxy::start(&server.url, empty.path());
+    let env = [
+        ("QK_STORE_SERVER_URL", proxy.url.as_str()),
+        ("QK_REMOTE_BLOB_THRESHOLD", "1KB"),
+    ];
+    let fetch = || {
+        clear_local_cache(&fixture);
+        fs::remove_dir_all(fixture.root.join("dist")).unwrap();
+        let output = success(server_build(&fixture, store_server::READ_TOKEN, &env));
+        assert!(
+            stderr(&output).contains("qk: remote cache hit app:build"),
+            "{}",
+            stderr(&output)
+        );
+    };
+    fetch();
+    let first = fetched(&server);
+    assert!(first > 0);
+    fetch();
+    assert_eq!(fetched(&server), first);
+    assert_eq!(executions(&fixture), 1);
+}
+
 // The target is a POSIX shell command.
 #[cfg(unix)]
 #[test]

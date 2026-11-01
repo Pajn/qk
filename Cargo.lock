@@ -1829,6 +1829,7 @@ name = "qk-cli"
 version = "0.18.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "clap",
  "ctrlc",
  "libc",
@@ -1848,6 +1849,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "terminal_size",
+ "ureq",
  "walkdir",
  "zstd",
 ]
