@@ -171,6 +171,50 @@ ignores `s3`.
 `tools/store-server` in qk's repository is a reference server, a Cloudflare
 Worker over R2, and documents the protocol in its `PROTOCOL.md`.
 
+### Store proxy
+
+`qk store proxy` serves a store server's protocol to machines on one
+network, in front of the real one, so that what they fetch often and what
+they upload travel over the local network, and the store server's latency is
+the proxy's to wait on:
+
+```sh
+qk store proxy --upstream https://cache.example.com --dir /var/cache/qk-proxy --max-size 200GB
+```
+
+Machines point `QK_STORE_SERVER_URL` at it, `http://<host>:7077` by default,
+and keep their own tokens. Outputs never change once stored, so the proxy
+keeps those that pass through it on its disk: those it fetches for a
+machine, those a machine uploads, and those an uploaded entry or warm state
+carries inline. It checks each against its hash before keeping it, and
+serves it again to any machine whose token the store server has accepted.
+
+Uploads of outputs, entries and warm state are answered once the proxy has
+them on its disk, so a run saving its results waits on the local network
+rather than on the store server. That holds for a token the store server has
+taken an upload from through the proxy; until then, a token's uploads go to
+the store server as they came, so one that may only read is refused there. Asked whether it holds an
+output it lacks, the proxy says it does not without asking the store server,
+so the output comes over the local network, and the proxy asks the store
+server itself before sending it on. The proxy queues them in
+`queue/` under its directory, the client's token with each, and sends them
+on in the background, an entry or warm state after the outputs it cites,
+asking the store server which outputs it lacks many at a time. It sends again what the store server could not take for
+now, as while it cannot be reached, and gives up what it refuses, saying so
+in its log; a queue a stopped proxy left is sent once it starts again. Until
+an entry or warm state reaches the store server, the proxy serves it itself
+to the machines behind it, as the store server would; other machines miss
+it. An entry is found through the store server's index, which lists it only
+once it arrives, so it is the warm state that machines behind the proxy find
+this way. Everything else, including reads
+of entries and warm state and the index, goes to the store server as it
+came.
+
+Past `--max-size` the proxy removes the outputs used least recently, never
+one still queued. `GET /proxy/stats` reports how much it served itself, how
+much it fetched, and how many uploads are queued, sent and given up. While
+the proxy does not answer, runs on those machines get no remote cache.
+
 ## Storage limits
 
 The cache stays under a size limit: `QK_MAX_CACHE_SIZE`, else

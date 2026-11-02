@@ -1458,6 +1458,206 @@ fn a_store_server_leaves_out_the_blobs_a_client_holds() {
     assert_eq!(executions(&fixture), 1);
 }
 
+/// `qk store proxy`, started on a free port in front of `upstream`, and
+/// stopped when dropped.
+#[cfg(unix)]
+struct StoreProxy {
+    child: std::process::Child,
+    url: String,
+    log: PathBuf,
+}
+
+#[cfg(unix)]
+impl StoreProxy {
+    fn start(upstream: &str, directory: &Path) -> Self {
+        use std::io::BufRead;
+        let mut child = Command::new(env!("CARGO_BIN_EXE_qk"))
+            .args([
+                "store",
+                "proxy",
+                "--upstream",
+                upstream,
+                "--listen",
+                "127.0.0.1:0",
+                "--dir",
+            ])
+            .arg(directory)
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+        let mut line = String::new();
+        stderr.read_line(&mut line).unwrap();
+        let url = line
+            .split_once("listening on ")
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .unwrap_or_else(|| panic!("{line}"))
+            .trim_end_matches(',')
+            .to_owned();
+        // The rest of its log, kept for a failure to show.
+        let log = directory.join("proxy.log");
+        let mut file = fs::File::create(&log).unwrap();
+        std::thread::spawn(move || std::io::copy(&mut stderr, &mut file));
+        Self { child, url, log }
+    }
+
+    fn log(&self) -> String {
+        fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    fn stats(&self) -> serde_json::Value {
+        let body = ureq::get(&format!("{}/proxy/stats", self.url))
+            .call()
+            .unwrap()
+            .body_mut()
+            .read_to_string()
+            .unwrap();
+        serde_json::from_str(&body).unwrap()
+    }
+
+    /// Waits until the proxy's log, written after it answers, says `text`.
+    fn logged(&self, text: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !self.log().contains(text) {
+            assert!(std::time::Instant::now() < deadline, "{}", self.log());
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Uploads `content` as a blob through the proxy with `token`, answering
+    /// the status.
+    fn put_blob(&self, token: &str, content: &[u8]) -> u16 {
+        let hash = blake3::hash(content).to_hex();
+        let frame = zstd::stream::encode_all(content, 3).unwrap();
+        ureq::put(&format!("{}/v4/blobs/{hash}", self.url))
+            .config()
+            .http_status_as_error(false)
+            .build()
+            .header("authorization", &format!("Bearer {token}"))
+            .send(&frame[..])
+            .unwrap()
+            .status()
+            .as_u16()
+    }
+
+    /// Waits until the proxy has sent upstream every upload it queued.
+    fn drained(&self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while self.stats()["queued"].as_u64().unwrap() > 0 {
+            assert!(std::time::Instant::now() < deadline, "{}", self.log());
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for StoreProxy {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+// The target is a POSIX shell command.
+#[cfg(unix)]
+#[test]
+fn a_store_proxy_serves_the_blobs_it_holds_and_passes_on_the_rest() {
+    let server = store_server::FakeStoreServer::start();
+    let (fixture, _) = large_outputs(1);
+    with_store_server(&fixture, &server);
+    let blobs = TempDir::new().unwrap();
+    let proxy = StoreProxy::start(&server.url, blobs.path());
+    // Outputs stored apart, as large ones are, so that blobs travel by hash.
+    let env = [
+        ("QK_STORE_SERVER_URL", proxy.url.as_str()),
+        ("QK_REMOTE_BLOB_THRESHOLD", "1KB"),
+    ];
+    success(server_build(&fixture, store_server::WRITE_TOKEN, &env));
+    // Answered by the proxy, which sends the uploads upstream after.
+    proxy.logged(" 204 queued ");
+    proxy.logged(" 404 local ");
+    proxy.drained();
+    assert_eq!(server.state.lock().unwrap().entries(), 1);
+    assert_eq!(proxy.stats()["dropped"], 0, "{}", proxy.log());
+    let uploaded = server.requests("blobs/");
+    assert!(
+        uploaded
+            .iter()
+            .any(|(request, _)| request.starts_with("PUT ")),
+        "{uploaded:?}"
+    );
+    // Kept: the blob uploaded on its own, and those the entry carried inline.
+    let stored = proxy.stats()["stored"].as_u64().unwrap();
+    let alone = uploaded
+        .iter()
+        .filter(|(request, _)| request.starts_with("PUT "))
+        .count() as u64;
+    assert!(stored > alone, "{stored} stored, {alone} uploaded alone");
+
+    // Another machine fetches every blob by hash: the proxy has those it passed
+    // on, so none of them reaches the upstream.
+    server.state.lock().unwrap().omit_all = true;
+    let fetch = || {
+        clear_local_cache(&fixture);
+        fs::remove_dir_all(fixture.root.join("dist")).unwrap();
+        let output = success(server_build(&fixture, store_server::READ_TOKEN, &env));
+        assert!(
+            stderr(&output).contains("qk: remote cache hit app:build"),
+            "{}",
+            stderr(&output)
+        );
+        assert_eq!(
+            fs::read(fixture.root.join("dist/0.bin")).unwrap(),
+            incompressible(8 << 10, 0)
+        );
+    };
+    fetch();
+    let fetched = |server: &store_server::FakeStoreServer| {
+        server
+            .requests("blobs/")
+            .iter()
+            .filter(|(request, _)| request.starts_with("GET "))
+            .count()
+    };
+    assert_eq!(
+        fetched(&server),
+        0,
+        "{:?}\n{}",
+        server.requests("blobs/"),
+        proxy.log()
+    );
+    assert!(
+        proxy.stats()["localHits"].as_u64().unwrap() > 0,
+        "{}",
+        proxy.stats()
+    );
+
+    // A proxy without them fetches each from the upstream once, and keeps it.
+    drop(proxy);
+    let empty = TempDir::new().unwrap();
+    let proxy = StoreProxy::start(&server.url, empty.path());
+    let env = [
+        ("QK_STORE_SERVER_URL", proxy.url.as_str()),
+        ("QK_REMOTE_BLOB_THRESHOLD", "1KB"),
+    ];
+    let fetch = || {
+        clear_local_cache(&fixture);
+        fs::remove_dir_all(fixture.root.join("dist")).unwrap();
+        let output = success(server_build(&fixture, store_server::READ_TOKEN, &env));
+        assert!(
+            stderr(&output).contains("qk: remote cache hit app:build"),
+            "{}",
+            stderr(&output)
+        );
+    };
+    fetch();
+    let first = fetched(&server);
+    assert!(first > 0);
+    fetch();
+    assert_eq!(fetched(&server), first);
+    assert_eq!(executions(&fixture), 1);
+}
+
 // The target is a POSIX shell command.
 #[cfg(unix)]
 #[test]
@@ -1512,6 +1712,149 @@ fn a_commit_a_store_server_refuses_for_lost_blobs_is_made_again() {
         .filter(|(request, _)| request.starts_with("PUT /v4/blobs/"))
         .count();
     assert_eq!(puts, 2);
+}
+
+// The target is a POSIX shell command.
+#[cfg(unix)]
+#[test]
+fn a_store_proxy_sends_again_the_blobs_a_commit_it_queued_lacks() {
+    let server = store_server::FakeStoreServer::start();
+    let (fixture, _) = large_outputs(1);
+    with_store_server(&fixture, &server);
+    let directory = TempDir::new().unwrap();
+    let proxy = StoreProxy::start(&server.url, directory.path());
+    let env = [
+        ("QK_STORE_SERVER_URL", proxy.url.as_str()),
+        ("QK_REMOTE_BLOB_THRESHOLD", "1KB"),
+    ];
+    server.state.lock().unwrap().fail_commit_once = true;
+    success(server_build(&fixture, store_server::WRITE_TOKEN, &env));
+    proxy.drained();
+    let state = server.state.lock().unwrap();
+    assert_eq!(state.entries(), 1, "{}", proxy.log());
+    let stats = proxy.stats();
+    assert_eq!(stats["dropped"], 0, "{}", proxy.log());
+    // The commit waited for its blob, was refused once it had lost it, and
+    // was made again after the blob was sent once more.
+    let puts = |prefix: &str| {
+        state
+            .requests
+            .iter()
+            .filter(|(request, _)| request.starts_with(prefix))
+            .count()
+    };
+    assert_eq!(puts("PUT /v4/entries/"), 2, "{:?}", state.requests);
+    assert_eq!(
+        puts("PUT /v4/blobs/"),
+        2 * state.blobs.len(),
+        "{:?}",
+        state.requests
+    );
+}
+
+// The target is a POSIX shell command.
+#[cfg(unix)]
+#[test]
+fn a_store_proxy_serves_warm_state_it_has_not_yet_sent_on() {
+    let server = store_server::FakeStoreServer::start();
+    let fixture = Fixture::new(json!({
+        "command": "if [ -f \"$TOOL_CACHE/seen\" ]; then cat \"$TOOL_CACHE/seen\"; else echo cold; fi; mkdir -p \"$TOOL_CACHE\" && echo warm > \"$TOOL_CACHE/seen\" && head -c 8192 /dev/urandom > \"$TOOL_CACHE/large\"",
+        "qk:warm": {"portable": true, "env": {"TOOL_CACHE": "{warm}/tool"}}
+    }));
+    with_store_server(&fixture, &server);
+    let directory = TempDir::new().unwrap();
+    let proxy = StoreProxy::start(&server.url, directory.path());
+    let env = [
+        ("QK_STORE_SERVER_URL", proxy.url.as_str()),
+        ("QK_REMOTE_BLOB_THRESHOLD", "1KB"),
+        ("GITHUB_REF_NAME", "main"),
+    ];
+    let first_line = |output: &Output| stdout(output).lines().next().unwrap_or_default().to_owned();
+    // The store server takes one write from the token, which the proxy then
+    // answers uploads for, and nothing after, so the save stays queued.
+    assert_eq!(proxy.put_blob(store_server::WRITE_TOKEN, b"proof"), 204);
+    server.state.lock().unwrap().refuse_writes = true;
+    let output = success(server_build(&fixture, store_server::WRITE_TOKEN, &env));
+    assert_eq!(first_line(&output), "cold");
+    assert!(
+        proxy.stats()["queued"].as_u64().unwrap() > 0,
+        "{}",
+        proxy.log()
+    );
+    assert!(
+        !server
+            .state
+            .lock()
+            .unwrap()
+            .records
+            .keys()
+            .any(|path| path.starts_with("warm/"))
+    );
+    // Another machine finds the save at the proxy, its large file included.
+    clear_local_cache(&fixture);
+    let _ = fs::remove_dir_all(fixture.root.join(".git/qk/warm"));
+    let output = success(server_build(&fixture, store_server::WRITE_TOKEN, &env));
+    assert_eq!(
+        first_line(&output),
+        "warm",
+        "{}\n{}",
+        stderr(&output),
+        proxy.log()
+    );
+    proxy.logged(" 200 queued ");
+    // Once the store server takes writes, the queue reaches it.
+    server.state.lock().unwrap().refuse_writes = false;
+    proxy.drained();
+    assert!(
+        server
+            .state
+            .lock()
+            .unwrap()
+            .records
+            .keys()
+            .any(|path| path.starts_with("warm/"))
+    );
+}
+
+// The target is a POSIX shell command.
+#[cfg(unix)]
+#[test]
+fn a_store_proxy_answers_uploads_only_for_tokens_that_wrote() {
+    let server = store_server::FakeStoreServer::start();
+    let directory = TempDir::new().unwrap();
+    let proxy = StoreProxy::start(&server.url, directory.path());
+    // A read makes a token trusted, but not with writes: the store server
+    // refuses its upload, and so does the proxy, queuing nothing.
+    let index = ureq::get(&format!("{}/v4/index", proxy.url))
+        .header(
+            "authorization",
+            &format!("Bearer {}", store_server::READ_TOKEN),
+        )
+        .call()
+        .unwrap();
+    assert_eq!(index.status().as_u16(), 200);
+    assert_eq!(proxy.put_blob(store_server::READ_TOKEN, b"refused"), 403);
+    assert_eq!(proxy.stats()["queued"], 0);
+    // A token's first upload goes to the store server; once it took one, the
+    // proxy answers the next itself.
+    assert_eq!(proxy.put_blob(store_server::WRITE_TOKEN, b"first"), 204);
+    proxy.logged(" 204 upstream ");
+    assert_eq!(proxy.put_blob(store_server::WRITE_TOKEN, b"second"), 204);
+    proxy.logged(" 204 queued ");
+    proxy.drained();
+    assert_eq!(server.state.lock().unwrap().blobs.len(), 2);
+    // Before sending the queued blob, the proxy asked which blobs the store
+    // server lacked, many at once, rather than one by one.
+    let asked = server.requests("blobs/");
+    assert!(
+        asked
+            .iter()
+            .any(|(request, _)| request == "POST /v4/blobs/missing")
+            && !asked
+                .iter()
+                .any(|(request, _)| request.starts_with("HEAD ")),
+        "{asked:?}"
+    );
 }
 
 #[test]
