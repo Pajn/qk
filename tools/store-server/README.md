@@ -24,6 +24,15 @@ R2 holds `entries/<key>`, `warm/<a>/<b>`, `pathsets/<weak>` and
 `expectations/<name>` (upload bodies), `blobs/<hash>` (one zstd frame each) and
 `sessions/<id>` (Bloom filters).
 
+The index also lists every blob stored apart with its stored size, so that
+checking or composing a record that cites thousands of blobs takes a few
+queries instead of an R2 request per blob, each of which costs a round trip
+the Worker waits on. Blobs are only ever written through `PUT blobs/<hash>`,
+which lists them. Blobs stored before the index held them are listed from the
+bucket once, in the background, by the Durable Object's alarm; until it is
+done, a blob the index lacks is asked of the bucket. So do not write `blobs/`
+into the bucket any other way, or the index will take those blobs as missing.
+
 ## Deploying
 
 This needs a Cloudflare account with R2 and Durable Objects, and Wrangler
