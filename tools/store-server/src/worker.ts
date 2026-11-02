@@ -50,6 +50,14 @@ const LARGEST_EXPECTATIONS = 4 << 20;
 const SESSION_LIFETIME = 24 * 60 * 60 * 1000;
 /** How many R2 requests one request makes at a time. */
 const CONCURRENCY = 32;
+/** Blobs stored apart that a pack carries inline, read ahead of the one it is
+ * sending, at most. */
+const READ_AHEAD = 16;
+/** Bytes every pack an isolate is sending may hold read ahead together. A
+ * blob that does not fit is read on its turn and streamed, as one larger than
+ * this always is. */
+const READ_AHEAD_BYTES = 16 << 20;
+let readAheadHeld = 0;
 /** Where the edge cache files immutable objects; never fetched. */
 const CACHE_ORIGIN = "https://qk-store-server.cache";
 
@@ -287,7 +295,7 @@ async function compose(
   }
   const header = parseHeader(await reader.read(headerLength));
   const record = await reader.read(header.record);
-  const placements = await place(header, held, env);
+  const { placements, sizes } = await place(header, held, env);
   const head = rawFrame(packHeader(record, header.blobs.map((blob, index) => ({ placement: placements[index]!, raw: blob.raw }))));
   // The stored frames past the last one this pack carries are never read.
   let lastStored = -1;
@@ -296,6 +304,16 @@ async function compose(
       lastStored = index;
     }
   });
+
+  // Read ahead in order, so a pack inlining many small blobs stored apart
+  // waits on one R2 read at a time only when the reads cannot keep up.
+  const apart = readAhead(
+    header.blobs
+      .filter((blob, index) => blob.compressed === null && placements[index] === INLINE)
+      .map((blob) => ({ hash: blob.hash, size: sizes.get(blob.hash)! })),
+    env,
+    ctx,
+  );
 
   async function* parts(): AsyncGenerator<Uint8Array> {
     try {
@@ -309,31 +327,119 @@ async function compose(
             await reader.skip(blob.compressed);
           }
         } else if (blob.compressed === null && inline) {
-          const apart = await readImmutable(`blobs/${blob.hash}`, env, ctx);
-          if (!apart) {
-            throw new Error(`blob ${blob.hash} went missing while a pack was sent`);
-          }
-          yield* chunksOf(apart.body);
+          yield* await apart.next();
         }
       }
     } finally {
+      apart.close();
       await reader.cancel().catch(() => {});
     }
   }
   return streamOf(parts());
 }
 
+/** Answers, in order, the bodies of the blobs stored apart `blobs` names,
+ * each of the size the index has for it. Up to `READ_AHEAD` are read whole
+ * ahead of the one asked for while they fit what the isolate's packs may hold
+ * together; the rest are streamed on their turn. A body read ahead counts
+ * against that until the pack asks for the next one, or `close`s; a read the
+ * pack gave up counts until it settles. */
+function readAhead(
+  blobs: { hash: string; size: number }[],
+  env: Env,
+  ctx: ExecutionContext,
+): { next: () => Promise<AsyncIterable<Uint8Array> | Iterable<Uint8Array>>; close: () => void } {
+  let next = 0;
+  const reading: { size: number; read: Promise<Uint8Array> }[] = [];
+  // The body last answered, until the pack is past it.
+  let sending = 0;
+  const release = () => {
+    readAheadHeld -= sending;
+    sending = 0;
+  };
+  const fill = () => {
+    while (reading.length < READ_AHEAD && next < blobs.length) {
+      const { hash, size } = blobs[next]!;
+      if (readAheadHeld + size > READ_AHEAD_BYTES) {
+        return;
+      }
+      readAheadHeld += size;
+      next++;
+      const read = readImmutable(`blobs/${hash}`, env, ctx).then((stored) => {
+        if (!stored) {
+          throw new Error(`blob ${hash} went missing while a pack was sent`);
+        }
+        return readAtMost(stored.body, size, hash);
+      });
+      // Its failure is the pack's once it is that blob's turn, not before.
+      read.catch(() => {});
+      reading.push({ size, read });
+    }
+  };
+  return {
+    next: async () => {
+      release();
+      fill();
+      const ahead = reading.shift();
+      if (ahead) {
+        sending = ahead.size;
+        return [await ahead.read];
+      }
+      const blob = blobs[next++];
+      if (!blob) {
+        throw new Error("more blobs stored apart were asked for than the pack inlines");
+      }
+      const stored = await readImmutable(`blobs/${blob.hash}`, env, ctx);
+      if (!stored) {
+        throw new Error(`blob ${blob.hash} went missing while a pack was sent`);
+      }
+      return chunksOf(stored.body);
+    },
+    close: () => {
+      release();
+      for (const ahead of reading.splice(0)) {
+        void ahead.read.then(
+          () => {},
+          () => {},
+        ).finally(() => {
+          readAheadHeld -= ahead.size;
+        });
+      }
+    },
+  };
+}
+
+/** The whole of `body`, which is to be `size` bytes: one that runs past it is
+ * not the blob the index sized, as a write could have replaced it since. */
+async function readAtMost(body: ReadableStream<Uint8Array>, size: number, hash: string): Promise<Uint8Array> {
+  const bytes = new Uint8Array(size);
+  let read = 0;
+  for await (const chunk of chunksOf(body)) {
+    if (read + chunk.length > size) {
+      // Leaving the loop cancels the body, as chunksOf does when cut short.
+      throw new Error(`blob ${hash} is larger than the index says`);
+    }
+    bytes.set(chunk, read);
+    read += chunk.length;
+  }
+  return read === size ? bytes : bytes.subarray(0, read);
+}
+
 /** Where the pack of `header` carries each blob: apart when the session holds
  * it, inline when the upload carried it, and inline when it is stored apart
  * while those stay within the budget. */
-async function place(header: UploadHeader, held: Bloom | null, env: Env): Promise<number[]> {
+async function place(
+  header: UploadHeader,
+  held: Bloom | null,
+  env: Env,
+): Promise<{ placements: number[]; sizes: Map<string, number | null> }> {
   const wanted = header.blobs.filter((blob) => blob.compressed === null && !held?.has(blob.hash));
   const sizes = await storedSizes(
     wanted.map((blob) => blob.hash),
     env,
   );
   let budget = 0;
-  return header.blobs.map((blob) => {
+  const placements = header.blobs.map((blob) => {
     if (held?.has(blob.hash)) {
       return APART;
     }
@@ -347,6 +453,7 @@ async function place(header: UploadHeader, held: Bloom | null, env: Env): Promis
     budget += size;
     return INLINE;
   });
+  return { placements, sizes };
 }
 
 // Blobs.
@@ -695,17 +802,24 @@ async function readBody(request: Request, limit: number): Promise<Uint8Array> {
   return concat(parts);
 }
 
+/** The chunks of `stream`. A consumer that stops before its end cancels the
+ * rest, which the stream would otherwise keep producing for no one. */
 async function* chunksOf(stream: ReadableStream<Uint8Array>): AsyncGenerator<Uint8Array> {
   const reader = stream.getReader();
+  let finished = false;
   try {
     for (;;) {
       const { done, value } = await reader.read();
       if (done) {
+        finished = true;
         return;
       }
       yield value;
     }
   } finally {
+    if (!finished) {
+      await reader.cancel().catch(() => {});
+    }
     reader.releaseLock();
   }
 }
