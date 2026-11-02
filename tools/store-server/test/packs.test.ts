@@ -1,3 +1,4 @@
+import { env } from "cloudflare:test";
 import { decompress } from "fzstd";
 import { describe, expect, it } from "vitest";
 import { Bloom } from "../src/bloom";
@@ -25,6 +26,42 @@ describe("entries", () => {
     await putApart(blobs[2]!);
     const body = await commit(key, blobs);
     expect(await pack(`entries/${key}`)).toEqual(expectedPack(body, blobs, () => true));
+  });
+
+  it("carry inline, in order, more blobs stored apart than are read ahead", async () => {
+    const key = hash();
+    const blobs = Array.from({ length: 40 }, (_, index) => blob(`stored apart ${index}`, false));
+    for (const stored of blobs) {
+      await putApart(stored);
+    }
+    const body = await commit(key, blobs);
+    expect(await pack(`entries/${key}`)).toEqual(expectedPack(body, blobs, () => true));
+  });
+
+  it("stream on its turn a blob stored apart too large to read ahead", async () => {
+    const key = hash();
+    const large = { hash: hash(), raw: new Uint8Array(17 << 20).fill(7), inline: false };
+    const blobs = [blob("small, read ahead", false), large, blob("after it", false)];
+    for (const stored of blobs) {
+      await putApart(stored);
+    }
+    const body = await commit(key, blobs);
+    // Compared by digest: a pack this size compared as arrays exhausts the
+    // test's memory.
+    const digest = async (data: Uint8Array) => new Uint8Array(await crypto.subtle.digest("SHA-256", data));
+    const received = await digest(await pack(`entries/${key}`));
+    expect(received).toEqual(await digest(expectedPack(body, blobs, () => true)));
+  });
+
+  it("fail rather than hold a blob stored apart larger than the index says", async () => {
+    const key = hash();
+    const replaced = blob("sized by its upload", false);
+    await putApart(replaced);
+    await commit(key, [replaced]);
+    // Written around the Worker, so the index keeps the size of the first.
+    await env.STORE.put(`blobs/${replaced.hash}`, rawFrame(bytes("a body larger than the one the index sized")));
+    const response = await request("GET", `entries/${key}`, { token: READ });
+    await expect(response.arrayBuffer()).rejects.toThrow();
   });
 
   it("leave out the blobs a session holds", async () => {
