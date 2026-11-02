@@ -204,6 +204,11 @@ pub enum Shadow {
         /// `<path> (<how>)`: one of them changed. At most [`UNCOVERED`].
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         uncovered: Vec<String>,
+        /// For a task its declared inputs took from the cache, whether they
+        /// cover every one of its path sets, so that mode `"on"` would have
+        /// taken the same result by its declared key.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        declared: bool,
     },
     /// It has no path set yet.
     Unrecorded,
@@ -773,16 +778,8 @@ impl Cache {
         let declared = recordings.as_ref().is_none_or(|(sets, _, settings)| {
             settings.mode == ultracache::Mode::Record
                 || sets.is_empty()
-                || hash::coverage(snapshot, workspace, graph, task, prepared, cancelled).is_ok_and(
-                    |coverage| {
-                        let outputs = self
-                            .workspace_outputs
-                            .get_or_init(|| workspace_outputs(workspace));
-                        let output = |path: &str| outputs.matches(path);
-                        sets.iter()
-                            .all(|set| coverage.covers(snapshot, &workspace.root, set, &output))
-                    },
-                )
+                || hash::coverage(snapshot, workspace, graph, task, prepared, cancelled)
+                    .is_ok_and(|coverage| self.covers_all(&coverage, snapshot, workspace, sets))
         });
         // How its recordings keyed it, unless it runs and records.
         let unrecorded = recordings
@@ -1130,6 +1127,7 @@ impl Cache {
         else {
             return shadow;
         };
+        let declared = self.covers_all(&coverage, snapshot, workspace, sets);
         let outputs = self
             .workspace_outputs
             .get_or_init(|| workspace_outputs(workspace));
@@ -1159,6 +1157,7 @@ impl Cache {
             return Some(Shadow::WouldMiss {
                 changed: named(changed),
                 uncovered: vec![],
+                declared,
             });
         }
         let uncovered = uncovered
@@ -1168,7 +1167,26 @@ impl Cache {
         Some(Shadow::WouldMiss {
             changed: vec![],
             uncovered: named(uncovered),
+            declared,
         })
+    }
+
+    /// Whether `coverage`, a task's declared key, covers every one of its
+    /// path sets: then a task none of whose path sets' keys has a result is
+    /// looked up by its declared key.
+    fn covers_all(
+        &self,
+        coverage: &hash::Coverage,
+        snapshot: &hash::Snapshot,
+        workspace: &Workspace,
+        sets: &[recorded::PathSet],
+    ) -> bool {
+        let outputs = self
+            .workspace_outputs
+            .get_or_init(|| workspace_outputs(workspace));
+        let output = |path: &str| outputs.matches(path);
+        sets.iter()
+            .all(|set| coverage.covers(snapshot, &workspace.root, set, &output))
     }
 
     /// Looks a task up by its recordings and restores what it finds: by each
@@ -1302,6 +1320,7 @@ impl Cache {
                 Shadow::WouldMiss {
                     changed: vec![],
                     uncovered: vec![],
+                    declared: false,
                 }
             });
         };
@@ -1377,6 +1396,7 @@ impl Cache {
                     Shadow::WouldMiss {
                         changed: vec![],
                         uncovered: vec![],
+                        declared: false,
                     }
                 },
                 |key| Shadow::WouldHit { key, check: None },

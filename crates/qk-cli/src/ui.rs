@@ -1139,17 +1139,17 @@ fn details(
         }
     }
     // Tasks with `qk:ultracache` mode "record", where what their recordings
-    // would have done differs from what their declared inputs did.
+    // would have done differs from what their declared inputs did. One whose
+    // declared inputs cover its recordings would have been taken by its
+    // declared key all the same.
     let shadowed = |kind: &str, hit: bool| -> Vec<&str> {
         report
             .tasks
             .iter()
             .filter(|task| {
-                task.shadow
-                    .as_ref()
-                    .and_then(|shadow| shadow["kind"].as_str())
-                    == Some(kind)
-                    && matches!(task.cache.as_deref(), Some("local-hit" | "remote-hit")) == hit
+                task.shadow.as_ref().is_some_and(|shadow| {
+                    shadow["kind"].as_str() == Some(kind) && shadow["declared"] != true
+                }) && matches!(task.cache.as_deref(), Some("local-hit" | "remote-hit")) == hit
             })
             .map(|task| task.id.as_str())
             .collect()

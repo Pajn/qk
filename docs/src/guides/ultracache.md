@@ -190,8 +190,11 @@ disagree:
 - a task its declared inputs missed where its recordings had a result: a
   change it never read, which `"on"` would have taken from the cache;
 - a task its declared inputs took from the cache where its recordings had
-  none: a change to what it read that its declared inputs leave out, a hit
-  that may be stale, or a recorded result never shared.
+  none, and its declared inputs do not cover every one of its path sets: a
+  change to what it read that its declared inputs leave out, a hit that may
+  be stale, or a recorded result never shared. Where they cover them all,
+  `"on"` takes the same result by its declared key, and `shadow` carries
+  `declared` true.
 
 Two more things tell whether `"on"` would be right:
 
