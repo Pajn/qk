@@ -45,7 +45,7 @@ them without adding to them, `off` neither reads nor writes them, and
 
 An output whose compressed size reaches 1 MiB is stored apart, as
 `blobs/<hash>`, uploaded once for every entry that has it and only when the
-store lacks it. A machine fetches it only when its local cache lacks it, so a
+store lacks it, a few at a time. A machine fetches it only when its local cache lacks it, so a
 machine that already holds a build's large files receives little more than the
 manifest. The index names each entry's large outputs, so a machine lacking
 them fetches them beside the entry, a few at a time, rather than after it.

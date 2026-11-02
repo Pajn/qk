@@ -70,6 +70,11 @@ const BLOB_FETCHERS: usize = 8;
 /// Blobs stored apart requested at once by every fetch together, leaving
 /// connections for entries and uploads.
 const BLOB_REQUESTS: usize = 24;
+/// Blobs one upload places at once. Placing a blob stored apart takes a
+/// request asking the store for it and, where the store lacks it, one sending
+/// it, so a record of thousands of them would otherwise take as many round
+/// trips one after another.
+const BLOB_UPLOADERS: usize = 8;
 /// The compressed size from which a blob is stored apart, unless
 /// `QK_REMOTE_BLOB_THRESHOLD` says otherwise. Below it, a request costs more
 /// than the bytes it would save. In `tools/bench/remote.mjs`, at 230 ms and
@@ -1149,27 +1154,67 @@ impl Remote {
     /// apart that the store lacks.
     fn place_all(&self, root: &Path, record: &[u8]) -> Result<HashMap<String, pack::Placement>> {
         let parsed = crate::record::StoredRecord::read(record)?;
-        let mut placements = HashMap::new();
+        let blobs: Vec<String> = parsed.blobs().into_iter().collect();
+        let placed = Mutex::new(HashMap::new());
+        self.each_blob(&blobs, |blob| {
+            let placement = self.place(root, blob)?;
+            placed.lock().unwrap().insert(blob.to_owned(), placement);
+            Ok(())
+        })?;
+        let mut placements = placed.into_inner().unwrap();
         // A store server takes one bounded body per record, so once the record,
         // its header and its inline blobs fill that, the rest of this record's
         // blobs go apart. Raw sizes bound the compressed ones; each blob's
         // header entry is a hash and two numbers.
-        let bounded = self.store.framing() == store::Framing::Upload;
-        let mut inline = record.len() as u64 + 128 * parsed.blobs().len() as u64 + 64;
-        for blob in parsed.blobs() {
-            let mut placement = self.place(root, &blob)?;
-            if bounded && placement == pack::Placement::Inline {
-                let size = fs::metadata(root.join("blobs").join(&blob))?.len();
-                if inline + size > UPLOAD_INLINE {
-                    self.store_apart(root, &blob, None)?;
-                    placement = pack::Placement::Apart;
-                } else {
-                    inline += size;
+        if self.store.framing() == store::Framing::Upload {
+            let mut inline = record.len() as u64 + 128 * blobs.len() as u64 + 64;
+            let mut overflow = Vec::new();
+            for blob in &blobs {
+                if placements[blob] == pack::Placement::Inline {
+                    let size = fs::metadata(root.join("blobs").join(blob))?.len();
+                    if inline + size > UPLOAD_INLINE {
+                        overflow.push(blob.clone());
+                    } else {
+                        inline += size;
+                    }
                 }
             }
-            placements.insert(blob, placement);
+            self.each_blob(&overflow, |blob| self.store_apart(root, blob, None))?;
+            for blob in overflow {
+                placements.insert(blob, pack::Placement::Apart);
+            }
         }
         Ok(placements)
+    }
+
+    /// Runs `work` on each of `blobs`, a few at a time, answering the first
+    /// error once every worker has stopped.
+    fn each_blob(&self, blobs: &[String], work: impl Fn(&str) -> Result<()> + Sync) -> Result<()> {
+        let queue = Mutex::new(blobs.iter());
+        let failed = std::sync::atomic::AtomicBool::new(false);
+        let worker = || -> Result<()> {
+            // A failure stops the others taking more.
+            while !failed.load(Ordering::Relaxed) {
+                let Some(blob) = queue.lock().unwrap().next() else {
+                    return Ok(());
+                };
+                if let Err(error) = work(blob) {
+                    failed.store(true, Ordering::Relaxed);
+                    return Err(error);
+                }
+            }
+            Ok(())
+        };
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..blobs.len().min(BLOB_UPLOADERS))
+                .map(|_| scope.spawn(worker))
+                .collect();
+            let results: Vec<Result<()>> = workers
+                .into_iter()
+                .map(|worker| worker.join().expect("blob upload panicked"))
+                .collect();
+            results.into_iter().collect()
+        })
     }
 
     /// Uploads `record` as `object`, carrying its blobs as `placements` says.
@@ -1647,6 +1692,11 @@ mod flight_tests {
         uploads: bool,
         /// Uploads to fail as a reset connection would, before taking any.
         resets: AtomicUsize,
+        /// How long asking whether it holds an object takes.
+        has_delay: Duration,
+        /// Questions whether it holds an object, open now and at most.
+        asking: AtomicUsize,
+        most_asking: Arc<AtomicUsize>,
     }
 
     fn name(object: Object) -> String {
@@ -1686,6 +1736,10 @@ mod flight_tests {
         }
 
         fn has(&self, object: Object) -> Result<bool> {
+            let asking = self.asking.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most_asking.fetch_max(asking, Ordering::SeqCst);
+            std::thread::sleep(self.has_delay);
+            self.asking.fetch_sub(1, Ordering::SeqCst);
             Ok(self.objects.lock().unwrap().contains_key(&name(object)))
         }
 
@@ -1778,6 +1832,85 @@ mod flight_tests {
             .unwrap();
         assert_eq!(placements[&blobs[0]], pack::Placement::Inline);
         assert_eq!(placements[&blobs[1]], pack::Placement::Apart);
+    }
+
+    #[test]
+    fn a_record_places_its_blobs_a_few_at_a_time() {
+        let source = cache();
+        let blobs: Vec<String> = (0..32u8)
+            .map(|index| {
+                let name = format!("{index:064x}");
+                fs::write(source.path().join("blobs").join(&name), [index; 64]).unwrap();
+                name
+            })
+            .collect();
+        let record = serde_json::to_vec(&serde_json::json!({
+            "artifacts": blobs
+                .iter()
+                .map(|blob| (blob.clone(), serde_json::json!({"blob": blob})))
+                .collect::<serde_json::Map<_, _>>()
+        }))
+        .unwrap();
+        let most_asking = Arc::new(AtomicUsize::new(0));
+        let memory = Memory {
+            uploads: true,
+            has_delay: Duration::from_millis(50),
+            most_asking: most_asking.clone(),
+            ..Memory::default()
+        };
+        // Every blob is stored apart, each asked about before it is sent.
+        let remote = Remote::new(Box::new(memory), Mode::ReadWrite, None, 0);
+        let placements = remote.place_all(source.path(), &record).unwrap();
+        for blob in &blobs {
+            assert_eq!(placements[blob], pack::Placement::Apart);
+            assert!(remote.store.has(Object::Blob(blob)).unwrap());
+        }
+        let most = most_asking.load(Ordering::SeqCst);
+        assert!(most > 1 && most <= BLOB_UPLOADERS, "{most} at once");
+    }
+
+    #[test]
+    fn blobs_past_the_inline_bound_are_stored_a_few_at_a_time() {
+        let source = cache();
+        // Sparse and alike; the names stand in for hashes, which placement
+        // never checks. Three fill the bound, the rest go apart after.
+        let blobs: Vec<String> = (0..24u8)
+            .map(|index| {
+                let name = format!("{index:064x}");
+                fs::File::create(source.path().join("blobs").join(&name))
+                    .unwrap()
+                    .set_len(UPLOAD_INLINE / 4)
+                    .unwrap();
+                name
+            })
+            .collect();
+        let record = serde_json::to_vec(&serde_json::json!({
+            "artifacts": blobs
+                .iter()
+                .map(|blob| (blob.clone(), serde_json::json!({"blob": blob})))
+                .collect::<serde_json::Map<_, _>>()
+        }))
+        .unwrap();
+        let most_asking = Arc::new(AtomicUsize::new(0));
+        let memory = Memory {
+            uploads: true,
+            has_delay: Duration::from_millis(50),
+            most_asking: most_asking.clone(),
+            ..Memory::default()
+        };
+        // Every blob is under the threshold, so only the bound sends any apart.
+        let remote = Remote::new(Box::new(memory), Mode::ReadWrite, None, u64::MAX);
+        let placements = remote.place_all(source.path(), &record).unwrap();
+        let apart: Vec<&String> = blobs
+            .iter()
+            .filter(|blob| placements[*blob] == pack::Placement::Apart)
+            .collect();
+        assert_eq!(apart.len(), blobs.len() - 3);
+        let most = most_asking.load(Ordering::SeqCst);
+        assert!(most > 1 && most <= BLOB_UPLOADERS, "{most} at once");
+        for blob in apart {
+            assert!(remote.store.has(Object::Blob(blob)).unwrap());
+        }
     }
 
     #[test]
