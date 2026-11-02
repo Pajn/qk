@@ -83,7 +83,9 @@ everything the task could notice through it:
   keys for every task, or a directory it found holds a keyed file;
 - a file created where it looked for one and found none would be selected,
   and is neither gitignored nor a declared output, so that, say, a missing
-  `.env.local` keeps it on its recordings;
+  `.env.local` keeps it on its recordings; so would one created where a file
+  it read is gone since, as when a path set recorded on another
+  branch read a file this one does not have;
 - every entry a directory it listed could gain or lose would be selected,
   gitignored entries aside: a fileset takes all of what is under the
   directory, as `{projectRoot}/**/*` takes a project's directories, no

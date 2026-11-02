@@ -320,6 +320,46 @@ fn a_declared_result_is_taken_when_the_declared_inputs_cover_what_the_task_read(
     }
 }
 
+/// A file a recorded task read that is gone since, as one recorded on
+/// another branch, is covered where its coming back would change the
+/// declared key, as a file looked for and not found is.
+#[test]
+fn a_file_read_when_recorded_and_gone_since_is_covered_where_it_would_be_selected() {
+    if !has_strace() {
+        return;
+    }
+    for (inputs, rerun) in [
+        (r#"["{projectRoot}/**/*""#, ("local-hit", "declared")),
+        // Created again, it would not be selected.
+        (
+            r#"["{projectRoot}/**/*", "!{projectRoot}/icons/c.svg""#,
+            ("miss", "missed"),
+        ),
+    ] {
+        let temp = fixture();
+        let root = temp.path();
+        let nx = fs::read_to_string(root.join("nx.json")).unwrap();
+        write(
+            root,
+            "nx.json",
+            &nx.replace(r#"["{projectRoot}/**/*""#, inputs),
+        );
+        write(root, "app/icons/c.svg", "<svg/>");
+        assert_eq!(build_keyed(root, true), ("miss".into(), "saved".into()));
+        fs::remove_file(root.join("app/icons/c.svg")).unwrap();
+        assert_eq!(
+            build_keyed(root, false),
+            ("miss".into(), "missed".into()),
+            "{inputs}"
+        );
+        assert_eq!(
+            build_keyed(root, false),
+            (rerun.0.into(), rerun.1.into()),
+            "{inputs}"
+        );
+    }
+}
+
 /// Coverage is judged by the declared inputs a lookup runs with. A named
 /// input reaches no key's settings, so narrowing one keeps a task's weak key
 /// and its path sets, and the narrower declaration no longer covers them.
