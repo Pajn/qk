@@ -2,6 +2,11 @@
 // and the runs that used them. One Durable Object holds it all in SQLite, so
 // every update is ordered and a cursor names a point in that order. The line
 // formats are those of crates/qk-cache/src/remote/index.rs.
+//
+// It also holds which blobs are stored apart, with their sizes, so that a
+// record citing thousands of them is checked and composed with a few queries
+// rather than a bucket request per blob. Blobs stored before it held them are
+// listed from the bucket once, in the background.
 
 import { DurableObject } from "cloudflare:workers";
 
@@ -17,11 +22,17 @@ const RUN_MEMBERS = 20_000;
 const MEMBER = /^[0-9a-fA-F]{16}$/;
 const KEY = /^[0-9a-f]{64}$/;
 const TIME = /^\d{1,16}$/;
+/** SQLite in a Durable Object binds at most 100 parameters to a query. */
+const BOUND = 100;
+/** Bucket listings, of up to 1,000 objects each, one alarm takes. */
+const LISTINGS_PER_ALARM = 20;
+/** How long after a listing failed it is tried again. */
+const RELIST_AFTER = 60 * 1000;
 
-export class Index extends DurableObject<unknown> {
+export class Index extends DurableObject<{ STORE: R2Bucket }> {
   private sql: SqlStorage;
 
-  constructor(ctx: DurableObjectState, env: unknown) {
+  constructor(ctx: DurableObjectState, env: { STORE: R2Bucket }) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
     this.sql.exec(`
@@ -30,7 +41,91 @@ export class Index extends DurableObject<unknown> {
       CREATE INDEX IF NOT EXISTS keys_time ON keys (time);
       CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, time INTEGER NOT NULL, members TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS sequence (name TEXT PRIMARY KEY, value INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS blobs (hash TEXT PRIMARY KEY, size INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS listing (name TEXT PRIMARY KEY, value TEXT NOT NULL);
     `);
+    ctx.blockConcurrencyWhile(async () => {
+      if (!this.listed() && (await ctx.storage.getAlarm()) === null) {
+        await ctx.storage.setAlarm(Date.now());
+      }
+    });
+  }
+
+  /** Notes blobs just stored apart, by hash with their stored sizes. */
+  noteBlobs(blobs: [string, number][]): void {
+    this.note(blobs, "REPLACE");
+  }
+
+  /** Notes blobs found stored apart in the bucket. A size an upload noted
+   * meanwhile is newer than what the bucket said, so it is kept. */
+  noteFound(blobs: [string, number][]): void {
+    this.note(blobs, "IGNORE");
+  }
+
+  private note(blobs: [string, number][], conflict: "REPLACE" | "IGNORE"): void {
+    this.ctx.storage.transactionSync(() => {
+      for (const [hash, size] of blobs) {
+        this.sql.exec(`INSERT OR ${conflict} INTO blobs (hash, size) VALUES (?, ?)`, hash, size);
+      }
+    });
+  }
+
+  /** The stored size of each of `hashes` stored apart, or `null` for one that
+   * is not; and whether that is known for all of them, which it is once the
+   * blobs stored before the index held them have been listed. */
+  blobSizes(hashes: string[]): { sizes: (number | null)[]; complete: boolean } {
+    const sizes = new Map<string, number>();
+    for (let start = 0; start < hashes.length; start += BOUND) {
+      const chunk = hashes.slice(start, start + BOUND);
+      const rows = this.sql.exec<{ hash: string; size: number }>(
+        `SELECT hash, size FROM blobs WHERE hash IN (${chunk.map(() => "?").join(", ")})`,
+        ...chunk,
+      );
+      for (const { hash, size } of rows) {
+        sizes.set(hash, size);
+      }
+    }
+    return { sizes: hashes.map((hash) => sizes.get(hash) ?? null), complete: this.listed() };
+  }
+
+  /** Lists the bucket's blobs into the index, some pages at a time, until
+   * every blob stored before the index held them is in it. A listing that
+   * fails is tried again later from the last page listed, rather than left to
+   * the runtime's few retries of a failed alarm. */
+  async alarm(): Promise<void> {
+    try {
+      await this.listBucket();
+    } catch (error) {
+      console.error("listing the bucket's blobs failed; trying again later", error);
+      await this.ctx.storage.setAlarm(Date.now() + RELIST_AFTER);
+    }
+  }
+
+  private async listBucket(): Promise<void> {
+    if (this.listed()) {
+      return;
+    }
+    let cursor = this.listingCursor();
+    for (let page = 0; page < LISTINGS_PER_ALARM; page++) {
+      const listing = await this.env.STORE.list({ prefix: "blobs/", limit: 1000, cursor });
+      this.noteFound(listing.objects.map((object) => [object.key.slice("blobs/".length), object.size]));
+      if (!listing.truncated) {
+        this.sql.exec("INSERT OR REPLACE INTO listing (name, value) VALUES ('done', '1')");
+        return;
+      }
+      cursor = listing.cursor;
+      this.sql.exec("INSERT OR REPLACE INTO listing (name, value) VALUES ('cursor', ?)", cursor);
+    }
+    await this.ctx.storage.setAlarm(Date.now());
+  }
+
+  private listed(): boolean {
+    return this.sql.exec("SELECT 1 FROM listing WHERE name = 'done'").toArray().length > 0;
+  }
+
+  private listingCursor(): string | undefined {
+    const row = this.sql.exec<{ value: string }>("SELECT value FROM listing WHERE name = 'cursor'").toArray()[0];
+    return row?.value;
   }
 
   /** Lists `key` as committed at `time`, or keeps its later time. */

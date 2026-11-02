@@ -328,11 +328,10 @@ async function compose(
  * while those stay within the budget. */
 async function place(header: UploadHeader, held: Bloom | null, env: Env): Promise<number[]> {
   const wanted = header.blobs.filter((blob) => blob.compressed === null && !held?.has(blob.hash));
-  const sizes = new Map<string, number | null>();
-  await forEach(wanted, async (blob) => {
-    const object = await env.STORE.head(`blobs/${blob.hash}`);
-    sizes.set(blob.hash, object ? object.size : null);
-  });
+  const sizes = await storedSizes(
+    wanted.map((blob) => blob.hash),
+    env,
+  );
   let budget = 0;
   return header.blobs.map((blob) => {
     if (held?.has(blob.hash)) {
@@ -404,13 +403,16 @@ async function inlineFrame(object: string, hash: string, env: Env): Promise<{ bo
 async function putBlob(hash: string, request: Request, env: Env): Promise<Response> {
   const key = `blobs/${hash}`;
   const declared = request.headers.get("Content-Length");
+  let size: number;
   if (declared === null || !request.body) {
     // No length to stream with: read it whole.
     const body = await readBody(request, LARGEST_BODY);
     checkFrame(body);
     await env.STORE.put(key, body);
+    size = body.length;
   } else {
     const length = Number(declared);
+    size = length;
     if (!Number.isSafeInteger(length) || length < ZSTD_MAGIC.length) {
       throw new Failure(400, "malformed", "the body is not a zstd frame");
     }
@@ -463,6 +465,7 @@ async function putBlob(hash: string, request: Request, env: Env): Promise<Respon
       throw put.reason;
     }
   }
+  await indexOf(env).noteBlobs([[hash, size]]);
   await caches.default.delete(cacheUrl(key));
   return new Response(null, { status: 204 });
 }
@@ -489,13 +492,40 @@ async function missingBlobs(request: Request, env: Env): Promise<Response> {
 
 /** Those of `hashes` not stored apart, in order. */
 async function lacking(hashes: string[], env: Env): Promise<string[]> {
-  const present = new Set<string>();
-  await forEach(hashes, async (hash) => {
-    if (await env.STORE.head(`blobs/${hash}`)) {
-      present.add(hash);
-    }
-  });
-  return hashes.filter((hash) => !present.has(hash));
+  const sizes = await storedSizes(hashes, env);
+  return hashes.filter((hash) => sizes.get(hash) === null);
+}
+
+/** The stored size of each of `hashes` stored apart, or `null` for one that
+ * is not, as the index has them. Until the index has listed the blobs stored
+ * before it held them, one it lacks is asked of the bucket, a request each,
+ * and noted when found. */
+async function storedSizes(hashes: string[], env: Env): Promise<Map<string, number | null>> {
+  const index = indexOf(env);
+  const { sizes, complete } = await index.blobSizes(hashes);
+  const known = new Map(hashes.map((hash, at) => [hash, sizes[at] ?? null]));
+  if (complete) {
+    return known;
+  }
+  const found: [string, number][] = [];
+  await forEach(
+    hashes.filter((hash) => known.get(hash) === null),
+    async (hash) => {
+      const object = await env.STORE.head(`blobs/${hash}`);
+      if (object) {
+        found.push([hash, object.size]);
+        known.set(hash, object.size);
+      }
+    },
+  );
+  if (found.length > 0) {
+    await index.noteFound(found);
+  }
+  return known;
+}
+
+function indexOf(env: Env): DurableObjectStub<Index> {
+  return env.INDEX.get(env.INDEX.idFromName("index"));
 }
 
 // Commits.
@@ -504,7 +534,7 @@ async function putEntry(key: string, request: Request, env: Env): Promise<Respon
   const body = await readBody(request, LARGEST_BODY);
   const upload = parseUpload(body, key);
   const object = `entries/${key}`;
-  const index = env.INDEX.get(env.INDEX.idFromName("index"));
+  const index = indexOf(env);
   const exists = async () => {
     // The entry is there, so this commit succeeded; list it in case the
     // first commit's listing was lost.
@@ -579,7 +609,7 @@ async function listIndex(url: URL, env: Env): Promise<Response> {
   if (since !== null && !/^\d{1,15}$/.test(since)) {
     throw new Failure(400, "malformed", "the cursor is not one this server gave");
   }
-  const index = env.INDEX.get(env.INDEX.idFromName("index"));
+  const index = indexOf(env);
   const { text, cursor } = await index.list(since === null ? null : Number(since));
   return new Response(text, {
     headers: { "Content-Type": "text/plain; charset=utf-8", "Qk-Index-Cursor": cursor, "Cache-Control": "no-store" },
@@ -594,7 +624,7 @@ async function recordRuns(request: Request, env: Env): Promise<Response> {
   } catch {
     throw new Failure(400, "malformed", "the body is not UTF-8 text");
   }
-  const index = env.INDEX.get(env.INDEX.idFromName("index"));
+  const index = indexOf(env);
   await index.record(text, Date.now());
   return new Response(null, { status: 204 });
 }
