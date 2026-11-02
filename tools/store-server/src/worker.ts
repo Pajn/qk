@@ -416,7 +416,6 @@ async function readAtMost(body: ReadableStream<Uint8Array>, size: number, hash: 
   let read = 0;
   for await (const chunk of chunksOf(body)) {
     if (read + chunk.length > size) {
-      // Leaving the loop cancels the body, as chunksOf does when cut short.
       throw new Error(`blob ${hash} is larger than the index says`);
     }
     bytes.set(chunk, read);
