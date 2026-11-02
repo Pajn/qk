@@ -1624,8 +1624,9 @@ impl Coverage {
 
     /// Whether the declared key covers every path of `set`: each file read
     /// or found is keyed, or a directory found holds a keyed file, so that
-    /// its going changes the key; a file created where one was looked for
-    /// would be selected, and is neither gitignored nor a declared output;
+    /// its going changes the key; a file created where one was looked for,
+    /// or where one read is gone since, would be selected, and is neither
+    /// gitignored nor a declared output;
     /// and every entry a listed directory could gain or lose that is not
     /// gitignored would be selected, the directory being no declared output.
     /// A declared output never enters the declared files, unless a
@@ -1663,10 +1664,28 @@ impl Coverage {
             under(&self.resolved.declared.files, path).next().is_some()
                 || under(&self.resolved.inferred.files, path).next().is_some()
         };
+        // Whether a file created at `path` would enter the declared key.
+        let selected = move |path: &str| {
+            !snapshot.source_ignore.matches(path)
+                && !output(path)
+                && selection.selects(snapshot, path)
+        };
+        // A file the task read that is gone since is keyed as one it looked
+        // for and did not find: its coming back changes the key. A path it
+        // found may have been a directory, which the declared key leaves out
+        // while empty, so its going is not judged so.
+        let gone = move |path: &str| {
+            root.join(path).symlink_metadata().is_err_and(|error| {
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                )
+            })
+        };
         let reads = set
             .reads
             .iter()
-            .filter(move |path| !self.keyed(path))
+            .filter(move |path| !(self.keyed(path) || (gone(path) && selected(path))))
             .map(|path| (path.as_str(), "read"));
         let present = set
             .present
@@ -1678,12 +1697,7 @@ impl Coverage {
         let absent = set
             .absent
             .iter()
-            .filter(move |path| {
-                !(self.keyed(path)
-                    || (!snapshot.source_ignore.matches(path)
-                        && !output(path)
-                        && selection.selects(snapshot, path)))
-            })
+            .filter(move |path| !(self.keyed(path) || selected(path)))
             .map(|path| (path.as_str(), "looked for"));
         let listings = set
             .listings

@@ -83,7 +83,9 @@ everything the task could notice through it:
   keys for every task, or a directory it found holds a keyed file;
 - a file created where it looked for one and found none would be selected,
   and is neither gitignored nor a declared output, so that, say, a missing
-  `.env.local` keeps it on its recordings;
+  `.env.local` keeps it on its recordings; so would one created where a file
+  it read is gone since, as when a path set recorded on another
+  branch read a file this one does not have;
 - every entry a directory it listed could gain or lose would be selected,
   gitignored entries aside: a fileset takes all of what is under the
   directory, as `{projectRoot}/**/*` takes a project's directories, no
@@ -190,8 +192,11 @@ disagree:
 - a task its declared inputs missed where its recordings had a result: a
   change it never read, which `"on"` would have taken from the cache;
 - a task its declared inputs took from the cache where its recordings had
-  none: a change to what it read that its declared inputs leave out, a hit
-  that may be stale, or a recorded result never shared.
+  none, and its declared inputs do not cover every one of its path sets: a
+  change to what it read that its declared inputs leave out, a hit that may
+  be stale, or a recorded result never shared. Where they cover them all,
+  `"on"` takes the same result by its declared key, and `shadow` carries
+  `declared` true.
 
 Two more things tell whether `"on"` would be right:
 

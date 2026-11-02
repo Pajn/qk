@@ -82,8 +82,9 @@ pub struct TaskReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recorded: Option<Value>,
     /// For a task with `qk:ultracache` mode `"record"`, what its recordings
-    /// would have done: `{"kind": "wouldHit", "key"}`, `wouldMiss` or
-    /// `unrecorded`.
+    /// would have done: `{"kind": "wouldHit", "key"}`, `wouldMiss`, with
+    /// `declared` true where mode `"on"` would have taken the same result by
+    /// its declared key, or `unrecorded`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shadow: Option<Value>,
     /// Under `--sandbox=audit`, for a task audited, what it did beyond its

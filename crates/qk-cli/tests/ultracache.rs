@@ -320,6 +320,46 @@ fn a_declared_result_is_taken_when_the_declared_inputs_cover_what_the_task_read(
     }
 }
 
+/// A file a recorded task read that is gone since, as one recorded on
+/// another branch, is covered where its coming back would change the
+/// declared key, as a file looked for and not found is.
+#[test]
+fn a_file_read_when_recorded_and_gone_since_is_covered_where_it_would_be_selected() {
+    if !has_strace() {
+        return;
+    }
+    for (inputs, rerun) in [
+        (r#"["{projectRoot}/**/*""#, ("local-hit", "declared")),
+        // Created again, it would not be selected.
+        (
+            r#"["{projectRoot}/**/*", "!{projectRoot}/icons/c.svg""#,
+            ("miss", "missed"),
+        ),
+    ] {
+        let temp = fixture();
+        let root = temp.path();
+        let nx = fs::read_to_string(root.join("nx.json")).unwrap();
+        write(
+            root,
+            "nx.json",
+            &nx.replace(r#"["{projectRoot}/**/*""#, inputs),
+        );
+        write(root, "app/icons/c.svg", "<svg/>");
+        assert_eq!(build_keyed(root, true), ("miss".into(), "saved".into()));
+        fs::remove_file(root.join("app/icons/c.svg")).unwrap();
+        assert_eq!(
+            build_keyed(root, false),
+            ("miss".into(), "missed".into()),
+            "{inputs}"
+        );
+        assert_eq!(
+            build_keyed(root, false),
+            (rerun.0.into(), rerun.1.into()),
+            "{inputs}"
+        );
+    }
+}
+
 /// Coverage is judged by the declared inputs a lookup runs with. A named
 /// input reaches no key's settings, so narrowing one keeps a task's weak key
 /// and its path sets, and the narrower declaration no longer covers them.
@@ -442,7 +482,13 @@ fn a_task_in_mode_record_is_keyed_by_its_inputs_and_says_what_its_recordings_wou
     // And the recording misses where the declared key, now kept, hits.
     write(root, "app/src/main.txt", "changed\n");
     assert_eq!(shadow(false), expect("miss", "none", "wouldMiss"));
-    assert_eq!(shadow(false), expect("local-hit", "none", "wouldMiss"));
+    let task = build_report(root, false, &[]);
+    assert_eq!(task["cache"], "local-hit");
+    // The declared inputs cover what it read, so "on" would hit by them too.
+    assert_eq!(
+        task["shadow"],
+        json!({"kind": "wouldMiss", "changed": ["app/src/main.txt (read, declared)"], "declared": true})
+    );
 }
 
 #[test]
@@ -619,6 +665,49 @@ fn mode_record_looks_up_shared_recordings_behind_a_local_declared_hit() {
     assert_eq!(
         (task["cache"].as_str(), kind(&task["shadow"]).as_str()),
         (Some("local-hit"), "wouldHit")
+    );
+}
+
+/// Whether the declared inputs cover a task's recordings is judged with the
+/// path sets fetched from the store, too.
+#[test]
+fn mode_record_judges_the_declared_fallback_by_shared_recordings() {
+    if !has_strace() {
+        return;
+    }
+    let temp = fixture();
+    let root = temp.path();
+    let nx = fs::read_to_string(root.join("nx.json")).unwrap();
+    write(
+        root,
+        "nx.json",
+        &nx.replace(r#""ignoreReads""#, r#""mode": "record", "ignoreReads""#),
+    );
+    let server = s3::FakeS3::start();
+    let machine = with_remote(root, &server);
+    let (a, b) = (machine("a"), machine("b"));
+    let local: Vec<(String, String)> = b
+        .iter()
+        .filter(|(name, _)| name == "NX_CACHE_DIRECTORY")
+        .cloned()
+        .collect();
+    let task = build_report(root, true, &pairs(&a));
+    assert_eq!(kind(&task["recorded"]), "saved");
+    // `b` keeps a declared result for a change `a`'s recording misses,
+    // without the store, so that it has no path set of its own.
+    write(root, "app/src/main.txt", "changed\n");
+    let task = build_report(root, false, &pairs(&local));
+    assert_eq!(
+        (task["cache"].as_str(), kind(&task["shadow"]).as_str()),
+        (Some("miss"), "unrecorded")
+    );
+    // With the store, it hits that result, and the path set it fetches is
+    // one its declared inputs cover.
+    let task = build_report(root, false, &pairs(&b));
+    assert_eq!(task["cache"], "local-hit");
+    assert_eq!(
+        task["shadow"],
+        json!({"kind": "wouldMiss", "changed": ["app/src/main.txt (read, declared)"], "declared": true})
     );
 }
 
