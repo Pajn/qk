@@ -5,6 +5,7 @@ mod capture;
 pub mod dotenv;
 mod env_flags;
 mod interpolate;
+pub mod landlock;
 #[cfg(target_os = "linux")]
 pub mod overlay;
 mod process;
@@ -234,11 +235,40 @@ pub struct Overlay {
     /// The Landlock rules each command restricts itself to once the overlay
     /// is mounted, which reads must keep to.
     pub rules: OverlayRules,
-    /// Where the task may write: what its commands wrote beneath these is
-    /// applied to the workspace as they end, and the rest is not.
-    pub keep: Vec<PathBuf>,
+    /// Where the task may write: what its commands wrote there is applied to
+    /// the workspace as they end, and the rest is not.
+    pub keep: Keep,
     /// Set once the commands' writes are applied.
     pub settled: std::sync::OnceLock<Settled>,
+}
+
+/// Where a task over an overlay may write.
+#[derive(Clone, Debug, Default)]
+pub struct Keep {
+    /// Paths beneath which it may write.
+    pub paths: Vec<PathBuf>,
+    /// Names of directories beneath which it may write wherever they lie in
+    /// the workspace, there as the task started or made by it.
+    pub names: Vec<std::ffi::OsString>,
+}
+
+impl Keep {
+    /// Whether it may write `target`, in the workspace at `root`.
+    pub fn allows(&self, root: &std::path::Path, target: &std::path::Path) -> bool {
+        self.paths.iter().any(|path| target.starts_with(path))
+            || target.strip_prefix(root).is_ok_and(|relative| {
+                relative
+                    .components()
+                    .any(|part| self.names.iter().any(|name| part.as_os_str() == name))
+            })
+    }
+
+    /// Whether a path it may write beneath lies beneath `target`. Directories
+    /// it names by name are left out: those there as the task started are
+    /// bound through the overlay, which never holds them.
+    pub fn holds(&self, target: &std::path::Path) -> bool {
+        self.paths.iter().any(|path| path.starts_with(target))
+    }
 }
 
 /// What applying a task's overlay to the workspace did not apply.
@@ -249,6 +279,9 @@ pub struct Settled {
     /// What could not be read or applied, and why: outputs that may be
     /// missing from the workspace.
     pub failed: Vec<String>,
+    /// Directories `keep` names by name that applying made in the
+    /// workspace, but for those beneath another such directory.
+    pub made: Vec<PathBuf>,
 }
 
 impl Overlay {
@@ -274,19 +307,18 @@ impl Overlay {
 /// those in it are opened there, as the overlay's.
 #[derive(Debug, Default)]
 pub struct OverlayRules {
-    /// The rights the rule set handles, and those that apply to a file.
-    pub handled: u64,
-    pub file_rights: u64,
+    /// The rights the rule set handles.
+    pub handled: landlock::Rights,
     /// Opened outside the namespace: descriptors, held open until the task
     /// ends, with the rights beneath each.
     #[cfg(unix)]
-    pub outside: Vec<(std::os::fd::OwnedFd, u64)>,
+    pub outside: Vec<(std::os::fd::OwnedFd, landlock::Rights)>,
     /// The rights everywhere in the workspace, where writes reach the overlay
     /// and are judged as the task ends.
-    pub workspace: u64,
+    pub workspace: landlock::Rights,
     /// Paths in the workspace with the rights beneath each, and whether to
     /// reach it through no link.
-    pub inside: Vec<(PathBuf, u64, bool)>,
+    pub inside: Vec<(PathBuf, landlock::Rights, bool)>,
 }
 
 /// An external syscall recorder wrapping each command, with separate trace files.

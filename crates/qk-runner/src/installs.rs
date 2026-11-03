@@ -175,7 +175,7 @@ fn resolve(path: &Path) -> PathBuf {
 }
 
 #[cfg(all(test, unix))]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const LOCKFILE: &str = "lockfileVersion: '9.0'
@@ -223,7 +223,7 @@ snapshots:
 ";
 
     /// A workspace laid out as pnpm installs `LOCKFILE`.
-    fn workspace() -> tempfile::TempDir {
+    pub(crate) fn workspace() -> tempfile::TempDir {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         std::fs::write(root.join("pnpm-lock.yaml"), LOCKFILE).unwrap();

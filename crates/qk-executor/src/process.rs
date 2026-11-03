@@ -495,14 +495,7 @@ fn spawn(
         use std::os::unix::process::CommandExt;
         // Between fork and exec: only system calls.
         unsafe {
-            command.pre_exec(move || {
-                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
-                    || libc::syscall(libc::SYS_landlock_restrict_self, ruleset, 0u32) != 0
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
+            command.pre_exec(move || crate::landlock::restrict_self(ruleset));
         }
     }
     command

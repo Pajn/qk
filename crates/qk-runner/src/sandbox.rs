@@ -44,18 +44,19 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use qk_config::Workspace;
 use qk_taskgraph::{Task, TaskGraph};
-use serde::Serialize;
 
 use crate::installs::Installs;
 
-#[cfg(target_os = "linux")]
+mod audit;
 mod landlock;
-#[cfg(not(target_os = "linux"))]
-mod landlock {
-    pub fn abi() -> anyhow::Result<u32> {
-        anyhow::bail!("Landlock is Linux's")
-    }
-}
+mod policy;
+mod seatbelt;
+
+pub use audit::Findings;
+use audit::TaskAudit;
+use policy::Policy;
+pub use policy::in_git;
+use seatbelt::{Fit, quote, seatbelt};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -63,65 +64,6 @@ pub enum Mode {
     Audit,
     /// Refuse it.
     Enforce,
-}
-
-/// What one task did beyond what it declares.
-#[derive(Clone, Debug, Default, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Findings {
-    /// Workspace files it read that are not in its cache key, but for those
-    /// grouped below.
-    pub undeclared_reads: BTreeSet<String>,
-    /// Workspace packages' `package.json` read outside its key, as package
-    /// managers and bundlers do to resolve workspace packages.
-    pub manifest_reads: BTreeSet<String>,
-    /// Version and package managers' configuration read outside its key.
-    pub toolchain_reads: BTreeSet<String>,
-    /// TypeScript configuration read outside its key: likely inputs.
-    pub tsconfig_reads: BTreeSet<String>,
-    /// Files read outside its key in projects its project depends on, by
-    /// project: what running a dependency's code or following imports into
-    /// it reads. `^` inputs key them.
-    pub dependency_reads: BTreeMap<String, BTreeSet<String>>,
-    /// `.git` and dotenv files it read: allowed, but not in the key either.
-    pub unkeyed_reads: BTreeSet<String>,
-    /// Paths it wrote in the workspace outside its outputs.
-    pub stray_writes: BTreeSet<String>,
-    /// Installed packages it read that its key leaves out, by name, when
-    /// it names its `externalDependencies`: naming them there keys them.
-    pub unkeyed_packages: BTreeSet<String>,
-    /// Installed packages it read that its key leaves out although it counts
-    /// every package its importers install: none of those depends on them,
-    /// so a package found them through pnpm's hoisting, which links every
-    /// installed package where any can resolve it. Declaring each as a
-    /// dependency of what imports it keys it.
-    pub hoisted_packages: BTreeSet<String>,
-}
-
-impl Findings {
-    /// Whether it did anything enforce would refuse: beyond reading `.git` and
-    /// dotenv files and installed packages its key leaves out, and writing in
-    /// `.git`, which enforce allows.
-    pub fn went_beyond(&self) -> bool {
-        !self.undeclared_reads.is_empty()
-            || !self.manifest_reads.is_empty()
-            || !self.toolchain_reads.is_empty()
-            || !self.tsconfig_reads.is_empty()
-            || !self.dependency_reads.is_empty()
-            || self.stray_writes.iter().any(|path| !in_git(path))
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.undeclared_reads.is_empty()
-            && self.manifest_reads.is_empty()
-            && self.toolchain_reads.is_empty()
-            && self.tsconfig_reads.is_empty()
-            && self.dependency_reads.is_empty()
-            && self.unkeyed_reads.is_empty()
-            && self.stray_writes.is_empty()
-            && self.unkeyed_packages.is_empty()
-            && self.hoisted_packages.is_empty()
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -143,31 +85,15 @@ struct Plan {
     /// as the run started: Landlock, which follows links, allows each only
     /// while that still holds, so a link an earlier task put in its place
     /// leads nowhere new.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     unlinked: BTreeSet<PathBuf>,
     /// Its outputs, warm paths and scratch directories.
     write_trees: BTreeSet<PathBuf>,
     /// Its scratch directories, which are directories whatever their names:
     /// Landlock, which holds only paths that exist, needs them made first.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     scratch: BTreeSet<PathBuf>,
     /// Audit: the pnpm store directories whose manifests' reads are
     /// reported, as the shorter list Seatbelt takes.
     packages: Option<Packages>,
-}
-
-impl Plan {
-    /// Whether `path` may be read, or with `write` written, without a report:
-    /// what the audit profile allows outright.
-    fn allows(&self, path: &Path, write: bool, state: &Path) -> bool {
-        let under = |tree: &PathBuf| path.starts_with(tree);
-        path.starts_with(state)
-            || self.write_trees.iter().any(under)
-            || (!write
-                && (self.read_directories.iter().any(under)
-                    || self.read_trees.iter().any(under)
-                    || self.read_files.iter().any(|file| file == path)))
-    }
 }
 
 /// The store directories whose manifests' reads are reported.
@@ -196,26 +122,13 @@ impl Packages {
 pub struct Sandbox {
     pub mode: Mode,
     root: PathBuf,
-    state: PathBuf,
-    plans: BTreeMap<String, Plan>,
+    policies: BTreeMap<String, Policy>,
     profiles: BTreeMap<String, PathBuf>,
-    /// The installed packages, and in audit the installations each task's key
-    /// covers, or its ignored reads reach, for telling which package a
-    /// reported read belongs to.
+    /// The installed packages, for telling which package a reported read
+    /// belongs to.
     installs: Option<Installs>,
-    covered: BTreeMap<String, BTreeSet<String>>,
-    /// The tasks whose key names their `externalDependencies`, even none, in
-    /// place of what their importers install.
-    naming_external: BTreeSet<String>,
-    /// Each task's `qk:ultracache.ignoreReads`: reads that change nothing it
-    /// does, which are no finding either.
-    ignored: BTreeMap<String, qk_cache::ultracache::IgnoredReads>,
-    /// The manifests of the workspace projects its ignored reads link to,
-    /// beyond its key, which are no finding either.
-    ignored_manifests: BTreeMap<String, BTreeSet<String>>,
-    /// The projects each task's project depends on, directly or not, by name
-    /// with their roots, innermost first.
-    depended: BTreeMap<String, Vec<(Option<String>, String)>>,
+    /// What each task's reports are judged against.
+    audits: BTreeMap<String, TaskAudit>,
     /// Tasks that run unsandboxed, and why.
     unsandboxed: Mutex<BTreeMap<String, String>>,
     /// Enforce: tasks that cannot be sandboxed, and why. They fail when they
@@ -225,10 +138,15 @@ pub struct Sandbox {
     packages_unchecked: BTreeMap<String, String>,
     watcher: Option<Watcher>,
     directory: PathBuf,
-    /// Linux: every `node_modules` directory and dotenv file of the
-    /// workspace, since Landlock takes paths rather than patterns.
-    shared: Vec<PathBuf>,
-    dotenv: Vec<PathBuf>,
+    /// Linux enforce: what the policies' patterns name in the workspace,
+    /// since Landlock takes paths rather than patterns: those there as the
+    /// run starts, and the `node_modules` tasks over overlays make as they
+    /// settle, for the tasks starting after them. A task held by Landlock
+    /// alone cannot make a `node_modules` itself, and a command over an
+    /// overlay cannot read the files it wrote in one it made, only what
+    /// links there lead to.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    expansion: Mutex<landlock::Expansion>,
     /// Linux audit: the recorder, and each task's recording with the
     /// directory its commands start in.
     recording: Option<qk_executor::Recording>,
@@ -308,12 +226,11 @@ impl Sandbox {
         let tree = Tree::new(&resolution.candidates).protecting(protected(workspace));
         let installs = Installs::load(&root);
         let projects = qk_graph::ProjectGraph::build(workspace)?;
-        let depended = depended(workspace, graph, &projects);
-        let mut plans = BTreeMap::new();
-        let mut covered = BTreeMap::new();
-        let mut naming_external = BTreeSet::new();
-        let mut ignored = BTreeMap::new();
-        let mut ignored_manifests = BTreeMap::new();
+        let mut audits: BTreeMap<String, TaskAudit> = depended(workspace, graph, &projects)
+            .into_iter()
+            .map(|(id, depended)| (id, TaskAudit::new(&root, depended)))
+            .collect();
+        let mut policies = BTreeMap::new();
         // The files each list of ignored reads matches, walked once however
         // many tasks share it.
         let mut walked: BTreeMap<(Vec<String>, String), Ignored> = BTreeMap::new();
@@ -331,6 +248,7 @@ impl Sandbox {
             };
         };
         for (id, task) in &graph.tasks {
+            let audit = audits.get_mut(id).expect("every task has an audit");
             match qk_cache::scratch::Settings::of(task.definition.extra.get("qk:sandbox")) {
                 Ok(settings) if settings.sandboxed => {}
                 Ok(_) => {
@@ -364,7 +282,7 @@ impl Sandbox {
                     .entry((written, project))
                     .or_insert_with(|| matching_paths(&root, &reads))
                     .clone();
-                ignored.insert(id.clone(), reads);
+                audit.ignoring(reads);
             }
             match &resolution.tasks[id] {
                 Ok(resolved) => {
@@ -385,7 +303,7 @@ impl Sandbox {
                         let mut keyed = installs.covered(resolved);
                         // What it reaches through the nested workspaces its
                         // ignored reads cover is permitted as they are.
-                        if let Some(reads) = ignored.get(id) {
+                        if let Some(reads) = audit.ignored() {
                             // Keyed whole, the lockfile names no importers of
                             // its own; its project's is.
                             let importers =
@@ -405,9 +323,7 @@ impl Sandbox {
                                     .map(|manifest| root.join(manifest))
                                     .filter(|path| path.is_file()),
                             );
-                            if !manifests.is_empty() {
-                                ignored_manifests.insert(id.clone(), manifests);
-                            }
+                            audit.ignoring_manifests(manifests);
                         }
                         // Enforce leaves `node_modules` open.
                         if let Some(keyed) = keyed
@@ -415,13 +331,11 @@ impl Sandbox {
                         {
                             let (keyed_directories, unkeyed) = installs.directories(&keyed);
                             plan.packages = Some(Packages::shorter(keyed_directories, unkeyed));
-                            covered.insert(id.clone(), keyed);
-                            if resolved.declared.external_declared {
-                                naming_external.insert(id.clone());
-                            }
+                            audit.covering(keyed, resolved.declared.external_declared);
                         }
                     }
-                    plans.insert(id.clone(), plan);
+                    audit.writing(plan.write_trees.iter().cloned());
+                    policies.insert(id.clone(), Policy::new(mode, &root, &state, plan));
                 }
                 Err(reason) => {
                     unconfinable(&mut unsandboxed, &mut refused, id, reason.clone());
@@ -431,22 +345,16 @@ impl Sandbox {
         let mut sandbox = Self {
             mode,
             root,
-            state,
-            plans,
+            policies,
             profiles: BTreeMap::new(),
             installs,
-            covered,
-            naming_external,
-            ignored,
-            ignored_manifests,
-            depended,
+            audits,
             unsandboxed: Mutex::new(unsandboxed),
             refused: Mutex::new(refused),
             packages_unchecked: BTreeMap::new(),
             watcher: None,
             directory,
-            shared: Vec::new(),
-            dotenv: Vec::new(),
+            expansion: Mutex::new(landlock::Expansion::default()),
             recording: None,
             traces: Mutex::new(BTreeMap::new()),
             trace_count: std::sync::atomic::AtomicUsize::new(0),
@@ -473,12 +381,11 @@ impl Sandbox {
             }
         }
         if cfg!(target_os = "macos") {
-            for (index, id) in sandbox.plans.keys().enumerate() {
+            for (index, id) in sandbox.policies.keys().enumerate() {
                 let path = sandbox.directory.join(format!("{index}.sb"));
-                let plan = &sandbox.plans[id];
                 // A profile Seatbelt cannot take: audit runs the task
                 // unsandboxed, with the reason, and enforce fails it.
-                match seatbelt(plan, id, &sandbox.root, &sandbox.state, mode, &path)? {
+                match seatbelt(&sandbox.policies[id], id, &path)? {
                     Fit::Whole => {
                         sandbox.profiles.insert(id.clone(), path);
                     }
@@ -512,9 +419,7 @@ impl Sandbox {
                 .context("--sandbox on Linux records what each task does, with eBPF or strace")?;
             sandbox.recording = Some(recording.resolving());
         } else {
-            let (shared, dotenv) = scan(&sandbox.root);
-            sandbox.shared = shared;
-            sandbox.dotenv = dotenv;
+            sandbox.expansion = Mutex::new(landlock::Expansion::scan(&sandbox.root));
         }
         Ok(sandbox)
     }
@@ -534,7 +439,7 @@ impl Sandbox {
         if let Some(reason) = self.refused.lock().unwrap().get(id) {
             return Some(qk_executor::Confinement::Refused(reason.clone()));
         }
-        if !self.plans.contains_key(id) || self.recording.is_some() {
+        if !self.policies.contains_key(id) || self.recording.is_some() {
             return None;
         }
         if self.overlay {
@@ -586,34 +491,15 @@ impl Sandbox {
     /// directories, and the Landlock rules reads keep to.
     #[cfg(target_os = "linux")]
     fn overlaid(&self, id: &str) -> Result<qk_executor::Confinement> {
-        let plan = &self.plans[id];
+        let policy = &self.policies[id];
         let number = self
             .trace_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut passthrough: Vec<PathBuf> = vec![self.root.join(".git")];
-        if self.state.starts_with(&self.root) && !self.state.starts_with(self.root.join(".git")) {
-            passthrough.push(self.state.clone());
-        }
-        passthrough.extend(self.shared.iter().cloned());
-        for directory in &plan.scratch {
+        for directory in policy.scratch() {
             std::fs::create_dir_all(directory)?;
-            passthrough.push(directory.clone());
         }
-        passthrough.retain(|path| path.exists());
-        let mut through = passthrough.clone();
-        // qk's state, beneath the workspace or not.
-        through.push(self.state.clone());
-        let rules = landlock::overlay_rules(
-            &landlock::Paths {
-                root: &self.root,
-                read_directories: &plan.read_directories,
-                read_files: plan.read_files.iter().chain(&self.dotenv),
-                read_trees: &plan.read_trees,
-                unlinked: &plan.unlinked,
-                write_trees: plan.write_trees.iter(),
-            },
-            &through,
-        )?;
+        let (rules, passthrough, keep) =
+            landlock::overlay(policy, &self.expansion.lock().unwrap())?;
         // In this run's own directory: another run in the workspace numbers
         // its tasks' overlays from 0 too. One a run of the same process ID
         // left behind is cleared, never mounted again.
@@ -624,12 +510,7 @@ impl Sandbox {
             directory,
             passthrough,
             rules,
-            keep: plan
-                .write_trees
-                .iter()
-                .chain([&self.state])
-                .cloned()
-                .collect(),
+            keep,
             settled: std::sync::OnceLock::new(),
         });
         self.overlays
@@ -652,7 +533,12 @@ impl Sandbox {
         let Some(overlay) = self.overlays.lock().unwrap().remove(id) else {
             return;
         };
-        let discarded = overlay.settle().discarded.clone();
+        let settled = overlay.settle();
+        let discarded = settled.discarded.clone();
+        self.expansion
+            .lock()
+            .unwrap()
+            .add_node_modules(&settled.made);
         #[cfg(target_os = "linux")]
         qk_executor::overlay::clear(&overlay.directory);
         #[cfg(not(target_os = "linux"))]
@@ -677,7 +563,7 @@ impl Sandbox {
         existing: Option<&qk_executor::Recording>,
     ) -> Option<qk_executor::Recording> {
         let recording = self.recording.as_ref()?;
-        if !self.plans.contains_key(id) {
+        if !self.policies.contains_key(id) {
             return None;
         }
         self.make_outputs(id);
@@ -703,7 +589,7 @@ impl Sandbox {
     /// Records that a task runs no command: it did nothing beyond its
     /// declarations, and has no recording to read.
     pub fn ran_nothing(&self, id: &str) {
-        if self.plans.contains_key(id) {
+        if self.policies.contains_key(id) {
             self.idle.lock().unwrap().insert(id.to_owned());
         }
     }
@@ -768,22 +654,26 @@ impl Sandbox {
                     continue;
                 }
             };
-            let plan = &self.plans[&id];
+            let policy = &self.policies[&id];
             reports.extend(
                 accesses
                     .into_iter()
-                    .filter_map(|access| self.report(&id, plan, access)),
+                    .filter_map(|access| self.report(&id, policy, access)),
             );
             audited.insert(id);
         }
         (reports, audited)
     }
 
-    /// The report Seatbelt's audit profile would make of `access`, if any:
-    /// a read of a file or a write in the workspace that `plan` does not
-    /// allow, and in `node_modules` only a read of a package's manifest, by
-    /// which a package the key leaves out is found.
-    fn report(&self, id: &str, plan: &Plan, access: qk_input_analysis::Access) -> Option<Report> {
+    /// The report Seatbelt's audit profile would make of `access`, if any: a
+    /// successful read of a file or write in the workspace that `policy`
+    /// reports.
+    fn report(
+        &self,
+        id: &str,
+        policy: &Policy,
+        access: qk_input_analysis::Access,
+    ) -> Option<Report> {
         use qk_input_analysis::Operation;
         let write = access.operation.writes();
         if write {
@@ -804,21 +694,12 @@ impl Sandbox {
             self.root.join(path.strip_prefix(&self.given_root).ok()?)
         };
         // Directories may be listed; what a listing finds is not read.
-        if !write && path.is_dir() {
-            return None;
-        }
-        let relative = path.strip_prefix(&self.root).ok()?;
-        if relative
-            .components()
-            .any(|component| component.as_os_str() == "node_modules")
-        {
-            if write
-                || plan.packages.is_none()
-                || path.file_name() != Some(std::ffi::OsStr::new("package.json"))
-            {
-                return None;
-            }
-        } else if plan.allows(&path, write, &self.state) {
+        let (kind, is_dir) = if write {
+            (policy::Access::Write, false)
+        } else {
+            (policy::Access::Read, path.is_dir())
+        };
+        if policy.judge(&path, kind, is_dir) != policy::Verdict::Report {
             return None;
         }
         Some(Report {
@@ -842,10 +723,10 @@ impl Sandbox {
     /// its outputs. An output itself is not made, as a path names a file or a
     /// directory alike. Failing to create one leaves the task to.
     fn make_outputs(&self, id: &str) {
-        let Some(plan) = self.plans.get(id) else {
+        let Some(policy) = self.policies.get(id) else {
             return;
         };
-        for tree in &plan.write_trees {
+        for tree in policy.outputs() {
             let Some(parent) = tree.parent() else {
                 continue;
             };
@@ -863,33 +744,22 @@ impl Sandbox {
     #[cfg(target_os = "linux")]
     fn landlock(&self, id: &str) -> Result<qk_executor::Confinement> {
         use std::os::fd::AsRawFd;
-        let plan = &self.plans[id];
+        let policy = &self.policies[id];
         // Landlock holds paths that exist: an output without an extension is
         // taken for a directory and made too.
         self.make_outputs(id);
-        for tree in &plan.write_trees {
+        for tree in policy.outputs() {
             if !tree.exists() && tree.extension().is_none() {
                 std::fs::create_dir_all(tree)?;
-                self.created.lock().unwrap().push(tree.clone());
+                self.created.lock().unwrap().push(tree.to_owned());
             }
         }
         // A scratch directory is one whatever its name, and is made before
         // the task runs anyway.
-        for directory in &plan.scratch {
+        for directory in policy.scratch() {
             std::fs::create_dir_all(directory)?;
         }
-        let rules = landlock::rules(&landlock::Paths {
-            root: &self.root,
-            read_directories: &plan.read_directories,
-            read_files: plan.read_files.iter().chain(&self.dotenv),
-            read_trees: &plan.read_trees,
-            unlinked: &plan.unlinked,
-            write_trees: plan
-                .write_trees
-                .iter()
-                .chain(&self.shared)
-                .chain([&self.root.join(".git"), &self.state]),
-        })?;
+        let rules = landlock::ruleset(policy, &self.expansion.lock().unwrap())?;
         let fd = rules.as_raw_fd();
         self.rulesets.lock().unwrap().push(rules);
         Ok(qk_executor::Confinement::Landlock(fd))
@@ -927,7 +797,7 @@ impl Sandbox {
                 }
                 reports.retain(|report| !over.contains_key(&report.task));
                 let audited = self
-                    .plans
+                    .policies
                     .keys()
                     .filter(|id| !over.contains_key(*id))
                     .cloned()
@@ -938,109 +808,30 @@ impl Sandbox {
             None => (Vec::new(), BTreeSet::new()),
         };
         let _ = std::fs::remove_dir_all(&self.directory);
-        let mut findings: BTreeMap<String, Findings> = BTreeMap::new();
+        let mut by_task: BTreeMap<String, (Vec<Report>, BTreeSet<String>)> = BTreeMap::new();
+        for report in reports {
+            by_task
+                .entry(report.task.clone())
+                .or_default()
+                .0
+                .push(report);
+        }
         // Over an overlay, what a task wrote outside its outputs was not
         // kept: a finding as audit would report it.
         for (id, paths) in std::mem::take(&mut *self.discarded.lock().unwrap()) {
-            findings.entry(id).or_default().stray_writes.extend(paths);
+            by_task.entry(id).or_default().1.extend(paths);
         }
-        for report in reports {
-            let Ok(relative) = Path::new(&report.path).strip_prefix(&self.root) else {
-                continue;
-            };
-            let relative = relative.to_string_lossy().replace('\\', "/");
-            if !report.operation.starts_with("file-write")
-                && (self
-                    .ignored
-                    .get(&report.task)
-                    .is_some_and(|reads| reads.is_match(&relative))
-                    || self
-                        .ignored_manifests
-                        .get(&report.task)
-                        .is_some_and(|manifests| manifests.contains(&relative)))
-            {
-                continue;
-            }
-            let package = (!report.operation.starts_with("file-write"))
-                .then(|| {
-                    let installs = self.installs.as_ref()?;
-                    installs.unkeyed(self.covered.get(&report.task)?, Path::new(&report.path))
-                })
-                .flatten();
-            // Reads in `node_modules` are reported only to find packages: one
-            // the key covers, or a manifest belonging to no package, is not
-            // a finding.
-            if package.is_none() && relative.split('/').any(|part| part == "node_modules") {
-                continue;
-            }
-            // Making the directory an output lies in, as a tool writing
-            // `dist/app.js` makes `dist`, writes no output of its own: what it
-            // writes in it is reported by itself.
-            let path = Path::new(&report.path);
-            if report.operation.starts_with("file-write")
-                && path.is_dir()
-                && self.plans.get(&report.task).is_some_and(|plan| {
-                    plan.write_trees
-                        .iter()
-                        .any(|tree| tree != path && tree.starts_with(path))
-                })
-            {
-                continue;
-            }
-            let dependency = self
-                .depended
-                .get(&report.task)
-                .into_iter()
-                .flatten()
-                .find(|(_, root)| relative.starts_with(&format!("{root}/")))
-                .and_then(|(project, _)| project.clone());
-            let naming_external = self.naming_external.contains(&report.task);
-            let entry = findings.entry(report.task).or_default();
-            if let Some(package) = package {
-                if naming_external {
-                    entry.unkeyed_packages.insert(package);
-                } else {
-                    entry.hoisted_packages.insert(package);
-                }
-            } else if report.operation.starts_with("file-write") {
-                entry.stray_writes.insert(relative);
-            } else if unkeyed(&relative) {
-                entry.unkeyed_reads.insert(relative);
-            } else if let Some(project) = dependency
-                && qk_input_analysis::ReadKind::of(&relative)
-                    == qk_input_analysis::ReadKind::Content
-            {
-                entry
-                    .dependency_reads
-                    .entry(project)
-                    .or_default()
-                    .insert(relative);
-            } else {
-                match qk_input_analysis::ReadKind::of(&relative) {
-                    qk_input_analysis::ReadKind::Manifest => &mut entry.manifest_reads,
-                    qk_input_analysis::ReadKind::Toolchain => &mut entry.toolchain_reads,
-                    qk_input_analysis::ReadKind::TsConfig => &mut entry.tsconfig_reads,
-                    qk_input_analysis::ReadKind::Content => &mut entry.undeclared_reads,
-                }
-                .insert(relative);
-            }
-        }
-        // A file a task writes outside its outputs and reads, as a version
-        // stamp it keeps, is one finding: declaring it an output covers both.
-        for findings in findings.values_mut() {
-            for path in &findings.stray_writes {
-                findings.undeclared_reads.remove(path);
-                findings.manifest_reads.remove(path);
-                findings.toolchain_reads.remove(path);
-                findings.tsconfig_reads.remove(path);
-                for paths in findings.dependency_reads.values_mut() {
-                    paths.remove(path);
-                }
-            }
-            findings
-                .dependency_reads
-                .retain(|_, paths| !paths.is_empty());
-        }
+        // A report naming a task this run does not know is judged against
+        // nothing but the workspace.
+        let unknown = TaskAudit::new(&self.root, Vec::new());
+        let mut findings: BTreeMap<String, Findings> = by_task
+            .into_iter()
+            .map(|(id, (reports, discarded))| {
+                let audit = self.audits.get(&id).unwrap_or(&unknown);
+                let found = audit.classify(self.installs.as_ref(), reports, discarded);
+                (id, found)
+            })
+            .collect();
         let unsandboxed = std::mem::take(&mut *self.unsandboxed.lock().unwrap());
         // A task run again unsandboxed was audited only until it failed, so it
         // is listed as unsandboxed rather than with part of its findings.
@@ -1064,36 +855,6 @@ impl Sandbox {
     }
 }
 
-/// Every `node_modules` directory and dotenv file in the workspace, without
-/// looking inside `node_modules` or `.git`.
-fn scan(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
-    let mut shared = Vec::new();
-    let mut dotenv = Vec::new();
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(directory) = pending.pop() {
-        let Ok(entries) = std::fs::read_dir(&directory) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            let Ok(kind) = entry.file_type() else {
-                continue;
-            };
-            if kind.is_dir() {
-                match name.as_ref() {
-                    "node_modules" => shared.push(entry.path()),
-                    ".git" => {}
-                    _ => pending.push(entry.path()),
-                }
-            } else if unkeyed(&name) {
-                dotenv.push(entry.path());
-            }
-        }
-    }
-    (shared, dotenv)
-}
-
 impl Drop for Sandbox {
     fn drop(&mut self) {
         if let Some(mut watcher) = self.watcher.take() {
@@ -1105,43 +866,6 @@ impl Drop for Sandbox {
         #[cfg(not(target_os = "linux"))]
         let _ = std::fs::remove_dir_all(&self.directory);
     }
-}
-
-/// Whether `path` is `.git` or lies in it, which enforce lets a task read and
-/// write.
-pub fn in_git(path: &str) -> bool {
-    path == ".git" || path.starts_with(".git/")
-}
-
-/// `.git` and dotenv files, which tasks read outside their keys by design.
-fn unkeyed(path: &str) -> bool {
-    let name = path.rsplit('/').next().unwrap_or(path);
-    path == ".git"
-        || path.starts_with(".git/")
-        || name == ".env"
-        || name.starts_with(".env.")
-        || (name.starts_with('.') && name.ends_with(".env"))
-}
-
-// Rules name `file-read-data` rather than `file-read*`: Seatbelt lets a rule
-// for a specific operation win over one for a wildcard, whatever their order,
-// so a wildcard allow would not override the reporting rule.
-
-/// A string in a profile.
-fn quote(text: &str) -> String {
-    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
-}
-
-/// A regular expression matching `text` literally.
-fn literal_regex(text: &str) -> String {
-    let mut escaped = String::new();
-    for ch in text.chars() {
-        if "\\.+*?()|[]{}^$".contains(ch) {
-            escaped.push('\\');
-        }
-        escaped.push(ch);
-    }
-    escaped
 }
 
 /// Every task `task` depends on, directly or not.
@@ -1157,46 +881,6 @@ fn dependencies<'a>(graph: &'a TaskGraph, task: &'a Task) -> Vec<&'a Task> {
         }
     }
     found
-}
-
-/// How much of a task's plan its profile holds it to.
-#[derive(Debug, PartialEq)]
-enum Fit {
-    Whole,
-    /// All but its installed packages, with why.
-    WithoutPackages(String),
-    /// Nothing: Seatbelt rejects its profile, with why.
-    Rejected(String),
-}
-
-/// Writes a task's profile to `path`. Seatbelt caps the paths a profile with
-/// reports may name, and a large store can take them all: a task whose
-/// profile it rejects is still held to its inputs and outputs, without
-/// reporting packages.
-fn seatbelt(
-    plan: &Plan,
-    id: &str,
-    root: &Path,
-    state: &Path,
-    mode: Mode,
-    path: &Path,
-) -> Result<Fit> {
-    std::fs::write(path, profile(plan, id, root, state, mode)?)?;
-    let Err(reason) = compiles(path) else {
-        return Ok(Fit::Whole);
-    };
-    if plan.packages.is_none() {
-        return Ok(Fit::Rejected(reason));
-    }
-    let without = Plan {
-        packages: None,
-        ..plan.clone()
-    };
-    std::fs::write(path, profile(&without, id, root, state, mode)?)?;
-    Ok(match compiles(path) {
-        Ok(()) => Fit::WithoutPackages(reason),
-        Err(reason) => Fit::Rejected(reason),
-    })
 }
 
 /// For each task, every project's root, the deepest first so a path is
@@ -1272,26 +956,6 @@ pub(crate) fn nested(task: &qk_executor::PreparedTask, result: &qk_cache::TaskRe
                 .windows(REFUSED.len())
                 .any(|window| window == REFUSED)
         })
-}
-
-/// Whether Seatbelt accepts a profile, or its complaint.
-fn compiles(profile: &Path) -> std::result::Result<(), String> {
-    let output = Command::new("sandbox-exec")
-        .arg("-f")
-        .arg(profile)
-        .arg("/usr/bin/true")
-        .output()
-        .map_err(|error| format!("cannot run sandbox-exec: {error}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr)
-            .lines()
-            .next()
-            .unwrap_or("sandbox-exec rejected the profile")
-            .trim_start_matches("sandbox-exec: ")
-            .to_owned())
-    }
 }
 
 /// The workspace's files as directories, for allowing a directory whole
@@ -1517,123 +1181,6 @@ pub(crate) fn linked_targets(root: &Path, link: &Path) -> BTreeSet<PathBuf> {
     visited
 }
 
-/// The Seatbelt profile for a task's plan.
-fn profile(plan: &Plan, id: &str, root: &Path, state: &Path, mode: Mode) -> Result<String> {
-    let text = |path: &Path| -> Result<String> {
-        path.to_str()
-            .map(quote)
-            .context("sandboxed paths must be UTF-8")
-    };
-    let root_text = root.to_str().context("the workspace path must be UTF-8")?;
-    let tag = quote(&format!("{TAG}{id}"));
-    let mut rules = vec!["(version 1)".to_owned(), "(allow default)".to_owned()];
-    match mode {
-        Mode::Audit => {
-            rules.push(format!(
-                "(allow file-read-data (subpath {}) (with report) (with message {tag}))",
-                quote(root_text)
-            ));
-            rules.push(format!(
-                "(allow file-write* (subpath {}) (with report) (with message {tag}))",
-                quote(root_text)
-            ));
-        }
-        Mode::Enforce => {
-            rules.push(format!(
-                "(deny file-read-data (subpath {}) (with message {tag}))",
-                quote(root_text)
-            ));
-            rules.push(format!(
-                "(deny file-write* (subpath {}) (with message {tag}))",
-                quote(root_text)
-            ));
-            // Not keyed, but a task may need them.
-            rules.push(format!(
-                "(allow file-read-data file-write* (subpath {}))",
-                text(&root.join(".git"))?
-            ));
-            rules.push(format!(
-                "(allow file-read-data (regex #\"^{}/(.*/)?\\.(env|env\\.[^/]*|[^/]*\\.env)$\"))",
-                literal_regex(root_text)
-            ));
-        }
-    }
-    rules.push(format!(
-        "(allow file-read-data file-write* (regex #\"^{}/(.*/)?node_modules/\"))",
-        literal_regex(root_text)
-    ));
-    // A package the key leaves out is reported by its manifests, which Node
-    // and bundlers read for every package they load: a report for each of
-    // the thousands of files a tool reads would crowd out the run's other
-    // reports, which the log drops when many arrive at once. Seatbelt matches
-    // the path a link resolves to, so reads through an importer's
-    // `node_modules/<name>` land here too.
-    //
-    // Seatbelt caps the paths a profile with reports may name at 64 KiB
-    // together, whatever rules they are spread over, and a store may hold
-    // thousands of directories: the shorter of the two lists is named, those
-    // to report or, after a rule reporting every manifest in the store, those
-    // not to, since a later rule wins.
-    let manifests = |directories: &[PathBuf], report: &str| -> Result<Vec<String>> {
-        let mut rules = Vec::new();
-        for chunk in directories.chunks(200) {
-            rules.push(
-                "(allow file-read-data (require-all (regex #\"/package\\.json$\") (require-any"
-                    .to_owned(),
-            );
-            for directory in chunk {
-                rules.push(format!("  (subpath {})", text(directory)?));
-            }
-            rules.push(format!(")){report})"));
-        }
-        Ok(rules)
-    };
-    let report = format!(" (with report) (with message {tag})");
-    match &plan.packages {
-        None => {}
-        Some(Packages::Unkeyed(directories)) => rules.extend(manifests(directories, &report)?),
-        Some(Packages::AllBut(directories)) => {
-            rules.push(format!(
-                "(allow file-read-data (regex #\"^{}/node_modules/\\.pnpm/[^/]+/(.*/)?package\\.json$\"){report})",
-                literal_regex(root_text)
-            ));
-            rules.extend(manifests(directories, "")?);
-        }
-    }
-    // Directories may be listed; what a listing finds is not read.
-    rules.push("(allow file-read-data (vnode-type DIRECTORY))".to_owned());
-    // qk's own state for the worktree, where warm directories live.
-    rules.push(format!(
-        "(allow file-read-data file-write* (subpath {}))",
-        text(state)?
-    ));
-    for directory in &plan.read_directories {
-        rules.push(format!(
-            "(allow file-read-data (subpath {}))",
-            text(directory)?
-        ));
-    }
-    // The paths are spread over rules of a few hundred each; together they
-    // count toward Seatbelt's cap, as the packages' do.
-    for chunk in plan.read_files.chunks(200) {
-        rules.push("(allow file-read-data".to_owned());
-        for file in chunk {
-            rules.push(format!("  (literal {})", text(file)?));
-        }
-        rules.push(")".to_owned());
-    }
-    for tree in &plan.read_trees {
-        rules.push(format!("(allow file-read-data (subpath {}))", text(tree)?));
-    }
-    for tree in &plan.write_trees {
-        rules.push(format!(
-            "(allow file-read-data file-write* (subpath {}))",
-            text(tree)?
-        ));
-    }
-    Ok(rules.join("\n") + "\n")
-}
-
 /// What a task's ignored reads name on disk as the run starts.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Ignored {
@@ -1822,6 +1369,13 @@ pub(crate) struct Report {
     pub process: u32,
     pub operation: String,
     pub path: String,
+}
+
+impl Report {
+    /// Whether it reports a write, rather than a read.
+    pub(crate) fn writes(&self) -> bool {
+        self.operation.starts_with("file-write")
+    }
 }
 
 /// `log stream`, reading the sandbox's reports while the run lasts.
@@ -2324,67 +1878,5 @@ mod tests {
             .collect()
         );
         assert!(linked_targets(&root, &root.join("file.txt")).is_empty());
-    }
-
-    /// Seatbelt rejects a profile naming thousands of store directories with
-    /// reports; the shorter list fits, and a store too large for either still
-    /// holds the task to its inputs and outputs.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn fits_a_large_store_into_a_profile() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let store = |range: std::ops::Range<usize>| -> Vec<PathBuf> {
-            range
-                .map(|index| {
-                    root.join(format!(
-                        "node_modules/.pnpm/@scope+package-{index}@1.0.{index}_peer@2.0.0"
-                    ))
-                })
-                .collect()
-        };
-        let plan = |packages| Plan {
-            read_files: vec![root.join("src/index.ts")],
-            packages: Some(packages),
-            ..Plan::default()
-        };
-        let fit = |plan: &Plan| {
-            seatbelt(
-                plan,
-                "app:lint",
-                &root,
-                &root.join(".qk"),
-                Mode::Audit,
-                &root.join("p.sb"),
-            )
-            .unwrap()
-        };
-        let (keyed, unkeyed) = (store(0..100), store(100..2600));
-        assert_eq!(
-            fit(&plan(Packages::shorter(keyed, unkeyed.clone()))),
-            Fit::Whole
-        );
-        assert!(matches!(
-            fit(&plan(Packages::Unkeyed(unkeyed))),
-            Fit::WithoutPackages(reason) if reason.contains("exceeds maximum")
-        ));
-        assert!(matches!(
-            Packages::shorter(store(0..2), store(2..3)),
-            Packages::Unkeyed(directories) if directories.len() == 1
-        ));
-    }
-
-    #[test]
-    fn tells_unkeyed_files() {
-        for path in [
-            ".git",
-            ".git/HEAD",
-            ".env",
-            "apps/web/.env.local",
-            "apps/web/.build.env",
-        ] {
-            assert!(unkeyed(path), "{path}");
-        }
-        assert!(!unkeyed("src/env.ts") && !unkeyed(".github/workflows/ci.yml"));
     }
 }
