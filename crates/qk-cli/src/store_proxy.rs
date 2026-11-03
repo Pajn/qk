@@ -12,7 +12,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -62,6 +62,11 @@ struct Proxy {
     /// Uploads answered for and not yet sent upstream, each a job file named
     /// by its place in the queue and, for a record, its body beside it.
     queue: PathBuf,
+    /// The newest upload of each warm record sent upstream, named by a hash
+    /// of its path, which the proxy serves without asking the upstream: warm
+    /// state is never current, only recent, so a save the proxy holds serves
+    /// as well as a newer one elsewhere.
+    records: PathBuf,
     next_job: AtomicU64,
     jobs: Mutex<VecDeque<u64>>,
     job_ready: Condvar,
@@ -108,6 +113,8 @@ struct Stats {
 pub fn serve(options: Options) -> Result<()> {
     let proxy = Proxy::open(&options)?;
     let resumed = proxy.resume_queue()?;
+    // Within a limit lowered since it last ran, the queue held.
+    proxy.evict();
     for _ in 0..UPLOADERS {
         let proxy = proxy.clone();
         std::thread::spawn(move || proxy.upload_queued());
@@ -137,15 +144,18 @@ impl Proxy {
         let blobs = options.directory.join("blobs");
         let scratch = options.directory.join("tmp");
         let queue = options.directory.join("queue");
+        let records = options.directory.join("records");
         fs::create_dir_all(&blobs).with_context(|| format!("cannot create {}", blobs.display()))?;
         fs::create_dir_all(&scratch)?;
         fs::create_dir_all(&queue)?;
+        fs::create_dir_all(&records)?;
         // Partial downloads of an earlier run are no blob.
         for entry in fs::read_dir(&scratch)?.flatten() {
             let _ = fs::remove_file(entry.path());
         }
-        let size = fs::read_dir(&blobs)?
-            .flatten()
+        let size = [&blobs, &records]
+            .into_iter()
+            .flat_map(|directory| fs::read_dir(directory).into_iter().flatten().flatten())
             .filter_map(|entry| entry.metadata().ok())
             .map(|metadata| metadata.len())
             .sum();
@@ -164,6 +174,7 @@ impl Proxy {
             blobs,
             scratch,
             queue,
+            records,
             next_job: AtomicU64::new(0),
             jobs: Mutex::new(VecDeque::new()),
             job_ready: Condvar::new(),
@@ -396,11 +407,20 @@ fn handle(
         return Ok((200, "local", sent));
     }
     // An entry or warm record still queued is the newest; the upstream has
-    // an older one or none.
+    // an older one or none. A warm record sent on since is kept and served
+    // too, without asking the upstream for a newer one.
     if record
         && matches!(request.method.as_str(), "GET" | "HEAD")
         && proxy.trusts(request)
-        && let Some(pack) = proxy.queued_pack(path)
+        && let Some((pack, source)) = proxy
+            .queued_pack(path)
+            .map(|pack| (pack, "queued"))
+            .or_else(|| {
+                path.starts_with("/v4/warm/")
+                    .then(|| proxy.kept_pack(path))
+                    .flatten()
+                    .map(|pack| (pack, "kept"))
+            })
     {
         head(
             writer,
@@ -415,7 +435,7 @@ fn handle(
             proxy.stats.local_hits.fetch_add(1, Ordering::Relaxed);
             proxy.stats.local_bytes.fetch_add(sent, Ordering::Relaxed);
         }
-        return Ok((200, "queued", sent));
+        return Ok((200, source, sent));
     }
     // A client asks before uploading a blob. Uploading one the upstream has
     // costs only the local network, and the proxy asks the upstream itself
@@ -463,6 +483,12 @@ fn handle(
         } else if record {
             for (hash, frame) in inline_blobs(&request.body).unwrap_or_default() {
                 proxy.keep(&hash, frame);
+            }
+            // An older one kept is no longer what the upstream holds. Not
+            // replaced, as two such uploads may be answered in either order;
+            // the next read goes upstream.
+            if path.starts_with("/v4/warm/") {
+                proxy.forget_record(path);
             }
         }
     }
@@ -638,11 +664,10 @@ impl Proxy {
         let Ok(_guard) = self.evicting.try_lock() else {
             return;
         };
-        let Ok(entries) = fs::read_dir(&self.blobs) else {
-            return;
-        };
-        let mut blobs: Vec<(SystemTime, u64, PathBuf)> = entries
-            .flatten()
+        // Blobs and kept records together, the least recently used first.
+        let mut blobs: Vec<(SystemTime, u64, PathBuf)> = [&self.blobs, &self.records]
+            .into_iter()
+            .flat_map(|directory| fs::read_dir(directory).into_iter().flatten().flatten())
             .filter_map(|entry| {
                 let metadata = entry.metadata().ok()?;
                 Some((metadata.modified().ok()?, metadata.len(), entry.path()))
@@ -945,6 +970,15 @@ impl Proxy {
                     },
                 };
                 let sent = self.send(job, id);
+                // A warm record sent upstream is kept, so the proxy serves it
+                // once it is no longer queued; on its turn, so that a newer
+                // upload of it is kept after.
+                if matches!(sent, Sent::Done(_))
+                    && job.blob.is_none()
+                    && record_path(&job.target).starts_with("/v4/warm/")
+                {
+                    self.keep_record(record_path(&job.target), &self.body_path(id));
+                }
                 drop(turn);
                 match sent {
                     Sent::Done(status) => {
@@ -994,8 +1028,8 @@ impl Proxy {
                 }
                 self.blob_done.notify_all();
             } else {
-                let mut records = self.queued_records.lock().unwrap();
                 let path = record_path(&job.target);
+                let mut records = self.queued_records.lock().unwrap();
                 if records.get(path) == Some(&id) {
                     records.remove(path);
                 }
@@ -1183,6 +1217,60 @@ impl Proxy {
     fn queued_pack(&self, path: &str) -> Option<Vec<u8>> {
         let id = *self.queued_records.lock().unwrap().get(path)?;
         let body = fs::read(self.body_path(id)).ok()?;
+        pack_of_upload(&body)
+    }
+
+    fn record_file(&self, path: &str) -> PathBuf {
+        self.records
+            .join(blake3::hash(path.as_bytes()).to_hex().as_str())
+    }
+
+    /// Moves `body`, a record the upstream took, to where the proxy keeps the
+    /// record at `path`, in place of an older one.
+    fn keep_record(&self, path: &str, body: &Path) {
+        let destination = self.record_file(path);
+        {
+            // Not while eviction counts what the proxy holds, which would
+            // store its total over this change.
+            let _evicting = self.evicting.lock().unwrap();
+            let previous = fs::metadata(&destination).map_or(0, |metadata| metadata.len());
+            let Ok(length) = fs::metadata(body).map(|metadata| metadata.len()) else {
+                return;
+            };
+            if fs::rename(body, &destination).is_err() {
+                return;
+            }
+            self.size.fetch_add(length, Ordering::Relaxed);
+            self.size.fetch_sub(previous, Ordering::Relaxed);
+        }
+        if self
+            .max_size
+            .is_some_and(|max| self.size.load(Ordering::Relaxed) > max)
+        {
+            self.evict();
+        }
+    }
+
+    /// Removes the warm record kept for `path`, if any.
+    fn forget_record(&self, path: &str) {
+        let _evicting = self.evicting.lock().unwrap();
+        let file = self.record_file(path);
+        if let Ok(metadata) = fs::metadata(&file)
+            && fs::remove_file(&file).is_ok()
+        {
+            self.size.fetch_sub(metadata.len(), Ordering::Relaxed);
+        }
+    }
+
+    /// The pack of the warm record at `path` the proxy keeps, as the upstream
+    /// would send it. Reading it counts as a use, which eviction goes by.
+    fn kept_pack(&self, path: &str) -> Option<Vec<u8>> {
+        let file = self.record_file(path);
+        let body = fs::read(&file).ok()?;
+        let _ = File::options()
+            .write(true)
+            .open(&file)
+            .and_then(|file| file.set_modified(SystemTime::now()));
         pack_of_upload(&body)
     }
 
@@ -1564,6 +1652,43 @@ mod tests {
             "the queued blob was evicted"
         );
         assert_eq!(proxy.jobs.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn kept_records_are_evicted_least_recently_used_first() {
+        let directory = tempfile::tempdir().unwrap();
+        // Room for two records of 100 bytes and not three.
+        let proxy = Proxy::open(&Options {
+            upstream: "http://127.0.0.1:9".into(),
+            directory: directory.path().to_owned(),
+            listen: String::new(),
+            max_size: Some(250),
+        })
+        .unwrap();
+        let keep = |path: &str, age: u64| {
+            let body = directory.path().join("body");
+            fs::write(&body, [0; 100]).unwrap();
+            proxy.keep_record(path, &body);
+            File::options()
+                .write(true)
+                .open(proxy.record_file(path))
+                .unwrap()
+                .set_modified(SystemTime::now() - Duration::from_secs(age))
+                .unwrap();
+        };
+        keep("/v4/warm/a/first", 30);
+        keep("/v4/warm/a/second", 20);
+        // Read since, and so used more recently than the second.
+        proxy.kept_pack("/v4/warm/a/first");
+        keep("/v4/warm/a/third", 0);
+        assert!(proxy.record_file("/v4/warm/a/first").is_file());
+        assert!(!proxy.record_file("/v4/warm/a/second").exists());
+        assert!(proxy.record_file("/v4/warm/a/third").is_file());
+        assert_eq!(proxy.size.load(Ordering::Relaxed), 200);
+        // And one the upstream took a newer upload of directly is forgotten.
+        proxy.forget_record("/v4/warm/a/third");
+        assert!(!proxy.record_file("/v4/warm/a/third").exists());
+        assert_eq!(proxy.size.load(Ordering::Relaxed), 100);
     }
 
     #[test]
