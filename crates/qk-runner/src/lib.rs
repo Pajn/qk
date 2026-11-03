@@ -99,17 +99,14 @@ fn execute_retained(
 /// strace can. With `resolving`, an opened file's path is recorded with what
 /// its links lead to, as an audit reads it. Elsewhere than on Linux, or where
 /// no recorder works, nothing is recorded, and that is said once: the run
-/// goes on, as a recording only keys what a later run may take. A recorder
-/// `QK_RECORDER` names that cannot record fails the run, as asked for.
+/// goes on, as a recording only keys what a later run may take. A
+/// `QK_RECORDER` naming no recorder, or one that cannot record here, fails
+/// the run, as asked for.
 fn attach_recordings(
     graph: &TaskGraph,
     prepared: &mut BTreeMap<String, qk_executor::PreparedTask>,
     resolving: bool,
 ) -> Result<Option<tempfile::TempDir>> {
-    if !cfg!(target_os = "linux") {
-        qk_executor::status!("qk: --record records only on Linux; this run records nothing");
-        return Ok(None);
-    }
     let directory = tempfile::tempdir().context("cannot create a directory for recordings")?;
     // A recorder named wrong, or named and unable to record, is a mistake to
     // fix, not a runner without one.

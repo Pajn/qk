@@ -259,6 +259,40 @@ fn wait_for(path: &Path) {
     }
 }
 
+/// Off Linux, `--record` records nothing, says so and goes on, unless
+/// `QK_RECORDER` names a recorder, which cannot record here, or none.
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn off_linux_a_recording_run_fails_only_for_a_recorder_named() {
+    let temp = fixture(json!({"build":{"command":"echo built"}}));
+    let record = |recorder: &str| {
+        command(temp.path(), &["run", "app:build", "--record"])
+            .env("QK_RECORDER", recorder)
+            .output()
+            .unwrap()
+    };
+    for recorder in ["", "auto"] {
+        let output = success(record(recorder));
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("qk: --record records only on Linux; this run records nothing"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    for (recorder, error) in [
+        ("ebpf", "recording with eBPF needs Linux"),
+        ("strace", "recording with strace needs Linux"),
+        ("strase", "unknown QK_RECORDER \"strase\""),
+    ] {
+        let output = record(recorder);
+        assert!(!output.status.success(), "{recorder}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(error), "{stderr}");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("built"));
+    }
+}
+
 #[test]
 /// Shared dependencies run once before both branches, and raw output stays intact.
 fn dependency_diamond_runs_once_before_dependents_and_streams_raw_output() {

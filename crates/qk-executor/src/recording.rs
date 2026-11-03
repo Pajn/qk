@@ -42,12 +42,25 @@ pub enum Probed<R = Recording> {
 }
 
 /// The recorder `choice` gives, of eBPF's and strace's: one named must
-/// record, and `auto` takes eBPF where it can, else strace.
+/// record, and `auto` takes eBPF where it can, else strace. Only Linux
+/// records; elsewhere `auto` records nothing, and a recorder named fails.
 fn decide<R>(
     choice: Choice,
+    linux: bool,
     ebpf: impl FnOnce() -> Result<R, String>,
     strace: impl FnOnce() -> anyhow::Result<R>,
 ) -> anyhow::Result<Probed<R>> {
+    if !linux {
+        return match choice {
+            Choice::Auto => Ok(Probed::Unsupported),
+            Choice::Ebpf => anyhow::bail!(
+                "recording with eBPF needs Linux; unset QK_RECORDER or set it to auto"
+            ),
+            Choice::Strace => anyhow::bail!(
+                "recording with strace needs Linux; unset QK_RECORDER or set it to auto"
+            ),
+        };
+    }
     match choice {
         Choice::Ebpf => match ebpf() {
             Ok(recording) => Ok(Probed::Ready(recording)),
@@ -130,6 +143,7 @@ impl Recording {
     pub fn probe(directory: &Path) -> anyhow::Result<Probed> {
         decide(
             Choice::from_env()?,
+            cfg!(target_os = "linux"),
             || Self::ebpf(directory),
             || Self::strace(directory),
         )
@@ -351,6 +365,7 @@ mod tests {
     ) -> Result<Probed<&'static str>, String> {
         decide(
             choice,
+            true,
             || ebpf.map_err(str::to_owned),
             || strace.map_err(|error| anyhow::anyhow!(error)),
         )
@@ -404,12 +419,34 @@ mod tests {
     fn strace_named_is_never_ebpf() {
         let probed = decide(
             Choice::Strace,
+            true,
             || -> Result<&str, String> { panic!("eBPF probed") },
             || Ok("strace"),
         );
         assert_eq!(
             ready(probed.map_err(|error| error.to_string())),
             Some("strace")
+        );
+    }
+
+    #[test]
+    fn off_linux_auto_records_nothing_and_a_recorder_named_fails() {
+        let off = |choice| {
+            decide(
+                choice,
+                false,
+                || -> Result<&str, String> { panic!("eBPF probed") },
+                || panic!("strace probed"),
+            )
+        };
+        assert!(matches!(off(Choice::Auto), Ok(Probed::Unsupported)));
+        assert_eq!(
+            off(Choice::Ebpf).unwrap_err().to_string(),
+            "recording with eBPF needs Linux; unset QK_RECORDER or set it to auto"
+        );
+        assert_eq!(
+            off(Choice::Strace).unwrap_err().to_string(),
+            "recording with strace needs Linux; unset QK_RECORDER or set it to auto"
         );
     }
 
