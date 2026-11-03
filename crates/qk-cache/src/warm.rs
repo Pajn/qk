@@ -312,7 +312,8 @@ fn entry(
         let path = paths::expand(workspace, &task.project, path)?
             .trim_end_matches('/')
             .to_owned();
-        paths::validate_path(&path)?;
+        // A pattern, whose `\` escapes the character after it.
+        paths::validate_pattern(&path)?;
         paths.push(if excluded { format!("!{path}") } else { path });
     }
     let mut env = BTreeMap::new();

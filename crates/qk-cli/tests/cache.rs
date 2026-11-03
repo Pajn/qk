@@ -4975,6 +4975,28 @@ fn a_failed_warm_restore_leaves_nothing_behind() {
     assert_eq!(stdout(&output), "cold\n");
 }
 
+/// A warm path naming a directory with an `@`, as a pnpm package directory
+/// has, escapes it, as in outputs.
+#[cfg(unix)]
+#[test]
+fn warm_paths_name_directories_with_escaped_characters() {
+    let fixture = Fixture::new(json!({
+        "command": "echo restored $(ls deps 2>/dev/null | tr '\\n' ' '); mkdir -p deps/pkg@1 deps/pkg-other@1; echo kept > deps/pkg@1/state; echo other > deps/pkg-other@1/state",
+        "cache": false,
+        "qk:warm": {"paths": ["{projectRoot}/deps/pkg\\@*"]}
+    }));
+    let root = &fixture.root;
+    assert_eq!(said(&fixture, root, &[]), "restored");
+    fs::remove_dir_all(root.join("deps")).unwrap();
+    // Only what the pattern names was kept, not pkg-other@1, which a bare
+    // `@` would have let `pkg*` take.
+    assert_eq!(said(&fixture, root, &[]), "restored pkg@1");
+    assert_eq!(
+        fs::read_to_string(root.join("deps/pkg@1/state")).unwrap(),
+        "kept\n"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn each_path_restores_a_missing_path_beside_one_on_disk() {
