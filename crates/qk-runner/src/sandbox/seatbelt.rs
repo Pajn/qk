@@ -240,6 +240,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn rendered(mode: Mode, packages: Option<Packages>) -> String {
         let policy = Policy::new(
             mode,
