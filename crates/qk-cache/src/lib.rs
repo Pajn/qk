@@ -316,16 +316,24 @@ impl lookup::Results for Restoring<'_> {
     }
 }
 
-/// A lookup's results only looked for, which restores nothing.
-struct Checking<'a>(&'a Cache);
+/// A lookup's results only looked for, which restores nothing: here, an
+/// entry restoring would take, as far as can be told without restoring it;
+/// in the remote store, any it holds.
+struct Checking<'a> {
+    cache: &'a Cache,
+    task: &'a Task,
+    outputs: &'a paths::Outputs,
+}
 
 impl lookup::Results for Checking<'_> {
     fn here(&self, key: &str) -> bool {
-        self.0.holds_entry(key)
+        self.cache
+            .usable(&self.task.id, key, self.outputs)
+            .unwrap_or(false)
     }
 
     fn there(&self, key: &str) -> bool {
-        let Some(remote) = &self.0.remote else {
+        let Some(remote) = &self.cache.remote else {
             return false;
         };
         remote.holds(key).unwrap_or(false)
@@ -781,9 +789,9 @@ impl Cache {
                 }
                 lookup::Lookup::Shadow => {
                     let _lookup = profile::span(&task.id, "recorded_lookup");
-                    shadowing = Some(
-                        self.start_shadow(workspace, task, snapshot, &unlisted, sets, weak, &key),
-                    );
+                    shadowing = Some(self.start_shadow(
+                        workspace, task, snapshot, &outputs, &unlisted, sets, weak, &key,
+                    ));
                 }
                 lookup::Lookup::Restore => {
                     let recorded_profile = profile::span(&task.id, "recorded_restore");
@@ -832,7 +840,9 @@ impl Cache {
             let shadowing = shadowing.take()?;
             let (sets, weak, _) = recordings.as_mut()?;
             let _wait = profile::span(&task.id, "recorded_wait");
-            Some(self.settle_shadow(shadowing, workspace, task, snapshot, &unlisted, sets, weak))
+            Some(self.settle_shadow(
+                shadowing, workspace, task, snapshot, &outputs, &unlisted, sets, weak,
+            ))
         };
         // A task with path sets is keyed by them alone, unless its declared
         // inputs, as they are now, cover what each of them read.
@@ -1303,6 +1313,7 @@ impl Cache {
         workspace: &Workspace,
         task: &Task,
         snapshot: &hash::Snapshot,
+        outputs: &paths::Outputs,
         unlisted: &recorded::Unlisted,
         sets: &[recorded::PathSet],
         weak: &str,
@@ -1310,7 +1321,12 @@ impl Cache {
     ) -> Shadowing {
         let strong =
             |set: &recorded::PathSet| recording_key(weak, set, snapshot, workspace, unlisted, task);
-        let search = match lookup::Search::here(sets, strong, &Checking(self)) {
+        let checking = Checking {
+            cache: self,
+            task,
+            outputs,
+        };
+        let search = match lookup::Search::here(sets, strong, &checking) {
             Ok(found) => return Shadowing::Settled(lookup::shadow(found, sets)),
             Err(search) => search,
         };
@@ -1341,6 +1357,7 @@ impl Cache {
         workspace: &Workspace,
         task: &Task,
         snapshot: &hash::Snapshot,
+        outputs: &paths::Outputs,
         unlisted: &recorded::Unlisted,
         sets: &mut Vec<recorded::PathSet>,
         weak: &str,
@@ -1355,7 +1372,12 @@ impl Cache {
         let added = self.merged(fetched, weak, task);
         let strong =
             |set: &recorded::PathSet| recording_key(weak, set, snapshot, workspace, unlisted, task);
-        let found = search.there(added, sets, strong, &Checking(self));
+        let checking = Checking {
+            cache: self,
+            task,
+            outputs,
+        };
+        let found = search.there(added, sets, strong, &checking);
         lookup::shadow(found, sets)
     }
 

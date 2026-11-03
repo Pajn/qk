@@ -183,10 +183,10 @@ With `"record"`, a task is keyed by its declared inputs, as without the field,
 while a run with `--record` records it and keeps and shares its recordings as
 with `"on"`. Every run also looks the task up by its recordings without
 restoring anything, and says what they would have done: `--report` writes it
-as `shadow`, `wouldHit` with the key that had a result, `wouldMiss`, or
-`unrecorded` without path sets, and the run history keeps it, so runs can be
-counted afterwards: a task its declared inputs missed with `wouldHit` is a run
-its recordings would have saved. The run summary names the tasks where the two
+as `shadow`, `wouldHit` with the key that had a result `"on"` would take,
+`wouldMiss`, or `unrecorded` without path sets, and the run history keeps it,
+so runs can be counted afterwards: a task its declared inputs missed with
+`wouldHit` is a run its recordings would have saved. The run summary names the tasks where the two
 disagree:
 
 - a task its declared inputs missed where its recordings had a result: a
