@@ -1814,6 +1814,28 @@ fn a_store_proxy_serves_warm_state_it_has_not_yet_sent_on() {
             .keys()
             .any(|path| path.starts_with("warm/"))
     );
+    // Sent on, the save is kept: the next machine restores it from the proxy
+    // without the store server being asked for it.
+    let asked = |server: &store_server::FakeStoreServer| {
+        server
+            .requests("warm/")
+            .iter()
+            .filter(|(request, _)| request.starts_with("GET "))
+            .count()
+    };
+    let before = asked(&server);
+    clear_local_cache(&fixture);
+    let _ = fs::remove_dir_all(fixture.root.join(".git/qk/warm"));
+    let output = success(server_build(&fixture, store_server::WRITE_TOKEN, &env));
+    assert_eq!(
+        first_line(&output),
+        "warm",
+        "{}\n{}",
+        stderr(&output),
+        proxy.log()
+    );
+    proxy.logged(" 200 kept ");
+    assert_eq!(asked(&server), before, "{}", proxy.log());
 }
 
 // The target is a POSIX shell command.

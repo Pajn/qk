@@ -206,12 +206,15 @@ an entry or warm state reaches the store server, the proxy serves it itself
 to the machines behind it, as the store server would; other machines miss
 it. An entry is found through the store server's index, which lists it only
 once it arrives, so it is the warm state that machines behind the proxy find
-this way. Everything else, including reads
-of entries and warm state and the index, goes to the store server as it
-came.
+this way. Once sent, warm state stays in `records/` and the proxy goes on
+serving it without asking the store server: warm state is what a run left,
+not something that has to be current, so the newest save that came through
+the proxy is as good as the store server's. Everything else, including reads
+of entries, of warm state the proxy has not taken, and of the index, goes to
+the store server as it came.
 
-Past `--max-size` the proxy removes the outputs used least recently, never
-one still queued. `GET /proxy/stats` reports how much it served itself, how
+Past `--max-size` the proxy removes the outputs and warm state used least
+recently, never one still queued. `GET /proxy/stats` reports how much it served itself, how
 much it fetched, and how many uploads are queued, sent and given up. While
 the proxy does not answer, runs on those machines get no remote cache.
 
