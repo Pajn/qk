@@ -31,7 +31,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -95,6 +95,9 @@ const LARGEST_PATH_SETS: usize = (16 << 20) - 1024;
 /// The most an upload to a store server carries inline, counted raw, below the
 /// 100 MiB a server accepts in one body (`tools/store-server/PROTOCOL.md`).
 const UPLOAD_INLINE: u64 = 64 << 20;
+/// The most blobs one bundle carries, so that its header, about 111 bytes a
+/// blob, stays within the 16 MiB a store server reads of one.
+const BUNDLE_BLOBS: usize = 100_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -130,6 +133,8 @@ pub struct Remote {
     placements: Mutex<HashMap<String, pack::Placement>>,
     /// Blobs stored apart that the store is known to hold.
     stored: Mutex<HashSet<String>>,
+    /// Whether to send the store bundles, until it turns one away.
+    bundles: AtomicBool,
     /// The blobs each key this run used stores apart, for its listing.
     kept_apart: Mutex<HashMap<String, Vec<String>>>,
     /// Requests for blobs stored apart that may start now.
@@ -519,6 +524,7 @@ impl Remote {
             threshold,
             placements: Mutex::default(),
             stored: Mutex::default(),
+            bundles: AtomicBool::new(true),
             kept_apart: Mutex::default(),
             blob_requests: Slots::new(BLOB_REQUESTS),
             flights: Mutex::default(),
@@ -1179,7 +1185,7 @@ impl Remote {
                     }
                 }
             }
-            self.each_blob(&overflow, |blob| self.store_apart(root, blob, None))?;
+            self.store_overflow(root, &overflow)?;
             for blob in overflow {
                 placements.insert(blob, pack::Placement::Apart);
             }
@@ -1187,11 +1193,96 @@ impl Remote {
         Ok(placements)
     }
 
+    /// Stores `blobs`, small ones past what an upload carries inline. A store
+    /// that takes bundles takes those it lacks and those it holds loose, one
+    /// object each, in bundles of up to `UPLOAD_INLINE` before compression:
+    /// a pack carrying thousands of small blobs is read in a few ranges of a
+    /// bundle rather than an object per blob. Any other store takes each on
+    /// its own.
+    fn store_overflow(&self, root: &Path, blobs: &[String]) -> Result<()> {
+        let unknown: Vec<String> = {
+            let stored = self.stored.lock().unwrap();
+            blobs
+                .iter()
+                .filter(|blob| !stored.contains(*blob))
+                .cloned()
+                .collect()
+        };
+        let held = match unknown.is_empty() || !self.bundles.load(Ordering::Relaxed) {
+            true => None,
+            false => self.store.blobs_held(&unknown)?,
+        };
+        let Some(held) = held else {
+            return self.each_blob(&unknown, |blob| self.store_apart(root, blob, None));
+        };
+        let mut bundling = Vec::new();
+        {
+            let mut stored = self.stored.lock().unwrap();
+            for blob in unknown {
+                if held.missing.contains(&blob) || held.loose.contains(&blob) {
+                    bundling.push(blob);
+                } else {
+                    stored.insert(blob);
+                }
+            }
+        }
+        bundling.sort();
+        bundling.dedup();
+        let mut bundles: Vec<Vec<String>> = Vec::new();
+        let mut alone = Vec::new();
+        let mut size = 0;
+        for blob in bundling {
+            let length = fs::metadata(root.join("blobs").join(&blob))?.len();
+            // Past what a bundle holds, as one too large to go apart for the
+            // threshold set, it goes on its own.
+            if length > UPLOAD_INLINE {
+                alone.push(blob);
+                continue;
+            }
+            match bundles.last_mut() {
+                Some(bundle) if size + length <= UPLOAD_INLINE && bundle.len() < BUNDLE_BLOBS => {
+                    bundle.push(blob);
+                }
+                _ => {
+                    bundles.push(vec![blob]);
+                    size = 0;
+                }
+            }
+            size += length;
+        }
+        self.each_blob(&alone, |blob| self.store_apart(root, blob, None))?;
+        self.each(&bundles, |bundle| self.store_bundle(root, bundle))
+    }
+
+    /// Uploads `blobs` as one bundle, or each on its own once the store has
+    /// turned a bundle away.
+    fn store_bundle(&self, root: &Path, blobs: &[String]) -> Result<()> {
+        if self.bundles.load(Ordering::Relaxed) {
+            let mut file = tempfile::NamedTempFile::new_in(root.join("tmp"))?;
+            let id = pack::write_bundle(root, blobs, file.as_file_mut())?;
+            if self.store.put_bundle(&id, file.reopen()?)? {
+                self.stored.lock().unwrap().extend(blobs.iter().cloned());
+                return Ok(());
+            }
+            self.bundles.store(false, Ordering::Relaxed);
+        }
+        for blob in blobs {
+            self.store_apart(root, blob, None)?;
+        }
+        Ok(())
+    }
+
     /// Runs `work` on each of `blobs`, a few at a time, answering the first
     /// error once every worker has stopped.
     fn each_blob(&self, blobs: &[String], work: impl Fn(&str) -> Result<()> + Sync) -> Result<()> {
-        let queue = Mutex::new(blobs.iter());
-        let failed = std::sync::atomic::AtomicBool::new(false);
+        self.each(blobs, |blob| work(blob))
+    }
+
+    /// Runs `work` on each of `items`, a few at a time, answering the first
+    /// error once every worker has stopped.
+    fn each<T: Sync>(&self, items: &[T], work: impl Fn(&T) -> Result<()> + Sync) -> Result<()> {
+        let queue = Mutex::new(items.iter());
+        let failed = AtomicBool::new(false);
         let worker = || -> Result<()> {
             // A failure stops the others taking more.
             while !failed.load(Ordering::Relaxed) {
@@ -1206,7 +1297,7 @@ impl Remote {
             Ok(())
         };
         std::thread::scope(|scope| {
-            let workers: Vec<_> = (0..blobs.len().min(BLOB_UPLOADERS))
+            let workers: Vec<_> = (0..items.len().min(BLOB_UPLOADERS))
                 .map(|_| scope.spawn(worker))
                 .collect();
             let results: Vec<Result<()>> = workers
@@ -1697,6 +1788,14 @@ mod flight_tests {
         /// Questions whether it holds an object, open now and at most.
         asking: AtomicUsize,
         most_asking: Arc<AtomicUsize>,
+        /// Whether it takes bundles, as a store server does; and, if so,
+        /// whether it turns them away after all, as one from before them.
+        bundling: bool,
+        turns_bundles_away: bool,
+        /// The blobs each bundle it took carried, by bundle, and each blob's
+        /// frame.
+        bundles: Arc<Mutex<Vec<Vec<String>>>>,
+        bundled: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     }
 
     fn name(object: Object) -> String {
@@ -1759,6 +1858,58 @@ mod flight_tests {
             file.read_to_end(&mut bytes)?;
             self.objects.lock().unwrap().insert(name(object), bytes);
             Ok(())
+        }
+
+        fn blobs_held(&self, blobs: &[String]) -> Result<Option<store::Held>> {
+            if !self.bundling {
+                return Ok(None);
+            }
+            let objects = self.objects.lock().unwrap();
+            let bundled = self.bundled.lock().unwrap();
+            let mut held = store::Held::default();
+            for blob in blobs {
+                if bundled.contains_key(blob) {
+                    continue;
+                }
+                match objects.contains_key(&format!("blobs/{blob}")) {
+                    true => held.loose.insert(blob.clone()),
+                    false => held.missing.insert(blob.clone()),
+                };
+            }
+            Ok(Some(held))
+        }
+
+        fn put_bundle(&self, id: &str, mut file: fs::File) -> Result<bool> {
+            use sha2::Digest;
+            if self.turns_bundles_away {
+                return Ok(false);
+            }
+            let mut body = Vec::new();
+            file.read_to_end(&mut body)?;
+            let length = u32::from_le_bytes(body[..4].try_into().unwrap()) as usize;
+            let header = &body[4..4 + length];
+            let named: String = sha2::Sha256::digest(header)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            assert_eq!(named, id, "a bundle is named by its header");
+            let header: serde_json::Value = serde_json::from_slice(header).unwrap();
+            assert_eq!(header["record"], 0);
+            let mut at = 4 + length;
+            let mut carried = Vec::new();
+            for blob in header["blobs"].as_array().unwrap() {
+                let hash = blob[0].as_str().unwrap().to_owned();
+                let size = blob[2].as_u64().unwrap() as usize;
+                self.bundled
+                    .lock()
+                    .unwrap()
+                    .insert(hash.clone(), body[at..at + size].to_vec());
+                at += size;
+                carried.push(hash);
+            }
+            assert_eq!(at, body.len(), "a bundle carries every blob it lists");
+            self.bundles.lock().unwrap().push(carried);
+            Ok(true)
         }
 
         fn announce(&self, _: &str, _: &[String]) -> Result<Option<String>> {
@@ -1911,6 +2062,142 @@ mod flight_tests {
         for blob in apart {
             assert!(remote.store.has(Object::Blob(blob)).unwrap());
         }
+    }
+
+    /// A cache whose blobs are sparse files of just under a quarter of what an
+    /// upload carries inline, and a record citing them: four fill the bound,
+    /// the rest go apart. The names stand in for hashes.
+    fn overflowing(count: u8) -> (tempfile::TempDir, Vec<String>, Vec<u8>) {
+        let source = cache();
+        let blobs: Vec<String> = (0..count)
+            .map(|index| {
+                let name = format!("{index:064x}");
+                fs::File::create(source.path().join("blobs").join(&name))
+                    .unwrap()
+                    .set_len(UPLOAD_INLINE / 4 - 4096)
+                    .unwrap();
+                name
+            })
+            .collect();
+        let record = serde_json::to_vec(&serde_json::json!({
+            "artifacts": blobs
+                .iter()
+                .map(|blob| (blob.clone(), serde_json::json!({"blob": blob})))
+                .collect::<serde_json::Map<_, _>>()
+        }))
+        .unwrap();
+        (source, blobs, record)
+    }
+
+    /// A remote over `memory` taking bundles, with the bundles it takes and
+    /// the frames they carried.
+    #[allow(clippy::type_complexity)]
+    fn bundling(
+        memory: Memory,
+    ) -> (
+        Remote,
+        Arc<Mutex<Vec<Vec<String>>>>,
+        Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    ) {
+        let memory = Memory {
+            uploads: true,
+            bundling: true,
+            ..memory
+        };
+        let bundles = memory.bundles.clone();
+        let bundled = memory.bundled.clone();
+        let remote = Remote::new(Box::new(memory), Mode::ReadWrite, None, u64::MAX);
+        (remote, bundles, bundled)
+    }
+
+    #[test]
+    fn blobs_past_the_inline_bound_go_to_a_store_server_in_bundles() {
+        let (source, blobs, record) = overflowing(9);
+        let (remote, bundles, bundled) = bundling(Memory::default());
+        let placements = remote.place_all(source.path(), &record).unwrap();
+        let apart: Vec<&String> = blobs
+            .iter()
+            .filter(|blob| placements[*blob] == pack::Placement::Apart)
+            .collect();
+        assert_eq!(apart.len(), 5);
+        // Four to a bundle, within the bound before compression, and none on
+        // its own.
+        // Sent at once, so in either order.
+        let mut sizes: Vec<usize> = bundles.lock().unwrap().iter().map(Vec::len).collect();
+        sizes.sort_unstable();
+        assert_eq!(sizes, [1, 4]);
+        let bundled = bundled.lock().unwrap();
+        for blob in apart {
+            assert!(!remote.store.has(Object::Blob(blob)).unwrap());
+            let frame = &bundled[blob];
+            let raw = zstd::decode_all(&frame[..]).unwrap();
+            assert_eq!(raw.len() as u64, UPLOAD_INLINE / 4 - 4096);
+        }
+    }
+
+    #[test]
+    fn loose_blobs_a_record_cites_are_bundled_and_bundled_ones_are_not_sent_again() {
+        let (source, blobs, record) = overflowing(7);
+        let store = Memory::default();
+        // Past the bound: one stored loose, one bundled already, one missing.
+        store
+            .objects
+            .lock()
+            .unwrap()
+            .insert(format!("blobs/{}", blobs[4]), Vec::new());
+        store
+            .bundled
+            .lock()
+            .unwrap()
+            .insert(blobs[5].clone(), Vec::new());
+        let (remote, bundles, _) = bundling(store);
+        remote.place_all(source.path(), &record).unwrap();
+        let bundles = bundles.lock().unwrap().clone();
+        assert_eq!(bundles, [vec![blobs[4].clone(), blobs[6].clone()]]);
+    }
+
+    #[test]
+    fn a_small_blob_past_what_a_bundle_holds_is_stored_on_its_own() {
+        let (source, mut blobs, _) = overflowing(5);
+        // Past the bound by itself, yet under the threshold, as with none.
+        let large = format!("{:064x}", 99);
+        fs::File::create(source.path().join("blobs").join(&large))
+            .unwrap()
+            .set_len(UPLOAD_INLINE + 1)
+            .unwrap();
+        blobs.push(large.clone());
+        let record = serde_json::to_vec(&serde_json::json!({
+            "artifacts": blobs
+                .iter()
+                .map(|blob| (blob.clone(), serde_json::json!({"blob": blob})))
+                .collect::<serde_json::Map<_, _>>()
+        }))
+        .unwrap();
+        let (remote, bundles, _) = bundling(Memory::default());
+        let placements = remote.place_all(source.path(), &record).unwrap();
+        assert_eq!(placements[&large], pack::Placement::Apart);
+        assert!(remote.store.has(Object::Blob(&large)).unwrap());
+        let bundles = bundles.lock().unwrap();
+        assert_eq!(bundles.len(), 1);
+        assert!(!bundles[0].contains(&large));
+    }
+
+    #[test]
+    fn a_store_that_turns_bundles_away_takes_each_blob_on_its_own() {
+        let (source, blobs, record) = overflowing(5);
+        let (remote, bundles, _) = bundling(Memory {
+            turns_bundles_away: true,
+            ..Memory::default()
+        });
+        let placements = remote.place_all(source.path(), &record).unwrap();
+        assert!(!remote.bundles.load(Ordering::Relaxed));
+        for blob in blobs
+            .iter()
+            .filter(|blob| placements[*blob] == pack::Placement::Apart)
+        {
+            assert!(remote.store.has(Object::Blob(blob)).unwrap());
+        }
+        assert!(bundles.lock().unwrap().is_empty());
     }
 
     #[test]

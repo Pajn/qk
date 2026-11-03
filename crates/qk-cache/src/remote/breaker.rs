@@ -190,6 +190,14 @@ impl Store for Breaker {
         self.ask(refused, || self.store.put(object, file))
     }
 
+    fn blobs_held(&self, blobs: &[String]) -> Result<Option<super::store::Held>> {
+        self.ask(refused, || self.store.blobs_held(blobs))
+    }
+
+    fn put_bundle(&self, id: &str, file: File) -> Result<bool> {
+        self.ask(refused, || self.store.put_bundle(id, file))
+    }
+
     fn announce(&self, key: &str, apart: &[String]) -> Result<Option<String>> {
         self.ask(refused, || self.store.announce(key, apart))
     }

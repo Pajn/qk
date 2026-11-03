@@ -104,12 +104,33 @@ blob that record carries inline is found there too.
 ### `POST blobs/missing`
 
 Body: `{"blobs": [<hash>, …]}`, at most 4,096. Answer:
-`{"missing": [<hash>, …]}`, the ones the server does not store apart.
+`{"missing": [<hash>, …]}`, the ones the server does not store apart. A
+server that takes bundles also answers `"loose": [<hash>, …]`, the ones it
+stores on their own, as `blobs/<hash>`, that are smaller than 1 MiB; a server
+that does not leaves `loose` out, and clients take that to mean it takes no
+bundles.
 
 ### `PUT blobs/<hash>`
 
 Write token. Body: the blob as one zstd frame. Answer: `204`. The server cannot
 check the hash; clients check every blob they keep.
+
+### `PUT bundles/<id>`
+
+Write token. Optional: a server that does not take bundles answers `404`.
+Body: a **bundle**, an upload body whose record is empty (length 0) and which
+carries every blob it lists inline. `<id>` is the SHA-256 of the bundle's
+header, as 64 lowercase hex digits; the server refuses a bundle its `<id>`
+does not name with `400`. Answer: `204`.
+
+From then on, each blob the bundle carries is stored apart, as far as every
+other request goes, and a pack reads neighbouring blobs of a bundle together.
+A bundle once stored is not replaced, so sending it again changes nothing.
+
+Clients send in bundles the small blobs they would otherwise store apart one
+request each, those past what an upload carries inline, of up to 64 MiB
+together before compression; and the blobs `POST blobs/missing` answers as
+`loose`, so that blobs stored before bundles move to them.
 
 ### `HEAD entries/<key>`
 

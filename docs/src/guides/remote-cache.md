@@ -161,7 +161,11 @@ outputs the local cache holds, and it leaves those out of every entry it sends.
 A run whose request to tell it fails says why, and receives entries whole,
 as does, silently, one whose local cache holds no outputs or more than two
 million. It keeps the index itself and commits each entry once, so runs
-neither write announcements nor merge listings. `localMode`, `ciMode`, `uploadMode` and
+neither write announcements nor merge listings. A store server that takes
+bundles receives the small outputs an upload has no room for, past the 64 MiB
+it carries inline, many to an upload rather than one each, and moves small
+outputs stored one each before into bundles as records citing them are saved
+again: a large warm save restores in a few reads rather than thousands. `localMode`, `ciMode`, `uploadMode` and
 `NX_POWERPACK_CACHE_MODE` apply as they do for `s3`. A read token fetches; a
 write token also uploads.
 
@@ -189,7 +193,7 @@ machine, those a machine uploads, and those an uploaded entry or warm state
 carries inline. It checks each against its hash before keeping it, and
 serves it again to any machine whose token the store server has accepted.
 
-Uploads of outputs, entries and warm state are answered once the proxy has
+Uploads of outputs, bundles of them, entries and warm state are answered once the proxy has
 them on its disk, so a run saving its results waits on the local network
 rather than on the store server. That holds for a token the store server has
 taken an upload from through the proxy; until then, a token's uploads go to
