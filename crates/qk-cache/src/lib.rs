@@ -1587,10 +1587,22 @@ pub fn run_upload_worker() -> anyhow::Result<()> {
 /// The declared outputs of every target in the workspace, as their targets
 /// declare them and as each of their configurations does with its options,
 /// which can move an output; one whose outputs cannot be read is left out.
+/// Each target's scratch directories count as its outputs: they come and go
+/// beside another task as outputs do, and nothing in them is kept.
 fn workspace_outputs(workspace: &Workspace) -> recorded::WorkspaceOutputs {
     let mut outputs = Vec::new();
     for (name, project) in &workspace.projects {
         for (target, definition) in &project.targets {
+            if let Some(scratch) = scratch_outputs(workspace, name, definition) {
+                let configurations = std::iter::once(None)
+                    .chain(definition.configurations.keys().cloned().map(Some));
+                for configuration in configurations {
+                    outputs.push((
+                        (name.clone(), target.clone(), configuration),
+                        scratch.clone(),
+                    ));
+                }
+            }
             let configured = definition
                 .configurations
                 .iter()
@@ -1627,6 +1639,28 @@ fn workspace_outputs(workspace: &Workspace) -> recorded::WorkspaceOutputs {
         .map(|(name, project)| (name.clone(), project.root.clone()))
         .collect();
     recorded::WorkspaceOutputs::new(outputs, &roots)
+}
+
+/// A target's scratch directories as outputs; none when it has none, or
+/// they cannot be read.
+fn scratch_outputs(
+    workspace: &Workspace,
+    project: &str,
+    definition: &qk_config::Target,
+) -> Option<paths::Outputs> {
+    let directories =
+        scratch::directories_of(workspace, project, definition.extra.get("qk:sandbox")).ok()?;
+    let patterns: Vec<String> = directories
+        .iter()
+        .filter_map(|directory| {
+            let relative = directory.strip_prefix(&workspace.root).ok()?.to_str()?;
+            Some(glob::escape(&relative.replace('\\', "/")))
+        })
+        .collect();
+    if patterns.is_empty() {
+        return None;
+    }
+    paths::Outputs::from_paths(&patterns).ok()
 }
 
 /// The targets of every task `task` depends on, each with the configuration
@@ -1875,6 +1909,7 @@ mod tests {
                   "options":{"outputPath":"app/dist"},
                   "configurations":{"production":{"outputPath":"app/dist-production"}}},
                 "lint":{"command":"true"},
+                "browser":{"command":"true","qk:sandbox":{"scratch":["{projectRoot}/.vitest"]}},
                 "cover":{"command":"true","outputs":["{projectRoot}/.coverage/unit"]},
                 "cover-browser":{"command":"true","outputs":["{projectRoot}/.coverage/browser"]},
                 "wasm":{"command":"true","outputs":["{projectRoot}/target/wasm/release/*.wasm"]},
@@ -1886,6 +1921,7 @@ mod tests {
             root.join("lib/project.json"),
             r#"{"name":"lib","targets":{"build":{"command":"true","outputs":["{options.outputPath}"],
                 "options":{"outputPath":"lib/dist"},
+                "qk:sandbox":{"scratch":["{projectRoot}/.scratch"]},
                 "configurations":{"production":{"outputPath":"lib/dist-production"}}}}}"#,
         )
         .unwrap();
@@ -1910,6 +1946,8 @@ mod tests {
         assert!(lint.matches("app/dist-production/main.js"));
         assert!(lint.matches("lib/dist"));
         assert!(!lint.matches("app/src/main.ts"));
+        assert!(lint.matches("app/.vitest"));
+        assert!(lint.matches("app/.vitest/attachments/diff.png"));
         // The directories holding an output count as it, not its project's.
         assert!(lint.matches("app/target"));
         assert!(lint.matches("app/target/wasm"));
@@ -1939,5 +1977,10 @@ mod tests {
         let production = others("app:test:production");
         assert!(!production.matches("lib/dist-production"));
         assert!(production.matches("lib/dist"));
+        // A dependency's scratch is left in as its outputs are, whichever
+        // configuration it runs with.
+        assert!(others("app:lint").matches("lib/.scratch"));
+        assert!(!others("app:test").matches("lib/.scratch"));
+        assert!(!production.matches("lib/.scratch"));
     }
 }
