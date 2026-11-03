@@ -612,9 +612,12 @@ impl Outputs {
     }
 
     fn simple_segments(&self) -> Result<Option<Vec<Vec<Segment>>>> {
+        // Escaped characters are names, as `\@` in a package's directory is,
+        // and do not keep a pattern from being expanded segment by segment.
         if self.globs.iter().any(|glob| {
-            glob.contains("**")
-                || glob.contains(['!', '@', '+', '|', ',', '{', '}', '[', ']', '(', ')'])
+            let unescaped = unescaped(glob);
+            unescaped.contains("**")
+                || unescaped.contains(['!', '@', '+', '|', ',', '{', '}', '[', ']', '(', ')'])
         }) {
             return Ok(None);
         }
@@ -673,6 +676,23 @@ impl Outputs {
         }
         Ok(paths)
     }
+}
+
+/// `glob` with each escape, a `\` and what it escapes, in place of a plain
+/// character, so that it is a name and cannot join what is around it into
+/// syntax, as `*\.*` would into `**`.
+fn unescaped(glob: &str) -> String {
+    let mut kept = String::with_capacity(glob.len());
+    let mut chars = glob.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            chars.next();
+            kept.push('_');
+        } else {
+            kept.push(c);
+        }
+    }
+    kept
 }
 
 #[derive(Clone)]
@@ -1878,6 +1898,47 @@ mod tests {
                 "packages/c/lib/one.js",
             ]
         );
+    }
+
+    /// A package directory's `@` and `+`, escaped, are expanded segment by
+    /// segment rather than by walking all below the fixed prefix, and match
+    /// only themselves.
+    #[test]
+    fn escaped_names_are_expanded_segment_by_segment() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        for file in [
+            "node_modules/.pnpm/react-native@1_patch/node_modules/react-native/.gradle/state",
+            "node_modules/.pnpm/react-native-screens@2/node_modules/react-native/.gradle/state",
+            "node_modules/.pnpm/@scope+plugin@3/node_modules/@scope/plugin/.gradle/state",
+            "node_modules/.pnpm/scope+plugin@3/node_modules/@scope/plugin/.gradle/state",
+        ] {
+            let path = root.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+        let outputs = Outputs::from_paths(&[
+            "node_modules/.pnpm/react-native\\@*/node_modules/react-native/.gradle".into(),
+            "node_modules/.pnpm/\\@scope\\+plugin\\@*/node_modules/\\@scope/plugin/.gradle".into(),
+        ])
+        .unwrap();
+        assert!(outputs.simple_segments().unwrap().is_some());
+        assert_eq!(
+            outputs.paths(root).unwrap().into_iter().collect::<Vec<_>>(),
+            [
+                "node_modules/.pnpm/@scope+plugin@3/node_modules/@scope/plugin/.gradle",
+                "node_modules/.pnpm/@scope+plugin@3/node_modules/@scope/plugin/.gradle/state",
+                "node_modules/.pnpm/react-native@1_patch/node_modules/react-native/.gradle",
+                "node_modules/.pnpm/react-native@1_patch/node_modules/react-native/.gradle/state",
+            ]
+        );
+        // Unescaped, they stay glob syntax, which this way of expanding does
+        // not read.
+        let unescaped = Outputs::from_paths(&["node_modules/.pnpm/react-native@*".into()]).unwrap();
+        assert!(unescaped.simple_segments().unwrap().is_none());
+        // An escape between two stars keeps them apart.
+        let apart = Outputs::from_paths(&["dist/*\\.*".into()]).unwrap();
+        assert!(apart.simple_segments().unwrap().is_some());
     }
 
     /// A slash inside a character class does not separate path segments.

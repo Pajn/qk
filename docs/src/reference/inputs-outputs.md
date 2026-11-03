@@ -200,7 +200,11 @@ project graph. Braces that do not start with a token are glob text, so
 `{projectRoot}/dist/**/*.{js,map}` is one output, and so is `{env.NAME}`:
 environment variables are no placeholder in outputs. As in inputs, `\`
 escapes a glob character, so `{projectRoot}/app/\\(group\\)` in JSON names
-the `app/(group)` directory. The project's root and name go in as the
+the `app/(group)` directory. As in Nx, a `@` or `+` that no group follows is
+dropped, so a pnpm package directory such as `react-native@0.88.0` is named
+with them escaped: `{workspaceRoot}/node_modules/.pnpm/react-native\\@*` in
+JSON. Escaped, they do not keep qk from looking only in the directories the
+pattern can reach. The project's root and name go in as the
 paths they are, so `{projectRoot}/dist` of a project at `apps/(group)` names
 `apps/(group)/dist`, which Nx does not do; an option's value goes in as
 written, a pattern if it holds one.
