@@ -4931,19 +4931,49 @@ fn state_that_does_not_relocate_stays_in_its_worktree() {
 
 #[cfg(unix)]
 #[test]
-fn preserved_modification_times_come_back_only_to_their_worktree() {
+fn preserved_modification_times_come_back_wherever_the_save_is_restored() {
     let fixture = Fixture::new(json!({
-        "command": "if [ -f scratch/state ]; then date -r scratch/state +%Y; else echo cold; fi; mkdir -p scratch; touch scratch/state",
+        "command": "if [ -f scratch/state ]; then date -r scratch/state +%Y%m%d%H%M.%S; else echo cold; mkdir -p scratch; touch -t 200001020304.56 scratch/state; fi",
         "qk:warm": {"portable": true, "paths": ["{projectRoot}/scratch"], "mtimes": "preserve"}
     }));
     assert_eq!(said(&fixture, &fixture.root, &[]), "cold");
-    let year = said(&fixture, &fixture.root, &[]);
-    assert_ne!(year, "1970");
+    assert_eq!(said(&fixture, &fixture.root, &[]), "200001020304.56");
     fs::remove_dir_all(fixture.root.join("scratch")).unwrap();
-    assert_eq!(said(&fixture, &fixture.root, &[]), year);
-    // Another worktree's timestamps say nothing about this one's sources.
+    assert_eq!(said(&fixture, &fixture.root, &[]), "200001020304.56");
+    // In another worktree too, as asked.
     let linked = fixture.worktree();
-    assert_eq!(said(&fixture, &linked, &[]), "1970");
+    assert_eq!(said(&fixture, &linked, &[]), "200001020304.56");
+}
+
+/// And from the remote store, into another machine's checkout.
+#[cfg(unix)]
+#[test]
+fn preserved_modification_times_come_back_from_the_remote_store() {
+    let server = s3::FakeS3::start();
+    let fixture = Fixture::new(json!({
+        "command": "if [ -f scratch/state ]; then date -r scratch/state +%Y%m%d%H%M.%S; else echo cold; mkdir -p scratch; touch -t 200001020304.56 scratch/state; fi",
+        "qk:warm": {"portable": true, "paths": ["{projectRoot}/scratch"], "mtimes": "preserve"}
+    }));
+    with_remote(&fixture, &server, json!({}));
+    let first = |output: Output| {
+        stdout(&success(output))
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    assert_eq!(
+        first(remote_build(&fixture, &[("GITHUB_REF_NAME", "main")])),
+        "cold"
+    );
+    // Another machine: no local cache and no warm paths on disk.
+    clear_local_cache(&fixture);
+    let _ = fs::remove_dir_all(fixture.root.join(".git/qk/warm"));
+    fs::remove_dir_all(fixture.root.join("scratch")).unwrap();
+    assert_eq!(
+        first(remote_build(&fixture, &[("GITHUB_REF_NAME", "main")])),
+        "200001020304.56"
+    );
 }
 
 #[cfg(unix)]

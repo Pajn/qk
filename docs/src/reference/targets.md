@@ -301,7 +301,7 @@ variable is set by two. See
 | `maxSize` | bytes or size string | No per-group limit; a save over it is not stored, and the save before it is not restored; see [Warm state](../guides/warm-state.md) |
 | `remote` | boolean | `true`; permit remote exchange when `portable` is `true` or `"path"` |
 | `portable` | `true`, `false` or `"path"` | `false`; `true` permits another worktree's save and remote exchange; `"path"` permits remote exchange, restoring a save only when made in a checkout at the same path |
-| `mtimes` | `"epoch"` or `"preserve"` | `"epoch"`; `"preserve"` keeps a worktree's own save's modification times |
+| `mtimes` | `"epoch"` or `"preserve"` | `"epoch"`; `"preserve"` restores the modification times a save's files had, wherever it was made; see [Warm state](../guides/warm-state.md) |
 | `key` | array of workspace paths and `{"env": name}` objects | Empty; a save is restored only where the key matches |
 | `restoreKeys` | count | None; how many leading `key` parts a save must match when none matches whole |
 | `group` | string | None; share `{warm}` and its saves with every target naming the group; an entry with a group cannot set `outputs`, `paths` or `survive` |
