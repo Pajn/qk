@@ -749,6 +749,8 @@ impl Cache {
             ignore: &ignore,
         };
         let inputs = &keyed.as_ref().expect("a cacheable task is keyed").1;
+        // Why its recordings cannot key it, with its mode, where they cannot.
+        let mut unkeyable = None;
         let mut recordings = settings.and_then(|settings| {
             let weak = hash::weak_key(
                 snapshot,
@@ -768,6 +770,7 @@ impl Cache {
                         "qk: {}: not keyed by its recordings ({error:#})",
                         task.id
                     );
+                    unkeyable = Some((settings.mode, format!("{error:#}")));
                     None
                 }
             }
@@ -861,12 +864,12 @@ impl Cache {
                     .is_ok_and(|coverage| self.covers_all(&coverage, snapshot, workspace, sets))
             },
         );
-        // How its recordings keyed it, taken by its declared key.
-        let unrecorded = lookup::recorded(
-            mode,
-            had_sets(&recordings),
-            lookup::Taken::Declared(key.clone()),
-        );
+        // How its recordings keyed it, or why they could not.
+        let verdict = |had_sets: bool, taken: lookup::Taken| match &unkeyable {
+            Some((mode, reason)) => lookup::unkeyable(*mode, reason, taken),
+            None => lookup::recorded(mode, had_sets, taken),
+        };
+        let unrecorded = verdict(had_sets(&recordings), lookup::Taken::Declared(key.clone()));
         // An entry fetched ahead of this task is local, but it came from the
         // remote store, and is reported as such.
         let prefetched = declared
@@ -1123,9 +1126,13 @@ impl Cache {
                 }
             }
             (Some(Ok(_)), _) => lookup::Ran::Unkept,
-            (None, _) => lookup::Ran::Unkeyed,
+            (None, _) => match (&unkeyable, keying) {
+                // Recorded to key it, by recordings that cannot.
+                (Some((_, reason)), Some(_)) => lookup::Ran::Refused(reason.clone()),
+                _ => lookup::Ran::Unkeyed,
+            },
         };
-        let recorded = lookup::recorded(mode, had_sets(&recordings), lookup::Taken::Ran(ran));
+        let recorded = verdict(had_sets(&recordings), lookup::Taken::Ran(ran));
         let shadow = match shadow {
             Some(Shadow::WouldHit { key: recorded, .. }) => Some(Shadow::WouldHit {
                 key: recorded,

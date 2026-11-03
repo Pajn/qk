@@ -180,6 +180,20 @@ pub(crate) fn recorded(mode: Option<Mode>, had_sets: bool, taken: Taken) -> Opti
     }
 }
 
+/// How a task in `mode` was keyed where its recordings cannot key it, for
+/// `reason`: in mode `"on"`, they failed, wherever its result came from; in
+/// mode `"record"`, only where it ran recorded to key it, as a recording
+/// that keys nothing.
+pub(crate) fn unkeyable(mode: Mode, reason: &str, taken: Taken) -> Option<Recorded> {
+    let failed = Some(Recorded::Failed {
+        reason: reason.to_owned(),
+    });
+    match (mode, taken) {
+        (Mode::On, _) | (Mode::Record, Taken::Ran(Ran::Refused(_))) => failed,
+        (Mode::Record, _) => None,
+    }
+}
+
 /// What a task's recordings would have done, by what their lookup found.
 pub(crate) fn shadow(found: Found, sets: &[PathSet]) -> Shadow {
     match found {
@@ -392,6 +406,36 @@ mod tests {
                 Some(Recorded::Saved { key: "s".into() })
             );
         }
+    }
+
+    #[test]
+    fn recordings_that_cannot_key_a_task_fail_it_where_a_verdict_is_given() {
+        let failed = Some(Recorded::Failed {
+            reason: "weak".into(),
+        });
+        for taken in [
+            Taken::Declared("d".into()),
+            Taken::Ran(Ran::Unkeyed),
+            Taken::Ran(Ran::Refused("weak".into())),
+        ] {
+            assert_eq!(unkeyable(Mode::On, "weak", taken), failed);
+        }
+        assert_eq!(
+            unkeyable(Mode::Record, "weak", Taken::Declared("d".into())),
+            None
+        );
+        assert_eq!(
+            unkeyable(Mode::Record, "weak", Taken::Ran(Ran::Unkeyed)),
+            None
+        );
+        assert_eq!(
+            unkeyable(
+                Mode::Record,
+                "weak",
+                Taken::Ran(Ran::Refused("weak".into()))
+            ),
+            failed
+        );
     }
 
     #[test]
