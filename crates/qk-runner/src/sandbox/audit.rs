@@ -10,7 +10,7 @@ use qk_cache::ultracache::IgnoredReads;
 use serde::Serialize;
 
 use super::Report;
-use super::policy::{in_git, is_dotenv};
+use super::policy::in_git;
 use crate::installs::Installs;
 
 /// What one task did beyond what it declares.
@@ -31,7 +31,7 @@ pub struct Findings {
     /// project: what running a dependency's code or following imports into
     /// it reads. `^` inputs key them.
     pub dependency_reads: BTreeMap<String, BTreeSet<String>>,
-    /// `.git` and dotenv files it read: allowed, but not in the key either.
+    /// `.git` files it read: allowed, but not in the key either.
     pub unkeyed_reads: BTreeSet<String>,
     /// Paths it wrote in the workspace outside its outputs.
     pub stray_writes: BTreeSet<String>,
@@ -48,8 +48,8 @@ pub struct Findings {
 
 impl Findings {
     /// Whether it did anything enforce would refuse: beyond reading `.git` and
-    /// dotenv files and installed packages its key leaves out, and writing in
-    /// `.git`, which enforce allows.
+    /// installed packages its key leaves out, and writing in `.git`, which
+    /// enforce allows.
     pub fn went_beyond(&self) -> bool {
         !self.undeclared_reads.is_empty()
             || !self.manifest_reads.is_empty()
@@ -186,7 +186,7 @@ impl TaskAudit {
                 }
             } else if report.writes() {
                 findings.stray_writes.insert(relative);
-            } else if unkeyed(&relative) {
+            } else if in_git(&relative) {
                 findings.unkeyed_reads.insert(relative);
             } else if let Some(project) = dependency
                 && qk_input_analysis::ReadKind::of(&relative)
@@ -225,9 +225,13 @@ impl TaskAudit {
     }
 }
 
-/// `.git` and dotenv files, which tasks read outside their keys by design.
-fn unkeyed(path: &str) -> bool {
-    in_git(path) || is_dotenv(path.rsplit('/').next().unwrap_or(path))
+/// Whether `path` names a dotenv file: `.env`, `.env.*` or `.*.env`. Such a
+/// file matters only through the variables qk loads from it, which `env`
+/// inputs key, so a task names those it reads in its ignored reads; read
+/// otherwise, it is read outside the task's inputs.
+pub fn is_dotenv(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    name == ".env" || name.starts_with(".env.") || (name.starts_with('.') && name.ends_with(".env"))
 }
 
 #[cfg(all(test, unix))]
@@ -282,19 +286,17 @@ mod tests {
             }]),
             [],
         );
-        assert_eq!(
-            found.unkeyed_reads,
-            set(&[
-                ".env",
-                ".git",
-                ".git/HEAD",
-                "apps/web/.build.env",
-                "apps/web/.env.local"
-            ])
-        );
+        assert_eq!(found.unkeyed_reads, set(&[".git", ".git/HEAD"]));
+        // A dotenv file is read outside its inputs as any other.
         assert_eq!(
             found.undeclared_reads,
-            set(&[".github/workflows/ci.yml", "src/env.ts"])
+            set(&[
+                ".env",
+                ".github/workflows/ci.yml",
+                "apps/web/.build.env",
+                "apps/web/.env.local",
+                "src/env.ts"
+            ])
         );
         assert_eq!(found.manifest_reads, set(&["libs/lib/package.json"]));
         assert_eq!(found.toolchain_reads, set(&[".nvmrc"]));
@@ -302,18 +304,23 @@ mod tests {
         assert!(found.stray_writes.is_empty() && found.went_beyond());
     }
 
-    /// Reads its ignored reads match, and the manifests of the projects
-    /// they link to, are no finding; writing there still is.
+    /// Reads its ignored reads match, dotenv files among them, and the
+    /// manifests of the projects they link to, are no finding; writing there
+    /// still is.
     #[test]
     fn leaves_out_ignored_reads() {
         let root = Path::new("/workspace");
         let mut audit = TaskAudit::new(root, Vec::new());
-        audit.ignoring(IgnoredReads::of_globs(&["apps/app/e2e/**".to_owned()]).unwrap());
+        audit.ignoring(
+            IgnoredReads::of_globs(&["apps/app/e2e/**".to_owned(), "**/.env".to_owned()]).unwrap(),
+        );
         audit.ignoring_manifests(set(&["packages/core/package.json"]));
         let found = audit.classify(
             None,
             [
                 read(root, "apps/app/e2e/spec.js"),
+                read(root, "apps/app/.env"),
+                read(root, ".env"),
                 read(root, "packages/core/package.json"),
                 read(root, "packages/core/index.js"),
                 write(root, "apps/app/e2e/out.txt"),

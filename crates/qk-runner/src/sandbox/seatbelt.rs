@@ -155,11 +155,6 @@ fn profile(policy: &Policy, id: &str) -> Result<String> {
                 operations(&grant),
                 literal_regex(root_text)
             )),
-            Scope::Dotenv => rules.push(format!(
-                "(allow {} (regex #\"^{}/(.*/)?\\.(env|env\\.[^/]*|[^/]*\\.env)$\"))",
-                operations(&grant),
-                literal_regex(root_text)
-            )),
             Scope::Directories => rules.push(format!(
                 "(allow {} (vnode-type DIRECTORY))",
                 operations(&grant)
@@ -310,8 +305,8 @@ mod tests {
         );
     }
 
-    /// Enforce refuses everything in the workspace, then allows `.git`,
-    /// dotenv files and what the plan names.
+    /// Enforce refuses everything in the workspace, then allows `.git` and
+    /// what the plan names.
     #[cfg(unix)]
     #[test]
     fn renders_an_enforce_profile() {
@@ -322,7 +317,6 @@ mod tests {
 (deny file-read-data (subpath "/w") (with message "qk-task:app:build"))
 (deny file-write* (subpath "/w") (with message "qk-task:app:build"))
 (allow file-read-data file-write* (subpath "/w/.git"))
-(allow file-read-data (regex #"^/w/(.*/)?\.(env|env\.[^/]*|[^/]*\.env)$"))
 (allow file-read-data file-write* (regex #"^/w/(.*/)?node_modules/"))
 (allow file-read-data (vnode-type DIRECTORY))
 (allow file-read-data file-write* (subpath "/w/.qk"))

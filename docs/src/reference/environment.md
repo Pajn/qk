@@ -107,7 +107,10 @@ read as dotenv reads them: `export` is allowed, `KEY: value` works, quoted
 values may span lines, `\n` and `\r` are line breaks inside double quotes,
 an unquoted value ends at `#`, and a line dotenv cannot read is skipped
 rather than failing the run. `envFile` is read the same way, and so fills a
-variable set but empty, as in Nx 24.
+variable set but empty, as in Nx 24. qk reads them itself, before the task
+starts; under `--sandbox`, a tool in the task reading one itself must find
+it named in the task's `qk:ultracache.ignoreReads` (see
+[Dotenv files](../guides/sandbox.md#dotenv-files)).
 
 As Nx does at startup, qk loads the workspace's root `.local.env`,
 `.env.local` and `.env`, in that order of precedence, into its own

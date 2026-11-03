@@ -4609,11 +4609,16 @@ fn the_sandbox_reports_and_refuses_what_a_task_does_not_declare() {
             report.to_str().unwrap(),
         ],
     );
-    success(audit);
+    let stderr = String::from_utf8_lossy(&success(audit).stderr).into_owned();
     let findings: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
     let build = &findings["tasks"]["app:build"];
-    assert_eq!(build["undeclaredReads"], json!(["other/notes.txt"]));
-    assert_eq!(build["unkeyedReads"], json!([".env"]));
+    // A dotenv file its ignored reads do not name is read outside its inputs.
+    assert_eq!(build["undeclaredReads"], json!([".env", "other/notes.txt"]));
+    assert_eq!(build["unkeyedReads"], json!([]));
+    assert!(
+        stderr.contains("  app:build\n    1 read outside its inputs:\n      other/notes.txt\n    1 dotenv file read outside its inputs; name it in qk:ultracache.ignoreReads, and the variables that matter as env inputs:\n      .env\n"),
+        "{stderr}"
+    );
     // Read back after writing it, it is listed once, as a write.
     assert_eq!(build["strayWrites"], json!(["stray.txt"]));
     assert!(findings["tasks"].get("app:clean").is_none(), "{findings}");
@@ -4649,6 +4654,52 @@ fn the_sandbox_reports_and_refuses_what_a_task_does_not_declare() {
     );
     assert!(!temp.path().join("stray.txt").exists());
     assert!(temp.path().join("dist/out.txt").is_file());
+}
+
+/// Enforce lets a task read a dotenv file only as its ignored reads name it,
+/// written in the target or in nx.json `targetDefaults`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn the_sandbox_lets_a_task_read_dotenv_files_its_ignored_reads_name() {
+    let read = "cat .env apps/web/.env.local > /dev/null";
+    let ignored = json!({"mode": "off", "ignoreReads": ["**/.env", "**/.env.*"]});
+    let temp = fixture(json!({
+        "plain": {"command": read, "inputs": []},
+        "named": {"command": read, "inputs": [], "qk:ultracache": ignored},
+        "defaulted": {"command": read, "inputs": []}
+    }));
+    fs::write(
+        temp.path().join("nx.json"),
+        json!({"targetDefaults": {"defaulted": {"qk:ultracache": ignored}}}).to_string(),
+    )
+    .unwrap();
+    fs::create_dir_all(temp.path().join("apps/web")).unwrap();
+    fs::write(temp.path().join(".env"), "X=1\n").unwrap();
+    fs::write(temp.path().join("apps/web/.env.local"), "Y=1\n").unwrap();
+    let enforced = |target: &str| {
+        run(
+            temp.path(),
+            &[
+                "run",
+                &format!("app:{target}"),
+                "--skip-cache",
+                "--sandbox=enforce",
+            ],
+        )
+    };
+    let plain = enforced("plain");
+    assert!(!plain.status.success());
+    #[cfg(target_os = "macos")]
+    let refused = ".env: Operation not permitted";
+    #[cfg(target_os = "linux")]
+    let refused = ".env: Permission denied";
+    assert!(
+        String::from_utf8_lossy(&plain.stderr).contains(refused),
+        "{}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    success(enforced("named"));
+    success(enforced("defaulted"));
 }
 
 /// Configuration files a key holds by what they change, or not at all, are
@@ -5420,7 +5471,7 @@ fn warm_suggest_lists_the_directories_a_task_wrote_outside_its_outputs() {
 fn the_sandbox_refuses_what_a_task_does_not_declare_on_linux() {
     let temp = fixture(json!({
         "build": {
-            "command": "cat src/in.txt .env node_modules/dep/index.js /etc/hostname > /dev/null && ls other > /dev/null && mkdir -p dist && echo out > dist/out.txt && echo ok",
+            "command": "cat src/in.txt node_modules/dep/index.js /etc/hostname > /dev/null && ls other > /dev/null && mkdir -p dist && echo out > dist/out.txt && echo ok",
             "inputs": ["{projectRoot}/src/**/*"],
             "outputs": ["{projectRoot}/dist"]
         },
@@ -5432,7 +5483,6 @@ fn the_sandbox_refuses_what_a_task_does_not_declare_on_linux() {
     }
     fs::write(temp.path().join("src/in.txt"), "in").unwrap();
     fs::write(temp.path().join("other/notes.txt"), "notes").unwrap();
-    fs::write(temp.path().join(".env"), "X=1\n").unwrap();
     fs::write(temp.path().join("node_modules/dep/index.js"), "").unwrap();
     let sandboxed = |target: &str| {
         run(
@@ -5446,7 +5496,7 @@ fn the_sandbox_refuses_what_a_task_does_not_declare_on_linux() {
             ],
         )
     };
-    // Its inputs, dotenv files, node_modules, outside the workspace, listing,
+    // Its inputs, node_modules, outside the workspace, listing,
     // and writing its outputs, which did not exist yet.
     let built = success(sandboxed("app:build"));
     assert!(String::from_utf8_lossy(&built.stdout).contains("ok"));

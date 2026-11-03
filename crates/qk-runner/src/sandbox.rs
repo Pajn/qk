@@ -9,8 +9,10 @@
 //! changes or resolves to, such as nx.json, project.json or the pnpm
 //! lockfile, is read only as declared, since what the task reads of it
 //! could change without its key. In audit mode anything else is allowed and reported; in enforce
-//! mode it is refused, except reading and writing `.git` and reading dotenv
-//! files, which a task may need although they are not keyed.
+//! mode it is refused, except reading and writing `.git`, which a task may
+//! need although it is not keyed. A dotenv file is read only as its ignored
+//! reads name it: what it holds matters through the variables qk loads from
+//! it, which `env` inputs key.
 //!
 //! Audit also reports reading an installed package the key leaves out, as a
 //! task naming its `externalDependencies` but running a tool only the root
@@ -52,8 +54,8 @@ mod landlock;
 mod policy;
 mod seatbelt;
 
-pub use audit::Findings;
 use audit::TaskAudit;
+pub use audit::{Findings, is_dotenv};
 use policy::Policy;
 pub use policy::in_git;
 use seatbelt::{Fit, quote, seatbelt};
