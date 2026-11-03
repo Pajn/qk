@@ -252,7 +252,9 @@ mod tests {
 
     /// Audit reports everything in the workspace, then allows what the plan
     /// names; the store's manifests are reported again after `node_modules`
-    /// is allowed, but for the directories named after them.
+    /// is allowed, but for the directories named after them. The paths are
+    /// Unix paths, as on macOS, where profiles are made.
+    #[cfg(unix)]
     #[test]
     fn renders_an_audit_profile() {
         let keyed = vec![PathBuf::from("/w/node_modules/.pnpm/a@1.0.0")];
@@ -309,6 +311,7 @@ mod tests {
 
     /// Enforce refuses everything in the workspace, then allows `.git`,
     /// dotenv files and what the plan names.
+    #[cfg(unix)]
     #[test]
     fn renders_an_enforce_profile() {
         assert_eq!(
