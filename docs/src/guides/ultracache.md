@@ -181,12 +181,14 @@ set, which costs a miss, never a wrong result.
 
 With `"record"`, a task is keyed by its declared inputs, as without the field,
 while a run with `--record` records it and keeps and shares its recordings as
-with `"on"`. Every run also looks the task up by its recordings without
-restoring anything, and says what they would have done: `--report` writes it
-as `shadow`, `wouldHit` with the key that had a result `"on"` would take,
-`wouldMiss`, or `unrecorded` without path sets, and the run history keeps it,
-so runs can be counted afterwards: a task its declared inputs missed with
-`wouldHit` is a run its recordings would have saved. The run summary names the tasks where the two
+with `"on"`. Every run but a cold one also looks the task up by its
+recordings without restoring anything, and says what they would have done:
+`--report` writes it as `shadow`, `wouldHit` with the key that had a result
+`"on"` would take, `wouldMiss`, or `unrecorded` without path sets, and the run
+history keeps it, so runs can be counted afterwards: a task its declared
+inputs missed with `wouldHit` is a run its recordings would have saved. A
+cold run, with `--cold` or `QK_COLD`, looks nothing up, so its tasks carry no
+`shadow` and leave such counts out. The run summary names the tasks where the two
 disagree:
 
 - a task its declared inputs missed where its recordings had a result: a
