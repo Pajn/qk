@@ -1594,7 +1594,14 @@ fn workspace_outputs(workspace: &Workspace) -> recorded::WorkspaceOutputs {
     for (name, project) in &workspace.projects {
         for (target, definition) in &project.targets {
             if let Some(scratch) = scratch_outputs(workspace, name, definition) {
-                outputs.push(((name.clone(), target.clone(), None), scratch));
+                let configurations = std::iter::once(None)
+                    .chain(definition.configurations.keys().cloned().map(Some));
+                for configuration in configurations {
+                    outputs.push((
+                        (name.clone(), target.clone(), configuration),
+                        scratch.clone(),
+                    ));
+                }
             }
             let configured = definition
                 .configurations
@@ -1914,6 +1921,7 @@ mod tests {
             root.join("lib/project.json"),
             r#"{"name":"lib","targets":{"build":{"command":"true","outputs":["{options.outputPath}"],
                 "options":{"outputPath":"lib/dist"},
+                "qk:sandbox":{"scratch":["{projectRoot}/.scratch"]},
                 "configurations":{"production":{"outputPath":"lib/dist-production"}}}}}"#,
         )
         .unwrap();
@@ -1969,5 +1977,10 @@ mod tests {
         let production = others("app:test:production");
         assert!(!production.matches("lib/dist-production"));
         assert!(production.matches("lib/dist"));
+        // A dependency's scratch is left in as its outputs are, whichever
+        // configuration it runs with.
+        assert!(others("app:lint").matches("lib/.scratch"));
+        assert!(!others("app:test").matches("lib/.scratch"));
+        assert!(!production.matches("lib/.scratch"));
     }
 }
