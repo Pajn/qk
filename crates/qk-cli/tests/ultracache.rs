@@ -282,6 +282,45 @@ fn a_task_that_changes_what_it_read_is_not_recorded() {
     );
 }
 
+/// A run whose declared inputs changed while it ran keeps no result, and so
+/// no recording, and says that its recording was not saved.
+#[test]
+fn a_recording_of_a_run_whose_inputs_changed_is_not_saved_and_says_so() {
+    if !has_strace() {
+        return;
+    }
+    let temp = fixture();
+    let root = temp.path();
+    let project = fs::read_to_string(root.join("app/project.json")).unwrap();
+    write(
+        root,
+        "app/project.json",
+        &project.replace(
+            " > dist/listing.txt",
+            " > dist/listing.txt && echo changed > always.txt",
+        ),
+    );
+    let report = root.join(".git/report.json");
+    let output = qk(
+        root,
+        &[
+            "run",
+            "app:build",
+            "--record",
+            "--report",
+            report.to_str().unwrap(),
+        ],
+        &[],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("app:build: recording not saved (its inputs changed while it ran)"),
+        "{stderr}"
+    );
+    let run: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+    assert_eq!(kind(&run["tasks"][0]["recorded"]), "unrecorded");
+}
+
 /// A task run without recording, after a change its recordings missed, keeps
 /// its result under its declared key alone. When its declared inputs cover
 /// everything its recordings say it read, looked for and listed, the next

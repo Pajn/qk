@@ -1125,7 +1125,20 @@ impl Cache {
                     }
                 }
             }
-            (Some(Ok(_)), _) => lookup::Ran::Unkept,
+            (Some(Ok(_)), _) => {
+                // A task that failed says so itself.
+                let why = if outcome != Outcome::Success {
+                    None
+                } else if !inputs_unchanged {
+                    Some("its inputs changed while it ran")
+                } else {
+                    Some("its log could not be written")
+                };
+                if let Some(why) = why {
+                    qk_executor::status!("qk: {}: recording not saved ({why})", task.id);
+                }
+                lookup::Ran::Unkept
+            }
             (None, _) => match (&unkeyable, keying) {
                 // Recorded to key it, by recordings that cannot.
                 (Some((_, reason)), Some(_)) => lookup::Ran::Refused(reason.clone()),
