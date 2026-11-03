@@ -46,15 +46,17 @@ pub(crate) fn asks_store(
 /// Whether a task is looked up by its declared key: without recordings, in
 /// mode `"record"`, or without path sets, or where its declared inputs, as
 /// `covers` says, cover what each of its path sets read: otherwise its
-/// declared inputs are what a recording found wanting.
+/// declared inputs are what a recording found wanting. A cold run looks
+/// nothing up, so its path sets' coverage is never judged.
 pub(crate) fn by_declared(
     mode: Option<Mode>,
+    cold: bool,
     sets: &[PathSet],
     covers: impl FnOnce(&[PathSet]) -> bool,
 ) -> bool {
     match mode {
         None | Some(Mode::Record) => true,
-        Some(Mode::On) => sets.is_empty() || covers(sets),
+        Some(Mode::On) => sets.is_empty() || (!cold && covers(sets)),
     }
 }
 
@@ -273,14 +275,17 @@ mod tests {
     }
 
     #[test]
-    fn coverage_is_judged_only_for_path_sets_in_mode_on() {
+    fn coverage_is_judged_only_for_path_sets_in_mode_on_when_not_cold() {
         let sets = [set("a")];
         let never = |_: &[PathSet]| -> bool { panic!("judged") };
-        assert!(by_declared(None, &sets, never));
-        assert!(by_declared(Some(Mode::Record), &sets, never));
-        assert!(by_declared(Some(Mode::On), &[], never));
-        assert!(by_declared(Some(Mode::On), &sets, |_| true));
-        assert!(!by_declared(Some(Mode::On), &sets, |_| false));
+        for cold in [false, true] {
+            assert!(by_declared(None, cold, &sets, never));
+            assert!(by_declared(Some(Mode::Record), cold, &sets, never));
+            assert!(by_declared(Some(Mode::On), cold, &[], never));
+        }
+        assert!(by_declared(Some(Mode::On), false, &sets, |_| true));
+        assert!(!by_declared(Some(Mode::On), false, &sets, |_| false));
+        assert!(!by_declared(Some(Mode::On), true, &sets, never));
     }
 
     #[test]

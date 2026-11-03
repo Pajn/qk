@@ -854,6 +854,7 @@ impl Cache {
         };
         let declared = lookup::by_declared(
             mode,
+            self.cold,
             recordings.as_ref().map_or(&[], |(sets, _, _)| sets),
             |sets| {
                 hash::coverage(snapshot, workspace, graph, task, prepared, cancelled)
