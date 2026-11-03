@@ -98,10 +98,15 @@ outputs were renewed.
 
 Warm state helps when the task must run. It can belong to an older input
 set, so qk dates restored files to the Unix epoch by default and lets the
-tool validate them. `mtimes: "preserve"` applies only to the worktree that
-saved the state. Another worktree's or a remote save still receives epoch
-timestamps; this setting never promises an up-to-date build in a different
-checkout. Preserving times also preserves the tool's timestamp assumptions:
+tool validate them. `mtimes: "preserve"` restores the times the files had
+when saved instead, wherever the save came from: this worktree, another one,
+or the remote store. Tools that record times and compare them exactly, as
+Android's CMake builds do, otherwise discard their state on every restore.
+The times only say what they said where the state was made: a source file
+whose time here is older than the state, but whose content differs from what
+the state was built from, looks unchanged to a tool comparing times, so use
+it where sources get a new time when they change, as a fresh checkout gives
+them. Preserving times also preserves the tool's timestamp assumptions:
 Make 3.81 can miss a rapid source edit within its output timestamp's
 one-second resolution. Validate source changes as well as unchanged builds
 before using preserved times for that tool.

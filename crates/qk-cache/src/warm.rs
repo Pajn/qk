@@ -110,8 +110,8 @@ pub struct Warm {
     pub directory: bool,
     pub max_size: Option<u64>,
     pub remote: bool,
-    /// Whether a worktree's own save comes back with the modification times it
-    /// was saved with, rather than [`RESTORED_AT`].
+    /// Whether a save comes back with the modification times it was saved
+    /// with, rather than [`RESTORED_AT`], wherever it was made.
     pub preserve_mtimes: bool,
     /// Which saves besides this worktree's own may be restored.
     pub portable: Portable,
@@ -1426,8 +1426,7 @@ impl Cache {
     /// Restores each warm group not already on disk from the save
     /// [`Cache::choose_warm`] picks, or the remote's, and notes what it
     /// restored so the next save can tell which files are unchanged. Files are
-    /// dated [`RESTORED_AT`], unless the target keeps modification times and
-    /// the save is this worktree's own.
+    /// dated [`RESTORED_AT`], unless the target keeps modification times.
     pub(crate) fn restore_warm(
         &self,
         workspace: &Workspace,
@@ -1514,7 +1513,10 @@ impl Cache {
         };
         drop(choosing);
         let _files = profile::span(&task.id, "warm_restore_files");
-        let keep_mtimes = warm.preserve_mtimes && source == "local";
+        // Asked for, the save's times come back wherever it was made: tools
+        // that compare them exactly, as Android's CMake builds do, otherwise
+        // start over on every save from elsewhere.
+        let keep_mtimes = warm.preserve_mtimes;
         restored.source = source;
         let mut noted = read_restored_files(workspace, warm);
         for (location, kept) in missing {
