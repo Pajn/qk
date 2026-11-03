@@ -233,7 +233,7 @@ pub fn validate_path(path: &str) -> Result<()> {
 
 /// [`validate_path`] for an output pattern, whose `\` escapes the character
 /// after it, as in Nx: the paths it can match must be safe.
-fn validate_pattern(pattern: &str) -> Result<()> {
+pub(crate) fn validate_pattern(pattern: &str) -> Result<()> {
     let mut path = String::new();
     let mut chars = pattern.chars();
     while let Some(c) = chars.next() {
