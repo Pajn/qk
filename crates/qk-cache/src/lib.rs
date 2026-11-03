@@ -927,7 +927,7 @@ impl Cache {
         let keying = prepared
             .recording
             .as_ref()
-            .filter(|_| prepared.recording_keys);
+            .filter(|recording| recording.keys());
         let listed = match (&recordings, keying) {
             (Some(_), Some(_)) => {
                 let project_root = workspace
@@ -1440,24 +1440,10 @@ impl Cache {
                 })
             })
         };
-        let limits = qk_input_analysis::strace::Limits {
-            records: 1_000_000,
-            bytes: 256 * 1024 * 1024,
-            accesses: 500_000,
-            keep: Some(&keep),
-            // A path set names what a task read by the paths it named.
-            resolved: false,
-            // And names each once, whichever processes read it.
-            distinct: true,
-        };
-        recording.settle().map_err(failed)?;
-        let (accesses, diagnostics) =
-            qk_input_analysis::strace::collect_within(&recording.directory, &prepared.cwd, &limits)
-                .map_err(failed)?;
-        // A partial trace would key the task by part of what it read.
-        if let Some(diagnostic) = diagnostics.first() {
-            return Err(diagnostic.clone());
-        }
+        // A path set names what a task read by the paths it named. A partial
+        // trace would key the task by part of what it read.
+        let limits = qk_input_analysis::strace::Limits::kept(&keep, false);
+        let accesses = recording.whole_accesses(&prepared.cwd, &limits)?;
         let ignore = self
             .ignored_reads(workspace, task, prepared, &settings.ignore_reads)
             .map_err(failed)?;

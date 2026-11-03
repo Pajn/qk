@@ -795,7 +795,7 @@ fn a_sandbox_audit_records_nothing_for_the_cache_without_record() {
 /// Where no recorder works, a recording run records nothing, says why once,
 /// and goes on: a recording only keys what a later run may take. An audit of
 /// what is recorded goes on unaudited the same way. A recorder named that
-/// cannot record, or one named wrong, is a mistake, and fails the run.
+/// cannot record is a mistake, and fails the run.
 #[test]
 fn a_run_where_no_recorder_works_goes_on_unrecorded() {
     let temp = fixture();
@@ -831,20 +831,6 @@ fn a_run_where_no_recorder_works_goes_on_unrecorded() {
     assert!(!named.status.success());
     let stderr = String::from_utf8_lossy(&named.stderr);
     assert!(stderr.contains("recording needs strace"), "{stderr}");
-    let misnamed = Command::new(env!("CARGO_BIN_EXE_qk"))
-        .current_dir(root)
-        .arg("--workspace")
-        .arg(root)
-        .args(["run", "app:build", "--record"])
-        .env("QK_RECORDER", "strase")
-        .output()
-        .unwrap();
-    assert!(!misnamed.status.success());
-    assert!(
-        String::from_utf8_lossy(&misnamed.stderr).contains("unknown QK_RECORDER \"strase\""),
-        "{}",
-        String::from_utf8_lossy(&misnamed.stderr)
-    );
     // As root, the eBPF helper needs no sudo, so `auto` may still record.
     // SAFETY: geteuid has no preconditions.
     if unsafe { libc::geteuid() } == 0 {

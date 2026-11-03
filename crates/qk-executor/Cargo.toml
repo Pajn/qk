@@ -16,6 +16,7 @@ rustls-native-certs.workspace = true
 regex.workspace = true
 shlex.workspace = true
 qk-config.workspace = true
+qk-input-analysis.workspace = true
 qk-taskgraph.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

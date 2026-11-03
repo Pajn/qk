@@ -1168,12 +1168,7 @@ fn run(mut cli: Cli) -> Result<i32> {
     if matches!(cli.command, Command::TraceHelper) {
         #[cfg(target_os = "linux")]
         {
-            // Buffered: stdout flushes at every newline byte, which binary
-            // frames hold everywhere, and the helper flushes when it needs to.
-            qk_trace::helper::run(
-                std::io::BufReader::new(std::io::stdin()),
-                std::io::BufWriter::new(std::io::stdout().lock()),
-            )?;
+            qk_trace::helper::serve()?;
             return Ok(0);
         }
         #[cfg(not(target_os = "linux"))]

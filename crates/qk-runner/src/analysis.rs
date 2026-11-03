@@ -15,7 +15,7 @@ use crate::sandbox::Watcher;
 
 use qk_input_analysis::strace;
 
-pub struct Recorder {
+pub struct Analysis {
     root: PathBuf,
     directory: tempfile::TempDir,
     watcher: Option<Watcher>,
@@ -28,7 +28,7 @@ pub struct Recorder {
     tag_prefix: String,
 }
 
-impl Recorder {
+impl Analysis {
     pub fn start(
         workspace: &Workspace,
         graph: &TaskGraph,
@@ -53,7 +53,7 @@ impl Recorder {
             "recording:{}:",
             directory.path().file_name().unwrap().to_string_lossy()
         );
-        let mut recorder = Self {
+        let mut analysis = Self {
             root: root.clone(),
             directory,
             watcher: None,
@@ -64,8 +64,8 @@ impl Recorder {
             symlinks: BTreeMap::new(),
             tag_prefix,
         };
-        let mut candidates = recorder.declared.candidates.clone();
-        for resolved in recorder
+        let mut candidates = analysis.declared.candidates.clone();
+        for resolved in analysis
             .declared
             .tasks
             .values()
@@ -75,22 +75,22 @@ impl Recorder {
         }
         for path in candidates {
             let targets =
-                crate::sandbox::linked_targets(&recorder.root, &recorder.root.join(&path));
+                crate::sandbox::linked_targets(&analysis.root, &analysis.root.join(&path));
             if !targets.is_empty() {
-                recorder.symlinks.insert(path, targets);
+                analysis.symlinks.insert(path, targets);
             }
         }
         if cfg!(target_os = "macos") {
             for (index, task) in prepared.values_mut().enumerate() {
-                let path = recorder.directory.path().join(format!("task-{index}.sb"));
+                let path = analysis.directory.path().join(format!("task-{index}.sb"));
                 let root = serde_json::to_string(
-                    recorder
+                    analysis
                         .root
                         .to_str()
                         .context("workspace path is not UTF-8")?,
                 )?;
                 let tag =
-                    serde_json::to_string(&format!("qk-task:{}{}", recorder.tag_prefix, task.id))?;
+                    serde_json::to_string(&format!("qk-task:{}{}", analysis.tag_prefix, task.id))?;
                 std::fs::write(
                     &path,
                     format!(
@@ -111,18 +111,19 @@ impl Recorder {
                 }
                 task.sandbox = Some(qk_executor::Confinement::Seatbelt(path));
             }
-            recorder.watcher = Some(Watcher::start(recorder.directory.path())?);
+            analysis.watcher = Some(Watcher::start(analysis.directory.path())?);
         } else {
             // What links lead to is part of the report.
-            let recording = qk_executor::Recording::probe(recorder.directory.path())?.resolving();
+            let recording =
+                qk_executor::Recording::required(analysis.directory.path())?.resolving();
             for (index, task) in prepared.values_mut().enumerate() {
-                let directory = recorder.directory.path().join(format!("task-{index}"));
+                let directory = analysis.directory.path().join(format!("task-{index}"));
                 std::fs::create_dir(&directory)?;
                 task.recording = Some(recording.in_directory(directory));
             }
-            recorder.backend = Some(recording.backend());
+            analysis.backend = Some(recording.backend());
         }
-        Ok(recorder)
+        Ok(analysis)
     }
 
     pub fn finish(
@@ -207,7 +208,7 @@ impl Recorder {
                         .push(format!("recording incomplete: {error:#}"));
                     continue;
                 }
-                match strace::collect(&recording.directory, &task.cwd) {
+                match recording.accesses(&task.cwd, &strace::ANALYSIS) {
                     Ok((events, issues)) => {
                         observed.insert(id.clone(), events);
                         diagnostics.insert(id.clone(), issues);
