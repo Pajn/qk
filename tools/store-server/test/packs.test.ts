@@ -153,7 +153,8 @@ describe("blobs", () => {
       token: READ,
       body: JSON.stringify({ blobs: [stored.hash, absent] }),
     });
-    expect(await response.json()).toEqual({ missing: [absent] });
+    // A small blob stored on its own is loose, for clients to bundle.
+    expect(await response.json()).toEqual({ missing: [absent], loose: [stored.hash] });
     const tooMany = JSON.stringify({ blobs: Array.from({ length: 4097 }, hash) });
     expect((await request("POST", "blobs/missing", { body: tooMany })).status).toBe(400);
   });

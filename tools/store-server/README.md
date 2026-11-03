@@ -21,17 +21,23 @@ header followed by the client's own zstd frames.
 | `src/auth.ts` | Bearer tokens checked against SHA-256 digests |
 
 R2 holds `entries/<key>`, `warm/<a>/<b>`, `pathsets/<weak>` and
-`expectations/<name>` (upload bodies), `blobs/<hash>` (one zstd frame each) and
+`expectations/<name>` (upload bodies), `blobs/<hash>` (one zstd frame each),
+`bundles/<id>` (bundle bodies, many small blobs' frames each) and
 `sessions/<id>` (Bloom filters).
 
 The index also lists every blob stored apart with its stored size, so that
 checking or composing a record that cites thousands of blobs takes a few
 queries instead of an R2 request per blob, each of which costs a round trip
-the Worker waits on. Blobs are only ever written through `PUT blobs/<hash>`,
-which lists them. Blobs stored before the index held them are listed from the
+the Worker waits on. A bundled blob is listed with its bundle and where its
+frame starts in it, and a pack reads neighbouring blobs of a bundle as one
+range: an invocation has six R2 reads in flight at most, so a range rather
+than a read per blob is what makes a pack of many small blobs quick. Blobs are
+only ever written through `PUT blobs/<hash>` and `PUT bundles/<id>`, which
+list them. Blobs stored before the index held them are listed from the
 bucket once, in the background, by the Durable Object's alarm; until it is
 done, a blob the index lacks is asked of the bucket. So do not write `blobs/`
-into the bucket any other way, or the index will take those blobs as missing.
+or `bundles/` into the bucket any other way, or the index will take those
+blobs as missing.
 
 ## Deploying
 
@@ -91,8 +97,8 @@ pnpm typecheck
 
 ## Limits
 
-- Upload bodies (`PUT entries/…`, `PUT warm/…`) are read into memory, up to
-  100 MiB, path sets (`PUT pathsets/…`) up to 16 MiB and expectations
+- Upload bodies (`PUT entries/…`, `PUT warm/…`) and bundles
+  (`PUT bundles/…`) are read into memory, up to 100 MiB, path sets (`PUT pathsets/…`) up to 16 MiB and expectations
   (`PUT expectations/…`) up to 4 MiB; Cloudflare's own request size limit for the account's plan applies
   first. Blobs stored apart (`PUT blobs/…`) stream to R2.
 - A pack carries inline at most 64 MiB of blobs stored apart; the rest the

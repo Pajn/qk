@@ -29,6 +29,14 @@ const LISTINGS_PER_ALARM = 20;
 /** How long after a listing failed it is tried again. */
 const RELIST_AFTER = 60 * 1000;
 
+/** Where a blob stored apart is: on its own as `blobs/<hash>` when `bundle`
+ * is null, else in `bundles/<bundle>` from `offset`; `size` bytes either way. */
+export interface StoredBlob {
+  size: number;
+  bundle: string | null;
+  offset: number;
+}
+
 export class Index extends DurableObject<{ STORE: R2Bucket }> {
   private sql: SqlStorage;
 
@@ -44,6 +52,17 @@ export class Index extends DurableObject<{ STORE: R2Bucket }> {
       CREATE TABLE IF NOT EXISTS blobs (hash TEXT PRIMARY KEY, size INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS listing (name TEXT PRIMARY KEY, value TEXT NOT NULL);
     `);
+    // Bundles came later than the table.
+    const columns = this.sql
+      .exec<{ name: string }>("PRAGMA table_info(blobs)")
+      .toArray()
+      .map((column) => column.name);
+    if (!columns.includes("bundle")) {
+      this.sql.exec("ALTER TABLE blobs ADD COLUMN bundle TEXT");
+    }
+    if (!columns.includes("offset")) {
+      this.sql.exec("ALTER TABLE blobs ADD COLUMN offset INTEGER");
+    }
     ctx.blockConcurrencyWhile(async () => {
       if (!this.listed() && (await ctx.storage.getAlarm()) === null) {
         await ctx.storage.setAlarm(Date.now());
@@ -70,22 +89,42 @@ export class Index extends DurableObject<{ STORE: R2Bucket }> {
     });
   }
 
-  /** The stored size of each of `hashes` stored apart, or `null` for one that
-   * is not; and whether that is known for all of them, which it is once the
-   * blobs stored before the index held them have been listed. */
-  blobSizes(hashes: string[]): { sizes: (number | null)[]; complete: boolean } {
-    const sizes = new Map<string, number>();
+  /** Notes blobs just stored in `bundle`, by hash with the length of their
+   * frames and where those start in it. Reads take them from there from now
+   * on, a blob also stored on its own included; one already in a bundle stays
+   * where it is, so that sending a bundle again changes nothing. */
+  noteBundled(bundle: string, blobs: [string, number, number][]): void {
+    this.ctx.storage.transactionSync(() => {
+      for (const [hash, size, offset] of blobs) {
+        this.sql.exec(
+          `INSERT INTO blobs (hash, size, bundle, offset) VALUES (?, ?, ?, ?)
+           ON CONFLICT (hash) DO UPDATE SET size = excluded.size, bundle = excluded.bundle, offset = excluded.offset
+           WHERE blobs.bundle IS NULL`,
+          hash,
+          size,
+          bundle,
+          offset,
+        );
+      }
+    });
+  }
+
+  /** Where each of `hashes` stored apart is, or `null` for one that is not;
+   * and whether that is known for all of them, which it is once the blobs
+   * stored before the index held them have been listed. */
+  blobsStored(hashes: string[]): { stored: (StoredBlob | null)[]; complete: boolean } {
+    const found = new Map<string, StoredBlob>();
     for (let start = 0; start < hashes.length; start += BOUND) {
       const chunk = hashes.slice(start, start + BOUND);
-      const rows = this.sql.exec<{ hash: string; size: number }>(
-        `SELECT hash, size FROM blobs WHERE hash IN (${chunk.map(() => "?").join(", ")})`,
+      const rows = this.sql.exec<{ hash: string; size: number; bundle: string | null; offset: number | null }>(
+        `SELECT hash, size, bundle, offset FROM blobs WHERE hash IN (${chunk.map(() => "?").join(", ")})`,
         ...chunk,
       );
-      for (const { hash, size } of rows) {
-        sizes.set(hash, size);
+      for (const { hash, size, bundle, offset } of rows) {
+        found.set(hash, { size, bundle, offset: offset ?? 0 });
       }
     }
-    return { sizes: hashes.map((hash) => sizes.get(hash) ?? null), complete: this.listed() };
+    return { stored: hashes.map((hash) => found.get(hash) ?? null), complete: this.listed() };
   }
 
   /** Lists the bucket's blobs into the index, some pages at a time, until

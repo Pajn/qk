@@ -117,7 +117,8 @@ check the hash; clients check every blob they keep.
 
 ### `PUT bundles/<id>`
 
-Write token. Optional: a server that does not take bundles answers `404`.
+Write token. Optional: a server that does not take bundles answers `404`;
+the reference server here takes them.
 Body: a **bundle**, an upload body whose record is empty (length 0) and which
 carries every blob it lists inline. `<id>` is the SHA-256 of the bundle's
 header, as 64 lowercase hex digits; the server refuses a bundle its `<id>`
