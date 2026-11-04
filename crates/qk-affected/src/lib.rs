@@ -52,6 +52,9 @@ pub struct Options {
     pub explicit_files: bool,
     pub uncommitted: bool,
     pub untracked: bool,
+    /// Projects every revision afresh rather than reading the manifest kept
+    /// for it, and keeps none, as NX_SKIP_NX_CACHE does for task results.
+    pub skip_projection_cache: bool,
 }
 
 /// The lockfiles Nx reads at both revisions rather than diffing as JSON or

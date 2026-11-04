@@ -347,8 +347,9 @@ pub(super) fn apply(
                 artifacts.push(Vec::new());
                 continue;
             }
-            let left = projected(rule, workspace, &cache, &base, &head)?;
-            let right = projected(rule, workspace, &cache, &head, &head)?;
+            let cache = (!options.skip_projection_cache).then_some(cache.as_path());
+            let left = projected(rule, workspace, cache, &base, &head)?;
+            let right = projected(rule, workspace, cache, &head, &head)?;
             let changed = (|| -> Result<Vec<String>> {
                 for path in left.keys().chain(right.keys()).collect::<BTreeSet<_>>() {
                     ensure!(
@@ -613,43 +614,74 @@ impl Drop for Process {
 }
 
 /// What decides a manifest: the projection, the adapter's commit, the
-/// revision it reads, and the workspace whose installation it runs with.
+/// revision it reads, the workspace whose installation and local overrides it
+/// runs with, and the qk that ran it.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ManifestKey<'a> {
     protocol: u32,
+    qk: &'a str,
+    platform: [&'a str; 2],
     name: &'a str,
     command: &'a [String],
     sources: &'a [String],
     outputs: &'a [String],
     workspace_root: &'a Path,
+    local_overrides: Vec<(&'a str, Option<String>)>,
     adapter: &'a str,
     revision: &'a str,
 }
 
-/// The manifest of `revision` under the adapter committed at `head`, from the
-/// cache when an earlier projection kept it, otherwise from fresh checkouts.
+/// The manifest of `revision` under the adapter committed at `head`, from
+/// `cache` when an earlier projection kept it there, otherwise from fresh
+/// checkouts. A command naming `{workspaceRoot}` runs code from the checkout
+/// as it is, which no key here covers, so its manifests are never kept.
 fn projected(
     rule: &Rule,
     workspace: &Workspace,
-    cache: &Path,
+    cache: Option<&Path>,
     revision: &str,
     head: &str,
 ) -> Result<BTreeMap<String, String>> {
     let projection = &rule.projection;
-    let key = qk_cache::projections::key(&ManifestKey {
-        protocol: 1,
-        name: &projection.name,
-        command: &projection.command,
-        sources: &projection.sources,
-        outputs: &projection.outputs,
-        workspace_root: &workspace.root,
-        adapter: head,
-        revision,
-    })
-    // Where the adapter's request, which holds the same paths, would fail too
-    .context(AdapterFailure)?;
-    if let Some(artifacts) = qk_cache::projections::load(cache, &key) {
+    let cache = cache.filter(|_| {
+        !projection
+            .command
+            .iter()
+            .any(|argument| argument.contains("{workspaceRoot}"))
+    });
+    let key = match cache {
+        Some(_) => Some(
+            qk_cache::projections::key(&ManifestKey {
+                protocol: 1,
+                qk: env!("CARGO_PKG_VERSION"),
+                platform: [std::env::consts::OS, std::env::consts::ARCH],
+                name: &projection.name,
+                command: &projection.command,
+                sources: &projection.sources,
+                outputs: &projection.outputs,
+                workspace_root: &workspace.root,
+                local_overrides: workspace
+                    .local_overrides
+                    .iter()
+                    .map(|path| {
+                        let content = std::fs::read(workspace.root.join(path))
+                            .ok()
+                            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+                        (path.as_str(), content)
+                    })
+                    .collect(),
+                adapter: head,
+                revision,
+            })
+            // Where the adapter's request, which holds the same paths, would fail too
+            .context(AdapterFailure)?,
+        ),
+        None => None,
+    };
+    if let (Some(cache), Some(key)) = (cache, &key)
+        && let Some(artifacts) = qk_cache::projections::load(cache, key)
+    {
         return Ok(artifacts);
     }
     let timeout = Duration::from_secs(projection.timeout_seconds);
@@ -657,8 +689,10 @@ fn projected(
     let adapter = Revision::new(&workspace.root, head, timeout)?;
     let artifacts =
         snapshot(rule, workspace, &data.root, revision, &adapter.root).context(AdapterFailure)?;
-    // A manifest that is not kept is computed again next time.
-    let _ = qk_cache::projections::keep(cache, &key, &artifacts);
+    if let (Some(cache), Some(key)) = (cache, &key) {
+        // A manifest that is not kept is computed again next time.
+        let _ = qk_cache::projections::keep(cache, key, &artifacts);
+    }
     Ok(artifacts)
 }
 

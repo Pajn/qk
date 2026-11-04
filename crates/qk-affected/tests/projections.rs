@@ -182,6 +182,10 @@ impl Repo {
         }
     }
     fn analyse(&self, head: Option<String>, profile: bool) -> Analysis {
+        self.analyse_with(head, profile, Options::default())
+    }
+    /// As `analyse`, with `options` for everything but the revisions and profile.
+    fn analyse_with(&self, head: Option<String>, profile: bool, options: Options) -> Analysis {
         let workspace = Workspace::load(&self.root).unwrap();
         let graph = ProjectGraph::build(&workspace).unwrap();
         analyse(
@@ -191,10 +195,16 @@ impl Repo {
                 base: Some(self.base.clone()),
                 head,
                 affected_profile: profile.then(|| "runtime".into()),
-                ..Options::default()
+                ..options
             },
         )
         .unwrap()
+    }
+    /// The manifests kept in the repository's cache.
+    fn kept(&self) -> Vec<PathBuf> {
+        std::fs::read_dir(self.root.join(".git/qk/cache/v1/projections"))
+            .map(|entries| entries.map(|entry| entry.unwrap().path()).collect())
+            .unwrap_or_default()
     }
     fn changed(&self, text: &str) -> String {
         write(&self.root, "schemas/schema.txt", text);
@@ -557,6 +567,85 @@ fn a_revision_projected_before_reuses_its_manifest_without_the_adapter() {
             .count(),
         1
     );
+}
+
+#[test]
+fn another_base_against_the_same_head_projects_only_that_base() {
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let runs = || std::fs::read_to_string(log.path()).unwrap().lines().count();
+    let mut repo = Repo::with_arguments(&["counted", log.path().to_str().unwrap()]);
+    let middle = repo.changed("app=one\nother=three\ntype=before");
+    let head = repo.changed("app=one\nother=three\ntype=after");
+    assert!(names(&repo.analyse(Some(head.clone()), true)).contains("other"));
+    assert_eq!(runs(), 2);
+
+    repo.base = middle;
+    let since_middle = repo.analyse(Some(head), true);
+    assert_eq!(runs(), 3);
+    assert_eq!(since_middle.projections[0].status, "applied");
+    assert!(names(&since_middle).is_empty());
+}
+
+#[test]
+fn a_manifest_that_cannot_be_read_is_projected_again() {
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let runs = || std::fs::read_to_string(log.path()).unwrap().lines().count();
+    let repo = Repo::with_arguments(&["counted", log.path().to_str().unwrap()]);
+    let head = repo.changed("app=three\nother=two\ntype=before");
+    let first = repo.analyse(Some(head.clone()), true);
+    assert_eq!(repo.kept().len(), 2);
+    for manifest in repo.kept() {
+        std::fs::write(manifest, "{\"version\":1,").unwrap();
+    }
+
+    let again = repo.analyse(Some(head), true);
+    assert_eq!(runs(), 4);
+    assert_eq!(names(&again), names(&first));
+}
+
+#[test]
+fn a_changed_local_override_projects_again() {
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let runs = || std::fs::read_to_string(log.path()).unwrap().lines().count();
+    let repo = Repo::with_arguments(&["counted", log.path().to_str().unwrap()]);
+    let head = repo.changed("app=one\nother=two\ntype=after");
+    write(&repo.root, "nx.local.json", "{}");
+    repo.analyse(Some(head.clone()), true);
+    repo.analyse(Some(head.clone()), true);
+    assert_eq!(runs(), 2);
+
+    // An adapter may read the override through workspaceRoot
+    write(&repo.root, "nx.local.json", r#"{"defaultBase":"main"}"#);
+    repo.analyse(Some(head), true);
+    assert_eq!(runs(), 4);
+}
+
+#[test]
+fn an_adapter_given_the_workspace_as_it_is_is_never_kept() {
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let runs = || std::fs::read_to_string(log.path()).unwrap().lines().count();
+    let repo = Repo::with_arguments(&["counted", log.path().to_str().unwrap(), "{workspaceRoot}"]);
+    let head = repo.changed("app=one\nother=two\ntype=after");
+    repo.analyse(Some(head.clone()), true);
+    repo.analyse(Some(head), true);
+    assert_eq!(runs(), 4);
+    assert!(repo.kept().is_empty());
+}
+
+#[test]
+fn skipping_the_cache_projects_every_revision_and_keeps_nothing() {
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let runs = || std::fs::read_to_string(log.path()).unwrap().lines().count();
+    let repo = Repo::with_arguments(&["counted", log.path().to_str().unwrap()]);
+    let head = repo.changed("app=one\nother=two\ntype=after");
+    let skipping = || Options {
+        skip_projection_cache: true,
+        ..Options::default()
+    };
+    repo.analyse_with(Some(head.clone()), true, skipping());
+    repo.analyse_with(Some(head), true, skipping());
+    assert_eq!(runs(), 4);
+    assert!(repo.kept().is_empty());
 }
 
 #[test]

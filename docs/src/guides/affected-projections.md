@@ -170,21 +170,6 @@ Use the same chosen tool installation to interpret both revisions. qk does
 not reproduce historical installations. Installation metadata changing in
 the comparison causes conservative fallback.
 
-## Kept manifests
-
-qk keeps each manifest an adapter returns in its local cache, keyed by the
-projection's `name`, `command`, `sources` and `outputs`, the head commit whose
-adapter ran, the commit it read and the workspace root. Projecting the same
-revision under the same head again reads the kept manifest instead of
-checking out either commit or running the adapter. A comparison of several
-bases against one head therefore projects head once, and a repeated
-comparison projects nothing.
-
-The key leaves out the environment and the installation under
-`workspaceRoot`. An adapter whose manifest depends on either can return a
-stale one after they change. Kept manifests age out with the rest of the
-cache.
-
 For a generator adapter:
 
 1. Read the revision's generator configuration from `revisionRoot`.
@@ -207,6 +192,26 @@ execute the adapter code committed at head with runner permissions.
 Use an appropriate CI execution environment when reviewing untrusted changes.
 The adapter must write generated files only in `revisionRoot`; qk's disposable
 worktrees are isolation of files, not a permission sandbox.
+
+## Kept manifests
+
+qk keeps each manifest an adapter returns in its local cache. Its key is the
+projection's `name`, `command`, `sources` and `outputs`, the head commit whose
+adapter ran, the commit it read, the workspace root and the contents of its
+local overrides such as `nx.local.json`, and qk's version and platform.
+Projecting the same revision under the same head again reads the kept manifest
+instead of checking out either commit or running the adapter. A comparison of
+several bases against one head therefore projects head once, and a repeated
+comparison projects nothing.
+
+The key leaves out whatever else an adapter reads outside the two checkouts:
+the environment, the installation under `workspaceRoot`, and any other file
+there. An adapter whose manifest depends on one of them can return a stale
+manifest after it changes. A `command` naming `{workspaceRoot}` runs code from
+the checkout as it is, so qk keeps none of its manifests.
+`NX_SKIP_NX_CACHE=true`, which `qk affected --skip-cache` sets, projects every
+revision afresh and keeps nothing. Kept manifests age out with the rest of the
+cache.
 
 ## Conservative fallback and explanations
 

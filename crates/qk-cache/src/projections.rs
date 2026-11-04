@@ -38,6 +38,7 @@ pub fn load(cache: &Path, key: &str) -> Option<BTreeMap<String, String>> {
     Some(stored.artifacts)
 }
 
+/// Keeps `artifacts` under `key`, in place of any manifest kept there before.
 pub fn keep(cache: &Path, key: &str, artifacts: &BTreeMap<String, String>) -> Result<()> {
     // The whole layout, so a cache that only ever kept manifests is pruned too
     crate::Cache::new(cache.to_path_buf()).initialize()?;

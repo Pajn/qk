@@ -367,6 +367,8 @@ impl ChangeOptions {
             explicit_files: self.stdin,
             uncommitted: self.uncommitted,
             untracked: self.untracked,
+            // `qk affected --skip-cache` exports it before selecting
+            skip_projection_cache: env_flag("NX_SKIP_NX_CACHE") || env_flag("NX_DISABLE_NX_CACHE"),
         }
     }
 
