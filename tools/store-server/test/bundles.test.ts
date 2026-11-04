@@ -1,6 +1,7 @@
 import { decompress } from "fzstd";
 import { describe, expect, it } from "vitest";
 import { buildUpload, rawFrame } from "../src/frames";
+import { blobReads } from "../src/worker";
 import { READ, blob, expectedPack, hash, hex, putApart, record, request, sorted, upload, type TestBlob } from "./helpers";
 
 async function sha256(data: Uint8Array): Promise<string> {
@@ -98,6 +99,31 @@ describe("packs citing bundled blobs", () => {
     expect(await pack(`entries/${key}`)).toEqual(expectedPack(body, blobs, () => true));
   });
 
+  it("carry blobs from bundles that alternate in hash order", async () => {
+    const key = hash();
+    const blobs = sorted(Array.from({ length: 40 }, (_, index) => blob(`alternating ${index}`, false)));
+    await putBundle(blobs.filter((_, index) => index % 2 === 0));
+    await putBundle(blobs.filter((_, index) => index % 2 === 1));
+    const body = await commit(key, blobs);
+    expect(await pack(`entries/${key}`)).toEqual(expectedPack(body, blobs, () => true));
+  });
+
+  it("read on their turn the blobs of bundles past what the pack may hold ahead", async () => {
+    const key = hash();
+    // Twenty bundles, alternating, two blobs each that one range reads: a
+    // range is held from its first blob to its second, and twenty of them
+    // hold more than the read-ahead budget, so some blobs are read alone.
+    const blobs: TestBlob[] = sorted(
+      Array.from({ length: 40 }, (_, index) => ({ hash: hash(), raw: new Uint8Array(500 << 10).fill(index), inline: false })),
+    );
+    for (let bundle = 0; bundle < 20; bundle++) {
+      await putBundle(blobs.filter((_, index) => index % 20 === bundle));
+    }
+    const body = await commit(key, blobs);
+    const expected = expectedPack(body, blobs, () => true);
+    expect(await sha256(await pack(`entries/${key}`))).toEqual(await sha256(expected));
+  });
+
   it("stream on its turn a bundled blob too large to read ahead", async () => {
     const key = hash();
     const large: TestBlob = { hash: hash(), raw: new Uint8Array(17 << 20).fill(9), inline: false };
@@ -106,5 +132,45 @@ describe("packs citing bundled blobs", () => {
     const body = await commit(key, blobs);
     const expected = expectedPack(body, blobs, () => true);
     expect(await sha256(await pack(`entries/${key}`))).toEqual(await sha256(expected));
+  });
+});
+
+describe("the reads of a pack's bundled blobs", () => {
+  // Blobs of `size` bytes at consecutive offsets of their bundle.
+  const stored = (bundles: string[], size: number) => {
+    const offsets = new Map<string, number>();
+    return bundles.map((bundle, index) => {
+      const offset = offsets.get(bundle) ?? 0;
+      offsets.set(bundle, offset + size);
+      return { hash: `${index}`, size, bundle, offset };
+    });
+  };
+
+  it("are one range of each bundle, whatever comes between", () => {
+    const blobs = stored(
+      Array.from({ length: 40 }, (_, index) => (index % 2 === 0 ? "a" : "b")),
+      1000,
+    );
+    const { reads, where } = blobReads(blobs);
+    expect(reads.map((read) => [read.key, read.parts.length])).toEqual([
+      ["bundles/a", 20],
+      ["bundles/b", 20],
+    ]);
+    expect(where.slice(0, 3)).toEqual([
+      { read: 0, part: 0 },
+      { read: 1, part: 0 },
+      { read: 0, part: 1 },
+    ]);
+  });
+
+  it("end past what one range takes, and for a blob stored on its own", () => {
+    // Two of each fit a range of 1 MiB, not three.
+    const blobs = [...stored(["a", "a", "a"], 400 << 10), { hash: "own", size: 10, bundle: null, offset: 0 }];
+    const { reads } = blobReads(blobs);
+    expect(reads.map((read) => [read.key, read.parts.length])).toEqual([
+      ["bundles/a", 2],
+      ["bundles/a", 1],
+      ["blobs/own", 1],
+    ]);
   });
 });

@@ -52,20 +52,23 @@ const LARGEST_EXPECTATIONS = 4 << 20;
 const SESSION_LIFETIME = 24 * 60 * 60 * 1000;
 /** How many R2 requests one request makes at a time. */
 const CONCURRENCY = 32;
-/** Blobs stored apart that a pack carries inline, read ahead of the one it is
- * sending, at most. */
+/** Reads of blobs stored apart that a pack carries inline, made ahead of the
+ * blob it is sending, at most. */
 const READ_AHEAD = 16;
 /** Bytes every pack an isolate is sending may hold read ahead together. A
  * blob that does not fit is read on its turn and streamed, as one larger than
  * this always is. */
 const READ_AHEAD_BYTES = 16 << 20;
 let readAheadHeld = 0;
-/** Neighbouring blobs of a bundle a pack carries are read as one range while
- * the bytes between them stay under `BUNDLE_GAP` and the range under
- * `BUNDLE_RUN`. An invocation has six R2 reads in flight at most, so a range
- * rather than a read per blob is what makes many small blobs quick. */
+/** The blobs a pack carries from one bundle are read as ranges of it, each
+ * taking the next of them while the bytes between stay under `BUNDLE_GAP` and
+ * the range under `BUNDLE_RUN`. An invocation has six R2 reads in flight at
+ * most, so a range rather than a read per blob is what makes many small blobs
+ * quick. A pack's blobs from several bundles come in hash order, so one range
+ * of each is held at a time; `BUNDLE_RUN` keeps those within the read-ahead
+ * budget. */
 const BUNDLE_GAP = 256 << 10;
-const BUNDLE_RUN = 4 << 20;
+const BUNDLE_RUN = 1 << 20;
 /** Blobs stored on their own below this size, as qk stores them past what an
  * upload carries inline, are named `loose` so that clients bundle them. Above
  * it, qk stores a blob on its own anyway. */
@@ -359,43 +362,57 @@ interface BlobRead {
   parts: { hash: string; size: number; at: number }[];
 }
 
-/** The reads of `blobs`, in order, neighbours in a bundle taken together. */
-function blobReads(blobs: ({ hash: string } & StoredBlob)[]): BlobRead[] {
+/** The reads of `blobs`, each blob's read and part by its place in `blobs`.
+ * A bundle's blobs are read in ranges in the order they come, whatever other
+ * blobs come between them; the reads are in the order the pack first needs
+ * them. */
+export function blobReads(blobs: ({ hash: string } & StoredBlob)[]): {
+  reads: BlobRead[];
+  where: { read: number; part: number }[];
+} {
   const reads: BlobRead[] = [];
+  const where: { read: number; part: number }[] = [];
+  // Each bundle's read being added to.
+  const open = new Map<string, number>();
   for (const blob of blobs) {
-    const last = reads.at(-1);
-    if (blob.bundle !== null && last?.range && last.key === `bundles/${blob.bundle}`) {
+    const part = { hash: blob.hash, size: blob.size, at: 0 };
+    if (blob.bundle === null) {
+      where.push({ read: reads.length, part: 0 });
+      reads.push({ key: `blobs/${blob.hash}`, size: blob.size, parts: [part] });
+      continue;
+    }
+    const current = open.get(blob.bundle);
+    const last = current === undefined ? undefined : reads[current]!;
+    if (last?.range) {
       const end = last.range.offset + last.range.length;
       const length = blob.offset + blob.size - last.range.offset;
       if (blob.offset >= end && blob.offset - end <= BUNDLE_GAP && length <= BUNDLE_RUN) {
-        last.parts.push({ hash: blob.hash, size: blob.size, at: blob.offset - last.range.offset });
+        where.push({ read: current!, part: last.parts.length });
+        last.parts.push({ ...part, at: blob.offset - last.range.offset });
         last.range.length = length;
         last.size = length;
         continue;
       }
     }
-    const part = { hash: blob.hash, size: blob.size, at: 0 };
-    reads.push(
-      blob.bundle === null
-        ? { key: `blobs/${blob.hash}`, size: blob.size, parts: [part] }
-        : {
-            key: `bundles/${blob.bundle}`,
-            range: { offset: blob.offset, length: blob.size },
-            size: blob.size,
-            parts: [part],
-          },
-    );
+    open.set(blob.bundle, reads.length);
+    where.push({ read: reads.length, part: 0 });
+    reads.push({
+      key: `bundles/${blob.bundle}`,
+      range: { offset: blob.offset, length: blob.size },
+      size: blob.size,
+      parts: [part],
+    });
   }
-  return reads;
+  return { reads, where };
 }
 
 /** Answers, in order, the bodies of the blobs stored apart `blobs` names,
  * each of the size the index has for it. Blobs are read as `blobReads` takes
- * them. Up to `READ_AHEAD` reads are made whole ahead of the blob asked for
- * while they fit what the isolate's packs may hold together; the rest are
- * streamed on their turn. A read made ahead counts against that until the pack
- * is past its last blob, or `close`s; a read the pack gave up counts until it
- * settles.
+ * them. Up to `READ_AHEAD` reads are made whole, in the order the pack needs
+ * them, while they fit what the isolate's packs may hold together, and each
+ * is held until the pack is past its last blob or `close`s; a read the pack
+ * gave up counts until it settles. A blob whose read was not made ahead is
+ * read on its own on its turn, and streamed.
  *
  * They are read from R2 and not through the edge cache: an invocation has at
  * most six requests waiting on their response headers, and a cache match that
@@ -405,96 +422,84 @@ function readAhead(
   blobs: ({ hash: string } & StoredBlob)[],
   env: Env,
 ): { next: () => Promise<AsyncIterable<Uint8Array> | Iterable<Uint8Array>>; close: () => void } {
-  const reads = blobReads(blobs);
-  const get = (read: BlobRead) =>
-    env.STORE.get(read.key, read.range ? { range: read.range } : undefined).then((stored) => {
+  const { reads, where } = blobReads(blobs);
+  const get = (key: string, range?: { offset: number; length: number }) =>
+    env.STORE.get(key, range ? { range } : undefined).then((stored) => {
       if (!stored) {
-        throw new Error(`${read.key} went missing while a pack was sent`);
+        throw new Error(`${key} went missing while a pack was sent`);
       }
       return stored;
     });
-  let next = 0;
-  const reading: { read: BlobRead; bytes: Promise<Uint8Array> }[] = [];
-  // The read whose blobs the pack is being given, and how many it has had.
-  let current:
-    | {
-        read: BlobRead;
-        given: number;
-        bytes?: Uint8Array;
-        stream?: ReadableStream<Uint8Array>;
-        reader?: ByteReader;
-        past: number;
-      }
-    | undefined;
-  // What the current read holds against the budget, until the pack is past it.
-  let sending = 0;
-  const release = () => {
-    readAheadHeld -= sending;
-    sending = 0;
-  };
+  // Each read made ahead, until the pack is past its last blob; and each read
+  // left to its blobs' turns.
+  const made = new Map<number, { bytes: Promise<Uint8Array>; given: number }>();
+  const onTurn = new Set<number>();
+  let nextRead = 0;
+  let nextBlob = 0;
+  // The read whose last blob was given, which the response may still be
+  // sending: held until the pack asks for its next blob, or closes.
+  let finished: number | undefined;
   const fill = () => {
-    while (reading.length < READ_AHEAD && next < reads.length) {
-      const read = reads[next]!;
+    while (made.size < READ_AHEAD && nextRead < reads.length) {
+      const read = reads[nextRead]!;
       if (readAheadHeld + read.size > READ_AHEAD_BYTES) {
         return;
       }
       readAheadHeld += read.size;
-      next++;
-      const bytes = get(read).then((stored) => readAtMost(stored.body, read.size, read.key));
+      const bytes = get(read.key, read.range).then((stored) => readAtMost(stored.body, read.size, read.key));
       // Its failure is the pack's once it is that read's turn, not before.
       bytes.catch(() => {});
-      reading.push({ read, bytes });
+      made.set(nextRead, { bytes, given: 0 });
+      nextRead++;
     }
   };
-  const take = async () => {
-    release();
-    await current?.reader?.cancel().catch(() => {});
-    fill();
-    const ahead = reading.shift();
-    if (ahead) {
-      sending = ahead.read.size;
-      current = { read: ahead.read, given: 0, bytes: await ahead.bytes, past: 0 };
-      return;
-    }
-    const read = reads[next++];
-    if (!read) {
-      throw new Error("more blobs stored apart were asked for than the pack inlines");
-    }
-    const stored = await get(read);
-    current = read.range
-      ? { read, given: 0, reader: new ByteReader(stored.body), past: 0 }
-      : { read, given: 0, stream: stored.body, past: 0 };
+  const release = (index: number) => {
+    made.delete(index);
+    readAheadHeld -= reads[index]!.size;
   };
   return {
     next: async () => {
-      if (!current || current.given === current.read.parts.length) {
-        await take();
+      if (finished !== undefined) {
+        release(finished);
+        finished = undefined;
       }
-      const now = current!;
-      const part = now.read.parts[now.given++]!;
-      if (now.bytes) {
-        return [now.bytes.subarray(part.at, part.at + part.size)];
+      const at = where[nextBlob++];
+      if (!at) {
+        throw new Error("more blobs stored apart were asked for than the pack inlines");
       }
-      // A blob on its own is streamed as it is stored.
-      if (now.stream) {
-        const stream = now.stream;
-        now.stream = undefined;
-        return chunksOf(stream);
+      // A read the pack needs now that no room was left to make ahead is
+      // left to its blobs' turns.
+      if (at.read >= nextRead && !onTurn.has(at.read)) {
+        fill();
+        if (at.read >= nextRead) {
+          onTurn.add(at.read);
+          if (at.read === nextRead) {
+            nextRead++;
+          }
+        }
       }
-      const reader = now.reader!;
-      await reader.skip(part.at - now.past);
-      now.past = part.at + part.size;
-      return reader.chunks(part.size);
+      fill();
+      const read = reads[at.read]!;
+      const part = read.parts[at.part]!;
+      const ahead = made.get(at.read);
+      if (ahead) {
+        const bytes = await ahead.bytes;
+        if (++ahead.given === read.parts.length) {
+          finished = at.read;
+        }
+        return [bytes.subarray(part.at, part.at + part.size)];
+      }
+      const stored = await get(read.key, read.range && { offset: read.range.offset + part.at, length: part.size });
+      return chunksOf(stored.body);
     },
     close: () => {
-      release();
-      void current?.reader?.cancel().catch(() => {});
-      for (const ahead of reading.splice(0)) {
+      for (const [index, ahead] of [...made]) {
+        made.delete(index);
         void ahead.bytes.then(
           () => {},
           () => {},
         ).finally(() => {
-          readAheadHeld -= ahead.read.size;
+          readAheadHeld -= reads[index]!.size;
         });
       }
     },
