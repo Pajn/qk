@@ -36,9 +36,11 @@ pub struct Setup {
     /// state, where the overlay hides it: one reserved here, so that no
     /// descriptor the child inherits has its number.
     aside: std::os::fd::OwnedFd,
-    /// Each path bound through, as it lies in the workspace bound aside,
-    /// reached through `aside`, and in the workspace.
-    passthrough: Vec<(CString, CString)>,
+    /// Each path bound through, relative to the workspace, ending `/.` so
+    /// that only a directory resolves: opened through no link both in the
+    /// workspace bound aside, through `aside`, and in the overlay, so that a
+    /// link put in its place since it was chosen is never followed.
+    passthrough: Vec<CString>,
     cwd: CString,
     /// The rights the Landlock rule set handles, the descriptors opened
     /// outside with their rights, the workspace's rights, and each path in
@@ -82,10 +84,11 @@ impl Setup {
             let relative = path
                 .strip_prefix(&overlay.workspace)
                 .context("a path bound through lies outside the workspace")?;
-            let source = Path::new("/proc/self/fd")
-                .join(aside.as_raw_fd().to_string())
-                .join(relative);
-            passthrough.push((c_path(&source)?, c_path(path)?));
+            passthrough.push(
+                landlock::Open::Directory
+                    .name(relative)
+                    .context("a path holds a NUL byte")?,
+            );
         }
         let rules = &overlay.rules;
         let mut inside = Vec::new();
@@ -183,10 +186,38 @@ impl Setup {
             {
                 return fail();
             }
-            for (source, target) in &self.passthrough {
+            let merged = libc::open(
+                self.workspace.as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            );
+            if merged < 0 {
+                return fail();
+            }
+            for relative in &self.passthrough {
+                // Each end through no link, as a directory: one where a link
+                // or anything else now stands, or that is gone, is not bound,
+                // and what the command writes there lands in the overlay.
+                let ends = landlock::open_beneath(held, relative)
+                    .and_then(|source| Ok((source, landlock::open_beneath(merged, relative)?)));
+                let (source, target) = match ends {
+                    Ok(ends) => ends,
+                    Err(error)
+                        if matches!(
+                            error.raw_os_error(),
+                            Some(libc::ENOENT | libc::ELOOP | libc::EXDEV | libc::ENOTDIR)
+                        ) =>
+                    {
+                        continue;
+                    }
+                    // Where openat2 is refused, as a seccomp filter may, the
+                    // path cannot be bound without following a link that may
+                    // stand in it, so the command fails.
+                    Err(error) => return Err(error),
+                };
+                let (mut source_name, mut target_name) = ([0u8; 32], [0u8; 32]);
                 if libc::mount(
-                    source.as_ptr(),
-                    target.as_ptr(),
+                    proc_fd(source.as_raw_fd(), &mut source_name).as_ptr(),
+                    proc_fd(target.as_raw_fd(), &mut target_name).as_ptr(),
                     none,
                     libc::MS_BIND | libc::MS_REC,
                     none.cast(),
@@ -195,6 +226,7 @@ impl Setup {
                     return fail();
                 }
             }
+            libc::close(merged);
             libc::close(held);
             // The directory it was in is now beneath the overlay.
             if libc::chdir(self.cwd.as_ptr()) != 0 {
@@ -265,6 +297,30 @@ impl Setup {
         drop(root);
         landlock::restrict_self(ruleset.as_raw_fd())
     }
+}
+
+/// `/proc/self/fd/<fd>`, written into `buffer`: the path the descriptor was
+/// opened at, to mount from or on. Between fork and exec, so allocating
+/// nothing.
+fn proc_fd(fd: i32, buffer: &mut [u8; 32]) -> &std::ffi::CStr {
+    const PREFIX: &[u8] = b"/proc/self/fd/";
+    buffer[..PREFIX.len()].copy_from_slice(PREFIX);
+    let mut digits = [0u8; 10];
+    let mut count = 0;
+    let mut rest = fd.unsigned_abs();
+    loop {
+        digits[count] = b'0' + (rest % 10) as u8;
+        count += 1;
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    for (index, digit) in digits[..count].iter().rev().enumerate() {
+        buffer[PREFIX.len() + index] = *digit;
+    }
+    buffer[PREFIX.len() + count] = 0;
+    std::ffi::CStr::from_bytes_until_nul(&buffer[..]).unwrap_or(c"/proc/self/fd")
 }
 
 /// Whether a command can run over an overlay here: in a user and mount
@@ -682,6 +738,70 @@ mod tests {
         let path = upper.join(relative);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, relative).unwrap();
+    }
+
+    #[test]
+    fn writes_a_descriptors_path_without_allocating() {
+        let mut buffer = [0u8; 32];
+        assert_eq!(proc_fd(7, &mut buffer), c"/proc/self/fd/7");
+        assert_eq!(
+            proc_fd(1234567890, &mut buffer),
+            c"/proc/self/fd/1234567890"
+        );
+    }
+
+    /// A directory chosen to be bound through that a link replaced before a
+    /// command entered its overlay is not bound: the link is not followed,
+    /// and what the command writes there lands in its upper layer. One still
+    /// a directory is bound, and the write reaches the workspace.
+    #[test]
+    fn binds_no_link_put_in_place_of_a_directory_bound_through() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        if let Err(error) = probe(&root.join("probe")) {
+            eprintln!("skipped: an overlay cannot be mounted here: {error:#}");
+            return;
+        }
+        let workspace = root.join("workspace");
+        for directory in ["swapped", "kept", "secret"] {
+            std::fs::create_dir_all(workspace.join(directory)).unwrap();
+        }
+        let Ok(abi) = landlock::abi() else {
+            eprintln!("skipped: Landlock is not available");
+            return;
+        };
+        let everything: std::os::fd::OwnedFd = std::fs::File::open("/").unwrap().into();
+        let overlay = crate::Overlay {
+            workspace: workspace.clone(),
+            directory: root.join("overlay"),
+            passthrough: vec![workspace.join("swapped"), workspace.join("kept")],
+            rules: crate::OverlayRules {
+                handled: Rights::handled(abi),
+                outside: vec![(everything, Rights::ALL)],
+                workspace: Rights::ALL,
+                inside: Vec::new(),
+            },
+            keep: crate::Keep::default(),
+            settled: std::sync::OnceLock::new(),
+        };
+        let setup = Setup::new(&overlay, 0, &workspace).unwrap();
+        // Chosen as a directory, then replaced by a link before the command.
+        std::fs::remove_dir(workspace.join("swapped")).unwrap();
+        std::os::unix::fs::symlink("secret", workspace.join("swapped")).unwrap();
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "echo x > swapped/written && echo x > kept/written"])
+            .current_dir(&workspace);
+        unsafe {
+            std::os::unix::process::CommandExt::pre_exec(&mut command, move || setup.enter());
+        }
+        let status = command.status().unwrap();
+        assert!(status.success());
+        let [upper, ..] = layers(&overlay, 0);
+        assert!(!workspace.join("secret/written").exists());
+        assert!(upper.join("secret/written").is_file());
+        assert!(workspace.join("kept/written").is_file());
+        clear(&overlay.directory);
     }
 
     /// What a command wrote beneath a `node_modules`, there before or made by
