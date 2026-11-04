@@ -187,7 +187,8 @@ recordings without restoring anything, and says what they would have done:
 `"on"` would take, `wouldMiss`, or `unrecorded` without path sets, and the run
 history keeps it, so runs can be counted afterwards: a task its declared
 inputs missed with `wouldHit` is a run its recordings would have saved. A
-cold run, with `--cold` or `QK_COLD`, looks nothing up, so its tasks carry no
+result in the remote store counts where the store holds its key, so `wouldHit`
+can name one that fetching would fail to get. A cold run, with `--cold` or `QK_COLD`, looks nothing up, so its tasks carry no
 `shadow` and leave such counts out. The run summary names the tasks where the two
 disagree:
 
