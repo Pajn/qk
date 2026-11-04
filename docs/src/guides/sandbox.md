@@ -278,7 +278,7 @@ nx.json names them for every target it applies to:
 ```json
 "targetDefaults": {
   "build": {
-    "qk:ultracache": { "mode": "off", "ignoreReads": ["**/.env", "**/.env.*"] }
+    "qk:ultracache": { "mode": "off", "ignoreReads": ["**/.env", "**/.env.*", "**/.*.env"] }
   }
 }
 ```
