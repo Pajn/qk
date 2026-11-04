@@ -2301,9 +2301,12 @@ exec "$QK_TEST_REAL_GIT" "$@"
             let started = std::time::Instant::now();
             let mut args = vec!["show", "affected", "--json"];
             args.extend(comparison);
+            // Without the manifests earlier runs kept, so the revisions are checked out
+            let cache = tempfile::tempdir().unwrap();
             let output = isolated_command(env!("CARGO_BIN_EXE_qk"))
                 .current_dir(root)
                 .env_remove("NX_HEAD")
+                .env("QK_CACHE_DIRECTORY", cache.path())
                 .env("PATH", std::env::join_paths(&search_path).unwrap())
                 .env("QK_TEST_GIT_FAILURE_MODE", mode)
                 .env(

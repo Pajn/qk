@@ -339,6 +339,7 @@ pub(super) fn apply(
             !claimed.iter().any(|path| protected(path)),
             "projections cannot replace workspace or project metadata"
         );
+        let cache = qk_cache::cache_location(workspace);
         let mut artifacts = Vec::new();
         let mut owners = BTreeSet::new();
         for (rule, sources) in rules.iter().zip(&covered) {
@@ -346,15 +347,8 @@ pub(super) fn apply(
                 artifacts.push(Vec::new());
                 continue;
             }
-            let timeout = Duration::from_secs(rule.projection.timeout_seconds);
-            let before = Revision::new(&workspace.root, &base, timeout)?;
-            let after = Revision::new(&workspace.root, &head, timeout)?;
-            let adapter_before = Revision::new(&workspace.root, &head, timeout)?;
-            let left = snapshot(rule, workspace, &before.root, &base, &adapter_before.root)
-                .context(AdapterFailure)?;
-            let adapter_after = Revision::new(&workspace.root, &head, timeout)?;
-            let right = snapshot(rule, workspace, &after.root, &head, &adapter_after.root)
-                .context(AdapterFailure)?;
+            let left = projected(rule, workspace, &cache, &base, &head)?;
+            let right = projected(rule, workspace, &cache, &head, &head)?;
             let changed = (|| -> Result<Vec<String>> {
                 for path in left.keys().chain(right.keys()).collect::<BTreeSet<_>>() {
                     ensure!(
@@ -616,6 +610,54 @@ impl Drop for Process {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
+}
+
+/// What decides a manifest: the projection, the adapter's commit, the
+/// revision it reads, and the workspace whose installation it runs with.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ManifestKey<'a> {
+    protocol: u32,
+    name: &'a str,
+    command: &'a [String],
+    sources: &'a [String],
+    outputs: &'a [String],
+    workspace_root: &'a Path,
+    adapter: &'a str,
+    revision: &'a str,
+}
+
+/// The manifest of `revision` under the adapter committed at `head`, from the
+/// cache when an earlier projection kept it, otherwise from fresh checkouts.
+fn projected(
+    rule: &Rule,
+    workspace: &Workspace,
+    cache: &Path,
+    revision: &str,
+    head: &str,
+) -> Result<BTreeMap<String, String>> {
+    let projection = &rule.projection;
+    let key = qk_cache::projections::key(&ManifestKey {
+        protocol: 1,
+        name: &projection.name,
+        command: &projection.command,
+        sources: &projection.sources,
+        outputs: &projection.outputs,
+        workspace_root: &workspace.root,
+        adapter: head,
+        revision,
+    })?;
+    if let Some(artifacts) = qk_cache::projections::load(cache, &key) {
+        return Ok(artifacts);
+    }
+    let timeout = Duration::from_secs(projection.timeout_seconds);
+    let data = Revision::new(&workspace.root, revision, timeout)?;
+    let adapter = Revision::new(&workspace.root, head, timeout)?;
+    let artifacts =
+        snapshot(rule, workspace, &data.root, revision, &adapter.root).context(AdapterFailure)?;
+    // A manifest that is not kept is computed again next time.
+    let _ = qk_cache::projections::keep(cache, &key, &artifacts);
+    Ok(artifacts)
 }
 
 fn snapshot(

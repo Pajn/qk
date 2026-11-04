@@ -262,12 +262,15 @@ fn prune_inner(root: &Path, limit: u64, automatic: bool) -> Result<Pruned> {
     let mut entries = Vec::new();
     let mut references: BTreeMap<String, usize> = BTreeMap::new();
     // Warm state records cite blobs as entries do, and age out the same way.
-    // Path sets cite none, but take space and age out like entries.
+    // Path sets and projection manifests cite none, but take space and age
+    // out like entries.
     let warm = fs::read_dir(root.join("warm")).into_iter().flatten();
     let pathsets = fs::read_dir(root.join("pathsets")).into_iter().flatten();
+    let projections = fs::read_dir(root.join("projections")).into_iter().flatten();
     for item in fs::read_dir(root.join("entries"))?
         .chain(warm)
         .chain(pathsets)
+        .chain(projections)
     {
         let item = item?;
         let metadata = item.metadata()?;
@@ -391,7 +394,7 @@ struct SizeMemo {
 }
 
 fn directory_stamps(root: &Path) -> Result<Vec<Option<DirectoryStamp>>> {
-    ["entries", "blobs", "warm", "pathsets"]
+    ["entries", "blobs", "warm", "pathsets", "projections"]
         .iter()
         .map(|name| {
             let metadata = match fs::metadata(root.join(name)) {

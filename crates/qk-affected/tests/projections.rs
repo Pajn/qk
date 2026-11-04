@@ -91,6 +91,11 @@ fn main() {
         if mode == "failure-descendants" { process::exit(7); }
         if mode == "timeout-descendants" { loop { std::thread::park(); } }
     }
+    if mode == "counted" {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new().create(true).append(true).open(env::args().nth(2).unwrap()).unwrap();
+        writeln!(file, "run").unwrap();
+    }
     match mode.as_str() {
         "fail" => process::exit(7),
         "invalid" => { print!("not JSON"); return; },
@@ -126,12 +131,23 @@ struct Repo {
 }
 impl Repo {
     fn new(mode: &str) -> Self {
+        Self::with_arguments(&[mode])
+    }
+    /// A repository whose adapter is given `arguments`, the first its mode.
+    fn with_arguments(arguments: &[&str]) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         // Worktree checkouts share the adapter's deadline, so only adapters
         // that hang get a short one: a slow checkout is a comparison fallback.
-        let timeout = if mode.starts_with("timeout") { 5 } else { 60 };
-        let rule = json!({"name":"generated-runtime", "command":[adapter(),mode,"{revisionRoot}"], "sources":["schemas/**"], "outputs":["apps/*/generated/**"], "timeoutSeconds":timeout});
+        let timeout = if arguments[0].starts_with("timeout") {
+            5
+        } else {
+            60
+        };
+        let mut command = vec![json!(adapter())];
+        command.extend(arguments.iter().map(|argument| json!(argument)));
+        command.push(json!("{revisionRoot}"));
+        let rule = json!({"name":"generated-runtime", "command":command, "sources":["schemas/**"], "outputs":["apps/*/generated/**"], "timeoutSeconds":timeout});
         write(
             &root,
             "nx.json",
@@ -514,6 +530,33 @@ fn adapter_descendants_are_stopped_on_success_failure_and_timeout() {
             }
         }
     }
+}
+
+#[test]
+fn a_revision_projected_before_reuses_its_manifest_without_the_adapter() {
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let runs = || std::fs::read_to_string(log.path()).unwrap().lines().count();
+    let repo = Repo::with_arguments(&["counted", log.path().to_str().unwrap()]);
+    let head = repo.changed("app=one\nother=two\ntype=after");
+    let first = repo.analyse(Some(head.clone()), true);
+    assert_eq!(runs(), 2);
+    let again = repo.analyse(Some(head), true);
+    assert_eq!(runs(), 2);
+    assert_eq!(names(&again), names(&first));
+    assert_eq!(again.projections[0].status, "applied");
+
+    // A new head brings a new adapter, so both revisions are projected again
+    let next = repo.changed("app=three\nother=two\ntype=after");
+    let changed = repo.analyse(Some(next), true);
+    assert_eq!(runs(), 4);
+    assert!(names(&changed).contains("app"));
+    assert!(!names(&changed).contains("other"));
+    assert_eq!(
+        git(&repo.root, &["worktree", "list", "--porcelain"])
+            .matches("worktree ")
+            .count(),
+        1
+    );
 }
 
 #[test]

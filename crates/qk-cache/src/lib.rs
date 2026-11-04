@@ -10,6 +10,7 @@ mod inputs;
 mod lookup;
 mod paths;
 pub mod profile;
+pub mod projections;
 mod record;
 pub mod recorded;
 mod remote;
