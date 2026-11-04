@@ -1175,8 +1175,14 @@ mod tests {
         let other = "b".repeat(64);
         cache.publish(root, &other, &outputs, &log).unwrap();
         let empty = blake3::hash(b"").to_hex().to_string();
-        fs::write(cache.root.join("blobs").join(&empty), "corrupt").unwrap();
-        assert!(cache.usable("build", &other, &outputs).is_err());
+        // A well-formed log, so that its digest alone gives it away.
+        fs::write(
+            cache.root.join("blobs").join(&empty),
+            [0u8, 2, 0, 0, 0, b'h', b'i'],
+        )
+        .unwrap();
+        let unusable = cache.usable("build", &other, &outputs).unwrap_err();
+        assert!(format!("{unusable:#}").contains("corrupt cached log"));
         let restored = cache.restore(
             root,
             "build",
@@ -1186,7 +1192,7 @@ mod tests {
             &qk_executor::Display::Hidden,
             qk_executor::Shown::LocalCache,
         );
-        assert!(restored.is_err());
+        assert!(format!("{:#}", restored.unwrap_err()).contains("corrupt cached log"));
         // A file or link with an artifact beneath it, which no directory
         // could hold.
         use serde_json::json;
