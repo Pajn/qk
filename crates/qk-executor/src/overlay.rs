@@ -9,6 +9,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
+use crate::landlock::{self, Rights};
+
 /// The layers of one slot of commands: `upper` and `work`, the overlay's, and
 /// `real`, where the workspace is bound aside so that it can be the lower
 /// layer.
@@ -34,33 +36,21 @@ pub struct Setup {
     /// state, where the overlay hides it: one reserved here, so that no
     /// descriptor the child inherits has its number.
     aside: std::os::fd::OwnedFd,
-    /// Each path bound through, as it lies in the workspace bound aside,
-    /// reached through `aside`, and in the workspace.
-    passthrough: Vec<(CString, CString)>,
+    /// Each path bound through, relative to the workspace, ending `/.` so
+    /// that only a directory resolves: opened through no link both in the
+    /// workspace bound aside, through `aside`, and in the overlay, so that a
+    /// link put in its place since it was chosen is never followed.
+    passthrough: Vec<CString>,
     cwd: CString,
-    /// The Landlock rule set's handled and file rights, the descriptors
-    /// opened outside with their rights, the workspace's rights, and each
-    /// path in the workspace, relative to it, with its rights and whether to
-    /// reach it through no link.
-    handled: u64,
-    file_rights: u64,
-    outside: Vec<(i32, u64)>,
-    workspace_rights: u64,
-    inside: Vec<(CString, u64, bool)>,
+    /// The rights the Landlock rule set handles, the descriptors opened
+    /// outside with their rights, the workspace's rights, and each path in
+    /// the workspace, relative to it, with its rights and whether to reach
+    /// it through no link.
+    handled: Rights,
+    outside: Vec<(i32, Rights)>,
+    workspace_rights: Rights,
+    inside: Vec<(CString, Rights, bool)>,
 }
-
-#[repr(C)]
-struct RulesetAttr {
-    handled_access_fs: u64,
-}
-
-#[repr(C, packed)]
-struct PathBeneathAttr {
-    allowed_access: u64,
-    parent_fd: i32,
-}
-
-const RULE_PATH_BENEATH: i32 = 1;
 
 impl Setup {
     pub fn new(overlay: &crate::Overlay, slot: usize, cwd: &Path) -> Result<Self> {
@@ -94,14 +84,15 @@ impl Setup {
             let relative = path
                 .strip_prefix(&overlay.workspace)
                 .context("a path bound through lies outside the workspace")?;
-            let source = Path::new("/proc/self/fd")
-                .join(aside.as_raw_fd().to_string())
-                .join(relative);
-            passthrough.push((c_path(&source)?, c_path(path)?));
+            passthrough.push(
+                landlock::Open::Directory
+                    .name(relative)
+                    .context("a path holds a NUL byte")?,
+            );
         }
         let rules = &overlay.rules;
         let mut inside = Vec::new();
-        for (path, rights, unlinked) in &rules.inside {
+        for (path, rights, open) in &rules.inside {
             let Ok(relative) = path.strip_prefix(&overlay.workspace) else {
                 continue;
             };
@@ -110,12 +101,12 @@ impl Setup {
             } else {
                 relative
             };
-            inside.push((c_path(relative)?, *rights, *unlinked));
+            let name = open.name(relative).context("a path holds a NUL byte")?;
+            inside.push((name, *rights, *open != landlock::Open::Following));
         }
         Ok(Self {
             aside,
             handled: rules.handled,
-            file_rights: rules.file_rights,
             outside: rules
                 .outside
                 .iter()
@@ -195,10 +186,38 @@ impl Setup {
             {
                 return fail();
             }
-            for (source, target) in &self.passthrough {
+            let merged = libc::open(
+                self.workspace.as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            );
+            if merged < 0 {
+                return fail();
+            }
+            for relative in &self.passthrough {
+                // Each end through no link, as a directory: one where a link
+                // or anything else now stands, or that is gone, is not bound,
+                // and what the command writes there lands in the overlay.
+                let ends = landlock::open_beneath(held, relative)
+                    .and_then(|source| Ok((source, landlock::open_beneath(merged, relative)?)));
+                let (source, target) = match ends {
+                    Ok(ends) => ends,
+                    Err(error)
+                        if matches!(
+                            error.raw_os_error(),
+                            Some(libc::ENOENT | libc::ELOOP | libc::EXDEV | libc::ENOTDIR)
+                        ) =>
+                    {
+                        continue;
+                    }
+                    // Where openat2 is refused, as a seccomp filter may, the
+                    // path cannot be bound without following a link that may
+                    // stand in it, so the command fails.
+                    Err(error) => return Err(error),
+                };
+                let (mut source_name, mut target_name) = ([0u8; 32], [0u8; 32]);
                 if libc::mount(
-                    source.as_ptr(),
-                    target.as_ptr(),
+                    proc_fd(source.as_raw_fd(), &mut source_name).as_ptr(),
+                    proc_fd(target.as_raw_fd(), &mut target_name).as_ptr(),
                     none,
                     libc::MS_BIND | libc::MS_REC,
                     none.cast(),
@@ -207,6 +226,7 @@ impl Setup {
                     return fail();
                 }
             }
+            libc::close(merged);
             libc::close(held);
             // The directory it was in is now beneath the overlay.
             if libc::chdir(self.cwd.as_ptr()) != 0 {
@@ -220,95 +240,87 @@ impl Setup {
     /// Builds the Landlock rule set over the mounted overlay and restricts
     /// the command to it. Between fork and exec: system calls only.
     unsafe fn restrict(&self) -> std::io::Result<()> {
-        let fail = || Err(std::io::Error::last_os_error());
-        unsafe {
-            let attr = RulesetAttr {
-                handled_access_fs: self.handled,
-            };
-            let ruleset = libc::syscall(
-                libc::SYS_landlock_create_ruleset,
-                &attr as *const RulesetAttr,
-                std::mem::size_of::<RulesetAttr>(),
-                0u32,
-            ) as i32;
-            if ruleset < 0 {
-                return fail();
-            }
-            let add = |fd: i32, rights: u64| -> std::io::Result<()> {
-                let mut stat: libc::stat = std::mem::zeroed();
-                let directory =
-                    libc::fstat(fd, &mut stat) == 0 && stat.st_mode & libc::S_IFMT == libc::S_IFDIR;
-                let mut rights = rights & self.handled;
-                if !directory {
-                    rights &= self.file_rights;
-                }
-                if rights == 0 {
-                    return Ok(());
-                }
-                let attr = PathBeneathAttr {
-                    allowed_access: rights,
-                    parent_fd: fd,
-                };
-                if libc::syscall(
-                    libc::SYS_landlock_add_rule,
-                    ruleset,
-                    RULE_PATH_BENEATH,
-                    &attr as *const PathBeneathAttr,
-                    0u32,
-                ) != 0
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            };
-            for (fd, rights) in &self.outside {
-                add(*fd, *rights)?;
-            }
-            let root = libc::open(
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let ruleset = landlock::create_ruleset(self.handled)?;
+        let add = |fd: i32, rights: Rights| {
+            landlock::add_rule(ruleset.as_raw_fd(), fd, rights, self.handled)
+        };
+        for (fd, rights) in &self.outside {
+            add(*fd, *rights)?;
+        }
+        let root = unsafe {
+            libc::open(
                 self.workspace.as_ptr(),
                 libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
-            );
-            if root < 0 {
-                return fail();
-            }
-            add(root, self.workspace_rights)?;
-            for (relative, rights, unlinked) in &self.inside {
-                let fd = if *unlinked {
-                    let mut how: libc::open_how = std::mem::zeroed();
-                    how.flags = (libc::O_PATH | libc::O_CLOEXEC) as u64;
-                    how.resolve = libc::RESOLVE_BENEATH | libc::RESOLVE_NO_SYMLINKS;
-                    libc::syscall(
-                        libc::SYS_openat2,
-                        root,
+            )
+        };
+        if root < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: open returned a new descriptor, owned here.
+        let root = unsafe { OwnedFd::from_raw_fd(root) };
+        add(root.as_raw_fd(), self.workspace_rights)?;
+        for (relative, rights, unlinked) in &self.inside {
+            let opened = if *unlinked {
+                landlock::open_beneath(root.as_raw_fd(), relative)
+            } else {
+                let fd = unsafe {
+                    libc::openat(
+                        root.as_raw_fd(),
                         relative.as_ptr(),
-                        &how as *const libc::open_how,
-                        std::mem::size_of::<libc::open_how>(),
-                    ) as i32
-                } else {
-                    libc::openat(root, relative.as_ptr(), libc::O_PATH | libc::O_CLOEXEC)
+                        libc::O_PATH | libc::O_CLOEXEC,
+                    )
                 };
                 if fd < 0 {
-                    // One that does not exist, or that a link now stands in,
-                    // is not allowed, as outside the overlay.
-                    match *libc::__errno_location() {
-                        libc::ENOENT | libc::ELOOP | libc::EXDEV | libc::ENOTDIR => continue,
-                        _ => return fail(),
-                    }
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    // SAFETY: openat returned a new descriptor, owned here.
+                    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
                 }
-                let added = add(fd, *rights);
-                libc::close(fd);
-                added?;
-            }
-            libc::close(root);
-            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
-                || libc::syscall(libc::SYS_landlock_restrict_self, ruleset, 0u32) != 0
-            {
-                return fail();
-            }
-            libc::close(ruleset);
+            };
+            let fd = match opened {
+                Ok(fd) => fd,
+                // One that does not exist, or that a link now stands in, is
+                // not allowed, as outside the overlay.
+                Err(error)
+                    if matches!(
+                        error.raw_os_error(),
+                        Some(libc::ENOENT | libc::ELOOP | libc::EXDEV | libc::ENOTDIR)
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            add(fd.as_raw_fd(), *rights)?;
         }
-        Ok(())
+        drop(root);
+        landlock::restrict_self(ruleset.as_raw_fd())
     }
+}
+
+/// `/proc/self/fd/<fd>`, written into `buffer`: the path the descriptor was
+/// opened at, to mount from or on. Between fork and exec, so allocating
+/// nothing.
+fn proc_fd(fd: i32, buffer: &mut [u8; 32]) -> &std::ffi::CStr {
+    const PREFIX: &[u8] = b"/proc/self/fd/";
+    buffer[..PREFIX.len()].copy_from_slice(PREFIX);
+    let mut digits = [0u8; 10];
+    let mut count = 0;
+    let mut rest = fd.unsigned_abs();
+    loop {
+        digits[count] = b'0' + (rest % 10) as u8;
+        count += 1;
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    for (index, digit) in digits[..count].iter().rev().enumerate() {
+        buffer[PREFIX.len() + index] = *digit;
+    }
+    buffer[PREFIX.len() + count] = 0;
+    std::ffi::CStr::from_bytes_until_nul(&buffer[..]).unwrap_or(c"/proc/self/fd")
 }
 
 /// Whether a command can run over an overlay here: in a user and mount
@@ -455,14 +467,14 @@ struct Layer<'a> {
     upper: &'a Path,
     root: &'a Path,
     /// Where the task may write.
-    keep: &'a [std::path::PathBuf],
+    keep: &'a crate::Keep,
     /// Bound through the overlay: what lies there the layer never holds.
     passthrough: &'a [std::path::PathBuf],
 }
 
 impl Layer<'_> {
     fn allowed(&self, target: &Path) -> bool {
-        self.keep.iter().any(|keep| target.starts_with(keep))
+        self.keep.allows(self.root, target)
     }
 
     /// Whether something bound through the overlay lies beneath `target`.
@@ -474,7 +486,17 @@ impl Layer<'_> {
 
     /// Whether something the task may write lies beneath `target`.
     fn holds_kept(&self, target: &Path) -> bool {
-        self.keep.iter().any(|keep| keep.starts_with(target))
+        self.keep.holds(target)
+    }
+
+    /// Whether `relative`, a directory made in the workspace, is one `keep`
+    /// names by name, beneath none other.
+    fn names(&self, relative: &Path) -> bool {
+        let named = |part: &std::ffi::OsStr| self.keep.names.iter().any(|name| part == name);
+        relative.file_name().is_some_and(named)
+            && relative
+                .parent()
+                .is_none_or(|parent| !parent.components().any(|part| named(part.as_os_str())))
     }
 
     /// Applies what the layer holds under `relative`, adding what it may
@@ -556,6 +578,9 @@ impl Layer<'_> {
                     });
                     match made {
                         Ok(()) => {
+                            if !is_dir && self.names(&relative) {
+                                settled.made.push(target.clone());
+                            }
                             self.apply(&relative, prunes, settled);
                             // After its entries, which a read-only mode
                             // would keep out.
@@ -702,4 +727,193 @@ fn opaque(directory: &Path) -> bool {
         )
     };
     length == 1 && value[0] == b'y'
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A file in `upper` at `relative`, with what lies above it.
+    fn write(upper: &Path, relative: &str) {
+        let path = upper.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, relative).unwrap();
+    }
+
+    #[test]
+    fn writes_a_descriptors_path_without_allocating() {
+        let mut buffer = [0u8; 32];
+        assert_eq!(proc_fd(7, &mut buffer), c"/proc/self/fd/7");
+        assert_eq!(
+            proc_fd(1234567890, &mut buffer),
+            c"/proc/self/fd/1234567890"
+        );
+    }
+
+    /// A directory chosen to be bound through that a link replaced before a
+    /// command entered its overlay is not bound: the link is not followed,
+    /// and what the command writes there lands in its upper layer. One still
+    /// a directory is bound, and the write reaches the workspace.
+    #[test]
+    fn binds_no_link_put_in_place_of_a_directory_bound_through() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        if let Err(error) = probe(&root.join("probe")) {
+            eprintln!("skipped: an overlay cannot be mounted here: {error:#}");
+            return;
+        }
+        let workspace = root.join("workspace");
+        for directory in ["swapped", "kept", "secret"] {
+            std::fs::create_dir_all(workspace.join(directory)).unwrap();
+        }
+        let Ok(abi) = landlock::abi() else {
+            eprintln!("skipped: Landlock is not available");
+            return;
+        };
+        let everything: std::os::fd::OwnedFd = std::fs::File::open("/").unwrap().into();
+        let overlay = crate::Overlay {
+            workspace: workspace.clone(),
+            directory: root.join("overlay"),
+            passthrough: vec![workspace.join("swapped"), workspace.join("kept")],
+            rules: crate::OverlayRules {
+                handled: Rights::handled(abi),
+                outside: vec![(everything, Rights::ALL)],
+                workspace: Rights::ALL,
+                inside: Vec::new(),
+            },
+            keep: crate::Keep::default(),
+            settled: std::sync::OnceLock::new(),
+        };
+        let setup = Setup::new(&overlay, 0, &workspace).unwrap();
+        // Chosen as a directory, then replaced by a link before the command.
+        std::fs::remove_dir(workspace.join("swapped")).unwrap();
+        std::os::unix::fs::symlink("secret", workspace.join("swapped")).unwrap();
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "echo x > swapped/written && echo x > kept/written"])
+            .current_dir(&workspace);
+        unsafe {
+            std::os::unix::process::CommandExt::pre_exec(&mut command, move || setup.enter());
+        }
+        let status = command.status().unwrap();
+        assert!(status.success());
+        let [upper, ..] = layers(&overlay, 0);
+        assert!(!workspace.join("secret/written").exists());
+        assert!(upper.join("secret/written").is_file());
+        assert!(workspace.join("kept/written").is_file());
+        clear(&overlay.directory);
+    }
+
+    /// What a command wrote beneath a `node_modules`, there before or made by
+    /// it, is applied, removals and replacements too; the rest is not.
+    #[test]
+    fn keeps_what_is_written_in_any_node_modules() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        for file in [
+            "lib/node_modules/stale/a",
+            "app/node_modules/old/a",
+            "filed/node_modules",
+            "stubbed",
+            "elsewhere/kept",
+        ] {
+            write(&workspace, file);
+        }
+        std::fs::create_dir_all(workspace.join("linked")).unwrap();
+        std::os::unix::fs::symlink(workspace.join("lib"), workspace.join("linked/node_modules"))
+            .unwrap();
+        std::os::unix::fs::symlink(workspace.join("elsewhere"), workspace.join("tied")).unwrap();
+        let overlay = crate::Overlay {
+            workspace: workspace.clone(),
+            directory: temp.path().join("overlay"),
+            passthrough: Vec::new(),
+            rules: crate::OverlayRules::default(),
+            keep: crate::Keep {
+                paths: vec![workspace.join("dist")],
+                names: vec!["node_modules".into()],
+            },
+            settled: std::sync::OnceLock::new(),
+        };
+        let [upper, ..] = layers(&overlay, 0);
+        // A `node_modules` made where none was, and in place of a file and
+        // of a link.
+        for file in [
+            "pkg/node_modules/x/a",
+            "pkg/stray.js",
+            "dist/out.js",
+            "filed/node_modules/x/a",
+            "linked/node_modules/x/a",
+            // Beneath a file, and beneath a link.
+            "stubbed/node_modules/x/a",
+            "tied/node_modules/x/a",
+        ] {
+            write(&upper, file);
+        }
+        // A whiteout, and an opaque directory, where the file system lets
+        // them be made here as overlayfs makes them.
+        std::fs::create_dir_all(upper.join("app/node_modules")).unwrap();
+        let whiteout = c_path(&upper.join("app/node_modules/old")).unwrap();
+        let whited = unsafe { libc::mknod(whiteout.as_ptr(), libc::S_IFCHR, 0) } == 0;
+        write(&upper, "lib/node_modules/fresh/a");
+        let lib = c_path(&upper.join("lib/node_modules")).unwrap();
+        let opaque = unsafe {
+            libc::lsetxattr(
+                lib.as_ptr(),
+                c"user.overlay.opaque".as_ptr(),
+                b"y".as_ptr().cast(),
+                1,
+                0,
+            )
+        } == 0;
+        let settled = overlay.settle();
+        // Beneath a file it cannot be made, and fails; beneath a link, which
+        // is never followed, the link's entry is discarded whole.
+        assert_eq!(settled.failed.len(), 1, "{:?}", settled.failed);
+        assert!(
+            settled.failed[0].contains("stubbed/node_modules"),
+            "{:?}",
+            settled.failed
+        );
+        assert_eq!(
+            settled.discarded,
+            std::collections::BTreeSet::from(
+                ["pkg/stray.js", "stubbed", "tied"].map(str::to_owned)
+            )
+        );
+        assert!(workspace.join("stubbed").is_file());
+        assert!(!workspace.join("elsewhere/node_modules").exists());
+        let mut made = settled.made.clone();
+        made.sort();
+        assert_eq!(
+            made,
+            [
+                "filed/node_modules",
+                "linked/node_modules",
+                "pkg/node_modules"
+            ]
+            .map(|path| workspace.join(path))
+        );
+        // The link is replaced, not followed.
+        assert!(!workspace.join("lib/x").exists());
+        for file in [
+            "pkg/node_modules/x/a",
+            "dist/out.js",
+            "lib/node_modules/fresh/a",
+            "filed/node_modules/x/a",
+            "linked/node_modules/x/a",
+        ] {
+            assert!(workspace.join(file).is_file(), "{file}");
+        }
+        assert!(!workspace.join("pkg/stray.js").exists());
+        if whited {
+            assert!(!workspace.join("app/node_modules/old").exists());
+        } else {
+            eprintln!("skipped: a whiteout cannot be made here");
+        }
+        if opaque {
+            assert!(!workspace.join("lib/node_modules/stale").exists());
+        } else {
+            eprintln!("skipped: an opaque directory cannot be marked here");
+        }
+    }
 }

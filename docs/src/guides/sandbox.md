@@ -315,9 +315,18 @@ Commands run one after another share an upper layer, and ones run side by
 side each have their own. A continuous task's writes are applied when it
 stops. `.git`, qk's state, every `node_modules` and the
 task's scratch directories are bound through the overlay, so what a task
-writes there reaches the workspace at once, as without enforce. Reads are
+writes there reaches the workspace at once, as without enforce. A
+`node_modules` a task makes, as a package manager installing on demand does,
+is kept as the task ends, and bound through for the tasks that start after
+it, as is one a task with `"qk:sandbox": false` makes. Reads are
 held by Landlock, built in each command's namespace once the overlay is
-mounted; a refused read fails the task with `Permission denied`.
+mounted; a refused read fails the task with `Permission denied`. Landlock
+allows reads beneath paths that exist as each command starts, judging a link
+by where it leads: a command that installs into a `node_modules` it made can
+run what pnpm links there from the root `node_modules`, if that was there as
+the run started, but not files it wrote in the new directory itself, as on a
+fresh checkout, with `node-linker=hoisted`, or through the shims pnpm writes
+in a new `node_modules/.bin`.
 
 The overlay needs unprivileged user namespaces, which Linux 5.11 and later
 offer to any process where the system allows them; some distributions keep
@@ -376,7 +385,9 @@ directory and created then too, and removed again if the task leaves it
 empty, and a file output that does not exist yet cannot be created. A task
 may write beneath its outputs, but not remove or rename an output directory
 itself, which would need rights over its parent: a tool should clear an
-output directory rather than delete and recreate it. Outside the workspace,
+output directory rather than delete and recreate it. Nor may it make a
+`node_modules` itself; one an earlier task of the run made, over an overlay
+or unsandboxed, it may use. Outside the workspace,
 Landlock allows what exists when the task starts; an entry created later
 directly in a directory above the workspace, such as a new file in the home
 directory when the workspace is below it, is refused.

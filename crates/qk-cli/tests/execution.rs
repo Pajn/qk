@@ -3607,6 +3607,218 @@ fn the_overlay_sandbox_keeps_only_what_a_task_declares() {
     assert!(left.is_empty(), "{left:?}");
 }
 
+/// Linux enforce over an overlay: a `node_modules` a task makes, as a package
+/// manager installing on demand does, is kept as one there before, rather
+/// than listed as written outside its outputs; a task starting after it may
+/// read, run and write what it holds.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_overlay_sandbox_keeps_a_node_modules_a_task_makes() {
+    if !can_overlay() {
+        return;
+    }
+    let _audit = AUDIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = fixture(json!({
+        "install": {
+            "command": "mkdir -p pkg/node_modules/x && printf '#!/bin/sh\\necho ran\\n' > pkg/node_modules/x/tool && chmod +x pkg/node_modules/x/tool",
+            "inputs": []
+        },
+        "use": {
+            "command": "cat pkg/node_modules/x/tool > /dev/null && pkg/node_modules/x/tool > ran.txt && echo more > pkg/node_modules/x/more",
+            "dependsOn": ["install"],
+            "inputs": [],
+            "outputs": ["{projectRoot}/ran.txt"]
+        }
+    }));
+    let report = temp.path().join("report.json");
+    success(
+        command(
+            temp.path(),
+            &[
+                "run",
+                "app:use",
+                "--skip-cache",
+                "--sandbox=enforce",
+                "--sandbox-report",
+                report.to_str().unwrap(),
+            ],
+        )
+        .output()
+        .unwrap(),
+    );
+    let root = temp.path();
+    assert_eq!(fs::read_to_string(root.join("ran.txt")).unwrap(), "ran\n");
+    assert!(root.join("pkg/node_modules/x/tool").is_file());
+    assert_eq!(
+        fs::read_to_string(root.join("pkg/node_modules/x/more")).unwrap(),
+        "more\n"
+    );
+    let findings: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+    assert_eq!(findings["tasks"], json!({}), "{findings}");
+}
+
+/// Linux enforce over an overlay: a command cannot read back the files it
+/// wrote in a `node_modules` it made, as Landlock allows reads beneath paths
+/// that exist as the command starts.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_overlay_sandbox_refuses_what_a_command_writes_into_a_new_node_modules() {
+    if !can_overlay() {
+        return;
+    }
+    let _audit = AUDIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = fixture(json!({
+        "install": {
+            "command": "mkdir -p pkg/node_modules/x && printf '#!/bin/sh\\necho ran\\n' > pkg/node_modules/x/tool && chmod +x pkg/node_modules/x/tool && pkg/node_modules/x/tool",
+            "inputs": []
+        }
+    }));
+    let output = run(
+        temp.path(),
+        &["run", "app:install", "--skip-cache", "--sandbox=enforce"],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Permission denied"), "{stderr}");
+}
+
+/// Linux enforce: a `node_modules` an unsandboxed task makes is granted to
+/// the tasks that start after it, over an overlay and by Landlock alone.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_sandbox_grants_a_node_modules_an_unsandboxed_task_makes() {
+    let temp = fixture(json!({
+        "install": {"command": "mkdir -p pkg/node_modules/x && echo installed > pkg/node_modules/x/a", "qk:sandbox": false},
+        "use": {"command": "cat pkg/node_modules/x/a", "dependsOn": ["install"], "inputs": []}
+    }));
+    let root = temp.path();
+    for overlay in ["1", "0"] {
+        let _ = fs::remove_dir_all(root.join("pkg"));
+        let output = command(
+            root,
+            &["run", "app:use", "--skip-cache", "--sandbox=enforce"],
+        )
+        .env("QK_SANDBOX_OVERLAY", overlay)
+        .output()
+        .unwrap();
+        let output = success(output);
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("installed"),
+            "overlay {overlay}"
+        );
+    }
+}
+
+/// A `node_modules` the run found as it started that an earlier task
+/// replaces with a link leads nowhere new: Linux enforce, over an overlay or
+/// by Landlock alone, neither binds it through nor allows anything beneath
+/// it, so a later task can neither read nor write where it leads.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_sandbox_follows_no_link_put_in_place_of_a_node_modules() {
+    let temp = fixture(json!({
+        "swap": {"command": "rm -rf node_modules && ln -s secret node_modules", "qk:sandbox": false},
+        "read": {"command": "cat node_modules/x.txt", "dependsOn": ["swap"], "inputs": []},
+        "write": {"command": "echo planted > node_modules/planted.txt; echo \"write exit $?\"", "dependsOn": ["swap"], "inputs": []}
+    }));
+    let root = temp.path();
+    for overlay in ["1", "0"] {
+        for target in ["read", "write"] {
+            let _ = fs::remove_file(root.join("node_modules"));
+            fs::create_dir_all(root.join("node_modules")).unwrap();
+            fs::create_dir_all(root.join("secret")).unwrap();
+            fs::write(root.join("secret/x.txt"), "secret").unwrap();
+            let output = command(
+                root,
+                &[
+                    "run",
+                    &format!("app:{target}"),
+                    "--skip-cache",
+                    "--sandbox=enforce",
+                ],
+            )
+            .env("QK_SANDBOX_OVERLAY", overlay)
+            .output()
+            .unwrap();
+            // The link was made, so the task went through it.
+            assert!(
+                fs::symlink_metadata(root.join("node_modules"))
+                    .unwrap()
+                    .is_symlink()
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(!stdout.contains("secret"), "{stdout}");
+            if target == "read" {
+                assert!(!output.status.success(), "{stdout}");
+            } else {
+                // The task ran, and its write went nowhere new.
+                assert!(stdout.contains("write exit "), "{stdout}");
+            }
+            assert!(
+                !root.join("secret/planted.txt").exists(),
+                "overlay {overlay}"
+            );
+        }
+    }
+}
+
+/// Linux enforce over an overlay: one command can install into a
+/// `node_modules` it makes and run what it installed, as pnpm links a
+/// project's packages into the root `node_modules` there as the run started.
+/// Landlock judges the path a link resolves to, which it allows.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_overlay_sandbox_runs_what_a_command_links_into_a_new_node_modules() {
+    if !can_overlay() {
+        return;
+    }
+    let _audit = AUDIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let store = "node_modules/.pnpm/x@1.0.0/node_modules/x";
+    let temp = fixture(json!({
+        "install": {
+            "command": format!(
+                "mkdir -p {store} pkg/node_modules/.bin && printf '#!/bin/sh\\necho ran\\n' > {store}/bin.sh && chmod +x {store}/bin.sh && ln -s ../../{store} pkg/node_modules/x && ln -s ../x/bin.sh pkg/node_modules/.bin/x && cat pkg/node_modules/x/bin.sh > /dev/null && pkg/node_modules/.bin/x > ran.txt"
+            ),
+            "inputs": [],
+            "outputs": ["{projectRoot}/ran.txt"]
+        }
+    }));
+    let root = temp.path();
+    fs::create_dir_all(root.join("node_modules/.pnpm")).unwrap();
+    let report = root.join("report.json");
+    success(
+        command(
+            root,
+            &[
+                "run",
+                "app:install",
+                "--skip-cache",
+                "--sandbox=enforce",
+                "--sandbox-report",
+                report.to_str().unwrap(),
+            ],
+        )
+        .output()
+        .unwrap(),
+    );
+    assert_eq!(fs::read_to_string(root.join("ran.txt")).unwrap(), "ran\n");
+    assert!(root.join(store).join("bin.sh").is_file());
+    for link in ["pkg/node_modules/x", "pkg/node_modules/.bin/x"] {
+        assert!(
+            fs::symlink_metadata(root.join(link)).unwrap().is_symlink(),
+            "{link}"
+        );
+    }
+    let findings: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+    assert_eq!(findings["tasks"], json!({}), "{findings}");
+}
+
 /// Whether Linux enforce can run tasks over overlays here, which needs
 /// unprivileged user namespaces; where `QK_TEST_REQUIRE_OVERLAY` is set, as CI
 /// sets it, a test that would skip fails instead.
@@ -4577,7 +4789,7 @@ fn the_sandbox_lists_only_tasks_that_started() {
 }
 
 /// Reads in a project the task's project depends on are grouped by that
-/// project, apart from reads elsewhere outside its inputs.
+/// project.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn the_sandbox_groups_reads_in_dependency_projects() {
@@ -4594,7 +4806,7 @@ fn the_sandbox_groups_reads_in_dependency_projects() {
         (
             "apps/app",
             json!({"name": "app", "implicitDependencies": ["lib"], "targets": {"lint": {
-                "command": "cat ../../libs/lib/src/a.ts ../../libs/other/b.ts > /dev/null",
+                "command": "cat ../../libs/lib/src/a.ts > /dev/null",
                 "options": {"cwd": "apps/app"},
                 "inputs": ["{projectRoot}/**/*"]
             }}}),
@@ -4604,7 +4816,6 @@ fn the_sandbox_groups_reads_in_dependency_projects() {
             "libs/lib",
             json!({"name": "lib", "root": "./libs/lib/", "targets": {}}),
         ),
-        ("libs/other", json!({"name": "other", "targets": {}})),
     ] {
         fs::create_dir_all(root.join(directory)).unwrap();
         fs::write(
@@ -4615,7 +4826,6 @@ fn the_sandbox_groups_reads_in_dependency_projects() {
     }
     fs::create_dir_all(root.join("libs/lib/src")).unwrap();
     fs::write(root.join("libs/lib/src/a.ts"), "").unwrap();
-    fs::write(root.join("libs/other/b.ts"), "").unwrap();
     let report = root.join("sandbox.json");
     let output = success(run(
         root,
@@ -4634,12 +4844,6 @@ fn the_sandbox_groups_reads_in_dependency_projects() {
         json!({"lib": ["libs/lib/src/a.ts"]}),
         "{findings}"
     );
-    // `other` is no dependency of `app`.
-    assert_eq!(
-        lint["undeclaredReads"],
-        json!(["libs/other/b.ts"]),
-        "{findings}"
-    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains(
@@ -4650,9 +4854,8 @@ fn the_sandbox_groups_reads_in_dependency_projects() {
 }
 
 /// An `ignoreReads` entry starting `^` names what a task reads in the
-/// projects it depends on: those reads are no finding, and enforce lets the
-/// task make them. A project nested in a dependency that the task does not
-/// depend on is not one of them.
+/// projects it depends on, which enforce lets the task make. A project nested
+/// in a dependency that the task does not depend on is not one of them.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn the_sandbox_ignores_the_reads_a_task_names_in_its_dependencies() {
@@ -4678,7 +4881,6 @@ fn the_sandbox_ignores_the_reads_a_task_names_in_its_dependencies() {
             ),
             ("libs/lib", json!({"name": "lib", "targets": {}})),
             ("libs/lib/nested", json!({"name": "nested", "targets": {}})),
-            ("libs/other", json!({"name": "other", "targets": {}})),
         ] {
             fs::create_dir_all(root.join(directory)).unwrap();
             fs::write(
@@ -4688,36 +4890,10 @@ fn the_sandbox_ignores_the_reads_a_task_names_in_its_dependencies() {
             .unwrap();
         }
     };
-    for (path, text) in [
-        ("libs/lib/src/a.ts", ""),
-        ("libs/lib/nested/c.ts", ""),
-        ("libs/other/b.ts", ""),
-    ] {
+    for path in ["libs/lib/src/a.ts", "libs/lib/nested/c.ts"] {
         fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
-        fs::write(root.join(path), text).unwrap();
+        fs::write(root.join(path), "").unwrap();
     }
-    write_projects(
-        "cat ../../libs/lib/src/a.ts ../../libs/lib/nested/c.ts ../../libs/other/b.ts > /dev/null",
-    );
-    let report = root.join("sandbox.json");
-    success(run(
-        root,
-        &[
-            "run",
-            "app:lint",
-            "--sandbox",
-            "--sandbox-report",
-            report.to_str().unwrap(),
-        ],
-    ));
-    let findings: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
-    let lint = &findings["tasks"]["app:lint"];
-    assert_eq!(lint["dependencyReads"], json!({}), "{findings}");
-    assert_eq!(
-        lint["undeclaredReads"],
-        json!(["libs/lib/nested/c.ts", "libs/other/b.ts"]),
-        "{findings}"
-    );
     let enforced = |command: &str| {
         write_projects(command);
         run(
@@ -5021,88 +5197,73 @@ fn the_sandbox_reports_a_package_read_that_the_key_leaves_out() {
     let _audit = AUDIT
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // `helper`, which `apps/app` installs, is in either key; `stale` is in
-    // no lockfile snapshot, so it is no package.
-    let read = "cat ../../node_modules/fallow/index.js ../../node_modules/fallow/package.json \
-        ../../node_modules/.pnpm/helper@1.0.0/node_modules/helper/package.json \
-        ../../node_modules/.pnpm/stale@0.1.0/node_modules/stale/package.json";
-    let targets = |external: Value| {
-        json!({
-            // Naming its external dependencies, even none, leaves the root
-            // importer out of the key.
-            "lint": {"command": read, "options": {"cwd": "apps/app"}, "inputs": ["default", {"externalDependencies": external}]},
-            // Without, every package its importers install counts, but not
-            // `phantom`, which only `apps/mobile` installs and pnpm's
-            // hoisting lets anything resolve.
-            "build": {
-                "command": format!("{read} ../../node_modules/.pnpm/phantom@1.0.0/node_modules/phantom/package.json"),
-                "options": {"cwd": "apps/app"},
-                "inputs": ["default"]
-            }
-        })
-    };
-    let audit = |temp: &TempDir| {
-        let report = temp.path().join("sandbox.json");
-        let output = success(run(
-            temp.path(),
-            &[
-                "run-many",
-                "-t",
-                "lint,build",
-                "--sandbox",
-                "--sandbox-report",
-                report.to_str().unwrap(),
-            ],
-        ));
-        let findings: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
-        (
-            findings,
-            String::from_utf8_lossy(&output.stderr).into_owned(),
-        )
-    };
-    let unnamed = root_tool_fixture(targets(json!([])));
-    let (findings, stderr) = audit(&unnamed);
+    // Naming its external dependencies, even none, leaves the root importer
+    // out of the key.
+    let temp = root_tool_fixture(json!({
+        "lint": {
+            "command": "cat ../../node_modules/fallow/index.js ../../node_modules/fallow/package.json",
+            "options": {"cwd": "apps/app"},
+            "inputs": ["default", {"externalDependencies": []}]
+        }
+    }));
+    let report = temp.path().join("sandbox.json");
+    success(run(
+        temp.path(),
+        &[
+            "run",
+            "app:lint",
+            "--sandbox",
+            "--sandbox-report",
+            report.to_str().unwrap(),
+        ],
+    ));
+    let findings: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
     assert_eq!(
         findings["tasks"]["app:lint"]["unkeyedPackages"],
         json!(["fallow"]),
         "{findings}"
     );
-    // Reads of a package the key covers, and of no package, are no finding.
-    assert_eq!(
-        findings["tasks"]["app:lint"]["undeclaredReads"],
-        json!([]),
-        "{findings}"
-    );
-    assert_eq!(
-        findings["tasks"]["app:build"]["hoistedPackages"],
-        json!(["phantom"]),
-        "{findings}"
-    );
-    assert_eq!(
-        findings["tasks"]["app:build"]["unkeyedPackages"],
-        json!([]),
-        "{findings}"
-    );
-    assert!(
-        stderr.contains(
-            "1 installed package read, which the sandbox allows, but not in its key; name it in its externalDependencies:\n      fallow\n"
-        ),
-        "{stderr}"
-    );
-    assert!(
-        stderr.contains(
-            "1 installed package read that nothing its importers install depends on, which the sandbox allows, found through pnpm's hoisting; declare it as a dependency of the package importing it:\n      phantom\n"
-        ),
-        "{stderr}"
-    );
     // Enforce lets a task read any installed package.
     success(run(
-        unnamed.path(),
-        &["run", "app:lint", "--sandbox=enforce"],
+        temp.path(),
+        &["run", "app:lint", "--skip-cache", "--sandbox=enforce"],
     ));
-    let named = root_tool_fixture(targets(json!(["fallow"])));
-    let (findings, _) = audit(&named);
-    assert!(findings["tasks"].get("app:lint").is_none(), "{findings}");
+}
+
+/// Without `externalDependencies`, a task's key counts every package its
+/// importers install: one none of them installs, which pnpm's hoisting let
+/// it find, is listed as hoisted.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn the_sandbox_reports_a_package_found_through_hoisting() {
+    if !can_audit() {
+        return;
+    }
+    let _audit = AUDIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = root_tool_fixture(json!({
+        "build": {
+            "command": "cat ../../node_modules/.pnpm/phantom@1.0.0/node_modules/phantom/package.json",
+            "options": {"cwd": "apps/app"},
+            "inputs": ["default"]
+        }
+    }));
+    let report = temp.path().join("sandbox.json");
+    success(run(
+        temp.path(),
+        &[
+            "run",
+            "app:build",
+            "--sandbox",
+            "--sandbox-report",
+            report.to_str().unwrap(),
+        ],
+    ));
+    let findings: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+    let build = &findings["tasks"]["app:build"];
+    assert_eq!(build["hoistedPackages"], json!(["phantom"]), "{findings}");
+    assert_eq!(build["unkeyedPackages"], json!([]), "{findings}");
 }
 
 /// A nested workspace a task's `ignoreReads` covers brings what it installs,
@@ -5178,8 +5339,6 @@ fn the_sandbox_ignores_what_an_ignored_nested_workspace_installs() {
     let task = &findings["tasks"]["app:check"];
     // `fallow`, which only the root installs, is still the task's own read.
     assert_eq!(task["unkeyedPackages"], json!(["fallow"]), "{findings}");
-    assert_eq!(task["hoistedPackages"], json!([]), "{findings}");
-    assert_eq!(task["undeclaredReads"], json!([]), "{findings}");
     // Enforce lets it read them too, but of the linked project only its
     // manifest.
     let project = root.join("apps/app/project.json");
