@@ -17,7 +17,19 @@ pub enum Choice {
 
 impl Choice {
     pub fn from_env() -> anyhow::Result<Self> {
-        Self::named(&std::env::var("QK_RECORDER").unwrap_or_default())
+        Self::set(std::env::var_os("QK_RECORDER").as_deref())
+    }
+
+    /// The choice `QK_RECORDER`'s value makes; unset, `auto`.
+    fn set(value: Option<&std::ffi::OsStr>) -> anyhow::Result<Self> {
+        match value.map(std::ffi::OsStr::to_str) {
+            None => Ok(Self::Auto),
+            Some(Some(name)) => Self::named(name),
+            Some(None) => anyhow::bail!(
+                "unknown QK_RECORDER {value:?}, which is not UTF-8; use auto, ebpf or strace",
+                value = value.unwrap_or_default()
+            ),
+        }
     }
 
     fn named(name: &str) -> anyhow::Result<Self> {
@@ -447,6 +459,25 @@ mod tests {
         assert_eq!(
             off(Choice::Strace).unwrap_err().to_string(),
             "recording with strace needs Linux; unset QK_RECORDER or set it to auto"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn qk_recorder_unset_is_auto_and_not_utf8_fails() {
+        use std::os::unix::ffi::OsStrExt;
+        assert_eq!(Choice::set(None).unwrap(), Choice::Auto);
+        assert_eq!(
+            Choice::set(Some("strace".as_ref())).unwrap(),
+            Choice::Strace
+        );
+        let error = Choice::set(Some(std::ffi::OsStr::from_bytes(b"str\xffce")))
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("unknown QK_RECORDER "), "{error}");
+        assert!(
+            error.ends_with(", which is not UTF-8; use auto, ebpf or strace"),
+            "{error}"
         );
     }
 
