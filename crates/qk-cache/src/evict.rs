@@ -458,7 +458,7 @@ fn cached_size(root: &Path) -> Result<u64> {
     {
         return Ok(memo.size);
     }
-    let size = ["entries", "blobs", "warm"]
+    let size = ["entries", "blobs", "warm", "pathsets", "projections"]
         .iter()
         .zip(&before)
         .filter(|(_, stamp)| stamp.is_some())

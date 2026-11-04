@@ -646,7 +646,9 @@ fn projected(
         workspace_root: &workspace.root,
         adapter: head,
         revision,
-    })?;
+    })
+    // Where the adapter's request, which holds the same paths, would fail too
+    .context(AdapterFailure)?;
     if let Some(artifacts) = qk_cache::projections::load(cache, &key) {
         return Ok(artifacts);
     }
