@@ -96,6 +96,33 @@ impl std::ops::Not for Rights {
     }
 }
 
+/// How the path a rule allows rights beneath is opened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Open {
+    /// Following links.
+    Following,
+    /// From the workspace root through no link: one where a link stands, in
+    /// any part of the way down, is left out as one that does not exist.
+    Unlinked,
+    /// As `Unlinked`, and only a directory: a file there, which may be a
+    /// hard link to any file in the workspace, is left out too.
+    Directory,
+}
+
+impl Open {
+    /// The name `relative` is opened by, beneath the workspace root: for a
+    /// directory, with `/.` after it, which only a directory resolves.
+    #[cfg(unix)]
+    pub fn name(self, relative: &std::path::Path) -> Result<std::ffi::CString, std::ffi::NulError> {
+        use std::os::unix::ffi::OsStrExt;
+        let mut name = relative.as_os_str().as_bytes().to_vec();
+        if self == Self::Directory {
+            name.extend_from_slice(b"/.");
+        }
+        std::ffi::CString::new(name)
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub use system::*;
 

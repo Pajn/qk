@@ -3659,6 +3659,56 @@ fn the_overlay_sandbox_keeps_a_node_modules_a_task_makes() {
     assert_eq!(findings["tasks"], json!({}), "{findings}");
 }
 
+/// A `node_modules` the run found as it started that an earlier task
+/// replaces with a link leads nowhere new: Linux enforce, over an overlay or
+/// by Landlock alone, neither binds it through nor allows anything beneath
+/// it, so a later task can neither read nor write where it leads.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_sandbox_follows_no_link_put_in_place_of_a_node_modules() {
+    let temp = fixture(json!({
+        "swap": {"command": "rm -rf node_modules && ln -s secret node_modules", "qk:sandbox": false},
+        "read": {"command": "cat node_modules/x.txt", "dependsOn": ["swap"], "inputs": []},
+        "write": {"command": "echo planted > node_modules/planted.txt", "dependsOn": ["swap"], "inputs": []}
+    }));
+    let root = temp.path();
+    for overlay in ["1", "0"] {
+        for target in ["read", "write"] {
+            let _ = fs::remove_file(root.join("node_modules"));
+            fs::create_dir_all(root.join("node_modules")).unwrap();
+            fs::create_dir_all(root.join("secret")).unwrap();
+            fs::write(root.join("secret/x.txt"), "secret").unwrap();
+            let output = command(
+                root,
+                &[
+                    "run",
+                    &format!("app:{target}"),
+                    "--skip-cache",
+                    "--sandbox=enforce",
+                ],
+            )
+            .env("QK_SANDBOX_OVERLAY", overlay)
+            .output()
+            .unwrap();
+            // The link was made, so the task went through it.
+            assert!(
+                fs::symlink_metadata(root.join("node_modules"))
+                    .unwrap()
+                    .is_symlink()
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(!stdout.contains("secret"), "{stdout}");
+            if target == "read" {
+                assert!(!output.status.success(), "{stdout}");
+            }
+            assert!(
+                !root.join("secret/planted.txt").exists(),
+                "overlay {overlay}"
+            );
+        }
+    }
+}
+
 /// Linux enforce over an overlay: one command can install into a
 /// `node_modules` it makes and run what it installed, as pnpm links a
 /// project's packages into the root `node_modules` there as the run started.

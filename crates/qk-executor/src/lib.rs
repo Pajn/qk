@@ -316,9 +316,9 @@ pub struct OverlayRules {
     /// The rights everywhere in the workspace, where writes reach the overlay
     /// and are judged as the task ends.
     pub workspace: landlock::Rights,
-    /// Paths in the workspace with the rights beneath each, and whether to
-    /// reach it through no link.
-    pub inside: Vec<(PathBuf, landlock::Rights, bool)>,
+    /// Paths in the workspace with the rights beneath each, and how each is
+    /// opened.
+    pub inside: Vec<(PathBuf, landlock::Rights, landlock::Open)>,
 }
 
 /// An external syscall recorder wrapping each command, with separate trace files.

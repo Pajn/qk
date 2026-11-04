@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-use qk_executor::landlock::Rights;
+use qk_executor::landlock::{Open, Rights};
 
 use super::policy::{Policy, Reach, Scope, is_dotenv};
 
@@ -69,7 +69,14 @@ impl Expansion {
 /// and writing as its grants say. Installed packages' manifests, which it
 /// reports, are left to `node_modules`, as Landlock can only refuse.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub fn rights(policy: &Policy, expansion: &Expansion) -> Vec<(PathBuf, Rights, bool)> {
+pub fn rights(policy: &Policy, expansion: &Expansion) -> Vec<(PathBuf, Rights, Open)> {
+    let open = |unlinked: bool| {
+        if unlinked {
+            Open::Unlinked
+        } else {
+            Open::Following
+        }
+    };
     let mut rights = Vec::new();
     for grant in policy.grants() {
         let (tree, file) = if grant.writes() {
@@ -78,29 +85,35 @@ pub fn rights(policy: &Policy, expansion: &Expansion) -> Vec<(PathBuf, Rights, b
             (Rights::READ_TREE, Rights::READ)
         };
         match grant.scope {
-            Scope::Tree(path) => rights.push((path.to_owned(), tree, grant.unlinked)),
-            Scope::File(path) => rights.push((path.to_owned(), file, grant.unlinked)),
+            Scope::Tree(path) => rights.push((path.to_owned(), tree, open(grant.unlinked))),
+            Scope::File(path) => rights.push((path.to_owned(), file, open(grant.unlinked))),
+            // A task may replace a `node_modules` it can write with a link, or
+            // with a file, after the run recorded it: each is allowed only as
+            // a directory reached through no link, so neither leads anywhere.
             Scope::NodeModules => rights.extend(
                 expansion
                     .node_modules
                     .iter()
-                    .map(|path| (path.clone(), tree, false)),
+                    .map(|path| (path.clone(), tree, Open::Directory)),
             ),
             Scope::Dotenv => rights.extend(
                 expansion
                     .dotenv
                     .iter()
-                    .map(|path| (path.clone(), file, policy.is_unlinked(path))),
+                    .map(|path| (path.clone(), file, open(policy.is_unlinked(path)))),
             ),
-            Scope::Directories => rights.push((PathBuf::from("/"), Rights::READ_DIR, false)),
+            Scope::Directories => {
+                rights.push((PathBuf::from("/"), Rights::READ_DIR, Open::Following))
+            }
             Scope::Manifests(_) => {}
         }
     }
     rights
 }
 
-/// The paths in the workspace bound through a task's overlay, which exist,
-/// so that what it writes there reaches the workspace directly.
+/// The directories in the workspace bound through a task's overlay, so that
+/// what it writes there reaches the workspace directly. A link, which binding
+/// would follow, or anything else that is no directory, is left out.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn passthrough(policy: &Policy, expansion: &Expansion) -> Vec<PathBuf> {
     let mut paths = Vec::new();
@@ -114,7 +127,7 @@ pub fn passthrough(policy: &Policy, expansion: &Expansion) -> Vec<PathBuf> {
             _ => {}
         }
     }
-    paths.retain(|path| path.exists());
+    paths.retain(|path| std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()));
     paths
 }
 
@@ -153,7 +166,7 @@ mod system {
     use std::path::{Path, PathBuf};
 
     use anyhow::{Context, Result, bail};
-    use qk_executor::landlock::{self, Rights};
+    use qk_executor::landlock::{self, Open, Rights};
 
     use super::{Expansion, Policy, keep, passthrough, rights};
 
@@ -184,10 +197,17 @@ mod system {
             self.allow_open(&fd, path, rights)
         }
 
-        /// As [`Rules::allow`], for `path` beneath `root` reached through no
-        /// link: one where a link now stands, in any part of the way down from
-        /// `root`, is skipped as one that does not exist.
-        fn allow_unlinked(&self, root: &Path, path: &Path, rights: Rights) -> Result<()> {
+        /// As [`Rules::allow`], for `path` beneath `root` opened as `open`
+        /// says, through no link: one where a link now stands, in any part of
+        /// the way down from `root`, or for a directory anything else, is
+        /// skipped as one that does not exist.
+        fn allow_unlinked(
+            &self,
+            root: &Path,
+            path: &Path,
+            rights: Rights,
+            open: Open,
+        ) -> Result<()> {
             let Ok(relative) = path.strip_prefix(root) else {
                 return Ok(());
             };
@@ -196,7 +216,8 @@ mod system {
                 .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
                 .open(root)
                 .with_context(|| format!("cannot open {}", root.display()))?;
-            let name = std::ffi::CString::new(relative.as_os_str().as_encoded_bytes())
+            let name = open
+                .name(relative)
                 .with_context(|| format!("cannot open {}", path.display()))?;
             let fd = match landlock::open_beneath(root.as_raw_fd(), &name) {
                 Ok(fd) => fd,
@@ -267,9 +288,9 @@ mod system {
         for path in outside(root)? {
             rules.allow(&path, Rights::ALL)?;
         }
-        for (path, rights, unlinked) in rights(policy, expansion) {
-            if unlinked {
-                rules.allow_unlinked(root, &path, rights)?;
+        for (path, rights, open) in rights(policy, expansion) {
+            if open != Open::Following {
+                rules.allow_unlinked(root, &path, rights, open)?;
             } else {
                 rules.allow(&path, rights)?;
             }
@@ -293,19 +314,19 @@ mod system {
         let root = policy.root();
         let mut outside_fds = Vec::new();
         let mut inside = Vec::new();
-        let mut add = |path: &Path, rights: Rights, unlinked: bool| -> Result<()> {
+        let mut add = |path: &Path, rights: Rights, open: Open| -> Result<()> {
             if path.starts_with(root) {
-                inside.push((path.to_owned(), rights, unlinked));
+                inside.push((path.to_owned(), rights, open));
             } else if let Some(fd) = open_path(path)? {
                 outside_fds.push((fd, rights));
             }
             Ok(())
         };
         for path in outside(root)? {
-            add(&path, Rights::ALL, false)?;
+            add(&path, Rights::ALL, Open::Following)?;
         }
-        for (path, rights, unlinked) in rights(policy, expansion) {
-            add(&path, rights, unlinked)?;
+        for (path, rights, open) in rights(policy, expansion) {
+            add(&path, rights, open)?;
         }
         let rules = qk_executor::OverlayRules {
             handled,
@@ -317,7 +338,7 @@ mod system {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::collections::BTreeMap;
 
@@ -383,39 +404,39 @@ mod tests {
         );
     }
 
-    /// The rights granted beneath each path, and whether it is reached
-    /// through no link: Landlock unions its rules, so their order and
+    /// The rights granted beneath each path, and how each is
+    /// opened: Landlock unions its rules, so their order and
     /// repetition do not matter.
     #[test]
     fn grants_rights_beneath_the_policys_paths() {
         let (_temp, root, policy) = workspace();
         let expansion = Expansion::scan(&root);
-        let mut granted: BTreeMap<(PathBuf, bool), Rights> = BTreeMap::new();
-        for (path, rights, unlinked) in rights(&policy, &expansion) {
+        let mut granted: BTreeMap<(PathBuf, Open), Rights> = BTreeMap::new();
+        for (path, rights, open) in rights(&policy, &expansion) {
             let path = path
                 .strip_prefix(&root)
                 .map_or(path.clone(), Path::to_owned);
-            *granted.entry((path, unlinked)).or_default() |= rights;
+            *granted.entry((path, open)).or_default() |= rights;
         }
-        let expected: BTreeMap<(PathBuf, bool), Rights> = [
-            ("/", false, Rights::READ_DIR),
-            ("libs/lib", false, Rights::READ_TREE),
-            ("package.json", false, Rights::READ),
-            ("apps/app/src/main.ts", false, Rights::READ),
-            ("fixtures/data.json", true, Rights::READ),
-            (".env", false, Rights::READ),
-            ("apps/app/.env.local", false, Rights::READ),
-            ("libs/dep/dist", false, Rights::READ_TREE),
-            ("fixtures/cache", true, Rights::READ_TREE),
-            ("apps/app/dist", false, Rights::ALL),
-            ("tmp/app", false, Rights::ALL),
-            ("node_modules", false, Rights::ALL),
-            ("apps/app/node_modules", false, Rights::ALL),
-            (".git", false, Rights::ALL),
-            (".qk", false, Rights::ALL),
+        let expected: BTreeMap<(PathBuf, Open), Rights> = [
+            ("/", Open::Following, Rights::READ_DIR),
+            ("libs/lib", Open::Following, Rights::READ_TREE),
+            ("package.json", Open::Following, Rights::READ),
+            ("apps/app/src/main.ts", Open::Following, Rights::READ),
+            ("fixtures/data.json", Open::Unlinked, Rights::READ),
+            (".env", Open::Following, Rights::READ),
+            ("apps/app/.env.local", Open::Following, Rights::READ),
+            ("libs/dep/dist", Open::Following, Rights::READ_TREE),
+            ("fixtures/cache", Open::Unlinked, Rights::READ_TREE),
+            ("apps/app/dist", Open::Following, Rights::ALL),
+            ("tmp/app", Open::Following, Rights::ALL),
+            ("node_modules", Open::Directory, Rights::ALL),
+            ("apps/app/node_modules", Open::Directory, Rights::ALL),
+            (".git", Open::Following, Rights::ALL),
+            (".qk", Open::Following, Rights::ALL),
         ]
         .into_iter()
-        .map(|(path, unlinked, rights)| ((PathBuf::from(path), unlinked), rights))
+        .map(|(path, open, rights)| ((PathBuf::from(path), open), rights))
         .collect();
         assert_eq!(granted, expected);
     }
@@ -428,6 +449,22 @@ mod tests {
         let (_temp, root, policy) = workspace();
         let expansion = Expansion::scan(&root);
         let mut through = passthrough(&policy, &expansion);
+        // A recorded `node_modules` an earlier task replaced with a link, or
+        // with a file, is not bound: binding would follow the link.
+        let mut replaced = Expansion::default();
+        replaced.add_node_modules(&[
+            root.join("linked/node_modules"),
+            root.join("filed/node_modules"),
+        ]);
+        std::fs::create_dir_all(root.join("linked")).unwrap();
+        std::fs::create_dir_all(root.join("filed")).unwrap();
+        std::os::unix::fs::symlink(root.join("tmp"), root.join("linked/node_modules")).unwrap();
+        std::fs::write(root.join("filed/node_modules"), "").unwrap();
+        let swapped = passthrough(&policy, &replaced);
+        assert!(
+            !swapped.iter().any(|path| path.ends_with("node_modules")),
+            "{swapped:?}"
+        );
         through.sort();
         assert_eq!(
             through,

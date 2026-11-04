@@ -89,7 +89,7 @@ impl Setup {
         }
         let rules = &overlay.rules;
         let mut inside = Vec::new();
-        for (path, rights, unlinked) in &rules.inside {
+        for (path, rights, open) in &rules.inside {
             let Ok(relative) = path.strip_prefix(&overlay.workspace) else {
                 continue;
             };
@@ -98,7 +98,8 @@ impl Setup {
             } else {
                 relative
             };
-            inside.push((c_path(relative)?, *rights, *unlinked));
+            let name = open.name(relative).context("a path holds a NUL byte")?;
+            inside.push((name, *rights, *open != landlock::Open::Following));
         }
         Ok(Self {
             aside,
