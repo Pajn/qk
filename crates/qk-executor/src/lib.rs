@@ -280,7 +280,8 @@ pub struct Settled {
     /// missing from the workspace.
     pub failed: Vec<String>,
     /// Directories `keep` names by name that applying made in the
-    /// workspace, but for those beneath another such directory.
+    /// workspace where no directory stood, in place of nothing, a file or a
+    /// link, but for those beneath another such directory.
     pub made: Vec<PathBuf>,
 }
 

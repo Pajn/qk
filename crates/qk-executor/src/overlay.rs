@@ -522,7 +522,7 @@ impl Layer<'_> {
                     });
                     match made {
                         Ok(()) => {
-                            if existing.is_none() && self.names(&relative) {
+                            if !is_dir && self.names(&relative) {
                                 settled.made.push(target.clone());
                             }
                             self.apply(&relative, prunes, settled);
@@ -690,9 +690,16 @@ mod tests {
     fn keeps_what_is_written_in_any_node_modules() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
-        for file in ["lib/node_modules/stale/a", "app/node_modules/old/a"] {
+        for file in [
+            "lib/node_modules/stale/a",
+            "app/node_modules/old/a",
+            "filed/node_modules",
+        ] {
             write(&workspace, file);
         }
+        std::fs::create_dir_all(workspace.join("linked")).unwrap();
+        std::os::unix::fs::symlink(workspace.join("lib"), workspace.join("linked/node_modules"))
+            .unwrap();
         let overlay = crate::Overlay {
             workspace: workspace.clone(),
             directory: temp.path().join("overlay"),
@@ -705,7 +712,15 @@ mod tests {
             settled: std::sync::OnceLock::new(),
         };
         let [upper, ..] = layers(&overlay, 0);
-        for file in ["pkg/node_modules/x/a", "pkg/stray.js", "dist/out.js"] {
+        // A `node_modules` made where none was, and in place of a file and
+        // of a link.
+        for file in [
+            "pkg/node_modules/x/a",
+            "pkg/stray.js",
+            "dist/out.js",
+            "filed/node_modules/x/a",
+            "linked/node_modules/x/a",
+        ] {
             write(&upper, file);
         }
         // A whiteout, and an opaque directory, where the file system lets
@@ -730,11 +745,25 @@ mod tests {
             settled.discarded,
             std::collections::BTreeSet::from(["pkg/stray.js".to_owned()])
         );
-        assert_eq!(settled.made, [workspace.join("pkg/node_modules")]);
+        let mut made = settled.made.clone();
+        made.sort();
+        assert_eq!(
+            made,
+            [
+                "filed/node_modules",
+                "linked/node_modules",
+                "pkg/node_modules"
+            ]
+            .map(|path| workspace.join(path))
+        );
+        // The link is replaced, not followed.
+        assert!(!workspace.join("lib/x").exists());
         for file in [
             "pkg/node_modules/x/a",
             "dist/out.js",
             "lib/node_modules/fresh/a",
+            "filed/node_modules/x/a",
+            "linked/node_modules/x/a",
         ] {
             assert!(workspace.join(file).is_file(), "{file}");
         }
