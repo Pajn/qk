@@ -1177,6 +1177,16 @@ mod tests {
         let empty = blake3::hash(b"").to_hex().to_string();
         fs::write(cache.root.join("blobs").join(&empty), "corrupt").unwrap();
         assert!(cache.usable("build", &other, &outputs).is_err());
+        let restored = cache.restore(
+            root,
+            "build",
+            &Default::default(),
+            &other,
+            &outputs,
+            &qk_executor::Display::Hidden,
+            qk_executor::Shown::LocalCache,
+        );
+        assert!(restored.is_err());
         // A file or link with an artifact beneath it, which no directory
         // could hold.
         use serde_json::json;

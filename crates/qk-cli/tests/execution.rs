@@ -291,6 +291,19 @@ fn off_linux_a_recording_run_fails_only_for_a_recorder_named() {
         assert!(stderr.contains(error), "{stderr}");
         assert!(!String::from_utf8_lossy(&output.stdout).contains("built"));
     }
+    // A name that is not UTF-8 names no recorder, rather than none at all.
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let output = command(temp.path(), &["run", "app:build", "--record"])
+            .env("QK_RECORDER", std::ffi::OsStr::from_bytes(b"ebp\xff"))
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("which is not UTF-8"), "{stderr}");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("built"));
+    }
 }
 
 #[test]
