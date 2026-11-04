@@ -318,6 +318,9 @@ struct ChangeOptions {
     /// Only untracked files.
     #[arg(long, conflicts_with_all = ["base", "head"])]
     untracked: bool,
+    /// The command's own `--skip-cache`, where it takes one.
+    #[arg(skip)]
+    skip_cache: bool,
 }
 
 impl ChangeOptions {
@@ -367,8 +370,9 @@ impl ChangeOptions {
             explicit_files: self.stdin,
             uncommitted: self.uncommitted,
             untracked: self.untracked,
-            // `qk affected --skip-cache` exports it before selecting
-            skip_projection_cache: env_flag("NX_SKIP_NX_CACHE") || env_flag("NX_DISABLE_NX_CACHE"),
+            skip_projection_cache: self.skip_cache
+                || env_flag("NX_SKIP_NX_CACHE")
+                || env_flag("NX_DISABLE_NX_CACHE"),
         }
     }
 
@@ -1449,10 +1453,12 @@ fn run(mut cli: Cli) -> Result<i32> {
             targets,
             projects,
             exclude,
-            changes,
+            mut changes,
             options,
             ..
         } => {
+            // Selected before `options.export()` sets NX_SKIP_NX_CACHE
+            changes.skip_cache = options.skips_cache();
             let affected = changes.affected(&workspace)?;
             let selected = select_projects(&workspace.projects, &projects, &exclude)?
                 .into_iter()

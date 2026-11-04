@@ -1952,6 +1952,102 @@ fn reachability_profile_runs_only_the_cases_a_change_reaches() {
     assert!(output.contains("every case"), "{output}");
 }
 
+#[cfg(unix)]
+#[test]
+fn skipping_the_cache_projects_every_revision_again() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    let log = root.join("adapter.log");
+    let git = |args: &[&str]| {
+        let output = isolated_command("git")
+            .current_dir(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    // Logs each run, then answers with the revision's manifest
+    let adapter = format!(
+        "echo run >> '{}'; git -C \"$0\" show HEAD:manifest.json",
+        log.display()
+    );
+    for (path, content) in [
+        ("nx.json", json!({"qk:affectedProfiles":{"runtime":{"projections":[{"name":"runtime","command":["sh","-c",adapter,"{revisionRoot}"],"sources":["schemas/**"],"outputs":["apps/app/generated/**"]}]}}}).to_string()),
+        (".gitignore", "adapter.log\n".into()),
+        ("schemas/project.json", json!({"name":"schema"}).to_string()),
+        ("schemas/schema.txt", "before".into()),
+        ("apps/app/project.json", json!({"name":"app","implicitDependencies":["schema"],"targets":{"build":{"command":"echo build"}}}).to_string()),
+        ("manifest.json", json!({"version":1,"artifacts":{"apps/app/generated/runtime.js":"same"}}).to_string()),
+    ] {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+    git(&["init", "--quiet", "--initial-branch=main"]);
+    for (change, message) in [(None, "base"), (Some("after"), "head")] {
+        if let Some(content) = change {
+            std::fs::write(root.join("schemas/schema.txt"), content).unwrap();
+        }
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=qk",
+            "-c",
+            "user.email=qk@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            message,
+        ]);
+    }
+    let runs = || {
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let qk = |args: &[&str], skip: bool| {
+        let mut command = isolated_command(env!("CARGO_BIN_EXE_qk"));
+        command
+            .current_dir(root)
+            .env_remove("NX_HEAD")
+            .env_remove("NX_SKIP_NX_CACHE")
+            .env_remove("NX_DISABLE_NX_CACHE")
+            .args(args)
+            .args([
+                "--affected-profile",
+                "runtime",
+                "--base",
+                "HEAD^",
+                "--head",
+                "HEAD",
+            ]);
+        if skip {
+            command.env("NX_SKIP_NX_CACHE", "true");
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    qk(&["affected", "-t", "build"], false);
+    assert_eq!(runs(), 2);
+    qk(&["affected", "-t", "build"], false);
+    assert_eq!(runs(), 2);
+    // Selected before the run's options are exported, at project granularity
+    qk(&["affected", "-t", "build", "--skip-cache"], false);
+    assert_eq!(runs(), 4);
+    qk(&["show", "projects", "--affected", "--json"], true);
+    assert_eq!(runs(), 6);
+}
+
 #[test]
 fn affected_profile_lists_projects_explains_projection_and_rejects_task_selection() {
     let temp = TempDir::new().unwrap();
