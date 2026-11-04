@@ -419,8 +419,9 @@ impl Cache {
 
     /// Whether the local entry for `key` is one [`Self::restore`] would take,
     /// as far as it can tell without touching the task's outputs: its record
-    /// and log whole, its outputs within `outputs`, and every file's blob
-    /// present, though not hashed. `Ok(false)` when there is no such entry.
+    /// and log whole, its outputs within `outputs`, none beneath a file or
+    /// link of its own, and every file's blob present, though not hashed.
+    /// `Ok(false)` when there is no such entry.
     pub(crate) fn usable(&self, task: &str, key: &str, outputs: &Outputs) -> Result<bool> {
         let Some((manifest, _)) = self.entry(task, key)? else {
             return Ok(false);
@@ -428,6 +429,16 @@ impl Cache {
         for (path, artifact) in &manifest.artifacts {
             if !outputs.matches(path) {
                 bail!("cached artifact is outside declared outputs");
+            }
+            let mut parent = path.as_str();
+            while let Some((above, _)) = parent.rsplit_once('/') {
+                if !matches!(
+                    manifest.artifacts.get(above),
+                    None | Some(Artifact::Directory { .. })
+                ) {
+                    bail!("cached artifact parent is not a directory: {above}");
+                }
+                parent = above;
             }
             match artifact {
                 Artifact::File { blob, .. } => {
@@ -1164,8 +1175,36 @@ mod tests {
         let other = "b".repeat(64);
         cache.publish(root, &other, &outputs, &log).unwrap();
         let empty = blake3::hash(b"").to_hex().to_string();
-        fs::write(cache.root.join("blobs").join(empty), "corrupt").unwrap();
+        fs::write(cache.root.join("blobs").join(&empty), "corrupt").unwrap();
         assert!(cache.usable("build", &other, &outputs).is_err());
+        // A file or link with an artifact beneath it, which no directory
+        // could hold.
+        use serde_json::json;
+        fs::write(cache.root.join("blobs").join(&empty), "").unwrap();
+        for parent in [
+            json!({"type": "File", "blob": empty, "mode": 0o644}),
+            json!({"type": "Symlink", "target": "elsewhere", "directory": false}),
+        ] {
+            let entry = cache.root.join("entries").join(format!("{other}.json"));
+            let mut record: serde_json::Value =
+                serde_json::from_slice(&fs::read(&entry).unwrap()).unwrap();
+            record["artifacts"]["out/file"] = parent;
+            record["artifacts"]["out/file/child"] = json!({"type": "Directory", "mode": 0o755});
+            fs::write(&entry, serde_json::to_vec(&record).unwrap()).unwrap();
+            fs::remove_dir_all(root.join("out")).unwrap();
+            let restored = cache.restore(
+                root,
+                "build",
+                &Default::default(),
+                &other,
+                &outputs,
+                &qk_executor::Display::Hidden,
+                qk_executor::Shown::LocalCache,
+            );
+            assert!(restored.is_err());
+            fs::create_dir_all(root.join("out")).unwrap();
+            assert!(cache.usable("build", &other, &outputs).is_err(), "{record}");
+        }
     }
 
     #[test]
