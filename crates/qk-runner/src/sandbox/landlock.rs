@@ -112,8 +112,9 @@ pub fn rights(policy: &Policy, expansion: &Expansion) -> Vec<(PathBuf, Rights, O
 }
 
 /// The directories in the workspace bound through a task's overlay, so that
-/// what it writes there reaches the workspace directly. A link, which binding
-/// would follow, or anything else that is no directory, is left out.
+/// what it writes there reaches the workspace directly. One reached through
+/// a link, in any part of the way down from the workspace root, which
+/// binding would follow, or that is no directory, is left out.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn passthrough(policy: &Policy, expansion: &Expansion) -> Vec<PathBuf> {
     let mut paths = Vec::new();
@@ -127,8 +128,21 @@ pub fn passthrough(policy: &Policy, expansion: &Expansion) -> Vec<PathBuf> {
             _ => {}
         }
     }
-    paths.retain(|path| std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()));
+    paths.retain(|path| unlinked_directory(policy.root(), path));
     paths
+}
+
+/// Whether `path` is a directory beneath `root` reached through no link:
+/// each part of the way down from `root` is a directory itself.
+fn unlinked_directory(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let mut current = root.to_path_buf();
+    relative.components().all(|part| {
+        current.push(part);
+        std::fs::symlink_metadata(&current).is_ok_and(|metadata| metadata.is_dir())
+    })
 }
 
 /// Where a task over an overlay may write: what it wrote there is applied
@@ -450,16 +464,20 @@ mod tests {
         let expansion = Expansion::scan(&root);
         let mut through = passthrough(&policy, &expansion);
         // A recorded `node_modules` an earlier task replaced with a link, or
-        // with a file, is not bound: binding would follow the link.
+        // with a file, or put a link in the way to, is not bound: binding
+        // would follow the link.
         let mut replaced = Expansion::default();
         replaced.add_node_modules(&[
             root.join("linked/node_modules"),
             root.join("filed/node_modules"),
+            root.join("aliased/node_modules"),
         ]);
         std::fs::create_dir_all(root.join("linked")).unwrap();
         std::fs::create_dir_all(root.join("filed")).unwrap();
+        std::fs::create_dir_all(root.join("elsewhere/node_modules")).unwrap();
         std::os::unix::fs::symlink(root.join("tmp"), root.join("linked/node_modules")).unwrap();
         std::fs::write(root.join("filed/node_modules"), "").unwrap();
+        std::os::unix::fs::symlink(root.join("elsewhere"), root.join("aliased")).unwrap();
         let swapped = passthrough(&policy, &replaced);
         assert!(
             !swapped.iter().any(|path| path.ends_with("node_modules")),
