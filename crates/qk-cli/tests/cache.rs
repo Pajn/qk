@@ -1903,6 +1903,132 @@ fn a_store_proxy_sends_again_the_blobs_a_commit_it_queued_lacks() {
 // The target is a POSIX shell command.
 #[cfg(unix)]
 #[test]
+fn a_store_proxy_keeps_the_entries_it_sent_on_and_serves_them_itself() {
+    // Its output stored apart, so the entry is queued behind the blob, the
+    // token's first upload; or carried inline, so the entry is the first
+    // upload, which goes upstream as it came.
+    for threshold in ["1KB", "off"] {
+        keeps_the_entries_it_sent_on(threshold);
+    }
+}
+
+#[cfg(unix)]
+fn keeps_the_entries_it_sent_on(threshold: &str) {
+    let server = store_server::FakeStoreServer::start();
+    let (fixture, _) = large_outputs(1);
+    with_store_server(&fixture, &server);
+    let directory = TempDir::new().unwrap();
+    let proxy = StoreProxy::start(&server.url, directory.path());
+    let env = [
+        ("QK_STORE_SERVER_URL", proxy.url.as_str()),
+        ("QK_REMOTE_BLOB_THRESHOLD", threshold),
+    ];
+    success(server_build(&fixture, store_server::WRITE_TOKEN, &env));
+    proxy.drained();
+    assert_eq!(server.state.lock().unwrap().entries(), 1);
+    // Another machine restores the entry, and the large output it stores
+    // apart, from the proxy alone.
+    let asked = |server: &store_server::FakeStoreServer| {
+        server
+            .requests("entries/")
+            .iter()
+            .chain(server.requests("blobs/").iter())
+            .filter(|(request, _)| request.starts_with("GET "))
+            .count()
+    };
+    let before = asked(&server);
+    clear_local_cache(&fixture);
+    fs::remove_dir_all(fixture.root.join("dist")).unwrap();
+    let output = success(server_build(&fixture, store_server::WRITE_TOKEN, &env));
+    let runs = fs::read_to_string(fixture.root.join("../executions")).unwrap();
+    assert_eq!(
+        runs.lines().count(),
+        1,
+        "{}\n{}",
+        stderr(&output),
+        proxy.log()
+    );
+    assert!(fixture.root.join("dist/0.bin").is_file());
+    assert!(
+        proxy
+            .log()
+            .lines()
+            .any(|line| line.starts_with("qk: GET /v4/entries/") && line.contains(" 200 kept ")),
+        "{}",
+        proxy.log()
+    );
+    assert_eq!(asked(&server), before, "{}", proxy.log());
+}
+
+// The target is a POSIX shell command.
+#[cfg(unix)]
+#[test]
+fn a_store_proxy_lists_the_whole_index_from_its_copy() {
+    let server = store_server::FakeStoreServer::start();
+    let (fixture, env) = large_outputs(1);
+    with_store_server(&fixture, &server);
+    let directory = TempDir::new().unwrap();
+    let proxy = StoreProxy::start(&server.url, directory.path());
+    let mut env = env.clone();
+    env.push(("QK_STORE_SERVER_URL", proxy.url.as_str()));
+    success(server_build(&fixture, store_server::WRITE_TOKEN, &env));
+    proxy.drained();
+    // Each machine with an empty cache asks for the whole index: the proxy
+    // reads it once, and after that only what changed since, which lists the
+    // entry the first build committed.
+    for _ in 0..2 {
+        clear_local_cache(&fixture);
+        fs::remove_dir_all(fixture.root.join("dist")).unwrap();
+        success(server_build(&fixture, store_server::WRITE_TOKEN, &env));
+    }
+    let runs = fs::read_to_string(fixture.root.join("../executions")).unwrap();
+    assert_eq!(runs.lines().count(), 1, "{}", proxy.log());
+    assert_eq!(
+        server.state.lock().unwrap().whole_listings,
+        1,
+        "{}",
+        proxy.log()
+    );
+    let answered = proxy
+        .log()
+        .lines()
+        .filter(|line| line.starts_with("qk: GET /v4/index 200 proxy "))
+        .count();
+    assert_eq!(answered, 3, "{}", proxy.log());
+    // An entry committed once the proxy holds its copy, by a machine not
+    // behind it, is listed too: a copy never brought up to date would miss
+    // it, and the task would run again.
+    let runs = || {
+        fs::read_to_string(fixture.root.join("../executions"))
+            .unwrap()
+            .lines()
+            .count()
+    };
+    fs::write(fixture.root.join("src/input.txt"), "elsewhere\n").unwrap();
+    let direct: Vec<_> = env
+        .iter()
+        .copied()
+        .filter(|(name, _)| *name != "QK_STORE_SERVER_URL")
+        .collect();
+    success(server_build(&fixture, store_server::WRITE_TOKEN, &direct));
+    assert_eq!(runs(), 2);
+    // That machine listed the whole index itself; the proxy does not again.
+    let listed = server.state.lock().unwrap().whole_listings;
+    clear_local_cache(&fixture);
+    fs::remove_dir_all(fixture.root.join("dist")).unwrap();
+    success(server_build(&fixture, store_server::WRITE_TOKEN, &env));
+    assert_eq!(runs(), 2, "{}", proxy.log());
+    assert_eq!(
+        server.state.lock().unwrap().whole_listings,
+        listed,
+        "{}",
+        proxy.log()
+    );
+}
+
+// The target is a POSIX shell command.
+#[cfg(unix)]
+#[test]
 fn a_store_proxy_serves_warm_state_it_has_not_yet_sent_on() {
     let server = store_server::FakeStoreServer::start();
     let fixture = Fixture::new(json!({
