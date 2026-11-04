@@ -212,9 +212,16 @@ const PROBE_RETRY: Duration = Duration::from_millis(500);
 const PROBE_DEADLINE: Duration = Duration::from_secs(10);
 
 impl Sandbox {
-    /// Works out what each task may do; on macOS writes its profile and
-    /// starts reading the log.
-    pub fn start(workspace: &Workspace, graph: &TaskGraph, mode: Mode) -> Result<Self> {
+    /// Works out what each task may do, and with the dotenv files `prepared`
+    /// says each task's environment was loaded from, what its reports are
+    /// judged against; on macOS writes its profile and starts reading the
+    /// log.
+    pub fn start(
+        workspace: &Workspace,
+        graph: &TaskGraph,
+        prepared: &BTreeMap<String, qk_executor::PreparedTask>,
+        mode: Mode,
+    ) -> Result<Self> {
         if cfg!(target_os = "linux") {
             if mode == Mode::Enforce {
                 landlock::abi()
@@ -233,9 +240,6 @@ impl Sandbox {
         let resolution = qk_cache::resolve_each(workspace, graph)?;
         let tree = Tree::new(&resolution.candidates).protecting(protected(workspace));
         let installs = Installs::load(&root);
-        // The environment tasks start from, which says whether qk loads
-        // their dotenv files.
-        let base_env = qk_executor::environment(&workspace.root).unwrap_or_default();
         let projects = qk_graph::ProjectGraph::build(workspace)?;
         let mut audits: BTreeMap<String, TaskAudit> = depended(workspace, graph, &projects)
             .into_iter()
@@ -347,8 +351,11 @@ impl Sandbox {
                     }
                     audit.writing(plan.write_trees.iter().cloned());
                     audit.loading(
-                        qk_executor::loaded_dotenv_files(workspace, task, &base_env)
-                            .unwrap_or_default(),
+                        prepared
+                            .get(id)
+                            .into_iter()
+                            .flat_map(|task| &task.dotenv)
+                            .filter_map(|path| workspace_relative(&root, &workspace.root, path)),
                     );
                     policies.insert(id.clone(), Policy::new(mode, &root, &state, plan));
                 }
@@ -895,6 +902,24 @@ impl Drop for Sandbox {
         #[cfg(not(target_os = "linux"))]
         let _ = std::fs::remove_dir_all(&self.directory);
     }
+}
+
+/// `path` as reports name it, `/`-separated beneath the workspace, whose
+/// root `root` is resolved and `given` as given; `None` outside it.
+fn workspace_relative(root: &Path, given: &Path, path: &Path) -> Option<String> {
+    let relative = path
+        .strip_prefix(root)
+        .or_else(|_| path.strip_prefix(given))
+        .ok()?;
+    relative
+        .components()
+        .filter(|part| *part != std::path::Component::CurDir)
+        .map(|part| match part {
+            std::path::Component::Normal(part) => part.to_str(),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()
+        .map(|parts| parts.join("/"))
 }
 
 /// Every task `task` depends on, directly or not.
@@ -1788,6 +1813,28 @@ mod matching_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A loaded file's path, absolute or joined to the root as given, is
+    /// named as reports name it; one outside the workspace is not.
+    #[test]
+    fn names_loaded_files_as_reports_do() {
+        let (root, given) = (Path::new("/real/repo"), Path::new("/link/repo"));
+        for (path, named) in [
+            ("/real/repo/apps/app/.env", Some("apps/app/.env")),
+            (
+                "/link/repo/./config/variables.txt",
+                Some("config/variables.txt"),
+            ),
+            ("/elsewhere/.env", None),
+            ("/real/repo/../other/.env", None),
+        ] {
+            assert_eq!(
+                workspace_relative(root, given, Path::new(path)).as_deref(),
+                named,
+                "{path}"
+            );
+        }
+    }
 
     #[test]
     fn protects_the_manifests_of_a_root_spelled_with_dots() {

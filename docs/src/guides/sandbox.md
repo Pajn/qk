@@ -252,14 +252,19 @@ importer, and an importer the task's key counts, is never covered this way.
 
 ### Dotenv files
 
-A task whose tools read the dotenv files qk loads for it names them in
+A task whose tools read the dotenv files qk loads for it, its `envFile`
+among them, names them in
 `ignoreReads`, and declares the variables that matter as
 [`env` inputs](../reference/inputs-outputs.md#env-and-runtime). qk loads
 those files into the task's environment itself, and an `env` input keys a
 variable by its value, so once those are declared, reading the file cannot
 change the result beyond what is keyed, which is what `ignoreReads` claims.
-A task whose result depends on a file's content itself, as one that copies
-or hashes it, declares it as an input instead.
+That holds only for the values that reach the task: one a source that
+[takes precedence](../reference/environment.md) also sets masks the file's,
+and a tool reading the file sees a value no `env` input keys. A task whose
+tools read a file whose values others mask, or whose result depends on a
+file's content itself, as one that copies or hashes it, declares it as an
+input instead.
 
 A dotenv file qk does not load for the task, as `.env.production` read
 under a development configuration, holds values no `env` input keys, so it

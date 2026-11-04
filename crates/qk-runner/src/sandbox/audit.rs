@@ -32,7 +32,7 @@ pub struct Findings {
     /// it reads. `^` inputs key them.
     pub dependency_reads: BTreeMap<String, BTreeSet<String>>,
     /// Dotenv files qk loads into its environment that it read outside its
-    /// key: what they hold reaches it through the variables qk loads, which
+    /// key, its `envFile` among them: what they hold reaches it through the variables qk loads, which
     /// `env` inputs key, so naming them in its ignored reads covers them. A
     /// dotenv file qk does not load for it is read as any other file.
     pub dotenv_reads: BTreeSet<String>,
@@ -101,7 +101,8 @@ pub(super) struct TaskAudit {
     depended: Vec<(Option<String>, String)>,
     /// Its outputs, warm paths and scratch directories.
     outputs: BTreeSet<PathBuf>,
-    /// The dotenv files qk loads into its environment, workspace-relative.
+    /// The dotenv files qk loaded its environment from, `envFile` among them,
+    /// workspace-relative.
     loaded: BTreeSet<String>,
 }
 
@@ -201,14 +202,13 @@ impl TaskAudit {
                 findings.stray_writes.insert(relative);
             } else if in_git(&relative) {
                 findings.unkeyed_reads.insert(relative);
+            } else if self.loaded.contains(&relative) {
+                // An `envFile` among them, whatever its name.
+                findings.dotenv_reads.insert(relative);
             } else if is_dotenv(&relative) {
                 // Wherever it lies: one in a project it depends on is no
                 // code of that project's it ran.
-                if self.loaded.contains(&relative) {
-                    findings.dotenv_reads.insert(relative);
-                } else {
-                    findings.undeclared_reads.insert(relative);
-                }
+                findings.undeclared_reads.insert(relative);
             } else if let Some(project) = dependency
                 && qk_input_analysis::ReadKind::of(&relative)
                     == qk_input_analysis::ReadKind::Content
@@ -330,7 +330,11 @@ mod tests {
     fn tells_dotenv_files_qk_loads_from_others() {
         let root = Path::new("/workspace");
         let mut audit = TaskAudit::new(root, vec![(Some("lib".into()), "libs/lib".into())]);
-        audit.loading([".env".to_owned(), "apps/app/.env.local".to_owned()]);
+        audit.loading([
+            ".env".to_owned(),
+            "apps/app/.env.local".to_owned(),
+            "config/variables.txt".to_owned(),
+        ]);
         let found = audit.classify(
             None,
             [
@@ -339,11 +343,16 @@ mod tests {
                 ".env.production",
                 "libs/lib/.env",
                 "libs/lib/src/a.ts",
+                "config/variables.txt",
             ]
             .map(|path| read(root, path)),
             [],
         );
-        assert_eq!(found.dotenv_reads, set(&[".env", "apps/app/.env.local"]));
+        // An `envFile` it loaded is one, whatever its name.
+        assert_eq!(
+            found.dotenv_reads,
+            set(&[".env", "apps/app/.env.local", "config/variables.txt"])
+        );
         assert_eq!(
             found.undeclared_reads,
             set(&[".env.production", "libs/lib/.env"])

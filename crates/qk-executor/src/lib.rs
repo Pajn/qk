@@ -563,6 +563,9 @@ pub struct PreparedTask {
     pub env: BTreeMap<OsString, OsString>,
     /// Dotenv, explicit settings and local binary lookup without task metadata.
     pub runtime_env: BTreeMap<OsString, OsString>,
+    /// The dotenv files its environment was loaded from, `envFile` among
+    /// them, as absolute paths, whether or not each exists.
+    pub dotenv: Vec<PathBuf>,
     pub node_path: Option<NodePath>,
     /// The environment the task declares, `qk:env`, which its key holds;
     /// `None` where it inherits every variable.
@@ -677,40 +680,6 @@ fn dotenv_files(
     files
 }
 
-/// The dotenv files qk loads into a task's environment, workspace-relative,
-/// whether they exist or not: its own, as Nx picks them, and its `envFile`,
-/// unless `NX_LOAD_DOT_ENV_FILES=false` in `base_env` turns them off.
-pub fn loaded_dotenv_files(
-    workspace: &Workspace,
-    task: &Task,
-    base_env: &BTreeMap<OsString, OsString>,
-) -> Result<Vec<String>> {
-    if !loads_dotenv(base_env) {
-        return Ok(Vec::new());
-    }
-    let project = &workspace.projects[&task.project];
-    let (target, non_atomized) = owner_target(project, &task.target);
-    let mut files = dotenv_files(
-        &project.root,
-        target,
-        task.configuration.as_deref(),
-        non_atomized,
-    );
-    if task.definition.executor.as_deref() == Some("nx:run-commands") {
-        let options = run_commands_overrides(&task.definition.options, &task.args, project)?;
-        if let Some(file) = options.get("envFile").and_then(Value::as_str) {
-            // As reads are named: `/`-separated, without `.` parts.
-            files.push(
-                file.split(['/', '\\'])
-                    .filter(|part| !part.is_empty() && *part != ".")
-                    .collect::<Vec<_>>()
-                    .join("/"),
-            );
-        }
-    }
-    Ok(files)
-}
-
 /// The target whose dotenv files a task reads, and the target it was
 /// atomized from, as Nx's getOwnerTargetForTask finds them: through the
 /// project's `metadata.targetGroups`, a target of the task's group that
@@ -795,6 +764,7 @@ fn task_environment(
     task: &Task,
     base_env: &BTreeMap<OsString, OsString>,
     environment: Option<&mut qk_config::env::Environment>,
+    loaded: &mut Vec<PathBuf>,
 ) -> Result<(BTreeMap<OsString, OsString>, BTreeMap<OsString, OsString>)> {
     let mut env = base_env.clone();
     let project = &workspace.projects[&task.project];
@@ -848,6 +818,7 @@ fn task_environment(
         .map(|file| workspace.root.join(file))
         .collect();
         dotenv::load(&files, &mut env)?;
+        loaded.extend(files);
     }
     let runtime_env = env.clone();
     // Nx's own variables from an enclosing run, which describe that run.
@@ -956,8 +927,9 @@ pub fn prepare(
     };
     let mut environment = qk_config::env::Environment::of(&workspace.config, definition)
         .with_context(|| format!("invalid environment for {}", task.id))?;
+    let mut dotenv = Vec::new();
     let (mut env, mut runtime_env) =
-        task_environment(workspace, task, base_env, environment.as_mut())?;
+        task_environment(workspace, task, base_env, environment.as_mut(), &mut dotenv)?;
     // As in Nx 24, `envFile` sets what the task's environment, dotenv files
     // included, leaves unset or empty, beneath `env`; and the task's
     // environment says whether it loads.
@@ -970,6 +942,7 @@ pub fn prepare(
             }
             dotenv::load(std::slice::from_ref(&path), &mut runtime_env)?;
             dotenv::load(std::slice::from_ref(&path), &mut env)?;
+            dotenv.push(path);
         }
     }
     if let Some(values) = options.get("env").filter(|_| run_commands) {
@@ -1190,6 +1163,7 @@ pub fn prepare(
         parallel,
         cwd,
         env,
+        dotenv,
         runtime_env,
         environment,
         node_path: Some(node_path),
@@ -1452,5 +1426,57 @@ mod dotenv_tests {
         assert!(files.contains(&"app/.env".to_owned()));
         assert!(files.contains(&".env.ci".to_owned()));
         assert!(files.contains(&".env".to_owned()));
+    }
+}
+
+#[cfg(test)]
+mod loaded_tests {
+    use super::*;
+
+    /// The dotenv files a task's environment was loaded from are those
+    /// `prepare` loaded: its `envFile` whatever its name, absolute or not,
+    /// but not when the task's own dotenv files turn loading off.
+    #[test]
+    fn lists_the_dotenv_files_it_loaded() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let absolute = root.join("config/absolute.env");
+        std::fs::write(root.join("nx.json"), "{}").unwrap();
+        std::fs::write(
+            root.join("project.json"),
+            serde_json::json!({"name": "app", "targets": {
+                "plain": {"command": "true", "options": {"envFile": "config/variables.txt"}},
+                "absolute": {"command": "true", "options": {"envFile": absolute}},
+                "off": {"command": "true", "options": {"envFile": "config/variables.txt"}}
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("config")).unwrap();
+        std::fs::write(root.join("config/variables.txt"), "A=1\n").unwrap();
+        std::fs::write(&absolute, "B=1\n").unwrap();
+        std::fs::write(root.join(".env.off"), "NX_LOAD_DOT_ENV_FILES=false\n").unwrap();
+        let workspace = Workspace::load(root).unwrap();
+        let requests = ["app:plain", "app:absolute", "app:off"]
+            .map(|request| qk_taskgraph::Request::parse(request).unwrap());
+        let graph = qk_taskgraph::TaskGraph::build(&workspace, &requests).unwrap();
+        let loaded = |id: &str| {
+            prepare(&workspace, &graph.tasks[id], &BTreeMap::new())
+                .unwrap()
+                .dotenv
+        };
+        let plain = loaded("app:plain");
+        assert!(plain.contains(&workspace.root.join(".env")), "{plain:?}");
+        assert_eq!(
+            plain.last(),
+            Some(&workspace.root.join("config/variables.txt"))
+        );
+        assert_eq!(loaded("app:absolute").last(), Some(&absolute));
+        let off = loaded("app:off");
+        assert!(off.contains(&workspace.root.join(".env.off")), "{off:?}");
+        assert!(
+            !off.contains(&workspace.root.join("config/variables.txt")),
+            "{off:?}"
+        );
     }
 }
