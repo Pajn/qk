@@ -38,6 +38,8 @@ pub struct State {
     /// Answer the next entry commit with 422 for its blobs stored apart,
     /// forgetting them, as a store that lost them would.
     pub fail_commit_once: bool,
+    /// How many times the whole index was listed, without a cursor.
+    pub whole_listings: usize,
     /// Answer every write with 503, as a store that cannot take them now.
     pub refuse_writes: bool,
     pub latency: Duration,
@@ -272,6 +274,9 @@ fn handle(
             (201, Vec::new(), answer.to_string().into_bytes())
         }
         ("GET", "index") => {
+            if parameter("since").is_none() {
+                state.whole_listings += 1;
+            }
             let since: u64 = parameter("since")
                 .and_then(|since| since.parse().ok())
                 .unwrap_or(0);

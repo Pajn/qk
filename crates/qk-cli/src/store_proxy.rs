@@ -8,7 +8,7 @@
 //! `QK_STORE_SERVER_URL` at the proxy and keep their tokens, which the
 //! upstream checks.
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -35,6 +35,14 @@ const MAX_LINE: u64 = 64 << 10;
 const MAX_HEADERS: usize = 100;
 /// How long a connection may wait for a client to send or take bytes.
 const IDLE: Duration = Duration::from_secs(60);
+/// After how long the proxy reads the index whole again, as a listing of what
+/// changed cannot say which keys the upstream dropped.
+const INDEX_REREAD: Duration = Duration::from_secs(60 * 60);
+/// How long reading the index may take, after which a whole listing is
+/// asked of the upstream as it came.
+const INDEX_TIMEOUT: Duration = Duration::from_secs(60);
+/// The largest index the proxy reads into memory.
+const LARGEST_INDEX: u64 = 256 << 20;
 /// The largest bundle a store server takes, as the protocol bounds an upload
 /// body.
 const LARGEST_BUNDLE: usize = 100 << 20;
@@ -65,11 +73,20 @@ struct Proxy {
     /// Uploads answered for and not yet sent upstream, each a job file named
     /// by its place in the queue and, for a record, its body beside it.
     queue: PathBuf,
-    /// The newest upload of each warm record sent upstream, named by a hash
-    /// of its path, which the proxy serves without asking the upstream: warm
-    /// state is never current, only recent, so a save the proxy holds serves
-    /// as well as a newer one elsewhere.
+    /// The records the proxy serves without asking the upstream, named by a
+    /// hash of their paths: each entry it committed upstream, which never
+    /// changes once committed; and the newest upload of each warm record, as
+    /// warm state is never current, only recent, so a save the proxy holds
+    /// serves as well as a newer one elsewhere.
     records: PathBuf,
+    /// The upstream's index as last read, which whole listings are answered
+    /// from once brought up to date; and held while one is, so that listings
+    /// asked for meanwhile share it.
+    index: Mutex<Option<IndexCopy>>,
+    /// Held while the copy is brought up to date; it holds when the last
+    /// attempt that failed began, so that listings asked for before then
+    /// share its failure rather than each trying again.
+    catching_up: Mutex<Option<Instant>>,
     next_job: AtomicU64,
     jobs: Mutex<VecDeque<u64>>,
     job_ready: Condvar,
@@ -192,6 +209,8 @@ impl Proxy {
             record_sent: Condvar::new(),
             upstream_holds: Mutex::new(HashMap::new()),
             upstream_refuses_bundles: AtomicBool::new(false),
+            index: Mutex::new(None),
+            catching_up: Mutex::new(None),
             max_size: options.max_size,
             trusted: Mutex::new(HashSet::new()),
             writers: Mutex::new(HashSet::new()),
@@ -418,20 +437,14 @@ fn handle(
         return Ok((200, "local", sent));
     }
     // An entry or warm record still queued is the newest; the upstream has
-    // an older one or none. A warm record sent on since is kept and served
-    // too, without asking the upstream for a newer one.
+    // an older one or none. Once sent on, it is kept and served too.
     if record
         && matches!(request.method.as_str(), "GET" | "HEAD")
         && proxy.trusts(request)
         && let Some((pack, source)) = proxy
             .queued_pack(path)
             .map(|pack| (pack, "queued"))
-            .or_else(|| {
-                path.starts_with("/v4/warm/")
-                    .then(|| proxy.kept_pack(path))
-                    .flatten()
-                    .map(|pack| (pack, "kept"))
-            })
+            .or_else(|| proxy.kept_pack(path).map(|pack| (pack, "kept")))
     {
         head(
             writer,
@@ -447,6 +460,32 @@ fn handle(
             proxy.stats.local_bytes.fetch_add(sent, Ordering::Relaxed);
         }
         return Ok((200, source, sent));
+    }
+    // The whole index, which a client with no cursor asks for, from the copy
+    // brought up to date with what changed upstream since.
+    if request.method == "GET"
+        && request.target == "/v4/index"
+        && proxy.trusts(request)
+        && let Some(authorization) = &request.authorization
+        && let Ok((text, cursor)) = proxy.index_listing(authorization)
+    {
+        let text: &str = &text;
+        head(
+            writer,
+            200,
+            &[
+                ("content-type", "text/plain; charset=utf-8"),
+                ("qk-index-cursor", cursor.as_str()),
+            ],
+            Some(text.len() as u64),
+        )?;
+        writer.write_all(text.as_bytes())?;
+        proxy.stats.local_hits.fetch_add(1, Ordering::Relaxed);
+        proxy
+            .stats
+            .local_bytes
+            .fetch_add(text.len() as u64, Ordering::Relaxed);
+        return Ok((200, "proxy", text.len() as u64));
     }
     // A client asks before uploading a blob. Uploading one the upstream has
     // costs only the local network, and the proxy asks the upstream itself
@@ -514,12 +553,16 @@ fn handle(
             }
             // An older one kept is no longer what the upstream holds. Not
             // replaced, as two such uploads may be answered in either order;
-            // the next read goes upstream.
+            // the next read goes upstream. An entry the upstream committed
+            // never changes, so it is kept.
             if path.starts_with("/v4/warm/") {
                 proxy.forget_record(path);
+            } else if path.starts_with("/v4/entries/") {
+                proxy.keep_body(path, &request.body);
             }
         }
     }
+
     Ok((status, "upstream", sent))
 }
 
@@ -1014,12 +1057,14 @@ impl Proxy {
                     },
                 };
                 let sent = self.send(job, id);
-                // A warm record sent upstream is kept, so the proxy serves it
-                // once it is no longer queued; on its turn, so that a newer
-                // upload of it is kept after.
-                if matches!(sent, Sent::Done(_))
+                // An entry or warm record sent upstream is kept, so the proxy
+                // serves it once it is no longer queued; on its turn, so that
+                // a newer upload of it is kept after. Not an entry another run
+                // committed first, which may hold other outputs than this one.
+                if matches!(sent, Sent::Done(status) if status != 409)
                     && job.blob.is_none()
-                    && record_path(&job.target).starts_with("/v4/warm/")
+                    && (record_path(&job.target).starts_with("/v4/warm/")
+                        || record_path(&job.target).starts_with("/v4/entries/"))
                 {
                     self.keep_record(record_path(&job.target), &self.body_path(id));
                 }
@@ -1324,6 +1369,11 @@ impl Proxy {
             if fs::rename(body, &destination).is_err() {
                 return;
             }
+            // Used now, as far as eviction goes, however long it was queued.
+            let _ = File::options()
+                .write(true)
+                .open(&destination)
+                .and_then(|file| file.set_modified(SystemTime::now()));
             self.size.fetch_add(length, Ordering::Relaxed);
             self.size.fetch_sub(previous, Ordering::Relaxed);
         }
@@ -1335,7 +1385,7 @@ impl Proxy {
         }
     }
 
-    /// Removes the warm record kept for `path`, if any.
+    /// Removes the record kept for `path`, if any.
     fn forget_record(&self, path: &str) {
         let _evicting = self.evicting.lock().unwrap();
         let file = self.record_file(path);
@@ -1358,6 +1408,100 @@ impl Proxy {
         pack_of_upload(&body)
     }
 
+    /// Keeps `body`, an upload of the record at `path` the upstream took.
+    fn keep_body(&self, path: &str, body: &[u8]) {
+        if let Ok(mut file) = tempfile::NamedTempFile::new_in(&self.scratch)
+            && file.write_all(body).is_ok()
+        {
+            self.keep_record(path, file.path());
+        }
+    }
+
+    /// The whole index and its cursor: the copy, brought up to date with
+    /// what changed upstream since, so that an entry committed before it was
+    /// asked for is listed; or read whole again once it is old enough that
+    /// keys the upstream dropped since matter. Listings asked for while one
+    /// is brought up to date wait and share it, or its failure. Asked as
+    /// `authorization`.
+    fn index_listing(&self, authorization: &str) -> Result<(Arc<str>, String)> {
+        let asked = Instant::now();
+        let mut failed = self.catching_up.lock().unwrap();
+        if failed.is_some_and(|began| began >= asked) {
+            bail!("bringing the index up to date failed meanwhile");
+        }
+        let current = |copy: &Option<IndexCopy>| {
+            copy.as_ref()
+                .filter(|index| index.caught_up >= asked)
+                .map(|index| (index.text.clone(), index.cursor.clone()))
+        };
+        if let Some(listing) = current(&self.index.lock().unwrap()) {
+            return Ok(listing);
+        }
+        let started = Instant::now();
+        let held = self.index.lock().unwrap().as_ref().and_then(|index| {
+            (started.duration_since(index.read_whole) <= INDEX_REREAD).then(|| index.cursor.clone())
+        });
+        let (text, cursor) = match self.read_index(authorization, held.as_deref()) {
+            Ok(read) => read,
+            Err(error) => {
+                *failed = Some(started);
+                return Err(error);
+            }
+        };
+        let mut copy = self.index.lock().unwrap();
+        match (held, copy.as_mut()) {
+            (Some(_), Some(index)) => index.merge(&text, cursor, started),
+            _ => {
+                let mut index = IndexCopy {
+                    keys: BTreeMap::new(),
+                    runs: String::new(),
+                    cursor: String::new(),
+                    text: Arc::from(""),
+                    read_whole: started,
+                    caught_up: started,
+                };
+                index.merge(&text, cursor, started);
+                *copy = Some(index);
+            }
+        }
+        Ok(current(&copy).expect("the index was brought up to date"))
+    }
+
+    /// The upstream's index, whole or since `cursor`, with its cursor.
+    fn read_index(&self, authorization: &str, cursor: Option<&str>) -> Result<(String, String)> {
+        self.stats.upstream_requests.fetch_add(1, Ordering::Relaxed);
+        let target = match cursor {
+            Some(cursor) => format!("{}/v4/index?since={cursor}", self.upstream),
+            None => format!("{}/v4/index", self.upstream),
+        };
+        let mut response = self
+            .agent
+            .get(target)
+            .header("authorization", authorization)
+            .config()
+            .timeout_global(Some(INDEX_TIMEOUT))
+            .build()
+            .call()?;
+        if response.status().as_u16() != 200 {
+            bail!("the upstream answered {} for its index", response.status());
+        }
+        let cursor = response
+            .headers()
+            .get("qk-index-cursor")
+            .and_then(|value| value.to_str().ok())
+            .context("the upstream's index has no cursor")?
+            .to_owned();
+        let text = response
+            .body_mut()
+            .with_config()
+            .limit(LARGEST_INDEX)
+            .read_to_string()?;
+        self.stats
+            .upstream_bytes
+            .fetch_add(text.len() as u64, Ordering::Relaxed);
+        Ok((text, cursor))
+    }
+
     fn put(
         &self,
         target: &str,
@@ -1378,6 +1522,54 @@ impl Proxy {
 }
 
 /// What a status the upstream answered an upload with comes to.
+/// The upstream's index as the proxy last read it: each key with its time,
+/// and the runs, as the upstream lists them.
+struct IndexCopy {
+    keys: BTreeMap<String, String>,
+    runs: String,
+    cursor: String,
+    /// The whole listing, as of `cursor`.
+    text: Arc<str>,
+    /// When the reads it was last read whole and last brought up to date
+    /// with began.
+    read_whole: Instant,
+    caught_up: Instant,
+}
+
+impl IndexCopy {
+    /// Takes in `text`, a listing of what changed, as of `cursor`: a key's
+    /// time replaces the one held, and the runs, which every listing names
+    /// whole, replace those held.
+    fn merge(&mut self, text: &str, cursor: String, read: Instant) {
+        self.caught_up = read;
+        let mut runs = String::new();
+        for line in text.lines() {
+            if line.starts_with("run ") {
+                runs.push_str(line);
+                runs.push('\n');
+            } else if let Some((key, time)) = line.split_once(' ') {
+                self.keys.insert(key.to_owned(), time.to_owned());
+            }
+        }
+        self.runs = runs;
+        self.cursor = cursor;
+        self.text = Arc::from(self.listing());
+    }
+
+    /// The whole listing, keys in order and then the runs.
+    fn listing(&self) -> String {
+        let mut text = String::with_capacity(self.keys.len() * 80 + self.runs.len());
+        for (key, time) in &self.keys {
+            text.push_str(key);
+            text.push(' ');
+            text.push_str(time);
+            text.push('\n');
+        }
+        text.push_str(&self.runs);
+        text
+    }
+}
+
 /// Whether an upload to `target` is a bundle of blobs.
 fn is_bundle(target: &str) -> bool {
     record_path(target).starts_with("/v4/bundles/")
@@ -1898,6 +2090,47 @@ mod tests {
             "the queued blob was evicted"
         );
         assert_eq!(proxy.jobs.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_listing_shares_the_failure_of_a_catch_up_begun_after_it_was_asked_for() {
+        let directory = tempfile::tempdir().unwrap();
+        let proxy = Proxy::open(&Options {
+            upstream: "http://127.0.0.1:9".into(),
+            directory: directory.path().to_owned(),
+            listen: String::new(),
+            max_size: None,
+        })
+        .unwrap();
+        // One that failed after this listing was asked for is its answer,
+        // without asking the upstream again.
+        *proxy.catching_up.lock().unwrap() = Some(Instant::now() + Duration::from_secs(60));
+        let shared = proxy.index_listing("Bearer token").unwrap_err();
+        assert!(shared.to_string().contains("failed meanwhile"), "{shared}");
+        // One that failed before it was asked for is not: it asks itself.
+        *proxy.catching_up.lock().unwrap() = Some(Instant::now() - Duration::from_secs(60));
+        let own = proxy.index_listing("Bearer token").unwrap_err();
+        assert!(!own.to_string().contains("failed meanwhile"), "{own}");
+        assert_eq!(proxy.stats.upstream_requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn a_copy_of_the_index_takes_in_what_changed() {
+        let now = Instant::now();
+        let mut index = IndexCopy {
+            keys: BTreeMap::new(),
+            runs: String::new(),
+            cursor: String::new(),
+            text: Arc::from(""),
+            read_whole: now,
+            caught_up: now,
+        };
+        index.merge("b 1\na 1\nrun r1 5 m1\n", "7".into(), now);
+        // A key's newer time replaces its older one, a new key joins, and the
+        // runs, which every listing names whole, replace those held.
+        index.merge("b 9\nc 2\nrun r2 8 m2\n", "9".into(), now);
+        assert_eq!(&*index.text, "a 1\nb 9\nc 2\nrun r2 8 m2\n");
+        assert_eq!(index.cursor, "9");
     }
 
     #[test]
