@@ -3659,6 +3659,33 @@ fn the_overlay_sandbox_keeps_a_node_modules_a_task_makes() {
     assert_eq!(findings["tasks"], json!({}), "{findings}");
 }
 
+/// Linux enforce over an overlay: a command cannot read back the files it
+/// wrote in a `node_modules` it made, as Landlock allows reads beneath paths
+/// that exist as the command starts.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_overlay_sandbox_refuses_what_a_command_writes_into_a_new_node_modules() {
+    if !can_overlay() {
+        return;
+    }
+    let _audit = AUDIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = fixture(json!({
+        "install": {
+            "command": "mkdir -p pkg/node_modules/x && printf '#!/bin/sh\\necho ran\\n' > pkg/node_modules/x/tool && chmod +x pkg/node_modules/x/tool && pkg/node_modules/x/tool",
+            "inputs": []
+        }
+    }));
+    let output = run(
+        temp.path(),
+        &["run", "app:install", "--skip-cache", "--sandbox=enforce"],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Permission denied"), "{stderr}");
+}
+
 /// A `node_modules` the run found as it started that an earlier task
 /// replaces with a link leads nowhere new: Linux enforce, over an overlay or
 /// by Landlock alone, neither binds it through nor allows anything beneath
@@ -5171,6 +5198,42 @@ fn the_sandbox_reports_a_package_read_that_the_key_leaves_out() {
         temp.path(),
         &["run", "app:lint", "--skip-cache", "--sandbox=enforce"],
     ));
+}
+
+/// Without `externalDependencies`, a task's key counts every package its
+/// importers install: one none of them installs, which pnpm's hoisting let
+/// it find, is listed as hoisted.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn the_sandbox_reports_a_package_found_through_hoisting() {
+    if !can_audit() {
+        return;
+    }
+    let _audit = AUDIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = root_tool_fixture(json!({
+        "build": {
+            "command": "cat ../../node_modules/.pnpm/phantom@1.0.0/node_modules/phantom/package.json",
+            "options": {"cwd": "apps/app"},
+            "inputs": ["default"]
+        }
+    }));
+    let report = temp.path().join("sandbox.json");
+    success(run(
+        temp.path(),
+        &[
+            "run",
+            "app:build",
+            "--sandbox",
+            "--sandbox-report",
+            report.to_str().unwrap(),
+        ],
+    ));
+    let findings: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+    let build = &findings["tasks"]["app:build"];
+    assert_eq!(build["hoistedPackages"], json!(["phantom"]), "{findings}");
+    assert_eq!(build["unkeyedPackages"], json!([]), "{findings}");
 }
 
 /// A nested workspace a task's `ignoreReads` covers brings what it installs,
