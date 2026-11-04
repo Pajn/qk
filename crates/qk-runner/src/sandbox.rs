@@ -905,15 +905,29 @@ impl Drop for Sandbox {
 }
 
 /// `path` as reports name it, `/`-separated beneath the workspace, whose
-/// root `root` is resolved and `given` as given; `None` outside it.
+/// root `root` is resolved and `given` as given; `None` outside it. Reports
+/// name the path a read resolved to, so one that exists is resolved too;
+/// one that does not has its `.` and `..` parts taken as they read.
 fn workspace_relative(root: &Path, given: &Path, path: &Path) -> Option<String> {
+    let path = path.canonicalize().unwrap_or_else(|_| {
+        let mut normal = PathBuf::new();
+        for part in path.components() {
+            match part {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    normal.pop();
+                }
+                part => normal.push(part),
+            }
+        }
+        normal
+    });
     let relative = path
         .strip_prefix(root)
         .or_else(|_| path.strip_prefix(given))
         .ok()?;
     relative
         .components()
-        .filter(|part| *part != std::path::Component::CurDir)
         .map(|part| match part {
             std::path::Component::Normal(part) => part.to_str(),
             _ => None,
@@ -1824,6 +1838,10 @@ mod tests {
             (
                 "/link/repo/./config/variables.txt",
                 Some("config/variables.txt"),
+            ),
+            (
+                "/real/repo/apps/web/../shared/vars.txt",
+                Some("apps/shared/vars.txt"),
             ),
             ("/elsewhere/.env", None),
             ("/real/repo/../other/.env", None),
