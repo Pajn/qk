@@ -3686,6 +3686,33 @@ fn the_overlay_sandbox_refuses_what_a_command_writes_into_a_new_node_modules() {
     assert!(stderr.contains("Permission denied"), "{stderr}");
 }
 
+/// Linux enforce: a `node_modules` an unsandboxed task makes is granted to
+/// the tasks that start after it, over an overlay and by Landlock alone.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_sandbox_grants_a_node_modules_an_unsandboxed_task_makes() {
+    let temp = fixture(json!({
+        "install": {"command": "mkdir -p pkg/node_modules/x && echo installed > pkg/node_modules/x/a", "qk:sandbox": false},
+        "use": {"command": "cat pkg/node_modules/x/a", "dependsOn": ["install"], "inputs": []}
+    }));
+    let root = temp.path();
+    for overlay in ["1", "0"] {
+        let _ = fs::remove_dir_all(root.join("pkg"));
+        let output = command(
+            root,
+            &["run", "app:use", "--skip-cache", "--sandbox=enforce"],
+        )
+        .env("QK_SANDBOX_OVERLAY", overlay)
+        .output()
+        .unwrap();
+        let output = success(output);
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("installed"),
+            "overlay {overlay}"
+        );
+    }
+}
+
 /// A `node_modules` the run found as it started that an earlier task
 /// replaces with a link leads nowhere new: Linux enforce, over an overlay or
 /// by Landlock alone, neither binds it through nor allows anything beneath

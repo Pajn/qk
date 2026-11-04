@@ -140,13 +140,18 @@ pub struct Sandbox {
     directory: PathBuf,
     /// Linux enforce: what the policies' patterns name in the workspace,
     /// since Landlock takes paths rather than patterns: those there as the
-    /// run starts, and the `node_modules` tasks over overlays make as they
-    /// settle, for the tasks starting after them. A task held by Landlock
+    /// run starts, and the `node_modules` tasks over overlays, or unsandboxed,
+    /// make as they end, for the tasks starting after them. A task held by
+    /// Landlock
     /// alone cannot make a `node_modules` itself, and a command over an
     /// overlay cannot read the files it wrote in one it made, only what
     /// links there lead to.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     expansion: Mutex<landlock::Expansion>,
+    /// Linux enforce: tasks running unsandboxed, whose `node_modules` the
+    /// workspace is scanned for again as they end.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    running_bare: Mutex<BTreeSet<String>>,
     /// Linux audit: the recorder, and each task's recording with the
     /// directory its commands start in.
     recording: Option<qk_executor::Recording>,
@@ -355,6 +360,7 @@ impl Sandbox {
             watcher: None,
             directory,
             expansion: Mutex::new(landlock::Expansion::default()),
+            running_bare: Mutex::new(BTreeSet::new()),
             recording: None,
             traces: Mutex::new(BTreeMap::new()),
             trace_count: std::sync::atomic::AtomicUsize::new(0),
@@ -440,6 +446,9 @@ impl Sandbox {
             return Some(qk_executor::Confinement::Refused(reason.clone()));
         }
         if !self.policies.contains_key(id) || self.recording.is_some() {
+            if cfg!(target_os = "linux") && self.mode == Mode::Enforce {
+                self.running_bare.lock().unwrap().insert(id.to_owned());
+            }
             return None;
         }
         if self.overlay {
@@ -528,8 +537,18 @@ impl Sandbox {
     /// As a task ends, over an overlay: applies its commands' writes, if the
     /// executor has not as they ended, removes its layers, and keeps what
     /// lay outside its outputs, warm paths and scratch directories as
-    /// findings.
+    /// findings. Under Linux enforce, unsandboxed: adds the `node_modules`
+    /// it made to those later tasks are granted, rescanning the workspace
+    /// and adding to what is known rather than replacing it, which another
+    /// task settling meanwhile may have added to.
     pub fn settle(&self, id: &str) {
+        if self.running_bare.lock().unwrap().remove(id) {
+            let found = landlock::Expansion::scan(&self.root);
+            self.expansion
+                .lock()
+                .unwrap()
+                .add_node_modules(&found.node_modules);
+        }
         let Some(overlay) = self.overlays.lock().unwrap().remove(id) else {
             return;
         };
