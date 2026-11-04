@@ -118,19 +118,26 @@ export function parseHeader(bytes: Uint8Array): UploadHeader {
   return { record, blobs: parsed };
 }
 
-/** Reads a whole upload body. With `key`, its record must be the result
- * record for that key. Throws `Malformed` when the body is not an upload. */
-export function parseUpload(body: Uint8Array, key?: string): Upload {
+/** The header `body` starts with, as its length then its JSON, and where
+ * what follows it starts. `what` names the body in errors. */
+function leadingHeader(body: Uint8Array, what: string): { bytes: Uint8Array; header: UploadHeader; end: number } {
   if (body.length < 4) {
-    throw new Malformed("the upload body ends early");
+    throw new Malformed(`the ${what} body ends early`);
   }
   const view = new DataView(body.buffer, body.byteOffset, body.byteLength);
   const headerLength = view.getUint32(0, true);
   if (headerLength > LARGEST_HEADER || 4 + headerLength > body.length) {
-    throw new Malformed("the upload header's length is invalid");
+    throw new Malformed(`the ${what} header's length is invalid`);
   }
-  const header = parseHeader(body.subarray(4, 4 + headerLength));
-  let at = 4 + headerLength;
+  const bytes = body.subarray(4, 4 + headerLength);
+  return { bytes, header: parseHeader(bytes), end: 4 + headerLength };
+}
+
+/** Reads a whole upload body. With `key`, its record must be the result
+ * record for that key. Throws `Malformed` when the body is not an upload. */
+export function parseUpload(body: Uint8Array, key?: string): Upload {
+  const { header, end } = leadingHeader(body, "upload");
+  let at = end;
   const inlineTotal = header.blobs.reduce((total, blob) => total + (blob.compressed ?? 0), 0);
   if (at + header.record + inlineTotal !== body.length) {
     throw new Malformed("the upload body's length does not match its header");
@@ -161,6 +168,42 @@ export function parseUpload(body: Uint8Array, key?: string): Upload {
     at += blob.compressed;
   }
   return { header, record, json: json as Record<string, unknown>, inline };
+}
+
+/** A bundle body, read whole: the blobs it carries, each with where its zstd
+ * frame starts in the body and how long it is. */
+export interface Bundle {
+  /** The bytes of its header, which name it. */
+  header: Uint8Array;
+  blobs: { hash: string; offset: number; length: number }[];
+}
+
+/** The bundle `body` is: an upload body with an empty record that carries
+ * every blob it lists inline. Throws `Malformed` otherwise. */
+export function parseBundle(body: Uint8Array): Bundle {
+  const { bytes: header, header: parsed, end } = leadingHeader(body, "bundle");
+  if (parsed.record !== 0) {
+    throw new Malformed("a bundle carries no record");
+  }
+  let at = end;
+  const blobs = parsed.blobs.map((blob) => {
+    if (blob.compressed === null) {
+      throw new Malformed(`a bundle carries every blob it lists, not ${blob.hash}`);
+    }
+    if (at + blob.compressed > body.length || !ZSTD_MAGIC.every((byte, index) => body[at + index] === byte)) {
+      throw new Malformed(`blob ${blob.hash} is not a zstd frame`);
+    }
+    const placed = { hash: blob.hash, offset: at, length: blob.compressed };
+    at += blob.compressed;
+    return placed;
+  });
+  if (blobs.length === 0) {
+    throw new Malformed("a bundle carries at least one blob");
+  }
+  if (at !== body.length) {
+    throw new Malformed("the bundle body's length does not match its header");
+  }
+  return { header, blobs };
 }
 
 /** Builds an upload body: the counterpart of `parseUpload`, for tests and

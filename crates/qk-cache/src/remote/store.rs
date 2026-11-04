@@ -29,6 +29,16 @@ pub(super) enum Object<'a> {
     Expectations(&'a str),
 }
 
+/// What a store that takes bundles says of some blobs.
+#[derive(Default)]
+pub(super) struct Held {
+    /// The ones it lacks.
+    pub(super) missing: std::collections::HashSet<String>,
+    /// The ones it holds in an object each, which it would rather take
+    /// bundled.
+    pub(super) loose: std::collections::HashSet<String>,
+}
+
 /// How a store wants a record and the blobs it carries sent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Framing {
@@ -103,6 +113,19 @@ pub(super) trait Store: Send + Sync {
 
     /// Writes the pack in `file` as `object`.
     fn put(&self, object: Object, file: File) -> Result<()>;
+
+    /// Which of `blobs` the store lacks, and which it holds loose: each in an
+    /// object of its own, though small enough to bundle. `None` when the store
+    /// takes no bundles.
+    fn blobs_held(&self, _blobs: &[String]) -> Result<Option<Held>> {
+        Ok(None)
+    }
+
+    /// Writes the bundle in `file`, named `id`, answering whether the store
+    /// took it: `false` when it takes no bundles after all.
+    fn put_bundle(&self, _id: &str, _file: File) -> Result<bool> {
+        Ok(false)
+    }
 
     /// Records ahead of an upload that the store is about to hold `key`, whose
     /// entry stores the blobs `apart` on their own, so readers find it even

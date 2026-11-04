@@ -118,6 +118,37 @@ pub(super) fn write_upload(
     Ok(())
 }
 
+/// Writes the bundle of `blobs`, sorted hashes in the local store at `root`,
+/// to `output`: an upload body with an empty record that carries each of them
+/// inline, as `tools/store-server/PROTOCOL.md` describes. Answers its name,
+/// the SHA-256 of its header as hex, which a store server checks.
+pub(super) fn write_bundle(root: &Path, blobs: &[String], output: impl Write) -> Result<String> {
+    use sha2::Digest;
+    use std::io::Seek;
+    // One scratch file for the frames, rather than one open per blob.
+    let mut frames = tempfile::tempfile_in(root.join("tmp"))?;
+    let mut listed = Vec::new();
+    for blob in blobs {
+        if !crate::record::valid_hash(blob) {
+            bail!("invalid blob name in remote record");
+        }
+        let length = std::fs::metadata(root.join("blobs").join(blob))?.len();
+        let compressed = io::copy(&mut compress(root, blob)?.reopen()?, &mut frames)?;
+        listed.push(serde_json::json!([blob, length, compressed]));
+    }
+    let header = serde_json::to_vec(&serde_json::json!({"record": 0, "blobs": listed}))?;
+    let mut output = io::BufWriter::new(output);
+    output.write_all(&u32::try_from(header.len())?.to_le_bytes())?;
+    output.write_all(&header)?;
+    frames.rewind()?;
+    io::copy(&mut frames, &mut output)?;
+    output.flush()?;
+    Ok(sha2::Sha256::digest(&header)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
 /// What reading a pack moved: the bytes received, as compressed, how many of
 /// the inline blob bytes the local store held already, and how many bytes of
 /// blobs stored apart it did not fetch because the local store held them.

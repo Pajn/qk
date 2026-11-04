@@ -2,7 +2,8 @@
 // Durable Object for the index.
 //
 // R2 holds `entries/<key>`, `warm/<a>/<b>`, `pathsets/<weak>` and
-// `expectations/<name>` as the upload bodies clients sent, `blobs/<hash>` as one zstd frame each, and `sessions/<id>` as the
+// `expectations/<name>` as the upload bodies clients sent, `blobs/<hash>` as one zstd frame each, `bundles/<id>` as the
+// bundle bodies clients sent, many small blobs' frames each, and `sessions/<id>` as the
 // Bloom filters sessions were opened with. A fetched record is composed from
 // its upload body without touching the compressed bytes.
 
@@ -18,13 +19,14 @@ import {
   concat,
   isHash,
   packHeader,
+  parseBundle,
   parseHeader,
   parseUpload,
   rawFrame,
   utf8,
   type UploadHeader,
 } from "./frames";
-import type { Index } from "./index-do";
+import type { Index, StoredBlob } from "./index-do";
 
 export { Index } from "./index-do";
 
@@ -58,6 +60,16 @@ const READ_AHEAD = 16;
  * this always is. */
 const READ_AHEAD_BYTES = 16 << 20;
 let readAheadHeld = 0;
+/** Neighbouring blobs of a bundle a pack carries are read as one range while
+ * the bytes between them stay under `BUNDLE_GAP` and the range under
+ * `BUNDLE_RUN`. An invocation has six R2 reads in flight at most, so a range
+ * rather than a read per blob is what makes many small blobs quick. */
+const BUNDLE_GAP = 256 << 10;
+const BUNDLE_RUN = 4 << 20;
+/** Blobs stored on their own below this size, as qk stores them past what an
+ * upload carries inline, are named `loose` so that clients bundle them. Above
+ * it, qk stores a blob on its own anyway. */
+const LOOSE_BELOW = 1 << 20;
 /** Where the edge cache files immutable objects; never fetched. */
 const CACHE_ORIGIN = "https://qk-store-server.cache";
 
@@ -132,12 +144,18 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
       return getBlob(name, url, env, ctx);
     }
     if (method === "HEAD") {
-      return (await env.STORE.head(`blobs/${name}`)) ? new Response(null) : notFound();
+      return (await env.STORE.head(`blobs/${name}`)) || (await storedBlobs([name], env)).get(name)?.bundle
+        ? new Response(null)
+        : notFound();
     }
     if (method === "PUT") {
       write();
       return putBlob(name, request, env);
     }
+  }
+  if (kind === "bundles" && KEY.test(name) && method === "PUT") {
+    write();
+    return putBundle(name, request, env);
   }
   if (kind === "entries" && KEY.test(name)) {
     if (method === "GET") {
@@ -266,7 +284,7 @@ async function getPack(object: string, immutable: boolean, url: URL, env: Env, c
   const reader = new ByteReader(stored.body);
   let body: ReadableStream<Uint8Array>;
   try {
-    body = await compose(reader, held, env, ctx);
+    body = await compose(reader, held, env);
   } catch (error) {
     await reader.cancel().catch(() => {});
     throw error;
@@ -283,19 +301,14 @@ async function getPack(object: string, immutable: boolean, url: URL, env: Env, c
 
 /** The pack of the upload body `reader` streams: a raw frame of the pack up to
  * its inline blobs, then each inline blob's zstd frame as it is stored. */
-async function compose(
-  reader: ByteReader,
-  held: Bloom | null,
-  env: Env,
-  ctx: ExecutionContext,
-): Promise<ReadableStream<Uint8Array>> {
+async function compose(reader: ByteReader, held: Bloom | null, env: Env): Promise<ReadableStream<Uint8Array>> {
   const headerLength = new DataView((await reader.read(4)).slice().buffer).getUint32(0, true);
   if (headerLength > LARGEST_HEADER) {
     throw new Error("a stored upload's header is too large");
   }
   const header = parseHeader(await reader.read(headerLength));
   const record = await reader.read(header.record);
-  const { placements, sizes } = await place(header, held, env);
+  const { placements, stored } = await place(header, held, env);
   const head = rawFrame(packHeader(record, header.blobs.map((blob, index) => ({ placement: placements[index]!, raw: blob.raw }))));
   // The stored frames past the last one this pack carries are never read.
   let lastStored = -1;
@@ -310,9 +323,8 @@ async function compose(
   const apart = readAhead(
     header.blobs
       .filter((blob, index) => blob.compressed === null && placements[index] === INLINE)
-      .map((blob) => ({ hash: blob.hash, size: sizes.get(blob.hash)! })),
+      .map((blob) => ({ hash: blob.hash, ...stored.get(blob.hash)! })),
     env,
-    ctx,
   );
 
   async function* parts(): AsyncGenerator<Uint8Array> {
@@ -338,71 +350,151 @@ async function compose(
   return streamOf(parts());
 }
 
+/** One R2 read of what a pack carries: a blob stored on its own, or a range
+ * of a bundle holding one or more of its blobs, each `at` bytes into it. */
+interface BlobRead {
+  key: string;
+  range?: { offset: number; length: number };
+  size: number;
+  parts: { hash: string; size: number; at: number }[];
+}
+
+/** The reads of `blobs`, in order, neighbours in a bundle taken together. */
+function blobReads(blobs: ({ hash: string } & StoredBlob)[]): BlobRead[] {
+  const reads: BlobRead[] = [];
+  for (const blob of blobs) {
+    const last = reads.at(-1);
+    if (blob.bundle !== null && last?.range && last.key === `bundles/${blob.bundle}`) {
+      const end = last.range.offset + last.range.length;
+      const length = blob.offset + blob.size - last.range.offset;
+      if (blob.offset >= end && blob.offset - end <= BUNDLE_GAP && length <= BUNDLE_RUN) {
+        last.parts.push({ hash: blob.hash, size: blob.size, at: blob.offset - last.range.offset });
+        last.range.length = length;
+        last.size = length;
+        continue;
+      }
+    }
+    const part = { hash: blob.hash, size: blob.size, at: 0 };
+    reads.push(
+      blob.bundle === null
+        ? { key: `blobs/${blob.hash}`, size: blob.size, parts: [part] }
+        : {
+            key: `bundles/${blob.bundle}`,
+            range: { offset: blob.offset, length: blob.size },
+            size: blob.size,
+            parts: [part],
+          },
+    );
+  }
+  return reads;
+}
+
 /** Answers, in order, the bodies of the blobs stored apart `blobs` names,
- * each of the size the index has for it. Up to `READ_AHEAD` are read whole
- * ahead of the one asked for while they fit what the isolate's packs may hold
- * together; the rest are streamed on their turn. A body read ahead counts
- * against that until the pack asks for the next one, or `close`s; a read the
- * pack gave up counts until it settles. */
+ * each of the size the index has for it. Blobs are read as `blobReads` takes
+ * them. Up to `READ_AHEAD` reads are made whole ahead of the blob asked for
+ * while they fit what the isolate's packs may hold together; the rest are
+ * streamed on their turn. A read made ahead counts against that until the pack
+ * is past its last blob, or `close`s; a read the pack gave up counts until it
+ * settles.
+ *
+ * They are read from R2 and not through the edge cache: an invocation has at
+ * most six requests waiting on their response headers, and a cache match that
+ * misses and the put that fills it would each take one of those from the
+ * reads. */
 function readAhead(
-  blobs: { hash: string; size: number }[],
+  blobs: ({ hash: string } & StoredBlob)[],
   env: Env,
-  ctx: ExecutionContext,
 ): { next: () => Promise<AsyncIterable<Uint8Array> | Iterable<Uint8Array>>; close: () => void } {
+  const reads = blobReads(blobs);
+  const get = (read: BlobRead) =>
+    env.STORE.get(read.key, read.range ? { range: read.range } : undefined).then((stored) => {
+      if (!stored) {
+        throw new Error(`${read.key} went missing while a pack was sent`);
+      }
+      return stored;
+    });
   let next = 0;
-  const reading: { size: number; read: Promise<Uint8Array> }[] = [];
-  // The body last answered, until the pack is past it.
+  const reading: { read: BlobRead; bytes: Promise<Uint8Array> }[] = [];
+  // The read whose blobs the pack is being given, and how many it has had.
+  let current:
+    | {
+        read: BlobRead;
+        given: number;
+        bytes?: Uint8Array;
+        stream?: ReadableStream<Uint8Array>;
+        reader?: ByteReader;
+        past: number;
+      }
+    | undefined;
+  // What the current read holds against the budget, until the pack is past it.
   let sending = 0;
   const release = () => {
     readAheadHeld -= sending;
     sending = 0;
   };
   const fill = () => {
-    while (reading.length < READ_AHEAD && next < blobs.length) {
-      const { hash, size } = blobs[next]!;
-      if (readAheadHeld + size > READ_AHEAD_BYTES) {
+    while (reading.length < READ_AHEAD && next < reads.length) {
+      const read = reads[next]!;
+      if (readAheadHeld + read.size > READ_AHEAD_BYTES) {
         return;
       }
-      readAheadHeld += size;
+      readAheadHeld += read.size;
       next++;
-      const read = readImmutable(`blobs/${hash}`, env, ctx).then((stored) => {
-        if (!stored) {
-          throw new Error(`blob ${hash} went missing while a pack was sent`);
-        }
-        return readAtMost(stored.body, size, hash);
-      });
-      // Its failure is the pack's once it is that blob's turn, not before.
-      read.catch(() => {});
-      reading.push({ size, read });
+      const bytes = get(read).then((stored) => readAtMost(stored.body, read.size, read.key));
+      // Its failure is the pack's once it is that read's turn, not before.
+      bytes.catch(() => {});
+      reading.push({ read, bytes });
     }
+  };
+  const take = async () => {
+    release();
+    await current?.reader?.cancel().catch(() => {});
+    fill();
+    const ahead = reading.shift();
+    if (ahead) {
+      sending = ahead.read.size;
+      current = { read: ahead.read, given: 0, bytes: await ahead.bytes, past: 0 };
+      return;
+    }
+    const read = reads[next++];
+    if (!read) {
+      throw new Error("more blobs stored apart were asked for than the pack inlines");
+    }
+    const stored = await get(read);
+    current = read.range
+      ? { read, given: 0, reader: new ByteReader(stored.body), past: 0 }
+      : { read, given: 0, stream: stored.body, past: 0 };
   };
   return {
     next: async () => {
-      release();
-      fill();
-      const ahead = reading.shift();
-      if (ahead) {
-        sending = ahead.size;
-        return [await ahead.read];
+      if (!current || current.given === current.read.parts.length) {
+        await take();
       }
-      const blob = blobs[next++];
-      if (!blob) {
-        throw new Error("more blobs stored apart were asked for than the pack inlines");
+      const now = current!;
+      const part = now.read.parts[now.given++]!;
+      if (now.bytes) {
+        return [now.bytes.subarray(part.at, part.at + part.size)];
       }
-      const stored = await readImmutable(`blobs/${blob.hash}`, env, ctx);
-      if (!stored) {
-        throw new Error(`blob ${blob.hash} went missing while a pack was sent`);
+      // A blob on its own is streamed as it is stored.
+      if (now.stream) {
+        const stream = now.stream;
+        now.stream = undefined;
+        return chunksOf(stream);
       }
-      return chunksOf(stored.body);
+      const reader = now.reader!;
+      await reader.skip(part.at - now.past);
+      now.past = part.at + part.size;
+      return reader.chunks(part.size);
     },
     close: () => {
       release();
+      void current?.reader?.cancel().catch(() => {});
       for (const ahead of reading.splice(0)) {
-        void ahead.read.then(
+        void ahead.bytes.then(
           () => {},
           () => {},
         ).finally(() => {
-          readAheadHeld -= ahead.size;
+          readAheadHeld -= ahead.read.size;
         });
       }
     },
@@ -431,9 +523,9 @@ async function place(
   header: UploadHeader,
   held: Bloom | null,
   env: Env,
-): Promise<{ placements: number[]; sizes: Map<string, number | null> }> {
+): Promise<{ placements: number[]; stored: Map<string, StoredBlob | null> }> {
   const wanted = header.blobs.filter((blob) => blob.compressed === null && !held?.has(blob.hash));
-  const sizes = await storedSizes(
+  const stored = await storedBlobs(
     wanted.map((blob) => blob.hash),
     env,
   );
@@ -445,14 +537,14 @@ async function place(
     if (blob.compressed !== null) {
       return INLINE;
     }
-    const size = sizes.get(blob.hash);
+    const size = stored.get(blob.hash)?.size;
     if (size == null || budget + size > INLINE_APART_BUDGET) {
       return APART;
     }
     budget += size;
     return INLINE;
   });
-  return { placements, sizes };
+  return { placements, stored };
 }
 
 // Blobs.
@@ -467,6 +559,17 @@ async function getBlob(hash: string, url: URL, env: Env, ctx: ExecutionContext):
   const stored = await readImmutable(`blobs/${hash}`, env, ctx);
   if (stored) {
     return new Response(stored.body, { headers: { ...zstd, "Content-Length": String(stored.size) } });
+  }
+  const bundled = (await storedBlobs([hash], env)).get(hash);
+  if (bundled?.bundle) {
+    const frame = await env.STORE.get(`bundles/${bundled.bundle}`, {
+      range: { offset: bundled.offset, length: bundled.size },
+    });
+    if (frame) {
+      return new Response(cacheCopy(`blobs/${hash}`, frame.body, bundled.size, ctx), {
+        headers: { ...zstd, "Content-Length": String(bundled.size) },
+      });
+    }
   }
   const owner = entry !== null ? `entries/${entry}` : warm !== null ? `warm/${warm}` : null;
   const frame = owner ? await inlineFrame(owner, hash, env) : null;
@@ -593,23 +696,32 @@ async function missingBlobs(request: Request, env: Env): Promise<Response> {
   if (!Array.isArray(blobs) || blobs.length > LARGEST_MISSING_QUERY || !blobs.every(isHash)) {
     throw new Failure(400, "malformed", `blobs must be at most ${LARGEST_MISSING_QUERY} hashes`);
   }
-  return Response.json({ missing: await lacking(blobs, env) });
+  const stored = await storedBlobs(blobs, env);
+  return Response.json({
+    missing: blobs.filter((hash) => stored.get(hash) === null),
+    // Stored on their own, past what their upload carried inline: a client
+    // bundles them when it uploads a record citing them.
+    loose: blobs.filter((hash) => {
+      const blob = stored.get(hash);
+      return blob != null && blob.bundle === null && blob.size < LOOSE_BELOW;
+    }),
+  });
 }
 
 /** Those of `hashes` not stored apart, in order. */
 async function lacking(hashes: string[], env: Env): Promise<string[]> {
-  const sizes = await storedSizes(hashes, env);
-  return hashes.filter((hash) => sizes.get(hash) === null);
+  const stored = await storedBlobs(hashes, env);
+  return hashes.filter((hash) => stored.get(hash) === null);
 }
 
 /** The stored size of each of `hashes` stored apart, or `null` for one that
  * is not, as the index has them. Until the index has listed the blobs stored
  * before it held them, one it lacks is asked of the bucket, a request each,
  * and noted when found. */
-async function storedSizes(hashes: string[], env: Env): Promise<Map<string, number | null>> {
+async function storedBlobs(hashes: string[], env: Env): Promise<Map<string, StoredBlob | null>> {
   const index = indexOf(env);
-  const { sizes, complete } = await index.blobSizes(hashes);
-  const known = new Map(hashes.map((hash, at) => [hash, sizes[at] ?? null]));
+  const { stored, complete } = await index.blobsStored(hashes);
+  const known = new Map(hashes.map((hash, at) => [hash, stored[at] ?? null]));
   if (complete) {
     return known;
   }
@@ -620,7 +732,7 @@ async function storedSizes(hashes: string[], env: Env): Promise<Map<string, numb
       const object = await env.STORE.head(`blobs/${hash}`);
       if (object) {
         found.push([hash, object.size]);
-        known.set(hash, object.size);
+        known.set(hash, { size: object.size, bundle: null, offset: 0 });
       }
     },
   );
@@ -635,6 +747,26 @@ function indexOf(env: Env): DurableObjectStub<Index> {
 }
 
 // Commits.
+
+/** Stores a bundle of small blobs as `bundles/<id>`, `id` being the SHA-256
+ * of its header, which fixes where each blob's frame is. Once there, the
+ * bundle is not replaced: one sent again is noted again, in case the noting
+ * was lost. */
+async function putBundle(id: string, request: Request, env: Env): Promise<Response> {
+  const body = await readBody(request, LARGEST_BODY);
+  const bundle = parseBundle(body);
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bundle.header.slice()));
+  const named = Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  if (named !== id) {
+    throw new Failure(400, "malformed", "a bundle is named by the SHA-256 of its header");
+  }
+  await env.STORE.put(`bundles/${id}`, body, { onlyIf: { etagDoesNotMatch: "*" } });
+  await indexOf(env).noteBundled(
+    id,
+    bundle.blobs.map((blob) => [blob.hash, blob.length, blob.offset]),
+  );
+  return new Response(null, { status: 204 });
+}
 
 async function putEntry(key: string, request: Request, env: Env): Promise<Response> {
   const body = await readBody(request, LARGEST_BODY);
@@ -753,13 +885,24 @@ async function readImmutable(
   if (!object) {
     return null;
   }
-  const [body, copy] = object.body.tee();
+  return { body: cacheCopy(key, object.body, object.size, ctx), size: object.size };
+}
+
+/** `body`, the `size` bytes of the immutable object `key`, filing a copy in
+ * the edge cache on the way. */
+function cacheCopy(
+  key: string,
+  body: ReadableStream<Uint8Array>,
+  size: number,
+  ctx: ExecutionContext,
+): ReadableStream<Uint8Array> {
+  const [sent, copy] = body.tee();
   const headers = {
-    "Content-Length": String(object.size),
+    "Content-Length": String(size),
     "Cache-Control": "public, max-age=31536000, immutable",
   };
-  ctx.waitUntil(caches.default.put(url, new Response(copy, { headers })).catch(() => {}));
-  return { body, size: object.size };
+  ctx.waitUntil(caches.default.put(cacheUrl(key), new Response(copy, { headers })).catch(() => {}));
+  return sent;
 }
 
 function cacheUrl(key: string): string {

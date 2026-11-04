@@ -15,10 +15,13 @@ use serde_json::Value;
 
 use super::bloom::Bloom;
 use super::index;
-use super::store::{Body, Framing, MissingBlobs, Object, Store, warm_names};
+use super::store::{Body, Framing, Held, MissingBlobs, Object, Store, warm_names};
 
 /// The prefix the local copy of a store server's index names its cursor by.
 const CURSOR: &str = "cursor:";
+/// Blobs asked about in one `POST blobs/missing`, as many as the protocol
+/// allows.
+const MISSING_QUERY: usize = 4096;
 
 pub(super) struct Server {
     url: String,
@@ -250,6 +253,56 @@ impl Store for Server {
                     .collect();
                 Err(MissingBlobs(blobs).into())
             }
+            _ => Err(failure(&format!("PUT {path}"), response)),
+        }
+    }
+
+    fn blobs_held(&self, blobs: &[String]) -> Result<Option<Held>> {
+        let mut held = Held::default();
+        for asked in blobs.chunks(MISSING_QUERY) {
+            let response = self
+                .agent
+                .post(self.url("blobs/missing"))
+                .header("Authorization", self.authorization())
+                .header("Content-Type", "application/json")
+                .send(serde_json::json!({ "blobs": asked }).to_string())?;
+            if response.status().as_u16() != 200 {
+                return Err(failure("POST blobs/missing", response));
+            }
+            let answer: Value = serde_json::from_str(&response.into_body().read_to_string()?)?;
+            // A server that takes bundles always names the loose ones.
+            let Some(loose) = answer.get("loose").and_then(Value::as_array) else {
+                return Ok(None);
+            };
+            let names = |values: &Vec<Value>| -> Vec<String> {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter(|hash| crate::record::valid_hash(hash))
+                    .map(str::to_owned)
+                    .collect()
+            };
+            held.loose.extend(names(loose));
+            let missing = answer
+                .get("missing")
+                .and_then(Value::as_array)
+                .context("no missing blobs in the store server's answer")?;
+            held.missing.extend(names(missing));
+        }
+        Ok(Some(held))
+    }
+
+    fn put_bundle(&self, id: &str, file: File) -> Result<bool> {
+        let path = format!("bundles/{id}");
+        let response = self
+            .agent
+            .put(self.url(&path))
+            .header("Authorization", self.authorization())
+            .header("Content-Type", "application/x-qk-upload")
+            .send(file)?;
+        match response.status().as_u16() {
+            200..=299 => Ok(true),
+            404 => Ok(false),
             _ => Err(failure(&format!("PUT {path}"), response)),
         }
     }

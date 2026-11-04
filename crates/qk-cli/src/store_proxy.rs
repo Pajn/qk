@@ -13,7 +13,7 @@ use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -35,6 +35,9 @@ const MAX_LINE: u64 = 64 << 10;
 const MAX_HEADERS: usize = 100;
 /// How long a connection may wait for a client to send or take bytes.
 const IDLE: Duration = Duration::from_secs(60);
+/// The largest bundle a store server takes, as the protocol bounds an upload
+/// body.
+const LARGEST_BUNDLE: usize = 100 << 20;
 /// Queued uploads sent upstream at once.
 const UPLOADERS: usize = 32;
 /// Blobs asked about in one `POST blobs/missing`, of the 4,096 the protocol
@@ -84,6 +87,10 @@ struct Proxy {
     record_sent: Condvar,
     /// Whether the upstream holds queued blobs, as asked for many at once.
     upstream_holds: Mutex<HashMap<String, bool>>,
+    /// Whether the upstream turned a bundle away, as one that takes none.
+    /// Bundles go to it as they came from then on, so that clients see its
+    /// refusal and send their blobs one each.
+    upstream_refuses_bundles: AtomicBool,
     max_size: Option<u64>,
     /// Tokens the upstream accepted, which may read blobs held here.
     trusted: Mutex<HashSet<String>>,
@@ -184,6 +191,7 @@ impl Proxy {
             sending_records: Mutex::new(HashSet::new()),
             record_sent: Condvar::new(),
             upstream_holds: Mutex::new(HashMap::new()),
+            upstream_refuses_bundles: AtomicBool::new(false),
             max_size: options.max_size,
             trusted: Mutex::new(HashSet::new()),
             writers: Mutex::new(HashSet::new()),
@@ -370,6 +378,9 @@ fn handle(
 ) -> Result<(u16, &'static str, u64)> {
     let path = record_path(&request.target);
     let record = path.starts_with("/v4/entries/") || path.starts_with("/v4/warm/");
+    // Many small blobs as one upload body, which the proxy takes as a record
+    // whose blobs records citing them wait for.
+    let bundle = path.starts_with("/v4/bundles/");
     if request.method == "GET" && path == "/proxy/stats" {
         let body = proxy.stats_json().into_bytes();
         head(
@@ -447,9 +458,26 @@ fn handle(
     // An upload from a token the upstream accepted is kept, queued and
     // answered at once. Others go upstream as they came, the answer being
     // the upstream's to give.
-    if request.method == "PUT" && proxy.writes(request) && (blob.is_some() || record) {
+    if request.method == "PUT" && proxy.writes(request) && (blob.is_some() || record || bundle) {
         let queued = match blob {
             Some(hash) => proxy.queue_blob(request, hash).unwrap_or(false),
+            // A bundle is queued first, which holds its blobs against
+            // eviction while they are kept; one that does not parse, or is
+            // past what a store server takes, goes upstream as it came, for
+            // the upstream to refuse.
+            None if bundle && proxy.upstream_refuses_bundles.load(Ordering::Relaxed) => false,
+            None if bundle => match bundle_blobs(path, &request.body) {
+                Some(blobs) => {
+                    let queued = proxy.enqueue(request, None).is_ok();
+                    if queued {
+                        for (hash, frame) in blobs {
+                            proxy.keep(&hash, frame);
+                        }
+                    }
+                    queued
+                }
+                None => false,
+            },
             None => {
                 for (hash, frame) in inline_blobs(&request.body).unwrap_or_default() {
                     proxy.keep(&hash, frame);
@@ -480,7 +508,7 @@ fn handle(
         writer.flush()?;
         if let Some(hash) = blob {
             proxy.keep(hash, &request.body);
-        } else if record {
+        } else if record || bundle {
             for (hash, frame) in inline_blobs(&request.body).unwrap_or_default() {
                 proxy.keep(&hash, frame);
             }
@@ -859,21 +887,34 @@ impl Proxy {
     }
 
     fn admit(&self, id: u64, job: &Job) {
-        if let Some(hash) = &job.blob {
-            self.queued_blobs
-                .lock()
-                .unwrap()
-                .entry(hash.clone())
-                .or_default()
-                .insert(id);
+        let mut queued = self.queued_blobs.lock().unwrap();
+        for hash in self.job_blobs(id, job) {
+            queued.entry(hash).or_default().insert(id);
         }
+        drop(queued);
         self.admit_held(id, job);
+    }
+
+    /// The blobs job `id` sends: the one it uploads on its own, or those its
+    /// bundle carries. A record citing them waits for it.
+    fn job_blobs(&self, id: u64, job: &Job) -> Vec<String> {
+        match &job.blob {
+            Some(hash) => vec![hash.clone()],
+            None if is_bundle(&job.target) => fs::read(self.body_path(id))
+                .ok()
+                .and_then(|body| {
+                    inline_blobs(&body)
+                        .map(|blobs| blobs.into_iter().map(|(hash, _)| hash).collect())
+                })
+                .unwrap_or_default(),
+            None => Vec::new(),
+        }
     }
 
     /// Queues `id`, whose blob, if it sends one, is held already.
     fn admit_held(&self, id: u64, job: &Job) {
         // Queued in order, so the last admitted is the newest.
-        if job.blob.is_none() {
+        if job.blob.is_none() && !is_bundle(&job.target) {
             self.queued_records
                 .lock()
                 .unwrap()
@@ -958,9 +999,12 @@ impl Proxy {
             let mut missing = 0;
             let outcome = loop {
                 // A record is sent on its path's turn, unless a newer upload
-                // of it has been queued since, which replaces it.
+                // of it has been queued since, which replaces it. A bundle is
+                // named by what it holds, so it takes no turn: one sent again
+                // is the same, and records waiting for the first keep waiting.
                 let turn = match job.blob {
                     Some(_) => None,
+                    None if is_bundle(&job.target) => None,
                     None => match self.record_turn(record_path(&job.target), id) {
                         Some(turn) => Some(turn),
                         None => {
@@ -1012,22 +1056,28 @@ impl Proxy {
                 job.target,
                 started.elapsed().as_millis()
             );
-            if let Some(hash) = &job.blob {
+            let blobs = self.job_blobs(id, job);
+            if !blobs.is_empty() {
                 let mut queued = self.queued_blobs.lock().unwrap();
-                let mut sent_on = false;
-                if let Some(ids) = queued.get_mut(hash) {
-                    ids.remove(&id);
-                    if ids.is_empty() {
-                        queued.remove(hash);
-                        sent_on = true;
+                let mut sent_on = Vec::new();
+                for hash in &blobs {
+                    if let Some(ids) = queued.get_mut(hash) {
+                        ids.remove(&id);
+                        if ids.is_empty() {
+                            queued.remove(hash);
+                            sent_on.push(hash);
+                        }
                     }
                 }
                 drop(queued);
-                if sent_on {
-                    self.upstream_holds.lock().unwrap().remove(hash);
+                let mut holds = self.upstream_holds.lock().unwrap();
+                for hash in sent_on {
+                    holds.remove(hash);
                 }
+                drop(holds);
                 self.blob_done.notify_all();
-            } else {
+            }
+            if job.blob.is_none() {
                 let path = record_path(&job.target);
                 let mut records = self.queued_records.lock().unwrap();
                 if records.get(path) == Some(&id) {
@@ -1085,6 +1135,35 @@ impl Proxy {
         }
     }
 
+    /// Sends each blob the bundle of job `id` carries on its own, as an
+    /// upstream that takes no bundles has them.
+    fn send_bundled(&self, job: &Job, id: u64) -> Sent {
+        let Ok(body) = fs::read(self.body_path(id)) else {
+            return Sent::Refused("its body is gone".into());
+        };
+        for (hash, frame) in inline_blobs(&body).unwrap_or_default() {
+            let file = tempfile::NamedTempFile::new_in(&self.scratch).and_then(|mut file| {
+                file.write_all(frame)?;
+                file.reopen()
+            });
+            let Ok(file) = file else {
+                return Sent::Later(format!("blob {hash} could not be written to send"));
+            };
+            let response = self.put(
+                &format!("/v4/blobs/{hash}"),
+                &job.authorization,
+                Some("application/zstd"),
+                file,
+            );
+            match response.map(|response| response.status().as_u16()) {
+                Ok(200..=299) => {}
+                Ok(status) => return sent(status),
+                Err(error) => return Sent::Later(error.to_string()),
+            }
+        }
+        Sent::Done(204)
+    }
+
     fn send(&self, job: &Job, id: u64) -> Sent {
         if let Some(hash) = &job.blob {
             return self.send_blob(hash, &job.authorization, true);
@@ -1105,6 +1184,11 @@ impl Proxy {
         match response.status().as_u16() {
             // An entry another run committed first.
             409 if job.target.starts_with("/v4/entries/") => Sent::Done(409),
+            // An upstream that takes no bundles takes their blobs one each.
+            404 if is_bundle(&job.target) => {
+                self.upstream_refuses_bundles.store(true, Ordering::Relaxed);
+                self.send_bundled(job, id)
+            }
             422 => {
                 let answer: serde_json::Value = response
                     .body_mut()
@@ -1294,12 +1378,62 @@ impl Proxy {
 }
 
 /// What a status the upstream answered an upload with comes to.
+/// Whether an upload to `target` is a bundle of blobs.
+fn is_bundle(target: &str) -> bool {
+    record_path(target).starts_with("/v4/bundles/")
+}
+
 fn sent(status: u16) -> Sent {
     match status {
         200..=299 => Sent::Done(status),
         429 | 500.. => Sent::Later(format!("the upstream answered {status}")),
         _ => Sent::Refused(format!("the upstream answered {status}")),
     }
+}
+
+/// The blobs the bundle uploaded to `path` carries, by hash, when it is one a
+/// store server takes, as `tools/store-server/PROTOCOL.md` describes: within
+/// the largest upload body, named by the SHA-256 of its header, its record
+/// empty, and every blob it lists, sorted and once each, carried inline as a
+/// zstd frame.
+fn bundle_blobs<'a>(path: &str, body: &'a [u8]) -> Option<Vec<(String, &'a [u8])>> {
+    use sha2::Digest;
+    if body.len() > LARGEST_BUNDLE {
+        return None;
+    }
+    let length = u32::from_le_bytes(body.get(..4)?.try_into().ok()?) as usize;
+    let header = body.get(4..4 + length)?;
+    let named: String = sha2::Sha256::digest(header)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    if path.strip_prefix("/v4/bundles/") != Some(named.as_str()) {
+        return None;
+    }
+    let parsed: serde_json::Value = serde_json::from_slice(header).ok()?;
+    if parsed["record"].as_u64()? != 0 {
+        return None;
+    }
+    let listed = parsed["blobs"].as_array()?;
+    let mut at = 4 + length;
+    let mut blobs: Vec<(String, &[u8])> = Vec::new();
+    for blob in listed {
+        let hash = blob[0].as_str()?;
+        let valid = hash.len() == 64
+            && hash
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
+        let sorted = blobs.last().is_none_or(|(last, _)| last.as_str() < hash);
+        blob[1].as_u64()?;
+        let size = usize::try_from(blob[2].as_u64()?).ok()?;
+        let frame = body.get(at..at.checked_add(size)?)?;
+        if !valid || !sorted || !frame.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+            return None;
+        }
+        blobs.push((hash.to_owned(), frame));
+        at += size;
+    }
+    (!blobs.is_empty() && at == body.len()).then_some(blobs)
 }
 
 /// The blobs an upload body carries inline, by hash: after the header and the
@@ -1316,7 +1450,7 @@ fn inline_blobs(body: &[u8]) -> Option<Vec<(String, &[u8])>> {
         };
         let size = usize::try_from(size).ok()?;
         let hash = blob[0].as_str()?.to_owned();
-        blobs.push((hash, body.get(at..at + size)?));
+        blobs.push((hash, body.get(at..at.checked_add(size)?)?));
         at += size;
     }
     Some(blobs)
@@ -1574,6 +1708,118 @@ mod tests {
             .enqueue(&request("/v4/entries/second".into(), body), None)
             .unwrap();
         let finished = waits(2);
+        assert!(finished.recv_timeout(Duration::from_millis(200)).is_err());
+        proxy.queued_blobs.lock().unwrap().remove(&blob);
+        proxy.blob_done.notify_all();
+        assert!(finished.recv_timeout(Duration::from_secs(5)).is_ok());
+    }
+
+    #[test]
+    fn only_bundles_a_store_server_takes_are_queued() {
+        use sha2::Digest;
+        let frame = zstd::stream::encode_all(&b"x"[..], 1).unwrap();
+        // A bundle of `listed`, each carried as `frame` when its third field
+        // is a length, and its path named by its header unless `path` says.
+        let bundle = |record: u64, listed: serde_json::Value, path: Option<&str>| {
+            let header =
+                serde_json::to_vec(&serde_json::json!({"record": record, "blobs": listed}))
+                    .unwrap();
+            let mut body = (header.len() as u32).to_le_bytes().to_vec();
+            body.extend(&header);
+            body.extend(vec![b'r'; record as usize]);
+            for blob in listed.as_array().unwrap() {
+                if blob[2].is_u64() {
+                    body.extend(&frame);
+                }
+            }
+            let named: String = sha2::Sha256::digest(&header)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            let path = path.map_or(format!("/v4/bundles/{named}"), str::to_owned);
+            (path, body)
+        };
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        let size = frame.len();
+        let takes = |(path, body): (String, Vec<u8>)| bundle_blobs(&path, &body).is_some();
+        assert!(takes(bundle(
+            0,
+            serde_json::json!([[a, 1, size], [b, 1, size]]),
+            None
+        )));
+        // Named otherwise, carrying a record, listing a blob it does not
+        // carry, unsorted, or carrying nothing.
+        let other = format!("/v4/bundles/{}", "c".repeat(64));
+        assert!(!takes(bundle(
+            0,
+            serde_json::json!([[a, 1, size]]),
+            Some(&other)
+        )));
+        assert!(!takes(bundle(2, serde_json::json!([[a, 1, size]]), None)));
+        assert!(!takes(bundle(
+            0,
+            serde_json::json!([[a, 1, size], [b, 1, null]]),
+            None
+        )));
+        assert!(!takes(bundle(
+            0,
+            serde_json::json!([[b, 1, size], [a, 1, size]]),
+            None
+        )));
+        assert!(!takes(bundle(0, serde_json::json!([]), None)));
+    }
+
+    #[test]
+    fn a_record_waits_for_a_bundle_queued_before_it_carrying_its_blobs() {
+        let directory = tempfile::tempdir().unwrap();
+        let proxy = Proxy::open(&Options {
+            upstream: "http://127.0.0.1:9".into(),
+            directory: directory.path().to_owned(),
+            listen: String::new(),
+            max_size: None,
+        })
+        .unwrap();
+        let blob = "b".repeat(64);
+        let request = |target: String, body: Vec<u8>| Request {
+            method: "PUT".into(),
+            target,
+            authorization: Some("Bearer token".into()),
+            content_type: None,
+            body,
+            close: false,
+        };
+        let body = |record: &[u8], frame: Option<&[u8]>| {
+            let header = serde_json::json!({
+                "record": record.len(),
+                "blobs": [[blob, 1, frame.map(<[u8]>::len)]],
+            });
+            let header = serde_json::to_vec(&header).unwrap();
+            let mut body = (header.len() as u32).to_le_bytes().to_vec();
+            body.extend(&header);
+            body.extend(record);
+            body.extend(frame.unwrap_or_default());
+            body
+        };
+        let frame = zstd::stream::encode_all(&b"x"[..], 1).unwrap();
+        proxy
+            .enqueue(
+                &request(
+                    format!("/v4/bundles/{}", "c".repeat(64)),
+                    body(b"", Some(&frame)),
+                ),
+                None,
+            )
+            .unwrap();
+        // A record citing the bundled blob stored apart waits for the bundle.
+        proxy
+            .enqueue(&request("/v4/entries/key".into(), body(b"{}", None)), None)
+            .unwrap();
+        let (done, finished) = std::sync::mpsc::channel();
+        let waiting = proxy.clone();
+        std::thread::spawn(move || {
+            waiting.await_blobs(1);
+            let _ = done.send(());
+        });
         assert!(finished.recv_timeout(Duration::from_millis(200)).is_err());
         proxy.queued_blobs.lock().unwrap().remove(&blob);
         proxy.blob_done.notify_all();

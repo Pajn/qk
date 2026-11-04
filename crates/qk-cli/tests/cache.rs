@@ -1714,6 +1714,154 @@ fn a_commit_a_store_server_refuses_for_lost_blobs_is_made_again() {
     assert_eq!(puts, 2);
 }
 
+/// A fixture whose outputs are five files of 17 MiB that compress to almost
+/// nothing, made from the first byte of `src/input.txt`: small blobs, of
+/// which three fit what an upload carries inline and two go past it.
+#[cfg(unix)]
+fn overflowing_outputs() -> Fixture {
+    Fixture::new(json!({
+        "command": "echo run >> ../executions; mkdir -p dist; c=$(head -c1 src/input.txt); for i in 0 1 2 3 4; do { head -c 17825792 /dev/zero | tr '\\000' \"$c\"; echo $i; } > dist/$i.bin; done",
+        "cache": true,
+        "outputs": ["{projectRoot}/dist"],
+    }))
+}
+
+#[cfg(unix)]
+fn requests(server: &store_server::FakeStoreServer, prefix: &str) -> usize {
+    server
+        .state
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .filter(|(request, _)| request.starts_with(prefix))
+        .count()
+}
+
+/// Restores the fixture's outputs from the store server alone, and checks
+/// they are as the task made them without running it again.
+#[cfg(unix)]
+fn restored_from_the_store_server(fixture: &Fixture) {
+    clear_local_cache(fixture);
+    fs::remove_dir_all(fixture.root.join("dist")).unwrap();
+    success(server_build(fixture, store_server::WRITE_TOKEN, &[]));
+    let runs = fs::read_to_string(fixture.root.join("../executions")).unwrap();
+    assert_eq!(runs.lines().count(), 1, "the task ran again");
+    for index in 0..5 {
+        let contents = fs::read(fixture.root.join(format!("dist/{index}.bin"))).unwrap();
+        assert_eq!(contents.len(), 17825792 + 2);
+        assert_eq!(&contents[17825792..], format!("{index}\n").as_bytes());
+    }
+}
+
+// The target is a POSIX shell command.
+#[cfg(unix)]
+#[test]
+fn small_blobs_past_what_an_upload_carries_go_to_a_store_server_in_a_bundle() {
+    let server = store_server::FakeStoreServer::start();
+    let fixture = overflowing_outputs();
+    with_store_server(&fixture, &server);
+    success(server_build(&fixture, store_server::WRITE_TOKEN, &[]));
+    assert_eq!(server.state.lock().unwrap().bundled.len(), 2);
+    assert_eq!(requests(&server, "PUT /v4/bundles/"), 1);
+    assert_eq!(requests(&server, "PUT /v4/blobs/"), 0);
+    restored_from_the_store_server(&fixture);
+}
+
+// The target is a POSIX shell command.
+#[cfg(unix)]
+#[test]
+fn a_store_server_without_bundles_takes_small_blobs_one_by_one() {
+    let server = store_server::FakeStoreServer::start();
+    server.state.lock().unwrap().no_bundles = true;
+    let fixture = overflowing_outputs();
+    with_store_server(&fixture, &server);
+    success(server_build(&fixture, store_server::WRITE_TOKEN, &[]));
+    assert!(server.state.lock().unwrap().bundled.is_empty());
+    assert_eq!(requests(&server, "PUT /v4/bundles/"), 0);
+    assert_eq!(requests(&server, "PUT /v4/blobs/"), 2);
+    restored_from_the_store_server(&fixture);
+}
+
+// The target is a POSIX shell command.
+#[cfg(unix)]
+#[test]
+fn a_store_proxy_queues_a_bundle_and_sends_it_before_the_record_citing_it() {
+    let server = store_server::FakeStoreServer::start();
+    let fixture = overflowing_outputs();
+    with_store_server(&fixture, &server);
+    let directory = TempDir::new().unwrap();
+    let proxy = StoreProxy::start(&server.url, directory.path());
+    let env = [("QK_STORE_SERVER_URL", proxy.url.as_str())];
+    // The first upload from a token goes upstream as it came; the second
+    // save, of new outputs, is queued.
+    success(server_build(&fixture, store_server::WRITE_TOKEN, &env));
+    fs::write(fixture.root.join("src/input.txt"), "two\n").unwrap();
+    success(server_build(&fixture, store_server::WRITE_TOKEN, &env));
+    proxy.drained();
+    assert!(
+        proxy.log().contains("queued PUT /v4/bundles/"),
+        "{}",
+        proxy.log()
+    );
+    let stats = proxy.stats();
+    assert_eq!(stats["dropped"], 0, "{}", proxy.log());
+    let state = server.state.lock().unwrap();
+    assert_eq!(state.entries(), 2, "{}", proxy.log());
+    assert_eq!(state.bundled.len(), 4, "{}", proxy.log());
+    // Each commit found the blobs it cites, so none was refused.
+    let refused = state
+        .requests
+        .iter()
+        .filter(|(request, _)| request.starts_with("PUT /v4/entries/"))
+        .count();
+    assert_eq!(refused, 2, "{:?}", state.requests);
+}
+
+// The target is a POSIX shell command.
+#[cfg(unix)]
+#[test]
+fn a_store_proxy_sends_the_blobs_of_a_bundle_the_upstream_turns_away_one_each() {
+    let server = store_server::FakeStoreServer::start();
+    server.state.lock().unwrap().turns_bundles_away = true;
+    let fixture = overflowing_outputs();
+    with_store_server(&fixture, &server);
+    let directory = TempDir::new().unwrap();
+    let proxy = StoreProxy::start(&server.url, directory.path());
+    let env = [("QK_STORE_SERVER_URL", proxy.url.as_str())];
+    success(server_build(&fixture, store_server::WRITE_TOKEN, &env));
+    fs::write(fixture.root.join("src/input.txt"), "two\n").unwrap();
+    success(server_build(&fixture, store_server::WRITE_TOKEN, &env));
+    proxy.drained();
+    assert!(
+        proxy.log().contains("queued PUT /v4/bundles/"),
+        "{}",
+        proxy.log()
+    );
+    assert_eq!(proxy.stats()["dropped"], 0, "{}", proxy.log());
+    {
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.entries(), 2, "{}", proxy.log());
+        assert!(state.bundled.is_empty());
+        assert_eq!(state.blobs.len(), 4, "{}", proxy.log());
+    }
+    // Once turned away, a bundle goes upstream as it came, so the next save
+    // sees the refusal and sends its blobs one each.
+    // Outputs are made from the first byte, so a new one makes new blobs.
+    fs::write(fixture.root.join("src/input.txt"), "four\n").unwrap();
+    success(server_build(&fixture, store_server::WRITE_TOKEN, &env));
+    proxy.drained();
+    let queued = proxy
+        .log()
+        .lines()
+        .filter(|line| line.starts_with("qk: queued PUT /v4/bundles/"))
+        .count();
+    assert_eq!(queued, 1, "{}", proxy.log());
+    let state = server.state.lock().unwrap();
+    assert_eq!(state.entries(), 3, "{}", proxy.log());
+    assert_eq!(state.blobs.len(), 6, "{}", proxy.log());
+}
+
 // The target is a POSIX shell command.
 #[cfg(unix)]
 #[test]

@@ -18,6 +18,14 @@ pub struct State {
     pub records: BTreeMap<String, Vec<u8>>,
     /// Blobs stored apart, each one zstd frame, by hash.
     pub blobs: BTreeMap<String, Vec<u8>>,
+    /// Blobs stored in bundles, each one zstd frame, by hash.
+    pub bundled: BTreeMap<String, Vec<u8>>,
+    /// Take no bundles, as a server from before them.
+    pub no_bundles: bool,
+    /// Name loose blobs, yet turn bundles away, as a server whose bundles
+    /// were switched off.
+    pub turns_bundles_away: bool,
+
     sessions: HashMap<String, Vec<u8>>,
     /// Each key's time and the sequence number of its last change.
     keys: BTreeMap<String, (u64, u64)>,
@@ -36,6 +44,11 @@ pub struct State {
 }
 
 impl State {
+    /// The frame of the blob `hash` stored apart, on its own or bundled.
+    fn frame(&self, hash: &str) -> Option<&Vec<u8>> {
+        self.blobs.get(hash).or_else(|| self.bundled.get(hash))
+    }
+
     /// The result entries committed, leaving out warm records, path sets and
     /// expectations.
     pub fn entries(&self) -> usize {
@@ -141,7 +154,7 @@ fn compose(state: &State, upload: &Upload, held: impl Fn(&str) -> bool) -> Vec<u
     header.extend_from_slice(&(upload.blobs.len() as u32).to_le_bytes());
     let mut bodies = Vec::new();
     for (hash, raw, frame) in &upload.blobs {
-        let frame = frame.as_ref().or_else(|| state.blobs.get(hash));
+        let frame = frame.as_ref().or_else(|| state.frame(hash));
         let inline = frame.filter(|_| !held(hash));
         header.push(u8::from(inline.is_some()));
         header.extend_from_slice(&raw.to_le_bytes());
@@ -294,15 +307,50 @@ fn handle(
         }
         ("POST", "blobs/missing") => {
             let asked: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
-            let missing: Vec<&str> = asked["blobs"]
+            let asked: Vec<&str> = asked["blobs"]
                 .as_array()
                 .into_iter()
                 .flatten()
                 .filter_map(serde_json::Value::as_str)
-                .filter(|hash| !state.blobs.contains_key(*hash))
                 .collect();
-            let answer = serde_json::json!({ "missing": missing });
+            let missing: Vec<&str> = asked
+                .iter()
+                .copied()
+                .filter(|hash| state.frame(hash).is_none())
+                .collect();
+            let answer = match state.no_bundles {
+                true => serde_json::json!({ "missing": missing }),
+                false => {
+                    let loose: Vec<&str> = asked
+                        .iter()
+                        .copied()
+                        .filter(|hash| {
+                            !state.bundled.contains_key(*hash)
+                                && state
+                                    .blobs
+                                    .get(*hash)
+                                    .is_some_and(|frame| frame.len() < 1 << 20)
+                        })
+                        .collect();
+                    serde_json::json!({ "missing": missing, "loose": loose })
+                }
+            };
             (200, Vec::new(), answer.to_string().into_bytes())
+        }
+        ("PUT", path) if path.starts_with("bundles/") => {
+            if state.no_bundles || state.turns_bundles_away {
+                return missing();
+            }
+            let Some(bundle) = parse_upload(&body).filter(|bundle| bundle.record.is_empty()) else {
+                return (400, Vec::new(), b"{}".to_vec());
+            };
+            for (hash, _, frame) in bundle.blobs {
+                let Some(frame) = frame else {
+                    return (400, Vec::new(), b"{}".to_vec());
+                };
+                state.bundled.insert(hash, frame);
+            }
+            done()
         }
         (method, path) if path.starts_with("blobs/") => {
             let hash = &path["blobs/".len()..];
@@ -311,12 +359,12 @@ fn handle(
                     state.blobs.insert(hash.to_owned(), body);
                     done()
                 }
-                "HEAD" => match state.blobs.contains_key(hash) {
+                "HEAD" => match state.frame(hash).is_some() {
                     true => found(Vec::new()),
                     false => missing(),
                 },
                 "GET" => {
-                    if let Some(frame) = state.blobs.get(hash) {
+                    if let Some(frame) = state.frame(hash) {
                         return found(frame.clone());
                     }
                     let owner = parameter("entry")
@@ -379,11 +427,12 @@ fn handle(
                         state.fail_commit_once = false;
                         for hash in &apart {
                             state.blobs.remove(hash);
+                            state.bundled.remove(hash);
                         }
                     }
                     let lacking: Vec<String> = apart
                         .into_iter()
-                        .filter(|hash| !state.blobs.contains_key(hash))
+                        .filter(|hash| state.frame(hash).is_none())
                         .collect();
                     if !lacking.is_empty() {
                         let answer = serde_json::json!({
