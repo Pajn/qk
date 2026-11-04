@@ -53,17 +53,18 @@ Sandbox audit: 1 of 2 tasks went beyond what they declare
   app:build
     1 read outside its inputs:
       other/notes.txt
-    1 dotenv file read outside its inputs; name it in qk:ultracache.ignoreReads, and the variables that matter as env inputs:
+    1 dotenv file qk loads read outside its inputs; name it in qk:ultracache.ignoreReads, and the variables that matter as env inputs:
       .env
     1 written outside its outputs:
       stray.txt
 ```
 
 For each task it lists the files read outside its inputs, the dotenv files
-among them apart (see [Dotenv files](#dotenv-files)), the TypeScript
+qk loads for it apart (see [Dotenv files](#dotenv-files)), the TypeScript
 configuration (`tsconfig*.json`) it read outside them, which is likely an
 input, and what it wrote outside its outputs. `--sandbox-report` lists the
-dotenv files among the task's `undeclaredReads`. The count of tasks that
+dotenv files qk loads as the task's `dotenvReads`; one it does not load is
+among its `undeclaredReads`, as any other file. The count of tasks that
 went beyond what they declare leaves out what enforce allows: the `.git`
 files tasks read, what they wrote in `.git`, and the installed packages
 their keys leave out, listed below. The `.git` files are not listed for each
@@ -178,7 +179,7 @@ what it does not declare fails, and only its declared outputs can change in
 the workspace. A write outside them is refused as it happens on macOS, and
 on Linux is discarded when the task ends, and listed (see [Linux](#linux)). Reading and writing `.git` stays allowed, and so do reading
 and writing qk's own state for the worktree, where warm state lives. A
-dotenv file is read only as the task's ignored reads name it (see
+dotenv file is read only as the task's inputs or ignored reads name it (see
 [Dotenv files](#dotenv-files)).
 
 Reading an installed package the key leaves out stays allowed too, and is
@@ -251,17 +252,20 @@ importer, and an importer the task's key counts, is never covered this way.
 
 ### Dotenv files
 
-A task whose tools read its dotenv files names them in `ignoreReads`, and
-declares the variables that matter as [`env` inputs](../reference/inputs-outputs.md#env-and-runtime).
-A dotenv file matters only through its values: qk loads the task's dotenv
-files into its environment itself, and an `env` input keys a variable by its
-value, so once those are declared, reading the file cannot change the
-result beyond what is keyed, which is what `ignoreReads` claims. Read
-without being named, a dotenv file is a read outside the task's inputs:
-audit lists it for the task and enforce refuses it. A dotenv file qk does
-not load for the task, as `.env.production` read under a development
-configuration, holds values no `env` input keys, so it belongs in the
-task's inputs instead.
+A task whose tools read the dotenv files qk loads for it names them in
+`ignoreReads`, and declares the variables that matter as
+[`env` inputs](../reference/inputs-outputs.md#env-and-runtime). qk loads
+those files into the task's environment itself, and an `env` input keys a
+variable by its value, so once those are declared, reading the file cannot
+change the result beyond what is keyed, which is what `ignoreReads` claims.
+A task whose result depends on a file's content itself, as one that copies
+or hashes it, declares it as an input instead.
+
+A dotenv file qk does not load for the task, as `.env.production` read
+under a development configuration, holds values no `env` input keys, so it
+belongs in the task's inputs, as any other file. Read without being named
+in either, a dotenv file is a read outside the task's inputs: audit lists
+it for the task, those qk loads apart, and enforce refuses it.
 
 A [`targetDefaults`](../reference/workspace.md#targetdefaults) entry in
 nx.json names them for every target it applies to:

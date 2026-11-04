@@ -4586,7 +4586,7 @@ fn the_sandbox_reports_and_refuses_what_a_task_does_not_declare() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let temp = fixture(json!({
         "build": {
-            "command": "cat src/in.txt other/notes.txt .env > /dev/null; mkdir -p dist && echo out > dist/out.txt && echo stray > stray.txt && cat stray.txt > /dev/null",
+            "command": "cat src/in.txt other/notes.txt .env .env.production > /dev/null; mkdir -p dist && echo out > dist/out.txt && echo stray > stray.txt && cat stray.txt > /dev/null",
             "inputs": ["{projectRoot}/src/**/*"],
             "outputs": ["{projectRoot}/dist"]
         },
@@ -4597,6 +4597,7 @@ fn the_sandbox_reports_and_refuses_what_a_task_does_not_declare() {
     fs::write(temp.path().join("src/in.txt"), "in").unwrap();
     fs::write(temp.path().join("other/notes.txt"), "notes").unwrap();
     fs::write(temp.path().join(".env"), "X=1\n").unwrap();
+    fs::write(temp.path().join(".env.production"), "X=2\n").unwrap();
     let report = temp.path().join("sandbox.json");
     let audit = run(
         temp.path(),
@@ -4612,11 +4613,16 @@ fn the_sandbox_reports_and_refuses_what_a_task_does_not_declare() {
     let stderr = String::from_utf8_lossy(&success(audit).stderr).into_owned();
     let findings: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
     let build = &findings["tasks"]["app:build"];
-    // A dotenv file its ignored reads do not name is read outside its inputs.
-    assert_eq!(build["undeclaredReads"], json!([".env", "other/notes.txt"]));
+    // A dotenv file its ignored reads do not name is read outside its inputs:
+    // one qk loads for it apart, one it does not as any other file.
+    assert_eq!(build["dotenvReads"], json!([".env"]));
+    assert_eq!(
+        build["undeclaredReads"],
+        json!([".env.production", "other/notes.txt"])
+    );
     assert_eq!(build["unkeyedReads"], json!([]));
     assert!(
-        stderr.contains("  app:build\n    1 read outside its inputs:\n      other/notes.txt\n    1 dotenv file read outside its inputs; name it in qk:ultracache.ignoreReads, and the variables that matter as env inputs:\n      .env\n"),
+        stderr.contains("  app:build\n    2 read outside its inputs:\n      .env.production\n      other/notes.txt\n    1 dotenv file qk loads read outside its inputs; name it in qk:ultracache.ignoreReads, and the variables that matter as env inputs:\n      .env\n"),
         "{stderr}"
     );
     // Read back after writing it, it is listed once, as a write.

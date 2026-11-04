@@ -677,6 +677,40 @@ fn dotenv_files(
     files
 }
 
+/// The dotenv files qk loads into a task's environment, workspace-relative,
+/// whether they exist or not: its own, as Nx picks them, and its `envFile`,
+/// unless `NX_LOAD_DOT_ENV_FILES=false` in `base_env` turns them off.
+pub fn loaded_dotenv_files(
+    workspace: &Workspace,
+    task: &Task,
+    base_env: &BTreeMap<OsString, OsString>,
+) -> Result<Vec<String>> {
+    if !loads_dotenv(base_env) {
+        return Ok(Vec::new());
+    }
+    let project = &workspace.projects[&task.project];
+    let (target, non_atomized) = owner_target(project, &task.target);
+    let mut files = dotenv_files(
+        &project.root,
+        target,
+        task.configuration.as_deref(),
+        non_atomized,
+    );
+    if task.definition.executor.as_deref() == Some("nx:run-commands") {
+        let options = run_commands_overrides(&task.definition.options, &task.args, project)?;
+        if let Some(file) = options.get("envFile").and_then(Value::as_str) {
+            // As reads are named: `/`-separated, without `.` parts.
+            files.push(
+                file.split(['/', '\\'])
+                    .filter(|part| !part.is_empty() && *part != ".")
+                    .collect::<Vec<_>>()
+                    .join("/"),
+            );
+        }
+    }
+    Ok(files)
+}
+
 /// The target whose dotenv files a task reads, and the target it was
 /// atomized from, as Nx's getOwnerTargetForTask finds them: through the
 /// project's `metadata.targetGroups`, a target of the task's group that

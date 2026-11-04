@@ -10,9 +10,10 @@
 //! lockfile, is read only as declared, since what the task reads of it
 //! could change without its key. In audit mode anything else is allowed and reported; in enforce
 //! mode it is refused, except reading and writing `.git`, which a task may
-//! need although it is not keyed. A dotenv file is read only as its ignored
-//! reads name it: what it holds matters through the variables qk loads from
-//! it, which `env` inputs key.
+//! need although it is not keyed. A dotenv file is read only as its inputs
+//! or its ignored reads name it: one qk loads for the task matters through
+//! the variables it sets, which `env` inputs key, and one it does not load
+//! is an input like any other file.
 //!
 //! Audit also reports reading an installed package the key leaves out, as a
 //! task naming its `externalDependencies` but running a tool only the root
@@ -232,6 +233,9 @@ impl Sandbox {
         let resolution = qk_cache::resolve_each(workspace, graph)?;
         let tree = Tree::new(&resolution.candidates).protecting(protected(workspace));
         let installs = Installs::load(&root);
+        // The environment tasks start from, which says whether qk loads
+        // their dotenv files.
+        let base_env = qk_executor::environment(&workspace.root).unwrap_or_default();
         let projects = qk_graph::ProjectGraph::build(workspace)?;
         let mut audits: BTreeMap<String, TaskAudit> = depended(workspace, graph, &projects)
             .into_iter()
@@ -342,6 +346,10 @@ impl Sandbox {
                         }
                     }
                     audit.writing(plan.write_trees.iter().cloned());
+                    audit.loading(
+                        qk_executor::loaded_dotenv_files(workspace, task, &base_env)
+                            .unwrap_or_default(),
+                    );
                     policies.insert(id.clone(), Policy::new(mode, &root, &state, plan));
                 }
                 Err(reason) => {

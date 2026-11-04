@@ -31,6 +31,11 @@ pub struct Findings {
     /// project: what running a dependency's code or following imports into
     /// it reads. `^` inputs key them.
     pub dependency_reads: BTreeMap<String, BTreeSet<String>>,
+    /// Dotenv files qk loads into its environment that it read outside its
+    /// key: what they hold reaches it through the variables qk loads, which
+    /// `env` inputs key, so naming them in its ignored reads covers them. A
+    /// dotenv file qk does not load for it is read as any other file.
+    pub dotenv_reads: BTreeSet<String>,
     /// `.git` files it read: allowed, but not in the key either.
     pub unkeyed_reads: BTreeSet<String>,
     /// Paths it wrote in the workspace outside its outputs.
@@ -52,6 +57,7 @@ impl Findings {
     /// enforce allows.
     pub fn went_beyond(&self) -> bool {
         !self.undeclared_reads.is_empty()
+            || !self.dotenv_reads.is_empty()
             || !self.manifest_reads.is_empty()
             || !self.toolchain_reads.is_empty()
             || !self.tsconfig_reads.is_empty()
@@ -61,6 +67,7 @@ impl Findings {
 
     pub fn is_empty(&self) -> bool {
         self.undeclared_reads.is_empty()
+            && self.dotenv_reads.is_empty()
             && self.manifest_reads.is_empty()
             && self.toolchain_reads.is_empty()
             && self.tsconfig_reads.is_empty()
@@ -94,6 +101,8 @@ pub(super) struct TaskAudit {
     depended: Vec<(Option<String>, String)>,
     /// Its outputs, warm paths and scratch directories.
     outputs: BTreeSet<PathBuf>,
+    /// The dotenv files qk loads into its environment, workspace-relative.
+    loaded: BTreeSet<String>,
 }
 
 impl TaskAudit {
@@ -120,6 +129,10 @@ impl TaskAudit {
     pub(super) fn covering(&mut self, covered: BTreeSet<String>, naming_external: bool) {
         self.covered = Some(covered);
         self.naming_external = naming_external;
+    }
+
+    pub(super) fn loading(&mut self, files: impl IntoIterator<Item = String>) {
+        self.loaded = files.into_iter().collect();
     }
 
     pub(super) fn writing(&mut self, outputs: impl IntoIterator<Item = PathBuf>) {
@@ -188,6 +201,14 @@ impl TaskAudit {
                 findings.stray_writes.insert(relative);
             } else if in_git(&relative) {
                 findings.unkeyed_reads.insert(relative);
+            } else if is_dotenv(&relative) {
+                // Wherever it lies: one in a project it depends on is no
+                // code of that project's it ran.
+                if self.loaded.contains(&relative) {
+                    findings.dotenv_reads.insert(relative);
+                } else {
+                    findings.undeclared_reads.insert(relative);
+                }
             } else if let Some(project) = dependency
                 && qk_input_analysis::ReadKind::of(&relative)
                     == qk_input_analysis::ReadKind::Content
@@ -211,6 +232,7 @@ impl TaskAudit {
         // stamp it keeps, is one finding: declaring it an output covers both.
         for path in &findings.stray_writes {
             findings.undeclared_reads.remove(path);
+            findings.dotenv_reads.remove(path);
             findings.manifest_reads.remove(path);
             findings.toolchain_reads.remove(path);
             findings.tsconfig_reads.remove(path);
@@ -225,10 +247,7 @@ impl TaskAudit {
     }
 }
 
-/// Whether `path` names a dotenv file: `.env`, `.env.*` or `.*.env`. Such a
-/// file matters only through the variables qk loads from it, which `env`
-/// inputs key, so a task names those it reads in its ignored reads; read
-/// otherwise, it is read outside the task's inputs.
+/// Whether `path` names a dotenv file: `.env`, `.env.*` or `.*.env`.
 pub fn is_dotenv(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);
     name == ".env" || name.starts_with(".env.") || (name.starts_with('.') && name.ends_with(".env"))
@@ -302,6 +321,38 @@ mod tests {
         assert_eq!(found.toolchain_reads, set(&[".nvmrc"]));
         assert_eq!(found.tsconfig_reads, set(&["tsconfig.base.json"]));
         assert!(found.stray_writes.is_empty() && found.went_beyond());
+    }
+
+    /// A dotenv file qk loads for the task is listed apart; one it does not
+    /// load is read outside its inputs as any other file, in a project it
+    /// depends on too, rather than as that project's code.
+    #[test]
+    fn tells_dotenv_files_qk_loads_from_others() {
+        let root = Path::new("/workspace");
+        let mut audit = TaskAudit::new(root, vec![(Some("lib".into()), "libs/lib".into())]);
+        audit.loading([".env".to_owned(), "apps/app/.env.local".to_owned()]);
+        let found = audit.classify(
+            None,
+            [
+                ".env",
+                "apps/app/.env.local",
+                ".env.production",
+                "libs/lib/.env",
+                "libs/lib/src/a.ts",
+            ]
+            .map(|path| read(root, path)),
+            [],
+        );
+        assert_eq!(found.dotenv_reads, set(&[".env", "apps/app/.env.local"]));
+        assert_eq!(
+            found.undeclared_reads,
+            set(&[".env.production", "libs/lib/.env"])
+        );
+        assert_eq!(
+            found.dependency_reads,
+            BTreeMap::from([("lib".to_owned(), set(&["libs/lib/src/a.ts"]))])
+        );
+        assert!(found.went_beyond());
     }
 
     /// Reads its ignored reads match, dotenv files among them, and the
