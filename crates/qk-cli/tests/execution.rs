@@ -3723,7 +3723,7 @@ fn the_sandbox_follows_no_link_put_in_place_of_a_node_modules() {
     let temp = fixture(json!({
         "swap": {"command": "rm -rf node_modules && ln -s secret node_modules", "qk:sandbox": false},
         "read": {"command": "cat node_modules/x.txt", "dependsOn": ["swap"], "inputs": []},
-        "write": {"command": "echo planted > node_modules/planted.txt", "dependsOn": ["swap"], "inputs": []}
+        "write": {"command": "echo planted > node_modules/planted.txt; echo \"write exit $?\"", "dependsOn": ["swap"], "inputs": []}
     }));
     let root = temp.path();
     for overlay in ["1", "0"] {
@@ -3754,6 +3754,9 @@ fn the_sandbox_follows_no_link_put_in_place_of_a_node_modules() {
             assert!(!stdout.contains("secret"), "{stdout}");
             if target == "read" {
                 assert!(!output.status.success(), "{stdout}");
+            } else {
+                // The task ran, and its write went nowhere new.
+                assert!(stdout.contains("write exit "), "{stdout}");
             }
             assert!(
                 !root.join("secret/planted.txt").exists(),

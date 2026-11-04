@@ -694,12 +694,15 @@ mod tests {
             "lib/node_modules/stale/a",
             "app/node_modules/old/a",
             "filed/node_modules",
+            "stubbed",
+            "elsewhere/kept",
         ] {
             write(&workspace, file);
         }
         std::fs::create_dir_all(workspace.join("linked")).unwrap();
         std::os::unix::fs::symlink(workspace.join("lib"), workspace.join("linked/node_modules"))
             .unwrap();
+        std::os::unix::fs::symlink(workspace.join("elsewhere"), workspace.join("tied")).unwrap();
         let overlay = crate::Overlay {
             workspace: workspace.clone(),
             directory: temp.path().join("overlay"),
@@ -720,6 +723,9 @@ mod tests {
             "dist/out.js",
             "filed/node_modules/x/a",
             "linked/node_modules/x/a",
+            // Beneath a file, and beneath a link.
+            "stubbed/node_modules/x/a",
+            "tied/node_modules/x/a",
         ] {
             write(&upper, file);
         }
@@ -740,11 +746,22 @@ mod tests {
             )
         } == 0;
         let settled = overlay.settle();
-        assert!(settled.failed.is_empty(), "{:?}", settled.failed);
+        // Beneath a file it cannot be made, and fails; beneath a link, which
+        // is never followed, the link's entry is discarded whole.
+        assert_eq!(settled.failed.len(), 1, "{:?}", settled.failed);
+        assert!(
+            settled.failed[0].contains("stubbed/node_modules"),
+            "{:?}",
+            settled.failed
+        );
         assert_eq!(
             settled.discarded,
-            std::collections::BTreeSet::from(["pkg/stray.js".to_owned()])
+            std::collections::BTreeSet::from(
+                ["pkg/stray.js", "stubbed", "tied"].map(str::to_owned)
+            )
         );
+        assert!(workspace.join("stubbed").is_file());
+        assert!(!workspace.join("elsewhere/node_modules").exists());
         let mut made = settled.made.clone();
         made.sort();
         assert_eq!(
