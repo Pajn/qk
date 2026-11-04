@@ -4809,6 +4809,44 @@ fn the_sandbox_keeps_an_ignored_project_local_json_out_of_whole_directories() {
     }
 }
 
+/// A Git-ignored dotenv file in a directory whose every tracked file is an
+/// input is not allowed with the directory: enforce refuses it unless the
+/// task names it, while the directory's other files stay readable.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn the_sandbox_keeps_an_ignored_dotenv_file_out_of_whole_directories() {
+    let temp = fixture(json!({}));
+    fs::write(temp.path().join(".gitignore"), ".env\n").unwrap();
+    let web = temp.path().join("apps/web");
+    fs::create_dir_all(web.join("src")).unwrap();
+    fs::write(web.join("src/index.ts"), "export {};\n").unwrap();
+    fs::write(web.join("src/.env"), "X=1\n").unwrap();
+    let project = |command: &str, ultracache: Value| {
+        json!({"name": "web", "targets": {"read": {
+            "command": command,
+            "inputs": ["{projectRoot}/**/*"],
+            "qk:ultracache": ultracache
+        }}})
+        .to_string()
+    };
+    for (command, ultracache, allowed) in [
+        ("cat apps/web/src/index.ts", json!({"mode": "off"}), true),
+        ("cat apps/web/src/.env", json!({"mode": "off"}), false),
+        (
+            "cat apps/web/src/.env",
+            json!({"mode": "off", "ignoreReads": ["**/.env"]}),
+            true,
+        ),
+    ] {
+        fs::write(web.join("project.json"), project(command, ultracache)).unwrap();
+        let output = run(
+            temp.path(),
+            &["run", "web:read", "--skip-cache", "--sandbox=enforce"],
+        );
+        assert_eq!(output.status.success(), allowed, "{command}");
+    }
+}
+
 /// Only a task that started is listed as running unsandboxed: one skipped
 /// after its dependency failed never ran.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
