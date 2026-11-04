@@ -724,6 +724,9 @@ async function lacking(hashes: string[], env: Env): Promise<string[]> {
  * before it held them, one it lacks is asked of the bucket, a request each,
  * and noted when found. */
 async function storedBlobs(hashes: string[], env: Env): Promise<Map<string, StoredBlob | null>> {
+  if (hashes.length === 0) {
+    return new Map();
+  }
   const index = indexOf(env);
   const { stored, complete } = await index.blobsStored(hashes);
   const known = new Map(hashes.map((hash, at) => [hash, stored[at] ?? null]));
