@@ -421,7 +421,7 @@ impl Sandbox {
                 Err(error) => return Err(error),
             }
         } else if mode == Mode::Audit {
-            let recording = qk_executor::Recording::probe(&sandbox.directory)
+            let recording = qk_executor::Recording::required(&sandbox.directory)
                 .context("--sandbox on Linux records what each task does, with eBPF or strace")?;
             sandbox.recording = Some(recording.resolving());
         } else {
@@ -641,34 +641,15 @@ impl Sandbox {
                 })
             })
         };
-        let limits = qk_input_analysis::strace::Limits {
-            records: 1_000_000,
-            bytes: 256 * 1024 * 1024,
-            accesses: 500_000,
-            keep: Some(&keep),
-            resolved: true,
-            // A finding names each path once, whichever process read it.
-            distinct: true,
-        };
+        // A finding names each path once, whichever process read it.
+        let limits = qk_input_analysis::strace::Limits::kept(&keep, true);
         for (id, (recording, cwd)) in traces {
-            let collected = recording.settle().and_then(|()| {
-                qk_input_analysis::strace::collect_within(&recording.directory, &cwd, &limits)
-            });
-            let accesses = match collected {
-                Ok((accesses, issues)) => match issues.first() {
-                    None => accesses,
-                    Some(issue) => {
-                        self.unconfined(
-                            &id,
-                            &format!("it was not audited, as its recording is incomplete: {issue}"),
-                        );
-                        continue;
-                    }
-                },
-                Err(error) => {
+            let accesses = match recording.whole_accesses(&cwd, &limits) {
+                Ok(accesses) => accesses,
+                Err(reason) => {
                     self.unconfined(
                         &id,
-                        &format!("it was not audited, as its recording is incomplete: {error:#}"),
+                        &format!("it was not audited, as its recording is incomplete: {reason}"),
                     );
                     continue;
                 }

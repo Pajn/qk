@@ -52,6 +52,23 @@ pub const ANALYSIS: Limits<'static> = Limits {
     distinct: false,
 };
 
+impl<'a> Limits<'a> {
+    /// What qk reads of a trace to key or audit a task: only the accesses
+    /// `keep` keeps, each once, whichever processes made it, within a budget
+    /// that a large build stays within. With `resolved`, an access is also
+    /// kept by what its path's links lead to.
+    pub fn kept(keep: &'a dyn Fn(&Path) -> bool, resolved: bool) -> Self {
+        Self {
+            records: 1_000_000,
+            bytes: 256 * 1024 * 1024,
+            accesses: 500_000,
+            keep: Some(keep),
+            resolved,
+            distinct: true,
+        }
+    }
+}
+
 /// A cwd no path can be in, to tell a line whose paths depend on the
 /// process's working directory from one that names its paths whole: deep
 /// enough that no `..` climbs out of it. A path relative to a descriptor,

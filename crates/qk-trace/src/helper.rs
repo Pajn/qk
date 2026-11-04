@@ -32,6 +32,16 @@ fn frame(output: &mut impl Write, kind: u8, payload: &[u8]) -> std::io::Result<(
     output.write_all(payload)
 }
 
+/// Runs the helper over this process's standard input and output, which it
+/// writes through a buffer: stdout flushes at every newline byte, which
+/// binary frames hold everywhere, and the helper flushes when it needs to.
+pub fn serve() -> Result<()> {
+    run(
+        std::io::BufReader::new(std::io::stdin()),
+        std::io::BufWriter::new(std::io::stdout().lock()),
+    )
+}
+
 /// Runs the helper over `input` and `output`, its standard input and output.
 pub fn run(input: impl BufRead + Send + 'static, mut output: impl Write) -> Result<()> {
     let mut lines = input.lines();

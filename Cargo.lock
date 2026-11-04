@@ -1878,6 +1878,7 @@ dependencies = [
  "command-group",
  "libc",
  "qk-config",
+ "qk-input-analysis",
  "qk-taskgraph",
  "qk-trace",
  "regex",

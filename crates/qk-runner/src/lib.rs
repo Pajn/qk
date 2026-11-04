@@ -26,12 +26,12 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Context, Result, bail};
 use qk_config::Workspace;
 use qk_executor::report::{self, Event};
-use qk_executor::{Display, Outcome, OutputStyle, environment, execute, prepare};
+use qk_executor::{Display, Outcome, OutputStyle, Probed, environment, execute, prepare};
 use qk_taskgraph::TaskGraph;
 
+mod analysis;
 mod installs;
 mod memory;
-mod recorder;
 pub mod sandbox;
 pub mod threads;
 use threads::Threads;
@@ -99,32 +99,27 @@ fn execute_retained(
 /// strace can. With `resolving`, an opened file's path is recorded with what
 /// its links lead to, as an audit reads it. Elsewhere than on Linux, or where
 /// no recorder works, nothing is recorded, and that is said once: the run
-/// goes on, as a recording only keys what a later run may take. A recorder
-/// `QK_RECORDER` names that cannot record fails the run, as asked for.
+/// goes on, as a recording only keys what a later run may take. A
+/// `QK_RECORDER` naming no recorder, or one that cannot record here, fails
+/// the run, as asked for.
 fn attach_recordings(
     graph: &TaskGraph,
     prepared: &mut BTreeMap<String, qk_executor::PreparedTask>,
     resolving: bool,
 ) -> Result<Option<tempfile::TempDir>> {
-    if !cfg!(target_os = "linux") {
-        qk_executor::status!("qk: --record records only on Linux; this run records nothing");
-        return Ok(None);
-    }
-    // A recorder named wrong is a mistake to fix, not a runner without one.
-    let choice = std::env::var("QK_RECORDER").unwrap_or_default();
-    if !matches!(choice.as_str(), "" | "auto" | "ebpf" | "strace") {
-        bail!("unknown QK_RECORDER {choice:?}; use auto, ebpf or strace");
-    }
     let directory = tempfile::tempdir().context("cannot create a directory for recordings")?;
-    let mut recording = match qk_executor::Recording::probe(directory.path()) {
-        Ok(recording) => recording,
-        // A recorder asked for by name that cannot record is a mistake to
-        // fix, as one named wrong is.
-        Err(error) if matches!(choice.as_str(), "ebpf" | "strace") => return Err(error),
-        Err(error) => {
+    // A recorder named wrong, or named and unable to record, is a mistake to
+    // fix, not a runner without one.
+    let mut recording = match qk_executor::Recording::probe(directory.path())? {
+        Probed::Ready(recording) => recording,
+        Probed::Unavailable(error) => {
             qk_executor::status!(
                 "qk: --record records nothing, as no recorder works here: {error:#}"
             );
+            return Ok(None);
+        }
+        Probed::Unsupported => {
+            qk_executor::status!("qk: --record records only on Linux; this run records nothing");
             return Ok(None);
         }
     };
@@ -138,8 +133,7 @@ fn attach_recordings(
         if let Some(prepared) = prepared.get_mut(id).filter(|_| opted) {
             let traces = directory.path().join(format!("task-{index}"));
             std::fs::create_dir(&traces)?;
-            prepared.recording = Some(recording.in_directory(traces));
-            prepared.recording_keys = true;
+            prepared.recording = Some(recording.in_directory(traces).keying());
         }
     }
     Ok(Some(directory))
@@ -394,8 +388,8 @@ pub fn run(
     let sandbox = sandbox_mode
         .map(|mode| sandbox::Sandbox::start(workspace, graph, mode))
         .transpose()?;
-    let recorder = analyze_inputs
-        .then(|| recorder::Recorder::start(workspace, graph, &mut prepared))
+    let analysis = analyze_inputs
+        .then(|| analysis::Analysis::start(workspace, graph, &mut prepared))
         .transpose()?;
     // As in Nx 24.0.1, a task waiting for a server with a `signal` check may
     // learn its address in NX_READY_URL, and resolves its own readyWhen once
@@ -1287,8 +1281,8 @@ pub fn run(
             })
         })
         .transpose()?;
-    let input_analysis = recorder
-        .map(|recorder| recorder.finish(workspace, graph, &prepared, &outcomes))
+    let input_analysis = analysis
+        .map(|analysis| analysis.finish(workspace, graph, &prepared, &outcomes))
         .transpose()?;
     let mut ran_threaded = records
         .iter()

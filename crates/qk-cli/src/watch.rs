@@ -455,7 +455,6 @@ fn callbacks(
                 tty: false,
                 sandbox: None,
                 recording: None,
-                recording_keys: false,
                 scratch: Vec::new(),
                 display: Display::Stream,
             };

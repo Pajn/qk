@@ -33,6 +33,22 @@ source, and a project when every task of it a change affects is left out. A
 target opts in through a named config. It does not change declared task inputs
 or cache keys.
 
+**Recording**:
+What a task's processes did to files while it ran, as a recorder on Linux
+saw it. Only a run with `--record` keys results by it; the sandbox's audit
+and input analysis read recordings without keying anything.
+
+**Path set**:
+What one recording of a task did to each workspace path (read, listed or
+looked up), less what is left out, such as its outputs and its
+`ignoreReads`. Up to eight, the newest first, are kept under the task's weak
+key.
+
+**Weak key**:
+A task's key without its declared file inputs, apart from those qk always
+includes. Its path sets are kept under it, and each stands in for the file
+inputs it leaves out.
+
 **Result record**:
 A saved successful task result, identified by its cache key, that describes
 the task's outputs and recorded log.
