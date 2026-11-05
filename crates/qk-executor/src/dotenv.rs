@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
@@ -51,9 +51,13 @@ pub fn parse(text: &str) -> Vec<(String, String)> {
 /// hold is set; then each value is expanded against `env` and what the files
 /// expanded before it, and set, which also fills a variable set but empty. A
 /// variable `env` already holds with another value keeps it. A file that
-/// does not exist is skipped.
-pub fn load(paths: &[impl AsRef<Path>], env: &mut BTreeMap<OsString, OsString>) -> Result<()> {
+/// does not exist is skipped. The files it read are returned.
+pub fn load(
+    paths: &[impl AsRef<Path>],
+    env: &mut BTreeMap<OsString, OsString>,
+) -> Result<Vec<PathBuf>> {
     let mut parsed: Vec<(String, String)> = Vec::new();
+    let mut read = Vec::new();
     for path in paths {
         let path = path.as_ref();
         let text = match std::fs::read(path) {
@@ -63,6 +67,7 @@ pub fn load(paths: &[impl AsRef<Path>], env: &mut BTreeMap<OsString, OsString>) 
                 return Err(error).with_context(|| format!("cannot read {}", path.display()));
             }
         };
+        read.push(path.to_path_buf());
         for (key, value) in parse(&text) {
             if !parsed.iter().any(|(name, _)| *name == key) {
                 parsed.push((key, value));
@@ -93,7 +98,7 @@ pub fn load(paths: &[impl AsRef<Path>], env: &mut BTreeMap<OsString, OsString>) 
     for (name, value) in expanded {
         env.insert(name, value.into());
     }
-    Ok(())
+    Ok(read)
 }
 
 /// The variables of one file as `load` would set them in an empty

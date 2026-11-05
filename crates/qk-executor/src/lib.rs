@@ -817,9 +817,7 @@ fn task_environment(
         .into_iter()
         .map(|file| workspace.root.join(file))
         .collect();
-        dotenv::load(&files, &mut env)?;
-        // Those there to load: a candidate missing is skipped.
-        loaded.extend(files.into_iter().filter(|file| file.is_file()));
+        loaded.extend(dotenv::load(&files, &mut env)?);
     }
     let runtime_env = env.clone();
     // Nx's own variables from an enclosing run, which describe that run.
@@ -942,8 +940,7 @@ pub fn prepare(
                 bail!("envFile {file} does not exist");
             }
             dotenv::load(std::slice::from_ref(&path), &mut runtime_env)?;
-            dotenv::load(std::slice::from_ref(&path), &mut env)?;
-            dotenv.push(path);
+            dotenv.extend(dotenv::load(std::slice::from_ref(&path), &mut env)?);
         }
     }
     if let Some(values) = options.get("env").filter(|_| run_commands) {
