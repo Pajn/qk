@@ -16,6 +16,11 @@
 //!   changes cannot change the result. One starting `^` names files in the
 //!   projects the task's project depends on, directly or not: see
 //!   [`IgnoredReads`].
+//! - `uncheckedOutputs`: workspace globs naming outputs that a run checked
+//!   against a recorded result leaves out of the comparison, for files a
+//!   tool does not write the same twice, such as coverage hit counts or
+//!   build state that records the builds before it. They are saved and
+//!   restored as any other output.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -30,12 +35,13 @@ use crate::glob::Pattern;
 
 /// The fields a `qk:ultracache` object can set. Others are ignored, as Nx
 /// ignores keys it does not know; `qk doctor` reports them.
-pub const FIELDS: &[&str] = &["mode", "ignoreReads"];
+pub const FIELDS: &[&str] = &["mode", "ignoreReads", "uncheckedOutputs"];
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Settings {
     pub mode: Mode,
     pub ignore_reads: Vec<String>,
+    pub unchecked_outputs: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -69,7 +75,31 @@ impl Settings {
             Some(_) => bail!("qk:ultracache.mode must be \"on\", \"record\" or \"off\""),
         };
         let ignore_reads = ignored_reads(task)?;
-        Ok(Some(Self { mode, ignore_reads }))
+        let unchecked_outputs: Vec<String> = match object.get("uncheckedOutputs") {
+            None => Vec::new(),
+            Some(value) => serde_json::from_value(value.clone())
+                .context("qk:ultracache.uncheckedOutputs must be an array of globs")?,
+        };
+        for glob in &unchecked_outputs {
+            Pattern::new(glob, false).with_context(|| {
+                format!("qk:ultracache.uncheckedOutputs has an invalid glob {glob:?}")
+            })?;
+        }
+        Ok(Some(Self {
+            mode,
+            ignore_reads,
+            unchecked_outputs,
+        }))
+    }
+
+    /// Whether a run's check leaves the output at `path` out.
+    pub fn unchecked(&self) -> Result<impl Fn(&str) -> bool + use<>> {
+        let patterns = self
+            .unchecked_outputs
+            .iter()
+            .map(|glob| Pattern::new(glob, false))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(move |path: &str| patterns.iter().any(|pattern| pattern.is_match(path)))
     }
 }
 
@@ -416,6 +446,16 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(record.mode, Mode::Record);
+        let unchecked = Settings::of(&task(serde_json::json!({
+            "uncheckedOutputs": ["**/coverage/**", "**/*.tsbuildinfo"]
+        })))
+        .unwrap()
+        .unwrap()
+        .unchecked()
+        .unwrap();
+        assert!(unchecked("app/coverage/lcov.info"));
+        assert!(unchecked("app/dist/.tsbuildinfo"));
+        assert!(!unchecked("app/dist/index.d.ts"));
         assert!(
             Settings::of(&task(serde_json::json!({"mode": "off"})))
                 .unwrap()
@@ -430,6 +470,8 @@ mod tests {
             serde_json::json!({"mode": 1}),
             serde_json::json!({"ignoreReads": "tmp/**"}),
             serde_json::json!({"ignoreReads": ["src/[*.log"]}),
+            serde_json::json!({"uncheckedOutputs": "coverage/**"}),
+            serde_json::json!({"uncheckedOutputs": ["src/[*.log"]}),
         ] {
             assert!(Settings::of(&task(invalid.clone())).is_err(), "{invalid}");
         }
