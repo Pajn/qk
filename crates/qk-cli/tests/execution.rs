@@ -4874,6 +4874,25 @@ fn the_sandbox_keeps_a_dotenv_file_out_of_a_linked_directory() {
     }
 }
 
+/// An input linking to a directory outside the workspace reads through it:
+/// outside the workspace everything is allowed, and the sandbox judges the
+/// path a link leads to.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn the_sandbox_reads_through_a_link_out_of_the_workspace() {
+    let outside = TempDir::new().unwrap();
+    fs::write(outside.path().join("f.txt"), "outside\n").unwrap();
+    let temp = fixture(json!({
+        "read": {"command": "cat linked/f.txt", "inputs": ["{projectRoot}/linked"]}
+    }));
+    std::os::unix::fs::symlink(outside.path(), temp.path().join("linked")).unwrap();
+    let output = success(run(
+        temp.path(),
+        &["run", "app:read", "--skip-cache", "--sandbox=enforce"],
+    ));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("outside"));
+}
+
 /// Only a task that started is listed as running unsandboxed: one skipped
 /// after its dependency failed never ran.
 #[cfg(any(target_os = "macos", target_os = "linux"))]

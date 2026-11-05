@@ -1142,9 +1142,12 @@ impl Tree {
         inputs: &BTreeSet<String>,
         loaded: &BTreeSet<String>,
     ) -> (Vec<String>, Vec<String>) {
+        // Whether `path` lies beneath `directory`, `""` holding everything.
         let beneath = |path: &str, directory: &str| {
-            path.strip_prefix(directory)
-                .is_some_and(|rest| rest.starts_with('/'))
+            directory.is_empty()
+                || path
+                    .strip_prefix(directory)
+                    .is_some_and(|rest| rest.starts_with('/'))
         };
         let held: BTreeSet<String> = self
             .dotenv_beneath(directory)
@@ -1177,7 +1180,10 @@ impl Tree {
                 ) else {
                     continue;
                 };
-                let path = format!("{current}/{name}");
+                let path = match current.as_str() {
+                    "" => name,
+                    current => format!("{current}/{name}"),
+                };
                 if kind.is_dir() {
                     pending.push(path);
                 } else if kind.is_file() && !held.contains(&path) {
@@ -1350,6 +1356,8 @@ fn plan(
                 .and_then(Path::to_str)
                 .filter(|_| target.is_dir())
             else {
+                // A linked file is keyed by the content of what it leads to,
+                // so reading that is declared, whatever its name.
                 read_files.push(target);
                 continue;
             };
@@ -2238,6 +2246,27 @@ mod tests {
             judge(plan(&declared), "shared/deep/.env"),
             policy::Verdict::Allow
         );
+    }
+
+    /// An input linking to the workspace root is split as any linked
+    /// directory: what the root holds is read, but for an undeclared dotenv
+    /// file and a file the task's environment was loaded from.
+    #[test]
+    fn splits_a_link_to_the_workspace_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        for file in ["a.ts", ".env", "src/b.ts", "src/vars.txt"] {
+            let path = root.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+        let tree = Tree::new(&BTreeSet::new()).protecting_dotenv(&root);
+        let loaded = BTreeSet::from(["src/vars.txt".to_owned()]);
+        let (mut trees, mut files) = tree.split("", &BTreeSet::new(), &loaded);
+        trees.sort();
+        files.sort();
+        assert!(trees.is_empty(), "{trees:?}");
+        assert_eq!(files, ["a.ts", "src/b.ts"]);
     }
 
     #[cfg(unix)]
