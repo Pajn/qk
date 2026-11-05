@@ -818,7 +818,8 @@ fn task_environment(
         .map(|file| workspace.root.join(file))
         .collect();
         dotenv::load(&files, &mut env)?;
-        loaded.extend(files);
+        // Those there to load: a candidate missing is skipped.
+        loaded.extend(files.into_iter().filter(|file| file.is_file()));
     }
     let runtime_env = env.clone();
     // Nx's own variables from an enclosing run, which describe that run.
@@ -1456,6 +1457,7 @@ mod loaded_tests {
         std::fs::write(root.join("config/variables.txt"), "A=1\n").unwrap();
         std::fs::write(&absolute, "B=1\n").unwrap();
         std::fs::write(root.join(".env.off"), "NX_LOAD_DOT_ENV_FILES=false\n").unwrap();
+        std::fs::write(root.join(".env"), "C=1\n").unwrap();
         let workspace = Workspace::load(root).unwrap();
         let requests = ["app:plain", "app:absolute", "app:off"]
             .map(|request| qk_taskgraph::Request::parse(request).unwrap());
@@ -1467,6 +1469,11 @@ mod loaded_tests {
         };
         let plain = loaded("app:plain");
         assert!(plain.contains(&workspace.root.join(".env")), "{plain:?}");
+        // A candidate that is not there was not loaded.
+        assert!(
+            !plain.contains(&workspace.root.join(".env.local")),
+            "{plain:?}"
+        );
         assert_eq!(
             plain.last(),
             Some(&workspace.root.join("config/variables.txt"))
