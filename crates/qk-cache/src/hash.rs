@@ -241,15 +241,23 @@ impl Membership {
             listed: None,
         };
         // Finding Git's own policy files takes several Git processes, which
-        // run while the directories are read.
-        let git_policies = std::thread::scope(|scope| {
+        // run while the directories are read. They are stamped as soon as
+        // they are found: a config rewritten during the walk could name an
+        // excludes file the discovered set lacks, and a stamp taken after
+        // that rewrite would not show it.
+        let (git_policies, git_stamps) = std::thread::scope(|scope| {
             let discovery = scope.spawn(|| {
-                git_policies
+                let policies = git_policies
                     .cloned()
-                    .unwrap_or_else(|| git_membership_policies(root))
+                    .unwrap_or_else(|| git_membership_policies(root));
+                let stamps = policies
+                    .iter()
+                    .map(|policy| Ok((policy.clone(), membership_stamp(policy)?)))
+                    .collect::<Result<BTreeMap<_, _>>>()?;
+                anyhow::Ok((policies, stamps))
             });
             membership.walk()?;
-            anyhow::Ok(discovery.join().expect("git policy thread panicked"))
+            discovery.join().expect("git policy thread panicked")
         })?;
         // Git lists tracked files even beneath ignored directories. Watching
         // only the ignore walker would miss deletion/rename of those files.
@@ -284,9 +292,11 @@ impl Membership {
         membership.policies.extend(git_policies.iter().cloned());
         membership.git_policies = git_policies;
         for policy in &membership.policies {
-            membership
-                .stamps
-                .insert(policy.clone(), membership_stamp(policy)?);
+            let stamp = match git_stamps.get(policy) {
+                Some(stamp) => stamp.clone(),
+                None => membership_stamp(policy)?,
+            };
+            membership.stamps.insert(policy.clone(), stamp);
         }
         // Capture contents before listing, so a later policy change cannot be
         // mistaken for the rules that produced that listing.
