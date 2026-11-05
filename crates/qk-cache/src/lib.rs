@@ -231,8 +231,8 @@ pub struct Check {
     /// at most [`UNCOVERED`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub differences: Vec<String>,
-    /// How many of the run's outputs, files and directories, its
-    /// `uncheckedOutputs` left out of the comparison.
+    /// How many outputs, files and directories of the run or of the recorded
+    /// result, its `uncheckedOutputs` left out of the comparison.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub unchecked: usize,
 }
@@ -1194,12 +1194,17 @@ impl Cache {
             });
         match compared {
             Ok(Some(((mut ran, mut recorded), unchecked))) => {
-                let before = ran.len();
+                let mut left_out = 0;
                 if let Some(unchecked) = unchecked {
+                    left_out = ran
+                        .keys()
+                        .chain(recorded.keys())
+                        .filter(|path| unchecked(path))
+                        .collect::<BTreeSet<_>>()
+                        .len();
                     ran.retain(|path, _| !unchecked(path));
                     recorded.retain(|path, _| !unchecked(path));
                 }
-                let left_out = before - ran.len();
                 let differences = store::differences(&ran, &recorded, UNCOVERED);
                 Some(Check {
                     matched: differences.is_empty(),

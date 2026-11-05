@@ -591,6 +591,10 @@ fn a_check_leaves_out_the_outputs_named_unchecked() {
         &nx.replace(
             r#""ignoreReads""#,
             r#""mode": "record", "uncheckedOutputs": ["app/dist/out.txt"], "ignoreReads""#,
+        )
+        .replace(
+            r#"["app/src/notes.txt"]"#,
+            r#"["app/src/notes.txt", "app/icons/a.svg"]"#,
         ),
     );
     assert_eq!(kind(&build_report(root, true, &[])["recorded"]), "saved");
@@ -601,6 +605,14 @@ fn a_check_leaves_out_the_outputs_named_unchecked() {
     assert_eq!(
         task["shadow"]["check"],
         json!({"matched": true, "unchecked": 1})
+    );
+    // The outputs it does not name are still compared.
+    write(root, "app/icons/a.svg", "<svg>changed</svg>\n");
+    let task = build_report(root, false, &[]);
+    assert_eq!(task["cache"], "miss");
+    assert_eq!(
+        task["shadow"]["check"],
+        json!({"matched": false, "differences": ["app/dist/sprite.svg (differs)"], "unchecked": 1})
     );
 }
 
