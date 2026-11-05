@@ -50,7 +50,29 @@ struct Cleanup(PathBuf);
 
 impl Drop for Cleanup {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        // A removal can fail while a file is still being created in the
+        // snapshot, so it is tried a few times; one that keeps failing is
+        // logged, as the snapshot then stays until a later launch reclaims it.
+        // Written so that a failure to log cannot abort a worker unwinding.
+        let mut attempt = 0;
+        loop {
+            match fs::remove_dir_all(&self.0) {
+                Ok(()) => return,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                Err(_) if attempt < 4 => {
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_millis(50 << attempt));
+                }
+                Err(error) => {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "qk: could not remove the upload snapshot {}: {error}",
+                        self.0.display()
+                    );
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -76,14 +98,17 @@ fn cleanup_abandoned(parent: &std::path::Path) {
             continue;
         }
         if metadata.is_dir() {
-            let Ok(lease) = fs::OpenOptions::new()
+            // One whose lease is gone, as a removal that stopped partway
+            // leaves it, no worker holds.
+            let lease = fs::OpenOptions::new()
                 .read(true)
                 .write(true)
-                .open(item.path().join("lease"))
-            else {
-                continue;
+                .open(item.path().join("lease"));
+            let free = match &lease {
+                Ok(lease) => FileExt::try_lock_exclusive(lease).is_ok(),
+                Err(error) => error.kind() == std::io::ErrorKind::NotFound,
             };
-            if FileExt::try_lock_exclusive(&lease).is_ok() {
+            if free {
                 let _ = fs::remove_dir_all(item.path());
             }
         } else if item
@@ -417,6 +442,21 @@ pub(crate) fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn an_expired_snapshot_left_without_its_lease_is_reclaimed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let snapshot = temporary.path().join("qk-upload-partly-removed");
+        fs::create_dir_all(snapshot.join("blobs")).unwrap();
+        fs::write(snapshot.join("blobs/a"), b"a").unwrap();
+        fs::File::open(&snapshot)
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH)
+            .unwrap();
+        cleanup_abandoned(temporary.path());
+        assert!(!snapshot.exists());
+    }
     use serde_json::json;
 
     #[test]
