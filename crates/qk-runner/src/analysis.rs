@@ -239,10 +239,13 @@ impl Analysis {
             let warm = qk_cache::warm::config(workspace, task).and_then(|entries| {
                 qk_cache::Outputs::from_paths(&qk_cache::warm::kept_paths(&entries))
             });
-            let dependencies: Vec<_> = task
-                .dependencies
+            // Those `--exclude-task-dependencies` left unrun too: their
+            // outputs key the task.
+            let dependencies: Vec<_> = graph
+                .output_dependencies(task, false)
                 .iter()
-                .map(|id| qk_cache::Outputs::new(workspace, &graph.tasks[id]))
+                .filter_map(|id| graph.keyed_task(id))
+                .map(|dependency| qk_cache::Outputs::new(workspace, dependency))
                 .collect();
             if outputs.is_err() || warm.is_err() || dependencies.iter().any(Result::is_err) {
                 coverage

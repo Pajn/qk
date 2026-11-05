@@ -65,7 +65,9 @@ package manager other than pnpm, lockfiles are always keyed by content.
 The [runtime input environment](../guides/cache.md) determines which tasks can
 share a runtime evaluation.
 `dependentTasksOutputFiles` selects matching files from completed dependency
-outputs rather than their full output fingerprints. `.` and `..` segments in
+outputs rather than their full output fingerprints; dependencies that
+`--exclude-task-dependencies` leaves unrun still count, by their outputs as
+they are on disk. `.` and `..` segments in
 paths are resolved within the workspace. A symlinked input is keyed by its
 target text and the content it resolves to, including the files below a
 linked directory; links that resolve outside the workspace are not supported.

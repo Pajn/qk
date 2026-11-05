@@ -840,6 +840,77 @@ fn forced_failure_pairs_with_a_real_success_and_preserves_its_cache_entry() {
     assert_eq!(groups[0]["executions"].as_array().unwrap().len(), 3);
 }
 
+// The targets are POSIX shell commands.
+#[cfg(unix)]
+#[test]
+fn excluded_dependencies_still_key_a_task_by_their_outputs() {
+    let fixture = Fixture::with_targets(json!({
+        "generate": {
+            "executor": "nx:run-commands",
+            "cache": true,
+            "inputs": ["{projectRoot}/src/**/*"],
+            "outputs": ["{projectRoot}/generated"],
+            "options": {"command": "mkdir -p generated && cp src/input.txt generated/out.txt"}
+        },
+        "build": {
+            "executor": "nx:run-commands",
+            "cache": true,
+            "dependsOn": ["generate"],
+            "inputs": [{"dependentTasksOutputFiles": "**/*"}],
+            "outputs": ["{projectRoot}/dist"],
+            "options": {"command": "echo run >> ../builds && mkdir -p dist && cp generated/out.txt dist/out.txt"}
+        }
+    }));
+    let builds = || {
+        fs::read_to_string(fixture.root.join("../builds"))
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    success(fixture.build(&fixture.root, &[]));
+    assert_eq!(builds(), 1);
+    // Without running its dependency, the task is keyed as it was with it.
+    let excluded = success(fixture.build(&fixture.root, &["--exclude-task-dependencies"]));
+    assert!(
+        stderr(&excluded).contains("cache hit app:build"),
+        "{}",
+        stderr(&excluded)
+    );
+    // Its dependency is not run, even from the cache.
+    assert!(
+        !stderr(&excluded).contains("app:generate"),
+        "{}",
+        stderr(&excluded)
+    );
+    assert_eq!(builds(), 1);
+    // A dependency's output that changed since keys it again, rather than
+    // restoring what was built from the old one.
+    fs::write(fixture.root.join("src/input.txt"), "two\n").unwrap();
+    success(fixture.qk(&fixture.root, &["run", "app:generate"]));
+    let rebuilt = success(fixture.build(&fixture.root, &["--exclude-task-dependencies"]));
+    assert!(
+        !stderr(&rebuilt).contains("app:generate"),
+        "{}",
+        stderr(&rebuilt)
+    );
+    assert_eq!(builds(), 2);
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("dist/out.txt")).unwrap(),
+        "two\n"
+    );
+    // A sandbox lets it read what keys it.
+    fs::write(fixture.root.join("src/input.txt"), "three\n").unwrap();
+    success(fixture.qk(&fixture.root, &["run", "app:generate"]));
+    success(fixture.build(
+        &fixture.root,
+        &["--exclude-task-dependencies", "--sandbox=enforce"],
+    ));
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("dist/out.txt")).unwrap(),
+        "three\n"
+    );
+}
+
 #[test]
 fn forced_runs_key_the_outputs_of_uncacheable_dependencies_without_retaining_their_logs() {
     let fixture = Fixture::with_targets(json!({
