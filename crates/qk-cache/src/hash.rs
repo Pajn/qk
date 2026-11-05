@@ -3,8 +3,8 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
@@ -189,6 +189,17 @@ struct Candidates {
     source_ignore: Arc<SourceIgnore>,
 }
 
+/// The type [`Membership::entries`] records for a directory; a file is 0 and
+/// a symlink 2.
+const DIRECTORY: u8 = 1;
+/// Directories read at once while the inventory walks the workspace.
+const WALKERS: usize = 8;
+
+/// Whether `name` is an ignore file, whose rules change which files are sources.
+fn is_policy(name: &std::ffi::OsStr) -> bool {
+    matches!(name.to_str(), Some(".gitignore" | ".nxignore"))
+}
+
 impl Membership {
     /// Inventory source directories and policy stamps before a new listing.
     fn new(
@@ -199,92 +210,6 @@ impl Membership {
         cache: Option<&Path>,
         git_policies: Option<&BTreeSet<PathBuf>>,
     ) -> Result<Self> {
-        let excluded: BTreeSet<_> = outputs
-            .iter()
-            .flat_map(Outputs::complete_roots)
-            .map(PathBuf::from)
-            .collect();
-        let excluded_roots = excluded.clone();
-        let walk_root = root.to_owned();
-        let walk_cache = cache.map(PathBuf::from);
-        let mut directories = BTreeSet::new();
-        let mut stamps = BTreeMap::new();
-        for entry in ignore::WalkBuilder::new(root)
-            .hidden(false)
-            .parents(false)
-            .git_global(false)
-            .require_git(false)
-            .ignore(false)
-            .git_ignore(false)
-            .git_exclude(false)
-            .follow_links(false)
-            .filter_entry(move |entry| {
-                let relative = entry
-                    .path()
-                    .strip_prefix(&walk_root)
-                    .unwrap_or(entry.path());
-                !matches!(
-                    entry.file_name().to_str(),
-                    Some(".git" | ".qk" | "node_modules")
-                ) && walk_cache
-                    .as_ref()
-                    .is_none_or(|cache| !relative.starts_with(cache))
-                    && !relative.ancestors().any(|path| excluded.contains(path))
-            })
-            .build()
-        {
-            let entry = entry?;
-            if entry.file_type().is_some_and(|kind| kind.is_dir()) {
-                let directory = entry.path().to_owned();
-                stamps.insert(directory.clone(), membership_stamp(&directory)?);
-                directories.insert(directory);
-            }
-        }
-        // Git lists tracked files even beneath ignored directories. Watching
-        // only the ignore walker would miss deletion/rename of those files.
-        for path in files {
-            for parent in Path::new(path).ancestors().skip(1) {
-                let directory = root.join(parent);
-                if directories.insert(directory.clone()) {
-                    stamps.insert(directory.clone(), membership_stamp(&directory)?);
-                }
-            }
-        }
-        let mut policies = BTreeSet::new();
-        for directory in &directories {
-            for name in [".gitignore", ".nxignore"] {
-                let path = directory.join(name);
-                // Creation of a new ignore file changes its directory stamp.
-                // Existing rules can be edited without changing the directory.
-                if membership_stamp(&path)?.is_some() {
-                    policies.insert(path);
-                }
-            }
-        }
-        for directory in root.ancestors() {
-            policies.insert(directory.join(".gitignore"));
-            // Also detect a newly initialized repository or changed worktree pointer.
-            policies.insert(directory.join(".git"));
-        }
-        let git_policies = git_policies
-            .cloned()
-            .unwrap_or_else(|| git_membership_policies(root));
-        policies.extend(git_policies.iter().cloned());
-        for policy in &policies {
-            stamps.insert(policy.clone(), membership_stamp(policy)?);
-        }
-        // Capture contents before listing, so a later policy change cannot be
-        // mistaken for the rules that produced that listing.
-        let mut ignore_contents = BTreeMap::new();
-        for policy in &policies {
-            if matches!(
-                policy.file_name().and_then(|name| name.to_str()),
-                Some(".gitignore" | ".nxignore")
-            ) && let Some(content) = ignore_content(policy, &stamps[policy])?
-            {
-                ignore_contents.insert(policy.clone(), content);
-            }
-        }
         let mut output_anchors: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
         for (index, outputs) in outputs.iter().enumerate() {
             for anchor in outputs.anchors() {
@@ -297,34 +222,200 @@ impl Membership {
         let mut membership = Self {
             files: Arc::new(BTreeSet::new()),
             source_ignore: source_ignore.clone(),
-            stamps,
-            directories,
+            stamps: BTreeMap::new(),
+            directories: BTreeSet::new(),
             directory_entries: BTreeMap::new(),
             root: root.to_owned(),
             outputs: outputs.to_vec(),
             output_anchors,
-            excluded_roots,
+            excluded_roots: outputs
+                .iter()
+                .flat_map(Outputs::complete_roots)
+                .map(PathBuf::from)
+                .collect(),
             cache: cache.map(PathBuf::from),
-            policies,
-            git_policies,
-            ignore_contents,
+            policies: BTreeSet::new(),
+            git_policies: BTreeSet::new(),
+            ignore_contents: BTreeMap::new(),
             settled: false,
             listed: None,
         };
-        for directory in &membership.directories {
-            if let Some(entries) = membership.entries(directory)? {
+        // Finding Git's own policy files takes several Git processes, which
+        // run while the directories are read.
+        let git_policies = std::thread::scope(|scope| {
+            let discovery = scope.spawn(|| {
+                git_policies
+                    .cloned()
+                    .unwrap_or_else(|| git_membership_policies(root))
+            });
+            membership.walk()?;
+            anyhow::Ok(discovery.join().expect("git policy thread panicked"))
+        })?;
+        // Git lists tracked files even beneath ignored directories. Watching
+        // only the ignore walker would miss deletion/rename of those files.
+        let mut beneath = Vec::new();
+        for path in files {
+            for parent in Path::new(path).ancestors().skip(1) {
+                let directory = root.join(parent);
+                // A watched directory's parent is watched too, so the
+                // nearest one watched ends the search.
+                if !membership.directories.insert(directory.clone()) {
+                    break;
+                }
                 membership
-                    .directory_entries
-                    .insert(directory.clone(), entries);
+                    .stamps
+                    .insert(directory.clone(), membership_stamp(&directory)?);
+                for name in [".gitignore", ".nxignore"] {
+                    let path = directory.join(name);
+                    // Creation of a new ignore file changes its directory stamp.
+                    // Existing rules can be edited without changing the directory.
+                    if membership_stamp(&path)?.is_some() {
+                        membership.policies.insert(path);
+                    }
+                }
+                beneath.push(directory);
+            }
+        }
+        for directory in root.ancestors() {
+            membership.policies.insert(directory.join(".gitignore"));
+            // Also detect a newly initialized repository or changed worktree pointer.
+            membership.policies.insert(directory.join(".git"));
+        }
+        membership.policies.extend(git_policies.iter().cloned());
+        membership.git_policies = git_policies;
+        for policy in &membership.policies {
+            membership
+                .stamps
+                .insert(policy.clone(), membership_stamp(policy)?);
+        }
+        // Capture contents before listing, so a later policy change cannot be
+        // mistaken for the rules that produced that listing.
+        for policy in &membership.policies {
+            if policy.file_name().is_some_and(is_policy)
+                && let Some(content) = ignore_content(policy, &membership.stamps[policy])?
+            {
+                membership.ignore_contents.insert(policy.clone(), content);
+            }
+        }
+        // The walk did not read these: their names are captured as any
+        // later check reads them, now that every policy is known.
+        for directory in beneath {
+            if let Some(entries) = membership.entries(&directory)? {
+                membership.directory_entries.insert(directory, entries);
             }
         }
         Ok(membership)
+    }
+
+    /// Stamp each directory from the root, then capture its names from the
+    /// same read that finds its subdirectories and ignore files. A change made
+    /// after the read changes the stamp, which later checks compare.
+    fn walk(&mut self) -> Result<()> {
+        // The directories waiting to be read, and how many are being read,
+        // whose subdirectories may still join them.
+        let queue = Mutex::new((vec![self.root.clone()], 0_usize));
+        let changed = Condvar::new();
+        let failed = AtomicBool::new(false);
+        let membership = &*self;
+        let read = |directory: &Path| -> Result<_> {
+            let stamp = membership_stamp(directory)?;
+            Ok((stamp, membership.listed(directory)?))
+        };
+        let walked: Vec<Result<Vec<_>>> = std::thread::scope(|scope| {
+            let walkers: Vec<_> = (0..WALKERS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut walked = Vec::new();
+                        loop {
+                            let directory = {
+                                let mut queue = queue.lock().unwrap();
+                                loop {
+                                    if failed.load(Ordering::Relaxed) {
+                                        return Ok(walked);
+                                    }
+                                    if let Some(directory) = queue.0.pop() {
+                                        queue.1 += 1;
+                                        break directory;
+                                    }
+                                    if queue.1 == 0 {
+                                        return Ok(walked);
+                                    }
+                                    queue = changed.wait(queue).unwrap();
+                                }
+                            };
+                            let result = read(&directory);
+                            let mut queue = queue.lock().unwrap();
+                            queue.1 -= 1;
+                            changed.notify_all();
+                            let (stamp, names) = match result {
+                                Ok(read) => read,
+                                Err(error) => {
+                                    failed.store(true, Ordering::Relaxed);
+                                    return Err(error);
+                                }
+                            };
+                            for (name, kind) in names.iter().flatten() {
+                                if *kind == DIRECTORY {
+                                    queue.0.push(directory.join(name));
+                                }
+                            }
+                            drop(queue);
+                            walked.push((directory, stamp, names));
+                        }
+                    })
+                })
+                .collect();
+            walkers
+                .into_iter()
+                .map(|walker| walker.join().expect("directory walker panicked"))
+                .collect()
+        });
+        for walked in walked {
+            for (directory, stamp, names) in walked? {
+                self.stamps.insert(directory.clone(), stamp);
+                if let Some(names) = names {
+                    for (name, _) in &names {
+                        // Creation of a new ignore file changes its directory stamp.
+                        // Existing rules can be edited without changing the directory.
+                        if is_policy(name) {
+                            self.policies.insert(directory.join(name));
+                        }
+                    }
+                    self.directory_entries.insert(directory.clone(), names);
+                }
+                self.directories.insert(directory);
+            }
+        }
+        Ok(())
     }
 
     /// Names and types that can affect source membership in this directory.
     /// Output files may be skipped, but partially excluded output directories
     /// must remain visible because they can contain source files or ignore rules.
     fn entries(&self, directory: &Path) -> Result<Option<BTreeSet<(OsString, u8)>>> {
+        let Some(names) = self.listed(directory)? else {
+            return Ok(None);
+        };
+        for (name, kind) in &names {
+            let path = directory.join(name);
+            // A policy created between policy discovery and name capture must
+            // get its own stamp before its in-place edits can permit reuse.
+            if is_policy(name) && !self.policies.contains(&path) {
+                return Ok(None);
+            }
+            // An empty directory created after the inventory walk would not
+            // appear among source files. Never bless its parent signature until
+            // that directory is itself watched by the inventory.
+            if *kind == DIRECTORY && !self.directories.contains(&path) {
+                return Ok(None);
+            }
+        }
+        Ok(Some(names))
+    }
+
+    /// The names [`Self::entries`] keeps, before it checks that the inventory
+    /// already watches each directory and policy among them.
+    fn listed(&self, directory: &Path) -> Result<Option<BTreeSet<(OsString, u8)>>> {
         let entries = match std::fs::read_dir(directory) {
             Ok(entries) => entries,
             Err(error)
@@ -368,22 +459,9 @@ impl Membership {
             {
                 continue;
             }
-            // A policy created between policy discovery and name capture must
-            // get its own stamp before its in-place edits can permit reuse.
-            if matches!(name.to_str(), Some(".gitignore" | ".nxignore"))
-                && !self.policies.contains(&path)
-            {
-                return Ok(None);
-            }
             let kind = entry.file_type()?;
-            // An empty directory created after the inventory walk would not
-            // appear among source files. Never bless its parent signature until
-            // that directory is itself watched by the inventory.
-            if kind.is_dir() && !self.directories.contains(&path) {
-                return Ok(None);
-            }
             if !kind.is_dir()
-                && !matches!(name.to_str(), Some(".gitignore" | ".nxignore"))
+                && !is_policy(&name)
                 && relative.to_str().is_some_and(|path| {
                     outputs
                         .iter()
@@ -395,7 +473,7 @@ impl Membership {
             names.insert((
                 name,
                 if kind.is_dir() {
-                    1
+                    DIRECTORY
                 } else if kind.is_symlink() {
                     2
                 } else {
@@ -3904,6 +3982,32 @@ mod tests {
         assert!(files().contains("untracked"));
         std::fs::write(root.path().join(".git/info/exclude"), "untracked\n").unwrap();
         assert!(!files().contains("untracked"));
+    }
+
+    #[test]
+    fn membership_watches_ignore_files_found_deep_in_the_walk() {
+        let (root, workspace, graph) = fixture(None);
+        let nested = root.path().join("packages/app/src/deep");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("kept"), "a").unwrap();
+        std::fs::write(nested.join("hidden"), "b").unwrap();
+        let policy = root.path().join("packages/app/.gitignore");
+        std::fs::write(&policy, "\n").unwrap();
+        let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
+        let files = || snapshot.current_files(root.path()).unwrap();
+        files();
+        // Waiting lets the listing settle, so it is reused, as in
+        // `membership_reuses_settled_candidates_and_detects_directory_changes`.
+        std::thread::sleep(Duration::from_millis(2100));
+        let before = files();
+        assert!(Arc::ptr_eq(&before, &files()));
+        assert!(before.contains("packages/app/src/deep/hidden"));
+        // Edited in place, so no directory's names change: only the policy
+        // the walk found can refuse the settled listing.
+        std::fs::write(&policy, "hidden\n").unwrap();
+        let after = files();
+        assert!(!after.contains("packages/app/src/deep/hidden"));
+        assert!(after.contains("packages/app/src/deep/kept"));
     }
 
     #[test]
