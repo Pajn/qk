@@ -168,8 +168,7 @@ const ts = requireTool('typescript')
 
 Use the same chosen tool installation to interpret both revisions. qk does
 not reproduce historical installations. Installation metadata changing in
-the comparison causes conservative fallback, and there is no persisted
-projection cache in this version.
+the comparison causes conservative fallback.
 
 For a generator adapter:
 
@@ -194,6 +193,26 @@ Use an appropriate CI execution environment when reviewing untrusted changes.
 The adapter must write generated files only in `revisionRoot`; qk's disposable
 worktrees are isolation of files, not a permission sandbox.
 
+## Kept manifests
+
+qk keeps each manifest an adapter returns in its local cache. Its key is the
+projection's `name`, `command`, `sources` and `outputs`, the head commit whose
+adapter ran, the commit it read, the workspace root and the contents of its
+local overrides such as `nx.local.json`, and qk's version and platform.
+Projecting the same revision under the same head again reads the kept manifest
+instead of checking out either commit or running the adapter. A comparison of
+several bases against one head therefore projects head once, and a repeated
+comparison projects nothing.
+
+The key leaves out whatever else an adapter reads outside the two checkouts:
+the environment, the installation under `workspaceRoot`, and any other file
+there. An adapter whose manifest depends on one of them can return a stale
+manifest after it changes. A `command` naming `{workspaceRoot}` runs code from
+the checkout as it is, so qk keeps none of its manifests.
+`NX_SKIP_NX_CACHE=true`, which `qk affected --skip-cache` sets, projects every
+revision afresh and keeps nothing. Kept manifests age out with the rest of the
+cache.
+
 ## Conservative fallback and explanations
 
 qk retains **all original changes for the profile** if any active adapter fails,
@@ -203,10 +222,11 @@ successful projection from hiding changes after another projection failed.
 Adapter process groups are stopped on exit and on failure, including timeout;
 worktrees are then removed. Each worktree checkout also has its own
 `timeoutSeconds` deadline; a stalled checkout is a comparison fallback, and
-its process group and any registered worktree are cleaned up. Each active
-projection creates four full checkouts (base and head data, plus fresh head
-code for each invocation), so checkout cost can be significant in large
-repositories. Adapter roots are writable and are not reused between runs.
+its process group and any registered worktree are cleaned up. Each adapter
+invocation creates two full checkouts (the revision's data and fresh head
+code), so checkout cost can be significant in large repositories; a kept
+manifest needs neither. Adapter roots are writable and are not reused between
+runs.
 An adapter that deliberately escapes its process
 group is outside this cleanup contract.
 

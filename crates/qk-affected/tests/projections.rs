@@ -91,6 +91,11 @@ fn main() {
         if mode == "failure-descendants" { process::exit(7); }
         if mode == "timeout-descendants" { loop { std::thread::park(); } }
     }
+    if mode == "counted" {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new().create(true).append(true).open(env::args().nth(2).unwrap()).unwrap();
+        writeln!(file, "run").unwrap();
+    }
     match mode.as_str() {
         "fail" => process::exit(7),
         "invalid" => { print!("not JSON"); return; },
@@ -126,12 +131,23 @@ struct Repo {
 }
 impl Repo {
     fn new(mode: &str) -> Self {
+        Self::with_arguments(&[mode])
+    }
+    /// A repository whose adapter is given `arguments`, the first its mode.
+    fn with_arguments(arguments: &[&str]) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         // Worktree checkouts share the adapter's deadline, so only adapters
         // that hang get a short one: a slow checkout is a comparison fallback.
-        let timeout = if mode.starts_with("timeout") { 5 } else { 60 };
-        let rule = json!({"name":"generated-runtime", "command":[adapter(),mode,"{revisionRoot}"], "sources":["schemas/**"], "outputs":["apps/*/generated/**"], "timeoutSeconds":timeout});
+        let timeout = if arguments[0].starts_with("timeout") {
+            5
+        } else {
+            60
+        };
+        let mut command = vec![json!(adapter())];
+        command.extend(arguments.iter().map(|argument| json!(argument)));
+        command.push(json!("{revisionRoot}"));
+        let rule = json!({"name":"generated-runtime", "command":command, "sources":["schemas/**"], "outputs":["apps/*/generated/**"], "timeoutSeconds":timeout});
         write(
             &root,
             "nx.json",
@@ -166,6 +182,10 @@ impl Repo {
         }
     }
     fn analyse(&self, head: Option<String>, profile: bool) -> Analysis {
+        self.analyse_with(head, profile, Options::default())
+    }
+    /// As `analyse`, with `options` for everything but the revisions and profile.
+    fn analyse_with(&self, head: Option<String>, profile: bool, options: Options) -> Analysis {
         let workspace = Workspace::load(&self.root).unwrap();
         let graph = ProjectGraph::build(&workspace).unwrap();
         analyse(
@@ -175,10 +195,16 @@ impl Repo {
                 base: Some(self.base.clone()),
                 head,
                 affected_profile: profile.then(|| "runtime".into()),
-                ..Options::default()
+                ..options
             },
         )
         .unwrap()
+    }
+    /// The manifests kept in the repository's cache.
+    fn kept(&self) -> Vec<PathBuf> {
+        std::fs::read_dir(self.root.join(".git/qk/cache/v1/projections"))
+            .map(|entries| entries.map(|entry| entry.unwrap().path()).collect())
+            .unwrap_or_default()
     }
     fn changed(&self, text: &str) -> String {
         write(&self.root, "schemas/schema.txt", text);
@@ -514,6 +540,112 @@ fn adapter_descendants_are_stopped_on_success_failure_and_timeout() {
             }
         }
     }
+}
+
+#[test]
+fn a_revision_projected_before_reuses_its_manifest_without_the_adapter() {
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let runs = || std::fs::read_to_string(log.path()).unwrap().lines().count();
+    let repo = Repo::with_arguments(&["counted", log.path().to_str().unwrap()]);
+    let head = repo.changed("app=one\nother=two\ntype=after");
+    let first = repo.analyse(Some(head.clone()), true);
+    assert_eq!(runs(), 2);
+    let again = repo.analyse(Some(head), true);
+    assert_eq!(runs(), 2);
+    assert_eq!(names(&again), names(&first));
+    assert_eq!(again.projections[0].status, "applied");
+
+    // A new head brings a new adapter, so both revisions are projected again
+    let next = repo.changed("app=three\nother=two\ntype=after");
+    let changed = repo.analyse(Some(next), true);
+    assert_eq!(runs(), 4);
+    assert!(names(&changed).contains("app"));
+    assert!(!names(&changed).contains("other"));
+    assert_eq!(
+        git(&repo.root, &["worktree", "list", "--porcelain"])
+            .matches("worktree ")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn another_base_against_the_same_head_projects_only_that_base() {
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let runs = || std::fs::read_to_string(log.path()).unwrap().lines().count();
+    let mut repo = Repo::with_arguments(&["counted", log.path().to_str().unwrap()]);
+    let middle = repo.changed("app=one\nother=three\ntype=before");
+    let head = repo.changed("app=one\nother=three\ntype=after");
+    assert!(names(&repo.analyse(Some(head.clone()), true)).contains("other"));
+    assert_eq!(runs(), 2);
+
+    repo.base = middle;
+    let since_middle = repo.analyse(Some(head), true);
+    assert_eq!(runs(), 3);
+    assert_eq!(since_middle.projections[0].status, "applied");
+    assert!(names(&since_middle).is_empty());
+}
+
+#[test]
+fn a_manifest_that_cannot_be_read_is_projected_again() {
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let runs = || std::fs::read_to_string(log.path()).unwrap().lines().count();
+    let repo = Repo::with_arguments(&["counted", log.path().to_str().unwrap()]);
+    let head = repo.changed("app=three\nother=two\ntype=before");
+    let first = repo.analyse(Some(head.clone()), true);
+    assert_eq!(repo.kept().len(), 2);
+    for manifest in repo.kept() {
+        std::fs::write(manifest, "{\"version\":1,").unwrap();
+    }
+
+    let again = repo.analyse(Some(head), true);
+    assert_eq!(runs(), 4);
+    assert_eq!(names(&again), names(&first));
+}
+
+#[test]
+fn a_changed_local_override_projects_again() {
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let runs = || std::fs::read_to_string(log.path()).unwrap().lines().count();
+    let repo = Repo::with_arguments(&["counted", log.path().to_str().unwrap()]);
+    let head = repo.changed("app=one\nother=two\ntype=after");
+    write(&repo.root, "nx.local.json", "{}");
+    repo.analyse(Some(head.clone()), true);
+    repo.analyse(Some(head.clone()), true);
+    assert_eq!(runs(), 2);
+
+    // An adapter may read the override through workspaceRoot
+    write(&repo.root, "nx.local.json", r#"{"defaultBase":"main"}"#);
+    repo.analyse(Some(head), true);
+    assert_eq!(runs(), 4);
+}
+
+#[test]
+fn an_adapter_given_the_workspace_as_it_is_is_never_kept() {
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let runs = || std::fs::read_to_string(log.path()).unwrap().lines().count();
+    let repo = Repo::with_arguments(&["counted", log.path().to_str().unwrap(), "{workspaceRoot}"]);
+    let head = repo.changed("app=one\nother=two\ntype=after");
+    repo.analyse(Some(head.clone()), true);
+    repo.analyse(Some(head), true);
+    assert_eq!(runs(), 4);
+    assert!(repo.kept().is_empty());
+}
+
+#[test]
+fn skipping_the_cache_projects_every_revision_and_keeps_nothing() {
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let runs = || std::fs::read_to_string(log.path()).unwrap().lines().count();
+    let repo = Repo::with_arguments(&["counted", log.path().to_str().unwrap()]);
+    let head = repo.changed("app=one\nother=two\ntype=after");
+    let skipping = || Options {
+        skip_projection_cache: true,
+        ..Options::default()
+    };
+    repo.analyse_with(Some(head.clone()), true, skipping());
+    repo.analyse_with(Some(head), true, skipping());
+    assert_eq!(runs(), 4);
+    assert!(repo.kept().is_empty());
 }
 
 #[test]

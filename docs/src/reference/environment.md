@@ -161,7 +161,7 @@ similar patterns in a value it substitutes, is not reproduced.
 
 | Variable | Behavior |
 | --- | --- |
-| `NX_SKIP_NX_CACHE=true`, `NX_DISABLE_NX_CACHE=true` | Bypass cache reads, writes and warm state |
+| `NX_SKIP_NX_CACHE=true`, `NX_DISABLE_NX_CACHE=true` | Bypass cache reads, writes and warm state, and the projection manifests affected selection keeps |
 | `NX_SKIP_REMOTE_CACHE=true`, `NX_DISABLE_REMOTE_CACHE=true` | Local cache only |
 | `NX_CACHE_DIRECTORY` | Override `nx.json`'s `cacheDirectory` |
 | `NX_MAX_CACHE_SIZE` | Override `nx.json`'s `maxCacheSize` |
