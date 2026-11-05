@@ -4847,11 +4847,11 @@ fn the_sandbox_keeps_an_ignored_dotenv_file_out_of_whole_directories() {
     }
 }
 
-/// An input linking to a directory lets the task read what it holds, but
-/// not a dotenv file there its inputs and ignored reads leave out.
+/// An input linking to a directory lets the task read all it holds, a
+/// dotenv file there included: its key holds everything behind the link.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
-fn the_sandbox_keeps_a_dotenv_file_out_of_a_linked_directory() {
+fn the_sandbox_reads_a_dotenv_file_in_a_linked_directory() {
     let temp = fixture(json!({
         "code": {"command": "cat linked/a.ts", "inputs": ["{projectRoot}/linked"]},
         "secret": {"command": "cat linked/.env", "inputs": ["{projectRoot}/linked"]}
@@ -4860,7 +4860,7 @@ fn the_sandbox_keeps_a_dotenv_file_out_of_a_linked_directory() {
     fs::write(temp.path().join("shared/a.ts"), "export {};\n").unwrap();
     fs::write(temp.path().join("shared/.env"), "X=1\n").unwrap();
     std::os::unix::fs::symlink("shared", temp.path().join("linked")).unwrap();
-    for (target, allowed) in [("code", true), ("secret", false)] {
+    for (target, allowed) in [("code", true), ("secret", true)] {
         let output = run(
             temp.path(),
             &[

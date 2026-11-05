@@ -1346,8 +1346,10 @@ fn plan(
         .filter(|file| !(file.is_symlink() && file.is_dir()))
         .collect();
     let mut read_trees = BTreeSet::new();
-    // A linked directory's target is read whole, as the link is an input,
-    // but for the dotenv files in it the inputs leave out.
+    // A linked directory's target is read whole: its key holds every file
+    // beneath it, Git-ignored ones included, so nothing there is undeclared.
+    // A link to the workspace root cannot be keyed, so the root is split, as
+    // directories are allowed whole, around dotenv files the inputs leave out.
     for file in files {
         for target in linked_targets(root, &root.join(file)) {
             let Some(relative) = target
@@ -1361,6 +1363,10 @@ fn plan(
                 read_files.push(target);
                 continue;
             };
+            if !relative.is_empty() {
+                read_trees.insert(target);
+                continue;
+            }
             let (trees, singles) = tree.split(relative, files, loaded);
             read_trees.extend(trees.iter().map(|tree| path(tree)));
             read_files.extend(singles.iter().map(|file| path(file)));
@@ -2183,12 +2189,12 @@ mod tests {
         assert_eq!(fresh.cover(&tracked, &loaded).0, ["apps/web/src"]);
     }
 
-    /// An input linking to a directory reads its target whole, but for a
-    /// dotenv file in it the inputs leave out: the rest of it is allowed,
-    /// and the dotenv file stays refused.
+    /// An input linking to a directory reads its target whole, a dotenv
+    /// file in it included, as its key holds everything beneath it; the link
+    /// is not granted by its own path, which Landlock follows.
     #[cfg(unix)]
     #[test]
-    fn allows_no_linked_directory_whole_that_holds_an_undeclared_dotenv_file() {
+    fn reads_a_linked_directory_whole() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         std::fs::write(root.join("nx.json"), "{}").unwrap();
@@ -2230,22 +2236,15 @@ mod tests {
             )
         };
         for (file, verdict) in [
-            ("shared/deep/.env", policy::Verdict::Refuse),
+            ("shared/deep/.env", policy::Verdict::Allow),
             ("shared/a.ts", policy::Verdict::Allow),
             ("shared/deep/b.ts", policy::Verdict::Allow),
         ] {
             assert_eq!(judge(plan(&files), file), verdict, "{file}");
         }
-        assert!(!plan(&files).read_trees.contains(&root.join("shared")));
-        // Nor is the link granted by its own path, which Landlock follows.
+        assert!(plan(&files).read_trees.contains(&root.join("shared")));
+        // The link itself is not granted by its path, which Landlock follows.
         assert!(!plan(&files).read_files.contains(&root.join("linked")));
-        // Named as an input, it is read with the rest.
-        let mut declared = files.clone();
-        declared.insert("shared/deep/.env".into());
-        assert_eq!(
-            judge(plan(&declared), "shared/deep/.env"),
-            policy::Verdict::Allow
-        );
     }
 
     /// An input linking to the workspace root is split as any linked
