@@ -1130,6 +1130,64 @@ impl Tree {
         files
     }
 
+    /// `directory`, workspace-relative, as the fewest paths to read it by:
+    /// itself whole, unless it holds a dotenv file or one of `loaded`, the
+    /// files the task's environment was loaded from, that its inputs leave
+    /// out, as [`Tree::cover`] holds a directory back; then each directory in
+    /// it whole that holds none, and each other file in it but those. A link
+    /// in it is left out: allowing it would allow where it leads.
+    fn split(
+        &self,
+        directory: &str,
+        inputs: &BTreeSet<String>,
+        loaded: &BTreeSet<String>,
+    ) -> (Vec<String>, Vec<String>) {
+        let beneath = |path: &str, directory: &str| {
+            path.strip_prefix(directory)
+                .is_some_and(|rest| rest.starts_with('/'))
+        };
+        let held: BTreeSet<String> = self
+            .dotenv_beneath(directory)
+            .into_iter()
+            .chain(
+                loaded
+                    .iter()
+                    .filter(|path| beneath(path, directory))
+                    .cloned(),
+            )
+            .filter(|path| !inputs.contains(path))
+            .collect();
+        let (mut trees, mut files) = (Vec::new(), Vec::new());
+        let Some(root) = self.root.as_ref().filter(|_| !held.is_empty()) else {
+            return (vec![directory.to_owned()], files);
+        };
+        let mut pending = vec![directory.to_owned()];
+        while let Some(current) = pending.pop() {
+            if !held.iter().any(|path| beneath(path, &current)) {
+                trees.push(current);
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(root.join(&current)) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let (Ok(kind), Some(name)) = (
+                    entry.file_type(),
+                    entry.file_name().to_str().map(str::to_owned),
+                ) else {
+                    continue;
+                };
+                let path = format!("{current}/{name}");
+                if kind.is_dir() {
+                    pending.push(path);
+                } else if kind.is_file() && !held.contains(&path) {
+                    files.push(path);
+                }
+            }
+        }
+        (trees, files)
+    }
+
     /// The inputs as the fewest paths: each outermost directory whose every
     /// file is an input, and holding no protected file, no dotenv file and
     /// none of `loaded`, the files the task's environment was loaded from,
@@ -1273,15 +1331,31 @@ fn plan(
         }
     };
     let (whole, singles) = tree.cover(files, loaded);
-    let mut read_files: Vec<PathBuf> = singles.iter().map(|file| path(file)).collect();
+    // A link to a directory is read through its target, below, not by its
+    // own path: Landlock, which follows it, would grant reading every file
+    // beneath the target.
+    let mut read_files: Vec<PathBuf> = singles
+        .iter()
+        .map(|file| path(file))
+        .filter(|file| !(file.is_symlink() && file.is_dir()))
+        .collect();
     let mut read_trees = BTreeSet::new();
+    // A linked directory's target is read whole, as the link is an input,
+    // but for the dotenv files in it the inputs leave out.
     for file in files {
         for target in linked_targets(root, &root.join(file)) {
-            if target.is_dir() {
-                read_trees.insert(target);
-            } else {
+            let Some(relative) = target
+                .strip_prefix(root)
+                .ok()
+                .and_then(Path::to_str)
+                .filter(|_| target.is_dir())
+            else {
                 read_files.push(target);
-            }
+                continue;
+            };
+            let (trees, singles) = tree.split(relative, files, loaded);
+            read_trees.extend(trees.iter().map(|tree| path(tree)));
+            read_files.extend(singles.iter().map(|file| path(file)));
         }
     }
     let anchors = |task: &Task| -> Vec<PathBuf> {
@@ -2099,6 +2173,71 @@ mod tests {
         // too.
         let loaded = BTreeSet::from(["apps/web/vars.txt".to_owned()]);
         assert_eq!(fresh.cover(&tracked, &loaded).0, ["apps/web/src"]);
+    }
+
+    /// An input linking to a directory reads its target whole, but for a
+    /// dotenv file in it the inputs leave out: the rest of it is allowed,
+    /// and the dotenv file stays refused.
+    #[cfg(unix)]
+    #[test]
+    fn allows_no_linked_directory_whole_that_holds_an_undeclared_dotenv_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("nx.json"), "{}").unwrap();
+        std::fs::write(
+            root.join("project.json"),
+            r#"{"name":"app","targets":{"read":{"command":"true","inputs":["{projectRoot}/linked"]}}}"#,
+        )
+        .unwrap();
+        for file in ["shared/a.ts", "shared/deep/b.ts", "shared/deep/.env"] {
+            let path = root.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+        std::os::unix::fs::symlink("shared", root.join("linked")).unwrap();
+        let workspace = qk_config::Workspace::load(&root).unwrap();
+        let graph = TaskGraph::build(
+            &workspace,
+            &[qk_taskgraph::Request::parse("app:read").unwrap()],
+        )
+        .unwrap();
+        let files: BTreeSet<String> = ["linked".to_owned()].into();
+        let tree = Tree::new(&files).protecting_dotenv(&root);
+        let plan = |files: &BTreeSet<String>| {
+            plan(
+                &workspace,
+                &graph,
+                &graph.tasks["app:read"],
+                &root,
+                &tree,
+                files,
+                &BTreeSet::new(),
+            )
+        };
+        let judge = |plan: Plan, file: &str| {
+            Policy::new(Mode::Enforce, &root, &root.join(".qk"), plan).judge(
+                &root.join(file),
+                policy::Access::Read,
+                false,
+            )
+        };
+        for (file, verdict) in [
+            ("shared/deep/.env", policy::Verdict::Refuse),
+            ("shared/a.ts", policy::Verdict::Allow),
+            ("shared/deep/b.ts", policy::Verdict::Allow),
+        ] {
+            assert_eq!(judge(plan(&files), file), verdict, "{file}");
+        }
+        assert!(!plan(&files).read_trees.contains(&root.join("shared")));
+        // Nor is the link granted by its own path, which Landlock follows.
+        assert!(!plan(&files).read_files.contains(&root.join("linked")));
+        // Named as an input, it is read with the rest.
+        let mut declared = files.clone();
+        declared.insert("shared/deep/.env".into());
+        assert_eq!(
+            judge(plan(&declared), "shared/deep/.env"),
+            policy::Verdict::Allow
+        );
     }
 
     #[cfg(unix)]

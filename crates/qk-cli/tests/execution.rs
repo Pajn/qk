@@ -4847,6 +4847,33 @@ fn the_sandbox_keeps_an_ignored_dotenv_file_out_of_whole_directories() {
     }
 }
 
+/// An input linking to a directory lets the task read what it holds, but
+/// not a dotenv file there its inputs and ignored reads leave out.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn the_sandbox_keeps_a_dotenv_file_out_of_a_linked_directory() {
+    let temp = fixture(json!({
+        "code": {"command": "cat linked/a.ts", "inputs": ["{projectRoot}/linked"]},
+        "secret": {"command": "cat linked/.env", "inputs": ["{projectRoot}/linked"]}
+    }));
+    fs::create_dir_all(temp.path().join("shared")).unwrap();
+    fs::write(temp.path().join("shared/a.ts"), "export {};\n").unwrap();
+    fs::write(temp.path().join("shared/.env"), "X=1\n").unwrap();
+    std::os::unix::fs::symlink("shared", temp.path().join("linked")).unwrap();
+    for (target, allowed) in [("code", true), ("secret", false)] {
+        let output = run(
+            temp.path(),
+            &[
+                "run",
+                &format!("app:{target}"),
+                "--skip-cache",
+                "--sandbox=enforce",
+            ],
+        );
+        assert_eq!(output.status.success(), allowed, "{target}");
+    }
+}
+
 /// Only a task that started is listed as running unsandboxed: one skipped
 /// after its dependency failed never ran.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
