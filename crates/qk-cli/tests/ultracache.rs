@@ -578,6 +578,33 @@ fn a_task_in_mode_record_checks_the_result_a_recording_would_take_and_names_what
 }
 
 #[test]
+fn a_check_leaves_out_the_outputs_named_unchecked() {
+    if !has_strace() {
+        return;
+    }
+    let temp = fixture();
+    let root = temp.path();
+    let nx = fs::read_to_string(root.join("nx.json")).unwrap();
+    write(
+        root,
+        "nx.json",
+        &nx.replace(
+            r#""ignoreReads""#,
+            r#""mode": "record", "uncheckedOutputs": ["app/dist/out.txt"], "ignoreReads""#,
+        ),
+    );
+    assert_eq!(kind(&build_report(root, true, &[])["recorded"]), "saved");
+    // A file its recording ignores changes only the output left unchecked.
+    write(root, "app/src/notes.txt", "other notes\n");
+    let task = build_report(root, false, &[]);
+    assert_eq!(task["cache"], "miss");
+    assert_eq!(
+        task["shadow"]["check"],
+        json!({"matched": true, "unchecked": 1})
+    );
+}
+
+#[test]
 fn a_task_without_recordings_cached_locally_asks_the_store_for_none() {
     if !has_strace() {
         return;

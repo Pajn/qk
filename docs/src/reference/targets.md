@@ -280,6 +280,7 @@ recorded. See [Keying tasks by what they read](../guides/ultracache.md).
 | --- | --- | --- |
 | `mode` | `"on"`, `"record"` or `"off"` | `"on"`; `"record"` records the task and reports what its recordings would have done, but keys it by its declared inputs; `"off"` keys it by its declared inputs, as without the field |
 | `ignoreReads` | array of workspace globs | Empty; files left out of recordings, whose changes cannot change the result; the sandbox's audit leaves them out too, and enforce lets the task read them, as it reads the dotenv files qk loads for it only when named here or in its inputs (see [Dotenv files](../guides/sandbox.md#dotenv-files)). A glob starting with `^` is matched from the root of each project the task's project depends on, directly or not |
+| `uncheckedOutputs` | array of workspace globs | Empty; outputs that a run checked against the result its recording would have taken leaves out of the comparison, for files a tool does not write the same twice. They are saved and restored as any other output |
 
 Nx's `"warn"` and `"error"` modes are not supported yet. Other fields are
 ignored, as in `qk:threads`, and `qk doctor` reports them. The field does not

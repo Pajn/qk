@@ -231,6 +231,14 @@ pub struct Check {
     /// at most [`UNCOVERED`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub differences: Vec<String>,
+    /// How many of the run's outputs, files and directories, its
+    /// `uncheckedOutputs` left out of the comparison.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unchecked: usize,
+}
+
+fn is_zero(count: &usize) -> bool {
+    *count == 0
 }
 
 /// A lookup by a task's recordings in mode `"record"`, started before its
@@ -1091,10 +1099,12 @@ impl Cache {
                 Outcome::Failed(code) => Some(Check {
                     matched: false,
                     differences: vec![format!("failed (exit {code})")],
+                    unchecked: 0,
                 }),
                 Outcome::Success if published => {
                     let _checking = profile::span(&task.id, "recorded_check");
-                    self.check(&task.id, &key, recorded)
+                    let settings = recordings.as_ref().map(|(_, _, settings)| settings);
+                    self.check(&task.id, &key, recorded, settings)
                 }
                 _ => None,
             },
@@ -1167,17 +1177,34 @@ impl Cache {
 
     /// Whether the result just published under `ran` is the one under
     /// `recorded`, here or in the remote store: `None` when that is not to
-    /// be had.
-    fn check(&self, task: &str, ran: &str, recorded: &str) -> Option<Check> {
+    /// be had. What its `uncheckedOutputs` name is not compared.
+    fn check(
+        &self,
+        task: &str,
+        ran: &str,
+        recorded: &str,
+        settings: Option<&ultracache::Settings>,
+    ) -> Option<Check> {
         let compared = self
             .artifacts(ran, task)
-            .and_then(|ran| Ok(ran.zip(self.artifacts(recorded, task)?)));
+            .and_then(|ran| Ok(ran.zip(self.artifacts(recorded, task)?)))
+            .and_then(|compared| {
+                let unchecked = settings.map(ultracache::Settings::unchecked).transpose()?;
+                Ok(compared.map(|compared| (compared, unchecked)))
+            });
         match compared {
-            Ok(Some((ran, recorded))) => {
+            Ok(Some(((mut ran, mut recorded), unchecked))) => {
+                let before = ran.len();
+                if let Some(unchecked) = unchecked {
+                    ran.retain(|path, _| !unchecked(path));
+                    recorded.retain(|path, _| !unchecked(path));
+                }
+                let left_out = before - ran.len();
                 let differences = store::differences(&ran, &recorded, UNCOVERED);
                 Some(Check {
                     matched: differences.is_empty(),
                     differences,
+                    unchecked: left_out,
                 })
             }
             Ok(None) => None,

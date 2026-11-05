@@ -211,6 +211,22 @@ Two more things tell whether `"on"` would be right:
   and the like change from run to run. The run summary names each task that
   gave another result: a recording that left out something the task read, or
   a task that does not give the same result twice.
+
+  A tool can write outputs that differ even when everything it read was the
+  same: test coverage whose hit counts depend on how many workers loaded a
+  module, or a `.tsbuildinfo` that records the builds before it in the warm
+  state it was restored from. `uncheckedOutputs` names them, as workspace
+  globs, so the check compares the rest:
+
+  ```json
+  "qk:ultracache": {
+    "mode": "record",
+    "uncheckedOutputs": ["**/coverage/**", "**/*.tsbuildinfo"]
+  }
+  ```
+
+  They are still saved and restored, and `check` carries how many were left
+  out as `unchecked`, so a match that compared nothing can be told apart.
 - **What changed that the declared inputs did not see.** Where the declared
   inputs took a task from the cache and its recordings had no result,
   `shadow` carries `changed`: the paths of its newest path set that are not
