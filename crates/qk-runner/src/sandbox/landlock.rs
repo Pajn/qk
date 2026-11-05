@@ -5,22 +5,20 @@
 //! handles elsewhere. Rights cannot be taken back beneath an allowed path,
 //! so everything outside the workspace is allowed by allowing each sibling
 //! along the way down to it. Landlock holds paths that exist rather than
-//! patterns, so the `node_modules` directories and dotenv files a policy
-//! grants are those there as the run starts.
+//! patterns, so the `node_modules` directories a policy grants are those
+//! there as the run starts, and those tasks before have made.
 
 use std::path::{Path, PathBuf};
 
 use qk_executor::landlock::{Open, Rights};
 
-use super::policy::{Policy, Reach, Scope, is_dotenv};
+use super::policy::{Policy, Reach, Scope};
 
 /// What a policy's patterns name in the workspace as the run starts.
 #[derive(Debug, Default)]
 pub struct Expansion {
     /// Every `node_modules` directory.
     pub node_modules: Vec<PathBuf>,
-    /// Every dotenv file.
-    pub dotenv: Vec<PathBuf>,
 }
 
 impl Expansion {
@@ -35,19 +33,13 @@ impl Expansion {
                 continue;
             };
             for entry in entries.flatten() {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                let Ok(kind) = entry.file_type() else {
+                if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
                     continue;
-                };
-                if kind.is_dir() {
-                    match name.as_ref() {
-                        "node_modules" => expansion.node_modules.push(entry.path()),
-                        ".git" => {}
-                        _ => pending.push(entry.path()),
-                    }
-                } else if is_dotenv(&name) {
-                    expansion.dotenv.push(entry.path());
+                }
+                match entry.file_name().to_str() {
+                    Some("node_modules") => expansion.node_modules.push(entry.path()),
+                    Some(".git") => {}
+                    _ => pending.push(entry.path()),
                 }
             }
         }
@@ -95,12 +87,6 @@ pub fn rights(policy: &Policy, expansion: &Expansion) -> Vec<(PathBuf, Rights, O
                     .node_modules
                     .iter()
                     .map(|path| (path.clone(), tree, Open::Directory)),
-            ),
-            Scope::Dotenv => rights.extend(
-                expansion
-                    .dotenv
-                    .iter()
-                    .map(|path| (path.clone(), file, open(policy.is_unlinked(path)))),
             ),
             Scope::Directories => {
                 rights.push((PathBuf::from("/"), Rights::READ_DIR, Open::Following))
@@ -360,8 +346,8 @@ mod tests {
     use crate::sandbox::{Mode, Plan};
 
     /// A workspace holding `.git`, qk's state in `.qk`, two `node_modules`
-    /// and two dotenv files, and an enforced policy reading and writing in
-    /// it.
+    /// and dotenv files no input names, and an enforced policy reading and
+    /// writing in it.
     fn workspace() -> (tempfile::TempDir, PathBuf, Policy) {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
@@ -394,27 +380,21 @@ mod tests {
         (temp, root, policy)
     }
 
-    /// Every `node_modules` and dotenv file, but none in `node_modules` or
-    /// `.git`, and not a `.git` file as a nested checkout keeps.
+    /// Every `node_modules`, but none in `node_modules` or `.git`.
     #[test]
     fn expands_patterns_into_what_the_workspace_holds() {
         let (_temp, root, _) = workspace();
-        std::fs::write(root.join(".git/.env"), "").unwrap();
-        std::fs::create_dir_all(root.join("vendor/checkout")).unwrap();
-        std::fs::write(root.join("vendor/checkout/.git"), "").unwrap();
+        for directory in [".git/node_modules", "node_modules/a/node_modules"] {
+            std::fs::create_dir_all(root.join(directory)).unwrap();
+        }
         let mut expansion = Expansion::scan(&root);
         expansion.node_modules.sort();
-        expansion.dotenv.sort();
         assert_eq!(
             expansion.node_modules,
             [
                 root.join("apps/app/node_modules"),
                 root.join("node_modules")
             ]
-        );
-        assert_eq!(
-            expansion.dotenv,
-            [root.join(".env"), root.join("apps/app/.env.local")]
         );
     }
 
@@ -438,8 +418,6 @@ mod tests {
             ("package.json", Open::Following, Rights::READ),
             ("apps/app/src/main.ts", Open::Following, Rights::READ),
             ("fixtures/data.json", Open::Unlinked, Rights::READ),
-            (".env", Open::Following, Rights::READ),
-            ("apps/app/.env.local", Open::Following, Rights::READ),
             ("libs/dep/dist", Open::Following, Rights::READ_TREE),
             ("fixtures/cache", Open::Unlinked, Rights::READ_TREE),
             ("apps/app/dist", Open::Following, Rights::ALL),

@@ -4067,6 +4067,59 @@ mod tests {
         );
     }
 
+    /// An input linking to a directory keys every file beneath it, the
+    /// Git-ignored ones included, such as a dotenv file there; one linking to
+    /// the workspace root cannot be keyed.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_directory_input_keys_ignored_files_beneath_it() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("nx.json"), "{}").unwrap();
+        std::fs::write(
+            root.path().join("project.json"),
+            json!({"name": "app", "targets": {
+                "read": {"command": "true", "inputs": ["{projectRoot}/linked"]},
+                "whole": {"command": "true", "inputs": ["{projectRoot}/everything"]}
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(root.path().join(".gitignore"), ".env\n").unwrap();
+        std::fs::create_dir(root.path().join("shared")).unwrap();
+        std::fs::write(root.path().join("shared/a.ts"), "a").unwrap();
+        std::fs::write(root.path().join("shared/.env"), "X=1\n").unwrap();
+        std::os::unix::fs::symlink("shared", root.path().join("linked")).unwrap();
+        std::os::unix::fs::symlink(".", root.path().join("everything")).unwrap();
+        assert!(
+            paths::git(root.path(), &["init", "--quiet"])
+                .unwrap()
+                .status
+                .success()
+        );
+        let workspace = Workspace::load(root.path()).unwrap();
+        let requests = ["app:read", "app:whole"].map(|request| Request::parse(request).unwrap());
+        let graph = TaskGraph::build(&workspace, &requests).unwrap();
+        let key = |id: &str| {
+            let task = &graph.tasks[id];
+            let prepared = qk_executor::prepare(&workspace, task, &BTreeMap::new()).unwrap();
+            let snapshot =
+                Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
+            inputs(
+                &snapshot,
+                &workspace,
+                task,
+                &prepared,
+                &BTreeMap::new(),
+                &AtomicBool::new(false),
+            )
+        };
+        let before = key("app:read").unwrap();
+        std::fs::write(root.path().join("shared/.env"), "X=2\n").unwrap();
+        assert_ne!(before, key("app:read").unwrap());
+        let error = format!("{:#}", key("app:whole").unwrap_err());
+        assert!(error.contains("resolves to the workspace root"), "{error}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn recent_change_time_prevents_membership_reuse_despite_old_mtime() {

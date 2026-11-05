@@ -386,7 +386,7 @@ pub fn run(
         sandbox_mode
     };
     let sandbox = sandbox_mode
-        .map(|mode| sandbox::Sandbox::start(workspace, graph, mode))
+        .map(|mode| sandbox::Sandbox::start(workspace, graph, &prepared, mode))
         .transpose()?;
     let analysis = analyze_inputs
         .then(|| analysis::Analysis::start(workspace, graph, &mut prepared))

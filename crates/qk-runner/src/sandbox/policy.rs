@@ -4,8 +4,8 @@
 //!
 //! Beyond its plan, every task may list any directory and use
 //! `node_modules` and qk's own state; enforce also lets it read and write
-//! `.git` and read dotenv files, which audit reports. Audit reports reading
-//! an installed package's manifest whose package its key leaves out.
+//! `.git`, which audit reports. Audit reports reading an installed package's
+//! manifest whose package its key leaves out.
 
 use std::path::{Path, PathBuf};
 
@@ -36,8 +36,6 @@ pub(super) enum Scope<'a> {
     File(&'a Path),
     /// Every `node_modules`, at any depth.
     NodeModules,
-    /// `.env`, `.env.*` and `.*.env` files, at any depth.
-    Dotenv,
     /// Every directory, to list it: what a listing finds is not read.
     Directories,
     /// Audit: the `package.json` of each installed package, read to find
@@ -111,7 +109,6 @@ impl Grant<'_> {
             Scope::Tree(tree) => path.starts_with(tree),
             Scope::File(file) => path == file,
             Scope::NodeModules => in_node_modules(),
-            Scope::Dotenv => !is_dir && name().is_some_and(is_dotenv),
             Scope::Directories => is_dir,
             Scope::Manifests(_) => !is_dir && name() == Some("package.json") && in_node_modules(),
         }
@@ -169,13 +166,9 @@ impl Policy {
             unlinked: plan.unlinked.contains(path),
             ..Grant::new(scope, Reach::ReadOnly)
         };
-        // Not keyed, but a task may need them.
-        let unkeyed = (self.mode == Mode::Enforce).then(|| {
-            [
-                Grant::new(Scope::Tree(&self.git), Reach::Through),
-                Grant::new(Scope::Dotenv, Reach::ReadOnly),
-            ]
-        });
+        // Not keyed, but a task may need it.
+        let git = (self.mode == Mode::Enforce)
+            .then(|| Grant::new(Scope::Tree(&self.git), Reach::Through));
         let packages = plan
             .packages
             .as_ref()
@@ -187,9 +180,7 @@ impl Policy {
         } else {
             Reach::Kept
         };
-        unkeyed
-            .into_iter()
-            .flatten()
+        git.into_iter()
             .chain([Grant::new(Scope::NodeModules, Reach::ThroughKept)])
             .chain(packages)
             .chain([
@@ -259,24 +250,12 @@ impl Policy {
     pub(super) fn scratch(&self) -> impl Iterator<Item = &Path> {
         self.plan.scratch.iter().map(PathBuf::as_path)
     }
-
-    /// Whether `path` is allowed only through no link.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub(super) fn is_unlinked(&self, path: &Path) -> bool {
-        self.plan.unlinked.contains(path)
-    }
 }
 
 /// Whether `path` is `.git` or lies in it, which enforce lets a task read and
 /// write.
 pub fn in_git(path: &str) -> bool {
     path == ".git" || path.starts_with(".git/")
-}
-
-/// Whether a file named `name` is a dotenv file: `.env`, `.env.*` or
-/// `.*.env`, which enforce lets a task read.
-pub(super) fn is_dotenv(name: &str) -> bool {
-    name == ".env" || name.starts_with(".env.") || (name.starts_with('.') && name.ends_with(".env"))
 }
 
 #[cfg(test)]
@@ -307,11 +286,12 @@ mod tests {
         let (audit, enforce) = (policy(Mode::Audit), policy(Mode::Enforce));
         let unchecked = audit.without_packages();
         for (path, access, is_dir, audited, enforced) in [
-            // Not keyed: enforce allows them, audit reports them.
+            // Not keyed: enforce allows `.git`, audit reports it. A dotenv
+            // file is read as any other.
             (".git/HEAD", Read, false, Report, Allow),
             (".git/index", Write, false, Report, Allow),
-            ("apps/app/.env.local", Read, false, Report, Allow),
-            (".build.env", Read, false, Report, Allow),
+            ("apps/app/.env.local", Read, false, Report, Refuse),
+            (".build.env", Read, false, Report, Refuse),
             ("apps/app/.env.local", Write, false, Report, Refuse),
             ("src/env.ts", Read, false, Report, Refuse),
             // Installed packages, and what tools keep beside them.
@@ -400,7 +380,6 @@ mod tests {
                     Scope::Tree(tree) => (tree.join("x"), false),
                     Scope::File(file) => (file.to_owned(), false),
                     Scope::NodeModules => (root.join("apps/app/node_modules/a/index.js"), false),
-                    Scope::Dotenv => (root.join("apps/app/.env.local"), false),
                     Scope::Directories => (root.join("apps"), true),
                     Scope::Manifests(_) => (root.join("node_modules/a/package.json"), false),
                 };

@@ -631,11 +631,11 @@ fn since(later: SystemTime, earlier: SystemTime) -> Duration {
 /// package manager and version manager a command starts through read them,
 /// not the task. Packages read by as many come next, once, each with how many
 /// tasks read it. Then each task's own: the files it read that its key leaves
-/// out, the installed packages it read that its key leaves out, and what it
-/// wrote outside its outputs, up to a few entries each. The `.git` and dotenv
-/// files tasks read, and what they wrote in `.git`, which enforce allows,
-/// neither count a task nor are listed for it: they come last, once, with how
-/// many tasks did each.
+/// out, the dotenv files qk loads for it apart, the installed packages it read
+/// that its key leaves out, and what it wrote outside its outputs, up to a
+/// few entries each. The `.git` files tasks read, and what they wrote in
+/// `.git`, which enforce allows, neither count a task nor are listed for it:
+/// they come last, once, with how many tasks did each.
 /// Tasks restored from the cache did not run, so they are counted apart.
 pub fn sandbox_summary(sandbox: &qk_runner::SandboxResult, tasks: usize, paint: Paint) -> String {
     use std::collections::{BTreeMap, BTreeSet};
@@ -651,9 +651,12 @@ pub fn sandbox_summary(sandbox: &qk_runner::SandboxResult, tasks: usize, paint: 
         .filter(|findings| findings.went_beyond())
         .count();
     let mut readers: BTreeMap<&str, usize> = BTreeMap::new();
+    // A dotenv file is the task's own to name, however many read it.
     for findings in sandbox.findings.values() {
         for path in &findings.undeclared_reads {
-            *readers.entry(path.as_str()).or_insert(0) += 1;
+            if !qk_runner::sandbox::is_dotenv(path) {
+                *readers.entry(path.as_str()).or_insert(0) += 1;
+            }
         }
     }
     let many = |count: usize| count >= 3 && count * 4 >= beyond;
@@ -686,6 +689,7 @@ pub fn sandbox_summary(sandbox: &qk_runner::SandboxResult, tasks: usize, paint: 
         Vec<&'a String>,
         Vec<&'a String>,
         Vec<&'a String>,
+        Vec<&'a String>,
     );
     let own: Vec<Own> = sandbox
         .findings
@@ -696,6 +700,7 @@ pub fn sandbox_summary(sandbox: &qk_runner::SandboxResult, tasks: usize, paint: 
                 .iter()
                 .filter(|path| !shared.contains(path.as_str()))
                 .collect::<Vec<_>>();
+            let dotenv = findings.dotenv_reads.iter().collect::<Vec<_>>();
             let packages = findings
                 .unkeyed_packages
                 .iter()
@@ -706,10 +711,11 @@ pub fn sandbox_summary(sandbox: &qk_runner::SandboxResult, tasks: usize, paint: 
                 .iter()
                 .filter(|package| !hoisted_readers.contains_key(package.as_str()))
                 .collect::<Vec<_>>();
-            (id, findings, reads, packages, hoisted)
+            (id, findings, reads, dotenv, packages, hoisted)
         })
-        .filter(|(_, findings, reads, packages, hoisted)| {
+        .filter(|(_, findings, reads, dotenv, packages, hoisted)| {
             !reads.is_empty()
+                || !dotenv.is_empty()
                 || !packages.is_empty()
                 || !hoisted.is_empty()
                 || !findings.tsconfig_reads.is_empty()
@@ -815,9 +821,21 @@ pub fn sandbox_summary(sandbox: &qk_runner::SandboxResult, tasks: usize, paint: 
         &mut lines,
         "  ",
     );
-    for (id, findings, reads, packages, hoisted) in own {
+    for (id, findings, reads, dotenv, packages, hoisted) in own {
         lines.push(format!("  {id}"));
         list("read outside its inputs", &reads, &mut lines, "    ");
+        // What qk loads from one matters through the variables it sets; one
+        // it does not load is listed with the other reads, as an input.
+        list(
+            &format!(
+                "dotenv file{} qk loads read outside its inputs; name {} in qk:ultracache.ignoreReads, and the variables that matter as env inputs",
+                if dotenv.len() == 1 { "" } else { "s" },
+                if dotenv.len() == 1 { "it" } else { "them" },
+            ),
+            &dotenv,
+            &mut lines,
+            "    ",
+        );
         // Each project's files are named in the report; here, how many.
         if !findings.dependency_reads.is_empty() {
             let projects: Vec<String> = findings
@@ -1892,7 +1910,13 @@ mod tests {
                         ..findings(&[".git"], &[])
                     },
                 ),
-                ("b:build", findings(&[".env", ".git"], &["notes.txt"])),
+                (
+                    "b:build",
+                    qk_runner::sandbox::Findings {
+                        dotenv_reads: ["apps/b/.env".to_owned()].into(),
+                        ..findings(&[".git"], &["notes.txt", "apps/b/.env.production"])
+                    },
+                ),
             ]),
             3,
             Paint(false),
@@ -1901,12 +1925,39 @@ mod tests {
             text,
             "Sandbox audit: 1 of 3 tasks went beyond what they declare
   b:build
-    1 read outside its inputs:
+    2 read outside its inputs:
+      apps/b/.env.production
       notes.txt
-  read, which the sandbox allows, but not in their keys: .env (1 task), .git (2 tasks)
+    1 dotenv file qk loads read outside its inputs; name it in qk:ultracache.ignoreReads, and the variables that matter as env inputs:
+      apps/b/.env
+  read, which the sandbox allows, but not in their keys: .git (2 tasks)
   written in .git, which the sandbox allows: 1 task
 "
         );
+        // A dotenv file many tasks read is each one's own to name, loaded or
+        // not, rather than one the tools they start through read.
+        let reading = |dotenv: &[&str], reads: &[&str]| qk_runner::sandbox::Findings {
+            dotenv_reads: dotenv.iter().map(|path| path.to_string()).collect(),
+            ..findings(&[], reads)
+        };
+        let text = sandbox_summary(
+            &sandbox(vec![
+                ("a:build", reading(&[".env"], &[".env.production"])),
+                ("b:build", reading(&[".env"], &[".env.production"])),
+                ("c:build", reading(&[".env"], &[".env.production"])),
+            ]),
+            3,
+            Paint(false),
+        );
+        assert!(!text.contains("read by many tasks"), "{text}");
+        for id in ["a:build", "b:build", "c:build"] {
+            assert!(
+                text.contains(&format!(
+                    "  {id}\n    1 read outside its inputs:\n      .env.production\n    1 dotenv file qk loads read outside its inputs; name it in qk:ultracache.ignoreReads, and the variables that matter as env inputs:\n      .env\n"
+                )),
+                "{text}"
+            );
+        }
         // Reading only what enforce allows, the tasks kept to what they declare.
         let text = sandbox_summary(
             &sandbox(vec![("a:build", findings(&[".git"], &[]))]),

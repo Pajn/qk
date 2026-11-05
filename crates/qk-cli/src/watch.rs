@@ -438,6 +438,7 @@ fn callbacks(
                 commands: vec![command.to_owned()],
                 cwd: cwd.to_owned(),
                 runtime_env: env.clone(),
+                dotenv: Vec::new(),
                 node_path: None,
                 env,
                 environment: None,

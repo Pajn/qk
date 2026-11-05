@@ -10,7 +10,7 @@ use qk_cache::ultracache::IgnoredReads;
 use serde::Serialize;
 
 use super::Report;
-use super::policy::{in_git, is_dotenv};
+use super::policy::in_git;
 use crate::installs::Installs;
 
 /// What one task did beyond what it declares.
@@ -31,7 +31,12 @@ pub struct Findings {
     /// project: what running a dependency's code or following imports into
     /// it reads. `^` inputs key them.
     pub dependency_reads: BTreeMap<String, BTreeSet<String>>,
-    /// `.git` and dotenv files it read: allowed, but not in the key either.
+    /// Dotenv files qk loads into its environment that it read outside its
+    /// key, its `envFile` among them: what they hold reaches it through the variables qk loads, which
+    /// `env` inputs key, so naming them in its ignored reads covers them. A
+    /// dotenv file qk does not load for it is read as any other file.
+    pub dotenv_reads: BTreeSet<String>,
+    /// `.git` files it read: allowed, but not in the key either.
     pub unkeyed_reads: BTreeSet<String>,
     /// Paths it wrote in the workspace outside its outputs.
     pub stray_writes: BTreeSet<String>,
@@ -48,10 +53,11 @@ pub struct Findings {
 
 impl Findings {
     /// Whether it did anything enforce would refuse: beyond reading `.git` and
-    /// dotenv files and installed packages its key leaves out, and writing in
-    /// `.git`, which enforce allows.
+    /// installed packages its key leaves out, and writing in `.git`, which
+    /// enforce allows.
     pub fn went_beyond(&self) -> bool {
         !self.undeclared_reads.is_empty()
+            || !self.dotenv_reads.is_empty()
             || !self.manifest_reads.is_empty()
             || !self.toolchain_reads.is_empty()
             || !self.tsconfig_reads.is_empty()
@@ -61,6 +67,7 @@ impl Findings {
 
     pub fn is_empty(&self) -> bool {
         self.undeclared_reads.is_empty()
+            && self.dotenv_reads.is_empty()
             && self.manifest_reads.is_empty()
             && self.toolchain_reads.is_empty()
             && self.tsconfig_reads.is_empty()
@@ -94,6 +101,9 @@ pub(super) struct TaskAudit {
     depended: Vec<(Option<String>, String)>,
     /// Its outputs, warm paths and scratch directories.
     outputs: BTreeSet<PathBuf>,
+    /// The dotenv files qk loaded its environment from, `envFile` among them,
+    /// workspace-relative.
+    loaded: BTreeSet<String>,
 }
 
 impl TaskAudit {
@@ -120,6 +130,10 @@ impl TaskAudit {
     pub(super) fn covering(&mut self, covered: BTreeSet<String>, naming_external: bool) {
         self.covered = Some(covered);
         self.naming_external = naming_external;
+    }
+
+    pub(super) fn loading(&mut self, files: impl IntoIterator<Item = String>) {
+        self.loaded = files.into_iter().collect();
     }
 
     pub(super) fn writing(&mut self, outputs: impl IntoIterator<Item = PathBuf>) {
@@ -186,8 +200,15 @@ impl TaskAudit {
                 }
             } else if report.writes() {
                 findings.stray_writes.insert(relative);
-            } else if unkeyed(&relative) {
+            } else if in_git(&relative) {
                 findings.unkeyed_reads.insert(relative);
+            } else if self.loaded.contains(&relative) {
+                // An `envFile` among them, whatever its name.
+                findings.dotenv_reads.insert(relative);
+            } else if is_dotenv(&relative) {
+                // Wherever it lies: one in a project it depends on is no
+                // code of that project's it ran.
+                findings.undeclared_reads.insert(relative);
             } else if let Some(project) = dependency
                 && qk_input_analysis::ReadKind::of(&relative)
                     == qk_input_analysis::ReadKind::Content
@@ -211,6 +232,7 @@ impl TaskAudit {
         // stamp it keeps, is one finding: declaring it an output covers both.
         for path in &findings.stray_writes {
             findings.undeclared_reads.remove(path);
+            findings.dotenv_reads.remove(path);
             findings.manifest_reads.remove(path);
             findings.toolchain_reads.remove(path);
             findings.tsconfig_reads.remove(path);
@@ -225,9 +247,10 @@ impl TaskAudit {
     }
 }
 
-/// `.git` and dotenv files, which tasks read outside their keys by design.
-fn unkeyed(path: &str) -> bool {
-    in_git(path) || is_dotenv(path.rsplit('/').next().unwrap_or(path))
+/// Whether `path` names a dotenv file: `.env`, `.env.*` or `.*.env`.
+pub fn is_dotenv(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    name == ".env" || name.starts_with(".env.") || (name.starts_with('.') && name.ends_with(".env"))
 }
 
 #[cfg(all(test, unix))]
@@ -282,19 +305,17 @@ mod tests {
             }]),
             [],
         );
-        assert_eq!(
-            found.unkeyed_reads,
-            set(&[
-                ".env",
-                ".git",
-                ".git/HEAD",
-                "apps/web/.build.env",
-                "apps/web/.env.local"
-            ])
-        );
+        assert_eq!(found.unkeyed_reads, set(&[".git", ".git/HEAD"]));
+        // A dotenv file is read outside its inputs as any other.
         assert_eq!(
             found.undeclared_reads,
-            set(&[".github/workflows/ci.yml", "src/env.ts"])
+            set(&[
+                ".env",
+                ".github/workflows/ci.yml",
+                "apps/web/.build.env",
+                "apps/web/.env.local",
+                "src/env.ts"
+            ])
         );
         assert_eq!(found.manifest_reads, set(&["libs/lib/package.json"]));
         assert_eq!(found.toolchain_reads, set(&[".nvmrc"]));
@@ -302,18 +323,64 @@ mod tests {
         assert!(found.stray_writes.is_empty() && found.went_beyond());
     }
 
-    /// Reads its ignored reads match, and the manifests of the projects
-    /// they link to, are no finding; writing there still is.
+    /// A dotenv file qk loads for the task is listed apart; one it does not
+    /// load is read outside its inputs as any other file, in a project it
+    /// depends on too, rather than as that project's code.
+    #[test]
+    fn tells_dotenv_files_qk_loads_from_others() {
+        let root = Path::new("/workspace");
+        let mut audit = TaskAudit::new(root, vec![(Some("lib".into()), "libs/lib".into())]);
+        audit.loading([
+            ".env".to_owned(),
+            "apps/app/.env.local".to_owned(),
+            "config/variables.txt".to_owned(),
+        ]);
+        let found = audit.classify(
+            None,
+            [
+                ".env",
+                "apps/app/.env.local",
+                ".env.production",
+                "libs/lib/.env",
+                "libs/lib/src/a.ts",
+                "config/variables.txt",
+            ]
+            .map(|path| read(root, path)),
+            [],
+        );
+        // An `envFile` it loaded is one, whatever its name.
+        assert_eq!(
+            found.dotenv_reads,
+            set(&[".env", "apps/app/.env.local", "config/variables.txt"])
+        );
+        assert_eq!(
+            found.undeclared_reads,
+            set(&[".env.production", "libs/lib/.env"])
+        );
+        assert_eq!(
+            found.dependency_reads,
+            BTreeMap::from([("lib".to_owned(), set(&["libs/lib/src/a.ts"]))])
+        );
+        assert!(found.went_beyond());
+    }
+
+    /// Reads its ignored reads match, dotenv files among them, and the
+    /// manifests of the projects they link to, are no finding; writing there
+    /// still is.
     #[test]
     fn leaves_out_ignored_reads() {
         let root = Path::new("/workspace");
         let mut audit = TaskAudit::new(root, Vec::new());
-        audit.ignoring(IgnoredReads::of_globs(&["apps/app/e2e/**".to_owned()]).unwrap());
+        audit.ignoring(
+            IgnoredReads::of_globs(&["apps/app/e2e/**".to_owned(), "**/.env".to_owned()]).unwrap(),
+        );
         audit.ignoring_manifests(set(&["packages/core/package.json"]));
         let found = audit.classify(
             None,
             [
                 read(root, "apps/app/e2e/spec.js"),
+                read(root, "apps/app/.env"),
+                read(root, ".env"),
                 read(root, "packages/core/package.json"),
                 read(root, "packages/core/index.js"),
                 write(root, "apps/app/e2e/out.txt"),

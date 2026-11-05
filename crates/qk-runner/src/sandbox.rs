@@ -9,8 +9,11 @@
 //! changes or resolves to, such as nx.json, project.json or the pnpm
 //! lockfile, is read only as declared, since what the task reads of it
 //! could change without its key. In audit mode anything else is allowed and reported; in enforce
-//! mode it is refused, except reading and writing `.git` and reading dotenv
-//! files, which a task may need although they are not keyed.
+//! mode it is refused, except reading and writing `.git`, which a task may
+//! need although it is not keyed. A dotenv file is read only as its inputs
+//! or its ignored reads name it: one qk loads for the task matters through
+//! the variables it sets, which `env` inputs key, and one it does not load
+//! is an input like any other file.
 //!
 //! Audit also reports reading an installed package the key leaves out, as a
 //! task naming its `externalDependencies` but running a tool only the root
@@ -52,8 +55,8 @@ mod landlock;
 mod policy;
 mod seatbelt;
 
-pub use audit::Findings;
 use audit::TaskAudit;
+pub use audit::{Findings, is_dotenv};
 use policy::Policy;
 pub use policy::in_git;
 use seatbelt::{Fit, quote, seatbelt};
@@ -209,9 +212,16 @@ const PROBE_RETRY: Duration = Duration::from_millis(500);
 const PROBE_DEADLINE: Duration = Duration::from_secs(10);
 
 impl Sandbox {
-    /// Works out what each task may do; on macOS writes its profile and
-    /// starts reading the log.
-    pub fn start(workspace: &Workspace, graph: &TaskGraph, mode: Mode) -> Result<Self> {
+    /// Works out what each task may do, and with the dotenv files `prepared`
+    /// says each task's environment was loaded from, what its reports are
+    /// judged against; on macOS writes its profile and starts reading the
+    /// log.
+    pub fn start(
+        workspace: &Workspace,
+        graph: &TaskGraph,
+        prepared: &BTreeMap<String, qk_executor::PreparedTask>,
+        mode: Mode,
+    ) -> Result<Self> {
         if cfg!(target_os = "linux") {
             if mode == Mode::Enforce {
                 landlock::abi()
@@ -228,7 +238,9 @@ impl Sandbox {
         let directory = state.join("sandbox").join(std::process::id().to_string());
         std::fs::create_dir_all(&directory)?;
         let resolution = qk_cache::resolve_each(workspace, graph)?;
-        let tree = Tree::new(&resolution.candidates).protecting(protected(workspace));
+        let tree = Tree::new(&resolution.candidates)
+            .protecting(protected(workspace))
+            .protecting_dotenv(&root);
         let installs = Installs::load(&root);
         let projects = qk_graph::ProjectGraph::build(workspace)?;
         let mut audits: BTreeMap<String, TaskAudit> = depended(workspace, graph, &projects)
@@ -292,7 +304,15 @@ impl Sandbox {
             match &resolution.tasks[id] {
                 Ok(resolved) => {
                     let files = resolved.file_inputs().map(str::to_owned).collect();
-                    let mut plan = plan(workspace, graph, task, &root, &tree, &files);
+                    // The files its environment was loaded from, as reports
+                    // name them.
+                    let loaded: BTreeSet<String> = prepared
+                        .get(id)
+                        .into_iter()
+                        .flat_map(|task| &task.dotenv)
+                        .filter_map(|path| workspace_relative(&root, &workspace.root, path))
+                        .collect();
+                    let mut plan = plan(workspace, graph, task, &root, &tree, &files, &loaded);
                     // What its ignored reads name, which it may read under
                     // enforce too. Landlock and Seatbelt hold paths, so of a
                     // file a glob matches, only one there as the run starts;
@@ -340,6 +360,7 @@ impl Sandbox {
                         }
                     }
                     audit.writing(plan.write_trees.iter().cloned());
+                    audit.loading(loaded);
                     policies.insert(id.clone(), Policy::new(mode, &root, &state, plan));
                 }
                 Err(reason) => {
@@ -868,6 +889,38 @@ impl Drop for Sandbox {
     }
 }
 
+/// `path` as reports name it, `/`-separated beneath the workspace, whose
+/// root `root` is resolved and `given` as given; `None` outside it. Reports
+/// name the path a read resolved to, so one that exists is resolved too;
+/// one that does not has its `.` and `..` parts taken as they read.
+fn workspace_relative(root: &Path, given: &Path, path: &Path) -> Option<String> {
+    let path = path.canonicalize().unwrap_or_else(|_| {
+        let mut normal = PathBuf::new();
+        for part in path.components() {
+            match part {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    normal.pop();
+                }
+                part => normal.push(part),
+            }
+        }
+        normal
+    });
+    let relative = path
+        .strip_prefix(root)
+        .or_else(|_| path.strip_prefix(given))
+        .ok()?;
+    relative
+        .components()
+        .map(|part| match part {
+            std::path::Component::Normal(part) => part.to_str(),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()
+        .map(|parts| parts.join("/"))
+}
+
 /// Every task `task` depends on, directly or not.
 fn dependencies<'a>(graph: &'a TaskGraph, task: &'a Task) -> Vec<&'a Task> {
     let mut seen = BTreeSet::new();
@@ -967,6 +1020,13 @@ struct Tree {
     /// counted can leave out, as Git leaves out an ignored
     /// `project.local.json`.
     protected: BTreeSet<String>,
+    /// The workspace root, resolved, beneath which the dotenv files of each
+    /// directory a task's inputs would allow whole are looked for; `None`
+    /// looks for none.
+    root: Option<PathBuf>,
+    /// The dotenv files found beneath each directory looked in, so that one
+    /// beneath it is answered without looking again.
+    dotenv: Mutex<Vec<(String, Vec<String>)>>,
 }
 
 impl Tree {
@@ -980,6 +1040,8 @@ impl Tree {
         Self {
             counts,
             protected: BTreeSet::new(),
+            root: None,
+            dotenv: Mutex::new(Vec::new()),
         }
     }
 
@@ -991,43 +1053,190 @@ impl Tree {
         self
     }
 
+    /// With the dotenv files beneath the workspace at `root` protected as
+    /// well, those Git ignores among them, looked for only beneath the
+    /// directories a task's inputs would allow whole, each once.
+    fn protecting_dotenv(mut self, root: &Path) -> Self {
+        self.root = Some(root.to_owned());
+        self
+    }
+
+    /// The dotenv files beneath `directory`, workspace-relative, but for
+    /// those in a directory the walk for ignored reads never enters.
+    fn dotenv_beneath(&self, directory: &str) -> Vec<String> {
+        let Some(root) = &self.root else {
+            return Vec::new();
+        };
+        // Whether `path` lies beneath `directory`, `""` holding everything.
+        let beneath = |path: &str, directory: &str| {
+            directory.is_empty()
+                || path
+                    .strip_prefix(directory)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        };
+        let mut found = self.dotenv.lock().unwrap();
+        if let Some((_, files)) = found
+            .iter()
+            .find(|(top, _)| top == directory || beneath(directory, top))
+        {
+            return files
+                .iter()
+                .filter(|path| beneath(path, directory))
+                .cloned()
+                .collect();
+        }
+        let mut files = Vec::new();
+        let mut pending = vec![root.join(directory)];
+        while let Some(current) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&current) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(kind) = entry.file_type() else {
+                    continue;
+                };
+                let path = entry.path();
+                if kind.is_dir() {
+                    if !skipped(&path) {
+                        pending.push(path);
+                    }
+                } else if entry.file_name().to_str().is_some_and(is_dotenv)
+                    && let Ok(relative) = path.strip_prefix(root)
+                {
+                    files.push(relative.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+        found.push((directory.to_owned(), files.clone()));
+        files
+    }
+
+    /// `directory`, workspace-relative, as the fewest paths to read it by:
+    /// itself whole, unless it holds a dotenv file or one of `loaded`, the
+    /// files the task's environment was loaded from, that its inputs leave
+    /// out, as [`Tree::cover`] holds a directory back; then each directory in
+    /// it whole that holds none, and each other file in it but those. A link
+    /// in it is left out: allowing it would allow where it leads.
+    fn split(
+        &self,
+        directory: &str,
+        inputs: &BTreeSet<String>,
+        loaded: &BTreeSet<String>,
+    ) -> (Vec<String>, Vec<String>) {
+        // Whether `path` lies beneath `directory`, `""` holding everything.
+        let beneath = |path: &str, directory: &str| {
+            directory.is_empty()
+                || path
+                    .strip_prefix(directory)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        };
+        let held: BTreeSet<String> = self
+            .dotenv_beneath(directory)
+            .into_iter()
+            .chain(
+                loaded
+                    .iter()
+                    .filter(|path| beneath(path, directory))
+                    .cloned(),
+            )
+            .filter(|path| !inputs.contains(path))
+            .collect();
+        let (mut trees, mut files) = (Vec::new(), Vec::new());
+        let Some(root) = self.root.as_ref().filter(|_| !held.is_empty()) else {
+            return (vec![directory.to_owned()], files);
+        };
+        let mut pending = vec![directory.to_owned()];
+        while let Some(current) = pending.pop() {
+            if !held.iter().any(|path| beneath(path, &current)) {
+                trees.push(current);
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(root.join(&current)) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let (Ok(kind), Some(name)) = (
+                    entry.file_type(),
+                    entry.file_name().to_str().map(str::to_owned),
+                ) else {
+                    continue;
+                };
+                let path = match current.as_str() {
+                    "" => name,
+                    current => format!("{current}/{name}"),
+                };
+                if kind.is_dir() {
+                    pending.push(path);
+                } else if kind.is_file() && !held.contains(&path) {
+                    files.push(path);
+                }
+            }
+        }
+        (trees, files)
+    }
+
     /// The inputs as the fewest paths: each outermost directory whose every
-    /// file is an input, and holding no protected file that is not, and the
-    /// other inputs one by one.
-    fn cover<'a>(&self, inputs: &'a BTreeSet<String>) -> (Vec<String>, Vec<&'a str>) {
+    /// file is an input, and holding no protected file, no dotenv file and
+    /// none of `loaded`, the files the task's environment was loaded from,
+    /// that is not, and the other inputs one by one. Landlock and Seatbelt
+    /// grant a directory with everything beneath it, Git-ignored files
+    /// included, so a dotenv file left out of the inputs would be granted
+    /// with it.
+    fn cover<'a>(
+        &self,
+        inputs: &'a BTreeSet<String>,
+        loaded: &BTreeSet<String>,
+    ) -> (Vec<String>, Vec<&'a str>) {
         let mut covered: BTreeMap<&str, usize> = BTreeMap::new();
         for input in inputs {
             for directory in parents(input) {
                 *covered.entry(directory).or_insert(0) += 1;
             }
         }
-        let held: BTreeSet<&str> = self
+        let mut held: BTreeSet<String> = self
             .protected
             .iter()
+            .chain(loaded)
             .filter(|path| !inputs.contains(*path))
             .flat_map(|path| parents(path))
+            .map(str::to_owned)
             .collect();
-        let whole: BTreeSet<&str> = covered
-            .iter()
-            .filter(|(directory, count)| {
-                !directory.is_empty()
-                    && self.counts.get(**directory) == Some(count)
-                    && !held.contains(**directory)
-            })
-            .map(|(directory, _)| *directory)
-            .collect();
-        // Only the outermost of those.
-        let outermost: Vec<String> = whole
-            .iter()
-            .filter(|directory| !parents(directory).any(|parent| whole.contains(parent)))
-            .map(|directory| (*directory).to_owned())
-            .collect();
-        let singles = inputs
-            .iter()
-            .map(String::as_str)
-            .filter(|input| !parents(input).any(|directory| whole.contains(directory)))
-            .collect();
-        (outermost, singles)
+        loop {
+            let whole: BTreeSet<&str> = covered
+                .iter()
+                .filter(|(directory, count)| {
+                    !directory.is_empty()
+                        && self.counts.get(**directory) == Some(count)
+                        && !held.contains(**directory)
+                })
+                .map(|(directory, _)| *directory)
+                .collect();
+            // Only the outermost of those.
+            let outermost: Vec<&str> = whole
+                .iter()
+                .filter(|directory| !parents(directory).any(|parent| whole.contains(parent)))
+                .copied()
+                .collect();
+            let mut more = false;
+            for directory in &outermost {
+                for file in self.dotenv_beneath(directory) {
+                    if !inputs.contains(&file) {
+                        for parent in parents(&file) {
+                            more |= held.insert(parent.to_owned());
+                        }
+                    }
+                }
+            }
+            if more {
+                continue;
+            }
+            let singles = inputs
+                .iter()
+                .map(String::as_str)
+                .filter(|input| !parents(input).any(|directory| whole.contains(directory)))
+                .collect();
+            return (outermost.into_iter().map(str::to_owned).collect(), singles);
+        }
     }
 }
 
@@ -1099,6 +1308,7 @@ fn plan(
     root: &Path,
     tree: &Tree,
     files: &BTreeSet<String>,
+    loaded: &BTreeSet<String>,
 ) -> Plan {
     let path = |relative: &str| -> PathBuf {
         if relative == "." || relative.is_empty() {
@@ -1107,16 +1317,40 @@ fn plan(
             root.join(relative)
         }
     };
-    let (whole, singles) = tree.cover(files);
-    let mut read_files: Vec<PathBuf> = singles.iter().map(|file| path(file)).collect();
+    let (whole, singles) = tree.cover(files, loaded);
+    // A link to a directory is read through its target, below, not by its
+    // own path: Landlock, which follows it, would grant reading every file
+    // beneath the target.
+    let mut read_files: Vec<PathBuf> = singles
+        .iter()
+        .map(|file| path(file))
+        .filter(|file| !(file.is_symlink() && file.is_dir()))
+        .collect();
     let mut read_trees = BTreeSet::new();
+    // A linked directory's target is read whole: its key holds every file
+    // beneath it, Git-ignored ones included, so nothing there is undeclared.
+    // A link to the workspace root cannot be keyed, so the root is split, as
+    // directories are allowed whole, around dotenv files the inputs leave out.
     for file in files {
         for target in linked_targets(root, &root.join(file)) {
-            if target.is_dir() {
-                read_trees.insert(target);
-            } else {
+            let Some(relative) = target
+                .strip_prefix(root)
+                .ok()
+                .and_then(Path::to_str)
+                .filter(|_| target.is_dir())
+            else {
+                // A linked file is keyed by the content of what it leads to,
+                // so reading that is declared, whatever its name.
                 read_files.push(target);
+                continue;
+            };
+            if !relative.is_empty() {
+                read_trees.insert(target);
+                continue;
             }
+            let (trees, singles) = tree.split(relative, files, loaded);
+            read_trees.extend(trees.iter().map(|tree| path(tree)));
+            read_files.extend(singles.iter().map(|file| path(file)));
         }
     }
     let anchors = |task: &Task| -> Vec<PathBuf> {
@@ -1760,6 +1994,32 @@ mod matching_tests {
 mod tests {
     use super::*;
 
+    /// A loaded file's path, absolute or joined to the root as given, is
+    /// named as reports name it; one outside the workspace is not.
+    #[test]
+    fn names_loaded_files_as_reports_do() {
+        let (root, given) = (Path::new("/real/repo"), Path::new("/link/repo"));
+        for (path, named) in [
+            ("/real/repo/apps/app/.env", Some("apps/app/.env")),
+            (
+                "/link/repo/./config/variables.txt",
+                Some("config/variables.txt"),
+            ),
+            (
+                "/real/repo/apps/web/../shared/vars.txt",
+                Some("apps/shared/vars.txt"),
+            ),
+            ("/elsewhere/.env", None),
+            ("/real/repo/../other/.env", None),
+        ] {
+            assert_eq!(
+                workspace_relative(root, given, Path::new(path)).as_deref(),
+                named,
+                "{path}"
+            );
+        }
+    }
+
     #[test]
     fn protects_the_manifests_of_a_root_spelled_with_dots() {
         let temp = tempfile::tempdir().unwrap();
@@ -1831,7 +2091,7 @@ mod tests {
         .into_iter()
         .map(str::to_owned)
         .collect();
-        let (whole, singles) = tree.cover(&inputs);
+        let (whole, singles) = tree.cover(&inputs, &BTreeSet::new());
         assert_eq!(whole, ["app/lib", "app/src/deep"]);
         assert_eq!(singles, ["app/src/a.ts"]);
 
@@ -1840,12 +2100,153 @@ mod tests {
         // whole, unless the inputs hold it.
         let tree =
             Tree::new(&files).protecting(BTreeSet::from(["app/lib/project.local.json".into()]));
-        let (whole, singles) = tree.cover(&inputs);
+        let (whole, singles) = tree.cover(&inputs, &BTreeSet::new());
         assert_eq!(whole, ["app/src/deep"]);
         assert_eq!(singles, ["app/lib/d.ts", "app/lib/e.ts", "app/src/a.ts"]);
         let mut declared = inputs.clone();
         declared.insert("app/lib/project.local.json".into());
-        assert!(!tree.cover(&declared).1.contains(&"app/lib/d.ts"));
+        assert!(
+            !tree
+                .cover(&declared, &BTreeSet::new())
+                .1
+                .contains(&"app/lib/d.ts")
+        );
+    }
+
+    /// A directory whose every tracked file is an input is not allowed whole
+    /// when it holds a dotenv file, Git-ignored or not, or a file the task's
+    /// environment was loaded from, that its inputs leave out: its files are
+    /// allowed one by one, and the dotenv file stays refused.
+    #[test]
+    fn allows_no_directory_whole_that_holds_an_undeclared_dotenv_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        for file in ["apps/web/a.ts", "apps/web/src/b.ts", "apps/web/.env"] {
+            let path = root.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+        let tracked: BTreeSet<String> = ["apps/web/a.ts", "apps/web/src/b.ts"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let tree = Tree::new(&tracked).protecting_dotenv(&root);
+        let none = BTreeSet::new();
+        let (whole, singles) = tree.cover(&tracked, &none);
+        assert_eq!(whole, ["apps/web/src"]);
+        assert_eq!(singles, ["apps/web/a.ts"]);
+        let plan = Plan {
+            read_directories: whole.iter().map(|directory| root.join(directory)).collect(),
+            read_files: singles.iter().map(|file| root.join(file)).collect(),
+            ..Plan::default()
+        };
+        let policy = Policy::new(Mode::Enforce, &root, &root.join(".qk"), plan);
+        for (file, verdict) in [
+            ("apps/web/.env", policy::Verdict::Refuse),
+            ("apps/web/a.ts", policy::Verdict::Allow),
+            ("apps/web/src/b.ts", policy::Verdict::Allow),
+        ] {
+            assert_eq!(
+                policy.judge(&root.join(file), policy::Access::Read, false),
+                verdict,
+                "{file}"
+            );
+        }
+        // Tracked and declared, it no longer keeps the directory from being
+        // allowed whole.
+        let mut declared = tracked.clone();
+        declared.insert("apps/web/.env".into());
+        let tracked_too = Tree::new(&declared).protecting_dotenv(&root);
+        assert_eq!(tracked_too.cover(&declared, &none).0, ["apps"]);
+        // Nor does one in a directory the walk never enters.
+        std::fs::remove_file(root.join("apps/web/.env")).unwrap();
+        std::fs::create_dir_all(root.join("apps/web/node_modules/x")).unwrap();
+        std::fs::write(root.join("apps/web/node_modules/x/.env"), "").unwrap();
+        let fresh = Tree::new(&tracked).protecting_dotenv(&root);
+        assert_eq!(fresh.cover(&tracked, &none).0, ["apps"]);
+        // A file its environment was loaded from, whatever its name, holds it
+        // too.
+        let loaded = BTreeSet::from(["apps/web/vars.txt".to_owned()]);
+        assert_eq!(fresh.cover(&tracked, &loaded).0, ["apps/web/src"]);
+    }
+
+    /// An input linking to a directory reads its target whole, a dotenv
+    /// file in it included, as its key holds everything beneath it; the link
+    /// is not granted by its own path, which Landlock follows.
+    #[cfg(unix)]
+    #[test]
+    fn reads_a_linked_directory_whole() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("nx.json"), "{}").unwrap();
+        std::fs::write(
+            root.join("project.json"),
+            r#"{"name":"app","targets":{"read":{"command":"true","inputs":["{projectRoot}/linked"]}}}"#,
+        )
+        .unwrap();
+        for file in ["shared/a.ts", "shared/deep/b.ts", "shared/deep/.env"] {
+            let path = root.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+        std::os::unix::fs::symlink("shared", root.join("linked")).unwrap();
+        let workspace = qk_config::Workspace::load(&root).unwrap();
+        let graph = TaskGraph::build(
+            &workspace,
+            &[qk_taskgraph::Request::parse("app:read").unwrap()],
+        )
+        .unwrap();
+        let files: BTreeSet<String> = ["linked".to_owned()].into();
+        let tree = Tree::new(&files).protecting_dotenv(&root);
+        let plan = |files: &BTreeSet<String>| {
+            plan(
+                &workspace,
+                &graph,
+                &graph.tasks["app:read"],
+                &root,
+                &tree,
+                files,
+                &BTreeSet::new(),
+            )
+        };
+        let judge = |plan: Plan, file: &str| {
+            Policy::new(Mode::Enforce, &root, &root.join(".qk"), plan).judge(
+                &root.join(file),
+                policy::Access::Read,
+                false,
+            )
+        };
+        for (file, verdict) in [
+            ("shared/deep/.env", policy::Verdict::Allow),
+            ("shared/a.ts", policy::Verdict::Allow),
+            ("shared/deep/b.ts", policy::Verdict::Allow),
+        ] {
+            assert_eq!(judge(plan(&files), file), verdict, "{file}");
+        }
+        assert!(plan(&files).read_trees.contains(&root.join("shared")));
+        // The link itself is not granted by its path, which Landlock follows.
+        assert!(!plan(&files).read_files.contains(&root.join("linked")));
+    }
+
+    /// An input linking to the workspace root is split as any linked
+    /// directory: what the root holds is read, but for an undeclared dotenv
+    /// file and a file the task's environment was loaded from.
+    #[test]
+    fn splits_a_link_to_the_workspace_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        for file in ["a.ts", ".env", "src/b.ts", "src/vars.txt"] {
+            let path = root.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+        let tree = Tree::new(&BTreeSet::new()).protecting_dotenv(&root);
+        let loaded = BTreeSet::from(["src/vars.txt".to_owned()]);
+        let (mut trees, mut files) = tree.split("", &BTreeSet::new(), &loaded);
+        trees.sort();
+        files.sort();
+        assert!(trees.is_empty(), "{trees:?}");
+        assert_eq!(files, ["a.ts", "src/b.ts"]);
     }
 
     #[cfg(unix)]

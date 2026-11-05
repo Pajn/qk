@@ -4633,8 +4633,9 @@ fn the_sandbox_reports_and_refuses_what_a_task_does_not_declare() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let temp = fixture(json!({
         "build": {
-            "command": "cat src/in.txt other/notes.txt .env > /dev/null; mkdir -p dist && echo out > dist/out.txt && echo stray > stray.txt && cat stray.txt > /dev/null",
+            "command": "cat src/in.txt other/notes.txt .env .env.production config/vars.txt > /dev/null; mkdir -p dist && echo out > dist/out.txt && echo stray > stray.txt && cat stray.txt > /dev/null",
             "inputs": ["{projectRoot}/src/**/*"],
+            "options": {"envFile": "config/vars.txt"},
             "outputs": ["{projectRoot}/dist"]
         },
         "clean": {"command": "cat src/in.txt > /dev/null", "inputs": ["{projectRoot}/src/**/*"]}
@@ -4644,6 +4645,9 @@ fn the_sandbox_reports_and_refuses_what_a_task_does_not_declare() {
     fs::write(temp.path().join("src/in.txt"), "in").unwrap();
     fs::write(temp.path().join("other/notes.txt"), "notes").unwrap();
     fs::write(temp.path().join(".env"), "X=1\n").unwrap();
+    fs::write(temp.path().join(".env.production"), "X=2\n").unwrap();
+    fs::create_dir_all(temp.path().join("config")).unwrap();
+    fs::write(temp.path().join("config/vars.txt"), "Y=1\n").unwrap();
     let report = temp.path().join("sandbox.json");
     let audit = run(
         temp.path(),
@@ -4656,11 +4660,22 @@ fn the_sandbox_reports_and_refuses_what_a_task_does_not_declare() {
             report.to_str().unwrap(),
         ],
     );
-    success(audit);
+    let stderr = String::from_utf8_lossy(&success(audit).stderr).into_owned();
     let findings: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
     let build = &findings["tasks"]["app:build"];
-    assert_eq!(build["undeclaredReads"], json!(["other/notes.txt"]));
-    assert_eq!(build["unkeyedReads"], json!([".env"]));
+    // A dotenv file its ignored reads do not name is read outside its inputs:
+    // one qk loads for it apart, one it does not as any other file.
+    // Its envFile is one qk loads, whatever its name.
+    assert_eq!(build["dotenvReads"], json!([".env", "config/vars.txt"]));
+    assert_eq!(
+        build["undeclaredReads"],
+        json!([".env.production", "other/notes.txt"])
+    );
+    assert_eq!(build["unkeyedReads"], json!([]));
+    assert!(
+        stderr.contains("  app:build\n    2 read outside its inputs:\n      .env.production\n      other/notes.txt\n    2 dotenv files qk loads read outside its inputs; name them in qk:ultracache.ignoreReads, and the variables that matter as env inputs:\n      .env\n      config/vars.txt\n"),
+        "{stderr}"
+    );
     // Read back after writing it, it is listed once, as a write.
     assert_eq!(build["strayWrites"], json!(["stray.txt"]));
     assert!(findings["tasks"].get("app:clean").is_none(), "{findings}");
@@ -4696,6 +4711,52 @@ fn the_sandbox_reports_and_refuses_what_a_task_does_not_declare() {
     );
     assert!(!temp.path().join("stray.txt").exists());
     assert!(temp.path().join("dist/out.txt").is_file());
+}
+
+/// Enforce lets a task read a dotenv file only as its ignored reads name it,
+/// written in the target or in nx.json `targetDefaults`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn the_sandbox_lets_a_task_read_dotenv_files_its_ignored_reads_name() {
+    let read = "cat .env apps/web/.env.local > /dev/null";
+    let ignored = json!({"mode": "off", "ignoreReads": ["**/.env", "**/.env.*"]});
+    let temp = fixture(json!({
+        "plain": {"command": read, "inputs": []},
+        "named": {"command": read, "inputs": [], "qk:ultracache": ignored},
+        "defaulted": {"command": read, "inputs": []}
+    }));
+    fs::write(
+        temp.path().join("nx.json"),
+        json!({"targetDefaults": {"defaulted": {"qk:ultracache": ignored}}}).to_string(),
+    )
+    .unwrap();
+    fs::create_dir_all(temp.path().join("apps/web")).unwrap();
+    fs::write(temp.path().join(".env"), "X=1\n").unwrap();
+    fs::write(temp.path().join("apps/web/.env.local"), "Y=1\n").unwrap();
+    let enforced = |target: &str| {
+        run(
+            temp.path(),
+            &[
+                "run",
+                &format!("app:{target}"),
+                "--skip-cache",
+                "--sandbox=enforce",
+            ],
+        )
+    };
+    let plain = enforced("plain");
+    assert!(!plain.status.success());
+    #[cfg(target_os = "macos")]
+    let refused = ".env: Operation not permitted";
+    #[cfg(target_os = "linux")]
+    let refused = ".env: Permission denied";
+    assert!(
+        String::from_utf8_lossy(&plain.stderr).contains(refused),
+        "{}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    success(enforced("named"));
+    success(enforced("defaulted"));
 }
 
 /// Configuration files a key holds by what they change, or not at all, are
@@ -4793,6 +4854,90 @@ fn the_sandbox_keeps_an_ignored_project_local_json_out_of_whole_directories() {
         let output = run(temp.path(), &["run", "lib:read", "--sandbox=enforce"]);
         assert_eq!(output.status.success(), allowed, "{inputs}");
     }
+}
+
+/// A Git-ignored dotenv file in a directory whose every tracked file is an
+/// input is not allowed with the directory: enforce refuses it unless the
+/// task names it, while the directory's other files stay readable.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn the_sandbox_keeps_an_ignored_dotenv_file_out_of_whole_directories() {
+    let temp = fixture(json!({}));
+    fs::write(temp.path().join(".gitignore"), ".env\n").unwrap();
+    let web = temp.path().join("apps/web");
+    fs::create_dir_all(web.join("src")).unwrap();
+    fs::write(web.join("src/index.ts"), "export {};\n").unwrap();
+    fs::write(web.join("src/.env"), "X=1\n").unwrap();
+    let project = |command: &str, ultracache: Value| {
+        json!({"name": "web", "targets": {"read": {
+            "command": command,
+            "inputs": ["{projectRoot}/**/*"],
+            "qk:ultracache": ultracache
+        }}})
+        .to_string()
+    };
+    for (command, ultracache, allowed) in [
+        ("cat apps/web/src/index.ts", json!({"mode": "off"}), true),
+        ("cat apps/web/src/.env", json!({"mode": "off"}), false),
+        (
+            "cat apps/web/src/.env",
+            json!({"mode": "off", "ignoreReads": ["**/.env"]}),
+            true,
+        ),
+    ] {
+        fs::write(web.join("project.json"), project(command, ultracache)).unwrap();
+        let output = run(
+            temp.path(),
+            &["run", "web:read", "--skip-cache", "--sandbox=enforce"],
+        );
+        assert_eq!(output.status.success(), allowed, "{command}");
+    }
+}
+
+/// An input linking to a directory lets the task read all it holds, a
+/// dotenv file there included: its key holds everything behind the link.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn the_sandbox_reads_a_dotenv_file_in_a_linked_directory() {
+    let temp = fixture(json!({
+        "code": {"command": "cat linked/a.ts", "inputs": ["{projectRoot}/linked"]},
+        "secret": {"command": "cat linked/.env", "inputs": ["{projectRoot}/linked"]}
+    }));
+    fs::create_dir_all(temp.path().join("shared")).unwrap();
+    fs::write(temp.path().join("shared/a.ts"), "export {};\n").unwrap();
+    fs::write(temp.path().join("shared/.env"), "X=1\n").unwrap();
+    std::os::unix::fs::symlink("shared", temp.path().join("linked")).unwrap();
+    for (target, allowed) in [("code", true), ("secret", true)] {
+        let output = run(
+            temp.path(),
+            &[
+                "run",
+                &format!("app:{target}"),
+                "--skip-cache",
+                "--sandbox=enforce",
+            ],
+        );
+        assert_eq!(output.status.success(), allowed, "{target}");
+    }
+}
+
+/// An input linking to a directory outside the workspace reads through it:
+/// outside the workspace everything is allowed, and the sandbox judges the
+/// path a link leads to.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn the_sandbox_reads_through_a_link_out_of_the_workspace() {
+    let outside = TempDir::new().unwrap();
+    fs::write(outside.path().join("f.txt"), "outside\n").unwrap();
+    let temp = fixture(json!({
+        "read": {"command": "cat linked/f.txt", "inputs": ["{projectRoot}/linked"]}
+    }));
+    std::os::unix::fs::symlink(outside.path(), temp.path().join("linked")).unwrap();
+    let output = success(run(
+        temp.path(),
+        &["run", "app:read", "--skip-cache", "--sandbox=enforce"],
+    ));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("outside"));
 }
 
 /// Only a task that started is listed as running unsandboxed: one skipped
@@ -5467,7 +5612,7 @@ fn warm_suggest_lists_the_directories_a_task_wrote_outside_its_outputs() {
 fn the_sandbox_refuses_what_a_task_does_not_declare_on_linux() {
     let temp = fixture(json!({
         "build": {
-            "command": "cat src/in.txt .env node_modules/dep/index.js /etc/hostname > /dev/null && ls other > /dev/null && mkdir -p dist && echo out > dist/out.txt && echo ok",
+            "command": "cat src/in.txt node_modules/dep/index.js /etc/hostname > /dev/null && ls other > /dev/null && mkdir -p dist && echo out > dist/out.txt && echo ok",
             "inputs": ["{projectRoot}/src/**/*"],
             "outputs": ["{projectRoot}/dist"]
         },
@@ -5479,7 +5624,6 @@ fn the_sandbox_refuses_what_a_task_does_not_declare_on_linux() {
     }
     fs::write(temp.path().join("src/in.txt"), "in").unwrap();
     fs::write(temp.path().join("other/notes.txt"), "notes").unwrap();
-    fs::write(temp.path().join(".env"), "X=1\n").unwrap();
     fs::write(temp.path().join("node_modules/dep/index.js"), "").unwrap();
     let sandboxed = |target: &str| {
         run(
@@ -5493,7 +5637,7 @@ fn the_sandbox_refuses_what_a_task_does_not_declare_on_linux() {
             ],
         )
     };
-    // Its inputs, dotenv files, node_modules, outside the workspace, listing,
+    // Its inputs, node_modules, outside the workspace, listing,
     // and writing its outputs, which did not exist yet.
     let built = success(sandboxed("app:build"));
     assert!(String::from_utf8_lossy(&built.stdout).contains("ok"));
