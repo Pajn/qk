@@ -2564,16 +2564,26 @@ fn detached_uploads_survive_parent_exit_and_local_cache_removal() {
     assert!(text.contains("0 failure(s)"), "{text}");
     assert_eq!(server.objects(&s3::path("entries/")).len(), 1);
     assert_eq!(server.objects(&s3::path("warm/")).len(), 1);
-    assert!(
-        !fs::read_dir(log.parent().unwrap())
-            .unwrap()
-            .flatten()
-            .any(|entry| entry.path().is_dir()
+    let left: Vec<String> = fs::read_dir(log.parent().unwrap())
+        .unwrap()
+        .flatten()
+        .filter(|entry| {
+            entry.path().is_dir()
                 && entry
                     .file_name()
                     .to_string_lossy()
-                    .starts_with("qk-upload-"))
-    );
+                    .starts_with("qk-upload-")
+        })
+        .map(|entry| {
+            format!(
+                "{} holding {:?}",
+                entry.path().display(),
+                walk(&entry.path())
+            )
+        })
+        .collect();
+    // The worker removes its snapshot before it logs that it is done.
+    assert!(left.is_empty(), "left behind: {left:?}\n{text}");
     // A new run, with detached uploads overridden, consumes the uploaded result.
     fs::remove_dir_all(fixture.root.join("dist")).unwrap();
     let restored = success(remote_build(&fixture, &[("QK_REMOTE_UPLOAD_MODE", "wait")]));
@@ -8101,4 +8111,33 @@ fn project_local_json_keys_tasks_by_what_it_changes() {
     assert_eq!(both(&fixture), (true, false));
     fs::write(&path, format!("// Mine.\n{local}")).unwrap();
     assert_eq!(both(&fixture), (true, true));
+}
+
+/// Every path under `path`, relative to it, and any directory it could not
+/// read.
+fn walk(path: &Path) -> Vec<String> {
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) => return vec![format!("<unreadable: {error}>")],
+    };
+    let mut found = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                found.push(format!("<unreadable entry: {error}>"));
+                continue;
+            }
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if entry.path().is_dir() {
+            found.extend(
+                walk(&entry.path())
+                    .into_iter()
+                    .map(|inner| format!("{name}/{inner}")),
+            );
+        }
+        found.push(name);
+    }
+    found
 }
