@@ -30,7 +30,10 @@ requested targets and errors when nothing matches. `run`, `run-many` and
   `NX_SKIP_NX_CACHE=true` when the cache is skipped.
 - `--nx-bail` (or `NX_BAIL=true`, which `--nx-bail=false` overrides): after a
   task fails, nothing else starts; what is running finishes.
-- `--exclude-task-dependencies`: only the requested tasks run.
+- `--exclude-task-dependencies`: only the requested tasks run. A task whose
+  `dependentTasksOutputFiles` reads its dependencies' outputs is still keyed
+  by them, as they are on disk; a continuous dependency's inputs no longer key
+  it.
 - `--nx-ignore-cycles` (or `NX_IGNORE_CYCLES=true`): a task dependency cycle
   is broken, as Nx does, by dropping the dependency that closes it, with a
   warning; otherwise it is an error.

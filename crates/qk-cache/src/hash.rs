@@ -1666,20 +1666,10 @@ pub(crate) fn coverage(
     let mut dependency_outputs = Vec::new();
     for (pattern, transitive) in selections {
         let matcher = snapshot.pattern(&pattern, false)?;
-        let mut selected = task.dependencies.clone();
-        if transitive {
-            let mut pending = selected.clone();
-            while let Some(id) = pending.pop_first() {
-                for dependency in &graph.tasks[&id].dependencies {
-                    if selected.insert(dependency.clone()) {
-                        pending.insert(dependency.clone());
-                    }
-                }
-            }
-        }
+        let selected = graph.output_dependencies(task, transitive);
         let mut outputs = Vec::new();
         for id in selected {
-            let declared = Outputs::new(workspace, &graph.tasks[&id])?;
+            let declared = Outputs::new(workspace, dependency_task(graph, &id)?)?;
             if declared.declared() {
                 outputs.push(declared);
             }
@@ -3151,6 +3141,13 @@ pub(crate) fn weak_key(
     key(&weak)
 }
 
+/// The task `id` of `graph`, run or left out by `exclude_task_dependencies`.
+fn dependency_task<'a>(graph: &'a TaskGraph, id: &str) -> Result<&'a qk_taskgraph::Task> {
+    graph
+        .keyed_task(id)
+        .with_context(|| format!("task {id} is not in the task graph"))
+}
+
 /// The dependency outputs a task's `dependentTasksOutputFiles` inputs read,
 /// as Nx hashes them: the files each glob selects of the declared outputs of
 /// its direct dependencies, or with `transitive` of every task it depends on.
@@ -3190,33 +3187,27 @@ fn dependency_keys_impl(
     let mut fresh_outputs = HashMap::new();
     for (pattern, transitive) in selections {
         let matcher = snapshot.pattern(pattern, false)?;
-        let mut selected = task.dependencies.clone();
-        if transitive {
-            let mut pending = selected.clone();
-            while let Some(id) = pending.pop_first() {
-                for dependency in &graph.tasks[&id].dependencies {
-                    if selected.insert(dependency.clone()) {
-                        pending.insert(dependency.clone());
-                    }
-                }
-            }
-        }
+        let selected = graph.output_dependencies(task, transitive);
         for id in selected {
             // As in Nx, a dependency without declared outputs offers none.
-            if !Outputs::new(workspace, &graph.tasks[&id])?.declared() {
+            if !Outputs::new(workspace, dependency_task(graph, &id)?)?.declared() {
                 continue;
             }
-            let outputs = if fresh {
-                if !fresh_outputs.contains_key(&id) {
-                    fresh_outputs.insert(
-                        id.clone(),
-                        Arc::new(snapshot.fresh_dependency_outputs(workspace, &graph.tasks[&id])?),
-                    );
-                }
-                fresh_outputs[&id].clone()
-            } else {
-                snapshot.dependency_outputs(workspace, &graph.tasks[&id])?
-            };
+            let outputs =
+                if fresh {
+                    if !fresh_outputs.contains_key(&id) {
+                        fresh_outputs.insert(
+                            id.clone(),
+                            Arc::new(snapshot.fresh_dependency_outputs(
+                                workspace,
+                                dependency_task(graph, &id)?,
+                            )?),
+                        );
+                    }
+                    fresh_outputs[&id].clone()
+                } else {
+                    snapshot.dependency_outputs(workspace, dependency_task(graph, &id)?)?
+                };
             let mut files = BTreeMap::new();
             for path in outputs.files.iter().filter(|path| matcher.is_match(path)) {
                 let known = outputs.values.lock().unwrap().get(path).cloned();
@@ -3276,22 +3267,12 @@ pub fn dependency_globs(workspace: &Workspace, graph: &TaskGraph) -> Result<Vec<
             continue;
         };
         for (pattern, transitive) in resolved.dependency_output_inputs() {
-            let mut selected = task.dependencies.clone();
-            if transitive {
-                let mut pending = selected.clone();
-                while let Some(id) = pending.pop_first() {
-                    for dependency in &graph.tasks[&id].dependencies {
-                        if selected.insert(dependency.clone()) {
-                            pending.insert(dependency.clone());
-                        }
-                    }
-                }
-            }
+            let selected = graph.output_dependencies(task, transitive);
             let matcher = snapshot.pattern(pattern, false)?;
             // A dependency not built yet may still produce what it matches.
             let (mut declared, mut files, mut matched, mut unbuilt) = (false, 0, false, false);
             for id in &selected {
-                let dependency = &graph.tasks[id];
+                let dependency = dependency_task(graph, id)?;
                 if !Outputs::new(workspace, dependency)?.declared() {
                     continue;
                 }

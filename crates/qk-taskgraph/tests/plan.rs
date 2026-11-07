@@ -1,5 +1,5 @@
 use qk_config::Workspace;
-use qk_taskgraph::{Edge, Request, TaskGraph, WaitFor};
+use qk_taskgraph::{BuildOptions, Edge, Request, TaskGraph, WaitFor};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -480,4 +480,39 @@ fn outputs_must_start_with_a_token() {
     for target in ["app:tokens", "app:defaults"] {
         assert!(TaskGraph::build(&workspace, &[Request::parse(target).unwrap()]).is_ok());
     }
+}
+
+#[test]
+fn excluded_dependencies_are_left_unrun_but_kept_for_their_outputs() {
+    let (_temp, workspace) = workspace(json!({
+        "app": {"targets":{"build":{"dependsOn":["prepare"]}, "prepare":{"dependsOn":["generate"]}, "generate":{}}}
+    }));
+    let request = [Request::parse("app:build").unwrap()];
+    let options = BuildOptions {
+        exclude_task_dependencies: true,
+        ..BuildOptions::default()
+    };
+    let graph = TaskGraph::build_with(&workspace, &request, options).unwrap();
+    // Only the requested task runs, with no dependency.
+    assert_eq!(graph.tasks.keys().collect::<Vec<_>>(), ["app:build"]);
+    let build = &graph.tasks["app:build"];
+    assert!(build.dependencies.is_empty());
+    // Its outputs' readers still see the tasks it depends on.
+    let named =
+        |selected: std::collections::BTreeSet<String>| selected.into_iter().collect::<Vec<_>>();
+    assert_eq!(
+        named(graph.output_dependencies(build, false)),
+        ["app:prepare"]
+    );
+    assert_eq!(
+        named(graph.output_dependencies(build, true)),
+        ["app:generate", "app:prepare"]
+    );
+    assert!(graph.keyed_task("app:generate").is_some());
+    // As a graph built without the option would have them.
+    let whole = TaskGraph::build(&workspace, &request).unwrap();
+    assert_eq!(
+        graph.output_dependencies(build, true),
+        whole.output_dependencies(&whole.tasks["app:build"], true)
+    );
 }

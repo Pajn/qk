@@ -164,6 +164,19 @@ pub struct TaskGraph {
     pub requests: Vec<Request>,
     #[serde(skip)]
     pub options: BuildOptions,
+    /// The tasks `exclude_task_dependencies` left out, whole, and the
+    /// dependencies it took from the tasks it kept: not run, but what a kept
+    /// task's `dependentTasksOutputFiles` inputs still read the outputs of.
+    #[serde(skip)]
+    pub excluded: Excluded,
+}
+
+/// What `exclude_task_dependencies` took out of a graph.
+#[derive(Clone, Debug, Default)]
+pub struct Excluded {
+    pub tasks: BTreeMap<String, Task>,
+    /// The dependencies each kept task had before they were pruned.
+    pub original_dependencies: BTreeMap<String, BTreeSet<String>>,
 }
 
 /// Nx's options for building a task graph.
@@ -221,19 +234,67 @@ impl TaskGraph {
             cycles: builder.cycles,
             requests: requests.to_vec(),
             options,
+            excluded: Excluded::default(),
         };
         if !graph.cycles.is_empty() {
             graph.make_acyclic();
         }
         if options.exclude_task_dependencies {
             let roots = graph.roots.clone();
-            graph.tasks.retain(|id, _| roots.contains(id));
+            let (kept, left): (BTreeMap<_, _>, BTreeMap<_, _>) = std::mem::take(&mut graph.tasks)
+                .into_iter()
+                .partition(|(id, _)| roots.contains(id));
+            graph.tasks = kept;
+            graph.excluded.tasks = left;
             for task in graph.tasks.values_mut() {
+                graph
+                    .excluded
+                    .original_dependencies
+                    .insert(task.id.clone(), task.dependencies.clone());
                 task.dependencies.retain(|id| roots.contains(id));
                 task.edges.retain(|id, _| roots.contains(id));
             }
         }
         Ok(graph)
+    }
+
+    /// The tasks whose declared outputs `task`'s `dependentTasksOutputFiles`
+    /// inputs read: its direct dependencies, or with `transitive` every task
+    /// it depends on. Those `exclude_task_dependencies` left out count: they
+    /// are not run, but their outputs as they are on disk still key `task`,
+    /// which would otherwise be keyed as though it read none.
+    pub fn output_dependencies(&self, task: &Task, transitive: bool) -> BTreeSet<String> {
+        let mut selected = self
+            .excluded
+            .original_dependencies
+            .get(&task.id)
+            .unwrap_or(&task.dependencies)
+            .clone();
+        if transitive {
+            let mut pending = selected.clone();
+            while let Some(id) = pending.pop_first() {
+                let Some(dependency) = self.keyed_task(&id) else {
+                    continue;
+                };
+                let dependencies = self
+                    .excluded
+                    .original_dependencies
+                    .get(&id)
+                    .unwrap_or(&dependency.dependencies);
+                for next in dependencies {
+                    if selected.insert(next.clone()) {
+                        pending.insert(next.clone());
+                    }
+                }
+            }
+        }
+        selected
+    }
+
+    /// The task `id`, among those that run or those
+    /// `exclude_task_dependencies` left out.
+    pub fn keyed_task(&self, id: &str) -> Option<&Task> {
+        self.tasks.get(id).or_else(|| self.excluded.tasks.get(id))
     }
 
     /// The graph the same requests make of `workspace`, with `extra`

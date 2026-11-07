@@ -1711,19 +1711,14 @@ fn upstream(graph: &TaskGraph, task: &Task) -> BTreeSet<recorded::TargetOf> {
             task.configuration.clone(),
         )
     };
-    let mut targets = BTreeSet::new();
-    let mut seen = BTreeSet::new();
-    let mut pending: Vec<&String> = task.dependencies.iter().collect();
-    while let Some(id) = pending.pop() {
-        if !seen.insert(id) {
-            continue;
-        }
-        if let Some(dependency) = graph.tasks.get(id) {
-            targets.insert(of(dependency));
-            pending.extend(&dependency.dependencies);
-        }
-    }
-    targets
+    // Those `--exclude-task-dependencies` left unrun among them, so that a
+    // recording lists the same in any run.
+    graph
+        .output_dependencies(task, true)
+        .iter()
+        .filter_map(|id| graph.keyed_task(id))
+        .map(of)
+        .collect()
 }
 
 #[cfg(test)]

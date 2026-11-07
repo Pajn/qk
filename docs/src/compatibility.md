@@ -27,6 +27,11 @@ edges off.
 
 ## Deliberate differences
 
+- `--exclude-task-dependencies` leaves a task's dependencies unrun, not unread:
+  its `dependentTasksOutputFiles` inputs still read their outputs, as they
+  are on disk. Nx keys the task as though it read no dependency outputs, so
+  two runs whose dependencies produced different outputs share a key, and one
+  can restore what the other built.
 - A pnpm lockfile change under `projectsAffectedByDependencyUpdates: "auto"`
   follows installed sets, avoiding projects whose installations are unchanged
   and including transitive installation changes Nx can miss. Task selection

@@ -921,19 +921,14 @@ fn workspace_relative(root: &Path, given: &Path, path: &Path) -> Option<String> 
         .map(|parts| parts.join("/"))
 }
 
-/// Every task `task` depends on, directly or not.
+/// Every task `task` depends on, directly or not, those
+/// `--exclude-task-dependencies` left unrun among them: their outputs key it.
 fn dependencies<'a>(graph: &'a TaskGraph, task: &'a Task) -> Vec<&'a Task> {
-    let mut seen = BTreeSet::new();
-    let mut pending: Vec<&String> = task.dependencies.iter().collect();
-    let mut found = Vec::new();
-    while let Some(id) = pending.pop() {
-        if seen.insert(id) {
-            let dependency = &graph.tasks[id];
-            pending.extend(dependency.dependencies.iter());
-            found.push(dependency);
-        }
-    }
-    found
+    graph
+        .output_dependencies(task, true)
+        .iter()
+        .filter_map(|id| graph.keyed_task(id))
+        .collect()
 }
 
 /// For each task, every project's root, the deepest first so a path is
