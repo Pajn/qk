@@ -6,7 +6,7 @@ use std::io::{self, Write};
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 use qk_config::Workspace;
-use qk_taskgraph::{Request, TaskGraph};
+use qk_taskgraph::{Request, TaskGraph, WaitFor};
 use serde_json::{Value, json};
 
 #[derive(Args)]
@@ -142,6 +142,29 @@ pub fn show(workspace: &Workspace, options: Options) -> Result<i32> {
             }
             if !task.dependencies.is_empty() {
                 data["dependsOn"] = json!(task.dependencies);
+                // As in Nx 24.0.3, each direct continuous dependency, with
+                // whether this task hashes its inputs and waits for it to be
+                // ready; empty when none is continuous.
+                let continuous: serde_json::Map<String, Value> = task
+                    .dependencies
+                    .iter()
+                    .filter(|id| {
+                        graph.tasks.get(*id).is_some_and(|dependency| {
+                            dependency.definition.continuous == Some(true)
+                        })
+                    })
+                    .map(|id| {
+                        let edge = task.edge(id);
+                        (
+                            id.clone(),
+                            json!({
+                                "inputsHashed": edge.inputs,
+                                "waitsForReady": edge.wait_for == WaitFor::Ready,
+                            }),
+                        )
+                    })
+                    .collect();
+                data["continuousDependencies"] = Value::Object(continuous);
             }
             let transitive: BTreeSet<_> = graph
                 .tasks

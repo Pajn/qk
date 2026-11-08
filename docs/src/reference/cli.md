@@ -265,7 +265,8 @@ As in Nx, `--runner` must name `default` or a runner in nx.json
 
 `qk show target <project:target[:configuration]> --json` shows the resolved
 executor, options, caching and concurrency settings, task dependencies,
-`readyWhen` with the timeout its check gets, or `null` where it turns one off,
+with `continuousDependencies` saying of each continuous one whether its inputs
+are hashed and whether the task waits for it to be ready, `readyWhen` with the timeout its check gets, or `null` where it turns one off,
 and qk's own fields, such as `qk:warm` and `qk:threads`, as configured.
 `-c <configuration>` selects a configuration. A target name without a project
 uses the current project, as `run` does.
