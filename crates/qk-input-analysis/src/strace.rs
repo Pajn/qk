@@ -22,14 +22,18 @@ pub fn normalize(path: &Path) -> PathBuf {
 }
 
 /// How much of a trace is read, and which accesses are kept.
+/// Whether an access to an absolute path, by what it does there, is kept.
+pub type Keep<'a> = dyn Fn(&Path, Operation) -> bool + 'a;
+
 pub struct Limits<'a> {
     /// Lines kept, and their bytes; past either the trace is cut short.
     pub records: usize,
     pub bytes: usize,
     /// Accesses kept; past it the trace is cut short.
     pub accesses: usize,
-    /// Whether an access to an absolute path is kept; `None` keeps all.
-    pub keep: Option<&'a dyn Fn(&Path) -> bool>,
+    /// Whether an access to an absolute path, by what it does there, is
+    /// kept; `None` keeps all.
+    pub keep: Option<&'a Keep<'a>>,
     /// Whether an access is also kept by what its path's links lead to, as
     /// a read through a workspace package linked into `node_modules` reads
     /// that package.
@@ -57,7 +61,7 @@ impl<'a> Limits<'a> {
     /// `keep` keeps, each once, whichever processes made it, within a budget
     /// that a large build stays within. With `resolved`, an access is also
     /// kept by what its path's links lead to.
-    pub fn kept(keep: &'a dyn Fn(&Path) -> bool, resolved: bool) -> Self {
+    pub fn kept(keep: &'a Keep<'a>, resolved: bool) -> Self {
         Self {
             records: 1_000_000,
             bytes: 256 * 1024 * 1024,
@@ -78,13 +82,13 @@ static UNKNOWN_CWD: std::sync::LazyLock<PathBuf> =
 
 /// Whether an access is kept under `keep`: by the path it names, or with
 /// `resolved` by what that path's links lead to.
-fn kept(event: &Access, keep: &dyn Fn(&Path) -> bool, resolved: bool) -> bool {
-    keep(Path::new(&event.path))
+fn kept(event: &Access, keep: &Keep<'_>, resolved: bool) -> bool {
+    keep(Path::new(&event.path), event.operation.clone())
         || (resolved
             && event
                 .resolved_path
                 .as_deref()
-                .is_some_and(|resolved| keep(Path::new(resolved))))
+                .is_some_and(|resolved| keep(Path::new(resolved), event.operation.clone())))
 }
 
 /// Why a trace was cut short of its lines.
@@ -111,12 +115,7 @@ fn key_of(event: &Access) -> AccessKey {
 /// The one access a trace line makes that `keep` keeps, when the line means
 /// the same in any process: it names whole paths only, and neither changes
 /// a working directory nor makes a process.
-fn alone(
-    process: u32,
-    call: &str,
-    keep: &dyn Fn(&Path) -> bool,
-    resolved: bool,
-) -> Option<AccessKey> {
+fn alone(process: u32, call: &str, keep: &Keep<'_>, resolved: bool) -> Option<AccessKey> {
     let (events, change, child) = decode(process, call, UNKNOWN_CWD.as_path())?;
     if change.is_some() || child.is_some() {
         return None;
@@ -138,7 +137,7 @@ fn alone(
 /// Whether a trace line can matter under `keep`: it changes a process's
 /// working directory or makes a process, names a path relative to the
 /// working directory, cannot be decoded, or names a kept path.
-fn relevant(process: u32, call: &str, keep: &dyn Fn(&Path) -> bool, resolved: bool) -> bool {
+fn relevant(process: u32, call: &str, keep: &Keep<'_>, resolved: bool) -> bool {
     let unknown = UNKNOWN_CWD.as_path();
     let Some((events, change, child)) = decode(process, call, unknown) else {
         return true;
@@ -718,7 +717,7 @@ mod tests {
                 .collect();
             std::fs::write(directory.path().join(format!("command-0.{process}")), lines).unwrap();
         }
-        let keep = |path: &Path| path.starts_with("/repo");
+        let keep = |path: &Path, _: Operation| path.starts_with("/repo");
         let tight = Limits {
             records: 10,
             keep: Some(&keep),
@@ -762,7 +761,7 @@ mod tests {
             format!("1.000 {long}\n"),
         )
         .unwrap();
-        let keep = |path: &Path| path.starts_with("/repo");
+        let keep = |path: &Path, _: Operation| path.starts_with("/repo");
         let limits = |bytes| Limits {
             bytes,
             keep: Some(&keep),
@@ -796,7 +795,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let keep = |path: &Path| path.starts_with("/repo");
+        let keep = |path: &Path, _: Operation| path.starts_with("/repo");
         let limits = Limits {
             keep: Some(&keep),
             distinct: true,
@@ -894,8 +893,9 @@ mod tests {
             ),
         )
         .unwrap();
-        let keep =
-            |path: &Path| path.starts_with("/repo") && !path.starts_with("/repo/node_modules");
+        let keep = |path: &Path, _: Operation| {
+            path.starts_with("/repo") && !path.starts_with("/repo/node_modules")
+        };
         let limits = Limits {
             keep: Some(&keep),
             resolved: true,

@@ -1503,7 +1503,7 @@ impl Cache {
             .map_err(|e| failed(e.into()))?;
         // Only what a path set can hold is kept and counted: a build reads
         // far more in node_modules and outside the workspace than in it.
-        let keep = |path: &std::path::Path| {
+        let keep = |path: &std::path::Path, operation: qk_input_analysis::Operation| {
             [&workspace.root, &canonical].iter().any(|root| {
                 path.strip_prefix(root).is_ok_and(|relative| {
                     let mut installed = false;
@@ -1517,7 +1517,7 @@ impl Cache {
                     !installed
                         || relative.to_str().is_some_and(|relative| {
                             let relative = relative.replace('\\', "/");
-                            produced.holds(&relative) || produced.lists(&relative)
+                            produced.traced(&relative, &operation)
                         })
                 })
             })

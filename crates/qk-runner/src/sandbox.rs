@@ -652,7 +652,7 @@ impl Sandbox {
         // and in `node_modules` only packages' manifests. A build reads far
         // more outside it, which within the budget `inputs analyze` keeps
         // would leave a task the cache records unaudited.
-        let keep = |path: &Path| {
+        let keep = |path: &Path, _: qk_input_analysis::Operation| {
             [&self.root, &self.given_root].iter().any(|root| {
                 path.strip_prefix(root).is_ok_and(|relative| {
                     !relative

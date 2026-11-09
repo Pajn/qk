@@ -192,6 +192,19 @@ impl Produced {
                 .any(|anchor| under(path, anchor))
     }
 
+    /// Whether an access to `path`, in `node_modules`, is read from a trace
+    /// at all, and so counts toward its limits: what [`Self::holds`], and
+    /// where only a listing is kept, as [`Self::lists`] says, only listings
+    /// and writes. An installed package read below where an upstream glob
+    /// starts is dropped from a path set anyway.
+    pub fn traced(&self, path: &str, operation: &Operation) -> bool {
+        let listed = matches!(
+            operation,
+            Operation::ListDirectory | Operation::ReadDirectory
+        ) || operation.writes();
+        self.holds(path) || listed && self.lists(path)
+    }
+
     /// What decides which paths in `node_modules` a recording keeps, for
     /// the weak key: a path set recorded under other declarations could
     /// leave out what this task's would key. `None` where nothing does.
@@ -1449,6 +1462,48 @@ mod tests {
         assert_eq!(key(), generated);
         std::fs::write(root.join("node_modules/.gen/app/extra.js"), "").unwrap();
         assert_ne!(key(), generated);
+    }
+
+    /// Below where an upstream glob starts, only listings and writes are read
+    /// from a trace, so an installed package's reads there never count
+    /// toward its limits.
+    #[test]
+    fn a_trace_keeps_in_node_modules_only_what_a_path_set_may() {
+        let produced = Produced::new(
+            vec![
+                Outputs::from_paths(&["node_modules/.gen/app".into()]).unwrap(),
+                Outputs::from_paths(&["libs/types/**/*.d.ts".into()]).unwrap(),
+            ],
+            Vec::new(),
+        );
+        let traced = |path: &str, operation: Operation| produced.traced(path, &operation);
+        // What is produced, however it is accessed.
+        assert!(traced(
+            "node_modules/.gen/app/index.js",
+            Operation::OpenRead
+        ));
+        assert!(traced(
+            "libs/types/node_modules/@types/x/index.d.ts",
+            Operation::OpenRead
+        ));
+        // Where only listings are kept, listings and writes alone.
+        assert!(traced("node_modules", Operation::ListDirectory));
+        assert!(traced(
+            "libs/types/node_modules/@types",
+            Operation::ListDirectory
+        ));
+        assert!(traced(
+            "libs/types/node_modules/x/cache.json",
+            Operation::Write
+        ));
+        assert!(!traced(
+            "libs/types/node_modules/x/index.js",
+            Operation::OpenRead
+        ));
+        assert!(!traced("libs/types/node_modules/x", Operation::Metadata));
+        // An installed package elsewhere, not at all.
+        assert!(!traced("node_modules/foo/index.js", Operation::OpenRead));
+        assert!(!traced("node_modules/foo", Operation::ListDirectory));
     }
 
     /// What decides which paths in node_modules a recording keeps is keyed
