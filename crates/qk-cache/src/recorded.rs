@@ -121,7 +121,7 @@ pub struct Exclusions<'a> {
     /// qk's own directories inside the workspace, relative to it.
     pub state: Vec<String>,
     /// What lies in `node_modules` without being installed there.
-    pub produced: Produced,
+    pub produced: &'a Produced,
 }
 
 /// Paths in `node_modules` that the lockfile does not key, which a path set
@@ -176,6 +176,22 @@ impl Produced {
         }) || self.upstream.iter().any(|outputs| outputs.matches(path))
     }
 
+    /// Whether a listing of `path`, a directory in `node_modules`, is kept,
+    /// and whether, as an entry of one, it is listed: what holds what is
+    /// produced or may come to, as `node_modules` holds `.gen` for an
+    /// output in `node_modules/.gen/app`, or as a directory below the anchor
+    /// of an upstream output's glob holds what it may match. An installed
+    /// package elsewhere is neither listed nor its listing kept.
+    pub fn lists(&self, path: &str) -> bool {
+        self.holds(path)
+            || self.roots.iter().any(|root| under(root, path))
+            || self
+                .upstream
+                .iter()
+                .flat_map(Outputs::anchors)
+                .any(|anchor| under(path, anchor))
+    }
+
     /// What decides which paths in `node_modules` a recording keeps, for
     /// the weak key: a path set recorded under other declarations could
     /// leave out what this task's would key. `None` where nothing does.
@@ -214,8 +230,18 @@ impl Exclusions<'_> {
     }
 
     fn excluded(&self, path: &str) -> bool {
+        self.excluded_unless(path, |path| self.produced.holds(path))
+    }
+
+    /// Whether a listing of `path` is left out: as [`Self::excluded`], but
+    /// a directory in `node_modules` that [`Produced::lists`] is kept.
+    fn excluded_listing(&self, path: &str) -> bool {
+        self.excluded_unless(path, |path| self.produced.lists(path))
+    }
+
+    fn excluded_unless(&self, path: &str, produced: impl Fn(&str) -> bool) -> bool {
         path.split('/').next() == Some(".git")
-            || in_node_modules(path) && !self.produced.holds(path)
+            || in_node_modules(path) && !produced(path)
             || self.state.iter().any(|state| {
                 path == state
                     || path
@@ -242,8 +268,18 @@ impl PathSet {
                 written.insert(path);
                 continue;
             }
+            let listing = matches!(
+                access.operation,
+                Operation::ListDirectory | Operation::ReadDirectory
+            );
             // What it wrote itself is no input.
-            if written.contains(&path) || exclusions.excluded(&path) {
+            if written.contains(&path)
+                || if listing {
+                    exclusions.excluded_listing(&path)
+                } else {
+                    exclusions.excluded(&path)
+                }
+            {
                 continue;
             }
             let found = matches!(access.result.as_str(), "success" | "unknown");
@@ -360,8 +396,9 @@ impl PathSet {
         before: &Before,
     ) -> Option<Option<String>> {
         // A directory listings leave out, such as another target's output,
-        // has nothing in it to key.
-        if directory != "." && unlisted.matches(directory) {
+        // has nothing in it to key. One only holding the task's outputs
+        // keys what else it holds.
+        if directory != "." && unlisted.matches(directory) && !unlisted.own_folder(directory) {
             return None;
         }
         let absolute = if directory == "." {
@@ -862,13 +899,16 @@ impl Others<'_> {
 /// there after a task runs whether or not it read anything, rather than what
 /// it read. The task's own outputs, the outputs of other targets, such as a
 /// build's output beside a lint's sources or another project's coverage, but
-/// not those of the targets it depends on, and what its `ignoreReads` names.
+/// not those of the targets it depends on, what its `ignoreReads` names, and
+/// in `node_modules`, what is installed rather than produced.
 /// Only listings leave them out: a file among them that the task read is
 /// still keyed by its content.
 pub(crate) struct Unlisted<'a> {
     pub own: Vec<&'a Outputs>,
     pub others: Option<Others<'a>>,
     pub ignore: &'a crate::ultracache::IgnoredReads,
+    /// What is produced in `node_modules`, which alone is listed there.
+    pub produced: Option<&'a Produced>,
 }
 
 impl Unlisted<'_> {
@@ -879,6 +919,8 @@ impl Unlisted<'_> {
                 .as_ref()
                 .is_some_and(|others| others.matches(path))
             || self.ignore.is_match(path)
+            || inside_node_modules(path)
+                && self.produced.is_some_and(|produced| !produced.lists(path))
     }
 
     /// Whether `path` is the task's own output, or a directory that only
@@ -922,6 +964,8 @@ impl Unlisted<'_> {
                     directories.insert(parent(folder).to_owned());
                 }
             }
+            // Its own folders, whose other entries its listings keep.
+            directories.extend(others.own_folders.iter().cloned());
         }
         directories
     }
@@ -1136,6 +1180,7 @@ mod tests {
         own: Vec::new(),
         others: None,
         ignore: &IGNORE_NOTHING,
+        produced: None,
     };
     use qk_input_analysis::Category;
 
@@ -1166,7 +1211,7 @@ mod tests {
             outputs: &[&outputs],
             ignore: IgnoredReads::of_globs(&["src/*.log".to_owned()]).unwrap(),
             state: vec![".qk".into()],
-            produced: Produced::default(),
+            produced: &Produced::default(),
         };
         let accesses = [
             access(&path("src/a.ts"), Operation::OpenRead, "success"),
@@ -1240,7 +1285,7 @@ mod tests {
             outputs: &[],
             ignore: IgnoredReads::none(),
             state: Vec::new(),
-            produced,
+            produced: &produced,
         };
         let read = |relative: &str| access(&path(relative), Operation::OpenRead, "success");
         let accesses = [
@@ -1270,6 +1315,12 @@ mod tests {
                 "success",
             ),
             access(&path("node_modules"), Operation::ListDirectory, "success"),
+            // Where an upstream glob may come to match.
+            access(
+                &path("libs/types/node_modules/@types"),
+                Operation::ListDirectory,
+                "success",
+            ),
             access(
                 &path("node_modules/foo"),
                 Operation::ListDirectory,
@@ -1312,6 +1363,8 @@ mod tests {
             set.listings,
             [
                 "libs/e2e/node_modules/.cache",
+                "libs/types/node_modules/@types",
+                "node_modules",
                 "node_modules/.gen",
                 "node_modules/.gen/app",
             ]
@@ -1343,8 +1396,20 @@ mod tests {
         let snapshot = Snapshot::new(&workspace, &graph, cache.path()).unwrap();
         std::fs::create_dir_all(root.join("node_modules/.gen/app")).unwrap();
         std::fs::write(root.join("node_modules/.gen/app/index.d.ts"), "").unwrap();
-        let key = || strong_key("weak", &set, &snapshot, &root, &NOTHING).unwrap();
+        let unlisted = Unlisted {
+            produced: Some(&produced),
+            ..NOTHING
+        };
+        let key = || strong_key("weak", &set, &snapshot, &root, &unlisted).unwrap();
         let generated = key();
+        // A package installed beside what was produced is the lockfile's.
+        std::fs::create_dir_all(root.join("node_modules/bar")).unwrap();
+        assert_eq!(key(), generated);
+        // What was produced coming and going is not.
+        std::fs::rename(root.join("node_modules/.gen"), root.join(".gen")).unwrap();
+        assert_ne!(key(), generated);
+        std::fs::rename(root.join(".gen"), root.join("node_modules/.gen")).unwrap();
+        assert_eq!(key(), generated);
         std::fs::remove_file(root.join("node_modules/.gen/app/index.d.ts")).unwrap();
         assert_ne!(key(), generated);
         std::fs::write(root.join("node_modules/.gen/app/index.d.ts"), "").unwrap();
@@ -1454,6 +1519,7 @@ mod tests {
             own: vec![&outputs],
             others: None,
             ignore: &IGNORE_NOTHING,
+            produced: None,
         };
         let strong = || strong_key("weak", &set, &snapshot, &root, &unlisted).unwrap();
         let first = strong();
@@ -1749,6 +1815,7 @@ mod tests {
             own: own.to_vec(),
             others: Some(Others::new(&outputs, BTreeSet::new(), &own)),
             ignore: &IGNORE_NOTHING,
+            produced: None,
         };
         let set = PathSet {
             listings: [".", "dist", "apps/web/coverage"].map(String::from).into(),
@@ -1772,6 +1839,20 @@ mod tests {
         // And another directory appearing beside them changes it.
         std::fs::create_dir(root.join("build")).unwrap();
         assert_ne!(key(), made);
+        // A source added beside its outputs while it ran is told, as in any
+        // directory it listed.
+        std::fs::create_dir_all(root.join("dist/apps")).unwrap();
+        let directories = unlisted.directories(".");
+        assert!(directories.contains("apps/web/coverage"));
+        let taken = Before::take(root, directories, &unlisted);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let started = now(root);
+        std::fs::write(root.join("apps/web/coverage/added.md"), "").unwrap();
+        assert_eq!(
+            set.changed_since(root, started, &unlisted, &taken)
+                .map(|changed| changed.path),
+            Some("apps/web/coverage")
+        );
     }
 
     #[test]
@@ -1841,6 +1922,7 @@ mod tests {
                 &[],
             )),
             ignore: &ignore,
+            produced: None,
         };
         assert_eq!(
             unlisted.directories("app"),

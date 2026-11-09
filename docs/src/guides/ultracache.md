@@ -57,8 +57,12 @@ a client generated into `node_modules/.prisma`, or when it lies below a
 directory in `node_modules` that such an output or an `includeIgnored`
 fileset of the task reads from. So do the directories between that directory
 and the `node_modules` holding it, where a task lists or looks for what was
-produced: `node_modules/.gen` for an output in `node_modules/.gen/app`. The
-lockfile does not key those. Which they are moves with what the targets the
+produced: `node_modules/.gen` for an output in `node_modules/.gen/app`. A
+listing of `node_modules` itself is kept too, but keys only those, never the
+packages installed beside them. A listing of a directory in `node_modules`
+below where an upstream output's glob starts, such as `libs/types` for
+`libs/types/**/*.d.ts`, keys all it holds, as anything there may come to
+match. The lockfile does not key those. Which they are moves with what the targets the
 task depends on declare, so those declarations are part of its weak key.
 
 A directory's listing leaves out the task's outputs and what it wrote there, which are there after

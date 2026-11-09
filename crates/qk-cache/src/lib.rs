@@ -754,16 +754,17 @@ impl Cache {
                     .ok()
             })
             .unwrap_or_default();
+        // What its recordings keep in node_modules, which its weak key holds.
+        let produced = settings
+            .as_ref()
+            .map(|_| produced(snapshot, workspace, graph, task));
         let unlisted = recorded::Unlisted {
             own: own.clone(),
             others,
             ignore: &ignore,
+            produced: produced.as_ref(),
         };
         let inputs = &keyed.as_ref().expect("a cacheable task is keyed").1;
-        // What its recordings keep in node_modules, which its weak key holds.
-        let mut produced = settings
-            .as_ref()
-            .map(|_| produced(snapshot, workspace, graph, task));
         // Why its recordings cannot key it, with its mode, where they cannot.
         let mut unkeyable = None;
         let mut recordings = settings.and_then(|settings| {
@@ -1056,7 +1057,7 @@ impl Cache {
                     prepared,
                     settings,
                     &own,
-                    produced.take().unwrap_or_default(),
+                    produced.as_ref(),
                 )
                 .and_then(|set| {
                     // Keyed by nothing, a recording would match any workspace.
@@ -1491,8 +1492,10 @@ impl Cache {
         prepared: &PreparedTask,
         settings: &ultracache::Settings,
         own: &[&paths::Outputs],
-        produced: recorded::Produced,
+        produced: Option<&recorded::Produced>,
     ) -> std::result::Result<recorded::PathSet, String> {
+        let nothing = recorded::Produced::default();
+        let produced = produced.unwrap_or(&nothing);
         let failed = |error: anyhow::Error| format!("{error:#}");
         let canonical = workspace
             .root
@@ -1512,9 +1515,10 @@ impl Cache {
                         }
                     }
                     !installed
-                        || relative
-                            .to_str()
-                            .is_some_and(|relative| produced.holds(&relative.replace('\\', "/")))
+                        || relative.to_str().is_some_and(|relative| {
+                            let relative = relative.replace('\\', "/");
+                            produced.holds(&relative) || produced.lists(&relative)
+                        })
                 })
             })
         };
@@ -2054,6 +2058,7 @@ mod tests {
             own: Vec::new(),
             others: Some(lint),
             ignore: &ultracache::IgnoredReads::none(),
+            produced: None,
         };
         let directories = unlisted.directories("lib");
         for directory in [".", ".cache", "app", "app/extra"] {
