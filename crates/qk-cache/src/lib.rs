@@ -739,11 +739,13 @@ impl Cache {
         // What its recordings' listings leave out, by the workspace's
         // configuration rather than what this run schedules, so that the
         // same recording keys the same in any run.
-        let others = settings.as_ref().map(|_| recorded::Others {
-            outputs: self
-                .workspace_outputs
-                .get_or_init(|| workspace_outputs(workspace)),
-            upstream: upstream(graph, task),
+        let others = settings.as_ref().map(|_| {
+            recorded::Others::new(
+                self.workspace_outputs
+                    .get_or_init(|| workspace_outputs(workspace)),
+                upstream(graph, task),
+                &own,
+            )
         });
         let ignore = settings
             .as_ref()
@@ -752,10 +754,15 @@ impl Cache {
                     .ok()
             })
             .unwrap_or_default();
+        // What its recordings keep in node_modules, which its weak key holds.
+        let produced = settings
+            .as_ref()
+            .map(|_| produced(snapshot, workspace, graph, task));
         let unlisted = recorded::Unlisted {
             own: own.clone(),
             others,
             ignore: &ignore,
+            produced: produced.as_ref(),
         };
         let inputs = &keyed.as_ref().expect("a cacheable task is keyed").1;
         // Why its recordings cannot key it, with its mode, where they cannot.
@@ -770,6 +777,7 @@ impl Cache {
                 inputs,
                 &settings.ignore_reads,
                 &ignore.scope(),
+                produced.as_ref().and_then(recorded::Produced::weak),
                 cancelled,
             );
             match weak {
@@ -1042,20 +1050,32 @@ impl Cache {
         });
         let path_set = match (&recordings, keying) {
             (Some((_, _, settings)), Some(recording)) => Some(
-                self.path_set(workspace, task, recording, prepared, settings, &own)
-                    .and_then(|set| {
-                        // Keyed by nothing, a recording would match any workspace.
-                        if set.is_empty() {
-                            return Err("its trace named no path in the workspace".to_owned());
-                        }
-                        match set
-                            .changed_since(&workspace.root, started, &unlisted, &listed)
-                            .map(|changed| changed.to_string())
-                        {
-                            Some(reason) => Err(reason),
-                            None => Ok(set),
-                        }
-                    }),
+                self.path_set(
+                    workspace,
+                    task,
+                    recording,
+                    prepared,
+                    settings,
+                    &own,
+                    produced.as_ref(),
+                )
+                .and_then(|set| {
+                    // Keyed by nothing, a recording would match any workspace.
+                    if set.is_empty() {
+                        return Err("its trace named no path in the workspace".to_owned());
+                    }
+                    // Nor may a path it read key the same whatever it held.
+                    if let Some(reason) = set.unkeyable(snapshot, &workspace.root) {
+                        return Err(reason);
+                    }
+                    match set
+                        .changed_since(&workspace.root, started, &unlisted, &listed)
+                        .map(|changed| changed.to_string())
+                    {
+                        Some(reason) => Err(reason),
+                        None => Ok(set),
+                    }
+                }),
             ),
             _ => None,
         };
@@ -1463,6 +1483,7 @@ impl Cache {
     }
 
     /// The path set of a task's recording, or why there is none.
+    #[allow(clippy::too_many_arguments)]
     fn path_set(
         &self,
         workspace: &Workspace,
@@ -1471,7 +1492,10 @@ impl Cache {
         prepared: &PreparedTask,
         settings: &ultracache::Settings,
         own: &[&paths::Outputs],
+        produced: Option<&recorded::Produced>,
     ) -> std::result::Result<recorded::PathSet, String> {
+        let nothing = recorded::Produced::default();
+        let produced = produced.unwrap_or(&nothing);
         let failed = |error: anyhow::Error| format!("{error:#}");
         let canonical = workspace
             .root
@@ -1479,15 +1503,22 @@ impl Cache {
             .map_err(|e| failed(e.into()))?;
         // Only what a path set can hold is kept and counted: a build reads
         // far more in node_modules and outside the workspace than in it.
-        let keep = |path: &std::path::Path| {
+        let keep = |path: &std::path::Path, operation: qk_input_analysis::Operation| {
             [&workspace.root, &canonical].iter().any(|root| {
                 path.strip_prefix(root).is_ok_and(|relative| {
-                    !relative.components().any(|component| {
-                        matches!(
-                            component.as_os_str().to_str(),
-                            Some("node_modules" | ".git")
-                        )
-                    })
+                    let mut installed = false;
+                    for component in relative.components() {
+                        match component.as_os_str().to_str() {
+                            Some(".git") => return false,
+                            Some("node_modules") => installed = true,
+                            _ => {}
+                        }
+                    }
+                    !installed
+                        || relative.to_str().is_some_and(|relative| {
+                            let relative = relative.replace('\\', "/");
+                            produced.traced(&relative, &operation)
+                        })
                 })
             })
         };
@@ -1514,6 +1545,7 @@ impl Cache {
             outputs: own,
             ignore,
             state,
+            produced,
         };
         Ok(recorded::PathSet::from_accesses(
             &accesses,
@@ -1698,6 +1730,40 @@ fn scratch_outputs(
         return None;
     }
     paths::Outputs::from_paths(&patterns).ok()
+}
+
+/// What `task`'s recordings keep in `node_modules`: the declared outputs of
+/// every task it depends on, those `--exclude-task-dependencies` left unrun
+/// among them, so that a recording keeps the same in any run, and where its
+/// `includeIgnored` filesets read.
+fn produced(
+    snapshot: &hash::Snapshot,
+    workspace: &Workspace,
+    graph: &TaskGraph,
+    task: &Task,
+) -> recorded::Produced {
+    let (upstream, declared): (Vec<_>, Vec<_>) = graph
+        .output_dependencies(task, true)
+        .iter()
+        .filter_map(|id| graph.keyed_task(id))
+        .filter_map(|dependency| {
+            let outputs = paths::Outputs::new(workspace, dependency)
+                .ok()
+                .filter(paths::Outputs::declared)?;
+            let (declared, _) = paths::resolved_outputs(workspace, dependency).ok()?;
+            Some((outputs, declared))
+        })
+        .unzip();
+    let include_ignored = snapshot
+        .include_ignored_roots(workspace, task)
+        .unwrap_or_else(|error| {
+            qk_executor::status!(
+                "qk: {}: includeIgnored inputs not kept in recordings ({error:#})",
+                task.id
+            );
+            Vec::new()
+        });
+    recorded::Produced::new(upstream, include_ignored).declared(declared)
 }
 
 /// The targets of every task `task` depends on, each with the configuration
@@ -1969,10 +2035,8 @@ mod tests {
         )
         .unwrap();
         let outputs = workspace_outputs(&workspace);
-        let others = |task: &str| recorded::Others {
-            outputs: &outputs,
-            upstream: upstream(&graph, &graph.tasks[task]),
-        };
+        let others =
+            |task: &str| recorded::Others::new(&outputs, upstream(&graph, &graph.tasks[task]), &[]);
         let lint = others("app:lint");
         assert!(lint.matches("app/dist/main.js"));
         assert!(lint.matches("app/dist-production/main.js"));
@@ -1994,6 +2058,7 @@ mod tests {
             own: Vec::new(),
             others: Some(lint),
             ignore: &ultracache::IgnoredReads::none(),
+            produced: None,
         };
         let directories = unlisted.directories("lib");
         for directory in [".", ".cache", "app", "app/extra"] {

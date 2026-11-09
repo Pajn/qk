@@ -883,6 +883,27 @@ impl Snapshot {
         Ok(paths)
     }
 
+    /// The directories a task's `includeIgnored` filesets read from, as
+    /// workspace-relative paths: each positive glob's leading literal
+    /// segments.
+    pub(crate) fn include_ignored_roots(
+        &self,
+        workspace: &Workspace,
+        task: &Task,
+    ) -> Result<Vec<String>> {
+        let empty = BTreeSet::new();
+        let cancelled = AtomicBool::new(false);
+        let mut resolver = Resolver::new(self, workspace, None, &cancelled, &empty);
+        resolver.task_inputs(task)?;
+        Ok(resolver
+            .ignored
+            .values()
+            .flatten()
+            .filter(|glob| !glob.starts_with('!'))
+            .map(|glob| crate::ignored::partition(glob.trim_end_matches('/')).0)
+            .collect())
+    }
+
     /// Reuse membership while source directories and listing policy are unchanged.
     /// Content changes are checked separately by the file digest cache.
     #[cfg(test)]
@@ -3085,7 +3106,8 @@ pub fn fingerprint(
 /// The key of a task keyed by its recordings, before its path set: `inputs`,
 /// the task's key, without its declared file inputs, which a path set
 /// replaces, but with its `"always": true` inputs, which count whatever it
-/// read, and with what `ignoreReads` leaves out of its path sets.
+/// read, and with what `ignoreReads` leaves out of its path sets and
+/// `produced`, what decides which paths in `node_modules` they keep.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn weak_key(
     snapshot: &Snapshot,
@@ -3096,6 +3118,7 @@ pub(crate) fn weak_key(
     inputs: &Value,
     ignore_reads: &[String],
     ignored_within: &[(&str, bool)],
+    produced: Option<Value>,
     cancelled: &AtomicBool,
 ) -> Result<String> {
     let mut weak = inputs.clone();
@@ -3129,7 +3152,10 @@ pub(crate) fn weak_key(
         "always".into(),
         json!({"files": always["files"], "values": always["values"], "dependencies": always["dependencies"]}),
     );
-    object.insert("schema".into(), json!("qk-weak-v1"));
+    // v2: path sets keep what upstream tasks write into `node_modules`. One
+    // recorded before left it out, and could key a task whose generated
+    // input had since changed.
+    object.insert("schema".into(), json!("qk-weak-v2"));
     object.insert("ignoreReads".into(), json!(ignore_reads));
     // What its `^` entries match moves with the project graph, the projects
     // depended on and those nested in them that are not, so a path set
@@ -3137,6 +3163,13 @@ pub(crate) fn weak_key(
     // them, so other weak keys stay as they were.
     if !ignored_within.is_empty() {
         object.insert("ignoredWithin".into(), json!(ignored_within));
+    }
+    // Which paths in `node_modules` its path sets keep moves with what the
+    // tasks it depends on declare as outputs, and its `includeIgnored`
+    // inputs: a path set recorded under others could leave out a file
+    // generated there, and so key nothing when it changes.
+    if let Some(produced) = produced {
+        object.insert("produced".into(), produced);
     }
     key(&weak)
 }

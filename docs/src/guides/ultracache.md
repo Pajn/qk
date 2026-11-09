@@ -49,14 +49,38 @@ before reading them, its
 [scratch directories](sandbox.md#scratch-directories-and-ignored-reads), and
 what its `ignoreReads` names, which the sandbox's audit leaves out too. A
 glob there starting with `^` names files in the projects the task's project
-depends on, so which projects those are is part of its weak key. A
-directory's listing leaves out the task's outputs and what it wrote there, which are there after
+depends on, so which projects those are is part of its weak key.
+
+Only installed packages are left out of `node_modules`. A path there stays
+when one of the targets the task depends on declares it as an output, such as
+a client generated into `node_modules/.prisma`, or when it lies below a
+directory in `node_modules` that such an output or an `includeIgnored`
+fileset of the task reads from. So do the directories between that directory
+and the `node_modules` holding it, where a task lists or looks for what was
+produced: `node_modules/.gen` for an output in `node_modules/.gen/app`. A
+listing of `node_modules` itself is kept too, but keys only those, never the
+packages installed beside them. A listing of a directory in `node_modules`
+below where an upstream output's glob starts, such as `libs/types` for
+`libs/types/**/*.d.ts`, keys all it holds, as anything there may come to
+match. The lockfile does not key those. Which they are moves with what the targets the
+task depends on declare, so those declarations are part of its weak key.
+
+A directory's listing leaves out the task's outputs and what it wrote there, which are there after
 it runs and need not be before, and the declared outputs of every other
 target in the workspace, which other tasks write whether or not this one
 reads them, with the directories between an output and its project's root,
 which hold it: `.cache` for an output in `.cache/build`. The outputs of the
 targets it depends on are its inputs, and stay in its listings. A directory
 listings leave out has nothing in them to key.
+
+The directories that hold the task's own outputs, such as `dist` and
+`dist/apps` for an output in `dist/apps/web`, key the same whether or not they
+exist. Whether they do before the task runs depends on the checkout, and on
+whether the sandbox made them for it, rather than on anything it read. They
+are left out of listings as its outputs are, and a listing of one keys what
+else it holds, which is nothing until something else is there. A project's
+root, a directory holding one, and a directory that also holds an output of a
+target it depends on are keyed as ever.
 
 ## Keying
 
@@ -65,7 +89,10 @@ inputs. It keeps the command, arguments, environment and runtime inputs,
 `externalDependencies`, the lockfile and what qk keys for every task, such
 as the nx.json settings and its project's configuration and `package.json`,
 and its inputs marked
-`"always": true`, which count whether it read them or not. Up to eight path
+`"always": true`, which count whether it read them or not. It also holds what
+decides which paths its path sets keep: its `ignoreReads`, the outputs the
+targets it depends on declare, and its `includeIgnored` directories in
+`node_modules`. Up to eight path
 sets are kept for a weak key, the newest first. A task that reads differently
 from run to run keeps a set for each way.
 
@@ -155,7 +182,9 @@ one, and a run that cannot record with it fails.
   it was created while the task ran, which a file system that keeps no
   creation time cannot tell. An entry another process removed there, or a
   subdirectory it moved in, cannot be told from the task's own writes, and
-  goes unnoticed.
+  goes unnoticed. Nor is a recording kept that names a file qk cannot key by
+  its content, such as one read through a linked directory or a link leading
+  out of the workspace: it would key the same whatever the file held.
 
 ## Sharing recordings
 
