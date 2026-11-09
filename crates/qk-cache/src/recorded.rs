@@ -1423,6 +1423,26 @@ mod tests {
         assert_ne!(listed(), before);
         std::fs::rename(root.join(".gen"), root.join("node_modules/.gen")).unwrap();
         assert_eq!(listed(), before);
+        // What it found and what it found missing there each key it alone.
+        let keyed = |set: &PathSet| strong_key("weak", set, &snapshot, &root, &unlisted).unwrap();
+        let found = PathSet {
+            present: set.present.clone(),
+            ..PathSet::default()
+        };
+        let before = keyed(&found);
+        std::fs::remove_file(root.join("node_modules/.gen/app/index.d.ts")).unwrap();
+        assert_ne!(keyed(&found), before);
+        std::fs::write(root.join("node_modules/.gen/app/index.d.ts"), "").unwrap();
+        assert_eq!(keyed(&found), before);
+        let missing = PathSet {
+            absent: set.absent.clone(),
+            ..PathSet::default()
+        };
+        let before = keyed(&missing);
+        std::fs::write(root.join("node_modules/.gen/app/extra.js"), "").unwrap();
+        assert_ne!(keyed(&missing), before);
+        std::fs::remove_file(root.join("node_modules/.gen/app/extra.js")).unwrap();
+        assert_eq!(keyed(&missing), before);
         std::fs::remove_file(root.join("node_modules/.gen/app/index.d.ts")).unwrap();
         assert_ne!(key(), generated);
         std::fs::write(root.join("node_modules/.gen/app/index.d.ts"), "").unwrap();
