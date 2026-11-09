@@ -4543,6 +4543,14 @@ fn warm_outputs_start_a_miss_from_the_previous_build() {
         text.contains("warm state restored from local: 1 file,"),
         "{text}"
     );
+    let restored = text
+        .split("; ")
+        .find(|part| part.contains("warm state restored from local"))
+        .unwrap();
+    assert!(
+        restored.contains(" MB in ") && !restored.contains("fetching"),
+        "{text}"
+    );
     assert!(text.contains("warm state saved in"), "{text}");
     // Local state wins over the saved one.
     fs::write(fixture.root.join("dist/state"), "local\n").unwrap();
@@ -4769,14 +4777,12 @@ fn warm_state_is_prefetched_for_a_target_that_asks() {
                 stderr(&output),
             )
         };
-        // Where the restore said the save came from.
-        let source = || {
+        let restored = || {
             let run: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
-            run["tasks"][0]["warm"]["restored"][0]["source"]
-                .as_str()
-                .unwrap_or_default()
-                .to_owned()
+            run["tasks"][0]["warm"]["restored"][0].clone()
         };
+        // Where the restore said the save came from.
+        let source = || restored()["source"].as_str().unwrap_or_default().to_owned();
         assert_eq!(run().0, "cold");
         // Another machine, with nothing of its own.
         clear_local_cache(&fixture);
@@ -4796,6 +4802,12 @@ fn warm_state_is_prefetched_for_a_target_that_asks() {
             "{profile}"
         );
         assert_eq!(source(), "remote main", "prefetch={prefetch} {profile}");
+        let entry = restored();
+        let (ms, fetched) = (entry["ms"].as_u64(), entry["fetchMs"].as_u64());
+        assert!(
+            ms.zip(fetched).is_some_and(|(ms, fetched)| fetched <= ms),
+            "prefetch={prefetch} {entry}"
+        );
         // With its paths on disk, nothing is fetched ahead.
         let (said, profile) = run();
         assert_eq!(said, "saved");

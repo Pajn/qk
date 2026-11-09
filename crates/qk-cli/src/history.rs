@@ -505,8 +505,15 @@ pub fn warm_line(warm: &serde_json::Value) -> Option<String> {
             .and_then(serde_json::Value::as_str)
             .map(|group| format!(" for group {group}"))
             .unwrap_or_default();
+        let took = match (number("ms"), number("fetchMs")) {
+            (Some(ms), Some(fetched)) => {
+                format!(" in {}, fetching {}", seconds(ms), seconds(fetched))
+            }
+            (Some(ms), None) => format!(" in {}", seconds(ms)),
+            (None, _) => String::new(),
+        };
         parts.push(format!(
-            "warm state{group} restored from {}: {files} file{}, {:.1} MB",
+            "warm state{group} restored from {}: {files} file{}, {:.1} MB{took}",
             restored
                 .get("source")
                 .and_then(serde_json::Value::as_str)
