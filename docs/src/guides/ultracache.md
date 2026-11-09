@@ -65,12 +65,14 @@ which hold it: `.cache` for an output in `.cache/build`. The outputs of the
 targets it depends on are its inputs, and stay in its listings. A directory
 listings leave out has nothing in them to key.
 
-The directories that only hold the task's own outputs are left out of its
-path sets altogether, as its outputs are: `dist` and `dist/apps` for an
-output in `dist/apps/web`. Whether they exist before the task runs depends on
-the checkout, and on whether the sandbox made them for it, rather than on
-anything it read. A project's root, a directory holding one, and a directory
-that also holds an output of a target it depends on stay keyed.
+The directories that hold the task's own outputs, such as `dist` and
+`dist/apps` for an output in `dist/apps/web`, key the same whether or not they
+exist. Whether they do before the task runs depends on the checkout, and on
+whether the sandbox made them for it, rather than on anything it read. They
+are left out of listings as its outputs are, and a listing of one keys what
+else it holds, which is nothing until something else is there. A project's
+root, a directory holding one, and a directory that also holds an output of a
+target it depends on are keyed as ever.
 
 ## Keying
 

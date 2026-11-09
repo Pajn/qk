@@ -1051,11 +1051,6 @@ impl Cache {
                     prepared,
                     settings,
                     &own,
-                    unlisted
-                        .others
-                        .as_ref()
-                        .map(|others| others.own_folders.clone())
-                        .unwrap_or_default(),
                     produced(snapshot, workspace, graph, task),
                 )
                 .and_then(|set| {
@@ -1487,7 +1482,6 @@ impl Cache {
         prepared: &PreparedTask,
         settings: &ultracache::Settings,
         own: &[&paths::Outputs],
-        own_folders: std::collections::BTreeSet<String>,
         produced: recorded::Produced,
     ) -> std::result::Result<recorded::PathSet, String> {
         let failed = |error: anyhow::Error| format!("{error:#}");
@@ -1536,7 +1530,6 @@ impl Cache {
         let exclusions = recorded::Exclusions {
             roots: [&workspace.root, &canonical],
             outputs: own,
-            own_folders,
             ignore,
             state,
             produced,

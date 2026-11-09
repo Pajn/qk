@@ -320,7 +320,7 @@ fn a_file_a_dependency_writes_into_node_modules_stays_in_recordings() {
 /// a fresh checkout does not. A recording made under the sandbox's audit
 /// keys a run without one all the same.
 #[test]
-fn the_directory_holding_its_outputs_keys_nothing() {
+fn the_directory_holding_its_outputs_keys_the_same_made_or_not() {
     if !has_strace() {
         return;
     }

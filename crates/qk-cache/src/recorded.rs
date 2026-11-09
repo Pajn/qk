@@ -10,8 +10,8 @@
 //! where the task found nothing changes its existence.
 //!
 //! Paths outside the workspace, `node_modules`, `.git`, qk's own state, the
-//! task's outputs and warm paths, the directories that only hold them, files
-//! it wrote before reading them and its `ignoreReads` are left out. What lies in `node_modules` without being
+//! task's outputs and warm paths, files it wrote before reading them and its
+//! `ignoreReads` are left out. What lies in `node_modules` without being
 //! installed there stays: see [`Produced`].
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -116,9 +116,6 @@ pub struct Exclusions<'a> {
     pub roots: [&'a Path; 2],
     /// The task's outputs and warm paths.
     pub outputs: &'a [&'a Outputs],
-    /// The directories that only hold them: whether one exists, and what it
-    /// lists, depend on whether they were made before the task ran.
-    pub own_folders: BTreeSet<String>,
     /// `ignoreReads`.
     pub ignore: crate::ultracache::IgnoredReads,
     /// qk's own directories inside the workspace, relative to it.
@@ -198,7 +195,6 @@ impl Exclusions<'_> {
                         .is_some_and(|rest| rest.starts_with('/'))
             })
             || self.outputs.iter().any(|outputs| outputs.matches(path))
-            || self.own_folders.contains(path)
             || self.ignore.is_match(path)
     }
 }
@@ -475,15 +471,34 @@ impl PathSet {
             .iter()
             .map(|path| (path.clone(), value(path)))
             .collect();
+        // A directory that only holds the task's outputs is there once they
+        // are, or once a sandbox made it for them: made or not, it keys the
+        // same, and lists only what else it holds.
+        let absent = json!("absent");
         let mut listings = Map::new();
         for directory in &self.listings {
-            listings.insert(directory.clone(), self.listing(root, directory, unlisted)?);
+            let listing = match self.listing(root, directory, unlisted)? {
+                listing if listing == absent && unlisted.own_folder(directory) => json!({}),
+                listing => listing,
+            };
+            listings.insert(directory.clone(), listing);
         }
         let existence: Map<String, Value> = self
             .present
             .iter()
             .chain(&self.absent)
-            .map(|path| (path.clone(), value(path)))
+            .map(|path| {
+                let value = match value(path) {
+                    value
+                        if unlisted.own_folder(path)
+                            && (value == absent || value == json!("directory")) =>
+                    {
+                        json!("folder")
+                    }
+                    value => value,
+                };
+                (path.clone(), value)
+            })
             .collect();
         Ok(json!({"reads": reads, "listings": listings, "existence": existence}))
     }
@@ -824,11 +839,14 @@ impl Unlisted<'_> {
     /// Whether `path` is the task's own output, or a directory that only
     /// holds its outputs.
     fn own(&self, path: &str) -> bool {
-        self.own.iter().any(|outputs| outputs.matches(path))
-            || self
-                .others
-                .as_ref()
-                .is_some_and(|others| others.own_folder(path))
+        self.own.iter().any(|outputs| outputs.matches(path)) || self.own_folder(path)
+    }
+
+    /// Whether `path` is a directory that only holds the task's outputs.
+    fn own_folder(&self, path: &str) -> bool {
+        self.others
+            .as_ref()
+            .is_some_and(|others| others.own_folder(path))
     }
 
     /// Where other targets' outputs and ignored paths come and go while the
@@ -1101,7 +1119,6 @@ mod tests {
         let exclusions = Exclusions {
             roots: [&root, &root],
             outputs: &[&outputs],
-            own_folders: BTreeSet::new(),
             ignore: IgnoredReads::of_globs(&["src/*.log".to_owned()]).unwrap(),
             state: vec![".qk".into()],
             produced: Produced::default(),
@@ -1176,7 +1193,6 @@ mod tests {
         let exclusions = Exclusions {
             roots: [&root, &root],
             outputs: &[],
-            own_folders: BTreeSet::new(),
             ignore: IgnoredReads::none(),
             state: Vec::new(),
             produced,
@@ -1476,7 +1492,7 @@ mod tests {
     /// they are, or when a sandbox made them before it ran, and not before:
     /// a lookup on a fresh checkout keys them as a run after the task does.
     #[test]
-    fn directories_only_holding_its_own_outputs_key_nothing() {
+    fn directories_only_holding_its_own_outputs_key_the_same_made_or_not() {
         let roots = [
             ("web".to_owned(), "apps/web".to_owned()),
             ("ui".to_owned(), "libs/ui".to_owned()),
@@ -1533,43 +1549,35 @@ mod tests {
             &[qk_taskgraph::Request::parse("app:build").unwrap()],
         )
         .unwrap();
-        let snapshot = Snapshot::new(&workspace, &graph, &root.join("cache")).unwrap();
-        let own = [&build];
-        let others = Others::new(&outputs, BTreeSet::new(), &own);
-        let own_folders = others.own_folders.clone();
+        // Its cache apart, as the root is listed.
+        let cache = tempfile::tempdir().unwrap();
+        let snapshot = Snapshot::new(&workspace, &graph, cache.path()).unwrap();
+        let own = [&build, &coverage];
         let unlisted = Unlisted {
             own: own.to_vec(),
-            others: Some(others),
+            others: Some(Others::new(&outputs, BTreeSet::new(), &own)),
             ignore: &IGNORE_NOTHING,
         };
-        // Recorded where a sandbox had made them, they are left out.
-        std::fs::create_dir_all(root.join("dist/apps")).unwrap();
-        let path = |relative: &str| root.join(relative).to_str().unwrap().to_owned();
-        let exclusions = Exclusions {
-            roots: [root, root],
-            outputs: &own,
-            own_folders,
-            ignore: IgnoredReads::none(),
-            state: Vec::new(),
-            produced: Produced::default(),
+        let set = PathSet {
+            listings: [".", "dist", "apps/web/coverage"].map(String::from).into(),
+            present: ["dist/apps".to_owned()].into(),
+            ..PathSet::default()
         };
-        let set = PathSet::from_accesses(
-            &[
-                access(&path("."), Operation::ListDirectory, "success"),
-                access(&path("dist"), Operation::ListDirectory, "success"),
-                access(&path("dist/apps"), Operation::Metadata, "success"),
-            ],
-            &exclusions,
-            root,
-        );
-        assert_eq!(set.listings, [".".to_owned()].into());
-        assert!(set.present.is_empty());
-        // And the workspace's listing keys the same without them.
         let key = || strong_key("weak", &set, &snapshot, root, &unlisted).unwrap();
+        // Made before it ran, as the sandbox makes them, or not.
+        std::fs::create_dir_all(root.join("dist/apps")).unwrap();
+        std::fs::create_dir_all(root.join("apps/web/coverage")).unwrap();
         let made = key();
         std::fs::remove_dir_all(root.join("dist")).unwrap();
+        std::fs::remove_dir(root.join("apps/web/coverage")).unwrap();
         assert_eq!(key(), made);
-        // Another directory appearing still changes it.
+        // What else such a directory holds is still listed.
+        std::fs::create_dir(root.join("apps/web/coverage")).unwrap();
+        assert_eq!(key(), made);
+        std::fs::write(root.join("apps/web/coverage/README.md"), "").unwrap();
+        assert_ne!(key(), made);
+        std::fs::remove_file(root.join("apps/web/coverage/README.md")).unwrap();
+        // And another directory appearing beside them changes it.
         std::fs::create_dir(root.join("build")).unwrap();
         assert_ne!(key(), made);
     }

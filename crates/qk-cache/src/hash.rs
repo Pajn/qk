@@ -3152,8 +3152,7 @@ pub(crate) fn weak_key(
     );
     // v2: path sets keep what upstream tasks write into `node_modules`. One
     // recorded before left it out, and could key a task whose generated
-    // input had since changed. Path sets also leave out the directories that
-    // only hold the task's outputs, which one recorded before could key.
+    // input had since changed.
     object.insert("schema".into(), json!("qk-weak-v2"));
     object.insert("ignoreReads".into(), json!(ignore_reads));
     // What its `^` entries match moves with the project graph, the projects
