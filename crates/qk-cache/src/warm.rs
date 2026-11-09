@@ -865,8 +865,9 @@ pub struct Restored {
     /// entry's lock included.
     #[serde(default)]
     pub ms: u64,
-    /// Of `ms`, how long getting the save from the remote took, waiting for
-    /// a fetch started ahead included; absent when no fetch was waited for.
+    /// Of `ms`, how long it waited on the remote store, for a fetch started
+    /// ahead or one of its own, even when the save it restored came from
+    /// this machine instead; absent when it did not ask the remote.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fetch_ms: Option<u64>,
 }

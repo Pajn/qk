@@ -4548,7 +4548,7 @@ fn warm_outputs_start_a_miss_from_the_previous_build() {
         .find(|part| part.contains("warm state restored from local"))
         .unwrap();
     assert!(
-        restored.contains(" MB in ") && !restored.contains("fetching"),
+        restored.contains(" MB in ") && !restored.contains("remote"),
         "{text}"
     );
     assert!(text.contains("warm state saved in"), "{text}");
@@ -4787,7 +4787,10 @@ fn warm_state_is_prefetched_for_a_target_that_asks() {
         // Another machine, with nothing of its own.
         clear_local_cache(&fixture);
         fs::remove_dir_all(fixture.root.join(".git/qk/warm")).unwrap();
+        let latency = std::time::Duration::from_millis(100);
+        server.state.lock().unwrap().latency = latency;
         let (said, profile) = run();
+        server.state.lock().unwrap().latency = std::time::Duration::ZERO;
         assert_eq!(said, "saved", "{profile}");
         assert_eq!(
             profile.contains("stage=warm_prefetch "),
@@ -4808,6 +4811,14 @@ fn warm_state_is_prefetched_for_a_target_that_asks() {
             ms.zip(fetched).is_some_and(|(ms, fetched)| fetched <= ms),
             "prefetch={prefetch} {entry}"
         );
+        // Fetching ahead may finish before the restore asks; its own fetch
+        // waits for at least one response.
+        if !prefetch {
+            assert!(
+                fetched.is_some_and(|fetched| fetched >= latency.as_millis() as u64),
+                "{entry}"
+            );
+        }
         // With its paths on disk, nothing is fetched ahead.
         let (said, profile) = run();
         assert_eq!(said, "saved");

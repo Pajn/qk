@@ -507,7 +507,11 @@ pub fn warm_line(warm: &serde_json::Value) -> Option<String> {
             .unwrap_or_default();
         let took = match (number("ms"), number("fetchMs")) {
             (Some(ms), Some(fetched)) => {
-                format!(" in {}, fetching {}", seconds(ms), seconds(fetched))
+                format!(
+                    " in {}, {} of it waiting on the remote",
+                    seconds(ms),
+                    seconds(fetched)
+                )
             }
             (Some(ms), None) => format!(" in {}", seconds(ms)),
             (None, _) => String::new(),
