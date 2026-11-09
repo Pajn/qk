@@ -1432,6 +1432,66 @@ fn show_target_includes_qk_fields() {
     assert_eq!(target["qk:threads"], json!({"max": 2}), "{target}");
 }
 
+/// `show target` reports each direct continuous dependency, as Nx 24.0.3
+/// does: whether its inputs are hashed and whether the task waits for it.
+#[test]
+fn show_target_reports_continuous_dependencies() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    std::fs::write(root.join("nx.json"), "{}").unwrap();
+    let write = |inputs: Value| {
+        std::fs::write(
+            root.join("project.json"),
+            json!({"name":"app","targets":{
+                "serve":{"command":"true","continuous":true},
+                "build":{"command":"true"},
+                "e2e":{"command":"true","dependsOn":[
+                    {"target":"serve","waitFor":"ready","inputs":inputs},
+                    "build"
+                ]},
+                "dev":{"command":"true","dependsOn":[
+                    {"target":"serve","waitFor":"started"}
+                ]},
+                "watch":{"command":"true","dependsOn":["serve"]},
+                "check":{"command":"true","dependsOn":["build"]},
+                "verify":{"command":"true","dependsOn":["e2e"]}
+            }})
+            .to_string(),
+        )
+        .unwrap();
+    };
+    let target = |name: &str| {
+        successful_json(
+            isolated_command(env!("CARGO_BIN_EXE_qk"))
+                .current_dir(root)
+                .args(["show", "target", &format!("app:{name}"), "--json"])
+                .output()
+                .unwrap(),
+        )
+    };
+    write(json!(true));
+    assert_eq!(
+        target("e2e")["continuousDependencies"],
+        json!({"app:serve": {"inputsHashed": true, "waitsForReady": true}})
+    );
+    write(json!(false));
+    assert_eq!(
+        target("e2e")["continuousDependencies"],
+        json!({"app:serve": {"inputsHashed": false, "waitsForReady": true}})
+    );
+    for name in ["dev", "watch"] {
+        assert_eq!(
+            target(name)["continuousDependencies"],
+            json!({"app:serve": {"inputsHashed": true, "waitsForReady": false}}),
+            "{name}"
+        );
+    }
+    assert_eq!(target("check")["continuousDependencies"], json!({}));
+    // Only direct dependencies count: verify reaches serve through e2e.
+    assert_eq!(target("verify")["continuousDependencies"], json!({}));
+    assert!(target("build").get("continuousDependencies").is_none());
+}
+
 /// `show target` shows a target's `readyWhen` with the timeout it gets, as
 /// Nx 24 does: one spreading a target default's keeps its check.
 #[test]
