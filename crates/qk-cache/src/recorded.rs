@@ -128,13 +128,17 @@ pub struct Exclusions<'a> {
 /// keeps: what the tasks a task depends on declare as their outputs, such as
 /// a client generated into `node_modules/.prisma`, and what lies below a
 /// directory in `node_modules` that an upstream output or an
-/// `includeIgnored` fileset reads from. Everything else there is installed.
+/// `includeIgnored` fileset reads from, with the directories between such a
+/// directory and the `node_modules` holding it, where a task looks for what
+/// was produced. Everything else there is installed.
 #[derive(Default)]
 pub struct Produced {
     /// The declared outputs of the tasks the task depends on.
     pub upstream: Vec<Outputs>,
     /// Directories naming a `node_modules` directory, workspace-relative.
     pub roots: Vec<String>,
+    /// The outputs of the tasks it depends on as they declare them, sorted.
+    pub declared: Vec<Vec<String>>,
 }
 
 impl Produced {
@@ -150,23 +154,47 @@ impl Produced {
             .collect();
         roots.sort_unstable();
         roots.dedup();
-        Self { upstream, roots }
+        Self {
+            upstream,
+            roots,
+            declared: Vec::new(),
+        }
     }
 
-    /// Whether `path`, workspace-relative, is produced rather than installed.
+    /// With the upstream outputs as declared, which [`Self::weak`] keys.
+    pub fn declared(mut self, mut declared: Vec<Vec<String>>) -> Self {
+        declared.sort_unstable();
+        self.declared = declared;
+        self
+    }
+
+    /// Whether `path`, workspace-relative, is produced rather than installed,
+    /// or a directory in `node_modules` holding what is.
     pub fn holds(&self, path: &str) -> bool {
         self.roots.iter().any(|root| {
-            path == root
-                || path
-                    .strip_prefix(root.as_str())
-                    .is_some_and(|rest| rest.starts_with('/'))
+            path == root || under(path, root) || (under(root, path) && inside_node_modules(path))
         }) || self.upstream.iter().any(|outputs| outputs.matches(path))
+    }
+
+    /// What decides which paths in `node_modules` a recording keeps, for
+    /// the weak key: a path set recorded under other declarations could
+    /// leave out what this task's would key. `None` where nothing does.
+    pub fn weak(&self) -> Option<Value> {
+        (!self.roots.is_empty() || !self.declared.is_empty())
+            .then(|| json!({"roots": self.roots, "upstream": self.declared}))
     }
 }
 
 /// Whether `path` has a `node_modules` component.
 pub fn in_node_modules(path: &str) -> bool {
     path.split('/').any(|part| part == "node_modules")
+}
+
+/// Whether `path` lies inside a `node_modules` directory, rather than only
+/// naming one.
+fn inside_node_modules(path: &str) -> bool {
+    path.rsplit_once('/')
+        .is_some_and(|(directory, _)| in_node_modules(directory))
 }
 
 impl Exclusions<'_> {
@@ -453,6 +481,23 @@ impl PathSet {
     /// How the set's paths are now: each read file's content, each listed
     /// directory's entries and each looked-up path's kind. `outputs` are the
     /// task's own, left out of listings.
+    /// Why a file it names cannot be keyed by its content, as one read
+    /// through a linked directory, or a link leading out of the workspace,
+    /// cannot: [`Self::values`] would key it the same whatever it held.
+    pub(crate) fn unkeyable(&self, snapshot: &Snapshot, root: &Path) -> Option<String> {
+        self.reads
+            .iter()
+            .chain(&self.present)
+            .chain(&self.absent)
+            .find_map(|path| match kind(&root.join(path)) {
+                "file" | "symlink" => snapshot
+                    .recorded_value(root, path)
+                    .err()
+                    .map(|error| format!("{path} cannot be keyed by its content ({error:#})")),
+                _ => None,
+            })
+    }
+
     pub(crate) fn values(
         &self,
         snapshot: &Snapshot,
@@ -1212,6 +1257,44 @@ mod tests {
             read("libs/types/node_modules/x/index.js"),
             read("libs/e2e/node_modules/.cache/fixtures/a.json"),
             read("libs/e2e/node_modules/foo/index.js"),
+            // Where it looks for what was produced, but not among what is
+            // installed.
+            access(
+                &path("node_modules/.gen"),
+                Operation::ListDirectory,
+                "success",
+            ),
+            access(
+                &path("libs/e2e/node_modules/.cache"),
+                Operation::ListDirectory,
+                "success",
+            ),
+            access(&path("node_modules"), Operation::ListDirectory, "success"),
+            access(
+                &path("node_modules/foo"),
+                Operation::ListDirectory,
+                "success",
+            ),
+            access(
+                &path("node_modules/.gen/app/index.d.ts"),
+                Operation::Metadata,
+                "success",
+            ),
+            access(
+                &path("node_modules/.gen/app/extra.js"),
+                Operation::Metadata,
+                "missing",
+            ),
+            access(
+                &path("node_modules/foo/package.json"),
+                Operation::Metadata,
+                "success",
+            ),
+            access(
+                &path("node_modules/foo/extra.js"),
+                Operation::Metadata,
+                "missing",
+            ),
         ];
         let set = PathSet::from_accesses(&accesses, &exclusions, &root);
         assert_eq!(
@@ -1225,7 +1308,116 @@ mod tests {
             .map(String::from)
             .into()
         );
-        assert_eq!(set.listings, ["node_modules/.gen/app".into()].into());
+        assert_eq!(
+            set.listings,
+            [
+                "libs/e2e/node_modules/.cache",
+                "node_modules/.gen",
+                "node_modules/.gen/app",
+            ]
+            .map(String::from)
+            .into()
+        );
+        assert_eq!(
+            set.present,
+            ["node_modules/.gen/app/index.d.ts".to_owned()].into()
+        );
+        assert_eq!(
+            set.absent,
+            ["node_modules/.gen/app/extra.js".to_owned()].into()
+        );
+        // And what it looked up there keys it.
+        std::fs::write(root.join("nx.json"), "{}").unwrap();
+        std::fs::write(
+            root.join("project.json"),
+            r#"{"name":"app","targets":{"build":{"command":"true"}}}"#,
+        )
+        .unwrap();
+        let workspace = qk_config::Workspace::load(&root).unwrap();
+        let graph = qk_taskgraph::TaskGraph::build(
+            &workspace,
+            &[qk_taskgraph::Request::parse("app:build").unwrap()],
+        )
+        .unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let snapshot = Snapshot::new(&workspace, &graph, cache.path()).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/.gen/app")).unwrap();
+        std::fs::write(root.join("node_modules/.gen/app/index.d.ts"), "").unwrap();
+        let key = || strong_key("weak", &set, &snapshot, &root, &NOTHING).unwrap();
+        let generated = key();
+        std::fs::remove_file(root.join("node_modules/.gen/app/index.d.ts")).unwrap();
+        assert_ne!(key(), generated);
+        std::fs::write(root.join("node_modules/.gen/app/index.d.ts"), "").unwrap();
+        assert_eq!(key(), generated);
+        std::fs::write(root.join("node_modules/.gen/app/extra.js"), "").unwrap();
+        assert_ne!(key(), generated);
+    }
+
+    /// What decides which paths in node_modules a recording keeps is keyed
+    /// however the dependencies come, and not at all where nothing does.
+    #[test]
+    fn what_keeps_paths_in_node_modules_is_keyed_once() {
+        assert_eq!(Produced::default().weak(), None);
+        let produced = |declared: &[&[&str]]| {
+            Produced::default()
+                .declared(
+                    declared
+                        .iter()
+                        .map(|outputs| outputs.iter().map(|output| (*output).to_owned()).collect())
+                        .collect(),
+                )
+                .weak()
+        };
+        let both = produced(&[&["dist/lib"], &["node_modules/.gen/app"]]);
+        assert!(both.is_some());
+        assert_eq!(produced(&[&["node_modules/.gen/app"], &["dist/lib"]]), both);
+        assert_ne!(produced(&[&["dist/lib"]]), both);
+    }
+
+    /// A file read through a linked directory cannot be keyed by its
+    /// content, so a recording naming one keys nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_read_through_a_linked_directory_is_unkeyable() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("nx.json"), "{}").unwrap();
+        std::fs::write(
+            root.join("project.json"),
+            r#"{"name":"app","targets":{"build":{"command":"true"}}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir(root.join("package")).unwrap();
+        std::fs::write(root.join("package/index.js"), "").unwrap();
+        std::os::unix::fs::symlink("package", root.join("linked")).unwrap();
+        let workspace = qk_config::Workspace::load(&root).unwrap();
+        let graph = qk_taskgraph::TaskGraph::build(
+            &workspace,
+            &[qk_taskgraph::Request::parse("app:build").unwrap()],
+        )
+        .unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let snapshot = Snapshot::new(&workspace, &graph, cache.path()).unwrap();
+        let reading = |path: &str| PathSet {
+            reads: [path.to_owned()].into(),
+            ..PathSet::default()
+        };
+        assert_eq!(
+            reading("package/index.js").unkeyable(&snapshot, &root),
+            None
+        );
+        let linked = reading("linked/index.js").unkeyable(&snapshot, &root);
+        assert!(
+            linked
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("linked/index.js cannot be keyed")),
+            "{linked:?}"
+        );
+        // A path it found absent is keyed as such.
+        assert_eq!(
+            reading("linked/missing.js").unkeyable(&snapshot, &root),
+            None
+        );
     }
 
     #[test]

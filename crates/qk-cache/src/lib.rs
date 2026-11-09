@@ -760,6 +760,10 @@ impl Cache {
             ignore: &ignore,
         };
         let inputs = &keyed.as_ref().expect("a cacheable task is keyed").1;
+        // What its recordings keep in node_modules, which its weak key holds.
+        let mut produced = settings
+            .as_ref()
+            .map(|_| produced(snapshot, workspace, graph, task));
         // Why its recordings cannot key it, with its mode, where they cannot.
         let mut unkeyable = None;
         let mut recordings = settings.and_then(|settings| {
@@ -772,6 +776,7 @@ impl Cache {
                 inputs,
                 &settings.ignore_reads,
                 &ignore.scope(),
+                produced.as_ref().and_then(recorded::Produced::weak),
                 cancelled,
             );
             match weak {
@@ -1051,12 +1056,16 @@ impl Cache {
                     prepared,
                     settings,
                     &own,
-                    produced(snapshot, workspace, graph, task),
+                    produced.take().unwrap_or_default(),
                 )
                 .and_then(|set| {
                     // Keyed by nothing, a recording would match any workspace.
                     if set.is_empty() {
                         return Err("its trace named no path in the workspace".to_owned());
+                    }
+                    // Nor may a path it read key the same whatever it held.
+                    if let Some(reason) = set.unkeyable(snapshot, &workspace.root) {
+                        return Err(reason);
                     }
                     match set
                         .changed_since(&workspace.root, started, &unlisted, &listed)
@@ -1729,16 +1738,18 @@ fn produced(
     graph: &TaskGraph,
     task: &Task,
 ) -> recorded::Produced {
-    let upstream = graph
+    let (upstream, declared): (Vec<_>, Vec<_>) = graph
         .output_dependencies(task, true)
         .iter()
         .filter_map(|id| graph.keyed_task(id))
         .filter_map(|dependency| {
-            paths::Outputs::new(workspace, dependency)
+            let outputs = paths::Outputs::new(workspace, dependency)
                 .ok()
-                .filter(paths::Outputs::declared)
+                .filter(paths::Outputs::declared)?;
+            let (declared, _) = paths::resolved_outputs(workspace, dependency).ok()?;
+            Some((outputs, declared))
         })
-        .collect();
+        .unzip();
     let include_ignored = snapshot
         .include_ignored_roots(workspace, task)
         .unwrap_or_else(|error| {
@@ -1748,7 +1759,7 @@ fn produced(
             );
             Vec::new()
         });
-    recorded::Produced::new(upstream, include_ignored)
+    recorded::Produced::new(upstream, include_ignored).declared(declared)
 }
 
 /// The targets of every task `task` depends on, each with the configuration

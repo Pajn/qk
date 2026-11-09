@@ -3106,7 +3106,8 @@ pub fn fingerprint(
 /// The key of a task keyed by its recordings, before its path set: `inputs`,
 /// the task's key, without its declared file inputs, which a path set
 /// replaces, but with its `"always": true` inputs, which count whatever it
-/// read, and with what `ignoreReads` leaves out of its path sets.
+/// read, and with what `ignoreReads` leaves out of its path sets and
+/// `produced`, what decides which paths in `node_modules` they keep.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn weak_key(
     snapshot: &Snapshot,
@@ -3117,6 +3118,7 @@ pub(crate) fn weak_key(
     inputs: &Value,
     ignore_reads: &[String],
     ignored_within: &[(&str, bool)],
+    produced: Option<Value>,
     cancelled: &AtomicBool,
 ) -> Result<String> {
     let mut weak = inputs.clone();
@@ -3161,6 +3163,13 @@ pub(crate) fn weak_key(
     // them, so other weak keys stay as they were.
     if !ignored_within.is_empty() {
         object.insert("ignoredWithin".into(), json!(ignored_within));
+    }
+    // Which paths in `node_modules` its path sets keep moves with what the
+    // tasks it depends on declare as outputs, and its `includeIgnored`
+    // inputs: a path set recorded under others could leave out a file
+    // generated there, and so key nothing when it changes.
+    if let Some(produced) = produced {
+        object.insert("produced".into(), produced);
     }
     key(&weak)
 }

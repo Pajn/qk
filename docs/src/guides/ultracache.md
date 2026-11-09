@@ -55,7 +55,11 @@ Only installed packages are left out of `node_modules`. A path there stays
 when one of the targets the task depends on declares it as an output, such as
 a client generated into `node_modules/.prisma`, or when it lies below a
 directory in `node_modules` that such an output or an `includeIgnored`
-fileset of the task reads from. The lockfile does not key those.
+fileset of the task reads from. So do the directories between that directory
+and the `node_modules` holding it, where a task lists or looks for what was
+produced: `node_modules/.gen` for an output in `node_modules/.gen/app`. The
+lockfile does not key those. Which they are moves with what the targets the
+task depends on declare, so those declarations are part of its weak key.
 
 A directory's listing leaves out the task's outputs and what it wrote there, which are there after
 it runs and need not be before, and the declared outputs of every other
@@ -81,7 +85,10 @@ inputs. It keeps the command, arguments, environment and runtime inputs,
 `externalDependencies`, the lockfile and what qk keys for every task, such
 as the nx.json settings and its project's configuration and `package.json`,
 and its inputs marked
-`"always": true`, which count whether it read them or not. Up to eight path
+`"always": true`, which count whether it read them or not. It also holds what
+decides which paths its path sets keep: its `ignoreReads`, the outputs the
+targets it depends on declare, and its `includeIgnored` directories in
+`node_modules`. Up to eight path
 sets are kept for a weak key, the newest first. A task that reads differently
 from run to run keeps a set for each way.
 
@@ -171,7 +178,9 @@ one, and a run that cannot record with it fails.
   it was created while the task ran, which a file system that keeps no
   creation time cannot tell. An entry another process removed there, or a
   subdirectory it moved in, cannot be told from the task's own writes, and
-  goes unnoticed.
+  goes unnoticed. Nor is a recording kept that names a file qk cannot key by
+  its content, such as one read through a linked directory or a link leading
+  out of the workspace: it would key the same whatever the file held.
 
 ## Sharing recordings
 
