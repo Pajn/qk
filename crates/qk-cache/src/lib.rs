@@ -739,11 +739,13 @@ impl Cache {
         // What its recordings' listings leave out, by the workspace's
         // configuration rather than what this run schedules, so that the
         // same recording keys the same in any run.
-        let others = settings.as_ref().map(|_| recorded::Others {
-            outputs: self
-                .workspace_outputs
-                .get_or_init(|| workspace_outputs(workspace)),
-            upstream: upstream(graph, task),
+        let others = settings.as_ref().map(|_| {
+            recorded::Others::new(
+                self.workspace_outputs
+                    .get_or_init(|| workspace_outputs(workspace)),
+                upstream(graph, task),
+                &own,
+            )
         });
         let ignore = settings
             .as_ref()
@@ -1049,6 +1051,11 @@ impl Cache {
                     prepared,
                     settings,
                     &own,
+                    unlisted
+                        .others
+                        .as_ref()
+                        .map(|others| others.own_folders.clone())
+                        .unwrap_or_default(),
                     produced(snapshot, workspace, graph, task),
                 )
                 .and_then(|set| {
@@ -1480,6 +1487,7 @@ impl Cache {
         prepared: &PreparedTask,
         settings: &ultracache::Settings,
         own: &[&paths::Outputs],
+        own_folders: std::collections::BTreeSet<String>,
         produced: recorded::Produced,
     ) -> std::result::Result<recorded::PathSet, String> {
         let failed = |error: anyhow::Error| format!("{error:#}");
@@ -1528,6 +1536,7 @@ impl Cache {
         let exclusions = recorded::Exclusions {
             roots: [&workspace.root, &canonical],
             outputs: own,
+            own_folders,
             ignore,
             state,
             produced,
@@ -2018,10 +2027,8 @@ mod tests {
         )
         .unwrap();
         let outputs = workspace_outputs(&workspace);
-        let others = |task: &str| recorded::Others {
-            outputs: &outputs,
-            upstream: upstream(&graph, &graph.tasks[task]),
-        };
+        let others =
+            |task: &str| recorded::Others::new(&outputs, upstream(&graph, &graph.tasks[task]), &[]);
         let lint = others("app:lint");
         assert!(lint.matches("app/dist/main.js"));
         assert!(lint.matches("app/dist-production/main.js"));

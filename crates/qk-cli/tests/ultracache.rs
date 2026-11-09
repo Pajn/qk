@@ -315,6 +315,55 @@ fn a_file_a_dependency_writes_into_node_modules_stays_in_recordings() {
     assert_eq!(build_keyed(root, false), ("miss".into(), "missed".into()));
 }
 
+/// The directory holding an output outside its project's root, `dist` for
+/// `dist/app`, exists before the task runs where the sandbox made it, and on
+/// a fresh checkout does not. A recording made under the sandbox's audit
+/// keys a run without one all the same.
+#[test]
+fn the_directory_holding_its_outputs_keys_nothing() {
+    if !has_strace() {
+        return;
+    }
+    let temp = fixture();
+    let root = temp.path();
+    write(root, ".gitignore", "dist/\n");
+    let nx = fs::read_to_string(root.join("nx.json")).unwrap();
+    write(
+        root,
+        "nx.json",
+        &nx.replace(
+            r#""outputs": ["{projectRoot}/dist"]"#,
+            r#""outputs": ["{workspaceRoot}/dist/app"]"#,
+        ),
+    );
+    // It looks for the directory before making it, as a build tool looks
+    // for its output directory.
+    let project = fs::read_to_string(root.join("app/project.json")).unwrap();
+    write(
+        root,
+        "app/project.json",
+        &project
+            .replace(
+                "mkdir -p dist",
+                "{ test -d ../dist || true; } && mkdir -p ../dist/app",
+            )
+            .replace(" dist/", " ../dist/app/"),
+    );
+    let audited = build_report(root, false, &[("QK_RECORD", "audit")]);
+    assert_eq!(
+        (
+            audited["cache"].as_str(),
+            kind(&audited["recorded"]).as_str()
+        ),
+        (Some("miss"), "saved")
+    );
+    // A fresh checkout, with a file the task never read edited.
+    fs::remove_dir_all(root.join("dist")).unwrap();
+    write(root, "app/README.md", "# app\n\nStill not read.\n");
+    assert_eq!(build_keyed(root, false), ("local-hit".into(), "hit".into()));
+    assert!(root.join("dist/app/out.txt").is_file());
+}
+
 #[test]
 fn a_task_that_changes_what_it_read_is_not_recorded() {
     if !has_strace() {

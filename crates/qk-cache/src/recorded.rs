@@ -10,8 +10,8 @@
 //! where the task found nothing changes its existence.
 //!
 //! Paths outside the workspace, `node_modules`, `.git`, qk's own state, the
-//! task's outputs and warm paths, files it wrote before reading them and its
-//! `ignoreReads` are left out. What lies in `node_modules` without being
+//! task's outputs and warm paths, the directories that only hold them, files
+//! it wrote before reading them and its `ignoreReads` are left out. What lies in `node_modules` without being
 //! installed there stays: see [`Produced`].
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -116,6 +116,9 @@ pub struct Exclusions<'a> {
     pub roots: [&'a Path; 2],
     /// The task's outputs and warm paths.
     pub outputs: &'a [&'a Outputs],
+    /// The directories that only hold them: whether one exists, and what it
+    /// lists, depend on whether they were made before the task ran.
+    pub own_folders: BTreeSet<String>,
     /// `ignoreReads`.
     pub ignore: crate::ultracache::IgnoredReads,
     /// qk's own directories inside the workspace, relative to it.
@@ -195,6 +198,7 @@ impl Exclusions<'_> {
                         .is_some_and(|rest| rest.starts_with('/'))
             })
             || self.outputs.iter().any(|outputs| outputs.matches(path))
+            || self.own_folders.contains(path)
             || self.ignore.is_match(path)
     }
 }
@@ -526,6 +530,12 @@ fn parent(path: &str) -> &str {
     path.rsplit_once('/').map_or(".", |(parent, _)| parent)
 }
 
+/// Whether `path` lies below `directory`, both workspace-relative.
+fn under(path: &str, directory: &str) -> bool {
+    path.strip_prefix(directory)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
 /// The path of `name` in `directory`, `.` being the workspace root.
 fn child(directory: &str, name: &str) -> String {
     if directory == "." {
@@ -616,6 +626,8 @@ pub(crate) struct WorkspaceOutputs {
     /// such as `.cache` for `.cache/build`, which exist to hold it.
     folders: Vec<Vec<String>>,
     by_folder: BTreeMap<String, Vec<usize>>,
+    /// Each project's root, and each directory holding one.
+    projects: BTreeSet<String>,
 }
 
 impl WorkspaceOutputs {
@@ -675,12 +687,36 @@ impl WorkspaceOutputs {
             }
             folders.push(held);
         }
+        let projects = projects.into_iter().map(str::to_owned).collect();
         Self {
             outputs,
             by_anchor,
             folders,
             by_folder,
+            projects,
         }
+    }
+
+    /// The directories that hold nothing a task keys but `own`, its outputs:
+    /// each directory between the workspace root and one of their anchors,
+    /// such as `dist` and `dist/apps` for `dist/apps/web`, but no project's
+    /// root, nor a directory holding one, nor one holding or held by an
+    /// output of `upstream`, the targets it depends on.
+    fn own_folders(&self, own: &[&Outputs], upstream: &BTreeSet<TargetOf>) -> BTreeSet<String> {
+        let inputs: Vec<&str> = self
+            .outputs
+            .iter()
+            .filter(|(target, _)| upstream.contains(target))
+            .flat_map(|(_, outputs)| outputs.anchors())
+            .collect();
+        let related = |a: &str, b: &str| a == b || under(a, b) || under(b, a);
+        own.iter()
+            .flat_map(|outputs| outputs.anchors())
+            .flat_map(|anchor| anchor.match_indices('/').map(move |(at, _)| &anchor[..at]))
+            .filter(|folder| !self.projects.contains(*folder))
+            .filter(|folder| !inputs.iter().any(|input| related(input, folder)))
+            .map(str::to_owned)
+            .collect()
     }
 
     /// The outputs whose anchor is `path` or a directory holding it.
@@ -704,6 +740,31 @@ pub(crate) struct Others<'a> {
     pub outputs: &'a WorkspaceOutputs,
     /// The targets the task depends on.
     pub upstream: BTreeSet<TargetOf>,
+    /// The directories that only hold the task's own outputs, which come
+    /// and go with them as its project's folders do: see
+    /// [`WorkspaceOutputs::own_folders`].
+    pub own_folders: BTreeSet<String>,
+}
+
+impl<'a> Others<'a> {
+    /// `own` holds the task's outputs and warm paths.
+    pub(crate) fn new(
+        outputs: &'a WorkspaceOutputs,
+        upstream: BTreeSet<TargetOf>,
+        own: &[&Outputs],
+    ) -> Self {
+        let own_folders = outputs.own_folders(own, &upstream);
+        Self {
+            outputs,
+            upstream,
+            own_folders,
+        }
+    }
+
+    /// Whether `path` is one of the task's own folders.
+    pub(crate) fn own_folder(&self, path: &str) -> bool {
+        self.own_folders.contains(path)
+    }
 }
 
 impl Others<'_> {
@@ -760,8 +821,14 @@ impl Unlisted<'_> {
             || self.ignore.is_match(path)
     }
 
+    /// Whether `path` is the task's own output, or a directory that only
+    /// holds its outputs.
     fn own(&self, path: &str) -> bool {
         self.own.iter().any(|outputs| outputs.matches(path))
+            || self
+                .others
+                .as_ref()
+                .is_some_and(|others| others.own_folder(path))
     }
 
     /// Where other targets' outputs and ignored paths come and go while the
@@ -1034,6 +1101,7 @@ mod tests {
         let exclusions = Exclusions {
             roots: [&root, &root],
             outputs: &[&outputs],
+            own_folders: BTreeSet::new(),
             ignore: IgnoredReads::of_globs(&["src/*.log".to_owned()]).unwrap(),
             state: vec![".qk".into()],
             produced: Produced::default(),
@@ -1108,6 +1176,7 @@ mod tests {
         let exclusions = Exclusions {
             roots: [&root, &root],
             outputs: &[],
+            own_folders: BTreeSet::new(),
             ignore: IgnoredReads::none(),
             state: Vec::new(),
             produced,
@@ -1403,6 +1472,108 @@ mod tests {
         );
     }
 
+    /// The directories that only hold the task's own outputs are there once
+    /// they are, or when a sandbox made them before it ran, and not before:
+    /// a lookup on a fresh checkout keys them as a run after the task does.
+    #[test]
+    fn directories_only_holding_its_own_outputs_key_nothing() {
+        let roots = [
+            ("web".to_owned(), "apps/web".to_owned()),
+            ("ui".to_owned(), "libs/ui".to_owned()),
+        ]
+        .into();
+        let declared = |upstream: Option<&str>| {
+            let mut outputs = vec![(
+                ("web".into(), "build".into(), None),
+                Outputs::from_patterns(&["dist/apps/web"]),
+            )];
+            outputs.extend(upstream.map(|anchor| {
+                (
+                    ("ui".into(), "build".into(), None),
+                    Outputs::from_patterns(&[anchor]),
+                )
+            }));
+            WorkspaceOutputs::new(outputs, &roots)
+        };
+        let build = Outputs::from_patterns(&["dist/apps/web"]);
+        let coverage = Outputs::from_patterns(&["apps/web/coverage/unit"]);
+        let upstream: BTreeSet<TargetOf> = [("ui".into(), "build".into(), None)].into();
+        let folders = |outputs: &WorkspaceOutputs| {
+            outputs
+                .own_folders(&[&build, &coverage], &upstream)
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        // Outside its project's root and inside it, but never the root, nor
+        // the directory holding it.
+        assert_eq!(
+            folders(&declared(None)),
+            ["apps/web/coverage", "dist", "dist/apps"]
+        );
+        // A directory also holding an output it depends on, or held by one,
+        // holds its input.
+        assert_eq!(
+            folders(&declared(Some("dist/libs/ui"))),
+            ["apps/web/coverage", "dist/apps"]
+        );
+        assert_eq!(folders(&declared(Some("dist"))), ["apps/web/coverage"]);
+        let outputs = declared(None);
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = &temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("nx.json"), "{}").unwrap();
+        std::fs::write(
+            root.join("project.json"),
+            r#"{"name":"app","targets":{"build":{"command":"true"}}}"#,
+        )
+        .unwrap();
+        let workspace = qk_config::Workspace::load(root).unwrap();
+        let graph = qk_taskgraph::TaskGraph::build(
+            &workspace,
+            &[qk_taskgraph::Request::parse("app:build").unwrap()],
+        )
+        .unwrap();
+        let snapshot = Snapshot::new(&workspace, &graph, &root.join("cache")).unwrap();
+        let own = [&build];
+        let others = Others::new(&outputs, BTreeSet::new(), &own);
+        let own_folders = others.own_folders.clone();
+        let unlisted = Unlisted {
+            own: own.to_vec(),
+            others: Some(others),
+            ignore: &IGNORE_NOTHING,
+        };
+        // Recorded where a sandbox had made them, they are left out.
+        std::fs::create_dir_all(root.join("dist/apps")).unwrap();
+        let path = |relative: &str| root.join(relative).to_str().unwrap().to_owned();
+        let exclusions = Exclusions {
+            roots: [root, root],
+            outputs: &own,
+            own_folders,
+            ignore: IgnoredReads::none(),
+            state: Vec::new(),
+            produced: Produced::default(),
+        };
+        let set = PathSet::from_accesses(
+            &[
+                access(&path("."), Operation::ListDirectory, "success"),
+                access(&path("dist"), Operation::ListDirectory, "success"),
+                access(&path("dist/apps"), Operation::Metadata, "success"),
+            ],
+            &exclusions,
+            root,
+        );
+        assert_eq!(set.listings, [".".to_owned()].into());
+        assert!(set.present.is_empty());
+        // And the workspace's listing keys the same without them.
+        let key = || strong_key("weak", &set, &snapshot, root, &unlisted).unwrap();
+        let made = key();
+        std::fs::remove_dir_all(root.join("dist")).unwrap();
+        assert_eq!(key(), made);
+        // Another directory appearing still changes it.
+        std::fs::create_dir(root.join("build")).unwrap();
+        assert_ne!(key(), made);
+    }
+
     #[test]
     fn listings_leave_out_other_targets_outputs_and_ignored_reads() {
         let temp = tempfile::tempdir().unwrap();
@@ -1459,15 +1630,16 @@ mod tests {
         let ignore = IgnoredReads::of_globs(&["**/.fallow".to_owned()]).unwrap();
         let unlisted = Unlisted {
             own: Vec::new(),
-            others: Some(Others {
-                outputs: &outputs,
+            others: Some(Others::new(
+                &outputs,
                 // It depends on codegen, whose output is its input.
-                upstream: [
+                [
                     ("app".into(), "build".into(), None),
                     ("app".into(), "codegen".into(), None),
                 ]
                 .into(),
-            }),
+                &[],
+            )),
             ignore: &ignore,
         };
         assert_eq!(
