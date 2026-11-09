@@ -505,8 +505,19 @@ pub fn warm_line(warm: &serde_json::Value) -> Option<String> {
             .and_then(serde_json::Value::as_str)
             .map(|group| format!(" for group {group}"))
             .unwrap_or_default();
+        let took = match (number("ms"), number("fetchMs")) {
+            (Some(ms), Some(fetched)) => {
+                format!(
+                    " in {}, {} of it waiting on the remote",
+                    seconds(ms),
+                    seconds(fetched)
+                )
+            }
+            (Some(ms), None) => format!(" in {}", seconds(ms)),
+            (None, _) => String::new(),
+        };
         parts.push(format!(
-            "warm state{group} restored from {}: {files} file{}, {:.1} MB",
+            "warm state{group} restored from {}: {files} file{}, {:.1} MB{took}",
             restored
                 .get("source")
                 .and_then(serde_json::Value::as_str)
@@ -672,4 +683,37 @@ pub fn show_log(workspace: &Workspace, run: &str, task: &str) -> Result<()> {
         eprintln!("qk: execution log truncated at 4 MiB");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn warm_line_says_how_long_a_restore_took_and_waited_on_the_remote() {
+        let line = |restored| warm_line(&json!({"restored": [restored]})).unwrap();
+        let entry = json!({"source": "remote main", "files": 2, "bytes": 3_000_000});
+        let timed = |fields: serde_json::Value| {
+            let mut entry = entry.clone();
+            entry
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            line(entry)
+        };
+        assert_eq!(
+            timed(json!({"ms": 3400, "fetchMs": 3100})),
+            "warm state restored from remote main: 2 files, 3.0 MB in 3.4s, 3.1s of it waiting on the remote"
+        );
+        assert_eq!(
+            timed(json!({"ms": 1200})),
+            "warm state restored from remote main: 2 files, 3.0 MB in 1.2s"
+        );
+        // Recorded before restores were timed.
+        assert_eq!(
+            line(entry),
+            "warm state restored from remote main: 2 files, 3.0 MB"
+        );
+    }
 }

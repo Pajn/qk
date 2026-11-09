@@ -429,6 +429,11 @@ fn directory(workspace: &Workspace, identity: &str) -> PathBuf {
 }
 
 impl Warm {
+    /// Whether its saves go to the remote store and come back from it.
+    pub(crate) fn shared_remotely(&self) -> bool {
+        self.remote && self.portable != Portable::Own
+    }
+
     /// The group the entry shares its saves with, if it names one.
     pub fn group(&self) -> Option<&str> {
         self.identity.strip_prefix(GROUP)
@@ -845,6 +850,7 @@ type GroupFiles = BTreeMap<String, (Vec<i64>, Artifact)>;
 
 /// What a restore brought back.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Restored {
     /// The group the entry shares its saves with, absent for the task's own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -855,6 +861,15 @@ pub struct Restored {
     pub groups: Vec<String>,
     pub files: usize,
     pub bytes: u64,
+    /// How long the restore kept the task from starting, waiting for the
+    /// entry's lock included.
+    #[serde(default)]
+    pub ms: u64,
+    /// Of `ms`, how long it waited on the remote store, for a fetch started
+    /// ahead or one of its own, even when the save it restored came from
+    /// this machine instead; absent when it did not ask the remote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetch_ms: Option<u64>,
 }
 
 /// What warm state did for one run of a task.
@@ -1200,7 +1215,7 @@ fn remote_warm(
     branches: &[String],
     current: &[String],
 ) -> Option<(WarmRecord, String)> {
-    if !warm.remote || warm.portable == Portable::Own {
+    if !warm.shared_remotely() {
         return None;
     }
     // Saved in a worktree at another path, it is no save for this one.
@@ -1434,6 +1449,7 @@ impl Cache {
         warm: &Warm,
         prepared: &qk_executor::PreparedTask,
     ) -> Result<(Restored, Vec<String>)> {
+        let started = std::time::Instant::now();
         let mut restored = Restored {
             group: warm.group().map(str::to_owned),
             ..Restored::default()
@@ -1465,9 +1481,14 @@ impl Cache {
         let keying = profile::span(&task.id, "warm_restore_key");
         let current = key_digests(workspace, warm, prepared)?;
         drop(keying);
+        let mut fetch_ms = None;
         let ahead = self.prefetches.get().map_or(Taken::Nothing, |prefetches| {
             let mut waiting = profile::span(&task.id, "warm_restore_prefetched");
+            let taking = std::time::Instant::now();
             let taken = prefetches.take(&warm.identity, &current);
+            if !matches!(taken, Taken::Nothing) {
+                fetch_ms = Some(taking.elapsed().as_millis() as u64);
+            }
             waiting.note(
                 "taken",
                 match taken {
@@ -1494,9 +1515,13 @@ impl Cache {
             (Taken::Missing, None) => None,
             (Taken::Nothing, None) => {
                 let mut fetching = profile::span(&task.id, "warm_restore_remote");
+                let asking = std::time::Instant::now();
                 let fetched = self
                     .remote_warm(workspace, task, warm, &current)
                     .map(|(record, branch)| (record, format!("remote {branch}")));
+                if self.remote.is_some() && warm.shared_remotely() {
+                    fetch_ms = Some(asking.elapsed().as_millis() as u64);
+                }
                 fetching.note(
                     "source",
                     fetched
@@ -1553,6 +1578,8 @@ impl Cache {
             fs::create_dir_all(path.parent().context("restore notes have a directory")?)?;
             fs::write(path, serde_json::to_vec(&noted)?)?;
         }
+        restored.fetch_ms = fetch_ms;
+        restored.ms = started.elapsed().as_millis() as u64;
         Ok((restored, present))
     }
 
@@ -1754,7 +1781,7 @@ impl Cache {
                 }
             }
             for warm in entries {
-                if !warm.prefetch || !warm.remote || warm.portable == Portable::Own {
+                if !warm.prefetch || !warm.shared_remotely() {
                     continue;
                 }
                 let missing = locations(workspace, task, &warm).is_ok_and(|locations| {
@@ -1991,8 +2018,7 @@ impl Cache {
             let _ = fs::remove_file(path);
         }
         // Stamps describe this machine's files; the remote record goes without.
-        if warm.remote
-            && warm.portable != Portable::Own
+        if warm.shared_remotely()
             && let Some(remote) = &self.remote
             && let Some(branch) = &save.branch
         {
