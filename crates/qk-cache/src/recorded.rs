@@ -1410,6 +1410,19 @@ mod tests {
         assert_ne!(key(), generated);
         std::fs::rename(root.join(".gen"), root.join("node_modules/.gen")).unwrap();
         assert_eq!(key(), generated);
+        // The listing of node_modules alone keys what was produced in it.
+        let listing = PathSet {
+            listings: ["node_modules".to_owned()].into(),
+            ..PathSet::default()
+        };
+        let listed = || strong_key("weak", &listing, &snapshot, &root, &unlisted).unwrap();
+        let before = listed();
+        std::fs::create_dir_all(root.join("node_modules/baz")).unwrap();
+        assert_eq!(listed(), before);
+        std::fs::rename(root.join("node_modules/.gen"), root.join(".gen")).unwrap();
+        assert_ne!(listed(), before);
+        std::fs::rename(root.join(".gen"), root.join("node_modules/.gen")).unwrap();
+        assert_eq!(listed(), before);
         std::fs::remove_file(root.join("node_modules/.gen/app/index.d.ts")).unwrap();
         assert_ne!(key(), generated);
         std::fs::write(root.join("node_modules/.gen/app/index.d.ts"), "").unwrap();
