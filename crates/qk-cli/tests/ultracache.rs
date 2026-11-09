@@ -101,7 +101,13 @@ fn build_report(root: &Path, record: bool, env: &[(&str, &str)]) -> Value {
     }
     qk(root, &args, env);
     let run: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
-    run["tasks"][0].clone()
+    run["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["id"] == "app:build")
+        .unwrap()
+        .clone()
 }
 
 fn kind(value: &Value) -> String {
@@ -255,6 +261,57 @@ fn a_dependency_glob_leaves_the_projects_depended_on_out_of_recordings() {
     write(root, "lib/data.txt", "changed\n");
     assert_eq!(build_keyed(root, false), ("local-hit".into(), "hit".into()));
     write(root, "other/data.txt", "changed\n");
+    assert_eq!(build_keyed(root, false), ("miss".into(), "missed".into()));
+}
+
+#[test]
+fn a_file_a_dependency_writes_into_node_modules_stays_in_recordings() {
+    if !has_strace() {
+        return;
+    }
+    let temp = fixture();
+    let root = temp.path();
+    write(root, ".gitignore", "dist/\nnode_modules/\n");
+    // `gen:gen` generates a client into node_modules, which `app:build`
+    // reads beside an installed package.
+    fs::create_dir_all(root.join("gen")).unwrap();
+    write(
+        root,
+        "gen/project.json",
+        r#"{
+  "name": "gen",
+  "targets": {
+    "gen": {
+      "command": "mkdir -p node_modules/.gen/app && cp gen/schema.txt node_modules/.gen/app/client.txt",
+      "outputs": ["{workspaceRoot}/node_modules/.gen/app"]
+    }
+  }
+}"#,
+    );
+    write(root, "gen/schema.txt", "one\n");
+    fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+    write(root, "node_modules/pkg/index.txt", "installed\n");
+    let project = fs::read_to_string(root.join("app/project.json")).unwrap();
+    write(
+        root,
+        "app/project.json",
+        &project
+            .replace(
+                r#""build": {"#,
+                r#""build": { "dependsOn": [{ "projects": ["gen"], "target": "gen" }],"#,
+            )
+            .replace(
+                " > dist/listing.txt",
+                " > dist/listing.txt && cat ../node_modules/.gen/app/client.txt ../node_modules/pkg/index.txt > dist/gen.txt",
+            ),
+    );
+    assert_eq!(build_keyed(root, true), ("miss".into(), "saved".into()));
+    assert_eq!(build_keyed(root, false), ("local-hit".into(), "hit".into()));
+    // An installed package is the lockfile's to key.
+    write(root, "node_modules/pkg/index.txt", "reinstalled\n");
+    assert_eq!(build_keyed(root, false), ("local-hit".into(), "hit".into()));
+    // What the dependency generates is not.
+    write(root, "gen/schema.txt", "two\n");
     assert_eq!(build_keyed(root, false), ("miss".into(), "missed".into()));
 }
 

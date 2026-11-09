@@ -11,7 +11,8 @@
 //!
 //! Paths outside the workspace, `node_modules`, `.git`, qk's own state, the
 //! task's outputs and warm paths, files it wrote before reading them and its
-//! `ignoreReads` are left out.
+//! `ignoreReads` are left out. What lies in `node_modules` without being
+//! installed there stays: see [`Produced`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -119,6 +120,53 @@ pub struct Exclusions<'a> {
     pub ignore: crate::ultracache::IgnoredReads,
     /// qk's own directories inside the workspace, relative to it.
     pub state: Vec<String>,
+    /// What lies in `node_modules` without being installed there.
+    pub produced: Produced,
+}
+
+/// Paths in `node_modules` that the lockfile does not key, which a path set
+/// keeps: what the tasks a task depends on declare as their outputs, such as
+/// a client generated into `node_modules/.prisma`, and what lies below a
+/// directory in `node_modules` that an upstream output or an
+/// `includeIgnored` fileset reads from. Everything else there is installed.
+#[derive(Default)]
+pub struct Produced {
+    /// The declared outputs of the tasks the task depends on.
+    pub upstream: Vec<Outputs>,
+    /// Directories naming a `node_modules` directory, workspace-relative.
+    pub roots: Vec<String>,
+}
+
+impl Produced {
+    /// The tasks' upstream outputs and `includeIgnored` roots: of the roots,
+    /// only those in `node_modules` count, as a project root would hold
+    /// installed packages too.
+    pub fn new(upstream: Vec<Outputs>, include_ignored: Vec<String>) -> Self {
+        let mut roots: Vec<String> = upstream
+            .iter()
+            .flat_map(|outputs| outputs.anchors().map(str::to_owned))
+            .chain(include_ignored)
+            .filter(|root| in_node_modules(root))
+            .collect();
+        roots.sort_unstable();
+        roots.dedup();
+        Self { upstream, roots }
+    }
+
+    /// Whether `path`, workspace-relative, is produced rather than installed.
+    pub fn holds(&self, path: &str) -> bool {
+        self.roots.iter().any(|root| {
+            path == root
+                || path
+                    .strip_prefix(root.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+        }) || self.upstream.iter().any(|outputs| outputs.matches(path))
+    }
+}
+
+/// Whether `path` has a `node_modules` component.
+pub fn in_node_modules(path: &str) -> bool {
+    path.split('/').any(|part| part == "node_modules")
 }
 
 impl Exclusions<'_> {
@@ -138,9 +186,8 @@ impl Exclusions<'_> {
     }
 
     fn excluded(&self, path: &str) -> bool {
-        let mut parts = path.split('/');
-        parts.clone().next() == Some(".git")
-            || parts.any(|part| part == "node_modules")
+        path.split('/').next() == Some(".git")
+            || in_node_modules(path) && !self.produced.holds(path)
             || self.state.iter().any(|state| {
                 path == state
                     || path
@@ -989,6 +1036,7 @@ mod tests {
             outputs: &[&outputs],
             ignore: IgnoredReads::of_globs(&["src/*.log".to_owned()]).unwrap(),
             state: vec![".qk".into()],
+            produced: Produced::default(),
         };
         let accesses = [
             access(&path("src/a.ts"), Operation::OpenRead, "success"),
@@ -1025,6 +1073,74 @@ mod tests {
                 recorded: None,
             }
         );
+    }
+
+    /// What upstream tasks write into `node_modules`, and what an
+    /// `includeIgnored` fileset reads there, is no installed package: the
+    /// lockfile does not key it, so the path set does.
+    #[test]
+    fn keeps_what_is_produced_in_node_modules() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let path = |relative: &str| root.join(relative).to_str().unwrap().to_owned();
+        let produced = Produced::new(
+            vec![
+                Outputs::from_paths(&["node_modules/.gen/app".into()]).unwrap(),
+                Outputs::from_paths(&["dist/lib".into()]).unwrap(),
+                // A glob from a project root names no directory in
+                // node_modules: only what it matches is produced.
+                Outputs::from_paths(&["libs/types/**/*.d.ts".into()]).unwrap(),
+            ],
+            vec![
+                "libs/e2e/node_modules/.cache/fixtures".into(),
+                // Reading a project's own directory does not make its
+                // installed packages produced.
+                "libs/e2e".into(),
+            ],
+        );
+        assert_eq!(
+            produced.roots,
+            [
+                "libs/e2e/node_modules/.cache/fixtures",
+                "node_modules/.gen/app"
+            ]
+        );
+        let exclusions = Exclusions {
+            roots: [&root, &root],
+            outputs: &[],
+            ignore: IgnoredReads::none(),
+            state: Vec::new(),
+            produced,
+        };
+        let read = |relative: &str| access(&path(relative), Operation::OpenRead, "success");
+        let accesses = [
+            read("node_modules/.gen/app/index.js"),
+            access(
+                &path("node_modules/.gen/app"),
+                Operation::ListDirectory,
+                "success",
+            ),
+            read("node_modules/.gen/other/index.js"),
+            read("node_modules/foo/index.js"),
+            read("dist/lib/node_modules/dep/index.js"),
+            read("libs/types/node_modules/@types/x/index.d.ts"),
+            read("libs/types/node_modules/x/index.js"),
+            read("libs/e2e/node_modules/.cache/fixtures/a.json"),
+            read("libs/e2e/node_modules/foo/index.js"),
+        ];
+        let set = PathSet::from_accesses(&accesses, &exclusions, &root);
+        assert_eq!(
+            set.reads,
+            [
+                "dist/lib/node_modules/dep/index.js",
+                "libs/e2e/node_modules/.cache/fixtures/a.json",
+                "libs/types/node_modules/@types/x/index.d.ts",
+                "node_modules/.gen/app/index.js",
+            ]
+            .map(String::from)
+            .into()
+        );
+        assert_eq!(set.listings, ["node_modules/.gen/app".into()].into());
     }
 
     #[test]

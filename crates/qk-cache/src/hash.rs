@@ -883,6 +883,27 @@ impl Snapshot {
         Ok(paths)
     }
 
+    /// The directories a task's `includeIgnored` filesets read from, as
+    /// workspace-relative paths: each positive glob's leading literal
+    /// segments.
+    pub(crate) fn include_ignored_roots(
+        &self,
+        workspace: &Workspace,
+        task: &Task,
+    ) -> Result<Vec<String>> {
+        let empty = BTreeSet::new();
+        let cancelled = AtomicBool::new(false);
+        let mut resolver = Resolver::new(self, workspace, None, &cancelled, &empty);
+        resolver.task_inputs(task)?;
+        Ok(resolver
+            .ignored
+            .values()
+            .flatten()
+            .filter(|glob| !glob.starts_with('!'))
+            .map(|glob| crate::ignored::partition(glob.trim_end_matches('/')).0)
+            .collect())
+    }
+
     /// Reuse membership while source directories and listing policy are unchanged.
     /// Content changes are checked separately by the file digest cache.
     #[cfg(test)]
@@ -3129,7 +3150,10 @@ pub(crate) fn weak_key(
         "always".into(),
         json!({"files": always["files"], "values": always["values"], "dependencies": always["dependencies"]}),
     );
-    object.insert("schema".into(), json!("qk-weak-v1"));
+    // v2: path sets keep what upstream tasks write into `node_modules`. One
+    // recorded before left it out, and could key a task whose generated
+    // input had since changed.
+    object.insert("schema".into(), json!("qk-weak-v2"));
     object.insert("ignoreReads".into(), json!(ignore_reads));
     // What its `^` entries match moves with the project graph, the projects
     // depended on and those nested in them that are not, so a path set

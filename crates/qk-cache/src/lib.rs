@@ -1042,20 +1042,28 @@ impl Cache {
         });
         let path_set = match (&recordings, keying) {
             (Some((_, _, settings)), Some(recording)) => Some(
-                self.path_set(workspace, task, recording, prepared, settings, &own)
-                    .and_then(|set| {
-                        // Keyed by nothing, a recording would match any workspace.
-                        if set.is_empty() {
-                            return Err("its trace named no path in the workspace".to_owned());
-                        }
-                        match set
-                            .changed_since(&workspace.root, started, &unlisted, &listed)
-                            .map(|changed| changed.to_string())
-                        {
-                            Some(reason) => Err(reason),
-                            None => Ok(set),
-                        }
-                    }),
+                self.path_set(
+                    workspace,
+                    task,
+                    recording,
+                    prepared,
+                    settings,
+                    &own,
+                    produced(snapshot, workspace, graph, task),
+                )
+                .and_then(|set| {
+                    // Keyed by nothing, a recording would match any workspace.
+                    if set.is_empty() {
+                        return Err("its trace named no path in the workspace".to_owned());
+                    }
+                    match set
+                        .changed_since(&workspace.root, started, &unlisted, &listed)
+                        .map(|changed| changed.to_string())
+                    {
+                        Some(reason) => Err(reason),
+                        None => Ok(set),
+                    }
+                }),
             ),
             _ => None,
         };
@@ -1463,6 +1471,7 @@ impl Cache {
     }
 
     /// The path set of a task's recording, or why there is none.
+    #[allow(clippy::too_many_arguments)]
     fn path_set(
         &self,
         workspace: &Workspace,
@@ -1471,6 +1480,7 @@ impl Cache {
         prepared: &PreparedTask,
         settings: &ultracache::Settings,
         own: &[&paths::Outputs],
+        produced: recorded::Produced,
     ) -> std::result::Result<recorded::PathSet, String> {
         let failed = |error: anyhow::Error| format!("{error:#}");
         let canonical = workspace
@@ -1482,12 +1492,18 @@ impl Cache {
         let keep = |path: &std::path::Path| {
             [&workspace.root, &canonical].iter().any(|root| {
                 path.strip_prefix(root).is_ok_and(|relative| {
-                    !relative.components().any(|component| {
-                        matches!(
-                            component.as_os_str().to_str(),
-                            Some("node_modules" | ".git")
-                        )
-                    })
+                    let mut installed = false;
+                    for component in relative.components() {
+                        match component.as_os_str().to_str() {
+                            Some(".git") => return false,
+                            Some("node_modules") => installed = true,
+                            _ => {}
+                        }
+                    }
+                    !installed
+                        || relative
+                            .to_str()
+                            .is_some_and(|relative| produced.holds(&relative.replace('\\', "/")))
                 })
             })
         };
@@ -1514,6 +1530,7 @@ impl Cache {
             outputs: own,
             ignore,
             state,
+            produced,
         };
         Ok(recorded::PathSet::from_accesses(
             &accesses,
@@ -1698,6 +1715,38 @@ fn scratch_outputs(
         return None;
     }
     paths::Outputs::from_paths(&patterns).ok()
+}
+
+/// What `task`'s recordings keep in `node_modules`: the declared outputs of
+/// every task it depends on, those `--exclude-task-dependencies` left unrun
+/// among them, so that a recording keeps the same in any run, and where its
+/// `includeIgnored` filesets read.
+fn produced(
+    snapshot: &hash::Snapshot,
+    workspace: &Workspace,
+    graph: &TaskGraph,
+    task: &Task,
+) -> recorded::Produced {
+    let upstream = graph
+        .output_dependencies(task, true)
+        .iter()
+        .filter_map(|id| graph.keyed_task(id))
+        .filter_map(|dependency| {
+            paths::Outputs::new(workspace, dependency)
+                .ok()
+                .filter(paths::Outputs::declared)
+        })
+        .collect();
+    let include_ignored = snapshot
+        .include_ignored_roots(workspace, task)
+        .unwrap_or_else(|error| {
+            qk_executor::status!(
+                "qk: {}: includeIgnored inputs not kept in recordings ({error:#})",
+                task.id
+            );
+            Vec::new()
+        });
+    recorded::Produced::new(upstream, include_ignored)
 }
 
 /// The targets of every task `task` depends on, each with the configuration

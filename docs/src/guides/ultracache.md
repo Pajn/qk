@@ -49,8 +49,15 @@ before reading them, its
 [scratch directories](sandbox.md#scratch-directories-and-ignored-reads), and
 what its `ignoreReads` names, which the sandbox's audit leaves out too. A
 glob there starting with `^` names files in the projects the task's project
-depends on, so which projects those are is part of its weak key. A
-directory's listing leaves out the task's outputs and what it wrote there, which are there after
+depends on, so which projects those are is part of its weak key.
+
+Only installed packages are left out of `node_modules`. A path there stays
+when one of the targets the task depends on declares it as an output, such as
+a client generated into `node_modules/.prisma`, or when it lies below a
+directory in `node_modules` that such an output or an `includeIgnored`
+fileset of the task reads from. The lockfile does not key those.
+
+A directory's listing leaves out the task's outputs and what it wrote there, which are there after
 it runs and need not be before, and the declared outputs of every other
 target in the workspace, which other tasks write whether or not this one
 reads them, with the directories between an output and its project's root,
