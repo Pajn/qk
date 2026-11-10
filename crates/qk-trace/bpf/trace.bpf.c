@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: GPL-2.0-or-later
 //
 // qk's recorder: the file system calls of the process trees qk hands it,
 // sent to user space through a ring buffer.
@@ -30,7 +30,7 @@
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
 
-char LICENSE[] SEC("license") = "Dual MIT/GPL";
+char LICENSE[] SEC("license") = "GPL";
 
 typedef struct {
 	int counter;
