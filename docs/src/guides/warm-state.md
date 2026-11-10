@@ -542,14 +542,17 @@ in what qk keys or reports:
 }
 ```
 
-A run in either configuration then restores what the other saved, including,
-from the remote store, the default branch's save when the branch has none, so
-a branch that builds only `preview` starts from the default branch's latest
-`release` build.
+A run in either configuration then restores what the other saved. Where the
+entry's state is [shared](#sharing-state-across-worktrees-and-ci) through the
+remote store, with `portable` set to `true` or `"path"`, this includes the
+default branch's save when the branch has none, so a branch that builds only
+`preview` starts from the default branch's latest `release` build.
 The entry's `key` still decides which saves suit a checkout. Saves a run in a
 configuration made before the option was set belong to that configuration and
 are not restored; those of a run without one already belong to the target, and
-are. A group's saves belong
+are.
+
+A group's saves belong
 to the group, so the configurations that select it share them and its
 `{warm}` directory. Entries left out still have to be valid. The rules for
 [several entries](#several-entries) apply among the entries that apply in a
