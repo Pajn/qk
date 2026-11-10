@@ -175,7 +175,11 @@ pub fn config(workspace: &Workspace, task: &Task) -> Result<Vec<Warm>> {
         if !selected(object, task)? {
             continue;
         }
-        if entries.iter().any(|other| other.identity == warm.identity) {
+        // Entries without a group are the task's own whatever their identity,
+        // which `perConfiguration` changes.
+        if entries.iter().any(|other| {
+            other.identity == warm.identity || (other.group().is_none() && warm.group().is_none())
+        }) {
             bail!(match warm.group() {
                 Some(group) => format!("qk:warm names group {group:?} twice"),
                 None => "only one qk:warm entry may go without a group".to_owned(),
@@ -2291,6 +2295,18 @@ mod tests {
                 entries(json!({"perConfiguration": "no"})).unwrap_err()
             ),
             "qk:warm.perConfiguration must be true or false"
+        );
+        // Still only one entry of the task's own, whichever way each keeps it.
+        assert_eq!(
+            format!(
+                "{:#}",
+                entries(json!([
+                    {"paths": ["one"]},
+                    {"paths": ["two"], "perConfiguration": false}
+                ]))
+                .unwrap_err()
+            ),
+            "only one qk:warm entry may go without a group"
         );
     }
 
