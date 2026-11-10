@@ -6,7 +6,7 @@ resolver = "3"
 version = "0.26.0"
 edition = "2024"
 publish = ["crates-io"]
-license = "MIT OR Apache-2.0"
+license = "GPL-2.0-or-later"
 repository = "https://github.com/Pajn/qk"
 
 [workspace.metadata.release]

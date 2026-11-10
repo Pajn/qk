@@ -21,11 +21,11 @@ for member in workspace['workspace']['members']:
 name = "{name}"
 version = "0.0.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "GPL-2.0-or-later"
 repository = "https://github.com/Pajn/qk"
 description = "Name reservation for {name}, a component of the qk task runner"
 readme = "README.md"
-include = ["Cargo.toml", "README.md", "src/lib.rs", "LICENSE-MIT", "LICENSE-APACHE"]
+include = ["Cargo.toml", "README.md", "src/lib.rs", "LICENSE"]
 publish = ["crates-io"]
 
 [workspace]
@@ -36,6 +36,6 @@ publish = ["crates-io"]
         'It contains no functional implementation or public API.\n'
         'The implementation is developed at https://github.com/Pajn/qk.\n'
     )
-    for license_name in ['LICENSE-MIT', 'LICENSE-APACHE']:
+    for license_name in ['LICENSE']:
         shutil.copyfile(root / license_name, directory / license_name)
     print(directory)

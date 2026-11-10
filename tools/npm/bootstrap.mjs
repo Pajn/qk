@@ -20,7 +20,7 @@ const platforms = [
 ];
 const common = {
   version: '0.0.0',
-  license: 'MIT OR Apache-2.0',
+  license: 'GPL-2.0-or-later',
   repository: { type: 'git', url: `git+https://github.com/${values.repository}.git` },
   publishConfig: { access: 'public', tag: 'bootstrap', registry: 'https://registry.npmjs.org' },
 };
@@ -29,7 +29,7 @@ function writePackage(name, fields) {
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, 'package.json'), JSON.stringify({ name, ...common, ...fields }, null, 2) + '\n');
   writeFileSync(join(dir, 'README.md'), `# ${name}\n\nThis 0.0.0 package bootstraps trusted publishing for qk, the Rust task runner.\nIt contains no native binary and is not a functional CLI release.\nFuture releases are built by https://github.com/${values.repository}.\n`);
-  for (const license of ['LICENSE-MIT', 'LICENSE-APACHE']) {
+  for (const license of ['LICENSE']) {
     copyFileSync(join(root, license), join(dir, license));
   }
   return dir;
@@ -39,13 +39,13 @@ for (const [os, cpu] of platforms) {
   const name = `@runqk/cli-${os}-${cpu}`;
   writePackage(name, {
     description: `Trusted publishing bootstrap for the qk ${os} ${cpu} binary`,
-    os: [os], cpu: [cpu], files: ['LICENSE-MIT', 'LICENSE-APACHE'],
+    os: [os], cpu: [cpu], files: ['LICENSE'],
   });
   optionalDependencies[name] = common.version;
 }
 const main = writePackage('@runqk/cli', {
   description: 'Trusted publishing bootstrap for qk, a standalone Nx-compatible task runner',
-  bin: { qk: 'bin/qk.js' }, files: ['bin', 'LICENSE-MIT', 'LICENSE-APACHE'], optionalDependencies,
+  bin: { qk: 'bin/qk.js' }, files: ['bin', 'LICENSE'], optionalDependencies,
 });
 mkdirSync(join(main, 'bin'), { recursive: true });
 writeFileSync(join(main, 'bin', 'qk.js'), `#!/usr/bin/env node

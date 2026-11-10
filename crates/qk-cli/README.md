@@ -38,4 +38,5 @@ cargo install qk-cli --locked
 The crates.io `0.0.0` version is a metadata-only name reservation.
 Functional Cargo releases start at `0.1.1` and install the `qk` executable.
 
-Licensed under either MIT or Apache-2.0, at your option.
+Licensed under the GNU General Public License, version 2 or, at your option,
+any later version.

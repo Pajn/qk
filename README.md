@@ -77,4 +77,5 @@ and benchmarks.
 
 ## License
 
-Licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+Licensed under the [GNU General Public License, version 2](LICENSE) or, at your
+option, any later version.
