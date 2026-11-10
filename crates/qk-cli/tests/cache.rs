@@ -227,6 +227,53 @@ fn warm_state_applies_only_in_the_configurations_it_names() {
     );
 }
 
+/// `qk:warm.perConfiguration: false` keeps one set of saves for the target:
+/// a run in one configuration restores what a run in another saved.
+#[cfg(unix)]
+#[test]
+fn configurations_share_warm_state_when_not_kept_per_configuration() {
+    let fixture = Fixture::new(json!({
+        "executor": "nx:run-commands",
+        "options": {
+            "command": "echo \"found $(cat tool/marker 2>/dev/null || echo none)\"; mkdir -p tool && echo \"$NAME\" > tool/marker",
+        },
+        "cache": false,
+        "qk:warm": {
+            "paths": ["{projectRoot}/tool"],
+            "configurations": ["release", "preview"],
+            "perConfiguration": false
+        },
+        "configurations": {
+            "release": {"env": {"NAME": "release"}},
+            "preview": {"env": {"NAME": "preview"}},
+            "other": {"env": {"NAME": "other"}}
+        }
+    }));
+    // Each run starts without the path, so what it finds was restored.
+    let run = |configuration: &str| {
+        let _ = fs::remove_dir_all(fixture.root.join("tool"));
+        let output = success(
+            fixture
+                .command(&fixture.root, &["run", "app:build", "-c", configuration])
+                .output()
+                .unwrap(),
+        );
+        stdout(&output)
+            .lines()
+            .find_map(|line| {
+                line.split_once("found ")
+                    .map(|(_, found)| found.trim().to_owned())
+            })
+            .unwrap()
+    };
+    assert_eq!(run("release"), "none");
+    assert_eq!(run("preview"), "release");
+    assert_eq!(run("release"), "preview");
+    // A configuration the entry does not apply in keeps nothing.
+    assert_eq!(run("other"), "none");
+    assert_eq!(run("preview"), "release");
+}
+
 #[test]
 fn warm_environment_paths_are_absolute_in_each_worktree() {
     let fixture = Fixture::new(json!({

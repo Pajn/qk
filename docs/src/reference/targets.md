@@ -311,6 +311,7 @@ variable is set by two. See
 | `restore` | `"whole"` or `"each-path"` | `"whole"`; `"each-path"` restores each missing path from `paths` and leaves those on disk; see [Restoring paths one by one](../guides/warm-state.md#restoring-paths-one-by-one) |
 | `prefetch` | boolean | `false`; fetch the remote save as the run starts, while the task's dependencies run; see [Fetching remote state ahead](../guides/warm-state.md#fetching-remote-state-ahead) |
 | `configurations` | array of configuration names | Every configuration; otherwise only those named keep this entry's state, and a run in another configuration, or none, neither restores nor saves it; see [Only some configurations](../guides/warm-state.md#only-some-configurations) |
+| `perConfiguration` | boolean | `true`; `false` keeps the task's own saves for the target, shared by every configuration the entry applies in; not allowed with `group`; see [Only some configurations](../guides/warm-state.md#only-some-configurations) |
 
 Other fields are ignored, as in `qk:threads`, and `qk doctor` reports them.
 Put it beside `inputs` and `outputs`, rather than in executor `options`.
