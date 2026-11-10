@@ -68,6 +68,7 @@ pub const FIELDS: &[&str] = &[
     "restore",
     "prefetch",
     "configurations",
+    "perConfiguration",
 ];
 
 /// How many saves are kept for a task, across worktrees and keys.
@@ -242,7 +243,22 @@ fn entry(
             "a qk:warm.group shares {{warm}} alone; outputs, paths and survive belong to one task"
         );
     }
-    let identity = group.map_or_else(|| task.id.clone(), |group| format!("{GROUP}{group}"));
+    // The task's own saves belong to the task, configuration included,
+    // unless `perConfiguration: false` makes them the target's, shared by
+    // every configuration the entry applies in. No two entries without a
+    // group apply in one configuration, so the run without a configuration,
+    // whose task is the target, can only share them with the same entry.
+    let per_configuration = flag("perConfiguration", true)?;
+    if group.is_some() && object.contains_key("perConfiguration") {
+        bail!(
+            "a qk:warm.group is shared by every task that names it; perConfiguration belongs to a task's own entry"
+        );
+    }
+    let identity = match group {
+        Some(group) => format!("{GROUP}{group}"),
+        None if per_configuration => task.id.clone(),
+        None => format!("{}:{}", task.project, task.target),
+    };
     const SURVIVE_SHAPE: &str = "qk:warm.survive must be an array of target names";
     let survive = object
         .get("survive")
@@ -2241,6 +2257,40 @@ mod tests {
         assert_eq!(
             format!("{:#}", entries_in(shared, Some("kept")).unwrap_err()),
             "qk:warm sets CACHE in more than one entry"
+        );
+    }
+
+    #[test]
+    fn configurations_share_the_task_entry_when_asked() {
+        let identity = |warm: Value, configuration| {
+            entries_in(warm, configuration).map(|entries| entries[0].identity.clone())
+        };
+        let own = json!({"paths": ["build"]});
+        assert_eq!(
+            identity(own.clone(), Some("kept")).unwrap(),
+            "app:build:kept"
+        );
+        assert_eq!(identity(own, None).unwrap(), "app:build");
+        let shared = json!({"paths": ["build"], "perConfiguration": false});
+        assert_eq!(identity(shared.clone(), Some("kept")).unwrap(), "app:build");
+        assert_eq!(
+            identity(shared.clone(), Some("skipped")).unwrap(),
+            "app:build"
+        );
+        assert_eq!(identity(shared, None).unwrap(), "app:build");
+        assert_eq!(
+            format!(
+                "{:#}",
+                entries(json!({"group": "gradle", "perConfiguration": false})).unwrap_err()
+            ),
+            "a qk:warm.group is shared by every task that names it; perConfiguration belongs to a task's own entry"
+        );
+        assert_eq!(
+            format!(
+                "{:#}",
+                entries(json!({"perConfiguration": "no"})).unwrap_err()
+            ),
+            "qk:warm.perConfiguration must be true or false"
         );
     }
 
