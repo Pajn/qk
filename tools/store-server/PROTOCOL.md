@@ -152,10 +152,12 @@ Write token. Body: an upload body. The newest save replaces the last. Answer:
 ### `GET pathsets/<weak>`, `HEAD pathsets/<weak>`, `PUT pathsets/<weak>`
 
 The path sets recorded for a weak key, 64 hex digits, as a record citing no
-blob: `{"version": 1, "weak": <weak>, "sets": […]}`. `GET` answers `200`, a
-pack, or `404`; `HEAD` answers `200` or `404`. `PUT` needs a write token and
-an upload body of at most 16 MiB whose record's `weak` is `<weak>` and which
-cites no blob; the newest save replaces the last. Answer: `204`, or `400`.
+blob: `{"version": <version>, "weak": <weak>, "sets": […]}`, in the version of
+the client that saved it, which the server neither reads nor checks. `GET`
+answers `200`, a pack, or `404`; `HEAD` answers `200` or `404`. `PUT` needs a
+write token and an upload body of at most 16 MiB whose record's `weak` is
+`<weak>` and which cites no blob; the newest save replaces the last. Answer:
+`204`, or `400`.
 
 ### `GET expectations/<name>`, `HEAD expectations/<name>`, `PUT expectations/<name>`
 

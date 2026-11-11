@@ -31,26 +31,51 @@ use crate::paths::Outputs;
 /// finds, keeps a set for each way.
 const KEPT: usize = 8;
 
+/// The version of the record path sets are kept and shared in. Version 2
+/// lists paths by directory, and leaves out the existence of the paths a
+/// task found missing while they still were. Version 1 is read too.
+const VERSION: u32 = 2;
+
 #[derive(Clone, Debug, Default, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PathSet {
     /// Files whose content the task read.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeSet::is_empty",
+        with = "by_directory"
+    )]
     pub reads: BTreeSet<String>,
     /// Directories it listed; `.` is the workspace root.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeSet::is_empty",
+        with = "by_directory"
+    )]
     pub listings: BTreeSet<String>,
     /// Paths it found, without reading them. A file among them is keyed by
     /// its content all the same: a tool that compares timestamps, as
     /// `tsc --build` does, decides by a file it never reads.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeSet::is_empty",
+        with = "by_directory"
+    )]
     pub present: BTreeSet<String>,
     /// Paths it looked for and did not find.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeSet::is_empty",
+        with = "by_directory"
+    )]
     pub absent: BTreeSet<String>,
     /// Paths it wrote in the directories it listed, left out of their
     /// listings: they are there after it runs, and need not be before.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeSet::is_empty",
+        with = "by_directory"
+    )]
     pub written: BTreeSet<String>,
     /// How its paths were when it was recorded, to tell which changed once
     /// its key no longer matches. Not part of the set, nor of its key: sets
@@ -482,13 +507,32 @@ impl PathSet {
             .map(|(entry, _, _)| Some(format!("{} added or changed", name(entry))))
     }
 
-    /// The set's paths, as its key holds them.
+    /// The set's paths, as its key holds them: each in full, as version 1
+    /// kept them, so that a set keys the same whichever version it came in.
     pub fn digest(&self) -> Result<String> {
-        let paths = Self {
-            recorded: None,
-            ..self.clone()
-        };
-        key(&serde_json::to_value(paths)?)
+        fn none(paths: &&BTreeSet<String>) -> bool {
+            paths.is_empty()
+        }
+        #[derive(Serialize)]
+        struct Paths<'a> {
+            #[serde(skip_serializing_if = "none")]
+            reads: &'a BTreeSet<String>,
+            #[serde(skip_serializing_if = "none")]
+            listings: &'a BTreeSet<String>,
+            #[serde(skip_serializing_if = "none")]
+            present: &'a BTreeSet<String>,
+            #[serde(skip_serializing_if = "none")]
+            absent: &'a BTreeSet<String>,
+            #[serde(skip_serializing_if = "none")]
+            written: &'a BTreeSet<String>,
+        }
+        key(&serde_json::to_value(Paths {
+            reads: &self.reads,
+            listings: &self.listings,
+            present: &self.present,
+            absent: &self.absent,
+            written: &self.written,
+        })?)
     }
 
     /// The paths that are not as they were when it was recorded, each with
@@ -518,11 +562,17 @@ impl PathSet {
                 changed.push((path.as_str(), "listed"));
             }
         }
-        for (paths, how) in [(&self.present, "found"), (&self.absent, "looked for")] {
-            for path in paths {
-                if differs(&recorded.existence, &now.existence, path) {
-                    changed.push((path.as_str(), how));
-                }
+        for path in &self.present {
+            if differs(&recorded.existence, &now.existence, path) {
+                changed.push((path.as_str(), "found"));
+            }
+        }
+        // A path found missing keeps no record of that while it was.
+        let missing = missing()?;
+        for path in &self.absent {
+            let then = recorded.existence.get(path).unwrap_or(&missing);
+            if Some(then) != now.existence.get(path) {
+                changed.push((path.as_str(), "looked for"));
             }
         }
         Ok(changed)
@@ -633,6 +683,11 @@ impl PathSet {
         }
         Ok(Value::Object(listed))
     }
+}
+
+/// The digest [`Values`] holds for a path that is missing.
+fn missing() -> Result<String> {
+    Ok(key(&json!("absent"))?[..16].to_owned())
 }
 
 /// The directory a workspace-relative path is in, `.` for the root.
@@ -1022,7 +1077,7 @@ pub(crate) fn load(cache: &Path, weak: &str) -> Vec<PathSet> {
     std::fs::read(location(cache, weak))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Stored>(&bytes).ok())
-        .filter(|stored| stored.version == 1 && stored.weak == weak)
+        .filter(|stored| matches!(stored.version, 1 | VERSION) && stored.weak == weak)
         .map(|stored| stored.sets)
         .unwrap_or_default()
 }
@@ -1077,7 +1132,7 @@ pub(crate) fn within(record: &[u8], largest: usize) -> Result<Option<Vec<u8>>> {
 pub(crate) fn merge(cache: &Path, weak: &str, record: &[u8]) -> Result<Vec<PathSet>> {
     let Some(fetched) = serde_json::from_slice::<Stored>(record)
         .ok()
-        .filter(|stored| stored.version == 1 && stored.weak == weak)
+        .filter(|stored| matches!(stored.version, 1 | VERSION) && stored.weak == weak)
     else {
         return Ok(Vec::new());
     };
@@ -1107,7 +1162,7 @@ fn keep(cache: &Path, weak: &str, mut sets: Vec<PathSet>) -> Result<()> {
         cache,
         &location(cache, weak),
         &Stored {
-            version: 1,
+            version: VERSION,
             weak: weak.to_owned(),
             sets,
         },
@@ -1145,7 +1200,14 @@ pub(crate) fn with_values(
 ) -> Result<(String, PathSet)> {
     let values = set.values(snapshot, root, unlisted)?;
     let strong = keyed(weak, &set, &values)?;
-    set.recorded = Some(Values::of(&values)?);
+    let mut recorded = Values::of(&values)?;
+    // Most of what a task looks up it finds missing, such as each extension
+    // a module resolver tries: those that still are are left to be assumed.
+    let missing = missing()?;
+    recorded
+        .existence
+        .retain(|path, digest| !set.absent.contains(path) || *digest != missing);
+    set.recorded = Some(recorded);
     Ok((strong, set))
 }
 
@@ -1179,6 +1241,65 @@ fn changed(metadata: &std::fs::Metadata) -> SystemTime {
         }
     }
     modified
+}
+
+/// A record's lists of paths, by the directory each path is in, so that a
+/// directory is written once rather than for every path in it: a path is its
+/// directory, up to and with its last `/`, followed by its name. A list of
+/// whole paths, as version 1 kept them, is read too.
+mod by_directory {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::fmt;
+
+    use serde::de::{MapAccess, SeqAccess, Visitor};
+    use serde::{Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        paths: &BTreeSet<String>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let mut grouped: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for path in paths {
+            let name = path.rfind('/').map_or(0, |slash| slash + 1);
+            grouped
+                .entry(&path[..name])
+                .or_default()
+                .push(&path[name..]);
+        }
+        grouped.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<BTreeSet<String>, D::Error> {
+        deserializer.deserialize_any(Paths)
+    }
+
+    struct Paths;
+
+    impl<'de> Visitor<'de> for Paths {
+        type Value = BTreeSet<String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("paths by directory, or a list of paths")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut paths = BTreeSet::new();
+            while let Some((directory, names)) = map.next_entry::<String, Vec<String>>()? {
+                paths.extend(names.into_iter().map(|name| format!("{directory}{name}")));
+            }
+            Ok(paths)
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut paths = BTreeSet::new();
+            while let Some(path) = seq.next_element::<String>()? {
+                paths.insert(path);
+            }
+            Ok(paths)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1618,6 +1739,10 @@ mod tests {
         assert_eq!(kept_key, first);
         assert_eq!(kept, set);
         assert_eq!(kept.digest().unwrap(), set.digest().unwrap());
+        // A path still missing is assumed so rather than kept.
+        let existence = &kept.recorded.as_ref().unwrap().existence;
+        assert!(existence.contains_key("checked.txt"));
+        assert!(!existence.contains_key("optional.txt"));
         assert!(
             kept.changed(&snapshot, &root, &unlisted)
                 .unwrap()
@@ -1708,6 +1833,74 @@ mod tests {
             6
         );
         assert_eq!(load(temp.path(), "weak").len(), KEPT);
+    }
+
+    #[test]
+    fn keeps_paths_by_directory_and_reads_whole_paths_too() {
+        let set = PathSet {
+            reads: ["a.txt", "src/a.ts", "src/b.ts", "src/lib/c.ts"]
+                .map(String::from)
+                .into(),
+            present: [".", "/abs", "../escape", "dir/"].map(String::from).into(),
+            absent: ["src/a.js", "src/a.mjs"].map(String::from).into(),
+            ..PathSet::default()
+        };
+        let json = serde_json::to_value(&set).unwrap();
+        assert_eq!(
+            json["reads"],
+            json!({"": ["a.txt"], "src/": ["a.ts", "b.ts"], "src/lib/": ["c.ts"]})
+        );
+        assert_eq!(json["absent"], json!({"src/": ["a.js", "a.mjs"]}));
+        // Every path comes back as it was, those outside the workspace too,
+        // so that a fetched set naming one is still turned away.
+        let read: PathSet = serde_json::from_value(json).unwrap();
+        assert_eq!(read, set);
+        assert!(!read.is_relative());
+        let whole: PathSet = serde_json::from_value(json!({
+            "reads": ["a.txt", "src/a.ts", "src/b.ts", "src/lib/c.ts"],
+            "present": [".", "/abs", "../escape", "dir/"],
+            "absent": ["src/a.js", "src/a.mjs"],
+        }))
+        .unwrap();
+        assert_eq!(whole, set);
+    }
+
+    #[test]
+    fn a_set_keys_as_its_whole_paths() {
+        let set = PathSet {
+            reads: ["src/a.ts".into()].into(),
+            absent: ["src/a.js".into()].into(),
+            ..PathSet::default()
+        };
+        assert_eq!(
+            set.digest().unwrap(),
+            key(&json!({"reads": ["src/a.ts"], "absent": ["src/a.js"]})).unwrap()
+        );
+    }
+
+    #[test]
+    fn reads_the_records_of_version_1() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("tmp")).unwrap();
+        let record = serde_json::to_vec(&json!({
+            "version": 1,
+            "weak": "weak",
+            "sets": [{"reads": ["src/a.ts"], "absent": ["src/a.js"]}],
+        }))
+        .unwrap();
+        let set = PathSet {
+            reads: ["src/a.ts".into()].into(),
+            absent: ["src/a.js".into()].into(),
+            ..PathSet::default()
+        };
+        assert_eq!(
+            merge(temp.path(), "weak", &record).unwrap(),
+            std::slice::from_ref(&set)
+        );
+        assert_eq!(load(temp.path(), "weak"), [set]);
+        let kept: Value =
+            serde_json::from_slice(&super::record(temp.path(), "weak").unwrap()).unwrap();
+        assert_eq!(kept["version"], VERSION);
     }
 
     #[test]
