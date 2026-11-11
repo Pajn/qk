@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
+use foldhash::HashSet;
 use qk_config::Workspace;
 use qk_taskgraph::Task;
 
@@ -248,7 +250,32 @@ pub(crate) fn validate_pattern(pattern: &str) -> Result<()> {
     validate_path(&path)
 }
 
+/// Fails when a directory `path` names below `root`, up to its parent, is a
+/// link or not a directory. Missing ones are fine.
 pub fn safe_parents(root: &Path, path: &str) -> Result<()> {
+    check_parents(root, path, "cache artifact", None)
+}
+
+/// [`safe_parents`] for many paths under the same directories: a directory
+/// in `known` is not looked at again, and each one found is added to it.
+/// `what` names the paths in errors. A directory stays known, so share `known`
+/// only while nothing can put a link in a known directory's place, as within
+/// one restore that refuses to replace a directory, or one run's inputs.
+pub fn safe_parents_once(
+    root: &Path,
+    path: &str,
+    what: &str,
+    known: &Mutex<HashSet<PathBuf>>,
+) -> Result<()> {
+    check_parents(root, path, what, Some(known))
+}
+
+fn check_parents(
+    root: &Path,
+    path: &str,
+    what: &str,
+    known: Option<&Mutex<HashSet<PathBuf>>>,
+) -> Result<()> {
     validate_path(path)?;
     let mut current = root.to_owned();
     for part in Path::new(path)
@@ -257,15 +284,21 @@ pub fn safe_parents(root: &Path, path: &str) -> Result<()> {
         .flat_map(Path::components)
     {
         current.push(part);
+        if known.is_some_and(|known| known.lock().unwrap().contains(&current)) {
+            continue;
+        }
         match std::fs::symlink_metadata(&current) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
-                bail!("cache artifact parent is a symlink: {}", current.display())
+                bail!("{what} parent is a symlink: {}", current.display())
             }
-            Ok(metadata) if !metadata.is_dir() => bail!(
-                "cache artifact parent is not a directory: {}",
-                current.display()
-            ),
-            Ok(_) => {}
+            Ok(metadata) if !metadata.is_dir() => {
+                bail!("{what} parent is not a directory: {}", current.display())
+            }
+            Ok(_) => {
+                if let Some(known) = known {
+                    known.lock().unwrap().insert(current.clone());
+                }
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
@@ -1695,6 +1728,35 @@ mod tests {
         std::os::unix::fs::symlink(root.join("outside"), root.join("dist/link")).unwrap();
         let outputs = Outputs::from_paths(&["dist".into(), "dist/link/nested".into()]).unwrap();
         assert!(outputs.entries(root).is_err());
+    }
+
+    /// Checking many paths looks at a directory once it has been seen to be
+    /// one, and only then: one missing when checked is looked at again, so a
+    /// link put there afterwards is still refused.
+    #[cfg(unix)]
+    #[test]
+    fn parents_checked_once_remember_only_directories_they_found() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        let known = std::sync::Mutex::default();
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        super::safe_parents_once(root, "a/b/c/file", "warm", &known).unwrap();
+        let seen = known.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2);
+        assert!(seen.contains(&root.join("a")) && seen.contains(&root.join("a/b")));
+
+        std::fs::create_dir_all(root.join("outside")).unwrap();
+        std::os::unix::fs::symlink(root.join("outside"), root.join("a/b/c")).unwrap();
+        let error = super::safe_parents_once(root, "a/b/c/file", "warm", &known).unwrap_err();
+        assert!(error.to_string().starts_with("warm parent is a symlink"));
+
+        std::fs::write(root.join("a/file"), "").unwrap();
+        let error = super::safe_parents_once(root, "a/file/x", "warm", &known).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("warm parent is not a directory")
+        );
     }
 
     /// A project's root and name go into its outputs as the paths they are;

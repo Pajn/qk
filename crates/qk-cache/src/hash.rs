@@ -1045,32 +1045,7 @@ impl Snapshot {
 
     /// `paths::safe_parents`, checking each directory once per run.
     fn safe_parents(&self, root: &Path, path: &str) -> Result<()> {
-        paths::validate_path(path)?;
-        let mut current = root.to_owned();
-        for part in Path::new(path)
-            .parent()
-            .into_iter()
-            .flat_map(Path::components)
-        {
-            current.push(part);
-            if self.directories.lock().unwrap().contains(&current) {
-                continue;
-            }
-            match std::fs::symlink_metadata(&current) {
-                Ok(metadata) if metadata.file_type().is_symlink() => {
-                    bail!("input parent is a symlink: {}", current.display())
-                }
-                Ok(metadata) if !metadata.is_dir() => {
-                    bail!("input parent is not a directory: {}", current.display())
-                }
-                Ok(_) => {
-                    self.directories.lock().unwrap().insert(current.clone());
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Ok(())
+        paths::safe_parents_once(root, path, "input", &self.directories)
     }
 
     fn installed(&self, root: &Path, task: &str) -> Result<Option<Arc<Installed>>> {

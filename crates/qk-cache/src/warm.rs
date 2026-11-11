@@ -25,6 +25,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -74,7 +75,7 @@ pub const FIELDS: &[&str] = &[
 /// How many saves are kept for a task, across worktrees and keys.
 const KEPT: usize = 8;
 /// Files restored at once.
-const RESTORERS: usize = 8;
+const RESTORERS: usize = 16;
 
 /// A warm file to restore: its path, blob, mode, destination and modification time.
 type PendingFile<'a> = (&'a String, &'a str, u32, PathBuf, SystemTime);
@@ -1620,8 +1621,12 @@ impl Cache {
         let mut created = BTreeSet::new();
         let mut directories = Vec::new();
         let mut pending = Vec::new();
+        // A deep tree shares its ancestors between thousands of paths, so each
+        // is looked at once. One seen as a directory stays one: a link is laid
+        // out before any path below it, and is not laid over a directory.
+        let checked = Mutex::default();
         for (path, artifact) in &group.artifacts {
-            paths::safe_parents(&location.base, path)?;
+            paths::safe_parents_once(&location.base, path, "cache artifact", &checked)?;
             if !location.matches(path) {
                 bail!("warm state for {task} holds {path}, outside its paths");
             }
