@@ -36,11 +36,24 @@ fn frame(output: &mut impl Write, kind: u8, payload: &[u8]) -> std::io::Result<(
 /// writes through a buffer: stdout flushes at every newline byte, which
 /// binary frames hold everywhere, and the helper flushes when it needs to.
 pub fn serve() -> Result<()> {
+    // As large a pipe as an unprivileged process may ask for by default, so
+    // that a burst of events waits in it rather than in the ring buffer.
+    // SAFETY: fcntl on standard output, which this process holds.
+    unsafe {
+        libc::fcntl(
+            libc::STDOUT_FILENO,
+            libc::F_SETPIPE_SZ,
+            OUTPUT_BUFFER as libc::c_int,
+        )
+    };
     run(
         std::io::BufReader::new(std::io::stdin()),
-        std::io::BufWriter::new(std::io::stdout().lock()),
+        std::io::BufWriter::with_capacity(OUTPUT_BUFFER, std::io::stdout().lock()),
     )
 }
+
+/// How many bytes of events are written to qk at once.
+pub(crate) const OUTPUT_BUFFER: usize = 1 << 20;
 
 /// Runs the helper over `input` and `output`, its standard input and output.
 pub fn run(input: impl BufRead + Send + 'static, mut output: impl Write) -> Result<()> {
