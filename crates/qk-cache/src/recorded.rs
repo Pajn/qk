@@ -159,11 +159,13 @@ pub struct Exclusions<'a> {
 #[derive(Default)]
 pub struct Produced {
     /// The declared outputs of the tasks the task depends on.
-    pub upstream: Vec<Outputs>,
+    upstream: Vec<Outputs>,
     /// Directories naming a `node_modules` directory, workspace-relative.
-    pub roots: Vec<String>,
+    roots: Vec<String>,
     /// The outputs of the tasks it depends on as they declare them, sorted.
     pub declared: Vec<Vec<String>>,
+    /// The bounds of `upstream`: an output is or lies below one of them.
+    bounds: BTreeSet<String>,
 }
 
 impl Produced {
@@ -179,10 +181,15 @@ impl Produced {
             .collect();
         roots.sort_unstable();
         roots.dedup();
+        let bounds = upstream
+            .iter()
+            .flat_map(|outputs| outputs.bounds().map(str::to_owned))
+            .collect();
         Self {
             upstream,
             roots,
             declared: Vec::new(),
+            bounds,
         }
     }
 
@@ -195,10 +202,23 @@ impl Produced {
 
     /// Whether `path`, workspace-relative, is produced rather than installed,
     /// or a directory in `node_modules` holding what is.
+    ///
+    /// Asked of every access in `node_modules` a trace holds, so the output
+    /// patterns are only matched within one of their bounds.
     pub fn holds(&self, path: &str) -> bool {
         self.roots.iter().any(|root| {
             path == root || under(path, root) || (under(root, path) && inside_node_modules(path))
-        }) || self.upstream.iter().any(|outputs| outputs.matches(path))
+        }) || self.within_bounds(path) && self.upstream.iter().any(|outputs| outputs.matches(path))
+    }
+
+    /// Whether `path` is one of the upstream outputs' bounds or lies below
+    /// one.
+    fn within_bounds(&self, path: &str) -> bool {
+        self.bounds.contains("")
+            || std::iter::successors(Some(path), |path| {
+                path.rsplit_once('/').map(|(parent, _)| parent)
+            })
+            .any(|ancestor| self.bounds.contains(ancestor))
     }
 
     /// Whether a listing of `path`, a directory in `node_modules`, is kept,
@@ -1382,6 +1402,65 @@ mod tests {
                 recorded: None,
             }
         );
+    }
+
+    #[test]
+    fn holds_what_any_upstream_output_matches() {
+        let upstream = || {
+            vec![
+                Outputs::from_paths(&["node_modules/.gen/app".into()]).unwrap(),
+                Outputs::from_paths(&["libs/*/node_modules/.out/**/*.js".into()]).unwrap(),
+                Outputs::from_paths(&[
+                    "libs/types/**/*.d.ts".into(),
+                    "!libs/types/skip.d.ts".into(),
+                ])
+                .unwrap(),
+                // Matched as `packages/scope/node_modules/pkg/{foo,bar}.js`,
+                // outside its anchor, `packages/@scope/node_modules/pkg`.
+                Outputs::from_paths(&["packages/@scope/node_modules/pkg/(foo|bar).js".into()])
+                    .unwrap(),
+                // Matched below `vendor`, as `\/` is a literal `/`.
+                Outputs::from_paths(&[r"vendor/lib\/node_modules/pkg/*.js".into()]).unwrap(),
+            ]
+        };
+        let produced = Produced::new(upstream(), Vec::new());
+        // A bound of the workspace root would let every path through.
+        assert!(!produced.bounds.contains(""));
+        let outputs = upstream();
+        for path in [
+            "node_modules/.gen/app",
+            "node_modules/.gen/app/index.js",
+            "node_modules/.gen",
+            "node_modules/.gen/other",
+            "node_modules/react/index.js",
+            "libs/a/node_modules/.out/x/y.js",
+            "libs/a/node_modules/.out/x/y.ts",
+            "libs/a/node_modules/react/index.js",
+            "libs/types/a/b.d.ts",
+            "libs/types/skip.d.ts",
+            "libs/typesx/a.d.ts",
+            "packages/scope/node_modules/pkg/foo.js",
+            "packages/@scope/node_modules/pkg/foo.js",
+            "vendor/lib/node_modules/pkg/a.js",
+            "vendor/other/a.js",
+            ".",
+        ] {
+            let matching_every_output = produced.roots.iter().any(|root| {
+                path == root
+                    || under(path, root)
+                    || (under(root, path) && inside_node_modules(path))
+            }) || outputs.iter().any(|outputs| outputs.matches(path));
+            assert_eq!(produced.holds(path), matching_every_output, "{path}");
+        }
+        assert!(produced.holds("packages/scope/node_modules/pkg/foo.js"));
+        assert!(produced.holds("vendor/lib/node_modules/pkg/a.js"));
+        // An escaped `/` in the first segment bounds an output by the root.
+        let rooted = Produced::new(
+            vec![Outputs::from_paths(&[r"vendor\/node_modules/pkg/*.js".into()]).unwrap()],
+            Vec::new(),
+        );
+        assert!(rooted.bounds.contains(""));
+        assert!(rooted.holds("vendor/node_modules/pkg/a.js"));
     }
 
     /// What upstream tasks write into `node_modules`, and what an
