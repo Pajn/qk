@@ -44,6 +44,8 @@ const LARGEST_BLOB = 5 * 2 ** 30;
 /** How many compressed bytes of blobs stored apart one pack carries inline. */
 const INLINE_APART_BUDGET = 64 << 20;
 const LARGEST_MISSING_QUERY = 4096;
+/** How an answer to `POST blobs/fetch` starts. */
+const BLOBS_MAGIC = new TextEncoder().encode("qkb1");
 const LARGEST_LISTING = 32 << 20;
 /** The largest upload of a weak key's path sets, which cite no blob. */
 const LARGEST_PATH_SETS = 16 << 20;
@@ -134,6 +136,9 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
   }
   if (path === "blobs/missing" && method === "POST") {
     return missingBlobs(request, env);
+  }
+  if (path === "blobs/fetch" && method === "POST") {
+    return fetchBlobs(request, env);
   }
   if (path === "index" && method === "GET") {
     return listIndex(url, env);
@@ -690,7 +695,9 @@ function checkFrame(body: Uint8Array): void {
   }
 }
 
-async function missingBlobs(request: Request, env: Env): Promise<Response> {
+/** The hashes a `{"blobs": [...]}` body asks about, at most
+ * `LARGEST_MISSING_QUERY` of them. */
+async function askedBlobs(request: Request): Promise<string[]> {
   const body = await readBody(request, 1 << 20);
   let blobs: unknown;
   try {
@@ -701,6 +708,64 @@ async function missingBlobs(request: Request, env: Env): Promise<Response> {
   if (!Array.isArray(blobs) || blobs.length > LARGEST_MISSING_QUERY || !blobs.every(isHash)) {
     throw new Failure(400, "malformed", `blobs must be at most ${LARGEST_MISSING_QUERY} hashes`);
   }
+  return blobs;
+}
+
+/** Many blobs stored apart in one answer, those of a bundle in the order they
+ * lie in it so that neighbours are read as one range, while their frames fit
+ * the budget a pack has for them. */
+async function fetchBlobs(request: Request, env: Env): Promise<Response> {
+  const asked = [...new Set(await askedBlobs(request))];
+  const stored = await storedBlobs(asked, env);
+  const chosen: ({ hash: string } & StoredBlob)[] = [];
+  let budget = 0;
+  for (const hash of asked) {
+    const blob = stored.get(hash);
+    if (blob == null || budget + blob.size > INLINE_APART_BUDGET) {
+      continue;
+    }
+    budget += blob.size;
+    chosen.push({ hash, ...blob });
+  }
+  chosen.sort((a, b) => {
+    if (a.bundle === b.bundle) {
+      return a.offset - b.offset || (a.hash < b.hash ? -1 : 1);
+    }
+    // Blobs stored on their own after every bundle's.
+    if (a.bundle === null || b.bundle === null) {
+      return a.bundle === null ? 1 : -1;
+    }
+    return a.bundle < b.bundle ? -1 : 1;
+  });
+  const table = new Uint8Array(8 + chosen.length * 40);
+  const view = new DataView(table.buffer);
+  table.set(BLOBS_MAGIC, 0);
+  view.setUint32(4, chosen.length, true);
+  chosen.forEach((blob, index) => {
+    const at = 8 + index * 40;
+    for (let byte = 0; byte < 32; byte++) {
+      table[at + byte] = parseInt(blob.hash.slice(byte * 2, byte * 2 + 2), 16);
+    }
+    view.setBigUint64(at + 32, BigInt(blob.size), true);
+  });
+  const reads = readAhead(chosen, env);
+  async function* parts(): AsyncGenerator<Uint8Array> {
+    try {
+      yield table;
+      for (let index = 0; index < chosen.length; index++) {
+        yield* await reads.next();
+      }
+    } finally {
+      reads.close();
+    }
+  }
+  return new Response(streamOf(parts()), {
+    headers: { "Content-Type": "application/x-qk-blobs", "Cache-Control": "no-store" },
+  });
+}
+
+async function missingBlobs(request: Request, env: Env): Promise<Response> {
+  const blobs = await askedBlobs(request);
   const stored = await storedBlobs(blobs, env);
   return Response.json({
     missing: blobs.filter((hash) => stored.get(hash) === null),

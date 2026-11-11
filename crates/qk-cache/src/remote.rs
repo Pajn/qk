@@ -67,6 +67,10 @@ const LARGEST_UPLOAD: u64 = 5 << 30;
 const LARGEST_INDEX: usize = 32 << 20;
 /// Blobs stored apart one fetch requests at once.
 const BLOB_FETCHERS: usize = 8;
+/// Blobs stored apart asked for in one `POST blobs/fetch`, of the 4,096 the
+/// protocol allows: an answer carries at most 64 MiB of them, and smaller
+/// requests spread a fetch over more connections.
+const BLOBS_AT_ONCE: usize = 1024;
 /// Blobs stored apart requested at once by every fetch together, leaving
 /// connections for entries and uploads.
 const BLOB_REQUESTS: usize = 24;
@@ -989,6 +993,8 @@ impl Remote {
     ) -> Result<()> {
         let mut fetching = crate::profile::span(task, "remote_blobs");
         fetching.count("blobs", blobs.len() as u64);
+        let blobs = self.fetch_many_at_once(root, blobs, task, received);
+        fetching.count("one_each", blobs.len() as u64);
         let queue = Mutex::new(blobs.iter());
         let fetch = || -> Result<()> {
             loop {
@@ -1016,6 +1022,86 @@ impl Remote {
                 .collect();
             results.into_iter().collect()
         })
+    }
+
+    /// Fetches what it can of `blobs` many to a request, as `POST blobs/fetch`
+    /// sends them, a few requests at a time, and answers the rest, to be
+    /// fetched one each. An answer leaving some out, as past what one answer
+    /// carries, is followed by another asking for them, until one holds none
+    /// of what it was asked for: those the store does not store apart, which
+    /// a record may carry inline, are left to the requests that find them.
+    /// So are the blobs of a request that failed, whose failure, if it lasts,
+    /// the requests one each report.
+    fn fetch_many_at_once(
+        &self,
+        root: &Path,
+        blobs: &[String],
+        task: &str,
+        received: &AtomicU64,
+    ) -> Vec<String> {
+        let mut rest = Vec::new();
+        let mut queue: Vec<Vec<String>> = blobs
+            .chunks(BLOBS_AT_ONCE)
+            .map(<[String]>::to_vec)
+            .collect();
+        let one_each = AtomicBool::new(false);
+        while !queue.is_empty() {
+            let workers = queue.len().min(BLOB_FETCHERS);
+            let pending = Mutex::new(std::mem::take(&mut queue));
+            let again = Mutex::new(Vec::new());
+            let left = Mutex::new(Vec::new());
+            let fetch = || {
+                loop {
+                    // Taken on its own, so the queue is not held through the request.
+                    let next = pending.lock().unwrap().pop();
+                    let Some(asked) = next else { return };
+                    if one_each.load(Ordering::Relaxed) {
+                        left.lock().unwrap().extend(asked);
+                        continue;
+                    }
+                    let _slot = self.blob_requests.take();
+                    let names: HashSet<&str> = asked.iter().map(String::as_str).collect();
+                    let answer = self.store.get_blobs(&asked, task).and_then(|body| {
+                        body.map(|body| pack::read_blobs(root, body, &names))
+                            .transpose()
+                    });
+                    match answer {
+                        Ok(Some((kept, bytes))) => {
+                            received.fetch_add(bytes, Ordering::Relaxed);
+                            let kept: HashSet<&str> = kept.iter().map(String::as_str).collect();
+                            let missed: Vec<String> = asked
+                                .iter()
+                                .filter(|hash| !kept.contains(hash.as_str()))
+                                .cloned()
+                                .collect();
+                            if kept.is_empty() {
+                                left.lock().unwrap().extend(missed);
+                            } else if !missed.is_empty() {
+                                again.lock().unwrap().push(missed);
+                            }
+                        }
+                        Ok(None) => {
+                            one_each.store(true, Ordering::Relaxed);
+                            left.lock().unwrap().extend(asked);
+                        }
+                        // Those it kept before failing are kept.
+                        Err(_) => left.lock().unwrap().extend(
+                            asked
+                                .into_iter()
+                                .filter(|hash| !root.join("blobs").join(hash).is_file()),
+                        ),
+                    }
+                }
+            };
+            std::thread::scope(|scope| {
+                for _ in 0..workers {
+                    scope.spawn(fetch);
+                }
+            });
+            queue = again.into_inner().unwrap();
+            rest.extend(left.into_inner().unwrap());
+        }
+        rest
     }
 
     fn enqueue(self: &Arc<Self>, upload: Upload) {

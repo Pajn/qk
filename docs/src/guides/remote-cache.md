@@ -165,7 +165,13 @@ neither write announcements nor merge listings. A store server that takes
 bundles receives the small outputs an upload has no room for, past the 64 MiB
 it carries inline, many to an upload rather than one each, and moves small
 outputs stored one each before into bundles as records citing them are saved
-again: a large warm save restores in a few reads rather than thousands. `localMode`, `ciMode`, `uploadMode` and
+again. An entry or warm state also carries at most 64 MiB of its outputs
+stored apart when it is sent, and a run fetches the rest many to a request,
+up to 64 MiB each, rather than one each; the server reads the outputs of a
+bundle that lie next to each other together. So a large warm save restores
+in a few dozen requests rather than one for each of its outputs. From a
+store server that does not send outputs many at once, a run fetches them one
+each. `localMode`, `ciMode`, `uploadMode` and
 `NX_POWERPACK_CACHE_MODE` apply as they do for `s3`. A read token fetches; a
 write token also uploads.
 
@@ -200,7 +206,9 @@ taken an upload from through the proxy; until then, a token's uploads go to
 the store server as they came, so one that may only read is refused there. Asked whether it holds an
 output it lacks, the proxy says it does not without asking the store server,
 so the output comes over the local network, and the proxy asks the store
-server itself before sending it on. The proxy queues them in
+server itself before sending it on. Asked for many outputs at once, it
+fetches those it lacks from the store server many at once too, keeps them,
+and answers from its disk. The proxy queues uploads in
 `queue/` under its directory, the client's token with each, and sends them
 on in the background, an entry or warm state after the outputs it cites,
 asking the store server which outputs it lacks many at a time. It sends again what the store server could not take for

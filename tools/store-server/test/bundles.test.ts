@@ -2,28 +2,7 @@ import { decompress } from "fzstd";
 import { describe, expect, it } from "vitest";
 import { buildUpload, rawFrame } from "../src/frames";
 import { blobReads } from "../src/worker";
-import { READ, blob, expectedPack, hash, hex, putApart, record, request, sorted, upload, type TestBlob } from "./helpers";
-
-async function sha256(data: Uint8Array): Promise<string> {
-  return hex(new Uint8Array(await crypto.subtle.digest("SHA-256", data.slice())));
-}
-
-/** The body of a bundle carrying `blobs`, and the name it is stored under. */
-async function bundle(blobs: TestBlob[]): Promise<{ id: string; body: Uint8Array }> {
-  const body = buildUpload(
-    new Uint8Array(0),
-    sorted(blobs).map((blob) => ({ hash: blob.hash, raw: blob.raw.length, frame: rawFrame(blob.raw) })),
-  );
-  const length = new DataView(body.buffer, body.byteOffset).getUint32(0, true);
-  return { id: await sha256(body.subarray(4, 4 + length)), body };
-}
-
-async function putBundle(blobs: TestBlob[]): Promise<string> {
-  const { id, body } = await bundle(blobs);
-  const response = await request("PUT", `bundles/${id}`, { body });
-  expect(response.status, await response.clone().text()).toBe(204);
-  return id;
-}
+import { READ, blob, bundle, expectedPack, hash, putApart, putBundle, record, request, sha256, sorted, upload, type TestBlob } from "./helpers";
 
 async function missing(hashes: string[]): Promise<{ missing: string[]; loose: string[] }> {
   const response = await request("POST", "blobs/missing", { token: READ, body: JSON.stringify({ blobs: hashes }) });

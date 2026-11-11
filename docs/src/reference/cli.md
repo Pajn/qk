@@ -169,7 +169,8 @@ the part of the wait the server spent, the rest being the network. The last adds
 `apart_bytes`, what was received for outputs stored apart, and
 `skipped_bytes`, the outputs stored apart that were not fetched because the
 local cache held them. Fetching outputs stored apart is `remote_blobs`, with
-their count, and waiting for another fetch of the same entry is
+their count and `one_each`, how many of them took a request each rather than
+coming many to a request, and waiting for another fetch of the same entry is
 `remote_flight_wait`. Fetches made ahead of the tasks that need them are
 timed under the task `prefetch`, and a run that prefetched ends with
 `task=run stage=remote_prefetch`, counting the `entries` fetched ahead, those

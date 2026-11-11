@@ -101,6 +101,30 @@ server's part of a wait from the network's by it.
 Answer: `200`, the blob as one zstd frame; or `404`. With `entry` or `warm`, a
 blob that record carries inline is found there too.
 
+### `POST blobs/fetch`
+
+Optional: a server that does not take it answers `404`, and clients fetch
+each blob with `GET blobs/<hash>`; the reference server here takes it.
+Body: `{"blobs": [<hash>, …]}`, at most 4,096. Answer: `200`,
+`application/x-qk-blobs`, many blobs stored apart in one answer:
+
+```text
+"qkb1"
+u32 LE count
+for each blob listed: its hash as 32 bytes, then u64 LE length of its frame
+each listed blob's frame, as GET blobs/<hash> answers it, in the order listed
+```
+
+It lists blobs asked for that the server stores apart, each once and in any
+order, while their frames total at most 64 MiB. A blob not stored apart, or
+past that, is left out. So a server can read the blobs of a bundle that lie
+next to each other in one read, and send many in one answer, where a request
+each would take a round trip each.
+
+A client asks again for the blobs left out while an answer lists any of them,
+and fetches the rest one each with `GET blobs/<hash>`, which also finds a blob
+that a record carries inline.
+
 ### `POST blobs/missing`
 
 Body: `{"blobs": [<hash>, …]}`, at most 4,096. Answer:

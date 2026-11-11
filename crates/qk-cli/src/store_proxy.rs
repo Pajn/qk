@@ -57,6 +57,11 @@ const RETRY_PAUSE: Duration = Duration::from_secs(60);
 /// Times the upstream may answer that it lacks a record's blobs, each sent
 /// again, before the record is given up.
 const MISSING_ROUNDS: u32 = 3;
+/// Blobs one `POST blobs/fetch` may ask for, as the protocol allows.
+const FETCH_QUERY: usize = 4096;
+/// How many bytes of frames one answer to `POST blobs/fetch` carries, as a
+/// store server's does.
+const FETCH_BUDGET: u64 = 64 << 20;
 
 pub struct Options {
     pub upstream: String,
@@ -108,6 +113,10 @@ struct Proxy {
     /// Bundles go to it as they came from then on, so that clients see its
     /// refusal and send their blobs one each.
     upstream_refuses_bundles: AtomicBool,
+    /// Whether the upstream answered `POST blobs/fetch` with `404`, as one
+    /// that sends blobs only one each. The proxy then answers it with the
+    /// blobs it holds, and clients fetch the rest one each through it.
+    upstream_fetches_one_each: AtomicBool,
     max_size: Option<u64>,
     /// Tokens the upstream accepted, which may read blobs held here.
     trusted: Mutex<HashSet<String>>,
@@ -209,6 +218,7 @@ impl Proxy {
             record_sent: Condvar::new(),
             upstream_holds: Mutex::new(HashMap::new()),
             upstream_refuses_bundles: AtomicBool::new(false),
+            upstream_fetches_one_each: AtomicBool::new(false),
             index: Mutex::new(None),
             catching_up: Mutex::new(None),
             max_size: options.max_size,
@@ -435,6 +445,16 @@ fn handle(
             proxy.stats.local_bytes.fetch_add(sent, Ordering::Relaxed);
         }
         return Ok((200, "local", sent));
+    }
+    // Many blobs at once, from those held here once the upstream has sent
+    // those it lacks. A body that does not parse goes upstream as it came.
+    if request.method == "POST"
+        && path == "/v4/blobs/fetch"
+        && proxy.trusts(request)
+        && let Some(asked) = fetch_query(&request.body)
+    {
+        let sent = proxy.fetch_blobs(&asked, request, writer)?;
+        return Ok((200, "proxy", sent));
     }
     // An entry or warm record still queued is the newest; the upstream has
     // an older one or none. Once sent on, it is kept and served too.
@@ -769,6 +789,120 @@ impl Proxy {
             drop(queued);
         }
         self.size.store(size, Ordering::Relaxed);
+    }
+
+    /// Answers `POST blobs/fetch` for `asked` with the blobs held here, after
+    /// fetching from the upstream, many at once, those it lacks. The answer
+    /// is the store server's format, within its budget; what it leaves out,
+    /// the client asks for again.
+    fn fetch_blobs(
+        &self,
+        asked: &[String],
+        request: &Request,
+        writer: &mut impl Write,
+    ) -> Result<u64> {
+        let lacking: Vec<&String> = asked.iter().filter(|hash| !self.held(hash)).collect();
+        if !lacking.is_empty()
+            && !self.upstream_fetches_one_each.load(Ordering::Relaxed)
+            && let Some(token) = &request.authorization
+        {
+            // A failure leaves the blobs out, for the client to fetch one each.
+            let _ = self.fetch_upstream(&lacking, token);
+        }
+        let mut listed = Vec::new();
+        let mut total = 0;
+        for hash in asked {
+            let Ok(file) = File::open(self.blobs.join(hash)) else {
+                continue;
+            };
+            let length = file.metadata()?.len();
+            if total + length > FETCH_BUDGET {
+                continue;
+            }
+            total += length;
+            listed.push((hash, file, length));
+        }
+        let mut table = Vec::with_capacity(8 + 40 * listed.len());
+        table.extend_from_slice(b"qkb1");
+        table.extend_from_slice(&(listed.len() as u32).to_le_bytes());
+        for (hash, _, length) in &listed {
+            table.extend(hash_bytes(hash).context("a held blob's name is not a hash")?);
+            table.extend_from_slice(&length.to_le_bytes());
+        }
+        head(
+            writer,
+            200,
+            &[("content-type", "application/x-qk-blobs")],
+            Some(table.len() as u64 + total),
+        )?;
+        writer.write_all(&table)?;
+        let served = listed.len() as u64;
+        for (hash, file, length) in listed {
+            // Held open, so eviction meanwhile does not cut it short.
+            if io::copy(&mut BufReader::new(file).take(length), writer)? != length {
+                bail!("held blob {hash} changed while it was sent");
+            }
+        }
+        self.stats.local_hits.fetch_add(served, Ordering::Relaxed);
+        self.stats.local_bytes.fetch_add(total, Ordering::Relaxed);
+        Ok(table.len() as u64 + total)
+    }
+
+    /// Fetches `blobs` from the upstream many at once and keeps those it sends.
+    fn fetch_upstream(&self, blobs: &[&String], token: &str) -> Result<()> {
+        self.stats.upstream_requests.fetch_add(1, Ordering::Relaxed);
+        let mut response = self
+            .agent
+            .post(format!("{}/v4/blobs/fetch", self.upstream))
+            .header("authorization", token)
+            .header("content-type", "application/json")
+            .send(serde_json::json!({ "blobs": blobs }).to_string())?;
+        match response.status().as_u16() {
+            200 => {}
+            404 => {
+                self.upstream_fetches_one_each
+                    .store(true, Ordering::Relaxed);
+                return Ok(());
+            }
+            status => bail!("the upstream answered POST blobs/fetch with {status}"),
+        }
+        let mut body = BufReader::new(response.body_mut().as_reader());
+        let mut start = [0; 8];
+        body.read_exact(&mut start)?;
+        if &start[..4] != b"qkb1" {
+            bail!("the upstream's blobs are not a qkb1 answer");
+        }
+        let count = u32::from_le_bytes(start[4..].try_into()?) as usize;
+        if count > blobs.len() {
+            bail!("the upstream listed more blobs than were asked for");
+        }
+        let mut listed = Vec::with_capacity(count);
+        for _ in 0..count {
+            let mut entry = [0; 40];
+            body.read_exact(&mut entry)?;
+            let hash: String = entry[..32]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            if !blobs.iter().any(|asked| **asked == hash) {
+                bail!("the upstream listed {hash}, which was not asked for");
+            }
+            listed.push((hash, u64::from_le_bytes(entry[32..].try_into()?)));
+        }
+        let mut received = 8 + 40 * count as u64;
+        for (hash, length) in listed {
+            let mut file = tempfile::NamedTempFile::new_in(&self.scratch)?;
+            if io::copy(&mut (&mut body).take(length), &mut file)? != length {
+                bail!("the upstream's blobs end early");
+            }
+            received += length;
+            // Checked against its hash before it is kept.
+            self.store(&hash, file);
+        }
+        self.stats
+            .upstream_bytes
+            .fetch_add(received, Ordering::Relaxed);
+        Ok(())
     }
 
     fn stats_json(&self) -> String {
@@ -1646,6 +1780,42 @@ fn inline_blobs(body: &[u8]) -> Option<Vec<(String, &[u8])>> {
         at += size;
     }
     Some(blobs)
+}
+
+/// The distinct hashes a `POST blobs/fetch` body asks for, or `None` for a
+/// body that does not parse or asks for more than the protocol allows.
+fn fetch_query(body: &[u8]) -> Option<Vec<String>> {
+    let parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let listed = parsed.get("blobs")?.as_array()?;
+    if listed.len() > FETCH_QUERY {
+        return None;
+    }
+    let mut seen = HashSet::new();
+    let mut asked = Vec::new();
+    for hash in listed {
+        let hash = hash.as_str()?;
+        hash_bytes(hash)?;
+        if seen.insert(hash) {
+            asked.push(hash.to_owned());
+        }
+    }
+    Some(asked)
+}
+
+/// The 32 bytes a blob's name, 64 lowercase hex digits, stands for.
+fn hash_bytes(hash: &str) -> Option<[u8; 32]> {
+    if hash.len() != 64
+        || !hash
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return None;
+    }
+    let mut bytes = [0; 32];
+    for (at, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hash[at * 2..at * 2 + 2], 16).ok()?;
+    }
+    Some(bytes)
 }
 
 /// A request target without its query.

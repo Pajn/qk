@@ -99,6 +99,12 @@ pub(super) trait Store: Send + Sync {
     }
 
     /// Names the store, so that each keeps its own local copy of its index.
+    /// Many of `blobs`, stored apart, in one answer as `POST blobs/fetch`
+    /// gives it, or `None` where the store gives none that way.
+    fn get_blobs(&self, _blobs: &[String], _task: &str) -> Result<Option<Body>> {
+        Ok(None)
+    }
+
     fn location(&self) -> String;
 
     /// Brings `known` up to date with the index the store holds now.

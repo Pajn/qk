@@ -35,6 +35,11 @@ pub struct State {
     pub requests: Vec<(String, usize)>,
     /// Take every blob as held, as a filter's false positive would.
     pub omit_all: bool,
+    /// Answer `POST blobs/fetch` with 404, as a server from before it.
+    pub no_fetch: bool,
+    /// The bytes of frames one answer to `POST blobs/fetch` carries at most,
+    /// rather than the protocol's 64 MiB.
+    pub fetch_budget: Option<usize>,
     /// Answer the next entry commit with 422 for its blobs stored apart,
     /// forgetting them, as a store that lost them would.
     pub fail_commit_once: bool,
@@ -341,6 +346,41 @@ fn handle(
                 }
             };
             (200, Vec::new(), answer.to_string().into_bytes())
+        }
+        ("POST", "blobs/fetch") => {
+            if state.no_fetch {
+                return missing();
+            }
+            let asked: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            let budget = state.fetch_budget.unwrap_or(64 << 20);
+            let mut listed = Vec::new();
+            let mut total = 0;
+            for hash in asked["blobs"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+            {
+                if let Some(frame) = state.frame(hash)
+                    && total + frame.len() <= budget
+                    && !listed.iter().any(|(listed, _)| listed == hash)
+                {
+                    total += frame.len();
+                    listed.push((hash.to_owned(), frame.clone()));
+                }
+            }
+            let mut answer = b"qkb1".to_vec();
+            answer.extend_from_slice(&(listed.len() as u32).to_le_bytes());
+            for (hash, frame) in &listed {
+                answer.extend(
+                    (0..32).map(|at| u8::from_str_radix(&hash[at * 2..at * 2 + 2], 16).unwrap()),
+                );
+                answer.extend_from_slice(&(frame.len() as u64).to_le_bytes());
+            }
+            for (_, frame) in listed {
+                answer.extend(frame);
+            }
+            found(answer)
         }
         ("PUT", path) if path.starts_with("bundles/") => {
             if state.no_bundles || state.turns_bundles_away {

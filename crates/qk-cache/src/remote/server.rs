@@ -7,6 +7,7 @@ use std::collections::BTreeSet;
 use std::fs::File;
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread::JoinHandle;
 
@@ -32,6 +33,9 @@ pub(super) struct Server {
     session: OnceLock<Option<String>>,
     /// The session being made in the background.
     sessioning: Mutex<Option<JoinHandle<Option<String>>>>,
+    /// Whether the server answered `POST blobs/fetch` with `404`, as one that
+    /// sends blobs only one each.
+    fetches_one_each: AtomicBool,
 }
 
 /// The store server `config`, nx.json's `qk:storeServer` object, names, with its
@@ -54,6 +58,7 @@ pub(super) fn configure(
         agent: super::agent(),
         session: OnceLock::new(),
         sessioning: Mutex::new(None),
+        fetches_one_each: AtomicBool::new(false),
     })
 }
 
@@ -254,6 +259,30 @@ impl Store for Server {
                 Err(MissingBlobs(blobs).into())
             }
             _ => Err(failure(&format!("PUT {path}"), response)),
+        }
+    }
+
+    fn get_blobs(&self, blobs: &[String], task: &str) -> Result<Option<Body>> {
+        if self.fetches_one_each.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let waiting = crate::profile::span(task, "remote_response");
+        let response = self
+            .agent
+            .post(self.url("blobs/fetch"))
+            .header("Authorization", self.authorization())
+            .header("Content-Type", "application/json")
+            .send(serde_json::json!({ "blobs": blobs }).to_string())?;
+        drop(waiting);
+        match response.status().as_u16() {
+            200 => Ok(Some(Box::new(io::BufReader::new(
+                response.into_body().into_reader(),
+            )))),
+            404 => {
+                self.fetches_one_each.store(true, Ordering::Relaxed);
+                Ok(None)
+            }
+            _ => Err(failure("POST blobs/fetch", response)),
         }
     }
 

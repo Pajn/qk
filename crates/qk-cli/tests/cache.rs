@@ -1730,11 +1730,12 @@ fn a_store_proxy_serves_the_blobs_it_holds_and_passes_on_the_rest() {
         );
     };
     fetch();
+    // Blobs asked for one each or many at once.
     let fetched = |server: &store_server::FakeStoreServer| {
         server
             .requests("blobs/")
             .iter()
-            .filter(|(request, _)| request.starts_with("GET "))
+            .filter(|(request, _)| request.starts_with("GET ") || request == "POST /v4/blobs/fetch")
             .count()
     };
     assert_eq!(
@@ -1750,7 +1751,8 @@ fn a_store_proxy_serves_the_blobs_it_holds_and_passes_on_the_rest() {
         proxy.stats()
     );
 
-    // A proxy without them fetches each from the upstream once, and keeps it.
+    // A proxy without them fetches them from the upstream once, many at once,
+    // and keeps them.
     drop(proxy);
     let empty = TempDir::new().unwrap();
     let proxy = StoreProxy::start(&server.url, empty.path());
@@ -1771,40 +1773,111 @@ fn a_store_proxy_serves_the_blobs_it_holds_and_passes_on_the_rest() {
     fetch();
     let first = fetched(&server);
     assert!(first > 0);
+    // Only those the entry carries inline, which no answer holds, one each.
+    let stored_apart: Vec<String> = {
+        let state = server.state.lock().unwrap();
+        state
+            .blobs
+            .keys()
+            .chain(state.bundled.keys())
+            .cloned()
+            .collect()
+    };
+    let requests = server.requests("blobs/");
+    assert!(
+        requests
+            .iter()
+            .any(|(request, _)| request == "POST /v4/blobs/fetch"),
+        "{requests:?}"
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|(request, _)| request.starts_with("GET ")
+                && stored_apart
+                    .iter()
+                    .any(|hash| request.ends_with(hash.as_str()))),
+        "{requests:?}"
+    );
     fetch();
     assert_eq!(fetched(&server), first);
+    assert_eq!(executions(&fixture), 1);
+
+    // In front of an upstream that sends blobs only one each, the proxy
+    // answers with the blobs it holds, none, and they come one each through it.
+    server.state.lock().unwrap().no_fetch = true;
+    drop(proxy);
+    let empty = TempDir::new().unwrap();
+    let proxy = StoreProxy::start(&server.url, empty.path());
+    let env = [
+        ("QK_STORE_SERVER_URL", proxy.url.as_str()),
+        ("QK_REMOTE_BLOB_THRESHOLD", "1KB"),
+    ];
+    clear_local_cache(&fixture);
+    fs::remove_dir_all(fixture.root.join("dist")).unwrap();
+    let output = success(server_build(&fixture, store_server::READ_TOKEN, &env));
+    assert!(
+        stderr(&output).contains("qk: remote cache hit app:build"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(
+        fs::read(fixture.root.join("dist/0.bin")).unwrap(),
+        incompressible(8 << 10, 0)
+    );
     assert_eq!(executions(&fixture), 1);
 }
 
 // The target is a POSIX shell command.
 #[cfg(unix)]
 #[test]
-fn a_client_fetches_by_hash_what_a_store_server_wrongly_took_as_held() {
-    let server = store_server::FakeStoreServer::start();
-    let (fixture, _) = large_outputs(1);
-    with_store_server(&fixture, &server);
-    success(server_build(&fixture, store_server::WRITE_TOKEN, &[]));
-    server.state.lock().unwrap().omit_all = true;
-    clear_local_cache(&fixture);
-    fs::remove_dir_all(fixture.root.join("dist")).unwrap();
-    let output = success(server_build(&fixture, store_server::READ_TOKEN, &[]));
-    assert!(
-        stderr(&output).contains("qk: remote cache hit app:build"),
-        "{}",
-        stderr(&output)
-    );
-    // The large file, the small one and the log, each fetched once.
-    let gets = server
-        .requests("blobs/")
-        .into_iter()
-        .filter(|(request, _)| request.starts_with("GET "))
-        .count();
-    assert_eq!(gets, 3);
-    assert_eq!(
-        fs::read(fixture.root.join("dist/0.bin")).unwrap(),
-        incompressible(8 << 10, 0)
-    );
-    assert_eq!(executions(&fixture), 1);
+fn a_client_fetches_what_a_store_server_wrongly_took_as_held_many_at_once() {
+    // Three large files stored apart, and the small one and the log, which the
+    // entry carries inline. The large ones come in one answer, or in several,
+    // each asking for what the last left out. An answer leaves out the inline
+    // ones, which are then fetched one each, naming the entry. A server that
+    // sends blobs only one each takes a request for each.
+    for (no_fetch, budget, posts, gets) in [
+        (false, None, 2, 2),
+        (false, Some(9 << 10), 4, 2),
+        (true, None, 1, 5),
+    ] {
+        let server = store_server::FakeStoreServer::start();
+        let (fixture, env) = large_outputs(3);
+        with_store_server(&fixture, &server);
+        success(server_build(&fixture, store_server::WRITE_TOKEN, &env));
+        {
+            let mut state = server.state.lock().unwrap();
+            state.omit_all = true;
+            state.no_fetch = no_fetch;
+            state.fetch_budget = budget;
+        }
+        clear_local_cache(&fixture);
+        fs::remove_dir_all(fixture.root.join("dist")).unwrap();
+        let output = success(server_build(&fixture, store_server::READ_TOKEN, &env));
+        assert!(
+            stderr(&output).contains("qk: remote cache hit app:build"),
+            "{}",
+            stderr(&output)
+        );
+        let requests = server.requests("blobs/");
+        let count = |method: &str| {
+            requests
+                .iter()
+                .filter(|(request, _)| request.starts_with(method))
+                .count()
+        };
+        let case = format!("no_fetch {no_fetch}, budget {budget:?}: {requests:?}");
+        assert_eq!(count("POST /v4/blobs/fetch"), posts, "{case}");
+        assert_eq!(count("GET "), gets, "{case}");
+        for index in 0..3 {
+            assert_eq!(
+                fs::read(fixture.root.join(format!("dist/{index}.bin"))).unwrap(),
+                incompressible(8 << 10, index)
+            );
+        }
+        assert_eq!(executions(&fixture), 1);
+    }
 }
 
 // The target is a POSIX shell command.
