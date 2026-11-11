@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -32,25 +32,50 @@ const FLUSH_TIMEOUT: Duration = Duration::from_secs(60);
 /// How many bytes of a recording's events the reader gathers before handing
 /// them to its worker.
 const BATCH: usize = 256 * 1024;
+/// How many bytes of events, of every recording together, may wait for
+/// their workers: an eighth of the machine's memory. A recording whose
+/// events would go past it fails, as one whose events the kernel program
+/// dropped does, rather than the recorder growing without bound.
+fn backlog_limit() -> usize {
+    // SAFETY: sysconf has no preconditions.
+    let (pages, size) = unsafe {
+        (
+            libc::sysconf(libc::_SC_PHYS_PAGES),
+            libc::sysconf(libc::_SC_PAGESIZE),
+        )
+    };
+    usize::try_from(pages)
+        .ok()
+        .zip(usize::try_from(size).ok())
+        .map_or(1 << 30, |(pages, size)| pages.saturating_mul(size) / 8)
+}
 
 #[derive(Default)]
 struct Shared {
     recordings: Mutex<HashMap<u32, Recorded>>,
     flushed: Mutex<Flushed>,
     signal: Condvar,
+    /// How many bytes of events wait for their workers.
+    backlog: Arc<AtomicUsize>,
+    /// How many may, by [`backlog_limit`].
+    limit: usize,
 }
 
 struct Recorded {
     queue: mpsc::Sender<Message>,
     worker: JoinHandle<Applied>,
+    /// Set once nothing is to be made of the events its worker has left.
+    abandoned: Arc<AtomicBool>,
     /// Events of no group the program could count apart, dropped before it
     /// began, by the helper's last count.
     unattributed: u64,
 }
 
 impl Recorded {
-    /// Stops its worker without waiting for it.
+    /// Stops its worker without waiting for it, or for it to apply what it
+    /// was sent.
     fn abandon(self) {
+        self.abandoned.store(true, Ordering::Relaxed);
         let _ = self.queue.send(Message::End);
     }
 
@@ -66,12 +91,24 @@ impl Recorded {
 
 /// What a recording's worker is sent.
 enum Message {
-    /// Events, each a little-endian `u32` length and that many bytes.
-    Events(Vec<u8>),
+    Events(Batch),
     /// An event that may have been the recording's could not be read.
     Lost(String),
     /// Every event of the recording has been sent.
     End,
+}
+
+/// Events, each a little-endian `u32` length and that many bytes, counted
+/// in the backlog until they are dropped, applied or not.
+struct Batch {
+    bytes: Vec<u8>,
+    backlog: Arc<AtomicUsize>,
+}
+
+impl Drop for Batch {
+    fn drop(&mut self) {
+        self.backlog.fetch_sub(self.bytes.len(), Ordering::Relaxed);
+    }
 }
 
 /// A recording's trace, and why it failed, if it did.
@@ -80,13 +117,14 @@ struct Applied {
     failure: Option<String>,
 }
 
-/// Applies a recording's events to its trace, as they are sent.
-fn work(mut trace: Trace, queue: mpsc::Receiver<Message>) -> Applied {
+/// Applies a recording's events to its trace, as they are sent, until
+/// `abandoned`.
+fn work(mut trace: Trace, queue: mpsc::Receiver<Message>, abandoned: &AtomicBool) -> Applied {
     let mut failure = None;
     for message in queue {
         match message {
-            Message::Events(batch) if failure.is_none() => {
-                let mut rest = batch.as_slice();
+            Message::Events(batch) if failure.is_none() && !abandoned.load(Ordering::Relaxed) => {
+                let mut rest = batch.bytes.as_slice();
                 while let Some((length, after)) = rest.split_first_chunk::<4>() {
                     let (payload, after) = after.split_at(u32::from_le_bytes(*length) as usize);
                     rest = after;
@@ -115,16 +153,36 @@ fn work(mut trace: Trace, queue: mpsc::Receiver<Message>) -> Applied {
 struct Route {
     queue: mpsc::Sender<Message>,
     batch: Vec<u8>,
+    /// Whether events of it went past the backlog, after which the rest are
+    /// not kept.
+    lost: bool,
 }
 
 impl Route {
-    /// Hands the gathered events on; false once the worker has stopped.
-    fn send(&mut self) -> bool {
-        self.batch.is_empty()
-            || self
+    /// Hands the gathered events on, unless they would take the backlog
+    /// past `limit`; false once the worker has stopped.
+    fn send(&mut self, backlog: &Arc<AtomicUsize>, limit: usize) -> bool {
+        let size = self.batch.len();
+        if size == 0 {
+            return true;
+        }
+        if backlog.fetch_add(size, Ordering::Relaxed) + size > limit {
+            backlog.fetch_sub(size, Ordering::Relaxed);
+            self.batch = Vec::new();
+            self.lost = true;
+            return self
                 .queue
-                .send(Message::Events(std::mem::take(&mut self.batch)))
-                .is_ok()
+                .send(Message::Lost(
+                    "the recorder fell too far behind the command's events".to_owned(),
+                ))
+                .is_ok();
+        }
+        self.queue
+            .send(Message::Events(Batch {
+                bytes: std::mem::take(&mut self.batch),
+                backlog: backlog.clone(),
+            }))
+            .is_ok()
     }
 }
 
@@ -202,14 +260,18 @@ fn read(mut output: impl Read, shared: &Shared) -> String {
                         vacant.insert(Route {
                             queue: recorded.queue.clone(),
                             batch: Vec::new(),
+                            lost: false,
                         })
                     }
                 };
+                if route.lost {
+                    continue;
+                }
                 route
                     .batch
                     .extend_from_slice(&(payload.len() as u32).to_le_bytes());
                 route.batch.extend_from_slice(&payload);
-                if route.batch.len() >= BATCH && !route.send() {
+                if route.batch.len() >= BATCH && !route.send(&shared.backlog, shared.limit) {
                     routes.remove(&group);
                 }
             }
@@ -217,7 +279,9 @@ fn read(mut output: impl Read, shared: &Shared) -> String {
                 // Every event before the flush reaches its worker before the
                 // recording that asked for it can end.
                 let recordings = shared.recordings.lock().unwrap();
-                routes.retain(|group, route| route.send() && recordings.contains_key(group));
+                routes.retain(|group, route| {
+                    route.send(&shared.backlog, shared.limit) && recordings.contains_key(group)
+                });
                 drop(recordings);
                 let word =
                     |at: usize| u64::from_le_bytes(payload[at..at + 8].try_into().expect("eight"));
@@ -268,7 +332,10 @@ impl Recorder {
                 bail!("the recorder's helper did not start: {}", stderr.trim());
             }
         }
-        let shared = Arc::new(Shared::default());
+        let shared = Arc::new(Shared {
+            limit: backlog_limit(),
+            ..Shared::default()
+        });
         let reading = shared.clone();
         std::thread::Builder::new()
             .name("qk-recorder".into())
@@ -297,12 +364,17 @@ impl Recorder {
         let unattributed = self.shared.flushed.lock().unwrap().unattributed;
         let trace = Trace::new(self.arch, directory, prefix, cwd, resolve);
         let (queue, received) = mpsc::channel();
-        let worker = std::thread::spawn(move || work(trace, received));
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let abandoned = abandoned.clone();
+            std::thread::spawn(move || work(trace, received, &abandoned))
+        };
         self.shared.recordings.lock().unwrap().insert(
             group,
             Recorded {
                 queue,
                 worker,
+                abandoned,
                 unattributed,
             },
         );
@@ -384,16 +456,65 @@ impl Recorder {
         };
         drop(state);
         let recorded = recorded().context("the command was not being recorded")?;
-        let before = recorded.unattributed;
+        // Only its own, or ones it may have been among; known without its
+        // worker, so it is not waited for.
+        if dropped > 0 || unattributed > recorded.unattributed {
+            recorded.abandon();
+            bail!("the recorder dropped events while the command ran");
+        }
         let applied = recorded.end()?;
         if let Some(failure) = applied.failure {
             bail!("{failure}");
         }
-        // Only its own, or ones it may have been among.
-        if dropped > 0 || unattributed > before {
-            bail!("the recorder dropped events while the command ran");
-        }
         applied.trace.finish()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn route() -> (Route, mpsc::Receiver<Message>) {
+        let (queue, received) = mpsc::channel();
+        let route = Route {
+            queue,
+            batch: vec![0; 100],
+            lost: false,
+        };
+        (route, received)
+    }
+
+    #[test]
+    fn a_batch_counts_in_the_backlog_until_it_is_dropped() {
+        let backlog = Arc::new(AtomicUsize::new(0));
+        let (mut route, received) = route();
+        assert!(route.send(&backlog, 1000));
+        assert_eq!(backlog.load(Ordering::Relaxed), 100);
+        let Ok(Message::Events(batch)) = received.recv() else {
+            panic!("no events sent");
+        };
+        drop(batch);
+        assert_eq!(backlog.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn events_past_the_backlog_fail_their_recording_and_are_not_kept() {
+        let backlog = Arc::new(AtomicUsize::new(950));
+        let (mut route, received) = route();
+        assert!(route.send(&backlog, 1000));
+        assert!(route.lost);
+        assert!(route.batch.is_empty());
+        assert_eq!(backlog.load(Ordering::Relaxed), 950);
+        assert!(matches!(received.recv(), Ok(Message::Lost(_))));
+    }
+
+    #[test]
+    fn a_batch_its_worker_never_received_leaves_the_backlog() {
+        let backlog = Arc::new(AtomicUsize::new(0));
+        let (mut route, received) = route();
+        drop(received);
+        assert!(!route.send(&backlog, 1000));
+        assert_eq!(backlog.load(Ordering::Relaxed), 0);
     }
 }
