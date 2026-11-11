@@ -139,6 +139,8 @@ pub struct Produced {
     pub roots: Vec<String>,
     /// The outputs of the tasks it depends on as they declare them, sorted.
     pub declared: Vec<Vec<String>>,
+    /// The anchors of `upstream`: an output lies at or below one of them.
+    anchors: BTreeSet<String>,
 }
 
 impl Produced {
@@ -154,10 +156,15 @@ impl Produced {
             .collect();
         roots.sort_unstable();
         roots.dedup();
+        let anchors = upstream
+            .iter()
+            .flat_map(|outputs| outputs.anchors().map(str::to_owned))
+            .collect();
         Self {
             upstream,
             roots,
             declared: Vec::new(),
+            anchors,
         }
     }
 
@@ -170,10 +177,23 @@ impl Produced {
 
     /// Whether `path`, workspace-relative, is produced rather than installed,
     /// or a directory in `node_modules` holding what is.
+    ///
+    /// Asked of every access in `node_modules` a trace holds, so the output
+    /// patterns are only matched below one of their anchors.
     pub fn holds(&self, path: &str) -> bool {
         self.roots.iter().any(|root| {
             path == root || under(path, root) || (under(root, path) && inside_node_modules(path))
-        }) || self.upstream.iter().any(|outputs| outputs.matches(path))
+        }) || self.below_anchor(path) && self.upstream.iter().any(|outputs| outputs.matches(path))
+    }
+
+    /// Whether `path` is one of the upstream outputs' anchors or lies below
+    /// one.
+    fn below_anchor(&self, path: &str) -> bool {
+        !self.anchors.is_empty()
+            && std::iter::successors(Some(path), |path| {
+                path.rsplit_once('/').map(|(parent, _)| parent)
+            })
+            .any(|ancestor| self.anchors.contains(ancestor))
     }
 
     /// Whether a listing of `path`, a directory in `node_modules`, is kept,
@@ -1261,6 +1281,44 @@ mod tests {
                 recorded: None,
             }
         );
+    }
+
+    #[test]
+    fn holds_what_any_upstream_output_matches() {
+        let upstream = || {
+            vec![
+                Outputs::from_paths(&["node_modules/.gen/app".into()]).unwrap(),
+                Outputs::from_paths(&["libs/*/node_modules/.out/**/*.js".into()]).unwrap(),
+                Outputs::from_paths(&[
+                    "libs/types/**/*.d.ts".into(),
+                    "!libs/types/skip.d.ts".into(),
+                ])
+                .unwrap(),
+            ]
+        };
+        let produced = Produced::new(upstream(), Vec::new());
+        let outputs = upstream();
+        for path in [
+            "node_modules/.gen/app",
+            "node_modules/.gen/app/index.js",
+            "node_modules/.gen",
+            "node_modules/.gen/other",
+            "node_modules/react/index.js",
+            "libs/a/node_modules/.out/x/y.js",
+            "libs/a/node_modules/.out/x/y.ts",
+            "libs/a/node_modules/react/index.js",
+            "libs/types/a/b.d.ts",
+            "libs/types/skip.d.ts",
+            "libs/typesx/a.d.ts",
+            ".",
+        ] {
+            let matching_every_output = produced.roots.iter().any(|root| {
+                path == root
+                    || under(path, root)
+                    || (under(root, path) && inside_node_modules(path))
+            }) || outputs.iter().any(|outputs| outputs.matches(path));
+            assert_eq!(produced.holds(path), matching_every_output, "{path}");
+        }
     }
 
     /// What upstream tasks write into `node_modules`, and what an
