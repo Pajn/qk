@@ -134,9 +134,9 @@ pub struct Exclusions<'a> {
 #[derive(Default)]
 pub struct Produced {
     /// The declared outputs of the tasks the task depends on.
-    pub upstream: Vec<Outputs>,
+    upstream: Vec<Outputs>,
     /// Directories naming a `node_modules` directory, workspace-relative.
-    pub roots: Vec<String>,
+    roots: Vec<String>,
     /// The outputs of the tasks it depends on as they declare them, sorted.
     pub declared: Vec<Vec<String>>,
     /// The bounds of `upstream`: an output is or lies below one of them.
@@ -1298,6 +1298,8 @@ mod tests {
                 // outside its anchor, `packages/@scope/node_modules/pkg`.
                 Outputs::from_paths(&["packages/@scope/node_modules/pkg/(foo|bar).js".into()])
                     .unwrap(),
+                // Matched below `vendor`, as `\/` is a literal `/`.
+                Outputs::from_paths(&[r"vendor\/node_modules/pkg/*.js".into()]).unwrap(),
             ]
         };
         let produced = Produced::new(upstream(), Vec::new());
@@ -1316,6 +1318,7 @@ mod tests {
             "libs/typesx/a.d.ts",
             "packages/scope/node_modules/pkg/foo.js",
             "packages/@scope/node_modules/pkg/foo.js",
+            "vendor/node_modules/pkg/a.js",
             ".",
         ] {
             let matching_every_output = produced.roots.iter().any(|root| {
@@ -1326,6 +1329,7 @@ mod tests {
             assert_eq!(produced.holds(path), matching_every_output, "{path}");
         }
         assert!(produced.holds("packages/scope/node_modules/pkg/foo.js"));
+        assert!(produced.holds("vendor/node_modules/pkg/a.js"));
     }
 
     /// What upstream tasks write into `node_modules`, and what an

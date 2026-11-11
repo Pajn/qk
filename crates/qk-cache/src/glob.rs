@@ -72,7 +72,7 @@ impl Pattern {
                     excluded.add(compiled);
                 } else {
                     included.add(compiled);
-                    prefixes.push(crate::ignored::partition(&glob).0);
+                    prefixes.push(prefix(&glob));
                 }
             }
         }
@@ -111,6 +111,24 @@ impl Pattern {
             !excluded && self.included.is_match(path)
         }
     }
+}
+
+/// The leading literal directories of a plain glob, with their escapes read.
+/// They end before a segment holding an escaped `/`, which the glob matches
+/// as a literal `/` but [`crate::ignored::partition`] splits at.
+fn prefix(glob: &str) -> String {
+    let mut segment = 0;
+    let mut chars = glob.char_indices();
+    while let Some((index, c)) = chars.next() {
+        match c {
+            '/' => segment = index + 1,
+            '\\' if chars.next().is_some_and(|(_, escaped)| escaped == '/') => {
+                return crate::ignored::partition(&glob[..segment.saturating_sub(1)]).0;
+            }
+            _ => {}
+        }
+    }
+    crate::ignored::partition(glob).0
 }
 
 /// `pattern` with every escaped character, and its `\`, left out, so what
