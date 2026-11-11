@@ -23,6 +23,7 @@ use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 pub struct Pattern {
     included: GlobSet,
     excluded: GlobSet,
+    prefixes: Vec<String>,
 }
 
 impl Pattern {
@@ -46,6 +47,7 @@ impl Pattern {
     fn from_globs(patterns: &[&str], negated: bool) -> Result<Self> {
         let mut included = GlobSetBuilder::new();
         let mut excluded = GlobSetBuilder::new();
+        let mut prefixes = Vec::new();
         for pattern in patterns {
             let globs = if negated
                 || ["|", "(", "{,", "!"]
@@ -62,21 +64,34 @@ impl Pattern {
                 } else {
                     glob
                 };
-                let glob = GlobBuilder::new(&glob)
+                let compiled = GlobBuilder::new(&glob)
                     .literal_separator(true)
                     .backslash_escape(true)
                     .build()?;
                 if excludes && !negated {
-                    excluded.add(glob);
+                    excluded.add(compiled);
                 } else {
-                    included.add(glob);
+                    included.add(compiled);
+                    prefixes.push(crate::ignored::partition(&glob).0);
                 }
             }
+        }
+        if prefixes.is_empty() {
+            prefixes.push(String::new());
         }
         Ok(Self {
             included: included.build()?,
             excluded: excluded.build()?,
+            prefixes,
         })
+    }
+
+    /// Directories every path it matches is or lies below, `""` for the
+    /// workspace root. These come from the globs the pattern expands to,
+    /// which can differ from the pattern's own leading directories: the
+    /// expansion drops a `@` or `+` that no group follows.
+    pub fn prefixes(&self) -> impl Iterator<Item = &str> {
+        self.prefixes.iter().map(String::as_str)
     }
 
     /// Whether a negated group made it exclude anything: then what it matches

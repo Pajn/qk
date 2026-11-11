@@ -528,6 +528,16 @@ impl Outputs {
         self.anchors.iter().map(String::as_str)
     }
 
+    /// Directories every path [`Self::matches`] accepts is or lies below,
+    /// `""` for the workspace root. Unlike [`Self::anchors`], these hold
+    /// for the globs the patterns are matched as.
+    pub fn bounds(&self) -> impl Iterator<Item = &str> {
+        self.complete
+            .iter()
+            .map(String::as_str)
+            .chain(self.patterns.iter().flat_map(Pattern::prefixes))
+    }
+
     /// Complete literal roots only: globs, implicit defaults and any exclusion
     /// retain per-artifact restoration. Nested roots are handled by their parent.
     pub(crate) fn complete_roots(&self) -> Vec<&str> {
