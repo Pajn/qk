@@ -867,29 +867,8 @@ impl Proxy {
             status => bail!("the upstream answered POST blobs/fetch with {status}"),
         }
         let mut body = BufReader::new(response.body_mut().as_reader());
-        let mut start = [0; 8];
-        body.read_exact(&mut start)?;
-        if &start[..4] != b"qkb1" {
-            bail!("the upstream's blobs are not a qkb1 answer");
-        }
-        let count = u32::from_le_bytes(start[4..].try_into()?) as usize;
-        if count > blobs.len() {
-            bail!("the upstream listed more blobs than were asked for");
-        }
-        let mut listed = Vec::with_capacity(count);
-        for _ in 0..count {
-            let mut entry = [0; 40];
-            body.read_exact(&mut entry)?;
-            let hash: String = entry[..32]
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect();
-            if !blobs.iter().any(|asked| **asked == hash) {
-                bail!("the upstream listed {hash}, which was not asked for");
-            }
-            listed.push((hash, u64::from_le_bytes(entry[32..].try_into()?)));
-        }
-        let mut received = 8 + 40 * count as u64;
+        let listed = upstream_table(&mut body, blobs)?;
+        let mut received = 8 + 40 * listed.len() as u64;
         for (hash, length) in listed {
             let mut file = tempfile::NamedTempFile::new_in(&self.scratch)?;
             if io::copy(&mut (&mut body).take(length), &mut file)? != length {
@@ -1782,6 +1761,42 @@ fn inline_blobs(body: &[u8]) -> Option<Vec<(String, &[u8])>> {
     Some(blobs)
 }
 
+/// The blobs an upstream's answer to `POST blobs/fetch` for `asked` lists,
+/// each with the length of its frame. Refused when it lists a blob not asked
+/// for, or frames past what one answer carries, before any is read: the proxy
+/// writes each frame to its disk to check it.
+fn upstream_table(body: &mut impl Read, asked: &[&String]) -> Result<Vec<(String, u64)>> {
+    let mut start = [0; 8];
+    body.read_exact(&mut start)?;
+    if &start[..4] != b"qkb1" {
+        bail!("the upstream's blobs are not a qkb1 answer");
+    }
+    let count = u32::from_le_bytes(start[4..].try_into()?) as usize;
+    if count > asked.len() {
+        bail!("the upstream listed more blobs than were asked for");
+    }
+    let mut listed = Vec::with_capacity(count);
+    let mut total: u64 = 0;
+    for _ in 0..count {
+        let mut entry = [0; 40];
+        body.read_exact(&mut entry)?;
+        let hash: String = entry[..32]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        if !asked.iter().any(|asked| **asked == hash) {
+            bail!("the upstream listed {hash}, which was not asked for");
+        }
+        let length = u64::from_le_bytes(entry[32..].try_into()?);
+        total = total.saturating_add(length);
+        if total > FETCH_BUDGET {
+            bail!("the upstream listed more than {FETCH_BUDGET} bytes of frames");
+        }
+        listed.push((hash, length));
+    }
+    Ok(listed)
+}
+
 /// The distinct hashes a `POST blobs/fetch` body asks for, or `None` for a
 /// body that does not parse or asks for more than the protocol allows.
 fn fetch_query(body: &[u8]) -> Option<Vec<String>> {
@@ -1954,6 +1969,36 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(agreed.body, b"abcd");
+    }
+
+    /// An upstream listing frames past what one answer carries is refused
+    /// before any frame is read, so it cannot fill the proxy's disk.
+    #[test]
+    fn an_upstream_answer_past_the_budget_is_refused_before_its_frames() {
+        let (one, two) = ("a".repeat(64), "b".repeat(64));
+        let asked = [&one, &two];
+        let table = |lengths: [u64; 2]| {
+            let mut table = b"qkb1".to_vec();
+            table.extend_from_slice(&2u32.to_le_bytes());
+            for (hash, length) in [&one, &two].into_iter().zip(lengths) {
+                table.extend(hash_bytes(hash).unwrap());
+                table.extend_from_slice(&length.to_le_bytes());
+            }
+            table
+        };
+        let within = table([FETCH_BUDGET / 2, FETCH_BUDGET / 2]);
+        assert_eq!(
+            upstream_table(&mut &within[..], &asked).unwrap(),
+            [
+                (one.clone(), FETCH_BUDGET / 2),
+                (two.clone(), FETCH_BUDGET / 2)
+            ]
+        );
+        let past = table([FETCH_BUDGET, 1]);
+        let error = upstream_table(&mut &past[..], &asked).unwrap_err();
+        assert!(error.to_string().contains("bytes of frames"), "{error}");
+        let huge = table([u64::MAX, u64::MAX]);
+        assert!(upstream_table(&mut &huge[..], &asked).is_err());
     }
 
     #[test]
