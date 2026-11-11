@@ -1299,10 +1299,12 @@ mod tests {
                 Outputs::from_paths(&["packages/@scope/node_modules/pkg/(foo|bar).js".into()])
                     .unwrap(),
                 // Matched below `vendor`, as `\/` is a literal `/`.
-                Outputs::from_paths(&[r"vendor\/node_modules/pkg/*.js".into()]).unwrap(),
+                Outputs::from_paths(&[r"vendor/lib\/node_modules/pkg/*.js".into()]).unwrap(),
             ]
         };
         let produced = Produced::new(upstream(), Vec::new());
+        // A bound of the workspace root would let every path through.
+        assert!(!produced.bounds.contains(""));
         let outputs = upstream();
         for path in [
             "node_modules/.gen/app",
@@ -1318,7 +1320,8 @@ mod tests {
             "libs/typesx/a.d.ts",
             "packages/scope/node_modules/pkg/foo.js",
             "packages/@scope/node_modules/pkg/foo.js",
-            "vendor/node_modules/pkg/a.js",
+            "vendor/lib/node_modules/pkg/a.js",
+            "vendor/other/a.js",
             ".",
         ] {
             let matching_every_output = produced.roots.iter().any(|root| {
@@ -1329,7 +1332,14 @@ mod tests {
             assert_eq!(produced.holds(path), matching_every_output, "{path}");
         }
         assert!(produced.holds("packages/scope/node_modules/pkg/foo.js"));
-        assert!(produced.holds("vendor/node_modules/pkg/a.js"));
+        assert!(produced.holds("vendor/lib/node_modules/pkg/a.js"));
+        // An escaped `/` in the first segment bounds an output by the root.
+        let rooted = Produced::new(
+            vec![Outputs::from_paths(&[r"vendor\/node_modules/pkg/*.js".into()]).unwrap()],
+            Vec::new(),
+        );
+        assert!(rooted.bounds.contains(""));
+        assert!(rooted.holds("vendor/node_modules/pkg/a.js"));
     }
 
     /// What upstream tasks write into `node_modules`, and what an
