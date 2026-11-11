@@ -26,6 +26,7 @@ const LEVEL: i32 = 3;
 const LARGEST_RECORD: u64 = 1 << 30;
 const WINDOW_LOG_MAX: u32 = 27;
 const MAGIC: &[u8; 4] = b"qkp4";
+const BLOBS_MAGIC: &[u8; 4] = b"qkb1";
 
 /// Where a pack carries a blob it cites.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -502,6 +503,69 @@ pub(super) fn read_blob(root: &Path, hash: &str, body: impl Read) -> Result<u64>
     }
     file.persist(root.join("blobs").join(hash))?;
     Ok(received)
+}
+
+/// Reads an answer to `POST blobs/fetch` into the local store at `root`:
+///
+/// ```text
+/// "qkb1"
+/// u32 LE count
+/// for each blob: its hash as 32 bytes, then u64 LE length of its frame
+/// each blob's zstd frame, in that order
+/// ```
+///
+/// Only blobs in `asked` may be listed, each once. Answers the blobs it kept
+/// and the bytes received.
+pub(super) fn read_blobs(
+    root: &Path,
+    body: impl Read,
+    asked: &std::collections::HashSet<&str>,
+) -> Result<(Vec<String>, u64)> {
+    let mut input = body;
+    let mut magic = [0; 4];
+    input
+        .read_exact(&mut magic)
+        .context("remote blobs end early")?;
+    if &magic != BLOBS_MAGIC {
+        bail!("remote blobs are not a qkb1 answer");
+    }
+    let mut count = [0; 4];
+    input
+        .read_exact(&mut count)
+        .context("remote blobs end early")?;
+    let count = u32::from_le_bytes(count) as usize;
+    if count > asked.len() {
+        bail!("remote blobs list more blobs than were asked for");
+    }
+    let mut listed = Vec::with_capacity(count);
+    let mut seen = std::collections::HashSet::with_capacity(count);
+    for _ in 0..count {
+        let mut raw = [0; 32];
+        input
+            .read_exact(&mut raw)
+            .context("remote blobs end early")?;
+        let hash: String = raw.iter().map(|byte| format!("{byte:02x}")).collect();
+        let length = part_length(&mut input)?;
+        if !asked.contains(hash.as_str()) || !seen.insert(hash.clone()) {
+            bail!("remote blobs list {hash}, which was not asked for or is listed twice");
+        }
+        if length > super::LARGEST_UPLOAD {
+            bail!("remote blob {hash} exceeds 5 GiB");
+        }
+        listed.push((hash, length));
+    }
+    let mut received = 8 + 40 * count as u64;
+    let mut kept = Vec::with_capacity(count);
+    for (hash, length) in listed {
+        let mut frame = (&mut input).take(length);
+        received += read_blob(root, &hash, &mut frame)?;
+        // A frame that ends early would leave the next one misread.
+        if frame.limit() != 0 {
+            bail!("remote blob {hash} is shorter than listed");
+        }
+        kept.push(hash);
+    }
+    Ok((kept, received))
 }
 
 fn part_length(reader: &mut impl Read) -> Result<u64> {
@@ -999,5 +1063,77 @@ mod tests {
         assert_eq!(encoded[4] & 0x20, 0);
         encoded[5] = (30 - 10) << 3;
         assert!(read(source.path(), &encoded[..], |_| Ok(())).is_err());
+    }
+
+    /// An answer to `POST blobs/fetch` of `blobs`, each a hash with its raw
+    /// bytes, listing each frame with `length` added to its true length.
+    fn blobs_answer(blobs: &[(&str, &[u8])], length: i64) -> Vec<u8> {
+        let frames: Vec<Vec<u8>> = blobs
+            .iter()
+            .map(|(_, raw)| zstd::encode_all(*raw, 3).unwrap())
+            .collect();
+        let mut answer = b"qkb1".to_vec();
+        answer.extend_from_slice(&(blobs.len() as u32).to_le_bytes());
+        for ((hash, _), frame) in blobs.iter().zip(&frames) {
+            for at in 0..32 {
+                answer.push(u8::from_str_radix(&hash[at * 2..at * 2 + 2], 16).unwrap());
+            }
+            answer.extend_from_slice(&((frame.len() as i64 + length) as u64).to_le_bytes());
+        }
+        for frame in frames {
+            answer.extend(frame);
+        }
+        answer
+    }
+
+    #[test]
+    fn many_blobs_in_one_answer_are_kept_verified_and_only_as_asked() {
+        let first = b"first blob".as_slice();
+        let second = b"second blob".repeat(100);
+        let (one, two) = (
+            blake3::hash(first).to_hex().to_string(),
+            blake3::hash(&second).to_hex().to_string(),
+        );
+        let blobs = [(one.as_str(), first), (two.as_str(), second.as_slice())];
+        let asked: std::collections::HashSet<&str> = [one.as_str(), two.as_str()].into();
+
+        let target = root();
+        let answer = blobs_answer(&blobs, 0);
+        let (kept, received) = read_blobs(target.path(), &answer[..], &asked).unwrap();
+        assert_eq!(kept, [one.clone(), two.clone()]);
+        assert_eq!(received, answer.len() as u64);
+        assert_eq!(
+            std::fs::read(target.path().join("blobs").join(&two)).unwrap(),
+            second
+        );
+
+        // A blob not asked for, one listed twice, or a frame shorter than it is
+        // listed, which would leave the next one misread.
+        let only_one: std::collections::HashSet<&str> = [one.as_str()].into();
+        let refused = |answer: &[u8], asked: &std::collections::HashSet<&str>| {
+            format!(
+                "{:#}",
+                read_blobs(root().path(), answer, asked).unwrap_err()
+            )
+        };
+        assert!(refused(&blobs_answer(&blobs, 0), &only_one).contains("more blobs than"));
+        let mut twice = blobs_answer(&[blobs[0], blobs[0]], 0);
+        assert!(refused(&twice, &asked).contains("listed twice"));
+        twice.truncate(4);
+        assert!(refused(&twice, &asked).contains("end early"));
+        let long = blobs_answer(&blobs[..1], 1);
+        assert!(refused(&long, &asked).contains("shorter than listed"));
+        let mut wrong = blobs_answer(&blobs[..1], 0);
+        wrong[8] ^= 1;
+        assert!(
+            refused(&wrong, &[&*hex_flip(&one), one.as_str()].into()).contains("does not match")
+        );
+    }
+
+    /// `hash` with the first bit of its first byte flipped, as the answer
+    /// `wrong` above lists it.
+    fn hex_flip(hash: &str) -> String {
+        let first = u8::from_str_radix(&hash[..2], 16).unwrap() ^ 1;
+        format!("{first:02x}{}", &hash[2..])
     }
 }

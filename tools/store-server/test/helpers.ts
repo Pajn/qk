@@ -1,4 +1,5 @@
 import { SELF } from "cloudflare:test";
+import { expect } from "vitest";
 import { buildUpload, concat, INLINE, packHeader, rawFrame } from "../src/frames";
 
 export const READ = "read-token";
@@ -73,4 +74,25 @@ export async function putApart(blob: TestBlob): Promise<void> {
 
 export function hex(data: Uint8Array): string {
   return [...data].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+export async function sha256(data: Uint8Array): Promise<string> {
+  return hex(new Uint8Array(await crypto.subtle.digest("SHA-256", data.slice())));
+}
+
+/** The body of a bundle carrying `blobs`, and the name it is stored under. */
+export async function bundle(blobs: TestBlob[]): Promise<{ id: string; body: Uint8Array }> {
+  const body = buildUpload(
+    new Uint8Array(0),
+    sorted(blobs).map((blob) => ({ hash: blob.hash, raw: blob.raw.length, frame: rawFrame(blob.raw) })),
+  );
+  const length = new DataView(body.buffer, body.byteOffset).getUint32(0, true);
+  return { id: await sha256(body.subarray(4, 4 + length)), body };
+}
+
+export async function putBundle(blobs: TestBlob[]): Promise<string> {
+  const { id, body } = await bundle(blobs);
+  const response = await request("PUT", `bundles/${id}`, { body });
+  expect(response.status, await response.clone().text()).toBe(204);
+  return id;
 }
