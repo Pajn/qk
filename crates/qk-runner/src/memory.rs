@@ -5,9 +5,13 @@
 //! not the shared libraries every process maps. Elsewhere it is the resident
 //! memory.
 //!
-//! A sample can miss a spike between samples. On macOS the system also keeps
-//! the most each process has used in its life, so a task's peak is at least
-//! that of its largest process.
+//! A sample can miss a spike between samples. macOS and Linux also keep the
+//! most each process has used in its life, so a task's peak is at least that
+//! of the largest process a sample saw. A process that exits before the next
+//! sample takes its spike with it.
+//!
+//! What tasks can use is the machine's memory, or what a control group this
+//! process is in allows where that is less: see [`limit`].
 //!
 //! Each sample also reads the CPU time each process has used since it
 //! started. Kept per process across samples, it sums to the CPU time a task
@@ -20,6 +24,38 @@ use std::collections::{BTreeMap, BTreeSet};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, ThreadKind};
 
 use crate::Expected;
+
+pub mod limit;
+
+/// The memory the run's tasks can use, in bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Available {
+    /// All of it, in use or not.
+    pub total: u64,
+    /// What nothing is using.
+    pub free: u64,
+}
+
+/// The machine's memory, or what `groups` allow where that is less.
+pub fn available(system: &System, groups: &limit::Groups) -> Available {
+    within(
+        Available {
+            total: system.total_memory(),
+            free: system.available_memory(),
+        },
+        groups.limit(),
+    )
+}
+
+fn within(machine: Available, limit: Option<limit::Limit>) -> Available {
+    match limit {
+        Some(limit) => Available {
+            total: machine.total.min(limit.total),
+            free: machine.free.min(limit.free),
+        },
+        None => machine,
+    }
+}
 
 /// What a task's processes use, in bytes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -63,7 +99,30 @@ pub fn sample<'a>(
             )
         })
         .collect();
-    trees(&processes, roots)
+    trees(&processes, roots, lifetime_peak)
+}
+
+/// The most resident memory a process has had in its life, which Linux
+/// keeps as its high-water mark; none elsewhere, or once the process is gone.
+fn lifetime_peak(pid: u32) -> Option<u64> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    high_water(&std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?)
+}
+
+/// The high-water mark in a `/proc/<pid>/status`, in bytes; a kernel thread
+/// has none.
+fn high_water(status: &str) -> Option<u64> {
+    let kib: u64 = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmHWM:"))?
+        .trim()
+        .strip_suffix("kB")?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(kib.saturating_mul(1_024))
 }
 
 /// The memory each task is expected to use, from its id and target: the most
@@ -137,9 +196,13 @@ fn memory(process: &sysinfo::Process) -> Used {
 
 /// The memory and CPU time of the processes under each set of roots, roots
 /// included, from each process's id, parent, memory and CPU time.
+/// `lifetime_peak` gives the most a process has used in its life where the
+/// system keeps that apart from what `processes` holds, and is asked only
+/// about the processes under the roots.
 fn trees<'a>(
     processes: &[(u32, Option<u32>, Used, u64)],
     roots: &BTreeMap<&'a str, BTreeSet<u32>>,
+    lifetime_peak: impl Fn(u32) -> Option<u64>,
 ) -> BTreeMap<&'a str, Sampled> {
     let mut children: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
     let mut memory = BTreeMap::new();
@@ -168,7 +231,9 @@ fn trees<'a>(
                 }
                 let process = memory.get(&pid).copied().unwrap_or_default();
                 used.now = used.now.saturating_add(process.now);
-                largest = largest.max(process.peak);
+                largest = largest
+                    .max(process.peak)
+                    .max(lifetime_peak(pid).unwrap_or(0));
                 stack.extend(children.get(&pid).into_iter().flatten());
             }
             used.peak = used.now.max(largest);
@@ -181,7 +246,8 @@ fn trees<'a>(
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
-    use super::{Used, expected, fits, trees};
+    use super::limit::Limit;
+    use super::{Available, Used, expected, fits, high_water, trees, within};
 
     fn used(sampled: BTreeMap<&str, super::Sampled>) -> BTreeMap<&str, Used> {
         sampled
@@ -213,7 +279,7 @@ mod tests {
             ("app:lint", BTreeSet::from([40])),
         ]);
         assert_eq!(
-            used(trees(&processes, &roots)),
+            used(trees(&processes, &roots, |_| None)),
             BTreeMap::from([
                 ("app:test", at(305)),
                 ("app:build", at(1_007)),
@@ -233,7 +299,7 @@ mod tests {
         ];
         let roots = BTreeMap::from([("app:test", BTreeSet::from([10]))]);
         assert_eq!(
-            trees(&processes, &roots)["app:test"].cpu,
+            trees(&processes, &roots, |_| None)["app:test"].cpu,
             BTreeMap::from([(10, 5), (11, 1_500)])
         );
     }
@@ -264,11 +330,79 @@ mod tests {
         ];
         let roots = BTreeMap::from([("app:tsc", BTreeSet::from([10]))]);
         assert_eq!(
-            trees(&processes, &roots)["app:tsc"].used,
+            trees(&processes, &roots, |_| None)["app:tsc"].used,
             Used {
                 now: 305,
                 peak: 3_000
             }
+        );
+    }
+
+    #[test]
+    fn a_task_peaked_at_least_as_high_as_the_system_says_a_process_of_it_did() {
+        let at = |now| Used { now, peak: now };
+        let processes = [
+            (10, None, at(5), 0),
+            (11, Some(10), at(100), 0),
+            // Not under the task: its peak is never asked for.
+            (30, None, at(1), 0),
+        ];
+        let roots = BTreeMap::from([("app:tsc", BTreeSet::from([10]))]);
+        let lifetime_peak = |pid| match pid {
+            11 => Some(3_000),
+            30 => panic!("asked about a process outside the task"),
+            _ => None,
+        };
+        assert_eq!(
+            trees(&processes, &roots, lifetime_peak)["app:tsc"].used,
+            Used {
+                now: 105,
+                peak: 3_000
+            }
+        );
+    }
+
+    #[test]
+    fn reads_the_high_water_mark_of_a_process_status() {
+        let status =
+            "Name:\tnode\nVmPeak:\t 9000000 kB\nVmHWM:\t  204800 kB\nVmRSS:\t  102400 kB\n";
+        assert_eq!(high_water(status), Some(204_800 * 1_024));
+        // A kernel thread has no memory of its own.
+        assert_eq!(high_water("Name:\tkthreadd\nState:\tS (sleeping)\n"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_keeps_the_most_a_process_used_once_it_has_let_go_of_it() {
+        const HELD: usize = 64 << 20;
+        let held = vec![1u8; HELD];
+        std::hint::black_box(&held);
+        drop(held);
+        let peak = super::lifetime_peak(std::process::id()).unwrap();
+        assert!(peak >= HELD as u64, "{peak}");
+    }
+
+    #[test]
+    fn a_group_that_allows_less_than_the_machine_has_is_what_tasks_can_use() {
+        let machine = Available {
+            total: 64,
+            free: 40,
+        };
+        assert_eq!(within(machine, None), machine);
+        assert_eq!(
+            within(machine, Some(Limit { total: 24, free: 2 })),
+            Available { total: 24, free: 2 }
+        );
+        // A limit above what the machine has left does not free any.
+        assert_eq!(
+            within(
+                machine,
+                Some(Limit {
+                    total: 128,
+                    free: 100
+                })
+            ),
+            machine
         );
     }
 
