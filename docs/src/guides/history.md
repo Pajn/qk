@@ -37,9 +37,11 @@ that executed also records the most memory it used: that of its commands and
 every process under them, summed, sampled every 250 ms while it runs, so a
 task too brief to be sampled records none. On macOS a process's memory is
 its physical footprint, the figure Activity Monitor shows; elsewhere it is
-its resident memory. On macOS and Linux a task's peak is at least the most
-its largest process used in its life, which the system keeps, so a spike
-of one process between samples is not missed. The scheduler [waits for memory](running-tasks.md#waiting-for-memory)
+its resident memory. On macOS and Linux the system keeps the most each
+process has used in its life, and a task's peak is at least that of each
+process a sample saw. A process that spiked between two samples and was
+still running at the next is thus not missed; one that started and exited,
+or spiked and exited, between two samples is. The scheduler [waits for memory](running-tasks.md#waiting-for-memory)
 from these peaks. The run
 summary gives the most the run's tasks used together and the three tasks
 that used the most, and `qk show task` what the task used in each run. The

@@ -7,7 +7,8 @@
 //!
 //! A sample can miss a spike between samples. macOS and Linux also keep the
 //! most each process has used in its life, so a task's peak is at least that
-//! of its largest process.
+//! of the largest process a sample saw. A process that exits before the next
+//! sample takes its spike with it.
 //!
 //! What tasks can use is the machine's memory, or what a control group this
 //! process is in allows where that is less: see [`limit`].
