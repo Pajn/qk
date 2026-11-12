@@ -157,6 +157,14 @@ fits, and starts regardless once nothing else of the run is running, so a
 run cannot stall. The summary names the tasks that waited, and does not
 count their wait for memory as a wait for a `--parallel` slot.
 
+On Linux a control group can allow a run less memory than the machine has,
+as a container's memory limit does, and reaching that limit ends the run's
+processes while the machine still has memory free. Where a control group
+(cgroup v2) the run is in sets a limit below the machine's memory, free
+memory is what that limit leaves and the tenth kept back is a tenth of the
+limit. Cached file data counts as free there, as it does for the machine,
+since the kernel gives it up before the limit is reached.
+
 A task is expected to use the most memory it used in its recent runs that
 executed it, as [run history](history.md) records. A task without such runs
 is expected to use the median of the run's other tasks of its target, so a

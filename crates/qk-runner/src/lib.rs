@@ -12,7 +12,8 @@
 //! A task expected to use memory starts only when the machine has it free:
 //! what is free, less a reserve and what the run's running tasks are still
 //! expected to grow by, must cover what the task is expected to use. Free
-//! memory is the machine's, so other runs and programs count. A task with
+//! memory is the machine's, so other runs and programs count, or what a
+//! control group the run is in has left where that is less. A task with
 //! nothing else of the run running starts regardless, so a run cannot stall.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -580,9 +581,11 @@ pub fn run(
     let load = std::sync::Mutex::new(Vec::new());
     let mut system = sysinfo::System::new();
     system.refresh_memory();
-    let reserve = system.total_memory() / 10;
+    let groups = memory::limit::Groups::of_this_process();
+    let available = memory::available(&system, &groups);
+    let reserve = available.total / 10;
     let seen = std::sync::Mutex::new(Seen {
-        free: system.available_memory(),
+        free: available.free,
         ..Seen::default()
     });
     // Since when each task has waited for memory, and how long it has
@@ -621,7 +624,7 @@ pub fn run(
                     memory::sample(&mut system, &roots)
                 };
                 let seen = &mut *seen.lock().unwrap();
-                seen.free = system.available_memory();
+                seen.free = memory::available(&system, &groups).free;
                 seen.now = used
                     .iter()
                     .map(|(id, sampled)| ((*id).to_owned(), sampled.used.now))
@@ -1352,7 +1355,7 @@ pub fn log_name(id: &str) -> String {
 /// What the sampler last saw of memory, in bytes.
 #[derive(Default)]
 struct Seen {
-    /// Free on the machine.
+    /// Free for the run's tasks to use.
     free: u64,
     /// What each running task uses now.
     now: BTreeMap<String, u64>,
