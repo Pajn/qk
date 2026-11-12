@@ -9,6 +9,7 @@
 //! reads a recording the same whichever recorder made it.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -207,6 +208,8 @@ pub struct Trace {
     /// to, as `-yy` writes it, which costs a lookup an open.
     resolve: bool,
     processes: HashMap<u32, Process>,
+    /// The line being written, kept to be written into again.
+    line: String,
 }
 
 impl Trace {
@@ -218,37 +221,37 @@ impl Trace {
             cwd: cwd.to_owned(),
             resolve,
             processes: HashMap::new(),
+            line: String::new(),
         }
     }
 
     fn process(&mut self, tgid: u32) -> &mut Process {
-        let cwd = self.cwd.clone();
-        self.processes.entry(tgid).or_insert_with(|| Process {
-            cwd,
-            ..Process::default()
-        })
+        process(&mut self.processes, &self.cwd, tgid)
     }
 
-    /// Writes `line`, timed `time`, to the trace of `tgid`.
-    fn write(&mut self, tgid: u32, time: u64, line: &str) -> Result<()> {
-        let path = self.directory.join(format!("{}.{tgid}", self.prefix));
-        let process = self.process(tgid);
-        if process.file.is_none() {
-            // Appended to, should a later process be given the same id; the
-            // directory starts empty.
-            let file = File::options()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .with_context(|| format!("cannot write {}", path.display()))?;
-            process.file = Some(BufWriter::new(file));
-        }
-        let file = process.file.as_mut().expect("opened above");
+    /// Writes `self.line`, timed `time`, to the trace of `tgid`.
+    fn write(&mut self, tgid: u32, time: u64) -> Result<()> {
+        let process = process(&mut self.processes, &self.cwd, tgid);
+        let file = match &mut process.file {
+            Some(file) => file,
+            None => {
+                let path = self.directory.join(format!("{}.{tgid}", self.prefix));
+                // Appended to, should a later process be given the same id;
+                // the directory starts empty.
+                let file = File::options()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .with_context(|| format!("cannot write {}", path.display()))?;
+                process.file.insert(BufWriter::new(file))
+            }
+        };
         writeln!(
             file,
-            "{}.{:06} {line}",
+            "{}.{:06} {}",
             time / 1_000_000_000,
-            (time % 1_000_000_000) / 1000
+            (time % 1_000_000_000) / 1000,
+            self.line
         )?;
         Ok(())
     }
@@ -282,11 +285,12 @@ impl Trace {
                 process.touched = inherited.3;
                 // As strace writes the call that made the child, which the
                 // decoder hands the parent's working directory to.
-                self.write(
-                    parent,
-                    time,
-                    &format!("clone(child_stack=NULL, flags=SIGCHLD) = {child}"),
-                )?;
+                self.line.clear();
+                let _ = write!(
+                    self.line,
+                    "clone(child_stack=NULL, flags=SIGCHLD) = {child}"
+                );
+                self.write(parent, time)?;
             }
             // Its trace is complete, and its file closed, so that a command
             // running many processes keeps only the live ones' open.
@@ -315,14 +319,22 @@ impl Trace {
                     exited,
                 };
                 if spec.written {
-                    let (arch, resolve) = (self.arch, self.resolve);
-                    let process = self.process(tgid);
-                    let opened = (resolve && spec.effect == Effect::Opens && result >= 0)
+                    let process = process(&mut self.processes, &self.cwd, tgid);
+                    let opened = (self.resolve && spec.effect == Effect::Opens && result >= 0)
                         .then(|| opened(spec, &entered, process))
                         .flatten()
                         .and_then(|path| std::fs::canonicalize(path).ok());
-                    let line = render(arch, spec, &entered, result, process, opened.as_deref());
-                    self.write(tgid, time, &line)?;
+                    self.line.clear();
+                    render(
+                        &mut self.line,
+                        self.arch,
+                        spec,
+                        &entered,
+                        result,
+                        process,
+                        opened.as_deref(),
+                    );
+                    self.write(tgid, time)?;
                 }
                 if result >= 0 {
                     let process = self.process(tgid);
@@ -342,6 +354,14 @@ impl Trace {
         }
         Ok(self.directory)
     }
+}
+
+/// `tgid`'s process, starting in `cwd` when it is new.
+fn process<'a>(processes: &'a mut HashMap<u32, Process>, cwd: &Path, tgid: u32) -> &'a mut Process {
+    processes.entry(tgid).or_insert_with(|| Process {
+        cwd: cwd.to_owned(),
+        ..Process::default()
+    })
 }
 
 /// The paths a call names, in the order its arguments do.
@@ -496,61 +516,81 @@ fn touch(process: &mut Process, fd: i32, at: u64) {
 /// A call as strace writes it, its descriptors annotated as `-yy` does: an
 /// opening call's result with `opened`, the path it resolved to, if known.
 fn render(
+    out: &mut String,
     arch: Arch,
     spec: &Call,
     entered: &Entered,
     result: i64,
     process: &Process,
     opened: Option<&Path>,
-) -> String {
+) {
     // A descriptor no recorded call opened, such as an inherited pipe or a
     // socket, is no file, as `-yy` would show; the decoder reads no path
     // from it.
-    let descriptor = |fd: i32| match process.descriptors.get(&fd) {
-        Some(path) => format!("{fd}<{}>", path.display()),
-        None if fd >= 0 => format!("{fd}<unknown>"),
-        None => fd.to_string(),
+    let descriptor = |out: &mut String, fd: i32| match process.descriptors.get(&fd) {
+        Some(path) => {
+            let _ = write!(out, "{fd}<{}>", path.display());
+        }
+        None if fd >= 0 => {
+            let _ = write!(out, "{fd}<unknown>");
+        }
+        None => {
+            let _ = write!(out, "{fd}");
+        }
     };
+    out.push_str(spec.name);
+    out.push('(');
     let mut paths = 0;
-    let args: Vec<String> = spec
-        .args
-        .iter()
-        .enumerate()
-        .map(|(index, kind)| {
-            let value = entered.args[index];
-            match kind {
-                Arg::Path => {
-                    let text = match &entered.paths[paths] {
-                        PathArg::Null => "NULL".to_owned(),
-                        PathArg::Read { bytes, cut } => {
-                            let quoted = quote(bytes);
-                            if *cut { format!("{quoted}...") } else { quoted }
+    for (index, kind) in spec.args.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        let value = entered.args[index];
+        match kind {
+            Arg::Path => {
+                match &entered.paths[paths] {
+                    PathArg::Null => out.push_str("NULL"),
+                    PathArg::Read { bytes, cut } => {
+                        quote(out, bytes);
+                        if *cut {
+                            out.push_str("...");
                         }
-                        PathArg::Unreadable => format!("{value:#x}"),
-                    };
-                    paths += 1;
-                    text
+                    }
+                    PathArg::Unreadable => {
+                        let _ = write!(out, "{value:#x}");
+                    }
                 }
-                Arg::Fd => descriptor(value as i32),
-                Arg::AtFd if value as i32 == AT_FDCWD => "AT_FDCWD".to_owned(),
-                Arg::AtFd => descriptor(value as i32),
-                Arg::OpenFlags => open_flags(arch, value),
-                Arg::AtFlags => at_flags(value),
-                Arg::Value => value.to_string(),
+                paths += 1;
             }
-        })
-        .collect();
-    let result = match opened {
-        _ if result < 0 => format!("-1 {} (error)", errno(-result)),
-        Some(path) => format!("{result}<{}>", path.display()),
-        None => result.to_string(),
-    };
-    format!("{}({}) = {result}", spec.name, args.join(", "))
+            Arg::Fd => descriptor(out, value as i32),
+            Arg::AtFd if value as i32 == AT_FDCWD => out.push_str("AT_FDCWD"),
+            Arg::AtFd => descriptor(out, value as i32),
+            Arg::OpenFlags => open_flags(out, arch, value),
+            Arg::AtFlags => at_flags(out, value),
+            Arg::Value => {
+                let _ = write!(out, "{value}");
+            }
+        }
+    }
+    out.push_str(") = ");
+    match opened {
+        _ if result < 0 => {
+            out.push_str("-1 ");
+            errno(out, -result);
+            out.push_str(" (error)");
+        }
+        Some(path) => {
+            let _ = write!(out, "{result}<{}>", path.display());
+        }
+        None => {
+            let _ = write!(out, "{result}");
+        }
+    }
 }
 
 /// A path as strace quotes it, as qk's decoder unquotes it.
-fn quote(bytes: &[u8]) -> String {
-    let mut text = String::with_capacity(bytes.len() + 2);
+fn quote(text: &mut String, bytes: &[u8]) {
+    text.reserve(bytes.len() + 2);
     text.push('"');
     for &byte in bytes {
         match byte {
@@ -560,19 +600,20 @@ fn quote(bytes: &[u8]) -> String {
             b'\r' => text.push_str("\\r"),
             b'\t' => text.push_str("\\t"),
             0x20..=0x7e => text.push(char::from(byte)),
-            _ => text.push_str(&format!("\\{byte:03o}")),
+            _ => {
+                let _ = write!(text, "\\{byte:03o}");
+            }
         }
     }
     text.push('"');
-    text
 }
 
-fn open_flags(arch: Arch, flags: u64) -> String {
-    let mut names = vec![match flags & 0o3 {
+fn open_flags(out: &mut String, arch: Arch, flags: u64) {
+    out.push_str(match flags & 0o3 {
         0 => "O_RDONLY",
         1 => "O_WRONLY",
         _ => "O_RDWR",
-    }];
+    });
     for (flag, name) in [
         (0o100, "O_CREAT"),
         (0o1000, "O_TRUNC"),
@@ -581,14 +622,14 @@ fn open_flags(arch: Arch, flags: u64) -> String {
         (0o2000000, "O_CLOEXEC"),
     ] {
         if flags & flag != 0 {
-            names.push(name);
+            out.push('|');
+            out.push_str(name);
         }
     }
-    names.join("|")
 }
 
-fn at_flags(flags: u64) -> String {
-    let mut names = Vec::new();
+fn at_flags(out: &mut String, flags: u64) {
+    let mut any = false;
     for (flag, name) in [
         (0x100, "AT_SYMLINK_NOFOLLOW"),
         (0x200, "AT_REMOVEDIR"),
@@ -596,18 +637,20 @@ fn at_flags(flags: u64) -> String {
         (0x1000, "AT_EMPTY_PATH"),
     ] {
         if flags & flag != 0 {
-            names.push(name);
+            if any {
+                out.push('|');
+            }
+            out.push_str(name);
+            any = true;
         }
     }
-    if names.is_empty() {
-        "0".to_owned()
-    } else {
-        names.join("|")
+    if !any {
+        out.push('0');
     }
 }
 
 /// An error number's name, as strace writes it.
-fn errno(number: i64) -> String {
+fn errno(out: &mut String, number: i64) {
     let name = match number {
         1 => "EPERM",
         2 => "ENOENT",
@@ -638,9 +681,12 @@ fn errno(number: i64) -> String {
         61 => "ENODATA",
         75 => "EOVERFLOW",
         95 => "EOPNOTSUPP",
-        _ => return format!("E{number}"),
+        _ => {
+            let _ = write!(out, "E{number}");
+            return;
+        }
     };
-    name.to_owned()
+    out.push_str(name);
 }
 
 #[cfg(test)]
@@ -1322,6 +1368,8 @@ mod tests {
 
     #[test]
     fn quotes_paths_as_the_decoder_reads_them() {
-        assert_eq!(quote(b"a b\"c\\d\n\x01"), "\"a b\\\"c\\\\d\\n\\001\"");
+        let mut quoted = String::new();
+        quote(&mut quoted, b"a b\"c\\d\n\x01");
+        assert_eq!(quoted, "\"a b\\\"c\\\\d\\n\\001\"");
     }
 }
