@@ -1976,8 +1976,11 @@ fn touched_by_root_tsconfig(
             return Ok(());
         }
         let roots = ProjectRoots::new(workspace);
+        let outside = |path: &str| path.starts_with('/') || path.split('/').next() == Some("..");
         for path in before.references.symmetric_difference(&after.references) {
-            if let Some(project) = roots.owner(path) {
+            if !outside(path)
+                && let Some(project) = roots.owner(path)
+            {
                 touches.touch(
                     project,
                     Reason::TsconfigReference {

@@ -128,6 +128,30 @@ pub fn parse_jsonc(text: &str) -> Option<Value> {
     jsonc_parser::parse_to_serde_value(text, &Default::default()).ok()
 }
 
+/// A root tsconfig reference's path as TypeScript resolves it from the
+/// workspace root, `.` and `..` resolved lexically. An absolute path is kept
+/// as it is.
+fn normalize_reference(path: &str) -> String {
+    if path.starts_with('/') {
+        return path.to_owned();
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." if parts.last().is_some_and(|last| *last != "..") => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    if parts.is_empty() {
+        ".".into()
+    } else {
+        parts.join("/")
+    }
+}
+
 /// The root tsconfig files, in the order Nx picks one.
 pub const ROOT_TSCONFIG_FILES: [&str; 2] = ["tsconfig.base.json", "tsconfig.json"];
 
@@ -158,8 +182,10 @@ pub fn selectively_hash_tsconfig(workspace: &Workspace) -> bool {
 pub struct TsConfig {
     pub rest: Value,
     pub paths: BTreeMap<String, Vec<String>>,
-    /// The `path` of each project reference, without a leading `./`. When
-    /// one has no `path`, they all stay in `rest`, which keys them.
+    /// The `path` of each project reference, relative to the workspace root
+    /// with `.` and `..` resolved; one leaving the workspace keeps its
+    /// leading `..`. When one is not an object holding only a string `path`,
+    /// they all stay in `rest`, which keys them.
     pub references: BTreeSet<String>,
 }
 
@@ -183,13 +209,13 @@ impl TsConfig {
         if let Some(Value::Array(entries)) = object.get("references")
             && let Some(found) = entries
                 .iter()
-                .map(|entry| entry.get("path").and_then(Value::as_str))
+                .map(|entry| match entry.as_object() {
+                    Some(fields) if fields.len() == 1 => fields.get("path").and_then(Value::as_str),
+                    _ => None,
+                })
                 .collect::<Option<Vec<_>>>()
         {
-            references = found
-                .into_iter()
-                .map(|path| path.strip_prefix("./").unwrap_or(path).to_owned())
-                .collect();
+            references = found.into_iter().map(normalize_reference).collect();
             object.remove("references");
         }
         Some(Self {

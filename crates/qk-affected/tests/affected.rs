@@ -1077,12 +1077,34 @@ fn root_tsconfig_references_affect_the_projects_they_point_into() {
         ),
     );
     assert_eq!(repo.committed(), names(&["tool"]));
+    // A path is resolved before its project is looked up.
     write(
         &repo.root,
         "tsconfig.json",
-        &tsconfig(&format!(r#"{lib}, {{"prepend": true}}"#), true),
+        &tsconfig(
+            &format!(r#"{lib}, {{"path": "./libs/lib/../../tools/tool"}}"#),
+            true,
+        ),
     );
-    assert_eq!(repo.committed(), names(&["app", "lib", "tool"]));
+    assert_eq!(repo.committed(), names(&["tool"]));
+    // Moved out of the workspace, it points into no project.
+    write(
+        &repo.root,
+        "tsconfig.json",
+        &tsconfig(&format!(r#"{lib}, {{"path": "../elsewhere"}}"#), true),
+    );
+    assert_eq!(repo.committed(), Vec::<String>::new());
+    for other in [
+        r#"{"prepend": true}"#,
+        r#"{"path": "./libs/lib", "prepend": true}"#,
+    ] {
+        write(
+            &repo.root,
+            "tsconfig.json",
+            &tsconfig(&format!("{lib}, {other}"), true),
+        );
+        assert_eq!(repo.committed(), names(&["app", "lib", "tool"]), "{other}");
+    }
     let repo = Repo::new(&[("tsconfig.json", &tsconfig(lib, true))]);
     write(&repo.root, "tsconfig.json", &tsconfig(lib, false));
     assert_eq!(repo.committed(), names(&["app", "lib", "tool"]));

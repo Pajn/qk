@@ -4130,6 +4130,10 @@ fn the_root_tsconfig_keys_path_mappings_as_nx_does() {
         referenced["references"] = json!([{"path": "./lib"}]);
         write("tsconfig.base.json", &referenced.to_string());
         assert!(check().contains("cache hit"), "selective={selective}");
+        // Those holding more than a path are keyed.
+        referenced["references"] = json!([{"path": "./lib", "prepend": true}]);
+        write("tsconfig.base.json", &referenced.to_string());
+        assert!(check().contains("cache miss"), "selective={selective}");
     }
 }
 
