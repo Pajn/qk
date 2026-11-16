@@ -134,7 +134,7 @@ pub fn parse_jsonc(text: &str) -> Option<Value> {
 /// kept as it is.
 fn normalize_reference(path: &str) -> String {
     let path = path.replace('\\', "/");
-    if path.starts_with('/') {
+    if is_absolute_reference(&path) {
         return path;
     }
     let mut parts: Vec<&str> = Vec::new();
@@ -152,6 +152,22 @@ fn normalize_reference(path: &str) -> String {
     } else {
         parts.join("/")
     }
+}
+
+/// Whether a reference path, its backslashes read as slashes, is absolute on
+/// any platform: from `/`, or from a drive letter such as `C:`, whichever
+/// platform qk runs on.
+fn is_absolute_reference(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    path.starts_with('/')
+        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+}
+
+/// Whether a path in [`TsConfig::references`] points into no project of
+/// the workspace: it is absolute, which a committed tsconfig resolves only in
+/// the checkout it was written in, or it leads out of the workspace.
+pub fn reference_is_outside(path: &str) -> bool {
+    is_absolute_reference(path) || path.split('/').next() == Some("..")
 }
 
 /// The root tsconfig files, in the order Nx picks one.

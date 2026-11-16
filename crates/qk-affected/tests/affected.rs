@@ -1087,13 +1087,20 @@ fn root_tsconfig_references_affect_the_projects_they_point_into() {
         );
         assert_eq!(repo.committed(), names(&["tool"]), "{path}");
     }
-    // Moved out of the workspace, it points into no project.
-    write(
-        &repo.root,
-        "tsconfig.json",
-        &tsconfig(&format!(r#"{lib}, {{"path": "../elsewhere"}}"#), true),
-    );
-    assert_eq!(repo.committed(), Vec::<String>::new());
+    // Out of the workspace, or absolute, it points into no project. The
+    // last is JSON for `C:\repo\..\..\tools\tool`.
+    for path in [
+        "../elsewhere",
+        "/repo/tools/tool",
+        r"C:\\repo\\..\\..\\tools\\tool",
+    ] {
+        write(
+            &repo.root,
+            "tsconfig.json",
+            &tsconfig(&format!(r#"{lib}, {{"path": "{path}"}}"#), true),
+        );
+        assert_eq!(repo.committed(), Vec::<String>::new(), "{path}");
+    }
     for other in [
         r#"{"prepend": true}"#,
         r#"{"path": "./libs/lib", "prepend": true}"#,

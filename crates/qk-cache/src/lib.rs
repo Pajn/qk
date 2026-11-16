@@ -39,8 +39,8 @@ pub use hash::{
 };
 pub use inputs::{
     InputChange, InputChanges, JsonFields, ROOT_TSCONFIG_FILES, Resolution, Resolved, TsConfig,
-    manifest_for_dependents, parse_jsonc, resolve_each, resolve_tasks, selectively_hash_tsconfig,
-    without_resolution,
+    manifest_for_dependents, parse_jsonc, reference_is_outside, resolve_each, resolve_tasks,
+    selectively_hash_tsconfig, without_resolution,
 };
 /// Expands `{projectRoot}` and `{workspaceRoot}` in a project's path or glob.
 pub use paths::expand as expand_project_path;
