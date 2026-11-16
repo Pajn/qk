@@ -1077,16 +1077,16 @@ fn root_tsconfig_references_affect_the_projects_they_point_into() {
         ),
     );
     assert_eq!(repo.committed(), names(&["tool"]));
-    // A path is resolved before its project is looked up.
-    write(
-        &repo.root,
-        "tsconfig.json",
-        &tsconfig(
-            &format!(r#"{lib}, {{"path": "./libs/lib/../../tools/tool"}}"#),
-            true,
-        ),
-    );
-    assert_eq!(repo.committed(), names(&["tool"]));
+    // A path is resolved before its project is looked up, backslashes read
+    // as slashes. The second is JSON for `.\tools\tool`.
+    for path in ["./libs/lib/../../tools/tool", r".\\tools\\tool"] {
+        write(
+            &repo.root,
+            "tsconfig.json",
+            &tsconfig(&format!(r#"{lib}, {{"path": "{path}"}}"#), true),
+        );
+        assert_eq!(repo.committed(), names(&["tool"]), "{path}");
+    }
     // Moved out of the workspace, it points into no project.
     write(
         &repo.root,

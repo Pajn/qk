@@ -129,11 +129,13 @@ pub fn parse_jsonc(text: &str) -> Option<Value> {
 }
 
 /// A root tsconfig reference's path as TypeScript resolves it from the
-/// workspace root, `.` and `..` resolved lexically. An absolute path is kept
-/// as it is.
+/// workspace root: backslashes read as slashes, as TypeScript reads them on
+/// every platform, and `.` and `..` resolved lexically. An absolute path is
+/// kept as it is.
 fn normalize_reference(path: &str) -> String {
+    let path = path.replace('\\', "/");
     if path.starts_with('/') {
-        return path.to_owned();
+        return path;
     }
     let mut parts: Vec<&str> = Vec::new();
     for part in path.split('/') {

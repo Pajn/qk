@@ -130,8 +130,9 @@ touch the projects they point into, as do project references added to or
 removed from it, and any other change to it every project. Nx touches every
 project for a changed reference too; qk does not, because no tsconfig
 inherits `references` through `extends` and task keys leave them out. A
-reference's path is resolved from the workspace root, `..` included, and one
-leading out of the workspace touches no project. References that are not all
+reference's path is resolved from the workspace root, `..` included and
+backslashes read as slashes, and one leading out of the workspace, or given as
+an absolute path, touches no project. References that are not all
 objects holding only a `path` count as any other change. qk
 compares the root tsconfig as TypeScript reads it, comments and trailing
 commas allowed, where Nx touches every project when either revision is not
