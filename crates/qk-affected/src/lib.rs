@@ -227,8 +227,11 @@ pub enum Reason {
         mapping: String,
         path: String,
     },
-    /// A root tsconfig change outside `compilerOptions.paths`, which touches
-    /// every project.
+    /// A project reference in the root tsconfig, added or removed, points
+    /// into the project.
+    TsconfigReference { file: String, path: String },
+    /// A root tsconfig change outside `compilerOptions.paths` and
+    /// `references`, which touches every project.
     Tsconfig { file: String },
 }
 
@@ -319,9 +322,12 @@ impl std::fmt::Display for Reason {
                 mapping,
                 path,
             } => write!(f, "{file} path mapping {mapping} points into it ({path})"),
+            Self::TsconfigReference { file, path } => {
+                write!(f, "{file} project reference {path} points into it")
+            }
             Self::Tsconfig { file } => write!(
                 f,
-                "{file} changed outside compilerOptions.paths, which affects every project"
+                "{file} changed outside compilerOptions.paths and references, which affects every project"
             ),
         }
     }
@@ -1911,6 +1917,11 @@ fn installed_packages(
 
 /// Nx's `getTouchedProjectsFromTsConfig`: changed path mappings in the root
 /// tsconfig touch the projects they point into; any other change touches all.
+/// Unlike Nx, an added or removed project reference touches only the project
+/// it points into: no tsconfig inherits `references` through `extends`, and
+/// task keys leave them out (see [`qk_cache::TsConfig`]). And unlike Nx, which
+/// compares only strict JSON, the file is read as TypeScript reads it, with
+/// comments and trailing commas, as task keys read it.
 fn touched_by_root_tsconfig(
     workspace: &Workspace,
     changes: &Changes,
@@ -1926,18 +1937,61 @@ fn touched_by_root_tsconfig(
         return Ok(());
     }
     let everything = Reason::Tsconfig { file: file.into() };
-    let FileChange::Json(diff) = changes.change(file) else {
+    let read = |revision: Option<&str>| {
+        changes
+            .read(file, revision)
+            .and_then(|text| qk_cache::parse_jsonc(&text))
+    };
+    let compared = if changes.whole {
+        None
+    } else {
+        read(changes.base.as_deref()).zip(read(changes.head.as_deref()))
+    };
+    let Some((before, after)) = compared else {
         touches.all(workspace, everything);
         return Ok(());
     };
+    let diff = json_diff::diff(&before, &after);
     let is_path_mapping = |change: &Change| {
         change.path[0] == "compilerOptions" && change.path.get(1).is_none_or(|key| key == "paths")
     };
-    if !diff.iter().all(is_path_mapping) {
+    let is_reference = |change: &Change| change.path[0] == "references";
+    if !diff
+        .iter()
+        .all(|change| is_path_mapping(change) || is_reference(change))
+    {
         touches.all(workspace, everything);
         return Ok(());
     }
-    for change in diff.iter().filter(|change| change.path.len() == 4) {
+    if diff.iter().any(is_reference) {
+        let split = |value: &Value| qk_cache::TsConfig::split(value.clone());
+        let Some((before, after)) = split(&before).zip(split(&after)) else {
+            touches.all(workspace, everything);
+            return Ok(());
+        };
+        // References that are not all `{"path": …}` stay in what keys the
+        // root tsconfig for every task.
+        if before.rest.get("references") != after.rest.get("references") {
+            touches.all(workspace, everything);
+            return Ok(());
+        }
+        let roots = ProjectRoots::new(workspace);
+        for path in before.references.symmetric_difference(&after.references) {
+            if let Some(project) = roots.owner(path) {
+                touches.touch(
+                    project,
+                    Reason::TsconfigReference {
+                        file: file.into(),
+                        path: path.clone(),
+                    },
+                );
+            }
+        }
+    }
+    for change in diff
+        .iter()
+        .filter(|change| is_path_mapping(change) && change.path.len() == 4)
+    {
         if change.kind == Kind::Deleted {
             touches.all(workspace, everything);
             return Ok(());

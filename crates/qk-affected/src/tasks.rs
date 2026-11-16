@@ -82,7 +82,8 @@ pub enum TaskReason {
     /// A file projects are created from changed, in a project whose
     /// configuration the task reads.
     ProjectConfiguration { file: String },
-    /// The root tsconfig changed outside `compilerOptions.paths`, or, with
+    /// The root tsconfig changed outside `compilerOptions.paths` and
+    /// `references`, or, with
     /// `selectivelyHashTsConfig`, in path mappings into a project the task
     /// reads.
     Tsconfig { file: String },
@@ -147,7 +148,7 @@ impl std::fmt::Display for TaskReason {
             }
             Self::Tsconfig { file } => write!(
                 f,
-                "{file} changed outside compilerOptions.paths, or in path mappings this task reads"
+                "{file} changed outside compilerOptions.paths and references, or in path mappings this task reads"
             ),
             Self::DependencyUpdates { file, setting } => write!(
                 f,
@@ -665,10 +666,11 @@ enum TsconfigTouch {
 
 /// The root tsconfig that changed and the tasks it reaches, or `None` when
 /// neither root tsconfig changed. Nx strips `compilerOptions.paths` from the
-/// hash, so a change only there reaches no task, unless
-/// `selectivelyHashTsConfig` keys each project's own entries. A change
-/// elsewhere, one it cannot compare, or a change to the root tsconfig it does
-/// not read, which may have switched which file is the root, reaches all.
+/// hash, and qk `references` as well, so a change only there reaches no task,
+/// unless `selectivelyHashTsConfig` keys each project's own path entries. A
+/// change elsewhere, one it cannot compare, or a change to the root tsconfig
+/// it does not read, which may have switched which file is the root, reaches
+/// all.
 fn tsconfig_touch(
     workspace: &Workspace,
     changes: &Changes,

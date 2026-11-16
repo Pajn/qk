@@ -126,7 +126,13 @@ named with `--files`, which are not compared with a base revision, or when the
 removed project's manifests cannot be read there.
 
 Path mappings changed in the root tsconfig
-touch the projects they point into, and any other change to it every project.
+touch the projects they point into, as do project references added to or
+removed from it, and any other change to it every project. Nx touches every
+project for a changed reference too; qk does not, because no tsconfig
+inherits `references` through `extends` and task keys leave them out. qk
+compares the root tsconfig as TypeScript reads it, comments and trailing
+commas allowed, where Nx touches every project when either revision is not
+strict JSON.
 
 A change to the root lockfile (`pnpm-lock.yaml`, `pnpm-lock.yml`,
 `package-lock.json`, `yarn.lock`, `bun.lock` or `bun.lockb`) touches projects
@@ -214,9 +220,10 @@ when:
   rule above, which falls back on every task where it does. A `project.json`
   or `project.local.json` compared at both revisions counts by its inputs
   and the rule below instead;
-- the root tsconfig changed outside `compilerOptions.paths`, or, with
-  `selectivelyHashTsConfig`, in path mappings into a project whose inputs it
-  reads (see [What changes the key](cache.md#what-changes-the-key));
+- the root tsconfig changed outside `compilerOptions.paths` and
+  `references`, or, with `selectivelyHashTsConfig`, in path mappings into a
+  project whose inputs it reads (see
+  [What changes the key](cache.md#what-changes-the-key));
 - the root lockfile changed and `projectsAffectedByDependencyUpdates` is
   `"all"`, Nx's default, and the task hashes installed packages: it declares
   no `externalDependencies`, or names some. Under a list of selectors, the

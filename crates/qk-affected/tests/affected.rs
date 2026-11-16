@@ -1046,6 +1046,48 @@ fn root_tsconfig_path_changes_affect_the_projects_they_map_into() {
     assert_eq!(repo.committed(), names(&["app", "lib", "tool"]));
 }
 
+/// No tsconfig inherits `references` through `extends`, so adding or
+/// removing one touches only the project it points into. References that
+/// are not all `{"path": …}` count as any other change. The file is read as
+/// TypeScript reads it, comments and trailing commas allowed.
+#[test]
+fn root_tsconfig_references_affect_the_projects_they_point_into() {
+    let tsconfig = |references: &str, strict: bool| {
+        format!(
+            "{{\n  // The solution\n  \"compilerOptions\": {{\"strict\": {strict}}},\n  \"references\": [{references},],\n}}"
+        )
+    };
+    let lib = r#"{"path": "./libs/lib"}"#;
+    let repo = Repo::new(&[("tsconfig.json", &tsconfig(lib, true))]);
+    write(
+        &repo.root,
+        "tsconfig.json",
+        &tsconfig(r#"{"path": "./tools/tool/tsconfig.json"}"#, true),
+    );
+    // Moving a reference touches the projects at both ends, and the app
+    // through lib.
+    assert_eq!(repo.committed(), names(&["app", "lib", "tool"]));
+    let repo = Repo::new(&[("tsconfig.json", &tsconfig(lib, true))]);
+    write(
+        &repo.root,
+        "tsconfig.json",
+        &tsconfig(
+            &format!(r#"{lib}, {{"path": "./tools/tool/tsconfig.json"}}"#),
+            true,
+        ),
+    );
+    assert_eq!(repo.committed(), names(&["tool"]));
+    write(
+        &repo.root,
+        "tsconfig.json",
+        &tsconfig(&format!(r#"{lib}, {{"prepend": true}}"#), true),
+    );
+    assert_eq!(repo.committed(), names(&["app", "lib", "tool"]));
+    let repo = Repo::new(&[("tsconfig.json", &tsconfig(lib, true))]);
+    write(&repo.root, "tsconfig.json", &tsconfig(lib, false));
+    assert_eq!(repo.committed(), names(&["app", "lib", "tool"]));
+}
+
 fn analyse(repo: &Repo, base: &str, head: &str) -> qk_affected::Analysis {
     let workspace = Workspace::load(&repo.root).unwrap();
     let graph = ProjectGraph::build(&workspace).unwrap();
@@ -2599,6 +2641,22 @@ fn root_tsconfig_paths_reach_tasks_only_when_hashed_selectively() {
         );
         assert_eq!(affected_tasks(&repo).len(), 4, "{extra}");
     }
+}
+
+/// Task keys leave out the root tsconfig's project references, so adding
+/// one reaches no task.
+#[test]
+fn root_tsconfig_references_reach_no_task() {
+    let tsconfig = |references: &str, strict: bool| {
+        format!(r#"{{"compilerOptions": {{"strict": {strict}}}, "references": [{references}]}}"#)
+    };
+    let lib = r#"{"path": "./libs/lib"}"#;
+    let repo = narrow_task_repo("", &[("tsconfig.json", &tsconfig(lib, true))]);
+    let both = format!(r#"{{"path": "./apps/app"}}, {lib}"#);
+    write(&repo.root, "tsconfig.json", &tsconfig(&both, true));
+    assert!(affected_tasks(&repo).is_empty());
+    write(&repo.root, "tsconfig.json", &tsconfig(&both, false));
+    assert_eq!(affected_tasks(&repo).len(), 4);
 }
 
 /// Under Nx's default `projectsAffectedByDependencyUpdates: "all"`, a
