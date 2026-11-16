@@ -84,7 +84,8 @@ pub struct Inferred {
     pub manifests: BTreeMap<String, Value>,
     /// The root tsconfig, keyed as Nx hashes it: without
     /// `compilerOptions.paths`, and with `selectivelyHashTsConfig` the paths
-    /// entries pointing into the task's [`Declared::projects`].
+    /// entries pointing into the task's [`Declared::projects`]. Unlike Nx,
+    /// without its project references either (see [`TsConfig`]).
     pub tsconfig: Option<String>,
     /// Files qk would add that the declared inputs already select.
     pub covered: BTreeSet<String>,
@@ -121,6 +122,54 @@ impl Inferred {
     }
 }
 
+/// `text` read as TypeScript reads a tsconfig, comments and trailing commas
+/// allowed.
+pub fn parse_jsonc(text: &str) -> Option<Value> {
+    jsonc_parser::parse_to_serde_value(text, &Default::default()).ok()
+}
+
+/// A root tsconfig reference's path as TypeScript resolves it from the
+/// workspace root: backslashes read as slashes, as TypeScript reads them on
+/// every platform, and `.` and `..` resolved lexically. An absolute path is
+/// kept as it is.
+fn normalize_reference(path: &str) -> String {
+    let path = path.replace('\\', "/");
+    if is_absolute_reference(&path) {
+        return path;
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." if parts.last().is_some_and(|last| *last != "..") => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    if parts.is_empty() {
+        ".".into()
+    } else {
+        parts.join("/")
+    }
+}
+
+/// Whether a reference path, its backslashes read as slashes, is absolute on
+/// any platform: from `/`, or from a drive letter such as `C:`, whichever
+/// platform qk runs on.
+fn is_absolute_reference(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    path.starts_with('/')
+        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+}
+
+/// Whether a path in [`TsConfig::references`] points into no project of
+/// the workspace: it is absolute, which a committed tsconfig resolves only in
+/// the checkout it was written in, or it leads out of the workspace.
+pub fn reference_is_outside(path: &str) -> bool {
+    is_absolute_reference(path) || path.split('/').next() == Some("..")
+}
+
 /// The root tsconfig files, in the order Nx picks one.
 pub const ROOT_TSCONFIG_FILES: [&str; 2] = ["tsconfig.base.json", "tsconfig.json"];
 
@@ -141,27 +190,57 @@ pub fn selectively_hash_tsconfig(workspace: &Workspace) -> bool {
         .unwrap_or(false)
 }
 
-/// A root tsconfig split as Nx hashes it: everything but
-/// `compilerOptions.paths`, and the paths apart. `None` when it cannot be
-/// read as JSON or JSONC, or a paths entry is not a list of strings.
+/// A root tsconfig split as qk hashes it: everything but
+/// `compilerOptions.paths` and `references`, and those two apart. Nx leaves
+/// out the paths. qk also leaves out the project references, the one
+/// top-level field a tsconfig never passes on to one that `extends` it, so
+/// they reach only what reads the root tsconfig itself, as a build of the
+/// whole solution does through its own inputs. `None` when it cannot be read
+/// as JSON or JSONC, or a paths entry is not a list of strings.
 pub struct TsConfig {
     pub rest: Value,
     pub paths: BTreeMap<String, Vec<String>>,
+    /// The `path` of each project reference, relative to the workspace root
+    /// with `.` and `..` resolved; one leaving the workspace keeps its
+    /// leading `..`. When one is not an object holding only a string `path`,
+    /// they all stay in `rest`, which keys them.
+    pub references: BTreeSet<String>,
 }
 
 impl TsConfig {
     pub fn parse(text: &str) -> Option<Self> {
-        let mut rest: Value = jsonc_parser::parse_to_serde_value(text, &Default::default()).ok()?;
+        Self::split(parse_jsonc(text)?)
+    }
+
+    /// The parsed root tsconfig split as [`TsConfig::parse`] splits it.
+    pub fn split(mut rest: Value) -> Option<Self> {
+        let object = rest.as_object_mut()?;
         let mut paths = BTreeMap::new();
-        if let Some(options) = rest
-            .as_object_mut()?
+        if let Some(options) = object
             .get_mut("compilerOptions")
             .and_then(Value::as_object_mut)
             && let Some(removed) = options.remove("paths")
         {
             paths = serde_json::from_value(removed).ok()?;
         }
-        Some(Self { rest, paths })
+        let mut references = BTreeSet::new();
+        if let Some(Value::Array(entries)) = object.get("references")
+            && let Some(found) = entries
+                .iter()
+                .map(|entry| match entry.as_object() {
+                    Some(fields) if fields.len() == 1 => fields.get("path").and_then(Value::as_str),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()
+        {
+            references = found.into_iter().map(normalize_reference).collect();
+            object.remove("references");
+        }
+        Some(Self {
+            rest,
+            paths,
+            references,
+        })
     }
 
     /// The paths entries Nx's `hash_tsconfig_selectively` keeps for

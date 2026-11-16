@@ -72,6 +72,17 @@ edges off.
 - The root tsconfig is keyed without the version of the installed
   `typescript` package Nx hashes beside it; qk keys what the task's importers
   install instead.
+- The root tsconfig is keyed without its project references, which Nx keys,
+  and adding or removing one affects only the project it points into, where
+  Nx affects every project. No tsconfig inherits `references` through
+  `extends`, so a task reading the root tsconfig through a project's own
+  tsconfig never sees them. A task that reads the root tsconfig itself
+  declares it as an input, which keys it whole. See
+  [What changes the key](guides/cache.md#what-changes-the-key).
+- A root tsconfig with comments or trailing commas is compared by what
+  changed in it, as TypeScript reads it, where Nx affects every project
+  unless both revisions are strict JSON. See
+  [How changes reach projects](guides/affected.md#how-changes-reach-projects).
 - The `pnpm-workspace.yaml` qk adds to every key leaves out its resolution
   keys, which reach tasks through the lockfile. A task whose inputs select the
   file keys it whole, as in Nx.

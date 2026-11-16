@@ -51,7 +51,11 @@ project are always included, its scripts and dependency declarations with
 it. The root tsconfig
 (`tsconfig.base.json`, or else `tsconfig.json`) is included as Nx hashes it:
 without `compilerOptions.paths`, so adding or moving a path mapping leaves
-every key as it was. With `selectivelyHashTsConfig: true` in the options of
+every key as it was. Unlike Nx, qk also leaves out its `references`: no
+tsconfig inherits them through `extends`, so only a task reading the root
+tsconfig itself sees them, and such a task declares it as an input, which
+keys it whole. References that are not all objects holding only a `path`,
+such as one that also sets `prepend`, are keyed. With `selectivelyHashTsConfig: true` in the options of
 nx.json's `tasksRunnerOptions` runner (the one `--runner` names, else the one
 `NX_TASKS_RUNNER` names, else `default`), the key also holds the mappings whose targets lie in the projects
 whose inputs the task reads: its own, and those its `^` and `projects` inputs

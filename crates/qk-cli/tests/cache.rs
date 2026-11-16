@@ -4063,7 +4063,7 @@ fn dependency_inputs_cover_transitive_dependencies_like_nx() {
 
 /// As in Nx, the root tsconfig keys every task without its path mappings,
 /// and with `selectivelyHashTsConfig` with the mappings into the projects
-/// whose inputs the task reads.
+/// whose inputs the task reads. Unlike Nx, it never keys its references.
 #[test]
 fn the_root_tsconfig_keys_path_mappings_as_nx_does() {
     for selective in [false, true] {
@@ -4122,6 +4122,17 @@ fn the_root_tsconfig_keys_path_mappings_as_nx_does() {
             "tsconfig.base.json",
             &tsconfig("lib/b.ts", "other/b.ts", false),
         );
+        assert!(check().contains("cache miss"), "selective={selective}");
+        // Unlike Nx, project references never count: no tsconfig inherits
+        // them through `extends`.
+        let mut referenced: serde_json::Value =
+            serde_json::from_str(&tsconfig("lib/b.ts", "other/b.ts", false)).unwrap();
+        referenced["references"] = json!([{"path": "./lib"}]);
+        write("tsconfig.base.json", &referenced.to_string());
+        assert!(check().contains("cache hit"), "selective={selective}");
+        // Those holding more than a path are keyed.
+        referenced["references"] = json!([{"path": "./lib", "prepend": true}]);
+        write("tsconfig.base.json", &referenced.to_string());
         assert!(check().contains("cache miss"), "selective={selective}");
     }
 }
