@@ -595,6 +595,59 @@ fn recordings_are_shared_through_the_remote_store() {
     );
 }
 
+/// On the default branch, a result a recording took brings along the warm
+/// state of the run that kept it, by the key the recording took it under:
+/// its declared key differs, in a file the task never read.
+#[test]
+fn the_default_branch_adopts_warm_state_by_the_key_a_recording_took() {
+    if !has_strace() {
+        return;
+    }
+    let temp = fixture();
+    let root = temp.path();
+    let server = s3::FakeS3::start();
+    let machine = with_remote(root, &server);
+    let path = root.join("nx.json");
+    let mut nx: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    nx["targetDefaults"]["build"]["qk:warm"] =
+        json!({"portable": true, "env": {"TOOL_CACHE": "{warm}/tool"}});
+    fs::write(&path, nx.to_string()).unwrap();
+    let project = fs::read_to_string(root.join("app/project.json")).unwrap();
+    write(
+        root,
+        "app/project.json",
+        &project.replace(
+            " > dist/listing.txt",
+            r#" > dist/listing.txt && mkdir -p \"$TOOL_CACHE\" && echo saved > \"$TOOL_CACHE/seen\""#,
+        ),
+    );
+    let on = |name: &str, branch: &str, record: bool| {
+        let mut env = machine(name);
+        env.push(("GITHUB_REF_NAME".into(), branch.into()));
+        build_report(root, record, &pairs(&env))
+    };
+    let task = on("a", "feature", true);
+    assert_eq!(
+        (task["cache"].as_str(), kind(&task["recorded"]).as_str()),
+        (Some("miss"), "saved")
+    );
+    // Saved by both keys the result was kept under.
+    assert_eq!(
+        server.objects(&s3::path("adoptable/")).len(),
+        2,
+        "{:?}",
+        server.objects("")
+    );
+    write(root, "app/README.md", "# app\n\nStill not read.\n");
+    let task = on("b", "main", false);
+    assert_eq!(
+        (task["cache"].as_str(), kind(&task["recorded"]).as_str()),
+        (Some("remote-hit"), "hit")
+    );
+    let adopted = server.state.lock().unwrap().adopted.clone();
+    assert_eq!(adopted.len(), 1, "{adopted:?}");
+}
+
 #[test]
 fn a_task_in_mode_record_is_keyed_by_its_inputs_and_says_what_its_recordings_would_do() {
     if !has_strace() {

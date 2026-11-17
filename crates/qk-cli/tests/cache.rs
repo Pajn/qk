@@ -5222,6 +5222,7 @@ fn warm_state_is_shared_through_the_remote_by_branch() {
 }
 
 /// A cacheable target whose warm state says which branch last saved it.
+#[cfg(unix)]
 fn branch_noting_target() -> Value {
     json!({
         "cache": true,
@@ -5232,6 +5233,7 @@ fn branch_noting_target() -> Value {
 
 /// The first line a build on `branch` printed, on a machine with nothing
 /// local, built by `build`.
+#[cfg(unix)]
 fn first_line_on(fixture: &Fixture, build: impl Fn(&str) -> Output, branch: &str) -> String {
     let _ = fs::remove_dir_all(cache_path(fixture));
     let _ = fs::remove_dir_all(fixture.root.join(".git/qk/warm"));
@@ -5286,6 +5288,29 @@ fn the_default_branch_adopts_the_warm_state_of_a_result_it_takes() {
     let saves = copies();
     on("feature");
     assert_eq!(copies(), saves);
+}
+
+/// A run whose inputs changed while it ran keeps no result, so its warm state
+/// is saved for its branch alone, by no result for the default branch to take.
+#[cfg(unix)]
+#[test]
+fn a_run_whose_inputs_changed_saves_no_warm_state_by_result() {
+    let server = s3::FakeS3::start();
+    let mut target = branch_noting_target();
+    target["command"] = json!(format!(
+        "{} && echo changed >> src/input.txt",
+        target["command"].as_str().unwrap()
+    ));
+    let fixture = Fixture::new(target);
+    with_remote(&fixture, &server, json!({}));
+    let output = success(remote_build(&fixture, &[("GITHUB_REF_NAME", "feature")]));
+    assert!(
+        stderr(&output).contains("not caching because inputs changed during execution"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(server.objects(&s3::path("warm/")).len(), 1);
+    assert_eq!(server.objects(&s3::path("adoptable/")).len(), 0);
 }
 
 #[cfg(unix)]

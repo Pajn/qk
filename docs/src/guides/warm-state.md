@@ -66,12 +66,19 @@ saves nothing. Its save would then stay where it was when it last ran the
 task, however much has landed since.
 
 So a run on another branch that saves a task's warm state to the remote
-store also saves it by the cache key of the result it gave. When a run on
+store also saves it by each cache key its result is kept under: the key of
+its declared inputs, and for a task with [Ultracache](ultracache.md)
+recordings, the key of what it read. A run that keeps no result, as one
+whose inputs changed while it ran, saves its state for its branch alone.
+When a run on
 the default branch takes that result from the cache, the store replaces
 the default branch's save with the one saved by that key. The hit means
 the run that saved it had the inputs the default branch has now, so its
 state is what the default branch would have saved had it run the task
-itself. The result is taken from the cache as ever; the replacement goes
+itself. A result taken by a recording adopts the save by the key it was
+taken under, so a change to a declared file the task never read does not
+keep its state from the default branch. The result is taken from the
+cache as ever; the replacement goes
 with the uploads, and the store makes it without the state passing
 through the machine. A save the default branch adopted is not replaced
 again by the same result, and a store without a save for it leaves the

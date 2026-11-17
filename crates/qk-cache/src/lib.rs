@@ -574,11 +574,12 @@ impl Cache {
             }
             (restored, present)
         };
-        // `result`: the key of the result a cacheable task gave.
+        // `adoptables`: where a cacheable task's saves meet the keys its
+        // result is kept under.
         let after = |outcome: Outcome,
                      (restored, present): (Vec<warm::Restored>, Vec<String>),
                      running: &PreparedTask,
-                     result: Option<&str>|
+                     adoptables: Option<&warm::Adoptables>|
          -> Option<warm::WarmReport> {
             if entries.is_empty() {
                 return None;
@@ -592,9 +593,9 @@ impl Cache {
             {
                 let started = std::time::Instant::now();
                 let saved = if warm.background {
-                    self.save_warm_in_background(workspace, task, warm, running, result)
+                    self.save_warm_in_background(workspace, task, warm, running, adoptables)
                 } else {
-                    self.save_warm(workspace, task, warm, running, result)
+                    self.save_warm(workspace, task, warm, running, adoptables)
                 };
                 match saved {
                     Ok(()) if warm.background => background = true,
@@ -828,7 +829,9 @@ impl Cache {
                             store.held(&strong);
                         }
                         recorded::touch(&self.root, weak);
-                        self.adopt_warm(workspace, task, &entries, &key);
+                        // By the key it was kept under, which a run whose
+                        // declared inputs differ in what it never read shares.
+                        self.adopt_warm(workspace, task, &entries, &strong);
                         qk_executor::report::event(qk_executor::report::Event::Cache {
                             id: task.id.clone(),
                             cached: if remote {
@@ -1046,7 +1049,11 @@ impl Cache {
         let executing = profile::span(&task.id, "execute");
         let outcome = execute_captured(running, cancelled, Some(&capture))?;
         drop(executing);
-        let warm_report = after(outcome, restored, running, Some(&key));
+        let adoptables = self
+            .remote
+            .clone()
+            .map(|remote| warm::Adoptables::new(remote, self.root.clone(), task.id.clone()));
+        let warm_report = after(outcome, restored, running, adoptables.as_ref());
         let inputs_unchanged =
             self.inputs_match(snapshot, workspace, graph, task, prepared, &key, cancelled);
         let execution = capture.take_log().map(|log| Execution {
@@ -1088,6 +1095,8 @@ impl Cache {
             qk_executor::status!("qk: {}: not recorded ({reason})", task.id);
         }
         let mut published = false;
+        // The keys the result is kept under, for its warm saves.
+        let mut kept_under = Vec::new();
         let kept = outcome == Outcome::Success && inputs_unchanged && capture.healthy();
         if kept {
             let publishing = profile::span(&task.id, "publish");
@@ -1096,18 +1105,18 @@ impl Cache {
             match publish {
                 Ok(()) => {
                     published = true;
+                    kept_under.push(key.clone());
                     store::record_outputs(&workspace.root, &task.id, &key, &outputs);
                     if let Some(remote) = &self.remote {
                         remote.upload(&self.root, &key);
                     }
                     for strong in &replaced {
-                        if let Err(error) =
-                            self.publish(&workspace.root, strong, &outputs, log.path())
-                        {
-                            qk_executor::status!(
+                        match self.publish(&workspace.root, strong, &outputs, log.path()) {
+                            Ok(()) => kept_under.push(strong.clone()),
+                            Err(error) => qk_executor::status!(
                                 "qk: {}: could not replace a recorded cache entry ({error})",
                                 task.id
-                            );
+                            ),
                         }
                     }
                 }
@@ -1154,7 +1163,10 @@ impl Cache {
                         Ok(strong)
                     });
                 match saved {
-                    Ok(key) => lookup::Ran::Saved(key),
+                    Ok(key) => {
+                        kept_under.push(key.clone());
+                        lookup::Ran::Saved(key)
+                    }
                     Err(error) => {
                         qk_executor::status!("qk: {}: recording not saved ({error:#})", task.id);
                         lookup::Ran::Unsaved(format!("{error:#}"))
@@ -1181,6 +1193,11 @@ impl Cache {
                 _ => lookup::Ran::Unkeyed,
             },
         };
+        if let Some(adoptables) = &adoptables
+            && !kept_under.is_empty()
+        {
+            adoptables.settle(kept_under);
+        }
         let recorded = verdict(had_sets(&recordings), lookup::Taken::Ran(ran));
         let shadow = match shadow {
             Some(Shadow::WouldHit { key: recorded, .. }) => Some(Shadow::WouldHit {

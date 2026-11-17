@@ -239,7 +239,12 @@ store server's. Asked for the whole index, as a machine with an empty cache
 is, the proxy answers from its own copy, which it brings up to date by asking
 the store server only what changed since, and reads whole again after an
 hour. Everything else, including reads of entries and warm state the proxy
-has not taken, goes to the store server as it came.
+has not taken, goes to the store server as it came. A request to
+[adopt](warm-state.md#the-default-branchs-state) warm state goes once the
+uploads it reads and replaces have reached the store server; the proxy
+then forgets the warm state it kept for that branch. If those uploads take
+more than half a minute, it turns the request away, and the next run on the
+default branch that takes the result asks again.
 
 Past `--max-size` the proxy removes the outputs and records used least
 recently, never one still queued. `GET /proxy/stats` reports how much it served itself, how

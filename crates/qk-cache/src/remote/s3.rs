@@ -318,11 +318,20 @@ impl Store for S3 {
             .header("x-amz-metadata-directive", "REPLACE")
             .header(ADOPTED, key)
             .send_empty()?;
-        let status = response.status().as_u16();
-        let body = response.into_body().read_to_string().unwrap_or_default();
-        match status {
-            // A copy can fail after S3 has answered 200, in the body.
-            200..=299 if !body.contains("<Error>") => Ok(()),
+        match response.status().as_u16() {
+            // A copy can fail after S3 has answered 200, in the body, so a
+            // body that cannot be read is no answer. Asked again, the HEAD
+            // finds a copy that was made.
+            200..=299 => {
+                let body = response
+                    .into_body()
+                    .read_to_string()
+                    .with_context(|| format!("reading the answer to copying {source}"))?;
+                if body.contains("<Error>") {
+                    bail!("copying {source} to {target} failed: {body}");
+                }
+                Ok(())
+            }
             // No run saved a record for this result.
             404 => Ok(()),
             status => bail!("copying {source} to {target} returned {status}"),
