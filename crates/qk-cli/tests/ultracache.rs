@@ -80,6 +80,9 @@ fn qk(root: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
         .env_remove("AWS_ACCESS_KEY_ID")
         .env_remove("AWS_SECRET_ACCESS_KEY")
         .env_remove("AWS_SESSION_TOKEN")
+        // A test names its branch itself, not the CI run's.
+        .env_remove("GITHUB_HEAD_REF")
+        .env_remove("GITHUB_REF_NAME")
         .envs(env.iter().copied())
         .output()
         .unwrap();
