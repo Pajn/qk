@@ -578,20 +578,24 @@ fn handle(
         ("GET", Some(hash)) => Some(hash),
         _ => None,
     };
-    let (status, sent) = proxy.forward(request, writer, keep)?;
+    let forwarded = proxy.forward(request, writer, keep);
+    // A warm record the upstream replaced by adopting another is no longer
+    // the one kept here; nor may it be when the answer could not be passed
+    // on, as the upstream may have adopted before. Forgotten on the
+    // adoption's turn.
+    if let Some(warm) = adoption
+        && forwarded
+            .as_ref()
+            .map_or(true, |(status, _)| (200..300).contains(status))
+    {
+        proxy.forget_record(warm);
+    }
+    let (status, sent) = forwarded?;
     if request.method == "PUT"
         && (200..300).contains(&status)
         && let Some(token) = &request.authorization
     {
         proxy.writers.lock().unwrap().insert(token.clone());
-    }
-    // A warm record the upstream replaced by adopting another is no longer
-    // the one kept here.
-    if (200..300).contains(&status)
-        && let Some(warm) = adoption
-    {
-        writer.flush()?;
-        proxy.forget_record(warm);
     }
     // An upload the upstream took is kept too, for the runners that fetch it:
     // a blob on its own, or those a result or warm record carries inline.
@@ -2556,6 +2560,61 @@ mod tests {
             drop(turn);
             assert!(waiting.recv_timeout(Duration::from_secs(5)).unwrap());
         });
+    }
+
+    #[test]
+    fn an_adoption_forgets_the_kept_record_though_its_answer_cannot_be_passed_on() {
+        // An upstream that adopts.
+        let upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = upstream.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in upstream.incoming() {
+                let mut stream = stream.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 4096];
+                while !request.ends_with(br#"{"key":"k"}"#) {
+                    let read = stream.read(&mut buffer).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\n\r\n");
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let proxy = Proxy::open(&Options {
+            upstream: format!("http://{address}"),
+            directory: directory.path().to_owned(),
+            listen: String::new(),
+            max_size: None,
+        })
+        .unwrap();
+        let warm = "/v4/warm/a/main";
+        let body = directory.path().join("body");
+        fs::write(&body, b"replaced").unwrap();
+        proxy.keep_record(warm, &body);
+        assert!(proxy.record_file(warm).is_file());
+        // A runner gone before its answer.
+        struct Gone;
+        impl Write for Gone {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        let request = Request {
+            method: "POST".into(),
+            target: format!("{warm}/adopt"),
+            authorization: Some("Bearer token".into()),
+            content_type: Some("application/json".into()),
+            body: br#"{"key":"k"}"#.to_vec(),
+            close: false,
+        };
+        assert!(handle(&proxy, &request, &mut Gone).is_err());
+        assert!(!proxy.record_file(warm).exists());
     }
 
     #[test]
