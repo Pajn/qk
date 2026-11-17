@@ -410,6 +410,9 @@ fn handle(
     // Many small blobs as one upload body, which the proxy takes as a record
     // whose blobs records citing them wait for.
     let bundle = path.starts_with("/v4/bundles/");
+    // A warm record saved by result, which no client reads back: it is
+    // queued as records are, but neither kept nor served.
+    let adoptable = path.starts_with("/v4/adoptable/");
     if request.method == "GET" && path == "/proxy/stats" {
         let body = proxy.stats_json().into_bytes();
         head(
@@ -517,7 +520,10 @@ fn handle(
     // An upload from a token the upstream accepted is kept, queued and
     // answered at once. Others go upstream as they came, the answer being
     // the upstream's to give.
-    if request.method == "PUT" && proxy.writes(request) && (blob.is_some() || record || bundle) {
+    if request.method == "PUT"
+        && proxy.writes(request)
+        && (blob.is_some() || record || bundle || adoptable)
+    {
         let queued = match blob {
             Some(hash) => proxy.queue_blob(request, hash).unwrap_or(false),
             // A bundle is queued first, which holds its blobs against
@@ -559,6 +565,17 @@ fn handle(
         && let Some(token) = &request.authorization
     {
         proxy.writers.lock().unwrap().insert(token.clone());
+    }
+    // A warm record the upstream replaced by adopting another is no longer
+    // the one kept here.
+    if request.method == "POST"
+        && (200..300).contains(&status)
+        && let Some(warm) = path
+            .strip_suffix("/adopt")
+            .filter(|warm| warm.starts_with("/v4/warm/"))
+    {
+        writer.flush()?;
+        proxy.forget_record(warm);
     }
     // An upload the upstream took is kept too, for the runners that fetch it:
     // a blob on its own, or those a result or warm record carries inline.

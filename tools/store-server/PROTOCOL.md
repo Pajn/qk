@@ -173,6 +173,32 @@ them and commits again.
 Write token. Body: an upload body. The newest save replaces the last. Answer:
 `204`, or `422` as for entries.
 
+### `PUT adoptable/<a>/<key>`, `HEAD adoptable/<a>/<key>`
+
+Optional: a server that does not take them answers `404`, and clients carry
+on without them; the reference server here takes them. Write token for
+`PUT`. Body: an upload body, the warm record a run saved for task `<a>`
+(named as in `warm/<a>/<b>`), saved by `<key>`, the key of the result that
+run gave. The newest save replaces the last. Answer: `204`, or `422` as for
+entries. `HEAD` answers `200` or `404`.
+
+Clients read these records only through adoption, so a server may expire
+them.
+
+### `POST warm/<a>/<b>/adopt`
+
+Optional, as `adoptable/` is. Write token. Body: `{"key": <key>}`. The
+server replaces `warm/<a>/<b>` with `adoptable/<a>/<key>`, the inline blobs
+it carries included, and notes `<key>` beside it, unless `warm/<a>/<b>`
+already holds the record adopted from `<key>`; a `PUT warm/<a>/<b>`
+clears the note. Answer: `204` when `warm/<a>/<b>` holds the record adopted
+from `<key>`, or `404` when there is no `adoptable/<a>/<key>`, which leaves
+`warm/<a>/<b>` as it was.
+
+A client on the default branch asks this when it takes the result under
+`<key>` from the store: the run that gave it saved warm state for inputs the
+branch now has, and the branch, not running the task, saves none of its own.
+
 ### `GET pathsets/<weak>`, `HEAD pathsets/<weak>`, `PUT pathsets/<weak>`
 
 The path sets recorded for a weak key, 64 hex digits, as a record citing no

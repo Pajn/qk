@@ -1043,18 +1043,19 @@ pub(crate) fn current_branch(workspace: &Workspace) -> Option<String> {
     (output.status.success() && !branch.is_empty() && branch != "HEAD").then_some(branch)
 }
 
+/// The workspace's default branch: nx.json `defaultBase`, else `main`.
+fn default_branch(workspace: &Workspace) -> String {
+    let default = workspace.config.default_base.as_deref().unwrap_or("main");
+    default
+        .strip_prefix("origin/")
+        .unwrap_or(default)
+        .to_owned()
+}
+
 /// The branches to take warm state from, in order: the current one, then the
 /// workspace's default branch.
 pub(crate) fn branches(workspace: &Workspace) -> Vec<String> {
-    let default = workspace
-        .config
-        .default_base
-        .clone()
-        .unwrap_or_else(|| "main".into());
-    let default = default
-        .strip_prefix("origin/")
-        .unwrap_or(&default)
-        .to_owned();
+    let default = default_branch(workspace);
     let mut branches: Vec<String> = current_branch(workspace).into_iter().collect();
     if !branches.contains(&default) {
         branches.push(default);
@@ -1876,8 +1877,9 @@ impl Cache {
         task: &Task,
         warm: &Warm,
         prepared: &qk_executor::PreparedTask,
+        result: Option<&str>,
     ) -> Result<()> {
-        self.save_prepared(&Save::prepare(workspace, task, warm, prepared)?)
+        self.save_prepared(&Save::prepare(workspace, task, warm, prepared, result)?)
     }
 
     /// Saves the task's warm groups on a thread of its own, which
@@ -1888,8 +1890,9 @@ impl Cache {
         task: &Task,
         warm: &Warm,
         prepared: &qk_executor::PreparedTask,
+        result: Option<&str>,
     ) -> Result<()> {
-        let save = Save::prepare(workspace, task, warm, prepared)?;
+        let save = Save::prepare(workspace, task, warm, prepared, result)?;
         let cache = Cache {
             remote: self.remote.clone(),
             ..Cache::new(self.root.clone())
@@ -2050,15 +2053,59 @@ impl Cache {
             for group in record.groups.values_mut() {
                 group.stamps.clear();
             }
-            remote.upload_warm(
-                &self.root,
-                &warm.identity,
-                &remote_identity(warm, &save.worktree),
-                branch,
-                serde_json::to_vec(&record)?,
-            );
+            let identity = remote_identity(warm, &save.worktree);
+            let bytes = serde_json::to_vec(&record)?;
+            // Saved by its result too, for the default branch to adopt once
+            // that result is its hit, as the branch never runs the task
+            // itself then. A group is saved by several tasks, each with a
+            // result of its own, so it is not.
+            if let Some(key) = &save.result
+                && *branch != save.default_branch
+                && warm.group().is_none()
+            {
+                remote.upload_adoptable(&self.root, &save.task, &identity, key, bytes.clone());
+            }
+            remote.upload_warm(&self.root, &warm.identity, &identity, branch, bytes);
         }
         Ok(())
+    }
+
+    /// On the default branch, a result taken from the cache under `key`
+    /// brings along the warm state the run that gave it saved: the branch's
+    /// remote save of each of the task's own entries is replaced with it. The
+    /// branch would otherwise save warm state only for the tasks it runs
+    /// itself, which other branches have mostly run first.
+    pub(crate) fn adopt_warm(
+        &self,
+        workspace: &Workspace,
+        task: &Task,
+        entries: &[Warm],
+        key: &str,
+    ) {
+        let Some(remote) = &self.remote else {
+            return;
+        };
+        let adoptable: Vec<&Warm> = entries
+            .iter()
+            .filter(|warm| warm.shared_remotely() && warm.group().is_none())
+            .collect();
+        if adoptable.is_empty() {
+            return;
+        }
+        let default = default_branch(workspace);
+        if current_branch(workspace).as_deref() != Some(default.as_str()) {
+            return;
+        }
+        let worktree = worktree(workspace);
+        for warm in adoptable {
+            remote.adopt_warm(
+                &self.root,
+                &task.id,
+                &remote_identity(warm, &worktree),
+                &default,
+                key,
+            );
+        }
     }
 }
 
@@ -2071,8 +2118,11 @@ struct Save {
     worktree: String,
     commit: Option<String>,
     branch: Option<String>,
+    default_branch: String,
     key: Vec<String>,
     notes: PathBuf,
+    /// The cache key of the result the run gave, for a cacheable task.
+    result: Option<String>,
 }
 
 impl Save {
@@ -2082,6 +2132,7 @@ impl Save {
         task: &Task,
         warm: &Warm,
         prepared: &qk_executor::PreparedTask,
+        result: Option<&str>,
     ) -> Result<Self> {
         Ok(Self {
             task: task.id.clone(),
@@ -2090,8 +2141,10 @@ impl Save {
             worktree: worktree(workspace),
             commit: current_commit(workspace),
             branch: current_branch(workspace),
+            default_branch: default_branch(workspace),
             key: key_digests(workspace, warm, prepared)?,
             notes: restored_files_path(workspace, warm),
+            result: result.map(str::to_owned),
         })
     }
 }

@@ -195,6 +195,10 @@ impl Store for Breaker {
         self.ask(refused, || self.store.put(object, file))
     }
 
+    fn adopt(&self, identity: &str, branch: &str, key: &str) -> Result<()> {
+        self.ask(refused, || self.store.adopt(identity, branch, key))
+    }
+
     fn blobs_held(&self, blobs: &[String]) -> Result<Option<super::store::Held>> {
         self.ask(refused, || self.store.blobs_held(blobs))
     }

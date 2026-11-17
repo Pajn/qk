@@ -24,6 +24,19 @@ server takes at most 16 MiB of them for one task, so a larger record is
 shared without its oldest sets; one whose newest set alone is larger is not
 shared, and its upload fails.
 
+A task's portable warm state is stored as `warm/<task>/<branch>`. A run on
+a branch other than the default one also stores it by the key of the
+result the run gave, as `adoptable/<task>/<key>`, and a run on the default
+branch that takes that result from the cache has the store copy it over the
+default branch's save: see
+[the default branch's state](warm-state.md#the-default-branchs-state). On
+S3 the copy is a `CopyObject` of one object to another, which marks the copy
+with the key in its metadata so that it is not copied again; the
+credentials need to read `adoptable/` and write `warm/`. Saves under
+`adoptable/` matter only until the default branch takes their result, so a
+lifecycle rule may expire them, for example after 14 days. Unlike `blobs/`,
+nothing else reads them.
+
 What tasks are expected to take, which orders them and sizes their
 [shares of the cores](threads.md), is stored as `expectations/<name>`, one
 record per branch and platform. It holds each task's last five runs that

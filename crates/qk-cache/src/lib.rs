@@ -574,9 +574,11 @@ impl Cache {
             }
             (restored, present)
         };
+        // `result`: the key of the result a cacheable task gave.
         let after = |outcome: Outcome,
                      (restored, present): (Vec<warm::Restored>, Vec<String>),
-                     running: &PreparedTask|
+                     running: &PreparedTask,
+                     result: Option<&str>|
          -> Option<warm::WarmReport> {
             if entries.is_empty() {
                 return None;
@@ -590,9 +592,9 @@ impl Cache {
             {
                 let started = std::time::Instant::now();
                 let saved = if warm.background {
-                    self.save_warm_in_background(workspace, task, warm, running)
+                    self.save_warm_in_background(workspace, task, warm, running, result)
                 } else {
-                    self.save_warm(workspace, task, warm, running)
+                    self.save_warm(workspace, task, warm, running, result)
                 };
                 match saved {
                     Ok(()) if warm.background => background = true,
@@ -666,7 +668,7 @@ impl Cache {
             let executing = profile::span(&task.id, "execute");
             let (outcome, execution) = execute_uncached(running, cancelled)?;
             drop(executing);
-            let warm_report = after(outcome, restored, running);
+            let warm_report = after(outcome, restored, running, None);
             return Ok(TaskResult {
                 outcome,
                 cache: CacheStatus::Uncached,
@@ -826,6 +828,7 @@ impl Cache {
                             store.held(&strong);
                         }
                         recorded::touch(&self.root, weak);
+                        self.adopt_warm(workspace, task, &entries, &key);
                         qk_executor::report::event(qk_executor::report::Event::Cache {
                             id: task.id.clone(),
                             cached: if remote {
@@ -914,6 +917,7 @@ impl Cache {
         };
         match restored {
             Ok(true) => {
+                self.adopt_warm(workspace, task, &entries, &key);
                 let claimed = match &self.remote {
                     Some(remote) if prefetched && remote.claim(&key) => true,
                     Some(remote) => {
@@ -977,6 +981,7 @@ impl Cache {
             });
             match fetched {
                 Ok(true) => {
+                    self.adopt_warm(workspace, task, &entries, &key);
                     qk_executor::report::event(qk_executor::report::Event::Cache {
                         id: task.id.clone(),
                         cached: qk_executor::report::Cached::RemoteHit,
@@ -1041,7 +1046,7 @@ impl Cache {
         let executing = profile::span(&task.id, "execute");
         let outcome = execute_captured(running, cancelled, Some(&capture))?;
         drop(executing);
-        let warm_report = after(outcome, restored, running);
+        let warm_report = after(outcome, restored, running, Some(&key));
         let inputs_unchanged =
             self.inputs_match(snapshot, workspace, graph, task, prepared, &key, cancelled);
         let execution = capture.take_log().map(|log| Execution {

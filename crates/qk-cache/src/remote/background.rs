@@ -158,8 +158,9 @@ fn snapshot(jobs: &[Upload]) -> Result<(tempfile::TempDir, Vec<Upload>, Vec<Stri
     let mut pinned = Vec::with_capacity(jobs.len());
     let mut skipped = Vec::new();
     for (index, job) in jobs.iter().enumerate() {
-        // Expectations cite no blob, and are composed as they are sent.
-        if job.expectations.is_some() {
+        // Expectations cite no blob, and are composed as they are sent; an
+        // adoption only names records the store holds.
+        if job.expectations.is_some() || job.adoption.is_some() {
             let mut job = job.clone();
             job.local = root.to_owned();
             pinned.push(job);
@@ -481,6 +482,7 @@ mod tests {
                 warm: None,
                 path_sets: None,
                 expectations: None,
+                adoption: None,
                 record_file: None,
             },
             Upload {
@@ -493,9 +495,11 @@ mod tests {
                         &json!({"groups": {"paths": {"artifacts": {"scratch": {"blob": blob}}}}}),
                     )
                     .unwrap(),
+                    result: None,
                 }),
                 path_sets: None,
                 expectations: None,
+                adoption: None,
                 record_file: None,
             },
         ];
@@ -536,9 +540,11 @@ mod tests {
                 identity: "app:build".into(),
                 branch: "main".into(),
                 record: record.clone(),
+                result: None,
             }),
             path_sets: None,
             expectations: None,
+            adoption: None,
             record_file: None,
         };
         assert!(serde_json::to_vec(&job).unwrap().len() as u64 > MAX_REQUEST);
@@ -575,6 +581,7 @@ mod tests {
             warm: None,
             path_sets: None,
             expectations: None,
+            adoption: None,
             record_file: None,
         };
         let (_pinned, jobs, skipped) =

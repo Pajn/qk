@@ -20,6 +20,10 @@ pub(super) enum Object<'a> {
     Entry(&'a str),
     /// A task's warm record, saved for a branch.
     Warm { identity: &'a str, branch: &'a str },
+    /// A task's warm record saved by the run that gave the result under a
+    /// cache key, which the default branch adopts when that result is its
+    /// hit.
+    Adoptable { identity: &'a str, key: &'a str },
     /// A blob stored apart from the packs that cite it, named by its hash.
     Blob(&'a str),
     /// The path sets recorded for a weak key, a pack citing no blob.
@@ -58,6 +62,12 @@ pub(super) fn warm_names(identity: &str, branch: &str) -> (String, String) {
         std::env::consts::ARCH
     );
     (hash(&identity), hash(branch))
+}
+
+/// The name a task's warm records are stored under, as [`warm_names`] gives
+/// it, for records saved by result rather than by branch.
+pub(super) fn warm_identity(identity: &str) -> String {
+    warm_names(identity, "").0
 }
 
 /// The name tasks' expectations saved for `branch` are stored under, as 32
@@ -119,6 +129,14 @@ pub(super) trait Store: Send + Sync {
 
     /// Writes the pack in `file` as `object`.
     fn put(&self, object: Object, file: File) -> Result<()>;
+
+    /// Replaces the task's warm record saved for `branch` with the one saved
+    /// by the run that gave the result under `key`, unless it is that record
+    /// already. A store without that record, or one that keeps none by result,
+    /// leaves the branch's as it is.
+    fn adopt(&self, _identity: &str, _branch: &str, _key: &str) -> Result<()> {
+        Ok(())
+    }
 
     /// Which of `blobs` the store lacks, and which it holds loose: each in an
     /// object of its own, though small enough to bundle. `None` when the store

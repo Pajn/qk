@@ -58,6 +58,11 @@ A saved collection of a task's or named group's scratch state, associated
 with the worktree that produced it. Warm state helps a tool run faster but
 does not establish a successful task result or a cache hit.
 
+**Adoption**:
+The default branch taking, as its own remote warm-state record for a task,
+the one a run on another branch saved by the cache key of the result it gave,
+when that result is the default branch's cache hit.
+
 **Blob**:
 Saved file or log content identified by its content hash. Several result
 records or warm-state records can cite the same blob.
