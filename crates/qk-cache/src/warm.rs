@@ -25,8 +25,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ahead::Taken;
@@ -1043,18 +1043,19 @@ pub(crate) fn current_branch(workspace: &Workspace) -> Option<String> {
     (output.status.success() && !branch.is_empty() && branch != "HEAD").then_some(branch)
 }
 
+/// The workspace's default branch: nx.json `defaultBase`, else `main`.
+fn default_branch(workspace: &Workspace) -> String {
+    let default = workspace.config.default_base.as_deref().unwrap_or("main");
+    default
+        .strip_prefix("origin/")
+        .unwrap_or(default)
+        .to_owned()
+}
+
 /// The branches to take warm state from, in order: the current one, then the
 /// workspace's default branch.
 pub(crate) fn branches(workspace: &Workspace) -> Vec<String> {
-    let default = workspace
-        .config
-        .default_base
-        .clone()
-        .unwrap_or_else(|| "main".into());
-    let default = default
-        .strip_prefix("origin/")
-        .unwrap_or(&default)
-        .to_owned();
+    let default = default_branch(workspace);
     let mut branches: Vec<String> = current_branch(workspace).into_iter().collect();
     if !branches.contains(&default) {
         branches.push(default);
@@ -1876,8 +1877,9 @@ impl Cache {
         task: &Task,
         warm: &Warm,
         prepared: &qk_executor::PreparedTask,
+        adoptables: Option<&Adoptables>,
     ) -> Result<()> {
-        self.save_prepared(&Save::prepare(workspace, task, warm, prepared)?)
+        self.save_prepared(&Save::prepare(workspace, task, warm, prepared, adoptables)?)
     }
 
     /// Saves the task's warm groups on a thread of its own, which
@@ -1888,8 +1890,9 @@ impl Cache {
         task: &Task,
         warm: &Warm,
         prepared: &qk_executor::PreparedTask,
+        adoptables: Option<&Adoptables>,
     ) -> Result<()> {
-        let save = Save::prepare(workspace, task, warm, prepared)?;
+        let save = Save::prepare(workspace, task, warm, prepared, adoptables)?;
         let cache = Cache {
             remote: self.remote.clone(),
             ..Cache::new(self.root.clone())
@@ -2050,15 +2053,116 @@ impl Cache {
             for group in record.groups.values_mut() {
                 group.stamps.clear();
             }
-            remote.upload_warm(
-                &self.root,
-                &warm.identity,
-                &remote_identity(warm, &save.worktree),
-                branch,
-                serde_json::to_vec(&record)?,
-            );
+            let identity = remote_identity(warm, &save.worktree);
+            let bytes = serde_json::to_vec(&record)?;
+            // Saved by its result too, for the default branch to adopt once
+            // that result is its hit, as the branch never runs the task
+            // itself then. A group is saved by several tasks, each with a
+            // result of its own, so it is not.
+            if let Some(adoptables) = &save.adoptables
+                && *branch != save.default_branch
+                && warm.group().is_none()
+            {
+                adoptables.offer(identity.clone(), bytes.clone());
+            }
+            remote.upload_warm(&self.root, &warm.identity, &identity, branch, bytes);
         }
         Ok(())
+    }
+
+    /// On the default branch, a result taken from the cache under `key`
+    /// brings along the warm state the run that gave it saved: the branch's
+    /// remote save of each of the task's own entries is replaced with it. The
+    /// branch would otherwise save warm state only for the tasks it runs
+    /// itself, which other branches have mostly run first.
+    pub(crate) fn adopt_warm(
+        &self,
+        workspace: &Workspace,
+        task: &Task,
+        entries: &[Warm],
+        key: &str,
+    ) {
+        let Some(remote) = &self.remote else {
+            return;
+        };
+        let adoptable: Vec<&Warm> = entries
+            .iter()
+            .filter(|warm| warm.shared_remotely() && warm.group().is_none())
+            .collect();
+        if adoptable.is_empty() {
+            return;
+        }
+        let default = default_branch(workspace);
+        if current_branch(workspace).as_deref() != Some(default.as_str()) {
+            return;
+        }
+        let worktree = worktree(workspace);
+        for warm in adoptable {
+            remote.adopt_warm(
+                &self.root,
+                &task.id,
+                &remote_identity(warm, &worktree),
+                &default,
+                key,
+            );
+        }
+    }
+}
+
+/// Where the warm records a cacheable task's run saves for the default branch
+/// to adopt meet the keys its result is kept under. The save may finish
+/// before the result is kept or after, on a thread of its own; whichever
+/// comes second queues the uploads. A result that is not kept, as when its
+/// inputs changed while it ran, is never settled, and nothing is uploaded.
+#[derive(Clone)]
+pub(crate) struct Adoptables(Arc<Mutex<Pending>>);
+
+struct Pending {
+    remote: Arc<crate::remote::Remote>,
+    root: PathBuf,
+    task: String,
+    /// The records saved so far, by remote identity, while no keys are known.
+    records: Vec<(String, Vec<u8>)>,
+    /// The keys the result is kept under, once it is.
+    keys: Option<Vec<String>>,
+}
+
+impl Adoptables {
+    pub(crate) fn new(remote: Arc<crate::remote::Remote>, root: PathBuf, task: String) -> Self {
+        Self(Arc::new(Mutex::new(Pending {
+            remote,
+            root,
+            task,
+            records: Vec::new(),
+            keys: None,
+        })))
+    }
+
+    /// A record saved, uploaded under each key the result is kept under.
+    fn offer(&self, identity: String, record: Vec<u8>) {
+        let mut pending = self.0.lock().unwrap();
+        match &pending.keys {
+            Some(keys) => pending.upload(keys, &identity, record),
+            None => pending.records.push((identity, record)),
+        }
+    }
+
+    /// The keys the result is kept under, each to have the records saved.
+    pub(crate) fn settle(&self, keys: Vec<String>) {
+        let mut pending = self.0.lock().unwrap();
+        for (identity, record) in std::mem::take(&mut pending.records) {
+            pending.upload(&keys, &identity, record);
+        }
+        pending.keys = Some(keys);
+    }
+}
+
+impl Pending {
+    fn upload(&self, keys: &[String], identity: &str, record: Vec<u8>) {
+        for key in keys {
+            self.remote
+                .upload_adoptable(&self.root, &self.task, identity, key, record.clone());
+        }
     }
 }
 
@@ -2071,8 +2175,12 @@ struct Save {
     worktree: String,
     commit: Option<String>,
     branch: Option<String>,
+    default_branch: String,
     key: Vec<String>,
     notes: PathBuf,
+    /// Where a cacheable task's save meets the keys its result is kept
+    /// under.
+    adoptables: Option<Adoptables>,
 }
 
 impl Save {
@@ -2082,6 +2190,7 @@ impl Save {
         task: &Task,
         warm: &Warm,
         prepared: &qk_executor::PreparedTask,
+        adoptables: Option<&Adoptables>,
     ) -> Result<Self> {
         Ok(Self {
             task: task.id.clone(),
@@ -2090,8 +2199,10 @@ impl Save {
             worktree: worktree(workspace),
             commit: current_commit(workspace),
             branch: current_branch(workspace),
+            default_branch: default_branch(workspace),
             key: key_digests(workspace, warm, prepared)?,
             notes: restored_files_path(workspace, warm),
+            adoptables: adoptables.cloned(),
         })
     }
 }

@@ -48,6 +48,9 @@ const LARGEST_INDEX: u64 = 256 << 20;
 const LARGEST_BUNDLE: usize = 100 << 20;
 /// Queued uploads sent upstream at once.
 const UPLOADERS: usize = 32;
+/// How long an adoption may wait for queued uploads of the records it reads
+/// and replaces, after which it is turned away to be asked again.
+const ADOPTION_WAIT: Duration = Duration::from_secs(30);
 /// Blobs asked about in one `POST blobs/missing`, of the 4,096 the protocol
 /// allows.
 const MISSING_BATCH: usize = 1024;
@@ -410,6 +413,9 @@ fn handle(
     // Many small blobs as one upload body, which the proxy takes as a record
     // whose blobs records citing them wait for.
     let bundle = path.starts_with("/v4/bundles/");
+    // A warm record saved by result, which no client reads back: it is
+    // queued as records are, but neither kept nor served.
+    let adoptable = path.starts_with("/v4/adoptable/");
     if request.method == "GET" && path == "/proxy/stats" {
         let body = proxy.stats_json().into_bytes();
         head(
@@ -517,7 +523,10 @@ fn handle(
     // An upload from a token the upstream accepted is kept, queued and
     // answered at once. Others go upstream as they came, the answer being
     // the upstream's to give.
-    if request.method == "PUT" && proxy.writes(request) && (blob.is_some() || record || bundle) {
+    if request.method == "PUT"
+        && proxy.writes(request)
+        && (blob.is_some() || record || bundle || adoptable)
+    {
         let queued = match blob {
             Some(hash) => proxy.queue_blob(request, hash).unwrap_or(false),
             // A bundle is queued first, which holds its blobs against
@@ -549,11 +558,39 @@ fn handle(
             return Ok((204, "queued", 0));
         }
     }
+    // An adoption goes upstream after the queued uploads of the record it
+    // copies and the one it replaces, and on the latter's turn, so that no
+    // upload of it sent before is kept after.
+    let adoption = path
+        .strip_suffix("/adopt")
+        .filter(|warm| request.method == "POST" && warm.starts_with("/v4/warm/"));
+    let _turn = match adoption {
+        Some(warm) => match proxy.adoption_turn(warm, &request.body) {
+            Some(turn) => Some(turn),
+            None => {
+                head(writer, 503, &[], Some(0))?;
+                return Ok((503, "busy", 0));
+            }
+        },
+        None => None,
+    };
     let keep = match (request.method.as_str(), blob) {
         ("GET", Some(hash)) => Some(hash),
         _ => None,
     };
-    let (status, sent) = proxy.forward(request, writer, keep)?;
+    let forwarded = proxy.forward(request, writer, keep);
+    // A warm record the upstream replaced by adopting another is no longer
+    // the one kept here; nor may it be when the answer could not be passed
+    // on, as the upstream may have adopted before. Forgotten on the
+    // adoption's turn.
+    if let Some(warm) = adoption
+        && forwarded
+            .as_ref()
+            .map_or(true, |(status, _)| (200..300).contains(status))
+    {
+        proxy.forget_record(warm);
+    }
+    let (status, sent) = forwarded?;
     if request.method == "PUT"
         && (200..300).contains(&status)
         && let Some(token) = &request.authorization
@@ -1236,11 +1273,7 @@ impl Proxy {
                 self.blob_done.notify_all();
             }
             if job.blob.is_none() {
-                let path = record_path(&job.target);
-                let mut records = self.queued_records.lock().unwrap();
-                if records.get(path) == Some(&id) {
-                    records.remove(path);
-                }
+                self.record_left_queue(record_path(&job.target), id);
             }
         }
         let _ = fs::remove_file(self.job_path(id));
@@ -1290,6 +1323,50 @@ impl Proxy {
                 });
             }
             sending = self.record_sent.wait(sending).unwrap();
+        }
+    }
+
+    /// Takes the upload `id` of the record at `path` off the queue, unless a
+    /// newer one replaced it there.
+    fn record_left_queue(&self, path: &str, id: u64) {
+        let mut records = self.queued_records.lock().unwrap();
+        if records.get(path) == Some(&id) {
+            records.remove(path);
+        }
+        drop(records);
+        // For an adoption waiting until no upload of it is queued; under the
+        // lock it waits with, so the change is not missed.
+        drop(self.sending_records.lock().unwrap());
+        self.record_sent.notify_all();
+    }
+
+    /// Waits until no upload is queued of the warm record at `warm`, nor of
+    /// the record saved by result an adoption with `body` copies over it, and
+    /// takes the turn of `warm`; or answers `None` after [`ADOPTION_WAIT`].
+    fn adoption_turn(&self, warm: &str, body: &[u8]) -> Option<RecordTurn<'_>> {
+        let identity = warm.strip_prefix("/v4/warm/")?.split('/').next()?;
+        let source = serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|body| body["key"].as_str().map(str::to_owned))
+            .map(|key| format!("/v4/adoptable/{identity}/{key}"));
+        let deadline = Instant::now() + ADOPTION_WAIT;
+        let mut sending = self.sending_records.lock().unwrap();
+        loop {
+            let queued = {
+                let records = self.queued_records.lock().unwrap();
+                records.contains_key(warm)
+                    || source
+                        .as_ref()
+                        .is_some_and(|source| records.contains_key(source))
+            };
+            if !queued && sending.insert(warm.to_owned()) {
+                return Some(RecordTurn {
+                    proxy: self,
+                    path: warm.to_owned(),
+                });
+            }
+            let left = deadline.checked_duration_since(Instant::now())?;
+            sending = self.record_sent.wait_timeout(sending, left).unwrap().0;
         }
     }
 
@@ -2428,6 +2505,116 @@ mod tests {
             drop(turn);
             assert!(waiting.recv_timeout(Duration::from_secs(5)).unwrap());
         });
+    }
+
+    #[test]
+    fn an_adoption_waits_for_the_queued_uploads_of_the_records_it_copies_and_replaces() {
+        let directory = tempfile::tempdir().unwrap();
+        let proxy = Proxy::open(&Options {
+            upstream: "http://127.0.0.1:9".into(),
+            directory: directory.path().to_owned(),
+            listen: String::new(),
+            max_size: None,
+        })
+        .unwrap();
+        let put = |path: &str| Request {
+            method: "PUT".into(),
+            target: path.into(),
+            authorization: Some("Bearer token".into()),
+            content_type: None,
+            body: b"record".to_vec(),
+            close: false,
+        };
+        let warm = "/v4/warm/a/main";
+        let adoption = br#"{"key":"k"}"#;
+        proxy.enqueue(&put("/v4/adoptable/a/k"), None).unwrap();
+        proxy.enqueue(&put(warm), None).unwrap();
+        // Another result's record is no reason to wait.
+        proxy.enqueue(&put("/v4/adoptable/a/other"), None).unwrap();
+        let (taken, waiting) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let turn = proxy.adoption_turn(warm, adoption);
+                taken.send(turn.is_some()).unwrap();
+            });
+            assert!(waiting.recv_timeout(Duration::from_millis(200)).is_err());
+            proxy.record_left_queue("/v4/adoptable/a/k", 0);
+            assert!(waiting.recv_timeout(Duration::from_millis(200)).is_err());
+            // Sent, the replaced record is kept on its turn, which the
+            // adoption waits for too.
+            let turn = proxy.record_turn(warm, 1).unwrap();
+            proxy.record_left_queue(warm, 1);
+            assert!(waiting.recv_timeout(Duration::from_millis(200)).is_err());
+            drop(turn);
+            assert!(waiting.recv_timeout(Duration::from_secs(5)).unwrap());
+        });
+        // Holding the turn, it keeps a newer upload of the record waiting.
+        let turn = proxy.adoption_turn(warm, adoption).unwrap();
+        proxy.enqueue(&put(warm), None).unwrap();
+        let (taken, waiting) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                taken.send(proxy.record_turn(warm, 3).is_some()).unwrap();
+            });
+            assert!(waiting.recv_timeout(Duration::from_millis(200)).is_err());
+            drop(turn);
+            assert!(waiting.recv_timeout(Duration::from_secs(5)).unwrap());
+        });
+    }
+
+    #[test]
+    fn an_adoption_forgets_the_kept_record_though_its_answer_cannot_be_passed_on() {
+        // An upstream that adopts.
+        let upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = upstream.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in upstream.incoming() {
+                let mut stream = stream.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 4096];
+                while !request.ends_with(br#"{"key":"k"}"#) {
+                    let read = stream.read(&mut buffer).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\n\r\n");
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let proxy = Proxy::open(&Options {
+            upstream: format!("http://{address}"),
+            directory: directory.path().to_owned(),
+            listen: String::new(),
+            max_size: None,
+        })
+        .unwrap();
+        let warm = "/v4/warm/a/main";
+        let body = directory.path().join("body");
+        fs::write(&body, b"replaced").unwrap();
+        proxy.keep_record(warm, &body);
+        assert!(proxy.record_file(warm).is_file());
+        // A runner gone before its answer.
+        struct Gone;
+        impl Write for Gone {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        let request = Request {
+            method: "POST".into(),
+            target: format!("{warm}/adopt"),
+            authorization: Some("Bearer token".into()),
+            content_type: Some("application/json".into()),
+            body: br#"{"key":"k"}"#.to_vec(),
+            close: false,
+        };
+        assert!(handle(&proxy, &request, &mut Gone).is_err());
+        assert!(!proxy.record_file(warm).exists());
     }
 
     #[test]

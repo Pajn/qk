@@ -13,9 +13,11 @@ pub const WRITE_TOKEN: &str = "write-token";
 
 #[derive(Default)]
 pub struct State {
-    /// Upload bodies by `entries/<key>`, `warm/<a>/<b>`, `pathsets/<weak>` or
-    /// `expectations/<name>`.
+    /// Upload bodies by `entries/<key>`, `warm/<a>/<b>`, `adoptable/<a>/<key>`,
+    /// `pathsets/<weak>` or `expectations/<name>`.
     pub records: BTreeMap<String, Vec<u8>>,
+    /// The key of the result each `warm/<a>/<b>` adopted from, if it did.
+    pub adopted: BTreeMap<String, String>,
     /// Blobs stored apart, each one zstd frame, by hash.
     pub blobs: BTreeMap<String, Vec<u8>>,
     /// Blobs stored in bundles, each one zstd frame, by hash.
@@ -210,7 +212,8 @@ fn serve(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
     reader.read_exact(&mut body)?;
     let latency = state.lock().unwrap().latency;
     std::thread::sleep(latency);
-    let writes = method == "PUT" || (method == "POST" && path == "/v4/runs");
+    let writes =
+        method == "PUT" || (method == "POST" && (path == "/v4/runs" || path.ends_with("/adopt")));
     let (status, headers, response) = {
         let mut state = state.lock().unwrap();
         let answer: (u16, Vec<(String, String)>, Vec<u8>) =
@@ -430,9 +433,36 @@ fn handle(
                 _ => (405, Vec::new(), Vec::new()),
             }
         }
+        // The branch's warm record replaced with the one saved by result,
+        // unless it was adopted from that already.
+        ("POST", path) if path.starts_with("warm/") && path.ends_with("/adopt") => {
+            let target = path.trim_end_matches("/adopt").to_owned();
+            let asked: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            let Some(key) = asked["key"].as_str() else {
+                return (400, Vec::new(), b"{}".to_vec());
+            };
+            if state.adopted.get(&target).map(String::as_str) == Some(key) {
+                return done();
+            }
+            let identity = target["warm/".len()..]
+                .split('/')
+                .next()
+                .unwrap_or_default();
+            let Some(record) = state
+                .records
+                .get(&format!("adoptable/{identity}/{key}"))
+                .cloned()
+            else {
+                return missing();
+            };
+            state.records.insert(target.clone(), record);
+            state.adopted.insert(target, key.to_owned());
+            done()
+        }
         (method, path)
             if path.starts_with("entries/")
                 || path.starts_with("warm/")
+                || path.starts_with("adoptable/")
                 || path.starts_with("pathsets/")
                 || path.starts_with("expectations/") =>
         {
@@ -493,6 +523,7 @@ fn handle(
                         );
                     }
                     state.records.insert(path.to_owned(), body);
+                    state.adopted.remove(path);
                     if entry {
                         state.sequence += 1;
                         let sequence = state.sequence;

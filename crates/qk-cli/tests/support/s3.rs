@@ -18,6 +18,8 @@ pub fn path(rest: &str) -> String {
 #[derive(Default)]
 pub struct State {
     pub objects: BTreeMap<String, Vec<u8>>,
+    /// The `x-amz-meta-qk-adopted` metadata of objects that have it.
+    pub adopted: BTreeMap<String, String>,
     /// Methods and paths, in order.
     pub requests: Vec<String>,
     /// Close the connection halfway through each object read.
@@ -142,6 +144,8 @@ fn serve(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
     };
     let mut length = 0;
     let mut chunked = false;
+    let mut copy_source = None;
+    let mut adopted = None;
     loop {
         let mut header = String::new();
         reader.read_line(&mut header)?;
@@ -153,6 +157,8 @@ fn serve(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
         match name.to_ascii_lowercase().as_str() {
             "content-length" => length = value.trim().parse().unwrap_or(0),
             "transfer-encoding" => chunked = value.trim().eq_ignore_ascii_case("chunked"),
+            "x-amz-copy-source" => copy_source = Some(decode(value.trim())),
+            "x-amz-meta-qk-adopted" => adopted = Some(value.trim().to_owned()),
             _ => {}
         }
     }
@@ -195,6 +201,7 @@ fn serve(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
     }
     let latency = state.lock().unwrap().latency;
     std::thread::sleep(latency);
+    let mut headers = Vec::new();
     let (status, response, cut) = {
         let mut state = state.lock().unwrap();
         state.requests.push(format!("{method} {path}"));
@@ -315,8 +322,39 @@ fn serve(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
             {
                 (500, Vec::new(), false)
             }
+            // A server-side copy, which replaces the metadata as qk asks.
+            "PUT" if copy_source.is_some() => {
+                let source = copy_source.unwrap();
+                let source = format!("/{}", source.trim_start_matches('/'));
+                match state.objects.get(&source).cloned() {
+                    Some(object) => {
+                        state.objects.insert(path.clone(), object);
+                        match adopted {
+                            Some(key) => state.adopted.insert(path.clone(), key),
+                            None => state.adopted.remove(&path),
+                        };
+                        (
+                            200,
+                            b"<CopyObjectResult><ETag>\"x\"</ETag></CopyObjectResult>".to_vec(),
+                            false,
+                        )
+                    }
+                    None => (
+                        404,
+                        b"<Error><Code>NoSuchKey</Code></Error>".to_vec(),
+                        false,
+                    ),
+                }
+            }
             "PUT" => {
                 state.objects.insert(path.clone(), body);
+                state.adopted.remove(&path);
+                (200, Vec::new(), false)
+            }
+            "HEAD" if state.objects.contains_key(&path) => {
+                if let Some(key) = state.adopted.get(&path) {
+                    headers.push(format!("x-amz-meta-qk-adopted: {key}\r\n"));
+                }
                 (200, Vec::new(), false)
             }
             "GET" | "HEAD" => match state.objects.get(&path) {
@@ -329,8 +367,9 @@ fn serve(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
     let mut stream = stream;
     write!(
         stream,
-        "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        response.len()
+        "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n",
+        response.len(),
+        headers.concat()
     )?;
     if cut {
         stream.write_all(&response[..response.len() / 2])?;

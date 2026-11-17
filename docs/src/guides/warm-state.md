@@ -57,6 +57,38 @@ warm restore does not prevent the target from running.
 The timestamp and path policies below distinguish reusable tool state from
 verified result outputs.
 
+## The default branch's state
+
+Other branches fall back to the default branch's save, but the default
+branch saves warm state only for the tasks it runs, and a task whose
+inputs a branch built before it merged is a result-cache hit there, which
+saves nothing. Its save would then stay where it was when it last ran the
+task, however much has landed since.
+
+So a run on another branch that saves a task's warm state to the remote
+store also saves it by each cache key its result is kept under: the key of
+its declared inputs, and for a task with [Ultracache](ultracache.md)
+recordings, the key of what it read. A run that keeps no result, as one
+whose inputs changed while it ran, saves its state for its branch alone.
+When a run on
+the default branch takes that result from the cache, the store replaces
+the default branch's save with the one saved by that key. The hit means
+the run that saved it had the inputs the default branch has now, so its
+state is what the default branch would have saved had it run the task
+itself. A result taken by a recording adopts the save by the key it was
+taken under, so a change to a declared file the task never read does not
+keep its state from the default branch. The result is taken from the
+cache as ever; the replacement goes
+with the uploads, and the store makes it without the state passing
+through the machine. A save the default branch adopted is not replaced
+again by the same result, and a store without a save for it leaves the
+branch's as it is.
+
+This applies to a task's own entries that the remote store shares, not to
+a [`group`](#shared-compiler-caches), which several tasks save with results
+of their own. The saves by result are only read when adopted, so
+the store can expire them: see [Remote cache](remote-cache.md).
+
 ## Replacing a bad save
 
 A save holding state a tool cannot recover from is restored by every run

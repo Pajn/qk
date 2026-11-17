@@ -70,6 +70,9 @@ impl Server {
                 let (identity, branch) = warm_names(identity, branch);
                 format!("warm/{identity}/{branch}")
             }
+            Object::Adoptable { identity, key } => {
+                format!("adoptable/{}/{key}", super::store::warm_identity(identity))
+            }
             Object::Blob(hash) => format!("blobs/{hash}"),
             Object::PathSets(weak) => format!("pathsets/{weak}"),
             Object::Expectations(branch) => {
@@ -210,7 +213,10 @@ impl Store for Server {
                 let (identity, branch) = warm_names(identity, branch);
                 format!("warm={identity}/{branch}")
             }
-            Object::Blob(_) | Object::PathSets(_) | Object::Expectations(_) => String::new(),
+            Object::Adoptable { .. }
+            | Object::Blob(_)
+            | Object::PathSets(_)
+            | Object::Expectations(_) => String::new(),
         };
         self.read(&format!("blobs/{hash}?{owner}"), task)
     }
@@ -245,6 +251,8 @@ impl Store for Server {
             200..=299 => Ok(()),
             // Another run committed the entry first.
             409 if matches!(object, Object::Entry(_)) => Ok(()),
+            // A server that keeps no warm records by result.
+            404 if matches!(object, Object::Adoptable { .. }) => Ok(()),
             422 => {
                 let answer: Value = serde_json::from_str(&response.into_body().read_to_string()?)?;
                 let blobs = answer
@@ -259,6 +267,23 @@ impl Store for Server {
                 Err(MissingBlobs(blobs).into())
             }
             _ => Err(failure(&format!("PUT {path}"), response)),
+        }
+    }
+
+    fn adopt(&self, identity: &str, branch: &str, key: &str) -> Result<()> {
+        let path = format!("{}/adopt", self.path(Object::Warm { identity, branch }));
+        let response = self
+            .agent
+            .post(self.url(&path))
+            .header("Authorization", self.authorization())
+            .header("Content-Type", "application/json")
+            .send(serde_json::json!({ "key": key }).to_string())?;
+        match response.status().as_u16() {
+            200..=299 => Ok(()),
+            // No run saved a record for this result, or the server keeps none
+            // by result.
+            404 => Ok(()),
+            _ => Err(failure(&format!("POST {path}"), response)),
         }
     }
 

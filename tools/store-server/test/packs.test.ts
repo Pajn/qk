@@ -187,6 +187,61 @@ describe("warm records", () => {
   });
 });
 
+describe("adoption", () => {
+  const warmRecord = (tag: string, cited: ReturnType<typeof blob>[]) =>
+    bytes(JSON.stringify({ version: 2, key: [tag], groups: { g: { artifacts: Object.fromEntries(cited.map((b, i) => [`x${i}`, { blob: b.hash }])) } } }));
+  const adopt = (name: string, key: unknown, token?: string) =>
+    request("POST", `warm/${name}/adopt`, { body: JSON.stringify({ key }), token, headers: { "Content-Type": "application/json" } });
+
+  it("replaces a branch's warm record with the one saved by result, once", async () => {
+    const identity = hash().slice(0, 32);
+    const name = `${identity}/${hash().slice(0, 32)}`;
+    const key = hash();
+    const branch = [blob("the branch's own", true)];
+    const byResult = [blob("saved by result", true), blob("stored apart", false)];
+    await putApart(byResult[1]!);
+    expect((await request("PUT", `warm/${name}`, { body: upload(warmRecord("branch", branch), branch) })).status).toBe(204);
+    const saved = warmRecord("result", byResult);
+    expect((await request("PUT", `adoptable/${identity}/${key}`, { body: upload(saved, byResult) })).status).toBe(204);
+    expect((await request("HEAD", `adoptable/${identity}/${key}`)).status).toBe(200);
+    expect((await adopt(name, key)).status).toBe(204);
+    expect(await pack(`warm/${name}`)).toEqual(expectedPack(saved, byResult, () => true));
+    // Its inline blobs came along with it.
+    const found = await request("GET", `blobs/${byResult[0]!.hash}?warm=${name}`);
+    expect(new Uint8Array(await found.arrayBuffer())).toEqual(rawFrame(byResult[0]!.raw));
+    expect((await env.STORE.head(`warm/${name}`))?.customMetadata?.adopted).toBe(key);
+    // Adopted from that record already, it is left alone, even once a newer
+    // save by that result replaces it.
+    const newer = [blob("newer by result", true)];
+    expect((await request("PUT", `adoptable/${identity}/${key}`, { body: upload(warmRecord("newer", newer), newer) })).status).toBe(204);
+    expect((await adopt(name, key)).status).toBe(204);
+    expect(await pack(`warm/${name}`)).toEqual(expectedPack(saved, byResult, () => true));
+    // A branch's own save replaces it, and is no longer adopted.
+    expect((await request("PUT", `warm/${name}`, { body: upload(warmRecord("branch", branch), branch) })).status).toBe(204);
+    expect((await env.STORE.head(`warm/${name}`))?.customMetadata?.adopted).toBeUndefined();
+  });
+
+  it("leaves the branch's record when nothing was saved for the result", async () => {
+    const name = `${hash().slice(0, 32)}/${hash().slice(0, 32)}`;
+    const branch = [blob("kept", true)];
+    const own = warmRecord("branch", branch);
+    expect((await request("PUT", `warm/${name}`, { body: upload(own, branch) })).status).toBe(204);
+    expect((await adopt(name, hash())).status).toBe(404);
+    expect(await pack(`warm/${name}`)).toEqual(expectedPack(own, branch, () => true));
+  });
+
+  it("needs a write token and a key", async () => {
+    const name = `${hash().slice(0, 32)}/${hash().slice(0, 32)}`;
+    expect((await adopt(name, hash(), READ)).status).toBe(403);
+    expect((await adopt(name, "not a key")).status).toBe(400);
+    const lacking = [blob("never stored", false)];
+    const response = await request("PUT", `adoptable/${hash().slice(0, 32)}/${hash()}`, {
+      body: upload(warmRecord("lacking", lacking), lacking),
+    });
+    expect(response.status).toBe(422);
+  });
+});
+
 describe("expectations", () => {
   it("are replaced by the newest save under their name alone", async () => {
     const name = hash().slice(0, 32);

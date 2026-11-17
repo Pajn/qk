@@ -23,6 +23,9 @@ const LARGEST_LISTING: usize = 8 << 20;
 const LARGEST_LIST_RESPONSE: usize = 1 << 20;
 /// The layout objects live under, after `cacheKeyPrefix`.
 pub(super) const LAYOUT: &str = "qk/v4/";
+/// The metadata that names the result a branch's warm record was adopted
+/// from.
+const ADOPTED: &str = "x-amz-meta-qk-adopted";
 
 pub(super) struct S3 {
     bucket: Bucket,
@@ -85,6 +88,10 @@ impl S3 {
                 let (identity, branch) = super::store::warm_names(identity, branch);
                 self.object("warm", &format!("{identity}/{branch}.json"))
             }
+            Object::Adoptable { identity, key } => self.object(
+                "adoptable",
+                &format!("{}/{key}.json", super::store::warm_identity(identity)),
+            ),
             Object::Blob(hash) => self.object("blobs", hash),
             Object::PathSets(weak) => self.object("pathsets", &format!("{weak}.json")),
             Object::Expectations(branch) => self.object(
@@ -274,6 +281,63 @@ impl Store for S3 {
         self.put_object(&self.name(object), file)
     }
 
+    /// A HEAD of the branch's record says which result's record it was
+    /// adopted from, if any; a server-side copy then replaces it, noting the
+    /// key, so that the record's bytes never pass through this machine.
+    fn adopt(&self, identity: &str, branch: &str, key: &str) -> Result<()> {
+        let target = self.name(Object::Warm { identity, branch });
+        let url = self
+            .bucket
+            .head_object(Some(&self.credentials), &target)
+            .sign(SIGNED_FOR);
+        let response = self.agent.head(url.as_str()).call()?;
+        let adopted = response
+            .headers()
+            .get(ADOPTED)
+            .and_then(|value| value.to_str().ok());
+        match response.status().as_u16() {
+            200 if adopted == Some(key) => return Ok(()),
+            200 | 404 => {}
+            status => bail!("HEAD {target} returned {status}"),
+        }
+        let source = self.name(Object::Adoptable { identity, key });
+        let source = format!("/{}/{}", self.bucket.name(), encode_path(&source));
+        let mut action = self.bucket.put_object(Some(&self.credentials), &target);
+        action
+            .headers_mut()
+            .insert("x-amz-copy-source", source.clone());
+        action
+            .headers_mut()
+            .insert("x-amz-metadata-directive", "REPLACE");
+        action.headers_mut().insert(ADOPTED, key.to_owned());
+        let url = action.sign(SIGNED_FOR);
+        let response = self
+            .agent
+            .put(url.as_str())
+            .header("x-amz-copy-source", &source)
+            .header("x-amz-metadata-directive", "REPLACE")
+            .header(ADOPTED, key)
+            .send_empty()?;
+        match response.status().as_u16() {
+            // A copy can fail after S3 has answered 200, in the body, so a
+            // body that cannot be read is no answer. Asked again, the HEAD
+            // finds a copy that was made.
+            200..=299 => {
+                let body = response
+                    .into_body()
+                    .read_to_string()
+                    .with_context(|| format!("reading the answer to copying {source}"))?;
+                if body.contains("<Error>") {
+                    bail!("copying {source} to {target} failed: {body}");
+                }
+                Ok(())
+            }
+            // No run saved a record for this result.
+            404 => Ok(()),
+            status => bail!("copying {source} to {target} returned {status}"),
+        }
+    }
+
     // Announce the key before publishing its entry. If the run stops or the
     // final listing fails, readers can still discover the entry. An
     // announcement whose upload fails merely causes a normal GET miss.
@@ -336,4 +400,18 @@ impl Store for S3 {
         );
         self.delete_listings(obsolete)
     }
+}
+
+/// An object name as `x-amz-copy-source` takes it: percent-encoded, but for
+/// its slashes.
+fn encode_path(name: &str) -> String {
+    let mut encoded = String::with_capacity(name.len());
+    for byte in name.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-_.~/".contains(&byte) {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }

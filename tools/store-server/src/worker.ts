@@ -51,6 +51,8 @@ const LARGEST_LISTING = 32 << 20;
 const LARGEST_PATH_SETS = 16 << 20;
 /** The largest upload of the tasks' expectations, which cite no blob. */
 const LARGEST_EXPECTATIONS = 4 << 20;
+/** The body of an adoption, which names one key. */
+const LARGEST_ADOPTION = 1 << 10;
 const SESSION_LIFETIME = 24 * 60 * 60 * 1000;
 /** How many R2 requests one request makes at a time. */
 const CONCURRENCY = 32;
@@ -80,6 +82,7 @@ const CACHE_ORIGIN = "https://qk-store-server.cache";
 
 const KEY = /^[0-9a-f]{64}$/;
 const WARM = /^[0-9a-f]{32}\/[0-9a-f]{32}$/;
+const ADOPTABLE = /^[0-9a-f]{32}\/[0-9a-f]{64}$/;
 const SESSION = /^[0-9a-f]{32}$/;
 const EXPECTATIONS = /^[0-9a-f]{32}$/;
 
@@ -187,6 +190,19 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
     if (method === "PUT") {
       write();
       return putWarm(name, request, env);
+    }
+  }
+  if (kind === "warm" && method === "POST" && name.endsWith("/adopt") && WARM.test(name.slice(0, -"/adopt".length))) {
+    write();
+    return adoptWarm(name.slice(0, -"/adopt".length), request, env);
+  }
+  if (kind === "adoptable" && ADOPTABLE.test(name)) {
+    if (method === "HEAD") {
+      return (await env.STORE.head(`adoptable/${name}`)) ? new Response(null) : notFound();
+    }
+    if (method === "PUT") {
+      write();
+      return putAdoptable(name, request, env);
     }
   }
   if (kind === "pathsets" && KEY.test(name)) {
@@ -872,6 +888,53 @@ async function putWarm(name: string, request: Request, env: Env): Promise<Respon
   const upload = parseUpload(body);
   await requireBlobs(upload.header, env);
   await env.STORE.put(`warm/${name}`, body, { httpMetadata: { contentType: "application/x-qk-upload" } });
+  return new Response(null, { status: 204 });
+}
+
+/** A warm record saved by the run that gave the result under a key, as
+ * `adoptable/<a>/<key>`, for the default branch to adopt. */
+async function putAdoptable(name: string, request: Request, env: Env): Promise<Response> {
+  const body = await readBody(request, LARGEST_BODY);
+  const upload = parseUpload(body);
+  await requireBlobs(upload.header, env);
+  await env.STORE.put(`adoptable/${name}`, body, { httpMetadata: { contentType: "application/x-qk-upload" } });
+  return new Response(null, { status: 204 });
+}
+
+/** Replaces the warm record `warm/<name>` with the one saved under the key the
+ * body names, unless it was adopted from that one already, as its metadata
+ * says. The record's inline blobs come along, so it stands on its own. */
+async function adoptWarm(name: string, request: Request, env: Env): Promise<Response> {
+  const body = await readBody(request, LARGEST_ADOPTION);
+  let key: unknown;
+  try {
+    key = JSON.parse(new TextDecoder().decode(body))?.key;
+  } catch {
+    key = undefined;
+  }
+  if (typeof key !== "string" || !KEY.test(key)) {
+    throw new Failure(400, "malformed", "the body must be {\"key\": <key>}");
+  }
+  const target = `warm/${name}`;
+  if ((await env.STORE.head(target))?.customMetadata?.adopted === key) {
+    return new Response(null, { status: 204 });
+  }
+  const identity = name.split("/")[0];
+  const source = await env.STORE.get(`adoptable/${identity}/${key}`);
+  if (!source) {
+    throw new Failure(404, "not_found", "no warm record was saved for that result");
+  }
+  const fixed = new FixedLengthStream(source.size);
+  const [put] = await Promise.all([
+    env.STORE.put(target, fixed.readable, {
+      httpMetadata: { contentType: "application/x-qk-upload" },
+      customMetadata: { adopted: key },
+    }),
+    source.body.pipeTo(fixed.writable),
+  ]);
+  if (!put) {
+    throw new Failure(503, "busy", "the record could not be adopted; try again");
+  }
   return new Response(null, { status: 204 });
 }
 

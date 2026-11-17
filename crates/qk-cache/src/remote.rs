@@ -4,9 +4,10 @@
 //!
 //! Objects live under `<cacheKeyPrefix>qk/v4/`, so a bucket shared with Nx never
 //! mixes the two: `entries/<key>` for results, `warm/<task>/<branch>` for warm
-//! records, `pathsets/<weak>` for recorded path sets, `expectations/<branch>`
-//! for what tasks are expected to take ([`crate::expectations`]) and
-//! `blobs/<hash>` for large blobs. Each entry or record is a
+//! records, `adoptable/<task>/<key>` for warm records saved by result, for the
+//! default branch to adopt, `pathsets/<weak>` for recorded path sets,
+//! `expectations/<branch>` for what tasks are expected to take
+//! ([`crate::expectations`]) and `blobs/<hash>` for large blobs. Each entry or record is a
 //! Zstandard level 3 [`pack`] holding it with the small blobs it cites, so one
 //! request reads or writes it whole; the store's latency is per request, and
 //! an entry can cite thousands of blobs. A blob whose compressed size reaches
@@ -236,6 +237,10 @@ struct Upload {
     /// the entry.
     #[serde(default)]
     expectations: Option<Expectations>,
+    /// A warm record for a branch to replace with one saved by result,
+    /// instead of the entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    adoption: Option<Adoption>,
     /// Where a detached worker finds the warm record or path sets, left out
     /// of its request, which would otherwise carry them inline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -262,6 +267,17 @@ struct Warm {
     identity: String,
     branch: String,
     record: Vec<u8>,
+    /// The cache key of the result the run that saved the record gave, when
+    /// it is saved by that rather than for `branch`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    result: Option<String>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct Adoption {
+    identity: String,
+    branch: String,
+    key: String,
 }
 
 /// An HTTP client for a store: statuses are answers, not errors.
@@ -771,6 +787,7 @@ impl Remote {
             warm: None,
             path_sets: None,
             expectations: None,
+            adoption: None,
             record_file: None,
         });
     }
@@ -787,6 +804,7 @@ impl Remote {
                 record,
             }),
             expectations: None,
+            adoption: None,
             record_file: None,
         });
     }
@@ -823,9 +841,63 @@ impl Remote {
                 identity: identity.to_owned(),
                 branch: branch.to_owned(),
                 record,
+                result: None,
             }),
             path_sets: None,
             expectations: None,
+            adoption: None,
+            record_file: None,
+        });
+    }
+
+    /// Queues a task's warm record under the key of the result the run that
+    /// saved it gave, for the default branch to adopt once that result is its
+    /// hit.
+    pub(crate) fn upload_adoptable(
+        self: &Arc<Self>,
+        root: &Path,
+        task: &str,
+        identity: &str,
+        key: &str,
+        record: Vec<u8>,
+    ) {
+        self.enqueue(Upload {
+            key: format!("{task} warm state by result"),
+            local: root.to_owned(),
+            warm: Some(Warm {
+                identity: identity.to_owned(),
+                branch: String::new(),
+                record,
+                result: Some(key.to_owned()),
+            }),
+            path_sets: None,
+            expectations: None,
+            adoption: None,
+            record_file: None,
+        });
+    }
+
+    /// Queues replacing a task's warm record for `branch` with the one saved
+    /// under the key of the result this run took from the cache.
+    pub(crate) fn adopt_warm(
+        self: &Arc<Self>,
+        root: &Path,
+        task: &str,
+        identity: &str,
+        branch: &str,
+        key: &str,
+    ) {
+        self.enqueue(Upload {
+            key: format!("{task} warm state adoption"),
+            local: root.to_owned(),
+            warm: None,
+            path_sets: None,
+            expectations: None,
+            adoption: Some(Adoption {
+                identity: identity.to_owned(),
+                branch: branch.to_owned(),
+                key: key.to_owned(),
+            }),
             record_file: None,
         });
     }
@@ -849,6 +921,7 @@ impl Remote {
                 runs,
                 now,
             }),
+            adoption: None,
             record_file: None,
         });
     }
@@ -1164,11 +1237,23 @@ impl Remote {
     }
 
     fn send(&self, job: &Upload) -> Result<()> {
+        if let Some(adoption) = &job.adoption {
+            return self
+                .store
+                .adopt(&adoption.identity, &adoption.branch, &adoption.key);
+        }
         if let Some(warm) = &job.warm {
-            // The newest save for the branch replaces the last one.
-            let object = Object::Warm {
-                identity: &warm.identity,
-                branch: &warm.branch,
+            // The newest save for the branch, or by result, replaces the last
+            // one.
+            let object = match &warm.result {
+                Some(key) => Object::Adoptable {
+                    identity: &warm.identity,
+                    key,
+                },
+                None => Object::Warm {
+                    identity: &warm.identity,
+                    branch: &warm.branch,
+                },
             };
             return self.put_pack(&job.local, object, &warm.record);
         }
@@ -1888,6 +1973,7 @@ mod flight_tests {
         match object {
             Object::Entry(key) => format!("entries/{key}"),
             Object::Warm { identity, branch } => format!("warm/{identity}/{branch}"),
+            Object::Adoptable { identity, key } => format!("adoptable/{identity}/{key}"),
             Object::Blob(hash) => format!("blobs/{hash}"),
             Object::PathSets(weak) => format!("pathsets/{weak}"),
             Object::Expectations(branch) => format!("expectations/{branch}"),

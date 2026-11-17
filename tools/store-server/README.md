@@ -20,8 +20,8 @@ header followed by the client's own zstd frames.
 | `src/index-do.ts` | The `Index` Durable Object (SQLite) |
 | `src/auth.ts` | Bearer tokens checked against SHA-256 digests |
 
-R2 holds `entries/<key>`, `warm/<a>/<b>`, `pathsets/<weak>` and
-`expectations/<name>` (upload bodies), `blobs/<hash>` (one zstd frame each),
+R2 holds `entries/<key>`, `warm/<a>/<b>`, `adoptable/<a>/<key>`,
+`pathsets/<weak>` and `expectations/<name>` (upload bodies), `blobs/<hash>` (one zstd frame each),
 `bundles/<id>` (bundle bodies, many small blobs' frames each) and
 `sessions/<id>` (Bloom filters).
 
@@ -49,6 +49,8 @@ pnpm install
 pnpm wrangler r2 bucket create qk-store
 # Sessions last a day; let R2 delete their filters after that.
 pnpm wrangler r2 bucket lifecycle add qk-store sessions sessions/ --expire-days 2
+# Warm state saved by result is read only when the default branch adopts it.
+pnpm wrangler r2 bucket lifecycle add qk-store adoptable adoptable/ --expire-days 14
 ```
 
 Tokens are kept as SHA-256 digests, comma-separated, lowercase hex. A read

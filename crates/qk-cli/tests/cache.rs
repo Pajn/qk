@@ -2303,6 +2303,60 @@ fn a_store_proxy_serves_warm_state_it_has_not_yet_sent_on() {
     assert_eq!(asked(&server), before, "{}", proxy.log());
 }
 
+#[cfg(unix)]
+#[test]
+fn a_store_proxy_passes_on_an_adoption_and_forgets_the_record_it_replaced() {
+    let server = store_server::FakeStoreServer::start();
+    let fixture = Fixture::new(branch_noting_target());
+    with_store_server(&fixture, &server);
+    let directory = TempDir::new().unwrap();
+    let proxy = StoreProxy::start(&server.url, directory.path());
+    assert_eq!(proxy.put_blob(store_server::WRITE_TOKEN, b"proof"), 204);
+    let on = |branch: &str| {
+        let line = first_line_on(
+            &fixture,
+            |branch| {
+                server_build(
+                    &fixture,
+                    store_server::WRITE_TOKEN,
+                    &[
+                        ("QK_STORE_SERVER_URL", proxy.url.as_str()),
+                        ("GITHUB_REF_NAME", branch),
+                    ],
+                )
+            },
+            branch,
+        );
+        proxy.drained();
+        line
+    };
+    assert_eq!(on("main"), "cold");
+    fs::write(fixture.root.join("src/input.txt"), "two\n").unwrap();
+    // The default branch's save, sent on, is now kept at the proxy.
+    assert_eq!(on("feature"), "main");
+    assert!(
+        server
+            .state
+            .lock()
+            .unwrap()
+            .records
+            .keys()
+            .any(|path| path.starts_with("adoptable/")),
+        "{}",
+        proxy.log()
+    );
+    on("main");
+    assert_eq!(
+        server.state.lock().unwrap().adopted.len(),
+        1,
+        "{}",
+        proxy.log()
+    );
+    // The proxy serves the adopted record, not the one it kept before.
+    fs::write(fixture.root.join("src/input.txt"), "three\n").unwrap();
+    assert_eq!(on("other"), "feature", "{}", proxy.log());
+}
+
 // The target is a POSIX shell command.
 #[cfg(unix)]
 #[test]
@@ -5165,6 +5219,151 @@ fn warm_state_is_shared_through_the_remote_by_branch() {
             "invalid branch records must allow default-branch fallback"
         );
     }
+}
+
+/// A cacheable target whose warm state says which branch last saved it.
+#[cfg(unix)]
+fn branch_noting_target() -> Value {
+    json!({
+        "cache": true,
+        "command": "if [ -f \"$TOOL_CACHE/seen\" ]; then cat \"$TOOL_CACHE/seen\"; else echo cold; fi; mkdir -p \"$TOOL_CACHE\" && echo \"$GITHUB_REF_NAME\" > \"$TOOL_CACHE/seen\"",
+        "qk:warm": {"portable": true, "env": {"TOOL_CACHE": "{warm}/tool"}}
+    })
+}
+
+/// The first line a build on `branch` printed, on a machine with nothing
+/// local, built by `build`.
+#[cfg(unix)]
+fn first_line_on(fixture: &Fixture, build: impl Fn(&str) -> Output, branch: &str) -> String {
+    let _ = fs::remove_dir_all(cache_path(fixture));
+    let _ = fs::remove_dir_all(fixture.root.join(".git/qk/warm"));
+    stdout(&success(build(branch)))
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+#[cfg(unix)]
+#[test]
+fn the_default_branch_adopts_the_warm_state_of_a_result_it_takes() {
+    let server = s3::FakeS3::start();
+    let fixture = Fixture::new(branch_noting_target());
+    with_remote(&fixture, &server, json!({}));
+    let on = |branch: &str| {
+        first_line_on(
+            &fixture,
+            |branch| remote_build(&fixture, &[("GITHUB_REF_NAME", branch)]),
+            branch,
+        )
+    };
+    let adoptable = || server.objects(&s3::path("adoptable/")).len();
+    let copies = || {
+        server
+            .requests(&s3::path("warm/"))
+            .iter()
+            .filter(|request| request.starts_with("PUT"))
+            .count()
+    };
+    // The default branch saves for itself, and by result for no one.
+    assert_eq!(on("main"), "cold");
+    assert_eq!(adoptable(), 0);
+    fs::write(fixture.root.join("src/input.txt"), "two\n").unwrap();
+    assert_eq!(on("feature"), "main");
+    assert_eq!(adoptable(), 1);
+    // The default branch takes the feature's result rather than running,
+    // and the warm state that run saved with it.
+    let saves = copies();
+    on("main");
+    assert_eq!(copies(), saves + 1);
+    let adopted = server.state.lock().unwrap().adopted.clone();
+    assert_eq!(adopted.len(), 1, "{adopted:?}");
+    // Once only: the record says which result it came from.
+    on("main");
+    assert_eq!(copies(), saves + 1);
+    // A branch with nothing of its own starts from it.
+    fs::write(fixture.root.join("src/input.txt"), "three\n").unwrap();
+    assert_eq!(on("other"), "feature");
+    // A branch that is not the default adopts nothing.
+    let saves = copies();
+    on("feature");
+    assert_eq!(copies(), saves);
+}
+
+/// A run whose inputs changed while it ran keeps no result, so its warm state
+/// is saved for its branch alone, by no result for the default branch to take.
+#[cfg(unix)]
+#[test]
+fn a_run_whose_inputs_changed_saves_no_warm_state_by_result() {
+    let server = s3::FakeS3::start();
+    let mut target = branch_noting_target();
+    target["command"] = json!(format!(
+        "{} && echo changed >> src/input.txt",
+        target["command"].as_str().unwrap()
+    ));
+    let fixture = Fixture::new(target);
+    with_remote(&fixture, &server, json!({}));
+    let output = success(remote_build(&fixture, &[("GITHUB_REF_NAME", "feature")]));
+    assert!(
+        stderr(&output).contains("not caching because inputs changed during execution"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(server.objects(&s3::path("warm/")).len(), 1);
+    assert_eq!(server.objects(&s3::path("adoptable/")).len(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_store_server_lets_the_default_branch_adopt_warm_state() {
+    let server = store_server::FakeStoreServer::start();
+    let fixture = Fixture::new(branch_noting_target());
+    with_store_server(&fixture, &server);
+    let on = |branch: &str| {
+        first_line_on(
+            &fixture,
+            |branch| {
+                server_build(
+                    &fixture,
+                    store_server::WRITE_TOKEN,
+                    &[("GITHUB_REF_NAME", branch)],
+                )
+            },
+            branch,
+        )
+    };
+    let adoptions = || {
+        server
+            .state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|(request, _)| request.ends_with("/adopt"))
+            .count()
+    };
+    assert_eq!(on("main"), "cold");
+    fs::write(fixture.root.join("src/input.txt"), "two\n").unwrap();
+    assert_eq!(on("feature"), "main");
+    on("main");
+    assert_eq!(adoptions(), 1);
+    assert_eq!(server.state.lock().unwrap().adopted.len(), 1);
+    fs::write(fixture.root.join("src/input.txt"), "three\n").unwrap();
+    assert_eq!(on("other"), "feature");
+    // A server that keeps nothing by result answers 404, which changes
+    // nothing for the default branch.
+    {
+        let mut state = server.state.lock().unwrap();
+        state
+            .records
+            .retain(|path, _| !path.starts_with("adoptable/"));
+        state.adopted.clear();
+    }
+    fs::write(fixture.root.join("src/input.txt"), "two\n").unwrap();
+    on("main");
+    assert!(server.state.lock().unwrap().adopted.is_empty());
+    fs::write(fixture.root.join("src/input.txt"), "four\n").unwrap();
+    assert_eq!(on("another"), "feature");
 }
 
 #[cfg(unix)]
