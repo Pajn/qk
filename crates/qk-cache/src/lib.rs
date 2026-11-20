@@ -1651,24 +1651,26 @@ impl Cache {
 /// A task's key, and the inputs it is computed from, or why it has none.
 pub type Keyed = std::result::Result<(String, Value), String>;
 
-/// The key each task in `graph` would be cached under if it ran now, and what
-/// it is computed from, without running a task. Runtime inputs are executed,
-/// and the dependency outputs a task reads are taken as they are on disk.
-pub fn keys(
+/// The key the task `id` of `graph` would be cached under if it ran now, and
+/// what it is computed from, without running a task. Runtime inputs are
+/// executed, and the dependency outputs it reads are taken as they are on
+/// disk. No other task's key is computed: a task's key holds what its
+/// dependencies' outputs are, not their keys.
+pub fn key(
     workspace: &Workspace,
     graph: &TaskGraph,
     prepared: &BTreeMap<String, PreparedTask>,
+    id: &str,
     cancelled: &AtomicBool,
-) -> Result<BTreeMap<String, Keyed>> {
-    let snapshot = hash::Snapshot::watched(workspace, graph, &paths::cache_location(workspace))?;
-    Ok(graph
+) -> Result<Keyed> {
+    let task = graph
         .tasks
-        .values()
-        .map(|task| {
-            let keyed = key_now(&snapshot, workspace, graph, task, prepared, cancelled);
-            (task.id.clone(), keyed)
-        })
-        .collect())
+        .get(id)
+        .ok_or_else(|| anyhow::anyhow!("task {id} is not in the task graph"))?;
+    let snapshot = hash::Snapshot::watched(workspace, graph, &paths::cache_location(workspace))?;
+    Ok(key_now(
+        &snapshot, workspace, graph, task, prepared, cancelled,
+    ))
 }
 
 fn key_now(

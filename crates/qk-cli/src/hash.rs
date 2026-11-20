@@ -134,9 +134,7 @@ fn key_now(workspace: &Workspace, request: Request) -> Result<Keyed> {
                 .map(|prepared| (id.clone(), prepared))
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
-    let (key, inputs) = qk_cache::keys(workspace, &graph, &prepared, &AtomicBool::new(false))?
-        .remove(task)
-        .expect("every task is keyed")
+    let (key, inputs) = qk_cache::key(workspace, &graph, &prepared, task, &AtomicBool::new(false))?
         .map_err(anyhow::Error::msg)
         .with_context(|| format!("{task} has no key"))?;
     Ok(Keyed {
