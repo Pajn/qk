@@ -235,19 +235,28 @@ pub fn fetch(workspace: &Workspace, environment: &BTreeMap<OsString, OsString>) 
     let Some(remote) = remote(workspace, environment) else {
         return Fetching(None);
     };
-    let root = paths::cache_location(workspace);
-    let branches = warm::branches(workspace);
+    // Where the cache is and which branch is checked out are asked of Git on
+    // the fetch's thread, so the run does not wait for Git to start.
+    let configured = paths::configured_cache_location(workspace);
+    let workspace_root = workspace.root.clone();
+    let default = warm::default_branch(workspace);
     let wanted = Arc::new(AtomicBool::new(true));
     let fetch = std::thread::spawn({
         let wanted = wanted.clone();
-        move || match remote.fetch_usable_expectations(&root, &branches) {
-            Ok(Some((bytes, branch))) => read(&bytes, &branch),
-            Ok(None) => BTreeMap::new(),
-            Err(error) => {
-                if wanted.load(Ordering::Relaxed) {
-                    qk_executor::status!("qk: remote task expectations unavailable ({error:#})");
+        move || {
+            let root = configured.unwrap_or_else(|| paths::cache_directory(&workspace_root));
+            let branches = warm::branches_at(&workspace_root, default);
+            match remote.fetch_usable_expectations(&root, &branches) {
+                Ok(Some((bytes, branch))) => read(&bytes, &branch),
+                Ok(None) => BTreeMap::new(),
+                Err(error) => {
+                    if wanted.load(Ordering::Relaxed) {
+                        qk_executor::status!(
+                            "qk: remote task expectations unavailable ({error:#})"
+                        );
+                    }
+                    BTreeMap::new()
                 }
-                BTreeMap::new()
             }
         }
     });

@@ -1194,6 +1194,15 @@ fn run(mut cli: Cli) -> Result<i32> {
         Some(path) => path,
         None => find_workspace(&std::env::current_dir().context("cannot read current directory")?)?,
     };
+    // A command that runs tasks finds its cache, worktree state and history
+    // from the repository's git directories: Git answers while the workspace
+    // loads.
+    if matches!(
+        cli.command,
+        Command::Run { .. } | Command::RunMany { .. } | Command::Affected { .. }
+    ) {
+        qk_cache::prefetch_git_dirs(&root);
+    }
     let workspace = Workspace::load(&root)?;
     for warning in &workspace.warnings {
         eprintln!("qk: warning: {warning}");
