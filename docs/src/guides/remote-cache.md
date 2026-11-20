@@ -49,7 +49,18 @@ branch, else of the default branch, so that a machine without history, such
 as a CI job on a fresh clone, still knows which tasks take long. Local history
 wins for a task it has. A record that cannot be read leaves the run without
 it, and is not replaced. The record is fetched while the run gets ready to
-start its tasks, and waited for only when local history lacks one of them.
+start its tasks, and needed only when local history lacks one of them.
+
+What a fetch gives is saved in the local cache, for the branch it was
+fetched for, whether or not the run used it. A run that needs the record
+before its fetch has ended starts from that copy, when it was saved in the
+last day, rather than wait for the store; its own fetch replaces the copy for
+the next run. A run waits for the store only without a copy that recent, as
+on a fresh clone. An expectation from the store can thus be up to a day older
+than the record the store holds, and the copy is kept when the store cannot
+be read, so a run on a machine that cannot reach the store still starts from
+it for that day. A store that holds no record for the branches removes the
+copy.
 
 Expectations are read and written as the store's mode allows.
 `QK_REMOTE_EXPECTATIONS` narrows that: `read` (also spelled `read-only`) reads

@@ -206,10 +206,11 @@ pub fn expected(workspace: &Workspace) -> std::collections::BTreeMap<String, qk_
         .unwrap_or_default()
 }
 
-/// Adds to `expected` what the remote store holds, as `fetching` fetches it,
+/// Adds to `expected` what the remote store holds, as `fetching` gives it,
 /// for each task in `graph` that local history has nothing for, when any
-/// lacks it: local history wins for a task that has it. Otherwise the fetch
-/// is left to end as the run goes on.
+/// lacks it: local history wins for a task that has it. `fetching` gives the
+/// copy the last fetch saved, when there is a recent one, rather than wait
+/// for the store. Otherwise the fetch is left to end as the run goes on.
 pub fn fill_from_remote(
     graph: &TaskGraph,
     fetching: &mut Option<qk_cache::expectations::Fetching>,

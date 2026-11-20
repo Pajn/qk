@@ -2570,6 +2570,53 @@ fn a_machine_without_history_takes_expectations_from_the_remote_store() {
     }
 }
 
+// The targets are POSIX shell commands.
+#[cfg(unix)]
+#[test]
+fn a_run_starts_from_the_expectations_the_last_fetch_saved() {
+    let server = s3::FakeS3::start();
+    let task = |name: &str, seconds: &str| json!({"command": format!("echo {name} >> started; sleep {seconds}"), "cache": false});
+    let fixture = Fixture::with_targets(json!({
+        "a-fast": task("a-fast", "0.1"), "b-slow": task("b-slow", "0.6")
+    }));
+    with_remote(&fixture, &server, json!({}));
+    let history = fixture.root.join(".git/qk/history.db");
+    let order = |env: &[(&str, &str)]| {
+        let _ = fs::remove_file(fixture.root.join("started"));
+        let mut command = fixture.command(
+            &fixture.root,
+            &["run-many", "-t", "a-fast,b-slow", "--parallel", "1"],
+        );
+        command
+            .env("AWS_ACCESS_KEY_ID", "key")
+            .env("AWS_SECRET_ACCESS_KEY", "secret")
+            .env_remove("NX_POWERPACK_CACHE_MODE")
+            .envs(env.iter().copied());
+        success(command.output().unwrap());
+        fs::read_to_string(fixture.root.join("started")).unwrap()
+    };
+    assert_eq!(order(&[]), "a-fast\nb-slow\n");
+    // Without history or a saved copy, the run waits for the store, and saves
+    // what it fetched.
+    fs::remove_file(&history).unwrap();
+    assert_eq!(order(&[]), "b-slow\na-fast\n");
+    // With the copy, a store that never answers holds nothing up: reading
+    // only, so nothing waits to add to the record either.
+    fs::remove_file(&history).unwrap();
+    server.state.lock().unwrap().hold_get = [".json".to_owned()].into();
+    let started = std::time::Instant::now();
+    assert_eq!(
+        order(&[("QK_REMOTE_EXPECTATIONS", "read")]),
+        "b-slow\na-fast\n"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    server.state.lock().unwrap().hold_get.clear();
+}
+
 #[test]
 fn a_variable_keeps_a_run_from_writing_or_reading_expectations() {
     let server = s3::FakeS3::start();
