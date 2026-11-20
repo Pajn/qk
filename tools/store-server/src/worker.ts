@@ -19,10 +19,12 @@ import {
   concat,
   isHash,
   packHeader,
+  packHeaderLength,
   parseBundle,
   parseHeader,
   parseUpload,
   rawFrame,
+  rawFrameLength,
   utf8,
   type UploadHeader,
 } from "./frames";
@@ -46,6 +48,13 @@ const INLINE_APART_BUDGET = 64 << 20;
 const LARGEST_MISSING_QUERY = 4096;
 /** How an answer to `POST blobs/fetch` starts. */
 const BLOBS_MAGIC = new TextEncoder().encode("qkb1");
+/** How an answer to `POST pathsets/fetch` starts. */
+const PATH_SETS_MAGIC = new TextEncoder().encode("qks1");
+/** Weak keys one `POST pathsets/fetch` may name. */
+const LARGEST_PATH_SETS_QUERY = 4096;
+/** Bytes of packs one answer to `POST pathsets/fetch` carries at most: room
+ * for two of the largest, and the most its bodies hold in memory at once. */
+const PATH_SETS_ANSWER = 32 << 20;
 const LARGEST_LISTING = 32 << 20;
 /** The largest upload of a weak key's path sets, which cite no blob. */
 const LARGEST_PATH_SETS = 16 << 20;
@@ -205,9 +214,12 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
       return putAdoptable(name, request, env);
     }
   }
+  if (path === "pathsets/fetch" && method === "POST") {
+    return fetchPathSets(request, env);
+  }
   if (kind === "pathsets" && KEY.test(name)) {
     if (method === "GET") {
-      return getPack(`pathsets/${name}`, false, url, env, ctx);
+      return getRecord(`pathsets/${name}`, env);
     }
     if (method === "HEAD") {
       return (await env.STORE.head(`pathsets/${name}`)) ? new Response(null) : notFound();
@@ -219,7 +231,7 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
   }
   if (kind === "expectations" && EXPECTATIONS.test(name)) {
     if (method === "GET") {
-      return getPack(`expectations/${name}`, false, url, env, ctx);
+      return getRecord(`expectations/${name}`, env);
     }
     if (method === "HEAD") {
       return (await env.STORE.head(`expectations/${name}`)) ? new Response(null) : notFound();
@@ -571,6 +583,141 @@ async function place(
     return INLINE;
   });
   return { placements, stored };
+}
+
+// Records citing no blob.
+
+/** The pack of the record citing no blob stored as `object`, path sets or
+ * expectations. It carries no blob, so no session is read for it. */
+async function getRecord(object: string, env: Env): Promise<Response> {
+  const started = Date.now();
+  const [body] = await readRecords([object], env);
+  const read = Date.now();
+  if (!body) {
+    return notFound();
+  }
+  const pack = rawFrame(packHeader(storedRecord(body), []));
+  return new Response(pack, {
+    headers: {
+      "Content-Type": "application/x-qk-pack",
+      "Cache-Control": "no-store",
+      "Server-Timing": `session;dur=0, object;dur=${read - started}, compose;dur=${Date.now() - read}`,
+    },
+  });
+}
+
+/** The path sets of many weak keys in one answer: each weak key asked for,
+ * once, with the pack `GET pathsets/<weak>` answers for it, or none, while
+ * the packs total at most `PATH_SETS_ANSWER`. One past that is left out, for
+ * the client to ask again. Each pack is made as it is sent. */
+async function fetchPathSets(request: Request, env: Env): Promise<Response> {
+  const body = await readBody(request, 1 << 20);
+  let weak: unknown;
+  try {
+    weak = (JSON.parse(new TextDecoder().decode(body)) as { weak?: unknown }).weak;
+  } catch {
+    throw new Failure(400, "malformed", "the body is not JSON");
+  }
+  if (!Array.isArray(weak) || weak.length > LARGEST_PATH_SETS_QUERY || !weak.every(isHash)) {
+    throw new Failure(400, "malformed", `weak must be at most ${LARGEST_PATH_SETS_QUERY} weak keys`);
+  }
+  const asked = [...new Set(weak)];
+  const started = Date.now();
+  const bodies = await readRecords(
+    asked.map((weak) => `pathsets/${weak}`),
+    env,
+    PATH_SETS_ANSWER,
+  );
+  const read = Date.now();
+  const listed: { weak: string; record: Uint8Array | null; length: number }[] = [];
+  let budget = 0;
+  asked.forEach((weak, index) => {
+    const stored = bodies[index];
+    if (stored === undefined) {
+      return;
+    }
+    if (stored === null) {
+      listed.push({ weak, record: null, length: 0 });
+      return;
+    }
+    const record = storedRecord(stored);
+    const length = rawFrameLength(packHeaderLength(record, 0));
+    if (budget + length > PATH_SETS_ANSWER) {
+      return;
+    }
+    budget += length;
+    listed.push({ weak, record, length });
+  });
+  const table = new Uint8Array(8 + listed.length * 40);
+  const view = new DataView(table.buffer);
+  table.set(PATH_SETS_MAGIC, 0);
+  view.setUint32(4, listed.length, true);
+  listed.forEach(({ weak, length }, index) => {
+    const at = 8 + index * 40;
+    for (let byte = 0; byte < 32; byte++) {
+      table[at + byte] = parseInt(weak.slice(byte * 2, byte * 2 + 2), 16);
+    }
+    view.setBigUint64(at + 32, BigInt(length), true);
+  });
+  async function* parts(): AsyncGenerator<Uint8Array> {
+    yield table;
+    for (const { record } of listed) {
+      if (record) {
+        yield rawFrame(packHeader(record, []));
+      }
+    }
+  }
+  return new Response(streamOf(parts()), {
+    headers: {
+      "Content-Type": "application/x-qk-path-sets",
+      "Cache-Control": "no-store",
+      "Server-Timing": `object;dur=${read - started}, compose;dur=${Date.now() - read}`,
+    },
+  });
+}
+
+/** The upload bodies of the records citing no blob `objects` names, in
+ * order, `null` for one not stored, read a few at a time. Bodies read are kept
+ * within `budget` bytes, all of them together; one that would take them past
+ * it is not read, and is `undefined`. */
+async function readRecords(objects: string[], env: Env, budget = Infinity): Promise<(Uint8Array | null | undefined)[]> {
+  const bodies: (Uint8Array | null | undefined)[] = objects.map(() => null);
+  let held = 0;
+  await forEach(
+    objects.map((_, at) => at),
+    async (at) => {
+      const object = await env.STORE.get(objects[at]!);
+      if (!object) {
+        return;
+      }
+      if (held + object.size > budget) {
+        bodies[at] = undefined;
+        await object.body.cancel().catch(() => {});
+        return;
+      }
+      held += object.size;
+      bodies[at] = new Uint8Array(await object.arrayBuffer());
+    },
+  );
+  return bodies;
+}
+
+/** The record in `body`, the upload body of a record citing no blob, whose
+ * pack is one raw frame of the pack header. */
+function storedRecord(body: Uint8Array): Uint8Array {
+  const headerLength = new DataView(body.buffer, body.byteOffset, body.byteLength).getUint32(0, true);
+  if (headerLength > LARGEST_HEADER || 4 + headerLength > body.length) {
+    throw new Error("a stored upload's header is too large");
+  }
+  const header = parseHeader(body.subarray(4, 4 + headerLength));
+  if (header.blobs.length > 0) {
+    throw new Error("a stored record that cites no blob cites blobs");
+  }
+  const record = body.subarray(4 + headerLength, 4 + headerLength + header.record);
+  if (record.length !== header.record) {
+    throw new Error("a stored upload ends early");
+  }
+  return record;
 }
 
 // Blobs.

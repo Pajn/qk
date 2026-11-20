@@ -10,8 +10,8 @@ already holds and keep the index itself.
 
 Every path is under `<url>/v4/`. Every request carries
 `Authorization: Bearer <token>`. A read token may make every `GET` and `HEAD`
-request, `POST sessions` and `POST blobs/missing`; a write token may make every
-request.
+request, `POST sessions`, `POST blobs/missing`, `POST blobs/fetch` and
+`POST pathsets/fetch`; a write token may make every request.
 
 Errors are JSON, `{"error": "<code>", "message": "<text>"}`:
 
@@ -93,8 +93,9 @@ can be wrong, so a client checks what it holds and asks for the rest.
 A pack's `Server-Timing` header says how long the server took before it began
 sending it, in milliseconds: `session`, reading the session's filter;
 `object`, reading the stored upload; and `compose`, placing its blobs. This is
-also true of the packs of path sets and expectations. A client can tell the
-server's part of a wait from the network's by it.
+also true of the packs of path sets and expectations, which cite no blob, so
+a server reads no session for them and says `session;dur=0`. A client can
+tell the server's part of a wait from the network's by it.
 
 ### `GET blobs/<hash>[?entry=<key>|?warm=<a>/<b>]`, `HEAD blobs/<hash>`
 
@@ -217,6 +218,32 @@ no blob: `{"version": 1, "name": <name>, "tasks": {…}}`. `GET` answers `200`, 
 pack, or `404`; `HEAD` answers `200` or `404`. `PUT` needs a write token and an
 upload body of at most 4 MiB whose record's `name` is `<name>` and which cites
 no blob; the newest save replaces the last. Answer: `204`, or `400`.
+
+### `POST pathsets/fetch`
+
+Optional: a server that does not take it answers `404`, and clients fetch
+each weak key's path sets with `GET pathsets/<weak>`; the reference server
+here takes it. Body: `{"weak": [<weak>, …]}`, at most 4,096. Answer: `200`,
+`application/x-qk-path-sets`, the path sets of many weak keys in one answer:
+
+```text
+"qks1"
+u32 LE count
+for each weak key listed: the key as 32 bytes, then u64 LE length of its pack,
+    0 when the server holds no path sets for it
+each listed pack, as GET pathsets/<weak> answers it, in the order listed
+```
+
+It lists weak keys asked for, each once and in any order, while their packs
+total at most 32 MiB. One past that is left out, so a client asks again for
+the weak keys an answer leaves out while it lists any of them, and fetches
+the rest one each with `GET pathsets/<weak>`. A run's tasks find their path
+sets in one round trip this way, where a request each would wait on the
+server once each. Its `Server-Timing` says `object`, reading the records, and
+`compose`.
+
+Expectations are not asked for here: a client reads them as a run starts,
+before it knows any task's weak key.
 
 ### `GET index[?since=<cursor>]`
 
