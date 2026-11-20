@@ -8,7 +8,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
-use foldhash::{HashMap, HashMapExt, HashSet};
+use foldhash::{HashMap, HashSet};
 use qk_config::Workspace;
 use qk_executor::{Capture, Display, Outcome, PreparedTask, execute_captured, read_capture};
 use qk_graph::ProjectGraph;
@@ -3357,16 +3357,16 @@ fn inputs_from(
         &candidates.files,
         &candidates.source_ignore,
     )?;
-    let file_values = |paths: &BTreeSet<String>| {
-        paths
-            .iter()
-            .map(|path| {
-                let value = snapshot
-                    .file_value(&workspace.root, path)
-                    .with_context(|| format!("cannot read input {path}"))?;
-                Ok((path.clone(), value))
-            })
-            .collect::<Result<BTreeMap<_, _>>>()
+    let file_values = |paths: &BTreeSet<String>| -> Result<BTreeMap<String, Value>> {
+        let paths: Vec<&String> = paths.iter().collect();
+        Ok(in_parallel(&paths, FILES_PER_THREAD, |path| {
+            let value = snapshot
+                .file_value(&workspace.root, path)
+                .with_context(|| format!("cannot read input {path}"))?;
+            Ok(((*path).clone(), value))
+        })?
+        .into_iter()
+        .collect::<BTreeMap<_, _>>())
     };
     let mut files = file_values(&(&declared.files - &declared.ignored))?;
     for path in &declared.ignored {
@@ -3457,6 +3457,45 @@ fn inputs_from(
         "files":files, "values":values, "inferred":configuration, "dependencies":dependencies,
     });
     Ok(hash)
+}
+
+/// Files a thread reads the values of at least, so a short list is not
+/// split.
+const FILES_PER_THREAD: usize = 256;
+
+/// `f` of each of `items`, in their order, on up to eight threads, each
+/// taking `per_thread` of them at least. Reading files is mostly system
+/// calls, which wait apart from each other. The error is the first in
+/// `items`' order, as one thread taking them in turn would return.
+fn in_parallel<T: Sync, R: Send>(
+    items: &[T],
+    per_thread: usize,
+    f: impl Fn(&T) -> Result<R> + Sync,
+) -> Result<Vec<R>> {
+    let threads = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(8)
+        .min(items.len() / per_thread);
+    if threads <= 1 {
+        return items.iter().map(&f).collect();
+    }
+    let chunk = items.len().div_ceil(threads);
+    let f = &f;
+    let chunks: Vec<Result<Vec<R>>> = std::thread::scope(|scope| {
+        let workers: Vec<_> = items
+            .chunks(chunk)
+            .map(|items| scope.spawn(move || items.iter().map(f).collect()))
+            .collect();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().expect("input thread panicked"))
+            .collect()
+    });
+    let mut results = Vec::with_capacity(items.len());
+    for chunk in chunks {
+        results.extend(chunk?);
+    }
+    Ok(results)
 }
 
 /// A task's definition as its key holds it. Warm state configuration never
@@ -3644,34 +3683,50 @@ fn dependency_keys_impl(
 ) -> Result<BTreeMap<String, String>> {
     // The globs alone, which need no listing.
     let plan = snapshot.file_plan(workspace, task)?;
-    let mut keys = BTreeMap::new();
-    let mut fresh_outputs = HashMap::new();
+    // Each glob with the dependencies it reads, which are listed together
+    // beforehand, each on a thread of its own. What fails is reported as
+    // reading them in turn would report it.
+    let mut reads = Vec::new();
     for (pattern, transitive) in &plan.dependency_outputs {
-        let matcher = snapshot.pattern(pattern, false)?;
-        let selected = graph.output_dependencies(task, *transitive);
-        for id in selected {
+        reads.push((pattern, graph.output_dependencies(task, *transitive)));
+    }
+    let ids: BTreeSet<&String> = reads.iter().flat_map(|(_, ids)| ids).collect();
+    let ids: Vec<&String> = ids.into_iter().collect();
+    let listed = in_parallel(&ids, 1, |id| {
+        let listed = (|| {
+            let dependency = dependency_task(graph, id)?;
             // As in Nx, a dependency without declared outputs offers none.
-            if !Outputs::new(workspace, dependency_task(graph, &id)?)?.declared() {
-                continue;
+            if !Outputs::new(workspace, dependency)?.declared() {
+                return Ok(None);
             }
-            let outputs =
-                if fresh {
-                    if !fresh_outputs.contains_key(&id) {
-                        fresh_outputs.insert(
-                            id.clone(),
-                            Arc::new(snapshot.fresh_dependency_outputs(
-                                workspace,
-                                dependency_task(graph, &id)?,
-                            )?),
-                        );
-                    }
-                    fresh_outputs[&id].clone()
-                } else {
-                    snapshot.dependency_outputs(workspace, dependency_task(graph, &id)?)?
-                };
-            let mut files = BTreeMap::new();
-            for path in outputs.files.iter().filter(|path| matcher.is_match(path)) {
-                let known = outputs.values.lock().unwrap().get(path).cloned();
+            Ok(Some(if fresh {
+                Arc::new(snapshot.fresh_dependency_outputs(workspace, dependency)?)
+            } else {
+                snapshot.dependency_outputs(workspace, dependency)?
+            }))
+        })();
+        Ok(listed.transpose().map(|listed| (*id, listed)))
+    })?;
+    let listed: HashMap<&String, Result<Arc<DependencyOutputs>>> =
+        listed.into_iter().flatten().collect();
+    let mut keys = BTreeMap::new();
+    for (pattern, selected) in &reads {
+        let matcher = snapshot.pattern(pattern, false)?;
+        for id in selected {
+            let Some(outputs) = listed.get(id) else {
+                continue;
+            };
+            let outputs = match outputs {
+                Ok(outputs) => outputs,
+                Err(error) => bail!("{error:#}"),
+            };
+            let matched: Vec<&String> = outputs
+                .files
+                .iter()
+                .filter(|path| matcher.is_match(path))
+                .collect();
+            let files: BTreeMap<_, _> = in_parallel(&matched, FILES_PER_THREAD, |path| {
+                let known = outputs.values.lock().unwrap().get(*path).cloned();
                 let value = match known {
                     Some(value) => value,
                     None => {
@@ -3682,13 +3737,15 @@ fn dependency_keys_impl(
                                 .values
                                 .lock()
                                 .unwrap()
-                                .insert(path.clone(), value.clone());
+                                .insert((*path).clone(), value.clone());
                         }
                         value
                     }
                 };
-                files.insert(path.clone(), value);
-            }
+                Ok(((*path).clone(), value))
+            })?
+            .into_iter()
+            .collect();
             keys.insert(format!("{id}:{pattern}"), key(&json!(files))?);
         }
     }
@@ -5120,6 +5177,23 @@ mod tests {
                 assert!(all.contains(path), "{path}");
             }
         }
+    }
+
+    /// Work split across threads comes back in order, and fails as taking
+    /// it in turn would: with the first error in that order.
+    #[test]
+    fn parallel_work_keeps_its_order_and_its_first_error() {
+        let items: Vec<usize> = (0..5000).collect();
+        assert_eq!(in_parallel(&items, 16, |item| Ok(item * 2)).unwrap(), {
+            items.iter().map(|item| item * 2).collect::<Vec<_>>()
+        });
+        let failed = in_parallel(&items, 16, |item| {
+            if *item % 1000 == 999 {
+                bail!("{item}");
+            }
+            Ok(*item)
+        });
+        assert_eq!(failed.unwrap_err().to_string(), "999");
     }
 
     /// A snapshot for keying lists the workspace beside the tasks it keys:
