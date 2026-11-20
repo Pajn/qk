@@ -681,3 +681,34 @@ fn upgrades_schema_five_to_record_worktrees() {
         Some("/repo")
     );
 }
+
+#[test]
+fn a_file_gives_back_what_pruning_frees_once_that_is_most_of_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("history.db");
+    let mut history = History::open(&path).unwrap();
+    let size = || std::fs::metadata(&path).unwrap().len();
+    // Inputs no task is keyed by are pruned as their run is recorded.
+    let unused = |bytes: usize| inputs(&[("unused", json!("a".repeat(bytes)))]);
+    let kept = run("kept", 0, vec![task("app:build", Some("key"), 0, 10, &[])]);
+    history
+        .record(kept, &inputs(&[("key", json!({"files": 1}))]))
+        .unwrap();
+
+    // Less than the file gives back from stays for the runs that follow.
+    let small = usize::try_from(qk_history::SHRINK_FROM).unwrap() / 2;
+    history
+        .record(run("small", 100, vec![]), &unused(small))
+        .unwrap();
+    assert!(size() > small as u64);
+
+    history
+        .record(run("large", 200, vec![]), &unused(small * 4))
+        .unwrap();
+    assert!(size() < small as u64, "{} bytes", size());
+    drop(history);
+    let history = History::open(&path).unwrap();
+    assert_eq!(history.runs(10, None).unwrap().len(), 3);
+    let (key, kept) = history.key("kept", "app:build").unwrap().unwrap();
+    assert_eq!((key.as_str(), kept), ("key", Some(json!({"files": 1}))));
+}

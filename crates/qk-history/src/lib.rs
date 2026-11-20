@@ -19,6 +19,9 @@ use serde_json::Value;
 pub const SCHEMA_VERSION: u32 = 9;
 /// Runs kept in the database.
 pub const KEPT_RUNS: usize = 200;
+/// The unused space a history file gives back from: less is kept for the
+/// runs that follow.
+pub const SHRINK_FROM: u64 = 16 * 1024 * 1024;
 
 /// A run as recorded and as reported by `--report`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -231,6 +234,9 @@ pub struct Expected {
     pub memory: Option<u64>,
 }
 
+/// How long a history waits for another process writing it.
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Executions an expectation is drawn from: the median of their times.
 const EXPECTED_FROM: usize = 5;
 
@@ -246,7 +252,7 @@ impl History {
         }
         let mut connection = Connection::open(path)
             .with_context(|| format!("cannot open run history at {}", path.display()))?;
-        connection.busy_timeout(std::time::Duration::from_secs(10))?;
+        connection.busy_timeout(BUSY_TIMEOUT)?;
         connection.execute_batch(
             "PRAGMA journal_mode = WAL;
              CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);",
@@ -475,7 +481,35 @@ impl History {
             [MAX_LOG_BYTES],
         )?;
         transaction.commit()?;
+        // The run is recorded whether or not the file shrinks.
+        let _ = self.shrink();
         Ok(run)
+    }
+
+    /// Gives the file's unused pages back to the filesystem once they are
+    /// three quarters of it and at least [`SHRINK_FROM`]. SQLite keeps the
+    /// pages pruning frees for later runs and never returns them, so a file
+    /// stays as large as its largest runs once made it. Rewriting it costs as
+    /// much as what it still holds, a fraction of what was written to free
+    /// that much.
+    fn shrink(&self) -> Result<()> {
+        let pragma = |name: &str| -> Result<u64> {
+            Ok(self
+                .connection
+                .query_row(&format!("PRAGMA {name}"), [], |row| row.get(0))?)
+        };
+        let (free, pages) = (pragma("freelist_count")?, pragma("page_count")?);
+        if free * pragma("page_size")? < SHRINK_FROM || free < (pages - free) * 3 {
+            return Ok(());
+        }
+        // A worktree writing its own run is not waited for: the file shrinks
+        // after a later run instead.
+        self.connection.busy_timeout(std::time::Duration::ZERO)?;
+        let shrunk = self
+            .connection
+            .execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);");
+        self.connection.busy_timeout(BUSY_TIMEOUT)?;
+        Ok(shrunk?)
     }
 
     fn cause(&self, task: &str, key: &str, inputs: Option<&Value>) -> Result<Cause> {
