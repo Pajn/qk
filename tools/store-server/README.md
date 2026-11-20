@@ -39,6 +39,19 @@ done, a blob the index lacks is asked of the bucket. So do not write `blobs/`
 or `bundles/` into the bucket any other way, or the index will take those
 blobs as missing.
 
+The index also holds path sets and expectations, records that cite no blob,
+beside their copies in the bucket. Every run reads them, and a read of a
+small object from R2 takes the Worker a request to the bucket's region,
+where the index answers many from memory in one call: a run's
+`POST pathsets/fetch` costs one call to the index, not a read per weak key.
+Each `PUT` writes the bucket, then the index, then answers, so a read
+never finds a save older than the last that succeeded. A record over 1 MiB
+is listed without its body and read from the bucket, as is one unread for 30
+days, until it is read again. Records stored before the index held them are
+listed by the same alarm after the blobs, and taken in as they are read;
+until then a record the index lacks is asked of the bucket. So do not write
+`pathsets/` or `expectations/` into the bucket any other way either.
+
 ## Deploying
 
 This needs a Cloudflare account with R2 and Durable Objects, and Wrangler

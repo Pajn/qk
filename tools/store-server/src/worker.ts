@@ -5,7 +5,8 @@
 // `expectations/<name>` as the upload bodies clients sent, `blobs/<hash>` as one zstd frame each, `bundles/<id>` as the
 // bundle bodies clients sent, many small blobs' frames each, and `sessions/<id>` as the
 // Bloom filters sessions were opened with. A fetched record is composed from
-// its upload body without touching the compressed bytes.
+// its upload body without touching the compressed bytes. The index holds path
+// sets and expectations too, which are read from it rather than the bucket.
 
 import { access } from "./auth";
 import { Bloom, LARGEST_FILTER } from "./bloom";
@@ -28,7 +29,7 @@ import {
   utf8,
   type UploadHeader,
 } from "./frames";
-import type { Index, StoredBlob } from "./index-do";
+import { HELD_RECORD, type Index, type RecordState, type StoredBlob } from "./index-do";
 
 export { Index } from "./index-do";
 
@@ -215,11 +216,11 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
     }
   }
   if (path === "pathsets/fetch" && method === "POST") {
-    return fetchPathSets(request, env);
+    return fetchPathSets(request, env, ctx);
   }
   if (kind === "pathsets" && KEY.test(name)) {
     if (method === "GET") {
-      return getRecord(`pathsets/${name}`, env);
+      return getRecord(`pathsets/${name}`, env, ctx);
     }
     if (method === "HEAD") {
       return (await env.STORE.head(`pathsets/${name}`)) ? new Response(null) : notFound();
@@ -231,7 +232,7 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
   }
   if (kind === "expectations" && EXPECTATIONS.test(name)) {
     if (method === "GET") {
-      return getRecord(`expectations/${name}`, env);
+      return getRecord(`expectations/${name}`, env, ctx);
     }
     if (method === "HEAD") {
       return (await env.STORE.head(`expectations/${name}`)) ? new Response(null) : notFound();
@@ -588,10 +589,11 @@ async function place(
 // Records citing no blob.
 
 /** The pack of the record citing no blob stored as `object`, path sets or
- * expectations. It carries no blob, so no session is read for it. */
-async function getRecord(object: string, env: Env): Promise<Response> {
+ * expectations, as the index holds it. It carries no blob, so no session is
+ * read for it. */
+async function getRecord(object: string, env: Env, ctx: ExecutionContext): Promise<Response> {
   const started = Date.now();
-  const [body] = await readRecords([object], env);
+  const [body] = await readRecords([object], env, ctx);
   const read = Date.now();
   if (!body) {
     return notFound();
@@ -610,7 +612,7 @@ async function getRecord(object: string, env: Env): Promise<Response> {
  * once, with the pack `GET pathsets/<weak>` answers for it, or none, while
  * the packs total at most `PATH_SETS_ANSWER`. One past that is left out, for
  * the client to ask again. Each pack is made as it is sent. */
-async function fetchPathSets(request: Request, env: Env): Promise<Response> {
+async function fetchPathSets(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const body = await readBody(request, 1 << 20);
   let weak: unknown;
   try {
@@ -623,9 +625,12 @@ async function fetchPathSets(request: Request, env: Env): Promise<Response> {
   }
   const asked = [...new Set(weak)];
   const started = Date.now();
+  const timing = { index: 0 };
   const bodies = await readRecords(
     asked.map((weak) => `pathsets/${weak}`),
     env,
+    ctx,
+    timing,
     PATH_SETS_ANSWER,
   );
   const read = Date.now();
@@ -671,21 +676,39 @@ async function fetchPathSets(request: Request, env: Env): Promise<Response> {
     headers: {
       "Content-Type": "application/x-qk-path-sets",
       "Cache-Control": "no-store",
-      "Server-Timing": `object;dur=${read - started}, compose;dur=${Date.now() - read}`,
+      "Server-Timing": `index;dur=${timing.index}, object;dur=${read - started - timing.index}, compose;dur=${Date.now() - read}`,
     },
   });
 }
 
 /** The upload bodies of the records citing no blob `objects` names, in
- * order, `null` for one not stored, read a few at a time. Bodies read are kept
- * within `budget` bytes, all of them together; one that would take them past
- * it is not read, and is `undefined`. */
-async function readRecords(objects: string[], env: Env, budget = Infinity): Promise<(Uint8Array | null | undefined)[]> {
-  const bodies: (Uint8Array | null | undefined)[] = objects.map(() => null);
-  let held = 0;
+ * order, `null` for one not stored. Those the index holds come from it in one
+ * call; the rest are read from the bucket, a few at a time, and handed to the
+ * index to hold once the answer is on its way. Bodies read are kept within
+ * `budget` bytes, all of them together; one that would take them past it is
+ * not read, and is `undefined`. The time the index took is added to
+ * `timing.index`. */
+async function readRecords(
+  objects: string[],
+  env: Env,
+  ctx: ExecutionContext,
+  timing = { index: 0 },
+  budget = Infinity,
+): Promise<(Uint8Array | null | undefined)[]> {
+  const index = indexOf(env);
+  const asked = Date.now();
+  const states: RecordState[] = await index.readRecords(objects);
+  timing.index += Date.now() - asked;
+  const bodies: (Uint8Array | null | undefined)[] = states.map((state) => (state.state === "held" ? state.body : null));
+  let held = bodies.reduce((total, body) => total + (body?.length ?? 0), 0);
+  const fills: [string, number | null, Uint8Array][] = [];
   await forEach(
-    objects.map((_, at) => at),
-    async (at) => {
+    states.flatMap((state, at) =>
+      state.state === "apart" || state.state === "unknown"
+        ? [{ at, version: state.state === "apart" ? state.version : null }]
+        : [],
+    ),
+    async ({ at, version }) => {
       const object = await env.STORE.get(objects[at]!);
       if (!object) {
         return;
@@ -696,9 +719,20 @@ async function readRecords(objects: string[], env: Env, budget = Infinity): Prom
         return;
       }
       held += object.size;
-      bodies[at] = new Uint8Array(await object.arrayBuffer());
+      const body = new Uint8Array(await object.arrayBuffer());
+      bodies[at] = body;
+      if (body.length <= HELD_RECORD) {
+        fills.push([objects[at]!, version, body]);
+      }
     },
   );
+  if (fills.length > 0) {
+    ctx.waitUntil(
+      Promise.all(fills.map(([object, version, body]) => index.fillRecord(object, version, body))).catch((error) =>
+        console.error("the index could not take in records read from the bucket", error),
+      ),
+    );
+  }
   return bodies;
 }
 
@@ -1095,6 +1129,10 @@ async function putPathSets(weak: string, request: Request, env: Env): Promise<Re
     throw new Failure(400, "malformed", `the record is not for weak key ${weak}`);
   }
   await env.STORE.put(`pathsets/${weak}`, body, { httpMetadata: { contentType: "application/x-qk-upload" } });
+  // After the bucket, so a read the index sends there meanwhile finds this
+  // save or a later one, and before the answer, so every read that starts
+  // after it does.
+  await indexOf(env).saveRecord(`pathsets/${weak}`, body.length <= HELD_RECORD ? body : null);
   return new Response(null, { status: 204 });
 }
 
@@ -1108,6 +1146,8 @@ async function putExpectations(name: string, request: Request, env: Env): Promis
     throw new Failure(400, "malformed", `the record is not named ${name}`);
   }
   await env.STORE.put(`expectations/${name}`, body, { httpMetadata: { contentType: "application/x-qk-upload" } });
+  // As for path sets.
+  await indexOf(env).saveRecord(`expectations/${name}`, body.length <= HELD_RECORD ? body : null);
   return new Response(null, { status: 204 });
 }
 

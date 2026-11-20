@@ -219,6 +219,14 @@ pack, or `404`; `HEAD` answers `200` or `404`. `PUT` needs a write token and an
 upload body of at most 4 MiB whose record's `name` is `<name>` and which cites
 no blob; the newest save replaces the last. Answer: `204`, or `400`.
 
+Every run reads path sets and expectations, and few write them, so a server
+may keep copies nearer its readers than its storage. A read that starts
+after a `PUT` answered `204` answers that save or a later one, except that a
+server keeping copies it cannot update at once may answer an older save for
+at most 60 seconds after it. The reference server keeps them in its index,
+which every save updates before it answers, so it never answers an older
+save.
+
 ### `POST pathsets/fetch`
 
 Optional: a server that does not take it answers `404`, and clients fetch
@@ -239,7 +247,8 @@ total at most 32 MiB. One past that is left out, so a client asks again for
 the weak keys an answer leaves out while it lists any of them, and fetches
 the rest one each with `GET pathsets/<weak>`. A run's tasks find their path
 sets in one round trip this way, where a request each would wait on the
-server once each. Its `Server-Timing` says `object`, reading the records, and
+server once each. Its `Server-Timing` says `index`, reading the records the
+server's index holds; `object`, reading the rest from its storage; and
 `compose`.
 
 Expectations are not asked for here: a client reads them as a run starts,

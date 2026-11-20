@@ -1,5 +1,7 @@
+import { env, runInDurableObject } from "cloudflare:test";
 import { decompress } from "fzstd";
 import { describe, expect, it } from "vitest";
+import type { Index } from "../src/index-do";
 import { READ, bytes, expectedPack, hash, hex, request, sha256, upload } from "./helpers";
 
 const pathSets = (weak: string, read: string, padding = 0) =>
@@ -28,7 +30,7 @@ async function fetchMany(weak: string[]): Promise<[string, Uint8Array | null][]>
     throw new Error(`POST pathsets/fetch: ${response.status} ${await response.text()}`);
   }
   expect(response.headers.get("Content-Type")).toBe("application/x-qk-path-sets");
-  expect(response.headers.get("Server-Timing")).toMatch(/^object;dur=\d+, compose;dur=\d+$/);
+  expect(response.headers.get("Server-Timing")).toMatch(/^index;dur=\d+, object;dur=-?\d+, compose;dur=\d+$/);
   const body = new Uint8Array(await response.arrayBuffer());
   const view = new DataView(body.buffer, body.byteOffset);
   expect(new TextDecoder().decode(body.subarray(0, 4))).toBe("qks1");
@@ -43,6 +45,10 @@ async function fetchMany(weak: string[]): Promise<[string, Uint8Array | null][]>
   }
   expect(at).toBe(body.length);
   return listed;
+}
+
+function index() {
+  return env.INDEX.get(env.INDEX.idFromName("index"));
 }
 
 describe("POST pathsets/fetch", () => {
@@ -70,7 +76,7 @@ describe("POST pathsets/fetch", () => {
     expect(await fetchMany([weak])).toEqual([[weak, expectedPack(pathSets(weak, "new"), [], () => true)]]);
   });
 
-  it("answers a large record", async () => {
+  it("reads from the bucket a record too large for the index to hold", async () => {
     const weak = hash();
     const large = pathSets(weak, "large", 3 << 20);
     await save(weak, large);
@@ -80,7 +86,7 @@ describe("POST pathsets/fetch", () => {
     const [[listed, pack]] = (await fetchMany([weak])) as [[string, Uint8Array]];
     expect(listed).toBe(weak);
     expect(await sha256(pack)).toBe(expected);
-    // A smaller save after it is answered instead.
+    // A smaller save after it is held, and answered, instead.
     await save(weak, pathSets(weak, "small"));
     expect(await fetchMany([weak])).toEqual([[weak, expectedPack(pathSets(weak, "small"), [], () => true)]]);
   });
@@ -106,11 +112,68 @@ describe("POST pathsets/fetch", () => {
   });
 });
 
-describe("expectations", () => {
-  it("are read without a session, as they cite no blob", async () => {
+describe("records citing no blob", () => {
+  it("saved before the index held them are read from the bucket until it lists them", async () => {
+    const weak = hash();
+    const name = `pathsets/${weak}`;
+    const record = pathSets(weak, "older");
+    // As a server from before the index held records left it: in the bucket
+    // alone, and the listing of path sets not yet done.
+    await runInDurableObject(index(), (_, state) => {
+      state.storage.sql.exec("DELETE FROM listing WHERE name LIKE 'pathsets%'");
+    });
+    await env.STORE.put(name, upload(record, []));
+    const expected = expectedPack(record, [], () => true);
+
+    expect(await getOne(weak)).toEqual(expected);
+    expect(await fetchMany([weak])).toEqual([[weak, expected]]);
+    // Taken in as it was read, so the index answers it from now on.
+    await env.STORE.delete(name);
+    expect(await fetchMany([weak])).toEqual([[weak, expected]]);
+  });
+
+  it("saved before the index held them are listed once, and one it lacks then is none", async () => {
+    const weak = hash();
+    const name = `pathsets/${weak}`;
+    const record = pathSets(weak, "listed");
+    await env.STORE.put(name, upload(record, []));
+    await runInDurableObject(index(), async (instance, state) => {
+      const stub = instance as unknown as Index;
+      state.storage.sql.exec("DELETE FROM listing WHERE name LIKE 'pathsets%'");
+      expect(stub.readRecords([name, `pathsets/${hash()}`]).map(({ state }) => state)).toEqual(["unknown", "unknown"]);
+      await stub.alarm();
+      while ((await state.storage.getAlarm()) !== null) {
+        await state.storage.deleteAlarm();
+        await stub.alarm();
+      }
+      expect(stub.readRecords([name, `pathsets/${hash()}`]).map(({ state }) => state)).toEqual(["apart", "none"]);
+    });
+    expect(await fetchMany([weak])).toEqual([[weak, expectedPack(record, [], () => true)]]);
+  });
+
+  it("are never taken in from a read older than a save the index heard of", async () => {
+    const weak = hash();
+    const name = `pathsets/${weak}`;
+    const older = upload(pathSets(weak, "older"), []);
+    const newer = upload(pathSets(weak, "newer"), []);
+    await runInDurableObject(index(), (instance) => {
+      const stub = instance as unknown as Index;
+      // Listed from the bucket without its body, as the read began.
+      stub.saveRecord(name, null);
+      const [began] = stub.readRecords([name]);
+      expect(began!.state).toBe("apart");
+      // A save, then the slow read of the older body ends.
+      stub.saveRecord(name, newer);
+      stub.fillRecord(name, (began as { version: number }).version, older);
+      expect(stub.readRecords([name])).toEqual([{ state: "held", body: newer }]);
+    });
+  });
+
+  it("serve expectations from the index too, without reading a session", async () => {
     const name = hash().slice(0, 32);
     const record = bytes(JSON.stringify({ version: 1, name, tasks: {} }));
     expect((await request("PUT", `expectations/${name}`, { body: upload(record, []) })).status).toBe(204);
+    await env.STORE.delete(`expectations/${name}`);
     const response = await request("GET", `expectations/${name}?session=${hash().slice(0, 32)}`, { token: READ });
     expect(response.status).toBe(200);
     expect(response.headers.get("Server-Timing")).toMatch(/^session;dur=0, /);
