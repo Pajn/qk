@@ -1533,6 +1533,57 @@ fn server_build(fixture: &Fixture, token: &str, env: &[(&str, &str)]) -> Output 
     command.output().unwrap()
 }
 
+/// Path sets cite no blob, so fetching them does not wait for the session
+/// that tells the store server which blobs this machine holds.
+#[test]
+fn path_sets_are_fetched_without_waiting_for_the_session() {
+    let server = store_server::FakeStoreServer::start();
+    let fixture = Fixture::new(target(
+        "build",
+        json!({
+            "inputs": ["{projectRoot}/src/**/*"],
+            "qk:ultracache": {"mode": "on"},
+        }),
+    ));
+    with_store_server(&fixture, &server);
+    success(server_build(&fixture, store_server::WRITE_TOKEN, &[]));
+    // Its declared key misses, and it has no path set, so it asks the store
+    // for them; the blobs the first run kept make a session worth opening.
+    fs::write(fixture.root.join("src/input.txt"), "two\n").unwrap();
+    {
+        let mut state = server.state.lock().unwrap();
+        state.hold_sessions = true;
+        state.requests.clear();
+    }
+    let running = fixture
+        .command(&fixture.root, &["run", "app:build"])
+        .env("QK_STORE_SERVER_TOKEN", store_server::WRITE_TOKEN)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Released once the path sets are asked for, or after a while without
+    // that, so that a run that waits for the session still ends.
+    let asked = || {
+        server
+            .state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|(request, _)| request.starts_with("GET /v4/pathsets/"))
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !asked() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let asked_while_held = asked();
+    server.state.lock().unwrap().hold_sessions = false;
+    success(running.wait_with_output().unwrap());
+    assert!(asked_while_held, "the path sets waited for the session");
+    assert_eq!(fixture.runs(), 2);
+}
+
 #[cfg(unix)]
 fn cache_path(fixture: &Fixture) -> PathBuf {
     PathBuf::from(

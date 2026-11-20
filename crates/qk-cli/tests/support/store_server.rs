@@ -49,6 +49,8 @@ pub struct State {
     pub whole_listings: usize,
     /// Answer every write with 503, as a store that cannot take them now.
     pub refuse_writes: bool,
+    /// Hold `POST sessions` until it is cleared.
+    pub hold_sessions: bool,
     pub latency: Duration,
 }
 
@@ -210,6 +212,9 @@ fn serve(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
     }
     let mut body = vec![0; length];
     reader.read_exact(&mut body)?;
+    while method == "POST" && path == "/v4/sessions" && state.lock().unwrap().hold_sessions {
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let latency = state.lock().unwrap().latency;
     std::thread::sleep(latency);
     let writes =

@@ -198,10 +198,20 @@ impl Store for Server {
 
     fn get(&self, object: Object, task: &str) -> Result<Option<Body>> {
         let mut path = self.path(object);
-        if !matches!(object, Object::Blob(_))
-            && let Some(session) = self.session()
-        {
-            path.push_str(&format!("?session={session}"));
+        // Path sets and expectations are records citing no blob, so the
+        // session has nothing to leave out of them, and they are not held up
+        // until it is made.
+        let cites_blobs = !matches!(
+            object,
+            Object::Blob(_) | Object::PathSets(_) | Object::Expectations(_)
+        );
+        if cites_blobs {
+            let waiting = crate::profile::span(task, "remote_session_wait");
+            let session = self.session();
+            drop(waiting);
+            if let Some(session) = session {
+                path.push_str(&format!("?session={session}"));
+            }
         }
         self.read(&path, task)
     }
