@@ -574,6 +574,9 @@ pub fn run(
     let mut held: BTreeMap<String, usize> = BTreeMap::new();
     let mut given: BTreeMap<String, usize> = BTreeMap::new();
     let (sender, receiver) = mpsc::channel();
+    // For each task reported done before its shadow lookup was, what its
+    // recordings would have done, once the remote store has said.
+    let (shadow_sender, shadow_receiver) = mpsc::channel::<(String, Option<qk_cache::Shadow>)>();
     report::event(Event::Planned {
         tasks: graph.tasks.len(),
     });
@@ -992,12 +995,32 @@ pub fn run(
                     let cache = cache.as_ref().filter(|_| narrowed.is_none());
                     let cancelled = cancelled.clone();
                     let sandbox = sandbox.as_ref();
+                    let shadow_sender = shadow_sender.clone();
                     scope.spawn(move || {
+                        // A task taken from the cache is reported done as
+                        // soon as it is, before its shadow lookup is, which
+                        // follows on its own.
+                        let reported = std::cell::Cell::new(false);
+                        let done = |result: qk_cache::TaskResult| {
+                            reported.set(true);
+                            if let Some(recording) = &task.recording {
+                                let _ = recording.settle();
+                            }
+                            let _ = sender.send((id.clone(), Ok(result)));
+                        };
                         let run = |task: &qk_executor::PreparedTask| match cache {
-                            Some(cache) => cache.run(workspace, graph, definition, task, &cancelled),
+                            Some(cache) => {
+                                cache.run(workspace, graph, definition, task, &cancelled, &done)
+                            }
                             None => execute_retained(task, &cancelled),
                         };
-                        let result = run(&task).and_then(|result| {
+                        let result = run(&task);
+                        if reported.get() {
+                            let shadow = result.ok().and_then(|result| result.shadow);
+                            let _ = shadow_sender.send((id, shadow));
+                            return;
+                        }
+                        let result = result.and_then(|result| {
                             // Seatbelt refuses a sandbox inside one that
                             // restricts anything, as Xcode applies to Swift
                             // macros. An audit runs such a task again
@@ -1233,6 +1256,14 @@ pub fn run(
             Ok(())
         })();
         drop(finish_sampling);
+        // Every task has been reported done; those whose shadow lookups
+        // still wait for the store end once it has answered.
+        drop(shadow_sender);
+        for (id, shadow) in shadow_receiver {
+            if let Some(record) = records.get_mut(&id) {
+                record.shadow = shadow;
+            }
+        }
         result
     })?;
     if let Some(cache) = &cache {

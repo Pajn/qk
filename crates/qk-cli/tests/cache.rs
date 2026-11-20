@@ -2736,6 +2736,86 @@ fn remote_build_command_at(fixture: &Fixture, root: &Path, env: &[(&str, &str)])
     command
 }
 
+/// A task taken from the cache whose lookup by its recordings in mode
+/// `"record"` waits for the store is done all the same: what depends on it is
+/// restored meanwhile, and the run still reports what its recordings would
+/// have done.
+#[test]
+fn a_restored_task_does_not_wait_for_its_shadow_lookup() {
+    let server = s3::FakeS3::start();
+    let fixture = Fixture::with_targets(json!({
+        "build": target("build", json!({
+            "inputs": ["{projectRoot}/src/**/*"],
+            "qk:ultracache": {"mode": "record"},
+        })),
+        "generate": target("generate", json!({
+            "inputs": ["{projectRoot}/src/**/*"],
+            "outputs": ["{projectRoot}/generated"],
+            "dependsOn": ["build"],
+        })),
+    }));
+    let report = fixture.root.parent().unwrap().join("report.json");
+    let generate = || {
+        let mut command = fixture.command(
+            &fixture.root,
+            &["run", "app:generate", "--report", report.to_str().unwrap()],
+        );
+        command
+            .env("AWS_ACCESS_KEY_ID", "key")
+            .env("AWS_SECRET_ACCESS_KEY", "secret")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        command
+    };
+    // Kept here, before the store is configured, so that the store is
+    // asked for the path sets only in the run that follows.
+    success(generate().output().unwrap());
+    assert_eq!(fixture.runs(), 2);
+    with_remote(&fixture, &server, json!({}));
+    fs::remove_dir_all(fixture.root.join("generated")).unwrap();
+    {
+        let mut state = server.state.lock().unwrap();
+        state.hold_get_containing.insert("/pathsets/".into());
+        state.requests.clear();
+    }
+    let running = generate().spawn().unwrap();
+    // Released once the dependent is restored, or after a while without it,
+    // so that a run that waits for the path sets still ends.
+    let restored = fixture.root.join("generated/value.txt");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !restored.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let restored_while_held = restored.exists()
+        && server
+            .state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .all(|request| !request.contains("/pathsets/"));
+    server.state.lock().unwrap().hold_get_containing.clear();
+    success(running.wait_with_output().unwrap());
+    assert!(
+        restored_while_held,
+        "the dependent waited for the path sets"
+    );
+    assert_eq!(fixture.runs(), 2);
+    let report: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+    let task = |id: &str| {
+        report["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|task| task["id"] == id)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(task("app:build")["cache"], "local-hit");
+    assert_eq!(task("app:build")["shadow"]["kind"], "unrecorded");
+    assert_eq!(task("app:generate")["cache"], "local-hit");
+}
+
 fn clear_local_cache(fixture: &Fixture) {
     let path = stdout(&success(fixture.qk(&fixture.root, &["cache", "path"])));
     fs::remove_dir_all(path.trim()).unwrap();

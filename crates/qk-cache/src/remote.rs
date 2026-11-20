@@ -75,6 +75,11 @@ const BLOBS_AT_ONCE: usize = 1024;
 /// Blobs stored apart requested at once by every fetch together, leaving
 /// connections for entries and uploads.
 const BLOB_REQUESTS: usize = 24;
+/// Path sets fetched at once for lookups that restore nothing. A task taken
+/// from the cache does not wait for its own, so in a run of such tasks they
+/// would otherwise all be in flight together, beside the fetches of tasks
+/// that do wait.
+const SHADOW_FETCHES: usize = 8;
 /// Blobs one upload places at once. Placing a blob stored apart takes a
 /// request asking the store for it and, where the store lacks it, one sending
 /// it, so a record of thousands of them would otherwise take as many round
@@ -144,6 +149,9 @@ pub struct Remote {
     kept_apart: Mutex<HashMap<String, Vec<String>>>,
     /// Requests for blobs stored apart that may start now.
     blob_requests: Slots,
+    /// Fetches of path sets for lookups that restore nothing that may start
+    /// now.
+    shadow_fetches: Slots,
     /// Fetches in progress, by key, so a key is fetched once however many
     /// ask for it at a time.
     flights: Mutex<HashMap<String, Arc<Flight>>>,
@@ -547,6 +555,7 @@ impl Remote {
             bundles: AtomicBool::new(true),
             kept_apart: Mutex::default(),
             blob_requests: Slots::new(BLOB_REQUESTS),
+            shadow_fetches: Slots::new(SHADOW_FETCHES),
             flights: Mutex::default(),
             prefetch: prefetch::Prefetch::default(),
             prefetching: true,
@@ -823,6 +832,20 @@ impl Remote {
                 Ok(())
             })?;
         Ok(fetched.map(|(record, _, _)| record))
+    }
+
+    /// [`Self::fetch_path_sets`] for a lookup that restores nothing, at most
+    /// [`SHADOW_FETCHES`] at a time.
+    pub(crate) fn fetch_shadow_path_sets(
+        &self,
+        root: &Path,
+        weak: &str,
+        task: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let waiting = crate::profile::span(task, "remote_shadow_wait");
+        let _slot = self.shadow_fetches.take();
+        drop(waiting);
+        self.fetch_path_sets(root, weak, task)
     }
 
     /// Queues a task's warm record for its branch, after the blobs it cites.

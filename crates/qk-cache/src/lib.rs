@@ -487,6 +487,13 @@ impl Cache {
             .map_err(Clone::clone)
     }
 
+    /// Runs `task`, or takes its result from the cache.
+    ///
+    /// A task taken from the cache in mode `"record"` whose shadow lookup
+    /// waits for the remote store is done before that lookup is: `restored`
+    /// is told its result then, without its `shadow`, and its outputs count
+    /// as written, so that what depends on it can start. The result returned
+    /// once the store has answered differs from it only in its `shadow`.
     pub fn run(
         &self,
         workspace: &Workspace,
@@ -494,11 +501,22 @@ impl Cache {
         task: &Task,
         prepared: &PreparedTask,
         cancelled: &AtomicBool,
+        restored: &dyn Fn(TaskResult),
     ) -> Result<TaskResult> {
-        let result = self.run_task(workspace, graph, task, prepared, cancelled);
-        if let Some(Ok(snapshot)) = self.snapshot.get() {
-            snapshot.outputs_written(workspace, task);
-        }
+        let written = std::sync::Once::new();
+        let write = || {
+            written.call_once(|| {
+                if let Some(Ok(snapshot)) = self.snapshot.get() {
+                    snapshot.outputs_written(workspace, task);
+                }
+            })
+        };
+        let early = |result: TaskResult| {
+            write();
+            restored(result);
+        };
+        let result = self.run_task(workspace, graph, task, prepared, cancelled, &early);
+        write();
         result
     }
 
@@ -509,6 +527,7 @@ impl Cache {
         task: &Task,
         prepared: &PreparedTask,
         cancelled: &AtomicBool,
+        done: &dyn Fn(TaskResult),
     ) -> Result<TaskResult> {
         let cacheable = task.definition.cache == Some(true);
         // Held until the task is done, whether it ran or came from the cache.
@@ -860,6 +879,8 @@ impl Cache {
                 }
             }
         }
+        // Whether what its recordings would have done waits for the store.
+        let fetching = matches!(shadowing, Some(Shadowing::Fetching { .. }));
         // What its recordings would have done, once the store has said.
         let mut settle = |recordings: &mut Option<(Vec<recorded::PathSet>, String, _)>| {
             let shadowing = shadowing.take()?;
@@ -899,6 +920,18 @@ impl Cache {
                 remote.resolved(&key);
                 remote.prefetched(&key)
             });
+        // Its result, taken from the cache. Restored, it is done: what depends
+        // on it need not wait for the store to say what its recordings would
+        // have done, which only its report reads, so `done` is told it first.
+        let hit = |cache: CacheStatus, shadow: Option<Shadow>| TaskResult {
+            outcome: Outcome::Success,
+            cache,
+            key: keyed.clone(),
+            warm: None,
+            execution: None,
+            recorded: unrecorded.clone(),
+            shadow,
+        };
         let local_profile = profile::span(&task.id, "local_restore");
         let restored = if declared && !self.cold {
             self.restore(
@@ -936,6 +969,15 @@ impl Cache {
                         qk_executor::report::Cached::Hit
                     },
                 });
+                let status = if claimed {
+                    CacheStatus::RemoteHit
+                } else {
+                    CacheStatus::LocalHit
+                };
+                drop(local_profile);
+                if fetching {
+                    done(hit(status, None));
+                }
                 let shadow = settle(&mut recordings);
                 let shadow = self.with_changes(
                     shadow,
@@ -943,19 +985,7 @@ impl Cache {
                     (snapshot, workspace, graph, task, prepared, &unlisted),
                     cancelled,
                 );
-                return Ok(TaskResult {
-                    outcome: Outcome::Success,
-                    cache: if claimed {
-                        CacheStatus::RemoteHit
-                    } else {
-                        CacheStatus::LocalHit
-                    },
-                    key: keyed,
-                    warm: None,
-                    execution: None,
-                    recorded: unrecorded,
-                    shadow,
-                });
+                return Ok(hit(status, shadow));
             }
             Ok(false) => {}
             Err(error) => {
@@ -988,6 +1018,9 @@ impl Cache {
                         id: task.id.clone(),
                         cached: qk_executor::report::Cached::RemoteHit,
                     });
+                    if fetching {
+                        done(hit(CacheStatus::RemoteHit, None));
+                    }
                     let shadow = settle(&mut recordings);
                     let shadow = self.with_changes(
                         shadow,
@@ -995,15 +1028,7 @@ impl Cache {
                         (snapshot, workspace, graph, task, prepared, &unlisted),
                         cancelled,
                     );
-                    return Ok(TaskResult {
-                        outcome: Outcome::Success,
-                        cache: CacheStatus::RemoteHit,
-                        key: keyed,
-                        warm: None,
-                        execution: None,
-                        recorded: unrecorded,
-                        shadow,
-                    });
+                    return Ok(hit(CacheStatus::RemoteHit, shadow));
                 }
                 Ok(false) => {}
                 Err(error) => {
@@ -1438,7 +1463,7 @@ impl Cache {
         );
         Shadowing::Fetching {
             search,
-            fetch: std::thread::spawn(move || remote.fetch_path_sets(&root, &weak, &id)),
+            fetch: std::thread::spawn(move || remote.fetch_shadow_path_sets(&root, &weak, &id)),
         }
     }
 
