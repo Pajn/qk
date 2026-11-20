@@ -213,6 +213,9 @@ struct FilePlan {
 const DIRECTORY: u8 = 1;
 /// Directories read at once while the inventory walks the workspace.
 const WALKERS: usize = 8;
+/// Threads listing source files when ignore files are read on the way. Past a
+/// few, more threads add system time faster than they save time.
+const LISTERS: usize = 4;
 
 /// Whether `name` is an ignore file, whose rules change which files are sources.
 fn is_policy(name: &std::ffi::OsStr) -> bool {
@@ -534,24 +537,52 @@ impl Membership {
             }
             selected
         });
-        let paths: Box<dyn Iterator<Item = (&PathBuf, bool)>> = match selected {
+        // Each path with its stamp and, for a directory, the names captured
+        // for it, if any.
+        type Checked<'a> = (
+            &'a PathBuf,
+            &'a Option<Stamp>,
+            Option<Option<&'a BTreeSet<(OsString, u8)>>>,
+        );
+        let paths: Box<dyn Iterator<Item = Checked>> = match selected {
             Some(selected) => Box::new(
                 selected
                     .into_iter()
-                    .map(|path| (path, true))
-                    .chain(self.policies.iter().map(|path| (path, false))),
+                    .map(|path| {
+                        (
+                            path,
+                            &self.stamps[path],
+                            Some(self.directory_entries.get(path)),
+                        )
+                    })
+                    .chain(
+                        self.policies
+                            .iter()
+                            .map(|path| (path, &self.stamps[path], None)),
+                    ),
             ),
-            None => Box::new(
-                self.stamps
-                    .keys()
-                    .map(|path| (path, self.directories.contains(path))),
-            ),
+            None => {
+                // Every directory has a stamp, and every captured listing
+                // belongs to a directory: walking the three in their shared
+                // order finds each path's own without searching for it.
+                let mut directories = self.directories.iter().peekable();
+                let mut entries = self.directory_entries.iter().peekable();
+                Box::new(self.stamps.iter().map(move |(path, before)| {
+                    let directory = directories
+                        .next_if(|directory| *directory == path)
+                        .map(|_| {
+                            entries
+                                .next_if(|(directory, _)| *directory == path)
+                                .map(|(_, names)| names)
+                        });
+                    (path, before, directory)
+                }))
+            }
         };
-        for (path, directory) in paths {
-            let before = &self.stamps[path];
+        for (path, before, directory) in paths {
             let after = membership_stamp(path)?;
-            if directory {
-                if after.is_some() && !self.directory_entries.contains_key(path) {
+            if let Some(captured) = directory {
+                if after.is_some() && captured.is_none() {
                     return Ok((false, false));
                 }
                 // Output publication changes its parent's timestamp too. Check
@@ -564,9 +595,7 @@ impl Membership {
                         .is_some_and(|stamp| !stamp.membership_settled())
                 {
                     let entries = self.entries(path)?;
-                    if entries.as_ref() != self.directory_entries.get(path)
-                        || membership_stamp(path)? != after
-                    {
+                    if entries.as_ref() != captured || membership_stamp(path)? != after {
                         return Ok((false, false));
                     }
                 }
@@ -597,6 +626,37 @@ impl Membership {
             files: self.files.clone(),
             source_ignore: self.source_ignore.clone(),
         }
+    }
+
+    /// List source files once this inventory has stamped directories and
+    /// policies, so a change made while listing shows in a later comparison.
+    /// `rebuilt` says whether the stamps were taken for this listing.
+    fn list(&mut self, extra: &BTreeSet<String>, rebuilt: bool) -> Result<()> {
+        let mut files = source_files(&self.root)?;
+        exclude_artifacts(&mut files, &self.outputs, self.cache.as_deref());
+        let ignore = SourceIgnore::new(&self.root)?;
+        files.extend(extra.iter().filter(|path| !ignore.matches(path)).cloned());
+        self.source_ignore = Arc::new(ignore);
+        self.files = Arc::new(files);
+        // An unstable inventory or recent policy never enables the fast path.
+        // Keep candidates so a rebuild also watches tracked, ignored parents.
+        self.settled = rebuilt && self.covers(&self.files) && self.state(None)?.1;
+        Ok(())
+    }
+
+    /// Whether every directory above each of `files` has a stamp. Files share
+    /// parents, so each directory is looked up once.
+    fn covers(&self, files: &BTreeSet<String>) -> bool {
+        let mut watched: HashSet<&Path> = HashSet::default();
+        files.iter().all(|path| {
+            // A directory seen before was checked with all its ancestors, or
+            // the search would have ended there.
+            Path::new(path)
+                .ancestors()
+                .skip(1)
+                .take_while(|parent| watched.insert(parent))
+                .all(|parent| self.stamps.contains_key(&self.root.join(parent)))
+        })
     }
 }
 
@@ -766,50 +826,77 @@ impl Installed {
     }
 }
 
+/// Every task's declared outputs, warm paths and scratch directories, which no
+/// source listing includes, and the scratch directories among them.
+fn source_exclusions(workspace: &Workspace, graph: &TaskGraph) -> (Vec<Outputs>, Vec<Outputs>) {
+    // Keep the patterns, not only the artifacts present at startup: new
+    // outputs and warm scratch files must be excluded on every refresh.
+    let mut source_exclusions: Vec<_> = graph
+        .tasks
+        .values()
+        .filter_map(|task| Outputs::new(workspace, task).ok())
+        .filter(Outputs::is_explicit)
+        .collect();
+    for task in graph.tasks.values() {
+        let Ok(entries) = crate::warm::config(workspace, task) else {
+            continue;
+        };
+        if let Ok(paths) = Outputs::from_paths(&crate::warm::kept_paths(&entries)) {
+            source_exclusions.push(paths);
+        }
+    }
+    // Scratch directories, which each run empties: what is in them is no
+    // input, before or after the task runs.
+    let mut scratch_paths = Vec::new();
+    for task in graph.tasks.values() {
+        let scratch: Vec<String> = crate::scratch::directories(workspace, task)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|directory| {
+                let relative = directory.strip_prefix(&workspace.root).ok()?.to_str()?;
+                let named = crate::glob::escape(&relative.replace('\\', "/"));
+                Some([named.clone(), format!("{named}/**")])
+            })
+            .flatten()
+            .collect();
+        if !scratch.is_empty()
+            && let Ok(paths) = Outputs::from_paths(&scratch)
+        {
+            source_exclusions.push(paths.clone());
+            scratch_paths.push(paths);
+        }
+    }
+    (source_exclusions, scratch_paths)
+}
+
 impl Snapshot {
+    /// A snapshot that lists source files on their own, for inspecting
+    /// inputs. Its first refresh, if any, lists them again with a directory
+    /// inventory to compare later refreshes against.
     pub fn new(workspace: &Workspace, graph: &TaskGraph, cache_path: &Path) -> Result<Self> {
+        Self::build(workspace, graph, cache_path, false)
+    }
+
+    /// A snapshot for keying tasks. When a task needs the workspace's files
+    /// listed, the listing is taken after the directory inventory a refresh
+    /// compares against, so the first task to key reuses it instead of
+    /// listing the workspace again.
+    pub fn watched(workspace: &Workspace, graph: &TaskGraph, cache_path: &Path) -> Result<Self> {
+        Self::build(workspace, graph, cache_path, true)
+    }
+
+    fn build(
+        workspace: &Workspace,
+        graph: &TaskGraph,
+        cache_path: &Path,
+        watched: bool,
+    ) -> Result<Self> {
         let canonical_root = workspace.root.canonicalize()?;
         let cache_relative = cache_path
             .strip_prefix(&workspace.root)
             .ok()
             .map(PathBuf::from);
-        // Keep the patterns, not only the artifacts present at startup: new
-        // outputs and warm scratch files must be excluded on every refresh.
-        let mut source_exclusions: Vec<_> = graph
-            .tasks
-            .values()
-            .filter_map(|task| Outputs::new(workspace, task).ok())
-            .filter(Outputs::is_explicit)
-            .collect();
-        for task in graph.tasks.values() {
-            let Ok(entries) = crate::warm::config(workspace, task) else {
-                continue;
-            };
-            if let Ok(paths) = Outputs::from_paths(&crate::warm::kept_paths(&entries)) {
-                source_exclusions.push(paths);
-            }
-        }
-        // Scratch directories, which each run empties: what is in them is no
-        // input, before or after the task runs.
-        let mut scratch_paths = Vec::new();
-        for task in graph.tasks.values() {
-            let scratch: Vec<String> = crate::scratch::directories(workspace, task)
-                .unwrap_or_default()
-                .iter()
-                .filter_map(|directory| {
-                    let relative = directory.strip_prefix(&workspace.root).ok()?.to_str()?;
-                    let named = crate::glob::escape(&relative.replace('\\', "/"));
-                    Some([named.clone(), format!("{named}/**")])
-                })
-                .flatten()
-                .collect();
-            if !scratch.is_empty()
-                && let Ok(paths) = Outputs::from_paths(&scratch)
-            {
-                source_exclusions.push(paths.clone());
-                scratch_paths.push(paths);
-            }
-        }
+        let (source_exclusions, scratch_paths) = source_exclusions(workspace, graph);
         let mut snapshot = Self {
             root: workspace.root.clone(),
             files: std::sync::OnceLock::new(),
@@ -869,8 +956,10 @@ impl Snapshot {
                 (digests, workspace_prefix)
             });
             // A task whose file inputs name paths lists only those, so a run
-            // of such tasks alone never lists the workspace.
-            if snapshot.lists(workspace, graph) {
+            // of such tasks alone never lists the workspace. Without an
+            // inventory, each task's refresh takes one, and reports why it
+            // cannot, as for a plain listing.
+            if snapshot.lists(workspace, graph) && !(watched && snapshot.watch().is_ok()) {
                 snapshot.files()?;
             }
             anyhow::Ok((
@@ -882,6 +971,31 @@ impl Snapshot {
         snapshot.digests = Mutex::new(digests);
         snapshot.workspace_prefix = workspace_prefix;
         Ok(snapshot)
+    }
+
+    /// Lists the workspace's files after taking the directory inventory a
+    /// refresh compares against, as a refresh does, and keeps both for the
+    /// first task that keys.
+    fn watch(&mut self) -> Result<()> {
+        let _listing = crate::profile::span("snapshot", "inventory_list");
+        let listed = Instant::now();
+        // No earlier listing names tracked files beneath directories the
+        // walk skips, so such a file leaves the inventory unsettled and the
+        // first refresh watches its parents.
+        let mut membership = Membership::new(
+            &self.root,
+            &BTreeSet::new(),
+            &self.source_ignore,
+            &self.source_exclusions,
+            self.cache_relative.as_deref(),
+            None,
+        )?;
+        membership.list(&self.extra_candidates, true)?;
+        membership.listed = Some(listed);
+        self.source_ignore = membership.source_ignore.clone();
+        self.files = std::sync::OnceLock::from(Ok((*membership.files).clone()));
+        *self.membership.get_mut().unwrap() = Some(Arc::new(membership));
+        Ok(())
     }
 
     /// Whether a task of `graph` needs the workspace's files listed: one
@@ -1142,31 +1256,8 @@ impl Snapshot {
                         .map(|entry| &entry.git_policies),
                 )?
             };
-            let mut files = source_files(root)?;
-            exclude_artifacts(
-                &mut files,
-                &self.source_exclusions,
-                self.cache_relative.as_deref(),
-            );
-            let ignore = SourceIgnore::new(root)?;
-            files.extend(
-                self.extra_candidates
-                    .iter()
-                    .filter(|path| !ignore.matches(path))
-                    .cloned(),
-            );
-            membership.source_ignore = Arc::new(ignore);
-            membership.files = Arc::new(files);
+            membership.list(&self.extra_candidates, rebuilt)?;
             let candidates = membership.candidates();
-            // An unstable inventory or recent policy never enables the fast path.
-            // Keep candidates so a rebuild also watches tracked, ignored parents.
-            let covered = candidates.files.iter().all(|path| {
-                Path::new(path)
-                    .ancestors()
-                    .skip(1)
-                    .all(|parent| membership.stamps.contains_key(&root.join(parent)))
-            });
-            membership.settled = rebuilt && covered && membership.state(None)?.1;
             membership.listed = Some(listed);
             *cached = Some(Arc::new(membership));
             return Ok(candidates);
@@ -1256,6 +1347,14 @@ impl Snapshot {
             );
         }
         self.extra_candidates.extend(paths.iter().cloned());
+        // A listing taken with its inventory adds them as a refresh would.
+        if let Some(membership) = self.membership.get_mut().unwrap() {
+            let membership = Arc::make_mut(membership);
+            let ignore = membership.source_ignore.clone();
+            Arc::make_mut(&mut membership.files)
+                .extend(paths.iter().filter(|path| !ignore.matches(path)).cloned());
+            membership.settled &= membership.covers(&membership.files);
+        }
         self
     }
 
@@ -1696,9 +1795,11 @@ fn walked_sources(
     root: &Path,
     enter: impl Fn(&Path) -> bool + Send + Sync + 'static,
 ) -> Result<BTreeSet<String>> {
-    let mut files = BTreeSet::new();
+    // Directories are read on several threads; each keeps the files it finds
+    // and adds them to the shared listing when it finishes.
+    let found = Mutex::new((Vec::new(), None));
     let walked = root.to_owned();
-    for entry in ignore::WalkBuilder::new(root)
+    ignore::WalkBuilder::new(root)
         .hidden(false)
         .parents(false)
         .git_global(false)
@@ -1712,14 +1813,18 @@ fn walked_sources(
                 Some(".git" | ".qk" | "node_modules")
             ) && enter(entry.path().strip_prefix(&walked).unwrap_or(entry.path()))
         })
-        .build()
-    {
-        let entry = entry?;
-        if entry.file_type().is_some_and(|kind| !kind.is_dir()) {
-            files.insert(paths::relative(root, entry.path())?);
-        }
+        .threads(LISTERS)
+        .build_parallel()
+        .visit(&mut WalkedFiles {
+            root,
+            found: &found,
+            files: Vec::new(),
+        });
+    let (files, error) = found.into_inner().unwrap();
+    if let Some(error) = error {
+        return Err(error);
     }
-    Ok(files)
+    Ok(files.into_iter().collect())
 }
 
 /// `candidates` without root ignore rules' files and runner state.
@@ -1734,6 +1839,55 @@ fn visible_sources(root: &Path, candidates: BTreeSet<String>) -> Result<BTreeSet
                     .any(|part| matches!(part, ".git" | ".qk" | "node_modules"))
         })
         .collect())
+}
+
+/// The files one thread of [`source_files`]' walk finds, added to `found` when
+/// the thread finishes, with the first error any thread meets.
+struct WalkedFiles<'a> {
+    root: &'a Path,
+    found: &'a Mutex<(Vec<String>, Option<anyhow::Error>)>,
+    files: Vec<String>,
+}
+
+impl<'a> ignore::ParallelVisitorBuilder<'a> for WalkedFiles<'a> {
+    fn build(&mut self) -> Box<dyn ignore::ParallelVisitor + 'a> {
+        Box::new(WalkedFiles {
+            root: self.root,
+            found: self.found,
+            files: Vec::new(),
+        })
+    }
+}
+
+impl ignore::ParallelVisitor for WalkedFiles<'_> {
+    fn visit(&mut self, entry: Result<ignore::DirEntry, ignore::Error>) -> ignore::WalkState {
+        let path = entry.map_err(anyhow::Error::from).and_then(|entry| {
+            Ok(if entry.file_type().is_some_and(|kind| !kind.is_dir()) {
+                Some(paths::relative(self.root, entry.path())?)
+            } else {
+                None
+            })
+        });
+        match path {
+            Ok(path) => {
+                self.files.extend(path);
+                ignore::WalkState::Continue
+            }
+            Err(error) => {
+                self.found.lock().unwrap().1.get_or_insert(error);
+                ignore::WalkState::Quit
+            }
+        }
+    }
+}
+
+impl Drop for WalkedFiles<'_> {
+    fn drop(&mut self) {
+        // A panicking thread poisons the lock; the walk fails regardless.
+        if let Ok(mut found) = self.found.lock() {
+            found.0.append(&mut self.files);
+        }
+    }
 }
 
 /// The text of `path` as a `json` input keys it: only `fields` when given,
@@ -3569,6 +3723,17 @@ mod tests {
     use super::*;
     use qk_taskgraph::Request;
 
+    /// A snapshot that lists files on its own, or with the directory
+    /// inventory a refresh compares against: refreshes behave alike.
+    fn snapshot(workspace: &Workspace, graph: &TaskGraph, watched: bool) -> Snapshot {
+        let cache = workspace.root.join("cache");
+        if watched {
+            Snapshot::watched(workspace, graph, &cache).unwrap()
+        } else {
+            Snapshot::new(workspace, graph, &cache).unwrap()
+        }
+    }
+
     fn fixture(outputs: Option<Value>) -> (tempfile::TempDir, Workspace, TaskGraph) {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("nx.json"), "{}").unwrap();
@@ -3783,7 +3948,7 @@ mod tests {
     #[test]
     fn membership_reuses_settled_candidates_and_detects_directory_changes() {
         let mut fixtures = Vec::new();
-        for git in [false, true] {
+        for (git, watched) in [(false, false), (true, false), (false, true), (true, true)] {
             let (root, workspace, graph) = fixture(Some(json!(["{projectRoot}/dist"])));
             for directory in ["src/empty", "dist", "cache", "ignored"] {
                 std::fs::create_dir_all(root.path().join(directory)).unwrap();
@@ -3804,8 +3969,7 @@ mod tests {
                         .success()
                 );
             }
-            let snapshot =
-                Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
+            let snapshot = snapshot(&workspace, &graph, watched);
             snapshot.current_files(root.path()).unwrap();
             fixtures.push((root, snapshot));
         }
@@ -3845,45 +4009,146 @@ mod tests {
     }
 
     #[test]
-    fn identical_ignore_rewrites_reuse_candidates_and_changed_rules_refresh() {
-        for name in [".gitignore", ".nxignore"] {
-            let (root, workspace, graph) = fixture(None);
-            let policy = root.path().join(name);
-            std::fs::write(root.path().join("alpha"), "a").unwrap();
-            std::fs::write(root.path().join("bravo"), "b").unwrap();
-            std::fs::write(&policy, "alpha\n").unwrap();
-            let snapshot =
-                Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
-            let original = snapshot.current_files(root.path()).unwrap();
-            assert!(!original.contains("alpha"));
-            assert!(original.contains("bravo"));
-            for _ in 0..3 {
-                std::fs::write(&policy, "alpha\n").unwrap();
-                assert!(Arc::ptr_eq(
-                    &original,
-                    &snapshot.current_files(root.path()).unwrap()
-                ));
+    fn a_watched_snapshot_lists_what_a_refresh_lists_and_its_first_refresh_reuses_it() {
+        for (git, policy) in [
+            (false, ".gitignore"),
+            (true, ".gitignore"),
+            (true, ".nxignore"),
+        ] {
+            let (root, workspace, graph) = fixture(Some(json!(["{projectRoot}/dist"])));
+            for directory in ["src/nested", "src/empty", "dist", "ignored"] {
+                std::fs::create_dir_all(root.path().join(directory)).unwrap();
             }
-            // Same-length content can change while coarse timestamps appear
-            // identical. Recent policies must still compare their contents.
-            std::fs::write(&policy, "bravo\n").unwrap();
-            {
-                let mut cached = snapshot.membership.lock().unwrap();
-                Arc::make_mut(cached.as_mut().unwrap())
-                    .stamps
-                    .insert(policy.clone(), membership_stamp(&policy).unwrap());
+            for file in ["src/nested/kept", "dist/artifact", "ignored/hidden"] {
+                std::fs::write(root.path().join(file), "a").unwrap();
             }
-            let changed = snapshot.current_files(root.path()).unwrap();
-            assert!(!Arc::ptr_eq(&original, &changed));
-            assert!(changed.contains("alpha"));
-            assert!(!changed.contains("bravo"));
-            std::fs::remove_file(&policy).unwrap();
+            std::fs::write(root.path().join(policy), "ignored/\n").unwrap();
+            if git {
+                for args in [&["init", "-q"][..], &["add", "-A"]] {
+                    assert!(paths::git(root.path(), args).unwrap().status.success());
+                }
+            }
+            // Recent policies keep any listing from being reused.
+            std::thread::sleep(Duration::from_millis(2100));
+            let plain = snapshot(&workspace, &graph, false);
+            let expected = plain.current_files(root.path()).unwrap();
+            let watched = snapshot(&workspace, &graph, true);
+            assert_eq!(watched.files().unwrap(), plain.files().unwrap());
+            assert_eq!(watched.files().unwrap(), &*expected);
+            assert!(watched.files().unwrap().contains("src/nested/kept"));
+            assert!(!watched.files().unwrap().contains("dist/artifact"));
+            assert!(!watched.files().unwrap().contains("ignored/hidden"));
+            let seeded = watched
+                .membership
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .files
+                .clone();
+            assert!(Arc::ptr_eq(
+                &seeded,
+                &watched.current_files(root.path()).unwrap()
+            ));
+            std::fs::write(root.path().join("src/empty/added"), "b").unwrap();
             assert!(
-                snapshot
+                watched
                     .current_files(root.path())
                     .unwrap()
-                    .contains("bravo")
+                    .contains("src/empty/added")
             );
+        }
+    }
+
+    #[test]
+    fn changes_between_stamping_and_listing_leave_the_listing_unsettled() {
+        let (root, _, _) = fixture(None);
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src/original"), "one").unwrap();
+        let ignore = Arc::new(SourceIgnore::new(root.path()).unwrap());
+        let mut membership =
+            Membership::new(root.path(), &BTreeSet::new(), &ignore, &[], None, None).unwrap();
+        // Model a change made after the walk but before the listing: the
+        // listing shows it, and the stamps taken earlier do not.
+        std::fs::rename(
+            root.path().join("src/original"),
+            root.path().join("src/renamed"),
+        )
+        .unwrap();
+        membership.list(&BTreeSet::new(), true).unwrap();
+        assert!(membership.files.contains("src/renamed"));
+        assert!(!membership.files.contains("src/original"));
+        assert!(!membership.settled);
+        assert!(!membership.state(None).unwrap().0);
+    }
+
+    #[test]
+    fn candidates_beneath_unwatched_directories_leave_the_listing_unsettled() {
+        let (root, workspace, graph) = fixture(None);
+        std::fs::create_dir_all(root.path().join("src/nested")).unwrap();
+        std::thread::sleep(Duration::from_millis(2100));
+        let ignore = Arc::new(SourceIgnore::new(root.path()).unwrap());
+        let membership =
+            Membership::new(root.path(), &BTreeSet::new(), &ignore, &[], None, None).unwrap();
+        let files = |paths: &[&str]| paths.iter().map(|path| (*path).to_owned()).collect();
+        assert!(membership.covers(&files(&["top", "src/a", "src/nested/b", "src/nested/c"])));
+        assert!(!membership.covers(&files(&["src/nested/b", "src/missing/c"])));
+        assert!(!membership.covers(&files(&["missing/deeper/c", "src/a"])));
+        // A deleted path a caller adds is kept, though no directory holds it:
+        // the listing is not reused until a refresh watches where it was.
+        let snapshot = snapshot(&workspace, &graph, true).with_candidates(&["gone/file".into()]);
+        assert!(snapshot.files().unwrap().contains("gone/file"));
+        let seeded = snapshot.membership.lock().unwrap().clone().unwrap();
+        assert!(seeded.files.contains("gone/file"));
+        assert!(!seeded.settled);
+        let refreshed = snapshot.current_files(root.path()).unwrap();
+        assert!(!Arc::ptr_eq(&seeded.files, &refreshed));
+        assert!(refreshed.contains("gone/file"));
+        let membership = snapshot.membership.lock().unwrap().clone().unwrap();
+        assert!(membership.stamps.contains_key(&root.path().join("gone")));
+    }
+
+    #[test]
+    fn identical_ignore_rewrites_reuse_candidates_and_changed_rules_refresh() {
+        for watched in [false, true] {
+            for name in [".gitignore", ".nxignore"] {
+                let (root, workspace, graph) = fixture(None);
+                let policy = root.path().join(name);
+                std::fs::write(root.path().join("alpha"), "a").unwrap();
+                std::fs::write(root.path().join("bravo"), "b").unwrap();
+                std::fs::write(&policy, "alpha\n").unwrap();
+                let snapshot = snapshot(&workspace, &graph, watched);
+                let original = snapshot.current_files(root.path()).unwrap();
+                assert!(!original.contains("alpha"));
+                assert!(original.contains("bravo"));
+                for _ in 0..3 {
+                    std::fs::write(&policy, "alpha\n").unwrap();
+                    assert!(Arc::ptr_eq(
+                        &original,
+                        &snapshot.current_files(root.path()).unwrap()
+                    ));
+                }
+                // Same-length content can change while coarse timestamps appear
+                // identical. Recent policies must still compare their contents.
+                std::fs::write(&policy, "bravo\n").unwrap();
+                {
+                    let mut cached = snapshot.membership.lock().unwrap();
+                    Arc::make_mut(cached.as_mut().unwrap())
+                        .stamps
+                        .insert(policy.clone(), membership_stamp(&policy).unwrap());
+                }
+                let changed = snapshot.current_files(root.path()).unwrap();
+                assert!(!Arc::ptr_eq(&original, &changed));
+                assert!(changed.contains("alpha"));
+                assert!(!changed.contains("bravo"));
+                std::fs::remove_file(&policy).unwrap();
+                assert!(
+                    snapshot
+                        .current_files(root.path())
+                        .unwrap()
+                        .contains("bravo")
+                );
+            }
         }
     }
 
@@ -3939,93 +4204,96 @@ mod tests {
 
     #[test]
     fn output_publication_reuses_candidates_but_source_names_still_refresh() {
-        for partial in [false, true] {
-            let outputs = if partial {
-                json!(["{projectRoot}/dist", "!{projectRoot}/dist/keep"])
-            } else {
-                json!(["{projectRoot}/dist"])
-            };
-            let (root, workspace, graph) = fixture(Some(outputs));
-            std::fs::create_dir_all(root.path().join("src")).unwrap();
-            std::fs::write(root.path().join("src/original"), "one").unwrap();
-            if partial {
-                std::fs::create_dir_all(root.path().join("dist/keep")).unwrap();
+        for watched in [false, true] {
+            for partial in [false, true] {
+                let outputs = if partial {
+                    json!(["{projectRoot}/dist", "!{projectRoot}/dist/keep"])
+                } else {
+                    json!(["{projectRoot}/dist"])
+                };
+                let (root, workspace, graph) = fixture(Some(outputs));
+                std::fs::create_dir_all(root.path().join("src")).unwrap();
+                std::fs::write(root.path().join("src/original"), "one").unwrap();
+                if partial {
+                    std::fs::create_dir_all(root.path().join("dist/keep")).unwrap();
+                }
+                let snapshot = snapshot(&workspace, &graph, watched);
+                snapshot.current_files(root.path()).unwrap();
+                // Policies retain their conservative timestamp window. Directory
+                // names are freshly verified throughout the window instead.
+                std::thread::sleep(Duration::from_millis(2100));
+                let before = snapshot.current_files(root.path()).unwrap();
+                std::fs::create_dir_all(root.path().join("dist")).unwrap();
+                std::fs::write(root.path().join("dist/restored"), "artifact").unwrap();
+                let restored = snapshot.current_files(root.path()).unwrap();
+                assert!(Arc::ptr_eq(&before, &restored));
+                std::fs::remove_file(root.path().join("dist/restored")).unwrap();
+                assert!(Arc::ptr_eq(
+                    &before,
+                    &snapshot.current_files(root.path()).unwrap()
+                ));
+                let source = if partial { "dist/keep/new" } else { "src/new" };
+                std::fs::write(root.path().join(source), "source").unwrap();
+                let after = snapshot.current_files(root.path()).unwrap();
+                assert!(after.contains(source));
+                assert!(!Arc::ptr_eq(&before, &after));
+                std::fs::remove_file(root.path().join(source)).unwrap();
+                assert!(
+                    !snapshot
+                        .current_files(root.path())
+                        .unwrap()
+                        .contains(source)
+                );
             }
-            let snapshot =
-                Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
-            snapshot.current_files(root.path()).unwrap();
-            // Policies retain their conservative timestamp window. Directory
-            // names are freshly verified throughout the window instead.
-            std::thread::sleep(Duration::from_millis(2100));
-            let before = snapshot.current_files(root.path()).unwrap();
-            std::fs::create_dir_all(root.path().join("dist")).unwrap();
-            std::fs::write(root.path().join("dist/restored"), "artifact").unwrap();
-            let restored = snapshot.current_files(root.path()).unwrap();
-            assert!(Arc::ptr_eq(&before, &restored));
-            std::fs::remove_file(root.path().join("dist/restored")).unwrap();
-            assert!(Arc::ptr_eq(
-                &before,
-                &snapshot.current_files(root.path()).unwrap()
-            ));
-            let source = if partial { "dist/keep/new" } else { "src/new" };
-            std::fs::write(root.path().join(source), "source").unwrap();
-            let after = snapshot.current_files(root.path()).unwrap();
-            assert!(after.contains(source));
-            assert!(!Arc::ptr_eq(&before, &after));
-            std::fs::remove_file(root.path().join(source)).unwrap();
-            assert!(
-                !snapshot
-                    .current_files(root.path())
-                    .unwrap()
-                    .contains(source)
-            );
         }
     }
 
     #[test]
     fn concurrent_fingerprints_refresh_without_replacing_newer_membership() {
-        let (root, workspace, graph) = fixture(None);
-        std::fs::create_dir_all(root.path().join("src")).unwrap();
-        let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
-        let original = snapshot.current_files(root.path()).unwrap();
-        let barrier = std::sync::Barrier::new(9);
-        std::thread::scope(|scope| {
-            let workers: Vec<_> = (0..8)
-                .map(|_| {
-                    scope.spawn(|| {
-                        let mut rounds = Vec::new();
-                        for _ in 0..6 {
-                            barrier.wait();
-                            rounds.push(snapshot.current_files(root.path()));
-                            barrier.wait();
-                        }
-                        rounds
+        for watched in [false, true] {
+            let (root, workspace, graph) = fixture(None);
+            std::fs::create_dir_all(root.path().join("src")).unwrap();
+            let snapshot = snapshot(&workspace, &graph, watched);
+            let original = snapshot.current_files(root.path()).unwrap();
+            let barrier = std::sync::Barrier::new(9);
+            std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..8)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            let mut rounds = Vec::new();
+                            for _ in 0..6 {
+                                barrier.wait();
+                                rounds.push(snapshot.current_files(root.path()));
+                                barrier.wait();
+                            }
+                            rounds
+                        })
                     })
-                })
-                .collect();
-            for round in 0..6 {
-                std::fs::write(root.path().join(format!("src/new{round}")), "source").unwrap();
-                barrier.wait();
-                barrier.wait();
-            }
-            // Assertions run after synchronization, so a failed membership
-            // check cannot strand other workers at a barrier.
-            for worker in workers {
-                for (round, files) in worker.join().unwrap().into_iter().enumerate() {
-                    let files = files.unwrap();
-                    for added in 0..=round {
-                        assert!(files.contains(&format!("src/new{added}")));
+                    .collect();
+                for round in 0..6 {
+                    std::fs::write(root.path().join(format!("src/new{round}")), "source").unwrap();
+                    barrier.wait();
+                    barrier.wait();
+                }
+                // Assertions run after synchronization, so a failed membership
+                // check cannot strand other workers at a barrier.
+                for worker in workers {
+                    for (round, files) in worker.join().unwrap().into_iter().enumerate() {
+                        let files = files.unwrap();
+                        for added in 0..=round {
+                            assert!(files.contains(&format!("src/new{added}")));
+                        }
                     }
                 }
-            }
-        });
-        assert!(!original.contains("src/new0"));
-        assert!(
-            snapshot
-                .current_files(root.path())
-                .unwrap()
-                .contains("src/new5")
-        );
+            });
+            assert!(!original.contains("src/new0"));
+            assert!(
+                snapshot
+                    .current_files(root.path())
+                    .unwrap()
+                    .contains("src/new5")
+            );
+        }
     }
 
     #[test]
@@ -4109,158 +4377,169 @@ mod tests {
 
     #[test]
     fn scoped_membership_defers_unrelated_changes_until_a_matching_task_asks() {
-        let (root, mut workspace, _) = fixture(Some(json!(["{projectRoot}/dist"])));
-        let targets = &mut workspace.projects.get_mut("app").unwrap().targets;
-        targets.get_mut("post").unwrap().inputs =
-            Some(vec![json!("{workspaceRoot}/left/**/*.txt")]);
-        targets.get_mut("gen").unwrap().inputs =
-            Some(vec![json!("{workspaceRoot}/right/**/*.txt")]);
-        targets.get_mut("build").unwrap().inputs = Some(vec![json!("{workspaceRoot}/**/*.txt")]);
-        for directory in ["left/empty", "right/empty"] {
-            std::fs::create_dir_all(root.path().join(directory)).unwrap();
-        }
-        let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
-        let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
-        snapshot.current_files(&workspace.root).unwrap();
-        std::thread::sleep(Duration::from_millis(2100));
-        let left = snapshot
-            .membership_prefixes(&workspace, &graph.tasks["app:post"])
-            .unwrap();
-        let right = snapshot
-            .membership_prefixes(&workspace, &graph.tasks["app:gen"])
-            .unwrap();
-        let all = snapshot
-            .membership_prefixes(&workspace, &graph.tasks["app:build"])
-            .unwrap();
-        let before = snapshot
-            .current_files_for(&workspace.root, Some(&left), "test")
-            .unwrap();
-        std::fs::write(root.path().join("right/empty/new.txt"), "right").unwrap();
-        let unrelated = snapshot
-            .current_files_for(&workspace.root, Some(&left), "test")
-            .unwrap();
-        assert!(Arc::ptr_eq(&before.files, &unrelated.files));
-        assert!(!unrelated.files.contains("right/empty/new.txt"));
-        assert!(
-            snapshot
-                .current_files_for(&workspace.root, Some(&right), "test")
-                .unwrap()
-                .files
-                .contains("right/empty/new.txt")
-        );
-        std::fs::create_dir_all(root.path().join("left/empty/nested")).unwrap();
-        std::fs::write(root.path().join("left/empty/nested/new.txt"), "left").unwrap();
-        assert!(
-            snapshot
+        for watched in [false, true] {
+            let (root, mut workspace, _) = fixture(Some(json!(["{projectRoot}/dist"])));
+            let targets = &mut workspace.projects.get_mut("app").unwrap().targets;
+            targets.get_mut("post").unwrap().inputs =
+                Some(vec![json!("{workspaceRoot}/left/**/*.txt")]);
+            targets.get_mut("gen").unwrap().inputs =
+                Some(vec![json!("{workspaceRoot}/right/**/*.txt")]);
+            targets.get_mut("build").unwrap().inputs =
+                Some(vec![json!("{workspaceRoot}/**/*.txt")]);
+            for directory in ["left/empty", "right/empty"] {
+                std::fs::create_dir_all(root.path().join(directory)).unwrap();
+            }
+            let graph =
+                TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
+            let snapshot = snapshot(&workspace, &graph, watched);
+            snapshot.current_files(&workspace.root).unwrap();
+            std::thread::sleep(Duration::from_millis(2100));
+            let left = snapshot
+                .membership_prefixes(&workspace, &graph.tasks["app:post"])
+                .unwrap();
+            let right = snapshot
+                .membership_prefixes(&workspace, &graph.tasks["app:gen"])
+                .unwrap();
+            let all = snapshot
+                .membership_prefixes(&workspace, &graph.tasks["app:build"])
+                .unwrap();
+            let before = snapshot
                 .current_files_for(&workspace.root, Some(&left), "test")
-                .unwrap()
-                .files
-                .contains("left/empty/nested/new.txt")
-        );
-        std::fs::write(root.path().join("right/empty/another.txt"), "right").unwrap();
-        assert!(
-            snapshot
-                .current_files_for(&workspace.root, Some(&all), "test")
-                .unwrap()
-                .files
-                .contains("right/empty/another.txt")
-        );
+                .unwrap();
+            std::fs::write(root.path().join("right/empty/new.txt"), "right").unwrap();
+            let unrelated = snapshot
+                .current_files_for(&workspace.root, Some(&left), "test")
+                .unwrap();
+            assert!(Arc::ptr_eq(&before.files, &unrelated.files));
+            assert!(!unrelated.files.contains("right/empty/new.txt"));
+            assert!(
+                snapshot
+                    .current_files_for(&workspace.root, Some(&right), "test")
+                    .unwrap()
+                    .files
+                    .contains("right/empty/new.txt")
+            );
+            std::fs::create_dir_all(root.path().join("left/empty/nested")).unwrap();
+            std::fs::write(root.path().join("left/empty/nested/new.txt"), "left").unwrap();
+            assert!(
+                snapshot
+                    .current_files_for(&workspace.root, Some(&left), "test")
+                    .unwrap()
+                    .files
+                    .contains("left/empty/nested/new.txt")
+            );
+            std::fs::write(root.path().join("right/empty/another.txt"), "right").unwrap();
+            assert!(
+                snapshot
+                    .current_files_for(&workspace.root, Some(&all), "test")
+                    .unwrap()
+                    .files
+                    .contains("right/empty/another.txt")
+            );
+        }
     }
 
     #[test]
     fn membership_watches_the_directories_json_globs_select_from() {
-        let (root, mut workspace, _) = fixture(Some(json!(["{projectRoot}/dist"])));
-        let targets = &mut workspace.projects.get_mut("app").unwrap().targets;
-        targets.get_mut("build").unwrap().inputs = Some(vec![json!(
-            {"json": "{workspaceRoot}/config/**/*.json", "fields": ["version"]}
-        )]);
-        std::fs::create_dir_all(root.path().join("config/empty")).unwrap();
-        let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
-        let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
-        snapshot.current_files(&workspace.root).unwrap();
-        std::thread::sleep(Duration::from_millis(2100));
-        let prefixes = snapshot
-            .membership_prefixes(&workspace, &graph.tasks["app:build"])
-            .unwrap();
-        snapshot
-            .current_files_for(&workspace.root, Some(&prefixes), "test")
-            .unwrap();
-        std::fs::write(
-            root.path().join("config/empty/new.json"),
-            r#"{"version": 1}"#,
-        )
-        .unwrap();
-        assert!(
+        for watched in [false, true] {
+            let (root, mut workspace, _) = fixture(Some(json!(["{projectRoot}/dist"])));
+            let targets = &mut workspace.projects.get_mut("app").unwrap().targets;
+            targets.get_mut("build").unwrap().inputs = Some(vec![json!(
+                {"json": "{workspaceRoot}/config/**/*.json", "fields": ["version"]}
+            )]);
+            std::fs::create_dir_all(root.path().join("config/empty")).unwrap();
+            let graph =
+                TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
+            let snapshot = snapshot(&workspace, &graph, watched);
+            snapshot.current_files(&workspace.root).unwrap();
+            std::thread::sleep(Duration::from_millis(2100));
+            let prefixes = snapshot
+                .membership_prefixes(&workspace, &graph.tasks["app:build"])
+                .unwrap();
             snapshot
                 .current_files_for(&workspace.root, Some(&prefixes), "test")
-                .unwrap()
-                .files
-                .contains("config/empty/new.json")
-        );
+                .unwrap();
+            std::fs::write(
+                root.path().join("config/empty/new.json"),
+                r#"{"version": 1}"#,
+            )
+            .unwrap();
+            assert!(
+                snapshot
+                    .current_files_for(&workspace.root, Some(&prefixes), "test")
+                    .unwrap()
+                    .files
+                    .contains("config/empty/new.json")
+            );
+        }
     }
 
     #[test]
     fn membership_watches_git_ignored_tracked_parents_and_index_policy() {
-        let (root, workspace, graph) = fixture(Some(json!(["{projectRoot}/dist"])));
-        std::fs::create_dir_all(root.path().join("tracked/nested")).unwrap();
-        std::fs::write(root.path().join("tracked/.gitignore"), "nested/\n").unwrap();
-        std::fs::write(root.path().join("tracked/nested/source"), "one").unwrap();
-        assert!(
-            paths::git(root.path(), &["init", "-q"])
-                .unwrap()
-                .status
-                .success()
-        );
-        assert!(
-            paths::git(root.path(), &["add", "-f", "tracked/nested/source"])
-                .unwrap()
-                .status
-                .success()
-        );
-        let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
-        let files = || snapshot.current_files(root.path()).unwrap();
-        assert!(files().contains("tracked/nested/source"));
-        std::fs::remove_file(root.path().join("tracked/nested/source")).unwrap();
-        assert!(!files().contains("tracked/nested/source"));
-        std::fs::write(root.path().join("tracked/nested/another"), "two").unwrap();
-        assert!(!files().contains("tracked/nested/another"));
-        assert!(
-            paths::git(root.path(), &["add", "-f", "tracked/nested/another"])
-                .unwrap()
-                .status
-                .success()
-        );
-        assert!(files().contains("tracked/nested/another"));
-        std::fs::write(root.path().join("untracked"), "three").unwrap();
-        assert!(files().contains("untracked"));
-        std::fs::write(root.path().join(".git/info/exclude"), "untracked\n").unwrap();
-        assert!(!files().contains("untracked"));
+        for watched in [false, true] {
+            let (root, workspace, graph) = fixture(Some(json!(["{projectRoot}/dist"])));
+            std::fs::create_dir_all(root.path().join("tracked/nested")).unwrap();
+            std::fs::write(root.path().join("tracked/.gitignore"), "nested/\n").unwrap();
+            std::fs::write(root.path().join("tracked/nested/source"), "one").unwrap();
+            assert!(
+                paths::git(root.path(), &["init", "-q"])
+                    .unwrap()
+                    .status
+                    .success()
+            );
+            assert!(
+                paths::git(root.path(), &["add", "-f", "tracked/nested/source"])
+                    .unwrap()
+                    .status
+                    .success()
+            );
+            let snapshot = snapshot(&workspace, &graph, watched);
+            let files = || snapshot.current_files(root.path()).unwrap();
+            assert!(files().contains("tracked/nested/source"));
+            std::fs::remove_file(root.path().join("tracked/nested/source")).unwrap();
+            assert!(!files().contains("tracked/nested/source"));
+            std::fs::write(root.path().join("tracked/nested/another"), "two").unwrap();
+            assert!(!files().contains("tracked/nested/another"));
+            assert!(
+                paths::git(root.path(), &["add", "-f", "tracked/nested/another"])
+                    .unwrap()
+                    .status
+                    .success()
+            );
+            assert!(files().contains("tracked/nested/another"));
+            std::fs::write(root.path().join("untracked"), "three").unwrap();
+            assert!(files().contains("untracked"));
+            std::fs::write(root.path().join(".git/info/exclude"), "untracked\n").unwrap();
+            assert!(!files().contains("untracked"));
+        }
     }
 
     #[test]
     fn membership_watches_ignore_files_found_deep_in_the_walk() {
-        let (root, workspace, graph) = fixture(None);
-        let nested = root.path().join("packages/app/src/deep");
-        std::fs::create_dir_all(&nested).unwrap();
-        std::fs::write(nested.join("kept"), "a").unwrap();
-        std::fs::write(nested.join("hidden"), "b").unwrap();
-        let policy = root.path().join("packages/app/.gitignore");
-        std::fs::write(&policy, "\n").unwrap();
-        let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
-        let files = || snapshot.current_files(root.path()).unwrap();
-        files();
-        // Waiting lets the listing settle, so it is reused, as in
-        // `membership_reuses_settled_candidates_and_detects_directory_changes`.
-        std::thread::sleep(Duration::from_millis(2100));
-        let before = files();
-        assert!(Arc::ptr_eq(&before, &files()));
-        assert!(before.contains("packages/app/src/deep/hidden"));
-        // Edited in place, so no directory's names change: only the policy
-        // the walk found can refuse the settled listing.
-        std::fs::write(&policy, "hidden\n").unwrap();
-        let after = files();
-        assert!(!after.contains("packages/app/src/deep/hidden"));
-        assert!(after.contains("packages/app/src/deep/kept"));
+        for watched in [false, true] {
+            let (root, workspace, graph) = fixture(None);
+            let nested = root.path().join("packages/app/src/deep");
+            std::fs::create_dir_all(&nested).unwrap();
+            std::fs::write(nested.join("kept"), "a").unwrap();
+            std::fs::write(nested.join("hidden"), "b").unwrap();
+            let policy = root.path().join("packages/app/.gitignore");
+            std::fs::write(&policy, "\n").unwrap();
+            let snapshot = snapshot(&workspace, &graph, watched);
+            let files = || snapshot.current_files(root.path()).unwrap();
+            files();
+            // Waiting lets the listing settle, so it is reused, as in
+            // `membership_reuses_settled_candidates_and_detects_directory_changes`.
+            std::thread::sleep(Duration::from_millis(2100));
+            let before = files();
+            assert!(Arc::ptr_eq(&before, &files()));
+            assert!(before.contains("packages/app/src/deep/hidden"));
+            // Edited in place, so no directory's names change: only the policy
+            // the walk found can refuse the settled listing.
+            std::fs::write(&policy, "hidden\n").unwrap();
+            let after = files();
+            assert!(!after.contains("packages/app/src/deep/hidden"));
+            assert!(after.contains("packages/app/src/deep/kept"));
+        }
     }
 
     #[test]
@@ -4850,7 +5129,8 @@ mod tests {
     }
 
     /// One task whose inputs match files, or which recordings may key, makes
-    /// the snapshot list the workspace's files as it is taken.
+    /// the snapshot list the workspace's files as it is taken, with their
+    /// directory inventory when the snapshot is for keying.
     #[test]
     fn snapshots_list_files_when_a_task_matches_them() {
         for (target, matching) in [
@@ -4890,6 +5170,22 @@ mod tests {
                 TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
             let snapshot = Snapshot::new(&workspace, &graph, &root.path().join("cache")).unwrap();
             assert_eq!(snapshot.files.get().is_some(), matching, "{target}");
+            assert!(snapshot.membership.lock().unwrap().is_none(), "{target}");
+            // For keying, the listing comes with the inventory its first
+            // refresh reuses, and a snapshot that lists nothing takes neither.
+            let watched =
+                Snapshot::watched(&workspace, &graph, &root.path().join("cache")).unwrap();
+            assert_eq!(watched.files.get().is_some(), matching, "{target}");
+            let inventory = watched.membership.lock().unwrap().clone();
+            assert_eq!(inventory.is_some(), matching, "{target}");
+            if let Some(inventory) = inventory {
+                assert_eq!(watched.files().unwrap(), &*inventory.files, "{target}");
+                assert_eq!(
+                    watched.files().unwrap(),
+                    snapshot.files().unwrap(),
+                    "{target}"
+                );
+            }
         }
     }
 

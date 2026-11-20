@@ -480,7 +480,7 @@ impl Cache {
     ) -> std::result::Result<&hash::Snapshot, String> {
         self.snapshot
             .get_or_init(|| {
-                hash::Snapshot::new(workspace, graph, &self.root)
+                hash::Snapshot::watched(workspace, graph, &self.root)
                     .map_err(|error| format!("cannot snapshot the workspace: {error:#}"))
             })
             .as_ref()
@@ -1635,7 +1635,7 @@ pub fn keys(
     prepared: &BTreeMap<String, PreparedTask>,
     cancelled: &AtomicBool,
 ) -> Result<BTreeMap<String, Keyed>> {
-    let snapshot = hash::Snapshot::new(workspace, graph, &paths::cache_location(workspace))?;
+    let snapshot = hash::Snapshot::watched(workspace, graph, &paths::cache_location(workspace))?;
     Ok(graph
         .tasks
         .values()

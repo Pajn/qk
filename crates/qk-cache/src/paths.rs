@@ -379,6 +379,8 @@ fn check_parents(
 }
 
 pub use crate::glob::Pattern;
+use crate::glob::PatternSet;
+use globset::Candidate;
 
 /// A fileset path with its tokens replaced, as Nx resolves an input's:
 /// `{projectRoot}` and `{projectName}` anywhere, and `{workspaceRoot}` only
@@ -451,6 +453,9 @@ pub struct Outputs {
     globs: Vec<String>,
     /// Negated patterns: what they match is never an output.
     negations: Vec<Pattern>,
+    /// `patterns` and `negations`, each matched as one set.
+    matched: PatternSet,
+    negated: PatternSet,
     /// The directories the patterns are read from, their leading literal
     /// segments with escapes read, as Nx's `partition_glob` takes them.
     anchors: BTreeSet<String>,
@@ -491,6 +496,8 @@ impl Outputs {
             anchors.insert(anchor);
         }
         Ok(Self {
+            matched: PatternSet::new(&compiled)?,
+            negated: PatternSet::new(&negations)?,
             patterns: compiled,
             globs,
             negations,
@@ -503,11 +510,14 @@ impl Outputs {
     /// Outputs from already-expanded patterns, for tests without a workspace.
     #[cfg(test)]
     pub fn from_patterns(patterns: &[&str]) -> Self {
+        let compiled: Vec<_> = patterns
+            .iter()
+            .map(|pattern| Pattern::new(pattern, false).unwrap())
+            .collect();
         Self {
-            patterns: patterns
-                .iter()
-                .map(|pattern| Pattern::new(pattern, false).unwrap())
-                .collect(),
+            matched: PatternSet::new(&compiled).unwrap(),
+            negated: PatternSet::new(&[]).unwrap(),
+            patterns: compiled,
             globs: patterns
                 .iter()
                 .map(|pattern| (*pattern).to_owned())
@@ -569,6 +579,8 @@ impl Outputs {
             anchors.insert(anchor);
         }
         Ok(Self {
+            matched: PatternSet::new(&patterns)?,
+            negated: PatternSet::new(&negations)?,
             patterns,
             globs,
             negations,
@@ -629,18 +641,19 @@ impl Outputs {
     }
 
     pub fn matches(&self, path: &str) -> bool {
-        let any = |patterns: &[Pattern]| {
-            Path::new(path)
-                .ancestors()
-                .any(|ancestor| patterns.iter().any(|pattern| pattern.is_match(ancestor)))
+        let any = |patterns: &PatternSet| {
+            !patterns.is_empty()
+                && Path::new(path)
+                    .ancestors()
+                    .any(|ancestor| patterns.is_match_candidate(&Candidate::new(ancestor)))
         };
         (self.complete.iter().any(|root| {
             path == root
                 || path
                     .strip_prefix(root)
                     .is_some_and(|suffix| suffix.starts_with('/'))
-        }) || any(&self.patterns))
-            && !any(&self.negations)
+        }) || any(&self.matched))
+            && !any(&self.negated)
     }
 
     pub fn paths(&self, root: &Path) -> Result<BTreeSet<String>> {
