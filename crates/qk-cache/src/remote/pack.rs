@@ -27,6 +27,10 @@ const LARGEST_RECORD: u64 = 1 << 30;
 const WINDOW_LOG_MAX: u32 = 27;
 const MAGIC: &[u8; 4] = b"qkp4";
 const BLOBS_MAGIC: &[u8; 4] = b"qkb1";
+const PATH_SETS_MAGIC: &[u8; 4] = b"qks1";
+/// The most the packs of one answer to `POST pathsets/fetch` hold together,
+/// as `tools/store-server/PROTOCOL.md` bounds them.
+const PATH_SETS_ANSWER: u64 = 32 << 20;
 
 /// Where a pack carries a blob it cites.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -566,6 +570,83 @@ pub(super) fn read_blobs(
         kept.push(hash);
     }
     Ok((kept, received))
+}
+
+/// A weak key an answer to `POST pathsets/fetch` lists, with its pack, or
+/// `None` when the store holds no path sets for it.
+pub(super) type ListedPathSets = (String, Option<Vec<u8>>);
+
+/// Reads an answer to `POST pathsets/fetch`:
+///
+/// ```text
+/// "qks1"
+/// u32 LE count
+/// for each weak key: the key as 32 bytes, then u64 LE length of its pack,
+///     0 when the store holds no path sets for it
+/// each pack, in that order
+/// ```
+///
+/// Only weak keys in `asked` may be listed, each once. Answers each weak key
+/// listed with its pack, or `None`, and the bytes received. The packs are read
+/// whole, at most 32 MiB of them together, as the protocol bounds an answer.
+pub(super) fn read_path_sets(
+    body: impl Read,
+    asked: &std::collections::HashSet<&str>,
+) -> Result<(Vec<ListedPathSets>, u64)> {
+    let mut input = body;
+    let mut magic = [0; 4];
+    input
+        .read_exact(&mut magic)
+        .context("remote path sets end early")?;
+    if &magic != PATH_SETS_MAGIC {
+        bail!("remote path sets are not a qks1 answer");
+    }
+    let mut count = [0; 4];
+    input
+        .read_exact(&mut count)
+        .context("remote path sets end early")?;
+    let count = u32::from_le_bytes(count) as usize;
+    if count > asked.len() {
+        bail!("remote path sets list more weak keys than were asked for");
+    }
+    let mut listed = Vec::with_capacity(count);
+    let mut seen = std::collections::HashSet::with_capacity(count);
+    let mut total = 0u64;
+    for _ in 0..count {
+        let mut raw = [0; 32];
+        input
+            .read_exact(&mut raw)
+            .context("remote path sets end early")?;
+        let weak: String = raw.iter().map(|byte| format!("{byte:02x}")).collect();
+        let length = part_length(&mut input)?;
+        if !asked.contains(weak.as_str()) || !seen.insert(weak.clone()) {
+            bail!("remote path sets list {weak}, which was not asked for or is listed twice");
+        }
+        total = total.saturating_add(length);
+        if total > PATH_SETS_ANSWER {
+            bail!("remote path sets exceed 32 MiB");
+        }
+        listed.push((weak, length));
+    }
+    let mut received = 8 + 40 * count as u64;
+    let mut packs = Vec::with_capacity(count);
+    for (weak, length) in listed {
+        if length == 0 {
+            packs.push((weak, None));
+            continue;
+        }
+        let mut pack = Vec::with_capacity(length as usize);
+        (&mut input).take(length).read_to_end(&mut pack)?;
+        if pack.len() as u64 != length {
+            bail!("remote path sets of {weak} are shorter than listed");
+        }
+        received += length;
+        packs.push((weak, Some(pack)));
+    }
+    if input.read(&mut [0])? != 0 {
+        bail!("remote path sets hold more than they list");
+    }
+    Ok((packs, received))
 }
 
 fn part_length(reader: &mut impl Read) -> Result<u64> {
@@ -1135,5 +1216,52 @@ mod tests {
     fn hex_flip(hash: &str) -> String {
         let first = u8::from_str_radix(&hash[..2], 16).unwrap() ^ 1;
         format!("{first:02x}{}", &hash[2..])
+    }
+
+    /// An answer to `POST pathsets/fetch` listing `listed`, each weak key with
+    /// its pack or none.
+    fn path_sets_answer(listed: &[(&str, Option<&[u8]>)]) -> Vec<u8> {
+        let mut answer = b"qks1".to_vec();
+        answer.extend_from_slice(&(listed.len() as u32).to_le_bytes());
+        for (weak, pack) in listed {
+            answer.extend(
+                (0..32).map(|at| u8::from_str_radix(&weak[at * 2..at * 2 + 2], 16).unwrap()),
+            );
+            answer.extend_from_slice(&(pack.map_or(0, <[u8]>::len) as u64).to_le_bytes());
+        }
+        for pack in listed.iter().filter_map(|(_, pack)| *pack) {
+            answer.extend_from_slice(pack);
+        }
+        answer
+    }
+
+    #[test]
+    fn many_path_sets_in_one_answer_are_read_only_as_asked() {
+        let (one, two) = ("1".repeat(64), "2".repeat(64));
+        let asked: std::collections::HashSet<&str> = [one.as_str(), two.as_str()].into();
+        let answer = path_sets_answer(&[(&two, None), (&one, Some(b"a pack"))]);
+        let (packs, received) = read_path_sets(&answer[..], &asked).unwrap();
+        assert_eq!(
+            packs,
+            [(two.clone(), None), (one.clone(), Some(b"a pack".to_vec()))]
+        );
+        assert_eq!(received, answer.len() as u64);
+
+        let refused = |answer: &[u8], asked: &std::collections::HashSet<&str>| {
+            format!("{:#}", read_path_sets(answer, asked).unwrap_err())
+        };
+        let only_one: std::collections::HashSet<&str> = [one.as_str()].into();
+        assert!(refused(&answer, &only_one).contains("more weak keys than"));
+        let twice = path_sets_answer(&[(&one, None), (&one, None)]);
+        assert!(refused(&twice, &asked).contains("listed twice"));
+        let mut short = path_sets_answer(&[(&one, Some(b"a pack"))]);
+        short.pop();
+        assert!(refused(&short, &asked).contains("shorter than listed"));
+        let mut long = path_sets_answer(&[(&one, Some(b"a pack"))]);
+        long.push(0);
+        assert!(refused(&long, &asked).contains("more than they list"));
+        let mut magic = answer.clone();
+        magic[3] = b'2';
+        assert!(refused(&magic, &asked).contains("not a qks1 answer"));
     }
 }

@@ -115,6 +115,13 @@ pub(super) trait Store: Send + Sync {
         Ok(None)
     }
 
+    /// The path sets of many weak keys in one answer, as `POST
+    /// pathsets/fetch` gives it, or `None` where the store gives none that
+    /// way.
+    fn get_path_sets(&self, _weak: &[String], _task: &str) -> Result<Option<Body>> {
+        Ok(None)
+    }
+
     fn location(&self) -> String;
 
     /// Brings `known` up to date with the index the store holds now.
