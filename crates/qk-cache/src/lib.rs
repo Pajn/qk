@@ -249,10 +249,12 @@ enum Shadowing {
     /// there is no store to ask.
     Settled(Shadow),
     /// Waiting for the path sets the store holds, with the lookup of the
-    /// path sets held here, none of which has a result here.
+    /// path sets held here, none of which has a result here. Without a
+    /// fetch, the store was asked a moment ago, and what it held then is
+    /// held here: the lookup goes on with the results it holds alone.
     Fetching {
         search: lookup::Search,
-        fetch: std::thread::JoinHandle<Result<Option<Vec<u8>>>>,
+        fetch: Option<std::thread::JoinHandle<Result<Option<Vec<u8>>>>>,
     },
 }
 
@@ -1455,6 +1457,15 @@ impl Cache {
         }) else {
             return Shadowing::Settled(lookup::unfound(sets));
         };
+        // Asked a moment ago, the store most likely holds what it held then,
+        // which only a recording made since would change: a verdict, unlike
+        // a result restored by one, can lag that little behind.
+        if recorded::asked_lately(&self.root, weak) {
+            return Shadowing::Fetching {
+                search,
+                fetch: None,
+            };
+        }
         let (remote, root, weak, id) = (
             std::sync::Arc::clone(remote),
             self.root.clone(),
@@ -1463,7 +1474,9 @@ impl Cache {
         );
         Shadowing::Fetching {
             search,
-            fetch: std::thread::spawn(move || remote.fetch_shadow_path_sets(&root, &weak, &id)),
+            fetch: Some(std::thread::spawn(move || {
+                remote.fetch_shadow_path_sets(&root, &weak, &id)
+            })),
         }
     }
 
@@ -1486,10 +1499,20 @@ impl Cache {
             Shadowing::Settled(shadow) => return shadow,
             Shadowing::Fetching { search, fetch } => (search, fetch),
         };
-        let fetched = fetch
-            .join()
-            .unwrap_or_else(|_| Err(anyhow::anyhow!("fetching them panicked")));
-        let added = self.merged(fetched, weak, task);
+        let added = match fetch {
+            Some(fetch) => {
+                let fetched = fetch
+                    .join()
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("fetching them panicked")));
+                let answered = fetched.is_ok();
+                let added = self.merged(fetched, weak, task);
+                if answered {
+                    recorded::asked(&self.root, weak);
+                }
+                added
+            }
+            None => Vec::new(),
+        };
         let strong =
             |set: &recorded::PathSet| recording_key(weak, set, snapshot, workspace, unlisted, task);
         let checking = Checking {

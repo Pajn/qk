@@ -2867,6 +2867,50 @@ fn a_restored_task_does_not_wait_for_its_shadow_lookup() {
     assert_eq!(task("app:generate")["cache"], "local-hit");
 }
 
+/// A lookup in mode `"record"` takes the store's answer for a task's path
+/// sets from a moment ago rather than asking again; mode `"on"`, which
+/// restores what it finds, asks all the same.
+#[test]
+fn a_shadow_lookup_does_not_ask_the_store_again_for_a_while() {
+    let server = s3::FakeS3::start();
+    let fixture = Fixture::new(target(
+        "build",
+        json!({
+            "inputs": ["{projectRoot}/src/**/*"],
+            "qk:ultracache": {"mode": "record"},
+        }),
+    ));
+    with_remote(&fixture, &server, json!({}));
+    let asked = || {
+        let mut state = server.state.lock().unwrap();
+        let asked = state
+            .requests
+            .iter()
+            .filter(|request| request.starts_with("GET ") && request.contains("/pathsets/"))
+            .count();
+        state.requests.clear();
+        asked
+    };
+    success(remote_build(&fixture, &[]));
+    assert_eq!(asked(), 1);
+    success(remote_build(&fixture, &[]));
+    assert_eq!(asked(), 0, "the store was asked again");
+    // A change to a file input leaves the weak key as it was, and misses the
+    // declared key, so mode "on" asks the store for path sets.
+    fs::write(fixture.root.join("src/input.txt"), "two\n").unwrap();
+    fs::write(
+        fixture.root.join("project.json"),
+        json!({"name": "app", "targets": {"build": target("build", json!({
+            "inputs": ["{projectRoot}/src/**/*"],
+            "qk:ultracache": {"mode": "on"},
+        }))}})
+        .to_string(),
+    )
+    .unwrap();
+    success(remote_build(&fixture, &[]));
+    assert_eq!(asked(), 1, "mode on did not ask the store");
+}
+
 fn clear_local_cache(fixture: &Fixture) {
     let path = stdout(&success(fixture.qk(&fixture.root, &["cache", "path"])));
     fs::remove_dir_all(path.trim()).unwrap();

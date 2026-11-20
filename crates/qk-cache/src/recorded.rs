@@ -1079,6 +1079,53 @@ impl Before {
     }
 }
 
+/// How long the store's answer for a weak key's path sets stands in for
+/// asking it again, for a lookup that restores nothing.
+const ASKED_FOR: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Where it is noted that the store was asked for `weak`'s path sets: apart
+/// from `pathsets/`, whose size eviction measures again when it changes.
+fn asked_location(cache: &Path, weak: &str) -> PathBuf {
+    cache.join("remote").join("asked").join(weak)
+}
+
+/// Whether the store was asked for `weak`'s path sets within [`ASKED_FOR`],
+/// the record it held then merged into those kept here.
+pub(crate) fn asked_lately(cache: &Path, weak: &str) -> bool {
+    std::fs::metadata(asked_location(cache, weak))
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|asked| SystemTime::now().duration_since(asked).ok())
+        .is_some_and(|age| age < ASKED_FOR)
+}
+
+/// Notes that the store was just asked for `weak`'s path sets, and, once a
+/// process, forgets what was asked longer ago than [`ASKED_FOR`].
+pub(crate) fn asked(cache: &Path, weak: &str) {
+    static PRUNED: std::sync::Once = std::sync::Once::new();
+    let directory = cache.join("remote").join("asked");
+    PRUNED.call_once(|| {
+        let now = SystemTime::now();
+        for item in std::fs::read_dir(&directory)
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let expired = item
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|asked| now.duration_since(asked).ok())
+                .is_none_or(|age| age >= ASKED_FOR);
+            if expired {
+                let _ = std::fs::remove_file(item.path());
+            }
+        }
+    });
+    let _ = std::fs::create_dir_all(&directory)
+        .and_then(|()| std::fs::write(asked_location(cache, weak), b""));
+}
+
 /// The path sets kept for weak keys, in `pathsets/` beside the entries.
 #[derive(Serialize, Deserialize)]
 struct Stored {
