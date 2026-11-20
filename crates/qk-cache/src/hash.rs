@@ -120,10 +120,16 @@ struct RuntimeKey {
 /// initial candidate list; execution fingerprints refresh membership so files
 /// added or removed during the run cannot escape input verification.
 pub struct Snapshot {
-    pub(crate) files: BTreeSet<String>,
+    root: PathBuf,
+    /// The initial candidate list, see [`Self::files`]: listed with the
+    /// snapshot unless every task's file inputs name paths, and otherwise on
+    /// first use.
+    files: std::sync::OnceLock<std::result::Result<BTreeSet<String>, String>>,
     extra_candidates: BTreeSet<String>,
     membership: Mutex<Option<Arc<Membership>>>,
     membership_prefixes: Mutex<HashMap<String, Arc<Vec<PathBuf>>>>,
+    /// Each task's [`FilePlan`], by its id and declared inputs.
+    plans: Mutex<HashMap<(String, String), Arc<FilePlan>>>,
     source_exclusions: Vec<Outputs>,
     /// Every task's scratch directories, among `source_exclusions`, which no
     /// input reads, `includeIgnored` ones included.
@@ -187,6 +193,19 @@ struct Membership {
 struct Candidates {
     files: Arc<BTreeSet<String>>,
     source_ignore: Arc<SourceIgnore>,
+}
+
+/// What a task's file inputs need of the workspace's files, read from its
+/// declared inputs without any listing.
+struct FilePlan {
+    /// The paths its filesets name, when each of them names one path rather
+    /// than matching, and it has no `json` glob: then every candidate it can
+    /// select is at one of these paths or beneath it, and listing those alone
+    /// selects what listing the workspace would.
+    paths: Option<BTreeSet<String>>,
+    /// Its `dependentTasksOutputFiles` globs, each with whether it is
+    /// transitive.
+    dependency_outputs: Vec<(String, bool)>,
 }
 
 /// The type [`Membership::entries`] records for a directory; a file is 0 and
@@ -749,26 +768,7 @@ impl Installed {
 
 impl Snapshot {
     pub fn new(workspace: &Workspace, graph: &TaskGraph, cache_path: &Path) -> Result<Self> {
-        // Every early task needs these, so loading saved digests and parsing
-        // the lockfile overlap listing files.
         let canonical_root = workspace.root.canonicalize()?;
-        let (files, lockfile, (digests, workspace_prefix)) = std::thread::scope(|scope| {
-            let lockfile = scope.spawn(|| parse_lockfile(&workspace.root.join("pnpm-lock.yaml")));
-            let digests = scope.spawn(|| {
-                let digests = load_digests(&workspace.root);
-                let workspace_prefix = paths::git_path(&workspace.root, "--show-toplevel")
-                    .and_then(|root| root.canonicalize().ok())
-                    .and_then(|root| canonical_root.strip_prefix(root).ok().map(PathBuf::from));
-                (digests, workspace_prefix)
-            });
-            let files = source_files(&workspace.root);
-            (
-                files,
-                lockfile.join().expect("lockfile thread panicked"),
-                digests.join().expect("digest thread panicked"),
-            )
-        });
-        let mut files = files?;
         let cache_relative = cache_path
             .strip_prefix(&workspace.root)
             .ok()
@@ -810,12 +810,13 @@ impl Snapshot {
                 scratch_paths.push(paths);
             }
         }
-        exclude_artifacts(&mut files, &source_exclusions, cache_relative.as_deref());
-        Ok(Self {
-            files,
+        let mut snapshot = Self {
+            root: workspace.root.clone(),
+            files: std::sync::OnceLock::new(),
             extra_candidates: BTreeSet::new(),
             membership: Mutex::default(),
             membership_prefixes: Mutex::default(),
+            plans: Mutex::default(),
             source_exclusions,
             scratch: scratch_paths,
             cache_relative,
@@ -844,18 +845,177 @@ impl Snapshot {
                 .keys()
                 .map(|id| (id.clone(), servers(graph, id)))
                 .collect(),
-            canonical_root,
-            workspace_prefix,
+            canonical_root: canonical_root.clone(),
+            workspace_prefix: None,
             patterns: Mutex::default(),
-            digests: Mutex::new(digests),
+            digests: Mutex::default(),
             digests_changed: Default::default(),
             ignored_files: Mutex::default(),
             directories: Mutex::default(),
             runtime: Mutex::default(),
-            lockfile: Mutex::new(lockfile),
+            lockfile: Mutex::default(),
             dependency_outputs: Mutex::default(),
             outputs_written: Default::default(),
+        };
+        // Every early task needs these, so loading saved digests and parsing
+        // the lockfile overlap listing files.
+        let (lockfile, (digests, workspace_prefix)) = std::thread::scope(|scope| {
+            let lockfile = scope.spawn(|| parse_lockfile(&workspace.root.join("pnpm-lock.yaml")));
+            let digests = scope.spawn(|| {
+                let digests = load_digests(&workspace.root);
+                let workspace_prefix = paths::git_path(&workspace.root, "--show-toplevel")
+                    .and_then(|root| root.canonicalize().ok())
+                    .and_then(|root| canonical_root.strip_prefix(root).ok().map(PathBuf::from));
+                (digests, workspace_prefix)
+            });
+            // A task whose file inputs name paths lists only those, so a run
+            // of such tasks alone never lists the workspace.
+            if snapshot.lists(workspace, graph) {
+                snapshot.files()?;
+            }
+            anyhow::Ok((
+                lockfile.join().expect("lockfile thread panicked"),
+                digests.join().expect("digest thread panicked"),
+            ))
+        })?;
+        snapshot.lockfile = Mutex::new(lockfile);
+        snapshot.digests = Mutex::new(digests);
+        snapshot.workspace_prefix = workspace_prefix;
+        Ok(snapshot)
+    }
+
+    /// Whether a task of `graph` needs the workspace's files listed: one
+    /// whose filesets match rather than name paths, or one a recording may
+    /// key, whose declared selection is compared with what it read.
+    fn lists(&self, workspace: &Workspace, graph: &TaskGraph) -> bool {
+        graph.tasks.values().any(|task| {
+            task.definition.extra.contains_key("qk:ultracache")
+                || !self
+                    .file_plan(workspace, task)
+                    .is_ok_and(|plan| plan.paths.is_some())
         })
+    }
+
+    /// The initial candidate list: the workspace's source files, without
+    /// declared artifacts and cache storage, and with added candidates.
+    pub(crate) fn files(&self) -> Result<&BTreeSet<String>> {
+        self.files
+            .get_or_init(|| {
+                let mut files = source_files(&self.root).map_err(|error| format!("{error:#}"))?;
+                exclude_artifacts(
+                    &mut files,
+                    &self.source_exclusions,
+                    self.cache_relative.as_deref(),
+                );
+                files.extend(
+                    self.extra_candidates
+                        .iter()
+                        .filter(|path| !self.source_ignore.matches(path))
+                        .cloned(),
+                );
+                Ok(files)
+            })
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("{error}"))
+    }
+
+    /// What `task`'s file inputs need of the workspace's files: see
+    /// [`FilePlan`]. Env and runtime inputs are not evaluated.
+    fn file_plan(&self, workspace: &Workspace, task: &Task) -> Result<Arc<FilePlan>> {
+        // By declared inputs too: a task's key without some of its inputs
+        // resolves under the same id.
+        let key = (
+            task.id.clone(),
+            serde_json::to_string(&task.definition.inputs)?,
+        );
+        if let Some(plan) = self.plans.lock().unwrap().get(&key) {
+            return Ok(plan.clone());
+        }
+        let empty = BTreeSet::new();
+        let cancelled = AtomicBool::new(false);
+        let mut resolver = Resolver::new(self, workspace, None, &cancelled, &empty);
+        resolver.task_inputs(task)?;
+        let paths = resolver
+            .json_globs
+            .is_empty()
+            .then(|| {
+                resolver
+                    .scopes
+                    .values()
+                    .flat_map(|scope| &scope.patterns)
+                    .map(|pattern| {
+                        // A fileset of the workspace root, or a path that is
+                        // no plain relative one, is left to the listing.
+                        let plain = !pattern.prefix.is_empty()
+                            && pattern
+                                .prefix
+                                .split('/')
+                                .all(|segment| !matches!(segment, "" | "." | ".."));
+                        (pattern.rest.is_none() && plain).then(|| pattern.prefix.clone())
+                    })
+                    .collect::<Option<BTreeSet<_>>>()
+            })
+            .flatten();
+        let dependency_outputs = resolver
+            .values
+            .iter()
+            .filter_map(|(name, transitive)| {
+                name.strip_prefix("dependentTasksOutputFiles:")
+                    .map(|pattern| (pattern.to_owned(), transitive == &Value::Bool(true)))
+            })
+            .collect();
+        let plan = Arc::new(FilePlan {
+            paths,
+            dependency_outputs,
+        });
+        self.plans.lock().unwrap().insert(key, plan.clone());
+        Ok(plan)
+    }
+
+    /// The candidates [`Self::current_files_for`] would list at `paths` and
+    /// beneath them, with their policy, listing nothing else. `None` when
+    /// they cannot be listed apart from the rest.
+    fn candidates_at(&self, paths: &BTreeSet<String>) -> Result<Option<Candidates>> {
+        let mut files = if paths.is_empty() {
+            BTreeSet::new()
+        } else {
+            match source_files_at(&self.root, paths)? {
+                Some(files) => files,
+                None => return Ok(None),
+            }
+        };
+        exclude_artifacts(
+            &mut files,
+            &self.source_exclusions,
+            self.cache_relative.as_deref(),
+        );
+        let ignore = SourceIgnore::new(&self.root)?;
+        files.extend(
+            self.extra_candidates
+                .iter()
+                .filter(|path| within(paths, path) && !ignore.matches(path))
+                .cloned(),
+        );
+        Ok(Some(Candidates {
+            files: Arc::new(files),
+            source_ignore: Arc::new(ignore),
+        }))
+    }
+
+    /// The candidates `task`'s filesets select from. Filesets that each name
+    /// a path select only what is at that path or beneath it, so listing
+    /// those paths alone selects what listing the workspace would.
+    fn task_candidates(&self, workspace: &Workspace, task: &Task) -> Result<Candidates> {
+        if let Ok(plan) = self.file_plan(workspace, task)
+            && let Some(paths) = &plan.paths
+        {
+            let _listing = crate::profile::span(&task.id, "inventory_paths");
+            if let Some(candidates) = self.candidates_at(paths)? {
+                return Ok(candidates);
+            }
+        }
+        let prefixes = self.membership_prefixes(workspace, task)?;
+        self.current_files_for(&workspace.root, Some(&prefixes), &task.id)
     }
 
     /// Restrict directory checks to the positive fileset prefixes a task reads.
@@ -969,7 +1129,10 @@ impl Snapshot {
                 // An addition during listing must not hide behind a newer stamp.
                 Membership::new(
                     root,
-                    cached.as_ref().map_or(&self.files, |entry| &entry.files),
+                    match cached.as_ref() {
+                        Some(entry) => &entry.files,
+                        None => self.files()?,
+                    },
                     &self.source_ignore,
                     &self.source_exclusions,
                     self.cache_relative.as_deref(),
@@ -1010,7 +1173,8 @@ impl Snapshot {
         }
     }
 
-    /// Saves the digests of files that still exist, for the next run.
+    /// Saves the digests of files that still exist, for the next run. A run
+    /// that listed no files keeps every digest, until one that lists them.
     pub fn save_digests(&self, root: &Path) {
         if !self
             .digests_changed
@@ -1020,9 +1184,15 @@ impl Snapshot {
         }
         let digests = self.digests.lock().unwrap();
         let ignored = self.ignored_files.lock().unwrap();
+        let files = match self.files.get() {
+            Some(Ok(files)) => Some(files),
+            _ => None,
+        };
         let entries: BTreeMap<&String, (&Stamp, &String)> = digests
             .iter()
-            .filter(|(path, _)| self.files.contains(*path) || ignored.contains(*path))
+            .filter(|(path, _)| {
+                files.is_none_or(|files| files.contains(*path)) || ignored.contains(*path)
+            })
             .map(|(path, (stamp, digest))| (path, (stamp, digest)))
             .collect();
         let path = digests_path(root);
@@ -1076,12 +1246,15 @@ impl Snapshot {
     /// Adds paths to the candidate files, such as files deleted since a base
     /// revision.
     pub fn with_candidates(mut self, paths: &[String]) -> Self {
-        self.files.extend(
-            paths
-                .iter()
-                .filter(|path| !self.source_ignore.matches(path))
-                .cloned(),
-        );
+        // Files listed later take them as they are listed.
+        if let Some(Ok(files)) = self.files.get_mut() {
+            files.extend(
+                paths
+                    .iter()
+                    .filter(|path| !self.source_ignore.matches(path))
+                    .cloned(),
+            );
+        }
         self.extra_candidates.extend(paths.iter().cloned());
         self
     }
@@ -1356,6 +1529,14 @@ impl Snapshot {
     }
 }
 
+/// Whether `path` is one of `paths` or beneath one, as [`under`] selects.
+fn within(paths: &BTreeSet<String>, path: &str) -> bool {
+    paths.iter().any(|prefix| {
+        path.strip_prefix(prefix.as_str())
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    })
+}
+
 fn under<'a>(files: &'a BTreeSet<String>, prefix: &'a str) -> impl Iterator<Item = &'a String> {
     files
         .range::<str, _>((
@@ -1402,6 +1583,55 @@ impl SourceIgnore {
 
 /// Source files visible to Nx, with runner state and root ignore rules removed.
 pub fn source_files(root: &Path) -> Result<BTreeSet<String>> {
+    // Nx negations can reinclude Git-ignored files, so this policy needs
+    // the walker regardless of what Git lists. Avoid launching Git here.
+    let git = if root.join(".nxignore").is_file() {
+        None
+    } else {
+        git_sources(root, &["."])
+    };
+    let candidates = match git {
+        Some(listed) => listed?,
+        None => walked_sources(root, |_| true)?,
+    };
+    visible_sources(root, candidates)
+}
+
+/// What [`source_files`] lists at the workspace-relative `paths` and beneath
+/// them, reading only the directories that lead to them and those beneath
+/// them. `None` when Git cannot list them, where `source_files` would walk.
+fn source_files_at(root: &Path, paths: &BTreeSet<String>) -> Result<Option<BTreeSet<String>>> {
+    let candidates = if root.join(".nxignore").is_file() {
+        // The walker decides on each entry from the ignore files of its own
+        // directory and those above it, so skipping every other directory
+        // leaves what it decides here as it is.
+        let paths: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+        walked_sources(root, move |relative| {
+            paths
+                .iter()
+                .any(|path| path.starts_with(relative) || relative.starts_with(path))
+        })?
+    } else {
+        let specs: Vec<String> = paths
+            .iter()
+            .map(|path| format!(":(literal){path}"))
+            .collect();
+        let specs: Vec<&str> = specs.iter().map(String::as_str).collect();
+        match git_sources(root, &specs) {
+            Some(listed) => listed?,
+            None => return Ok(None),
+        }
+    };
+    let candidates = candidates
+        .into_iter()
+        .filter(|path| within(paths, path))
+        .collect();
+    Ok(Some(visible_sources(root, candidates)?))
+}
+
+/// The files Git lists for `pathspecs`, tracked or not ignored, without
+/// those deleted from the working tree. `None` when Git cannot list them.
+fn git_sources(root: &Path, pathspecs: &[&str]) -> Option<Result<BTreeSet<String>>> {
     let lines =
         |output: std::io::Result<std::process::Output>| -> Option<Result<BTreeSet<String>>> {
             let output = output.ok().filter(|output| output.status.success())?;
@@ -1420,75 +1650,80 @@ pub fn source_files(root: &Path) -> Result<BTreeSet<String>> {
     // names them in a second listing, which is cheaper than checking each file.
     // Skip-worktree entries are listed whether or not they are on disk and never
     // as deleted, so those few are checked; `-v` tags them `S`.
-    let (listed, deleted) = if root.join(".nxignore").is_file() {
-        // Nx negations can reinclude Git-ignored files, so this policy needs
-        // the walker regardless of what Git lists. Avoid launching Git here.
-        (None, None)
-    } else {
-        std::thread::scope(|scope| {
-            let deleted =
-                scope.spawn(|| paths::git(root, &["ls-files", "--deleted", "-z", "--", "."]));
-            let listed = paths::git(
-                root,
-                &[
-                    "ls-files",
-                    "-v",
-                    "--cached",
-                    "--others",
-                    "--exclude-standard",
-                    "-z",
-                    "--",
-                    ".",
-                ],
-            );
-            (
-                lines(listed),
-                lines(deleted.join().expect("git listing thread panicked")),
-            )
+    let (listed, deleted) = std::thread::scope(|scope| {
+        let deleted = scope.spawn(|| {
+            let mut args = vec!["ls-files", "--deleted", "-z", "--"];
+            args.extend(pathspecs);
+            paths::git(root, &args)
+        });
+        let mut args = vec![
+            "ls-files",
+            "-v",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            "--",
+        ];
+        args.extend(pathspecs);
+        let listed = paths::git(root, &args);
+        (
+            lines(listed),
+            lines(deleted.join().expect("git listing thread panicked")),
+        )
+    });
+    let (listed, deleted) = (listed?, deleted?);
+    Some((|| {
+        let deleted = deleted?;
+        let mut files = BTreeSet::new();
+        for entry in listed? {
+            let Some((tag, path)) = entry.split_once(' ') else {
+                bail!("unexpected git ls-files entry {entry:?}");
+            };
+            let absent =
+                matches!(tag, "S" | "s") && std::fs::symlink_metadata(root.join(path)).is_err();
+            if !absent && !deleted.contains(path) {
+                files.insert(path.to_owned());
+            }
+        }
+        Ok(files)
+    })())
+}
+
+/// The files the ignore walker finds, entering only the directories whose
+/// workspace-relative path `enter` accepts.
+fn walked_sources(
+    root: &Path,
+    enter: impl Fn(&Path) -> bool + Send + Sync + 'static,
+) -> Result<BTreeSet<String>> {
+    let mut files = BTreeSet::new();
+    let walked = root.to_owned();
+    for entry in ignore::WalkBuilder::new(root)
+        .hidden(false)
+        .parents(false)
+        .git_global(false)
+        .require_git(false)
+        .ignore(false)
+        .add_custom_ignore_filename(".nxignore")
+        .follow_links(false)
+        .filter_entry(move |entry| {
+            !matches!(
+                entry.file_name().to_str(),
+                Some(".git" | ".qk" | "node_modules")
+            ) && enter(entry.path().strip_prefix(&walked).unwrap_or(entry.path()))
         })
-    };
-    let candidates = match (listed, deleted) {
-        (Some(listed), Some(deleted)) => {
-            let deleted = deleted?;
-            let mut files = BTreeSet::new();
-            for entry in listed? {
-                let Some((tag, path)) = entry.split_once(' ') else {
-                    bail!("unexpected git ls-files entry {entry:?}");
-                };
-                let absent =
-                    matches!(tag, "S" | "s") && std::fs::symlink_metadata(root.join(path)).is_err();
-                if !absent && !deleted.contains(path) {
-                    files.insert(path.to_owned());
-                }
-            }
-            files
+        .build()
+    {
+        let entry = entry?;
+        if entry.file_type().is_some_and(|kind| !kind.is_dir()) {
+            files.insert(paths::relative(root, entry.path())?);
         }
-        _ => {
-            let mut files = BTreeSet::new();
-            for entry in ignore::WalkBuilder::new(root)
-                .hidden(false)
-                .parents(false)
-                .git_global(false)
-                .require_git(false)
-                .ignore(false)
-                .add_custom_ignore_filename(".nxignore")
-                .follow_links(false)
-                .filter_entry(|entry| {
-                    !matches!(
-                        entry.file_name().to_str(),
-                        Some(".git" | ".qk" | "node_modules")
-                    )
-                })
-                .build()
-            {
-                let entry = entry?;
-                if entry.file_type().is_some_and(|kind| !kind.is_dir()) {
-                    files.insert(paths::relative(root, entry.path())?);
-                }
-            }
-            files
-        }
-    };
+    }
+    Ok(files)
+}
+
+/// `candidates` without root ignore rules' files and runner state.
+fn visible_sources(root: &Path, candidates: BTreeSet<String>) -> Result<BTreeSet<String>> {
     let ignore = SourceIgnore::new(root)?;
     Ok(candidates
         .into_iter()
@@ -2485,7 +2720,7 @@ pub fn resolve(
         task,
         prepared,
         cancelled,
-        &snapshot.files,
+        snapshot.files()?,
         &snapshot.source_ignore,
     )
 }
@@ -2890,8 +3125,28 @@ pub fn inputs(
     dependencies: &BTreeMap<String, String>,
     cancelled: &AtomicBool,
 ) -> Result<Value> {
-    let prefixes = snapshot.membership_prefixes(workspace, task)?;
-    let candidates = snapshot.current_files_for(&workspace.root, Some(&prefixes), &task.id)?;
+    let candidates = snapshot.task_candidates(workspace, task)?;
+    inputs_from(
+        snapshot,
+        workspace,
+        task,
+        prepared,
+        dependencies,
+        cancelled,
+        &candidates,
+    )
+}
+
+/// [`inputs`], selecting files from `candidates`.
+fn inputs_from(
+    snapshot: &Snapshot,
+    workspace: &Workspace,
+    task: &Task,
+    prepared: &PreparedTask,
+    dependencies: &BTreeMap<String, String>,
+    cancelled: &AtomicBool,
+    candidates: &Candidates,
+) -> Result<Value> {
     let Resolved { declared, inferred } = resolve_candidates(
         snapshot,
         workspace,
@@ -3114,7 +3369,7 @@ pub(crate) fn weak_key(
             .filter(|input| input.get("always") == Some(&Value::Bool(true)))
             .collect(),
     );
-    let dependencies = dependency_keys(snapshot, workspace, graph, &always, cancelled)?;
+    let dependencies = dependency_keys(snapshot, workspace, graph, &always)?;
     let always = self::inputs(
         snapshot,
         workspace,
@@ -3165,9 +3420,8 @@ pub(crate) fn dependency_keys(
     workspace: &Workspace,
     graph: &TaskGraph,
     task: &Task,
-    cancelled: &AtomicBool,
 ) -> Result<BTreeMap<String, String>> {
-    dependency_keys_impl(snapshot, workspace, graph, task, cancelled, false)
+    dependency_keys_impl(snapshot, workspace, graph, task, false)
 }
 
 /// Read dependency artifacts again before accepting an execution as unchanged.
@@ -3176,9 +3430,8 @@ pub(crate) fn recheck_dependency_keys(
     workspace: &Workspace,
     graph: &TaskGraph,
     task: &Task,
-    cancelled: &AtomicBool,
 ) -> Result<BTreeMap<String, String>> {
-    dependency_keys_impl(snapshot, workspace, graph, task, cancelled, true)
+    dependency_keys_impl(snapshot, workspace, graph, task, true)
 }
 
 fn dependency_keys_impl(
@@ -3186,16 +3439,15 @@ fn dependency_keys_impl(
     workspace: &Workspace,
     graph: &TaskGraph,
     task: &Task,
-    cancelled: &AtomicBool,
     fresh: bool,
 ) -> Result<BTreeMap<String, String>> {
-    let resolved = resolve(snapshot, workspace, task, None, cancelled)?;
-    let selections: Vec<_> = resolved.dependency_output_inputs().collect();
+    // The globs alone, which need no listing.
+    let plan = snapshot.file_plan(workspace, task)?;
     let mut keys = BTreeMap::new();
     let mut fresh_outputs = HashMap::new();
-    for (pattern, transitive) in selections {
+    for (pattern, transitive) in &plan.dependency_outputs {
         let matcher = snapshot.pattern(pattern, false)?;
-        let selected = graph.output_dependencies(task, transitive);
+        let selected = graph.output_dependencies(task, *transitive);
         for id in selected {
             // As in Nx, a dependency without declared outputs offers none.
             if !Outputs::new(workspace, dependency_task(graph, &id)?)?.declared() {
@@ -3267,6 +3519,8 @@ pub enum Selects {
 /// its dependencies' outputs as they are on disk, without running anything.
 pub fn dependency_globs(workspace: &Workspace, graph: &TaskGraph) -> Result<Vec<DependencyGlob>> {
     let snapshot = Snapshot::new(workspace, graph, &paths::cache_location(workspace))?;
+    // Every resolution chooses from the listing.
+    snapshot.files()?;
     let cancelled = AtomicBool::new(false);
     let mut globs = Vec::new();
     for task in graph.tasks.values() {
@@ -4263,14 +4517,7 @@ mod tests {
             let (root, workspace, graph) = fixture(outputs);
             let snapshot = Snapshot::new(&workspace, &graph, &root.path().join("cache")).unwrap();
             let keys = || {
-                dependency_keys(
-                    &snapshot,
-                    &workspace,
-                    &graph,
-                    &graph.tasks["app:build"],
-                    &AtomicBool::new(false),
-                )
-                .unwrap()
+                dependency_keys(&snapshot, &workspace, &graph, &graph.tasks["app:build"]).unwrap()
             };
             let before = keys();
             std::fs::write(root.path().join("generated/value"), "different").unwrap();
@@ -4295,16 +4542,8 @@ mod tests {
         std::os::unix::fs::symlink("../generated/value", root.path().join("links/value")).unwrap();
         let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
         let snapshot = Snapshot::new(&workspace, &graph, &root.path().join("cache")).unwrap();
-        let keys = || {
-            dependency_keys(
-                &snapshot,
-                &workspace,
-                &graph,
-                &graph.tasks["app:build"],
-                &AtomicBool::new(false),
-            )
-            .unwrap()
-        };
+        let keys =
+            || dependency_keys(&snapshot, &workspace, &graph, &graph.tasks["app:build"]).unwrap();
         let before = keys();
         std::fs::write(root.path().join("generated/value"), "different").unwrap();
         snapshot.outputs_written(&workspace, &graph.tasks["app:post"]);
@@ -4340,7 +4579,7 @@ mod tests {
         let workspace = Workspace::load(root.path()).unwrap();
         let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
         let snapshot = Snapshot::new(&workspace, &graph, &root.path().join("cache")).unwrap();
-        assert!(!snapshot.files.contains("generated/schema.json"));
+        assert!(!snapshot.files().unwrap().contains("generated/schema.json"));
         let prepared =
             qk_executor::prepare(&workspace, &graph.tasks["app:build"], &BTreeMap::new()).unwrap();
         inputs(
@@ -4354,5 +4593,360 @@ mod tests {
         .unwrap();
         snapshot.save_digests(root.path());
         assert!(load_digests(root.path()).contains_key("generated/schema.json"));
+    }
+
+    /// A workspace whose `app:build` reads `inputs`, beside `app:gen`, which
+    /// declares outputs, warm paths and scratch, among paths each listing
+    /// treats in its own way. With `git`, a repository tracks some of them;
+    /// with `nxignore`, the workspace has a root `.nxignore`, so the listing
+    /// walks rather than asking Git.
+    fn literal_fixture(
+        git: bool,
+        nxignore: bool,
+        inputs: Value,
+    ) -> (tempfile::TempDir, Workspace, TaskGraph) {
+        let root = tempfile::tempdir().unwrap();
+        let write = |path: &str, content: &str| {
+            let path = root.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        };
+        write("nx.json", "{}");
+        write(
+            "project.json",
+            &json!({"name": "app", "targets": {
+                "gen": {"command": "true", "outputs": ["{projectRoot}/dist"],
+                    "inputs": ["{workspaceRoot}/config.yaml"],
+                    "qk:warm": {"paths": ["warm"]},
+                    "qk:sandbox": {"scratch": ["{projectRoot}/scratch"]}},
+                "build": {"command": "true", "inputs": inputs}
+            }})
+            .to_string(),
+        );
+        write(".gitignore", "ignored.yaml\n*.log\n");
+        if nxignore {
+            write(".nxignore", "nx-ignored.yaml\n");
+        }
+        for path in [
+            "config.yaml",
+            "ignored.yaml",
+            "nx-ignored.yaml",
+            "sub/nested-ignored.yaml",
+            "sub/tracked-nested.yaml",
+            "sub/nx-nested.yaml",
+            "sub/kept.yaml",
+            "node_modules/pkg/package.json",
+            "dir/a.txt",
+            "dir/x.log",
+            "dir/deep/b.txt",
+            "dist/out.txt",
+            "warm/state.bin",
+            "scratch/tmp.txt",
+            "cache/entry",
+            ".qk/state",
+            "deleted.yaml",
+            "skipped.yaml",
+        ] {
+            write(path, path);
+        }
+        write(
+            "sub/.gitignore",
+            "nested-ignored.yaml\ntracked-nested.yaml\n",
+        );
+        write("sub/.nxignore", "nx-nested.yaml\n");
+        #[cfg(unix)]
+        for (target, link) in [
+            ("config.yaml", "link-file"),
+            ("dir", "link-dir"),
+            ("missing", "dangling"),
+        ] {
+            std::os::unix::fs::symlink(target, root.path().join(link)).unwrap();
+        }
+        if git {
+            let git = |args: &[&str]| {
+                assert!(paths::git(root.path(), args).unwrap().status.success());
+            };
+            git(&["init", "--quiet"]);
+            git(&["add", "."]);
+            git(&["add", "--force", "sub/tracked-nested.yaml"]);
+            git(&["update-index", "--skip-worktree", "skipped.yaml"]);
+            std::fs::remove_file(root.path().join("skipped.yaml")).unwrap();
+        }
+        std::fs::remove_file(root.path().join("deleted.yaml")).unwrap();
+        let workspace = Workspace::load(root.path()).unwrap();
+        let graph = TaskGraph::build(
+            &workspace,
+            &[
+                Request::parse("app:build").unwrap(),
+                Request::parse("app:gen").unwrap(),
+            ],
+        )
+        .unwrap();
+        (root, workspace, graph)
+    }
+
+    /// Paths a literal input can name, each of which some listing treats in
+    /// its own way.
+    const LITERAL_PATHS: &[&str] = &[
+        "config.yaml",
+        "absent.yaml",
+        "ignored.yaml",
+        "nx-ignored.yaml",
+        "sub/nested-ignored.yaml",
+        "sub/tracked-nested.yaml",
+        "sub/nx-nested.yaml",
+        "sub",
+        "node_modules/pkg/package.json",
+        "node_modules",
+        "dir",
+        "dir/deep",
+        "dir/x.log",
+        "link-file",
+        "link-dir",
+        "link-dir/a.txt",
+        "dangling",
+        "dist",
+        "dist/out.txt",
+        "warm/state.bin",
+        "scratch/tmp.txt",
+        "cache/entry",
+        ".qk/state",
+        ".git/HEAD",
+        "deleted.yaml",
+        "skipped.yaml",
+        "config.yaml/below",
+    ];
+
+    /// Listing the paths literal inputs name lists there what listing the
+    /// whole workspace does: the same files, whether absent, ignored by Git
+    /// or Nx at any depth, tracked though ignored, in `node_modules`, a
+    /// directory, a link or beneath one, or a declared output, warm path,
+    /// scratch or the cache.
+    #[test]
+    fn literal_paths_list_what_the_workspace_listing_holds_there() {
+        for (git, nxignore) in [(true, false), (true, true), (false, true), (false, false)] {
+            let (root, workspace, graph) = literal_fixture(git, nxignore, json!([]));
+            let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache"))
+                .unwrap()
+                .with_candidates(&["gone/file".into(), "dir/removed.txt".into()]);
+            assert!(!snapshot.scratch.is_empty());
+            let all = snapshot.current_files(root.path()).unwrap();
+            let sets = LITERAL_PATHS
+                .iter()
+                .map(|path| BTreeSet::from([path.to_string()]))
+                .chain([
+                    LITERAL_PATHS.iter().map(|path| path.to_string()).collect(),
+                    BTreeSet::from(["gone".to_owned(), "dir".to_owned()]),
+                ]);
+            for paths in sets {
+                let listed = snapshot.candidates_at(&paths).unwrap();
+                // Without Git, the workspace listing walks, where one of
+                // some paths would ask Git, so it is left to the listing.
+                if !git && !nxignore {
+                    assert!(listed.is_none());
+                    continue;
+                }
+                let expected: BTreeSet<String> = all
+                    .iter()
+                    .filter(|path| within(&paths, path))
+                    .cloned()
+                    .collect();
+                assert_eq!(
+                    *listed.unwrap().files,
+                    expected,
+                    "{paths:?} with git {git}, nxignore {nxignore}"
+                );
+            }
+            if !git && !nxignore {
+                continue;
+            }
+            // Each case is one the listings tell apart.
+            for path in [
+                "config.yaml",
+                "sub/kept.yaml",
+                "dir/a.txt",
+                "dir/deep/b.txt",
+            ] {
+                assert!(all.contains(path), "{path}");
+            }
+            for path in [
+                "ignored.yaml",
+                "sub/nested-ignored.yaml",
+                "node_modules/pkg/package.json",
+                "dir/x.log",
+                "dist/out.txt",
+                "warm/state.bin",
+                "scratch/tmp.txt",
+                "cache/entry",
+                ".qk/state",
+                "deleted.yaml",
+                "link-dir/a.txt",
+            ] {
+                assert!(!all.contains(path), "{path}");
+            }
+            assert!(all.contains("gone/file") && all.contains("dir/removed.txt"));
+            assert_eq!(all.contains("nx-ignored.yaml"), !nxignore);
+            assert_eq!(all.contains("sub/nx-nested.yaml"), !nxignore);
+            assert_eq!(all.contains("sub/tracked-nested.yaml"), !nxignore);
+            assert_eq!(all.contains("skipped.yaml"), !git);
+            #[cfg(unix)]
+            for path in ["link-file", "link-dir", "dangling"] {
+                assert!(all.contains(path), "{path}");
+            }
+        }
+    }
+
+    /// A task whose filesets each name a path keys as it would from the
+    /// workspace's listing, and a run of such tasks alone lists nothing.
+    #[test]
+    fn literal_inputs_key_as_the_workspace_listing_does() {
+        let mut inputs: Vec<Value> = LITERAL_PATHS
+            .iter()
+            .filter(|path| !matches!(**path, "config.yaml/below" | "link-dir"))
+            .map(|path| json!(format!("{{workspaceRoot}}/{path}")))
+            .collect();
+        inputs.extend([
+            json!("{projectRoot}/sub/kept.yaml"),
+            json!("!{workspaceRoot}/dir/deep"),
+            json!({"json": "{workspaceRoot}/config.yaml", "fields": ["a"]}),
+            json!({"fileset": "{projectRoot}/dist", "includeIgnored": true}),
+        ]);
+        for (git, nxignore) in [(true, false), (true, true), (false, true)] {
+            let (root, workspace, graph) = literal_fixture(git, nxignore, json!(inputs));
+            let snapshot =
+                Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
+            assert!(snapshot.files.get().is_none());
+            let task = &graph.tasks["app:build"];
+            let prepared = qk_executor::prepare(&workspace, task, &BTreeMap::new()).unwrap();
+            let cancelled = AtomicBool::new(false);
+            let dependencies = dependency_keys(&snapshot, &workspace, &graph, task).unwrap();
+            let literal = super::inputs(
+                &snapshot,
+                &workspace,
+                task,
+                &prepared,
+                &dependencies,
+                &cancelled,
+            )
+            .unwrap();
+            assert!(snapshot.files.get().is_none());
+            assert!(literal["files"].get("config.yaml").is_some());
+            assert!(literal["files"].get("dir/a.txt").is_some());
+            assert!(literal["files"].get("dir/deep/b.txt").is_none());
+            let listed = inputs_from(
+                &snapshot,
+                &workspace,
+                task,
+                &prepared,
+                &dependencies,
+                &cancelled,
+                &snapshot
+                    .current_files_for(root.path(), None, "test")
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(literal, listed, "git {git}, nxignore {nxignore}");
+        }
+    }
+
+    /// One task whose inputs match files, or which recordings may key, makes
+    /// the snapshot list the workspace's files as it is taken.
+    #[test]
+    fn snapshots_list_files_when_a_task_matches_them() {
+        for (target, matching) in [
+            (
+                json!({"command": "true", "inputs": ["{workspaceRoot}/config.yaml"]}),
+                false,
+            ),
+            (
+                json!({"command": "true", "inputs": ["{workspaceRoot}/*.yaml"]}),
+                true,
+            ),
+            (json!({"command": "true"}), true),
+            (
+                json!({"command": "true", "inputs": [{"json": "{workspaceRoot}/*.json"}]}),
+                true,
+            ),
+            (
+                json!({"command": "true", "inputs": ["{workspaceRoot}/"]}),
+                true,
+            ),
+            (
+                json!({"command": "true", "inputs": ["{workspaceRoot}/config.yaml"],
+                    "qk:ultracache": {}}),
+                true,
+            ),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("nx.json"), "{}").unwrap();
+            std::fs::write(root.path().join("config.yaml"), "a: 1").unwrap();
+            std::fs::write(
+                root.path().join("project.json"),
+                json!({"name": "app", "targets": {"build": target}}).to_string(),
+            )
+            .unwrap();
+            let workspace = Workspace::load(root.path()).unwrap();
+            let graph =
+                TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
+            let snapshot = Snapshot::new(&workspace, &graph, &root.path().join("cache")).unwrap();
+            assert_eq!(snapshot.files.get().is_some(), matching, "{target}");
+        }
+    }
+
+    /// A task's plan follows its declared inputs, as a key leaving some out
+    /// resolves the same task with others.
+    #[test]
+    fn file_plans_follow_declared_inputs() {
+        let (_root, workspace, graph) =
+            literal_fixture(false, true, json!(["{workspaceRoot}/config.yaml"]));
+        let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
+        let mut task = graph.tasks["app:build"].clone();
+        let plan = snapshot.file_plan(&workspace, &task).unwrap();
+        assert_eq!(plan.paths, Some(BTreeSet::from(["config.yaml".to_owned()])));
+        task.definition.inputs = Some(vec![json!("{workspaceRoot}/dir/**")]);
+        assert_eq!(snapshot.file_plan(&workspace, &task).unwrap().paths, None);
+    }
+
+    /// A run that lists no files keeps the digests saved before, beside its
+    /// own, until a run that lists them leaves out those of files gone.
+    #[test]
+    fn unlisted_runs_keep_saved_digests() {
+        let (root, workspace, graph) =
+            literal_fixture(false, true, json!(["{workspaceRoot}/config.yaml"]));
+        let old = std::time::SystemTime::now() - Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(root.path().join("config.yaml"))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        let path = digests_path(root.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            json!({"version": 1, "entries": {"elsewhere.txt": [[1, 2], "digest"]}}).to_string(),
+        )
+        .unwrap();
+        let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
+        let task = &graph.tasks["app:build"];
+        let prepared = qk_executor::prepare(&workspace, task, &BTreeMap::new()).unwrap();
+        inputs(
+            &snapshot,
+            &workspace,
+            task,
+            &prepared,
+            &BTreeMap::new(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(snapshot.files.get().is_none());
+        snapshot.save_digests(root.path());
+        let saved = load_digests(root.path());
+        assert!(saved.contains_key("config.yaml") && saved.contains_key("elsewhere.txt"));
+        snapshot.files().unwrap();
+        snapshot.digests_changed.store(true, Ordering::Relaxed);
+        snapshot.save_digests(root.path());
+        let saved = load_digests(root.path());
+        assert!(saved.contains_key("config.yaml") && !saved.contains_key("elsewhere.txt"));
     }
 }

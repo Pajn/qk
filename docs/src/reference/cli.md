@@ -158,7 +158,8 @@ fetches, local restore phases, restoring and saving
 [warm state](../guides/warm-state.md), the command itself (`execute`), the
 input recheck after it (`inputs_recheck`) and storing its result
 (`publish`). Input resolution also times listing the workspace's files
-(`inventory_list`), waiting for another task's listing (`inventory_wait`) and
+(`inventory_list`), listing only the paths a task's filesets name
+(`inventory_paths`), waiting for another task's listing (`inventory_wait`) and
 parsing `pnpm-lock.yaml` (`lockfile_parse`); each is charged to the task that
 needed it. A remote fetch also times waiting for the store's index
 (`remote_index_wait`), waiting for the store to respond (`remote_response`) and

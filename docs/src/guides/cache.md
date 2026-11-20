@@ -190,7 +190,10 @@ outputs after dependencies complete, including newly generated files, while
 respecting source ignore rules and excluding the consumer's own outputs. These
 files are keyed independently of selective `dependentTasksOutputFiles` inputs.
 The source list is taken once per run, so a file that a task creates without
-declaring it as an output is seen from the next run. File contents are re-read whenever their metadata changes; their
+declaring it as an output is seen from the next run. A task whose filesets
+each name a path, with no `json` glob, lists only those paths and what is
+beneath them, selecting what the source list would hold there; a run of such
+tasks alone takes no source list. File contents are re-read whenever their metadata changes; their
 digests persist between runs in the worktree's state, keyed by
 path, size, modification time and, on Unix, change time, inode and mode, so a
 warm run reads only files whose metadata changed. Without

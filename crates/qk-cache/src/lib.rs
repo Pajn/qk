@@ -633,8 +633,7 @@ impl Cache {
             Err(reason) => return bypass(reason),
         };
         let dependency_profile = profile::span(&task.id, "dependency_inputs");
-        let dependencies = match hash::dependency_keys(snapshot, workspace, graph, task, cancelled)
-        {
+        let dependencies = match hash::dependency_keys(snapshot, workspace, graph, task) {
             Ok(dependencies) => dependencies,
             Err(error) => return bypass(format!("{error:#}")),
         };
@@ -712,7 +711,7 @@ impl Cache {
         };
         // Inputs may have changed while another worktree held this key's lock.
         if waited
-            && hash::recheck_dependency_keys(snapshot, workspace, graph, task, cancelled)
+            && hash::recheck_dependency_keys(snapshot, workspace, graph, task)
                 .and_then(|dependencies| {
                     hash::fingerprint(
                         snapshot,
@@ -1592,8 +1591,8 @@ impl Cache {
             return false;
         }
         let _profile = profile::span(&task.id, "inputs_recheck");
-        let after = hash::recheck_dependency_keys(snapshot, workspace, graph, task, cancelled)
-            .and_then(|dependencies| {
+        let after = hash::recheck_dependency_keys(snapshot, workspace, graph, task).and_then(
+            |dependencies| {
                 hash::fingerprint(
                     snapshot,
                     workspace,
@@ -1602,7 +1601,8 @@ impl Cache {
                     &dependencies,
                     cancelled,
                 )
-            });
+            },
+        );
         if after.as_deref().ok() != Some(before) {
             if task.definition.cache == Some(true) {
                 if self.reuse {
@@ -1655,8 +1655,7 @@ fn key_now(
     cancelled: &AtomicBool,
 ) -> Keyed {
     let failed = |error: anyhow::Error| format!("{}: {error:#}", task.id);
-    let dependencies =
-        hash::dependency_keys(snapshot, workspace, graph, task, cancelled).map_err(failed)?;
+    let dependencies = hash::dependency_keys(snapshot, workspace, graph, task).map_err(failed)?;
     let inputs = hash::inputs(
         snapshot,
         workspace,
