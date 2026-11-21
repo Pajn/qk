@@ -125,6 +125,13 @@ pub struct Snapshot {
     /// snapshot unless every task's file inputs name paths, and otherwise on
     /// first use.
     files: std::sync::OnceLock<std::result::Result<BTreeSet<String>, String>>,
+    /// The inventory and listing a snapshot for keying takes while its first
+    /// tasks are keyed, see [`Self::settle`]. A task whose file inputs name
+    /// paths needs neither, so it is keyed, and runs, without waiting.
+    listing: Mutex<Option<std::thread::JoinHandle<Result<Membership>>>>,
+    /// The ignore policy read with that listing, which then replaces
+    /// `built_ignore`.
+    listed_ignore: std::sync::OnceLock<Arc<SourceIgnore>>,
     extra_candidates: BTreeSet<String>,
     membership: Mutex<Option<Arc<Membership>>>,
     membership_prefixes: Mutex<HashMap<String, Arc<Vec<PathBuf>>>>,
@@ -142,7 +149,9 @@ pub struct Snapshot {
     task_dependencies: BTreeMap<String, BTreeSet<String>>,
     /// Each task's servers, by project and declared inputs: see [`servers`].
     servers: BTreeMap<String, Vec<(String, Vec<Value>)>>,
-    source_ignore: Arc<SourceIgnore>,
+    /// The ignore policy read as the snapshot was built: see
+    /// [`Self::source_ignore`].
+    built_ignore: Arc<SourceIgnore>,
     canonical_root: PathBuf,
     workspace_prefix: Option<PathBuf>,
     patterns: Mutex<HashMap<(String, bool, bool), Arc<Pattern>>>,
@@ -900,6 +909,8 @@ impl Snapshot {
         let mut snapshot = Self {
             root: workspace.root.clone(),
             files: std::sync::OnceLock::new(),
+            listing: Mutex::default(),
+            listed_ignore: std::sync::OnceLock::new(),
             extra_candidates: BTreeSet::new(),
             membership: Mutex::default(),
             membership_prefixes: Mutex::default(),
@@ -913,7 +924,7 @@ impl Snapshot {
                 .values()
                 .map(|project| (project.root.clone(), project.name.clone()))
                 .collect(),
-            source_ignore: Arc::new(SourceIgnore::new(&workspace.root)?),
+            built_ignore: Arc::new(SourceIgnore::new(&workspace.root)?),
             generated_tasks: graph
                 .tasks
                 .values()
@@ -959,8 +970,12 @@ impl Snapshot {
             // of such tasks alone never lists the workspace. Without an
             // inventory, each task's refresh takes one, and reports why it
             // cannot, as for a plain listing.
-            if snapshot.lists(workspace, graph) && !(watched && snapshot.watch().is_ok()) {
-                snapshot.files()?;
+            if snapshot.lists(workspace, graph) {
+                if watched {
+                    snapshot.watch();
+                } else {
+                    snapshot.files()?;
+                }
             }
             anyhow::Ok((
                 lockfile.join().expect("lockfile thread panicked"),
@@ -973,29 +988,62 @@ impl Snapshot {
         Ok(snapshot)
     }
 
-    /// Lists the workspace's files after taking the directory inventory a
-    /// refresh compares against, as a refresh does, and keeps both for the
-    /// first task that keys.
-    fn watch(&mut self) -> Result<()> {
-        let _listing = crate::profile::span("snapshot", "inventory_list");
+    /// Starts listing the workspace's files after taking the directory
+    /// inventory a refresh compares against, as a refresh does, to keep both
+    /// for the first task that keys. Tasks that need neither are keyed
+    /// meanwhile; [`Self::settle`] waits for them.
+    fn watch(&mut self) {
+        // Taken before the inventory begins, so a refresh judges the listing
+        // no more current than it is.
         let listed = Instant::now();
-        // No earlier listing names tracked files beneath directories the
-        // walk skips, so such a file leaves the inventory unsettled and the
-        // first refresh watches its parents.
-        let mut membership = Membership::new(
-            &self.root,
-            &BTreeSet::new(),
-            &self.source_ignore,
-            &self.source_exclusions,
-            self.cache_relative.as_deref(),
-            None,
-        )?;
-        membership.list(&self.extra_candidates, true)?;
-        membership.listed = Some(listed);
-        self.source_ignore = membership.source_ignore.clone();
-        self.files = std::sync::OnceLock::from(Ok((*membership.files).clone()));
-        *self.membership.get_mut().unwrap() = Some(Arc::new(membership));
-        Ok(())
+        let root = self.root.clone();
+        let ignore = self.built_ignore.clone();
+        let exclusions = self.source_exclusions.clone();
+        let cache = self.cache_relative.clone();
+        let extra = self.extra_candidates.clone();
+        let listing = std::thread::spawn(move || {
+            let _listing = crate::profile::span("snapshot", "inventory_list");
+            // No earlier listing names tracked files beneath directories the
+            // walk skips, so such a file leaves the inventory unsettled and
+            // the first refresh watches its parents.
+            let mut membership = Membership::new(
+                &root,
+                &BTreeSet::new(),
+                &ignore,
+                &exclusions,
+                cache.as_deref(),
+                None,
+            )?;
+            membership.list(&extra, true)?;
+            membership.listed = Some(listed);
+            Ok(membership)
+        });
+        *self.listing.get_mut().unwrap() = Some(listing);
+    }
+
+    /// Waits for the listing [`Self::watch`] started, if it has not been
+    /// waited for, and keeps it and its inventory. Without them, the
+    /// listing is taken on first use and each refresh takes an inventory,
+    /// reporting why it cannot.
+    fn settle(&self) {
+        let mut listing = self.listing.lock().unwrap();
+        let Some(pending) = listing.take() else {
+            return;
+        };
+        let _waiting = crate::profile::span("snapshot", "inventory_wait");
+        let Ok(membership) = pending.join().expect("listing thread panicked") else {
+            return;
+        };
+        let _ = self.listed_ignore.set(membership.source_ignore.clone());
+        let _ = self.files.set(Ok((*membership.files).clone()));
+        *self.membership.lock().unwrap() = Some(Arc::new(membership));
+    }
+
+    /// The ignore policy that decides which files are sources: the one read
+    /// with the snapshot's listing, once it is taken.
+    fn source_ignore(&self) -> &Arc<SourceIgnore> {
+        self.settle();
+        self.listed_ignore.get().unwrap_or(&self.built_ignore)
     }
 
     /// Whether a task of `graph` needs the workspace's files listed: one
@@ -1013,6 +1061,7 @@ impl Snapshot {
     /// The initial candidate list: the workspace's source files, without
     /// declared artifacts and cache storage, and with added candidates.
     pub(crate) fn files(&self) -> Result<&BTreeSet<String>> {
+        self.settle();
         self.files
             .get_or_init(|| {
                 let mut files = source_files(&self.root).map_err(|error| format!("{error:#}"))?;
@@ -1024,7 +1073,7 @@ impl Snapshot {
                 files.extend(
                     self.extra_candidates
                         .iter()
-                        .filter(|path| !self.source_ignore.matches(path))
+                        .filter(|path| !self.source_ignore().matches(path))
                         .cloned(),
                 );
                 Ok(files)
@@ -1193,6 +1242,7 @@ impl Snapshot {
         task: &str,
     ) -> Result<Candidates> {
         let requested = Instant::now();
+        self.settle();
         loop {
             let previous = self.membership.lock().unwrap().clone();
             // Immutable entries let independent fingerprints validate their
@@ -1247,7 +1297,7 @@ impl Snapshot {
                         Some(entry) => &entry.files,
                         None => self.files()?,
                     },
-                    &self.source_ignore,
+                    self.source_ignore(),
                     &self.source_exclusions,
                     self.cache_relative.as_deref(),
                     cached
@@ -1273,6 +1323,7 @@ impl Snapshot {
         {
             return;
         }
+        self.settle();
         let digests = self.digests.lock().unwrap();
         let ignored = self.ignored_files.lock().unwrap();
         let files = match self.files.get() {
@@ -1337,14 +1388,11 @@ impl Snapshot {
     /// Adds paths to the candidate files, such as files deleted since a base
     /// revision.
     pub fn with_candidates(mut self, paths: &[String]) -> Self {
+        self.settle();
+        let ignore = self.source_ignore().clone();
         // Files listed later take them as they are listed.
         if let Some(Ok(files)) = self.files.get_mut() {
-            files.extend(
-                paths
-                    .iter()
-                    .filter(|path| !self.source_ignore.matches(path))
-                    .cloned(),
-            );
+            files.extend(paths.iter().filter(|path| !ignore.matches(path)).cloned());
         }
         self.extra_candidates.extend(paths.iter().cloned());
         // A listing taken with its inventory adds them as a refresh would.
@@ -2128,10 +2176,9 @@ impl Coverage {
                 || under(&self.resolved.inferred.files, path).next().is_some()
         };
         // Whether a file created at `path` would enter the declared key.
+        let ignore = snapshot.source_ignore();
         let selected = move |path: &str| {
-            !snapshot.source_ignore.matches(path)
-                && !output(path)
-                && selection.selects(snapshot, path)
+            !ignore.matches(path) && !output(path) && selection.selects(snapshot, path)
         };
         // A file the task read that is gone since is keyed as one it looked
         // for and did not find: its coming back changes the key. A path it
@@ -2875,7 +2922,7 @@ pub fn resolve(
         prepared,
         cancelled,
         snapshot.files()?,
-        &snapshot.source_ignore,
+        snapshot.source_ignore(),
     )
 }
 
@@ -5075,6 +5122,49 @@ mod tests {
         }
     }
 
+    /// A snapshot for keying lists the workspace beside the tasks it keys:
+    /// one whose filesets name paths is keyed without waiting for the
+    /// listing, as it would be after it, and one that matches files takes it.
+    #[test]
+    fn tasks_naming_paths_are_keyed_while_the_workspace_is_listed() {
+        let (_root, workspace, graph) = literal_fixture(
+            true,
+            false,
+            json!(["{workspaceRoot}/config.yaml", "{workspaceRoot}/dir"]),
+        );
+        let mut graph = graph;
+        let mut lint = graph.tasks["app:build"].clone();
+        lint.id = "app:lint".into();
+        lint.definition.inputs = Some(vec![json!("{projectRoot}/**/*.yaml")]);
+        graph.tasks.insert(lint.id.clone(), lint);
+        let cache = workspace.root.join("cache");
+        let key = |snapshot: &Snapshot, id: &str| {
+            let task = &graph.tasks[id];
+            let prepared = qk_executor::prepare(&workspace, task, &BTreeMap::new()).unwrap();
+            let dependencies = dependency_keys(snapshot, &workspace, &graph, task).unwrap();
+            let inputs = super::inputs(
+                snapshot,
+                &workspace,
+                task,
+                &prepared,
+                &dependencies,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            key(&inputs).unwrap()
+        };
+        let watched = Snapshot::watched(&workspace, &graph, &cache).unwrap();
+        let named = key(&watched, "app:build");
+        assert!(watched.listing.lock().unwrap().is_some());
+        let matched = key(&watched, "app:lint");
+        assert!(watched.listing.lock().unwrap().is_none());
+        assert!(watched.membership.lock().unwrap().is_some());
+        let listed = Snapshot::new(&workspace, &graph, &cache).unwrap();
+        listed.files().unwrap();
+        assert_eq!(named, key(&listed, "app:build"));
+        assert_eq!(matched, key(&listed, "app:lint"));
+    }
+
     /// A task whose filesets each name a path keys as it would from the
     /// workspace's listing, and a run of such tasks alone lists nothing.
     #[test]
@@ -5175,6 +5265,12 @@ mod tests {
             // refresh reuses, and a snapshot that lists nothing takes neither.
             let watched =
                 Snapshot::watched(&workspace, &graph, &root.path().join("cache")).unwrap();
+            assert_eq!(
+                watched.listing.lock().unwrap().is_some(),
+                matching,
+                "{target}"
+            );
+            watched.settle();
             assert_eq!(watched.files.get().is_some(), matching, "{target}");
             let inventory = watched.membership.lock().unwrap().clone();
             assert_eq!(inventory.is_some(), matching, "{target}");
