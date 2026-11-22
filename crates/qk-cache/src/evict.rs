@@ -274,12 +274,12 @@ fn prune_inner(root: &Path, limit: u64, automatic: bool) -> Result<Pruned> {
     let warm = fs::read_dir(root.join("warm")).into_iter().flatten();
     let pathsets = fs::read_dir(root.join("pathsets")).into_iter().flatten();
     let projections = fs::read_dir(root.join("projections")).into_iter().flatten();
-    for item in fs::read_dir(root.join("entries"))?
+    let items = fs::read_dir(root.join("entries"))?
         .chain(warm)
         .chain(pathsets)
         .chain(projections)
-    {
-        let item = item?;
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let read = in_parallel(items, |item| -> Result<Entry> {
         let metadata = item.metadata()?;
         // Unreadable manifests are misses already; they only take space.
         let blobs = fs::read(item.path())
@@ -287,15 +287,19 @@ fn prune_inner(root: &Path, limit: u64, automatic: bool) -> Result<Pruned> {
             .and_then(|bytes| crate::record::StoredRecord::read(&bytes).ok())
             .map(|record| record.blobs())
             .unwrap_or_default();
-        for blob in &blobs {
-            *references.entry(blob.clone()).or_default() += 1;
-        }
-        entries.push(Entry {
+        Ok(Entry {
             path: item.path(),
             used: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
             size: metadata.len(),
             blobs,
-        });
+        })
+    });
+    for entry in read {
+        let entry = entry?;
+        for blob in &entry.blobs {
+            *references.entry(blob.clone()).or_default() += 1;
+        }
+        entries.push(entry);
     }
     // A pin is a reference no eviction removes.
     for blob in pinned(root) {
@@ -303,9 +307,13 @@ fn prune_inner(root: &Path, limit: u64, automatic: bool) -> Result<Pruned> {
     }
     let mut blob_sizes = BTreeMap::new();
     let mut pruned = Pruned::default();
-    for item in fs::read_dir(root.join("blobs"))? {
-        let item = item?;
+    let blobs = fs::read_dir(root.join("blobs"))?.collect::<std::io::Result<Vec<_>>>()?;
+    let blobs = in_parallel(blobs, |item| {
         let metadata = item.metadata()?;
+        Ok::<_, std::io::Error>((item, metadata))
+    });
+    for blob in blobs {
+        let (item, metadata) = blob?;
         let name = item.file_name().to_string_lossy().into_owned();
         if !references.contains_key(&name) && age(&metadata) > IN_FLIGHT {
             if fs::remove_file(item.path()).is_ok() {
@@ -491,6 +499,32 @@ pub(crate) fn grew(root: &Path, bytes: u64) {
             });
         }
     }
+}
+
+/// `each` of `items`, in order, on a few threads once there are enough of
+/// them: one after another, stat-ing and reading a cache of tens of thousands
+/// of files takes most of a second.
+fn in_parallel<T: Send, R: Send>(items: Vec<T>, each: impl Fn(T) -> R + Sync) -> Vec<R> {
+    let workers = items.len().div_ceil(1024).clamp(1, 8);
+    if workers == 1 {
+        return items.into_iter().map(each).collect();
+    }
+    let chunk = items.len().div_ceil(workers);
+    let mut items = items.into_iter();
+    let chunks: Vec<Vec<T>> = (0..workers)
+        .map(|_| items.by_ref().take(chunk).collect())
+        .collect();
+    let each = &each;
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = chunks
+            .into_iter()
+            .map(|chunk| scope.spawn(move || chunk.into_iter().map(each).collect::<Vec<R>>()))
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("cache scan panicked"))
+            .collect()
+    })
 }
 
 #[cfg(test)]
@@ -732,6 +766,16 @@ mod tests {
         let before = ledger(root).added;
         crate::record::publish_bytes(root, &root.join("entries/b.json"), &[b' '; 25]).unwrap();
         assert_eq!(ledger(root).added - before, 25);
+    }
+
+    #[test]
+    fn work_is_spread_over_threads_in_order() {
+        let items: Vec<usize> = (0..5000).collect();
+        assert_eq!(
+            in_parallel(items.clone(), |item| item * 2),
+            items.iter().map(|item| item * 2).collect::<Vec<_>>()
+        );
+        assert_eq!(in_parallel(vec![1], |item| item + 1), [2]);
     }
 
     #[test]
