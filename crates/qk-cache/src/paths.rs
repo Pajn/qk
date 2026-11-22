@@ -228,6 +228,27 @@ pub fn worktree_state(root: &Path) -> PathBuf {
     state
 }
 
+/// Where a worktree keeps the record of which of its directories hold a
+/// project, for [`qk_config::Workspace::load_remembering`]: `projects` in the
+/// state directory [`worktree_state`] names, with the worktree's git
+/// directory read from the `.git` entry at or above `root` rather than asked
+/// of Git. Loading the workspace is the first thing a command does, and
+/// Git takes several times longer to answer than finding the record saves,
+/// so a load cannot wait for it. Git finds the same directory unless its
+/// environment or configuration says otherwise; then the record is kept
+/// beside the `.git` entry instead, which only matters to
+/// [`clear_worktree_state`], which removes both.
+pub fn projects_record(root: &Path) -> PathBuf {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_owned());
+    dot_git(&root)
+        .map(|(git_dir, _)| git_dir.join("qk"))
+        .unwrap_or_else(|| root.join(".qk"))
+        .join(PROJECTS)
+}
+
+/// The entry of [`worktree_state`] [`projects_record`] names.
+const PROJECTS: &str = "projects";
+
 /// What [`worktree_state`] holds. Inside Git, the state directory of the main
 /// worktree also holds the shared cache and run history, so these entries are
 /// removed one by one rather than the directory as a whole.
@@ -236,19 +257,20 @@ const WORKTREE_ENTRIES: &[&str] = &[
     "listings",
     "lockfile-digests.json",
     "outputs",
+    PROJECTS,
     "restore",
     "sandbox",
     "terminal-outputs",
     "warm",
 ];
 
-/// Removes a worktree's state: its file and lockfile digests and saved source
-/// listings, the outputs it records holding, its warm directories, the logs
+/// Removes a worktree's state: its file and lockfile digests, saved source
+/// listings and record of its projects, the outputs it records holding, its warm directories, the logs
 /// `--output-style=summary` kept and any restores or sandboxes left behind.
 pub fn clear_worktree_state(root: &Path) -> Result<()> {
     let state = worktree_state(root);
-    for entry in WORKTREE_ENTRIES {
-        let path = state.join(entry);
+    let entries = WORKTREE_ENTRIES.iter().map(|entry| state.join(entry));
+    for path in entries.chain([projects_record(root)]) {
         let removed = if path.is_dir() {
             std::fs::remove_dir_all(&path)
         } else {

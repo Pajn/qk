@@ -75,7 +75,7 @@ struct PnpmWorkspace {
 
 /// Which package.json files are projects, as Nx's package.json plugin
 /// decides it.
-struct Workspaces {
+pub(crate) struct Workspaces {
     positive: Vec<(String, Minimatch)>,
     negative: Vec<(String, Minimatch)>,
     /// `NX_INFER_ALL_PACKAGE_JSONS`: every package.json is a project.
@@ -214,7 +214,7 @@ fn manifest_pattern(pattern: &str) -> String {
 
 /// The repository's `.gitignore` files above the workspace, as Nx's walker
 /// reads them: from the workspace's parent up to the repository root.
-fn parent_gitignores(root: &Path) -> Vec<PathBuf> {
+pub(crate) fn parent_gitignores(root: &Path) -> Vec<PathBuf> {
     let Some(repository) = root.ancestors().find(|path| path.join(".git").exists()) else {
         return Vec::new();
     };
@@ -230,24 +230,19 @@ fn parent_gitignores(root: &Path) -> Vec<PathBuf> {
 /// workspaces take in its package.json, when it has one.
 type Found = std::sync::Mutex<Result<BTreeMap<PathBuf, (bool, Option<bool>)>>>;
 
-/// Each directory holding a project, and whether the package manager's
-/// workspaces take in its package.json. As in Nx, a package.json is a
-/// project when the workspaces take it in or a project.json is beside it.
-///
-/// The workspace files are read with `read`, so that another revision's
-/// package.json, pnpm-workspace.yaml and lerna.json decide what is a project.
-///
-/// While the walk goes on, `found` is called once for each directory as soon
-/// as it is known to hold a project, with whether the workspaces would take
-/// in a package.json there, so that the project can be read meanwhile. The
-/// walk may yet find that directory's package.json ignored, so what is
-/// returned decides.
-pub(crate) fn project_directories(
+/// Each directory a walk found holding a project.json or a package.json,
+/// with whether it holds each: what the walk finds whatever the workspaces
+/// take in, which is decided again on every load. See [`crate::remembered`].
+pub(crate) type Manifests = BTreeMap<PathBuf, (bool, bool)>;
+
+/// The workspaces of the workspace at `root`, read with `read`: which of its
+/// package.json files they take in. Fails when `root` holds no workspace
+/// configuration at all.
+pub(crate) fn workspaces(
     root: &Path,
     read: ConfigReader,
     warnings: &mut Vec<String>,
-    found_project: &(dyn Fn(&Path, bool) + Sync),
-) -> Result<BTreeMap<PathBuf, bool>> {
+) -> Result<Workspaces> {
     let package_path = root.join("package.json");
     let package = read(&package_path)?
         .map(|text| parse_json(&text, &package_path.display().to_string()))
@@ -262,7 +257,64 @@ pub(crate) fn project_directories(
             root.display()
         );
     }
-    let workspaces = Workspaces::read(root, read, package.as_ref(), warnings)?;
+    Workspaces::read(root, read, package.as_ref(), warnings)
+}
+
+/// Each directory holding a project, and whether the package manager's
+/// workspaces take in its package.json, among the directories holding
+/// `manifests`. As in Nx, a package.json is a project when the workspaces
+/// take it in or a project.json is beside it.
+pub(crate) fn projects(
+    root: &Path,
+    manifests: &Manifests,
+    workspaces: &Workspaces,
+) -> Result<BTreeMap<PathBuf, bool>> {
+    let mut projects = BTreeMap::new();
+    for (directory, (project_json, package_json)) in manifests {
+        let included = if *package_json {
+            let manifest = relative_path(root, &directory.join("package.json"))?;
+            Some(workspaces.includes(&manifest))
+        } else {
+            None
+        };
+        if is_project((*project_json, included)) {
+            projects.insert(directory.clone(), included == Some(true));
+        }
+    }
+    Ok(projects)
+}
+
+/// What [`project_directories`] found.
+pub(crate) struct Walked {
+    /// Each directory holding a project, and whether the workspaces take in
+    /// its package.json.
+    pub(crate) projects: BTreeMap<PathBuf, bool>,
+    /// Each directory holding either manifest, whether or not it is a
+    /// project.
+    pub(crate) manifests: Manifests,
+    /// Each directory the walk read, the workspace's root among them, when
+    /// asked for.
+    pub(crate) read: Option<Vec<PathBuf>>,
+}
+
+/// Walks the workspace at `root` for the directories holding a project.json
+/// or a package.json, taking in package.json files as `workspaces` do.
+///
+/// While the walk goes on, `found` is called once for each directory as soon
+/// as it is known to hold a project, with whether the workspaces would take
+/// in a package.json there, so that the project can be read meanwhile. The
+/// walk may yet find that directory's package.json ignored, so what is
+/// returned decides. With `list_read`, it also returns each directory it
+/// read, for [`crate::remembered`] to stamp.
+///
+/// What decides what the walk finds, from its configuration below, is set
+/// out in [`crate::remembered`], which must be kept in step with it.
+pub(crate) fn project_directories(
+    root: &Path,
+    workspaces: &Workspaces,
+    found_project: &(dyn Fn(&Path, bool) + Sync),
+    list_read: bool,
+) -> Result<Walked> {
     let mut walker = WalkBuilder::new(root);
     walker
         // Nx reads .nxignore with gitignore semantics, alongside .gitignore,
@@ -298,6 +350,7 @@ pub(crate) fn project_directories(
         .threads(4)
         .build_parallel();
     let found: Found = std::sync::Mutex::new(Ok(BTreeMap::new()));
+    let read = std::sync::Mutex::new(Vec::new());
     walker.run(|| {
         Box::new(|entry| {
             // A project.json makes a project; a package.json says whether
@@ -305,7 +358,13 @@ pub(crate) fn project_directories(
             // in a package.json in that directory.
             let visit = || -> Result<Option<(PathBuf, Option<bool>, bool)>> {
                 let entry = entry.context("cannot walk workspace")?;
-                if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+                let kind = entry.file_type();
+                // Every directory the walk is given, it reads: links are
+                // not followed, and nothing stops it going deeper.
+                if list_read && kind.is_some_and(|kind| kind.is_dir()) {
+                    read.lock().unwrap().push(entry.path().to_owned());
+                }
+                if !kind.is_some_and(|kind| kind.is_file()) {
                     return Ok(None);
                 }
                 let directory = entry
@@ -350,13 +409,21 @@ pub(crate) fn project_directories(
             ignore::WalkState::Continue
         })
     });
-    Ok(found
-        .into_inner()
-        .unwrap()?
-        .into_iter()
-        .filter(|(_, found)| is_project(*found))
-        .map(|(directory, (_, included))| (directory, included == Some(true)))
-        .collect())
+    let found = found.into_inner().unwrap()?;
+    Ok(Walked {
+        projects: found
+            .iter()
+            .filter(|(_, found)| is_project(**found))
+            .map(|(directory, (_, included))| (directory.clone(), *included == Some(true)))
+            .collect(),
+        manifests: found
+            .into_iter()
+            .map(|(directory, (project_json, included))| {
+                (directory, (project_json, included.is_some()))
+            })
+            .collect(),
+        read: list_read.then(|| read.into_inner().unwrap()),
+    })
 }
 
 /// Whether a directory holding these is a project: one with a project.json,

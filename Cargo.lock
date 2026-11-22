@@ -1862,8 +1862,10 @@ name = "qk-config"
 version = "0.27.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "ignore",
  "jsonc-parser",
+ "qk-state",
  "serde",
  "serde_json",
  "serde_yaml_ng",

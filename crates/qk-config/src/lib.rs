@@ -7,6 +7,7 @@ mod merge;
 pub mod minimatch;
 mod normalize;
 mod overrides;
+mod remembered;
 mod selector;
 
 use std::collections::BTreeMap;
@@ -374,15 +375,37 @@ impl Project {
 }
 
 impl Workspace {
+    /// The workspace at `root`, read from disk, its projects found by
+    /// walking every directory.
     pub fn load(root: &Path) -> Result<Self> {
         Self::load_with(root, &read_disk)
+    }
+
+    /// As [`Workspace::load`], but which directories hold a project.json or
+    /// a package.json is taken from the record an earlier load saved in
+    /// `directory` when it shows that a walk would find the same, and
+    /// otherwise found by walking and saved there for the next load, on a
+    /// thread of its own that [`finish_remembering`] waits for. The loaded
+    /// workspace is what [`Workspace::load`] gives either way. `directory`
+    /// belongs to the caller, which removes it to forget the records.
+    pub fn load_remembering(root: &Path, directory: &Path) -> Result<Self> {
+        Self::load_from(root, &read_disk, Some(directory))
     }
 
     /// As [`Workspace::load`], with nx.json, the file it extends,
     /// nx.local.json, each project's `project.json` and `project.local.json`
     /// and every package.json read with `read`: the workspace another revision
     /// of those files makes.
+    ///
+    /// The projects are always found by walking: a record of what is on
+    /// disk says nothing of what another revision holds.
     pub fn load_with(root: &Path, read: ConfigReader) -> Result<Self> {
+        Self::load_from(root, read, None)
+    }
+
+    /// [`Workspace::load_with`], remembering what the walk finds in
+    /// `remember`, when given: see [`Workspace::load_remembering`].
+    fn load_from(root: &Path, read: ConfigReader, remember: Option<&Path>) -> Result<Self> {
         let root = root
             .canonicalize()
             .map(simplified)
@@ -462,6 +485,7 @@ impl Workspace {
             package_manager,
             read,
             &mut workspace.warnings,
+            remember,
         )?;
         let mut roots = BTreeMap::new();
         for (directory, loaded) in loaded {
@@ -593,6 +617,11 @@ fn read_project(
 /// again with what the walk found. So each project is what reading it after
 /// the walk makes, and the projects are in the order of their directories,
 /// as one thread would have met them, whichever thread finishes first.
+///
+/// With `remember`, the directories are taken from the record an earlier
+/// load saved there when it still holds, and otherwise walked and saved
+/// there: see [`remembered`]. The workspaces are read either way, before
+/// anything else, so their warnings come first as they did.
 type Loaded = Vec<(PathBuf, Result<Option<LoadedProject>>)>;
 
 fn load_projects(
@@ -601,6 +630,7 @@ fn load_projects(
     package_manager: &str,
     read: ConfigReader,
     warnings: &mut Vec<String>,
+    remember: Option<&Path>,
 ) -> Result<Loaded> {
     let load = |directory: &Path, in_workspaces: bool| {
         read_project(
@@ -612,6 +642,60 @@ fn load_projects(
             read,
         )
     };
+    let workspaces = discovery::workspaces(root, read, warnings)?;
+    if let Some(directory) = remember
+        && let Some(record) = remembered::recall(directory, root)
+    {
+        // The projects the record names are read at once, in their order,
+        // while it is checked. Once it is found not to hold, the projects
+        // not yet read are passed over, and what was read is thrown away.
+        let projects: Vec<(PathBuf, bool)> =
+            discovery::projects(root, record.manifests(), &workspaces)?
+                .into_iter()
+                .collect();
+        let changed = std::sync::atomic::AtomicBool::new(false);
+        let (verdict, loaded) = std::thread::scope(|scope| {
+            let verdict = scope.spawn(|| {
+                let verdict = record.holds();
+                if matches!(verdict, remembered::Verdict::Changed) {
+                    changed.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                verdict
+            });
+            let loaded = parallel_map(&projects, |(directory, in_workspaces)| {
+                (!changed.load(std::sync::atomic::Ordering::Relaxed))
+                    .then(|| load(directory, *in_workspaces))
+            });
+            (
+                verdict
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+                loaded,
+            )
+        });
+        let holds = match verdict {
+            remembered::Verdict::Changed => false,
+            remembered::Verdict::Holds => true,
+            remembered::Verdict::Stamped(stamps) => {
+                // Stamped once, the record is compared from now on.
+                remember_in(directory, root, record.stamped(stamps));
+                true
+            }
+        };
+        if holds {
+            return Ok(projects
+                .into_iter()
+                .map(|(directory, _)| directory)
+                .zip(
+                    loaded
+                        .into_iter()
+                        .map(|loaded| loaded.expect("every project is read")),
+                )
+                .collect());
+        }
+    }
+    // What a walk about to begin is remembered with is looked at first.
+    let before = remember.and_then(|_| remembered::before_walk(root));
     let threads = std::thread::available_parallelism()
         .map_or(1, std::num::NonZeroUsize::get)
         .clamp(1, MAX_LOAD_THREADS);
@@ -644,7 +728,7 @@ fn load_projects(
             // The loaders outlive the walk, so they are there to receive.
             let _ = send.send((directory.to_owned(), includes));
         };
-        let directories = discovery::project_directories(root, read, warnings, &found);
+        let walked = discovery::project_directories(root, &workspaces, &found, before.is_some());
         drop(send);
         let mut early = std::collections::HashMap::new();
         for loader in loaders.into_inner().unwrap() {
@@ -653,8 +737,20 @@ fn load_projects(
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
             early.extend(done);
         }
-        directories.map(|directories| (directories, early))
+        walked.map(|walked| (walked, early))
     })?;
+    let discovery::Walked {
+        projects: directories,
+        manifests,
+        read: walked,
+    } = directories;
+    if let (Some(directory), Some((began, outside)), Some(walked)) = (remember, before, walked) {
+        remember_in(
+            directory,
+            root,
+            remembered::walked(began, outside, walked, manifests),
+        );
+    }
     let mut loaded: Vec<(PathBuf, Option<Result<Option<LoadedProject>>>)> = directories
         .iter()
         .map(|(directory, in_workspaces)| {
@@ -682,6 +778,45 @@ fn load_projects(
         .into_iter()
         .map(|(directory, project)| (directory, project.expect("every project is read")))
         .collect())
+}
+
+/// How many records [`Workspace::load_remembering`] is saving, and the
+/// signal that one is done.
+static SAVING: (std::sync::Mutex<usize>, std::sync::Condvar) =
+    (std::sync::Mutex::new(0), std::sync::Condvar::new());
+
+/// Saves `record` of the workspace at `root` in `directory` on a thread of
+/// its own, which [`finish_remembering`] waits for.
+fn remember_in(directory: &Path, root: &Path, record: remembered::Record) {
+    let directory = directory.to_owned();
+    let root = root.to_owned();
+    *SAVING.0.lock().unwrap() += 1;
+    std::thread::spawn(move || {
+        /// Counts the save done however it ends.
+        struct Done;
+        impl Drop for Done {
+            fn drop(&mut self) {
+                *SAVING
+                    .0
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) -= 1;
+                SAVING.1.notify_all();
+            }
+        }
+        let _done = Done;
+        // Saving is only for later loads, which walk when it fails.
+        let _ = remembered::save(&directory, &root, &record);
+    });
+}
+
+/// Waits for the records [`Workspace::load_remembering`] is still saving,
+/// for a process about to end, which would otherwise stop them unsaved.
+pub fn finish_remembering() {
+    let (saving, done) = &SAVING;
+    let mut saving = saving.lock().unwrap();
+    while *saving > 0 {
+        saving = done.wait(saving).unwrap();
+    }
 }
 
 /// The most threads projects are read on. Reading and normalizing a project

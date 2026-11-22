@@ -549,10 +549,12 @@ impl RunOptions {
     /// Sets what Nx sets in its own environment for these options, so tasks
     /// and the remote cache see it. Called while this is the only thread,
     /// and safe to call again: the threads started before it, asking Git
-    /// about the repository and parsing the lockfile, are waited for first.
+    /// about the repository, parsing the lockfile and saving the record of
+    /// the workspace's projects, are waited for first.
     fn export(&self) {
         qk_cache::await_git_dirs();
         qk_cache::await_lockfile();
+        qk_config::finish_remembering();
         let set = |name: &str| {
             // Only this thread exists yet.
             unsafe { std::env::set_var(name, "true") }
@@ -947,7 +949,11 @@ fn main() {
             std::process::exit(1);
         }
     };
-    match run(Cli::parse_from(args::normalize(args, &Cli::command()))) {
+    let result = run(Cli::parse_from(args::normalize(args, &Cli::command())));
+    // A record of the workspace's projects being saved is finished before
+    // the process ends, which would stop it.
+    qk_config::finish_remembering();
+    match result {
         Ok(0) => {}
         Ok(code) => std::process::exit(code),
         Err(error) => {
@@ -1208,7 +1214,9 @@ fn run(mut cli: Cli) -> Result<i32> {
         qk_cache::prefetch_git_dirs(&root);
         qk_cache::prefetch_lockfile(&root);
     }
-    let workspace = Workspace::load(&root)?;
+    // Which directories hold a project is remembered between commands in
+    // the worktree's state, which a load finds without waiting for Git.
+    let workspace = Workspace::load_remembering(&root, &qk_cache::projects_record(&root))?;
     for warning in &workspace.warnings {
         eprintln!("qk: warning: {warning}");
     }
@@ -1296,6 +1304,9 @@ fn run(mut cli: Cli) -> Result<i32> {
                 }
             }
             if all || only_workspace_data {
+                // The record this command's load may still be saving goes
+                // with the rest.
+                qk_config::finish_remembering();
                 qk_cache::clear_worktree_state(&workspace.root)?;
                 writeln!(stdout, "Removed this worktree's state.")?;
             }

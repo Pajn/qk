@@ -832,9 +832,15 @@ fn reset_clears_the_cache_and_worktree_state_but_keeps_history() {
     success(fixture.build(&fixture.root, &[]));
     let git = fixture.root.join(".git/qk");
     assert!(git.join("outputs").exists());
+    // Once what it walks has settled, loading the workspace keeps a record
+    // of which directories hold projects.
+    std::thread::sleep(SETTLE);
+    success(fixture.qk(&fixture.root, &["show", "projects"]));
+    assert!(fs::read_dir(git.join("projects")).unwrap().next().is_some());
 
     success(fixture.qk(&fixture.root, &["reset", "--onlyWorkspaceData"]));
     assert!(!git.join("outputs").exists());
+    assert!(!git.join("projects").exists());
     assert!(git.join("cache").exists());
     let hit = success(fixture.build(&fixture.root, &[]));
     assert!(stderr(&hit).contains("qk: cache hit app:build"));
