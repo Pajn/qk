@@ -493,13 +493,21 @@ impl History {
     /// much as what it still holds, a fraction of what was written to free
     /// that much.
     fn shrink(&self) -> Result<()> {
-        let pragma = |name: &str| -> Result<u64> {
-            Ok(self
-                .connection
-                .query_row(&format!("PRAGMA {name}"), [], |row| row.get(0))?)
+        // Read in one transaction, so that another worktree shrinking the
+        // file in between cannot give a free count from before it and a page
+        // count from after.
+        let (free, pages, page_size) = {
+            let reading = self.connection.unchecked_transaction()?;
+            let pragma = |name: &str| -> Result<u64> {
+                Ok(reading.query_row(&format!("PRAGMA {name}"), [], |row| row.get(0))?)
+            };
+            (
+                pragma("freelist_count")?,
+                pragma("page_count")?,
+                pragma("page_size")?,
+            )
         };
-        let (free, pages) = (pragma("freelist_count")?, pragma("page_count")?);
-        if free * pragma("page_size")? < SHRINK_FROM || free < (pages - free) * 3 {
+        if free * page_size < SHRINK_FROM || free < pages.saturating_sub(free) * 3 {
             return Ok(());
         }
         // A worktree writing its own run is not waited for: the file shrinks
