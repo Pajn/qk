@@ -64,9 +64,9 @@ pub fn revision(root: &Path) -> Option<String> {
         .map(|sha| sha.trim().to_owned())
 }
 
-/// Records a finished run with `sha`, the commit Git named while its tasks
-/// ran, and writes its report where asked. Failures are reported without
-/// failing the run.
+/// Records a finished run with `sha`, the commit Git named when asked on a
+/// thread started just before the run's tasks, and writes its report where
+/// asked. Failures are reported without failing the run.
 pub fn record(
     workspace: &Workspace,
     graph: &TaskGraph,

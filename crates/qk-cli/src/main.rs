@@ -2070,9 +2070,11 @@ fn execute_narrowed(
         qk_executor::report::write_all(true, title.start(ui::Paint::log()).as_bytes());
     }
     let started = std::time::SystemTime::now();
-    // The history records the commit checked out for the run: Git is asked
-    // as the tasks start and answers while they run, rather than after
-    // them. A commit made in that moment may be the one named.
+    // The history records a commit for the run: Git is asked on a thread
+    // started just before the tasks, and its answer is taken when the run
+    // is recorded. It names the commit checked out when it looked, which
+    // may be before the first task starts or, at the latest, as the run
+    // is recorded.
     let revision = {
         let root = workspace.root.clone();
         std::thread::spawn(move || history::revision(&root))
