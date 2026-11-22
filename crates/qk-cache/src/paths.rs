@@ -233,6 +233,7 @@ pub fn worktree_state(root: &Path) -> PathBuf {
 /// removed one by one rather than the directory as a whole.
 const WORKTREE_ENTRIES: &[&str] = &[
     "digests.json",
+    "lockfile-digests.json",
     "outputs",
     "restore",
     "sandbox",
@@ -240,8 +241,8 @@ const WORKTREE_ENTRIES: &[&str] = &[
     "warm",
 ];
 
-/// Removes a worktree's state: its file digests, the outputs it records
-/// holding, its warm directories, the logs `--output-style=summary` kept and
+/// Removes a worktree's state: its file and lockfile digests, the outputs it
+/// records holding, its warm directories, the logs `--output-style=summary` kept and
 /// any restores or sandboxes left behind.
 pub fn clear_worktree_state(root: &Path) -> Result<()> {
     let state = worktree_state(root);

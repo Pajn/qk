@@ -1072,6 +1072,30 @@ struct Installed {
     /// `None` when the file cannot be read as a pnpm v9 lockfile.
     lockfile: Option<Lockfile>,
     digests: Mutex<HashMap<String, String>>,
+    /// Whether `digests` holds one computed since they were last recalled or
+    /// saved.
+    computed: AtomicBool,
+}
+
+/// What [`Installed::save`] writes: the digests of what one revision of the
+/// lockfile installs, as one version of qk computes them.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedInstalled {
+    version: u32,
+    qk: String,
+    content: String,
+    digests: BTreeMap<String, String>,
+}
+
+/// The form of [`SavedInstalled`] and of the digests in it. Raise it with
+/// any change to what a digest of the lockfile covers, so that no digest
+/// saved before the change is taken for one computed after it.
+const SAVED_INSTALLED: u32 = 1;
+
+/// Where a worktree keeps the digests of what its lockfile installs between
+/// runs.
+fn installed_path(root: &Path) -> PathBuf {
+    paths::worktree_state(root).join("lockfile-digests.json")
 }
 
 impl Installed {
@@ -1089,7 +1113,61 @@ impl Installed {
             .lock()
             .unwrap()
             .insert(key.to_owned(), digest.clone());
+        self.computed.store(true, Ordering::Relaxed);
         digest
+    }
+
+    /// Takes the digests an earlier run saved for this revision of the
+    /// lockfile. A digest is computed from the lockfile's text alone, so one
+    /// saved for the same text by the same qk is the one this run would
+    /// compute: walking what an importer or a package installs takes
+    /// milliseconds that every run would otherwise spend before its first
+    /// task is keyed. Anything else saved is ignored.
+    fn recall(&self, root: &Path) {
+        let saved = std::fs::read(installed_path(root))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<SavedInstalled>(&bytes).ok())
+            .filter(|saved| {
+                saved.version == SAVED_INSTALLED
+                    && saved.qk == env!("CARGO_PKG_VERSION")
+                    && saved.content == self.content
+            });
+        if let Some(saved) = saved {
+            let mut digests = self.digests.lock().unwrap();
+            for (key, digest) in saved.digests {
+                digests.entry(key).or_insert(digest);
+            }
+        }
+    }
+
+    /// Saves the digests for the next run, when this one computed any.
+    fn save(&self, root: &Path) -> Result<()> {
+        if !self.computed.swap(false, Ordering::Relaxed) {
+            return Ok(());
+        }
+        let saved = SavedInstalled {
+            version: SAVED_INSTALLED,
+            qk: env!("CARGO_PKG_VERSION").to_owned(),
+            content: self.content.clone(),
+            digests: self
+                .digests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(key, digest)| (key.clone(), digest.clone()))
+                .collect(),
+        };
+        let path = installed_path(root);
+        let directory = path.parent().context("lockfile digests have a directory")?;
+        std::fs::create_dir_all(directory)?;
+        let mut file = tempfile::NamedTempFile::new_in(directory)?;
+        {
+            let mut writer = std::io::BufWriter::new(file.as_file_mut());
+            serde_json::to_writer(&mut writer, &saved)?;
+            writer.flush()?;
+        }
+        file.persist(&path)?;
+        Ok(())
     }
 }
 
@@ -1245,6 +1323,9 @@ impl Snapshot {
                 digests.join().expect("digest thread panicked"),
             ))
         })?;
+        if let Some(installed) = &lockfile {
+            installed.recall(&workspace.root);
+        }
         snapshot.lockfile = Mutex::new(lockfile);
         snapshot.digests = RwLock::new(digests);
         snapshot.workspace_prefix = workspace_prefix;
@@ -1640,8 +1721,15 @@ impl Snapshot {
 
     /// Saves the digests of files that still exist, for the next run: those
     /// the run listed or read. A run that listed no files keeps every
-    /// digest, until one that lists them.
+    /// digest, until one that lists them. The digests of what the lockfile
+    /// installs are saved beside them.
     pub fn save_digests(&self, root: &Path) {
+        let installed = self.lockfile.lock().unwrap().clone();
+        if let Some(installed) = installed
+            && let Err(error) = installed.save(root)
+        {
+            qk_executor::status!("qk: could not save lockfile digests: {error:#}");
+        }
         if !self
             .digests_changed
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -1705,6 +1793,7 @@ impl Snapshot {
         let Some(installed) = parsed else {
             return Ok(None);
         };
+        installed.recall(root);
         *current = Some(installed.clone());
         Ok(Some(installed))
     }
@@ -1989,6 +2078,7 @@ fn read_lockfile(path: &Path) -> ReadLockfile {
         content: blake3::hash(text.as_bytes()).to_hex().to_string(),
         lockfile,
         digests: Mutex::default(),
+        computed: AtomicBool::new(false),
     };
     Some((Arc::new(installed), unreadable))
 }
@@ -5385,6 +5475,62 @@ mod tests {
                 && error.contains("input parent is a symlink"),
             "{error}"
         );
+    }
+
+    /// The digests of what a lockfile installs are taken from an earlier run
+    /// only for the same text of the lockfile, saved by the same qk in the
+    /// same form. Otherwise they are computed.
+    #[test]
+    fn saved_lockfile_digests_are_recalled_only_for_the_same_lockfile_and_qk() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("pnpm-lock.yaml");
+        let text = "lockfileVersion: '9.0'\nimporters:\n  .: {}\n";
+        let read = |text: &str| {
+            std::fs::write(&path, text).unwrap();
+            read_lockfile(&path).unwrap().0
+        };
+        let computes = |installed: &Installed| {
+            let mut computed = false;
+            let digest = installed.digest("package:tool", || {
+                computed = true;
+                BTreeSet::from(["tool@1.0.0".to_owned()])
+            });
+            (digest, computed)
+        };
+
+        let first = read(text);
+        let (digest, computed) = computes(&first);
+        assert!(computed);
+        first.save(root.path()).unwrap();
+        let saved = std::fs::read_to_string(installed_path(root.path())).unwrap();
+
+        // The same lockfile: recalled, and nothing more to save.
+        let same = read(text);
+        same.recall(root.path());
+        assert_eq!(computes(&same), (digest.clone(), false));
+        assert!(!same.computed.load(Ordering::Relaxed));
+
+        // Another revision of the lockfile computes its own.
+        let other = read(&format!("{text}# another revision\n"));
+        other.recall(root.path());
+        assert!(computes(&other).1);
+
+        // Saved by another qk, or in another form, with another digest.
+        let version = format!("\"version\":{SAVED_INSTALLED}");
+        let qk = format!("\"qk\":\"{}\"", env!("CARGO_PKG_VERSION"));
+        assert!(saved.contains(&version) && saved.contains(&qk) && saved.contains(&digest));
+        for (field, replaced) in [(&version, "\"version\":0"), (&qk, "\"qk\":\"0.0.0\"")] {
+            let foreign = saved.replace(field, replaced).replace(&digest, "stale");
+            std::fs::write(installed_path(root.path()), foreign).unwrap();
+            let fresh = read(text);
+            fresh.recall(root.path());
+            assert_eq!(computes(&fresh), (digest.clone(), true), "{replaced}");
+        }
+        // One that does not read is ignored too.
+        std::fs::write(installed_path(root.path()), "{").unwrap();
+        let fresh = read(text);
+        fresh.recall(root.path());
+        assert_eq!(computes(&fresh), (digest, true));
     }
 
     /// A lockfile read ahead of the snapshot is what the snapshot takes, once
