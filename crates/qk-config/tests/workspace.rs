@@ -1603,7 +1603,9 @@ fn reports_a_clash_before_the_package_of_a_given_root() {
     );
     write(temp.path(), "libs/p001/package.json", r#"{"name":5}"#);
     let error = format!("{:#}", load_first_last(temp.path()).unwrap_err());
-    assert!(error.contains("libs/p001/package.json"), "{error}");
+    // The file is named as the system joins paths.
+    let named = Path::new("libs/p001").join("package.json");
+    assert!(error.contains(named.to_str().unwrap()), "{error}");
     // Without the invalid package, the clash itself is reported.
     write(temp.path(), "libs/p001/package.json", r#"{"name":"p001"}"#);
     let error = format!("{:#}", load_first_last(temp.path()).unwrap_err());
