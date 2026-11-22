@@ -220,9 +220,11 @@ result in the remote store counts where the store holds its key, so `wouldHit`
 can name one that fetching would fail to get. A task taken from the cache
 does not wait for this lookup: it is done, and what depends on it starts,
 while the store answers, and the run waits for the answers only before it
-reports. For this lookup a machine asks the store for a task's path sets at
-most once every ten minutes, keeping what it was sent: a recording shared
-in between counts from its next ask. Mode `"on"` asks each time. A cold run, with `--cold` or `QK_COLD`, looks nothing up, so its tasks carry no
+reports. For this lookup a machine that has the store's answer for a task's
+path sets does not ask again for ten minutes, and goes on with what it was
+sent: a recording shared in between counts from its next ask. An ask that
+fails is made again by the next lookup. Mode `"on"`, which restores what it
+finds, is not held back this way. A cold run, with `--cold` or `QK_COLD`, looks nothing up, so its tasks carry no
 `shadow` and leave such counts out. The run summary names the tasks where the two
 disagree:
 
@@ -279,7 +281,8 @@ recorded runs](sandbox.md#auditing-recorded-runs).
 
 Looking a task up by its recordings costs the request for its path sets
 whenever it has none of its own, even when its declared inputs hit the local
-cache: that is where a stale hit would show. Switching to `"on"` keys it by them.
+cache: that is where a stale hit would show. In mode `"record"` the request
+is left out for ten minutes after the store answered it. Switching to `"on"` keys it by them.
 
 ## Running the tests
 
