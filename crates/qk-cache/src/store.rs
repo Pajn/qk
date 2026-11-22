@@ -518,10 +518,10 @@ impl Cache {
                         .iter()
                         .any(|dependency| !kept.contains(dependency))
             };
-            if !changed || stamp_outputs(root, outputs, started).is_ok() {
-                if changed {
-                    record_outputs(root, task, key, outputs);
-                } else {
+            // Stamping is checked against the stamps just taken, and records
+            // the outputs from them, rather than walking the outputs again.
+            if !changed || stamp_outputs(root, task, key, checked.stamps.clone(), started).is_ok() {
+                if !changed {
                     self.kept.lock().unwrap().insert(task.to_owned());
                 }
                 qk_executor::replay(File::open(log)?, display, qk_executor::Shown::Kept)?;
@@ -676,13 +676,16 @@ impl Cache {
         }
         drop(mode_profile);
         if repair.is_some() {
+            // Outputs kept beside repaired ones are stamped as well, and the
+            // one walk that finds them records them all.
             let _profile = crate::profile::span(task, "restore_repair_timestamps");
-            stamp_outputs(root, outputs, started)?;
+            stamp_outputs(root, task, key, output_stamps(root, outputs)?, started)?;
         }
         stage.retire();
-        let record_profile = crate::profile::span(task, "restore_record_outputs");
-        record_outputs(root, task, key, outputs);
-        drop(record_profile);
+        if repair.is_none() {
+            let _profile = crate::profile::span(task, "restore_record_outputs");
+            record_outputs(root, task, key, outputs);
+        }
         let replay_profile = crate::profile::span(task, "restore_replay");
         qk_executor::replay(File::open(log)?, display, shown)?;
         drop(replay_profile);
@@ -943,13 +946,51 @@ pub(crate) fn set_modified(path: &Path, time: SystemTime) -> Result<()> {
         .with_context(|| format!("cannot set the modification time of {}", path.display()))
 }
 
-/// Stamps every output file with `time`. Links are left alone, since setting
-/// a time through one would change the file it points to.
-fn stamp_outputs(root: &Path, outputs: &Outputs, time: SystemTime) -> Result<()> {
-    for path in outputs.paths(root)? {
-        let absolute = root.join(&path);
-        if fs::symlink_metadata(&absolute)?.is_file() {
-            set_modified(&absolute, time)?;
+/// Above how many files a task's outputs are stamped on several threads.
+/// Setting a time and reading it back are two short system calls a file, so
+/// a thread pays for itself only over a few hundred of them.
+const STAMPS_PER_THREAD: usize = 256;
+
+/// Stamps every file among `stamps`, which are a task's outputs as they are
+/// now, with `time`, then records the outputs for `key`: `stamps` with each
+/// file's read again, since setting a time moves its change time too.
+/// Directories and links are left alone, and so are their stamps: setting a
+/// time through a link would change the file it points to, and setting a
+/// file's time changes nothing about the directory holding it. An error is
+/// one setting a time; one reading a stamp back only leaves the outputs
+/// unrecorded, so that the next restore checks them again.
+fn stamp_outputs(
+    root: &Path,
+    task: &str,
+    key: &str,
+    mut stamps: BTreeMap<String, Vec<i64>>,
+    time: SystemTime,
+) -> Result<()> {
+    let _profile = crate::profile::span(task, "restore_stamp_outputs");
+    let files: Vec<&str> = stamps
+        .iter()
+        .filter(|(_, stamp)| stamp[0] == 0)
+        .map(|(path, _)| path.as_str())
+        .collect();
+    let stamped = crate::hash::in_parallel(&files, STAMPS_PER_THREAD, |path| {
+        let absolute = root.join(path);
+        set_modified(&absolute, time)?;
+        Ok(fs::symlink_metadata(&absolute)
+            .ok()
+            .map(|metadata| output_stamp(&metadata)))
+    })?;
+    let stamped: Option<Vec<(String, Vec<i64>)>> = files
+        .iter()
+        .zip(stamped)
+        .map(|(path, stamp)| Some(((*path).to_owned(), stamp?)))
+        .collect();
+    match stamped {
+        Some(stamped) => {
+            stamps.extend(stamped);
+            write_outputs_record(root, task, key, stamps);
+        }
+        None => {
+            let _ = fs::remove_file(outputs_record(root, task));
         }
     }
     Ok(())
@@ -983,38 +1024,44 @@ fn output_stamps(root: &Path, outputs: &Outputs) -> Result<BTreeMap<String, Vec<
     let mut stamps = BTreeMap::new();
     for entry in outputs.entries(root)? {
         let (path, metadata) = entry?;
-        let kind = if metadata.file_type().is_symlink() {
-            2
-        } else if metadata.is_dir() {
-            1
-        } else {
-            0
-        };
-        let modified = metadata
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-            .map_or(-1, |duration| duration.as_nanos() as i64);
-        // Unix adds the change time, inode and mode below.
-        #[cfg_attr(not(unix), allow(unused_mut))]
-        let mut stamp = vec![
-            kind,
-            metadata.len() as i64,
-            modified,
-            i64::from(mode(&metadata)),
-        ];
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            stamp.extend([
-                metadata.ctime(),
-                metadata.ctime_nsec(),
-                metadata.ino() as i64,
-            ]);
-        }
-        stamps.insert(path, stamp);
+        stamps.insert(path, output_stamp(&metadata));
     }
     Ok(stamps)
+}
+
+/// One output's stamp, from its metadata read without following a link:
+/// its kind first, 0 for a file, 1 for a directory and 2 for a link.
+fn output_stamp(metadata: &fs::Metadata) -> Vec<i64> {
+    let kind = if metadata.file_type().is_symlink() {
+        2
+    } else if metadata.is_dir() {
+        1
+    } else {
+        0
+    };
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(-1, |duration| duration.as_nanos() as i64);
+    // Unix adds the change time, inode and mode below.
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut stamp = vec![
+        kind,
+        metadata.len() as i64,
+        modified,
+        i64::from(mode(metadata)),
+    ];
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        stamp.extend([
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+            metadata.ino() as i64,
+        ]);
+    }
+    stamp
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1025,11 +1072,16 @@ struct OutputRecord {
 
 /// Records the outputs a worktree now holds for a task's key.
 pub(crate) fn record_outputs(root: &Path, task: &str, key: &str, outputs: &Outputs) {
-    let record = output_stamps(root, outputs).and_then(|stamps| {
-        Ok(serde_json::to_vec(&OutputRecord {
-            key: key.to_owned(),
-            outputs: stamps,
-        })?)
+    if let Ok(stamps) = output_stamps(root, outputs) {
+        write_outputs_record(root, task, key, stamps);
+    }
+}
+
+/// Records `stamps` as the outputs a worktree holds for a task's key.
+fn write_outputs_record(root: &Path, task: &str, key: &str, stamps: BTreeMap<String, Vec<i64>>) {
+    let record = serde_json::to_vec(&OutputRecord {
+        key: key.to_owned(),
+        outputs: stamps,
     });
     let path = outputs_record(root, task);
     if let Ok(record) = record
@@ -1741,6 +1793,84 @@ mod tests {
             outputs_held(root, "build", &key, &outputs, &manifest),
             Some(false)
         );
+    }
+
+    /// Held outputs are stamped again after a dependency changed, enough of
+    /// them to take several threads, and recorded as they are then, so that
+    /// the next restore finds them unchanged without hashing them. A link
+    /// keeps its own time.
+    #[test]
+    fn held_outputs_are_stamped_after_a_changed_dependency_and_recorded() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("out/nested")).unwrap();
+        let count = 3 * STAMPS_PER_THREAD;
+        for index in 0..count {
+            fs::write(root.join(format!("out/nested/file-{index:04}")), "value").unwrap();
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("nested/file-0000", root.join("out/link")).unwrap();
+        let log = root.join("log");
+        fs::write(&log, "").unwrap();
+        let cache = Cache::new(root.join("cache"));
+        cache.initialize().unwrap();
+        let outputs = Outputs::from_patterns(&["out"]);
+        let key = "f".repeat(64);
+        cache.publish(root, &key, &outputs, &log).unwrap();
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        for index in 0..count {
+            set_modified(&root.join(format!("out/nested/file-{index:04}")), old).unwrap();
+        }
+        let link_time = || {
+            fs::symlink_metadata(root.join("out/link"))
+                .ok()
+                .map(|metadata| metadata.modified().unwrap())
+        };
+        let link_before = link_time();
+        record_outputs(root, "build", &key, &outputs);
+        let manifest = ResultRecord::read(
+            &fs::read(cache.root.join("entries").join(format!("{key}.json"))).unwrap(),
+            &key,
+        )
+        .unwrap();
+        let restore = |dependencies: &BTreeSet<String>| {
+            cache
+                .restore(
+                    root,
+                    "build",
+                    dependencies,
+                    &key,
+                    &outputs,
+                    &qk_executor::Display::Hidden,
+                    qk_executor::Shown::LocalCache,
+                )
+                .unwrap()
+        };
+        let before = SystemTime::now();
+        // A dependency that is not among the kept changed in this run.
+        assert!(restore(&BTreeSet::from(["dependency".to_owned()])));
+        for index in 0..count {
+            let file = root.join(format!("out/nested/file-{index:04}"));
+            assert!(fs::metadata(&file).unwrap().modified().unwrap() >= before);
+        }
+        assert_eq!(link_time(), link_before);
+        assert!(!cache.kept.lock().unwrap().contains("build"));
+        // Recorded as stamped: held, and found so without being hashed.
+        assert_eq!(
+            outputs_held(root, "build", &key, &outputs, &manifest),
+            Some(false)
+        );
+        assert_eq!(
+            output_stamps(root, &outputs).unwrap(),
+            check_outputs(root, "build", &key, &outputs, &manifest)
+                .unwrap()
+                .stamps
+        );
+        // With nothing changed before it, the outputs are kept as they are.
+        let stamped = output_stamps(root, &outputs).unwrap();
+        assert!(restore(&BTreeSet::new()));
+        assert_eq!(output_stamps(root, &outputs).unwrap(), stamped);
+        assert!(cache.kept.lock().unwrap().contains("build"));
     }
 
     /// Setting a link's time sets the link's own, never its target's.

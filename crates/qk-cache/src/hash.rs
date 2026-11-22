@@ -3467,7 +3467,7 @@ const FILES_PER_THREAD: usize = 256;
 /// taking `per_thread` of them at least. Reading files is mostly system
 /// calls, which wait apart from each other. The error is the first in
 /// `items`' order, as one thread taking them in turn would return.
-fn in_parallel<T: Sync, R: Send>(
+pub(crate) fn in_parallel<T: Sync, R: Send>(
     items: &[T],
     per_thread: usize,
     f: impl Fn(&T) -> Result<R> + Sync,
