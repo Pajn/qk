@@ -788,21 +788,24 @@ static SAVING: (std::sync::Mutex<usize>, std::sync::Condvar) =
 fn remember_in(directory: &Path, root: &Path, record: remembered::Record) {
     let directory = directory.to_owned();
     let root = root.to_owned();
-    *SAVING.0.lock().unwrap() += 1;
-    std::thread::spawn(move || {
-        /// Counts the save done however it ends.
-        struct Done;
-        impl Drop for Done {
-            fn drop(&mut self) {
-                *SAVING
-                    .0
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) -= 1;
-                SAVING.1.notify_all();
-            }
+    /// Counts a save done however it ends.
+    struct Done;
+    impl Drop for Done {
+        fn drop(&mut self) {
+            *SAVING
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) -= 1;
+            SAVING.1.notify_all();
         }
-        let _done = Done;
-        // Saving is only for later loads, which walk when it fails.
+    }
+    *SAVING.0.lock().unwrap() += 1;
+    let done = Done;
+    // Saving is only for later loads, which walk when it fails, or when no
+    // thread can be started for it: the save then counts as done at once,
+    // as dropping what the thread was to run drops `done` with it.
+    let _ = std::thread::Builder::new().spawn(move || {
+        let _done = done;
         let _ = remembered::save(&directory, &root, &record);
     });
 }
