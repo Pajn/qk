@@ -331,8 +331,11 @@ they were built from and newer than the outputs of the tasks they depend on.
 Tools that decide what to rebuild by comparing modification times, such as
 `tsc --build`, then find restored outputs up to date. Outputs a worktree
 already holds are stamped again when a dependency's outputs changed in the
-run, so they stay the newer. Symbolic links and directories keep their
-times.
+run, so they stay the newer. A dependency changed its outputs unless it was
+restored with the outputs the worktree held, or it runs no command, as
+`nx:noop` targets do, and none of its own dependencies changed theirs; a task
+that runs a command counts as changed even when it rewrote nothing. Symbolic
+links and directories keep their times.
 
 Entries unused for a week are evicted after each run, as in Nx, and the
 cache stays under a size limit. See [remote caching](remote-cache.md#storage-limits)

@@ -700,6 +700,35 @@ fn restored_outputs_are_newer_than_their_inputs_and_dependencies() {
     assert_eq!(fixture.runs(), 2);
 }
 
+/// A target that runs no command, as `nx:noop`'s, passes on whether the
+/// tasks it depends on changed their outputs: with nothing changed, what
+/// depends on it keeps its outputs as they are; after a restore, it stamps
+/// them again to stay the newer.
+#[test]
+fn a_task_running_no_command_passes_on_whether_its_dependencies_changed() {
+    let fixture = Fixture::with_targets(json!({
+        "gen": target("generate", json!({"outputs": ["{projectRoot}/generated"]})),
+        "group": {"executor": "nx:noop", "dependsOn": ["gen"]},
+        "build": target("build", json!({"dependsOn": ["group"]})),
+    }));
+    success(fixture.build(&fixture.root, &[]));
+    let generated = fixture.root.join("generated/value.txt");
+    let built = fixture.root.join("dist/nested/out.txt");
+
+    let times = (modified(&generated), modified(&built));
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let kept = success(fixture.build(&fixture.root, &[]));
+    assert!(stderr(&kept).contains("qk: cache hit app:build"));
+    assert_eq!((modified(&generated), modified(&built)), times);
+
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    fs::remove_dir_all(fixture.root.join("generated")).unwrap();
+    success(fixture.build(&fixture.root, &[]));
+    assert!(modified(&generated) > times.0);
+    assert!(modified(&built) >= modified(&generated));
+    assert_eq!(fixture.runs(), 2);
+}
+
 #[test]
 /// Reset removes only the selected state and preserves recorded run history.
 fn reset_clears_the_cache_and_worktree_state_but_keeps_history() {

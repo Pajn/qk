@@ -136,7 +136,9 @@ pub struct Cache {
     /// The blobs hashed since the machine started, which restores need not
     /// hash again.
     verified: OnceLock<verified::Verified>,
-    /// The tasks whose outputs this run left exactly as they were.
+    /// The tasks whose outputs this run left exactly as they were: restored
+    /// with the outputs a worktree held kept, or run with no command after
+    /// tasks that all were.
     kept: std::sync::Mutex<std::collections::BTreeSet<String>>,
     /// Warm state being saved in the background.
     saves: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>,
@@ -518,8 +520,34 @@ impl Cache {
             restored(result);
         };
         let result = self.run_task(workspace, graph, task, prepared, cancelled, &early);
+        if let Ok(result) = &result {
+            self.pass_on_kept(task, prepared, result);
+        }
         write();
         result
+    }
+
+    /// Counts a task that ran no command, as `nx:noop`'s, as having left its
+    /// outputs as they were when every task it depends on did: it wrote
+    /// nothing, so what depends on it need not stamp its own outputs again
+    /// for its sake. One that restored warm state may have written, and one
+    /// taken from the cache was counted as its restore found it.
+    fn pass_on_kept(&self, task: &Task, prepared: &PreparedTask, result: &TaskResult) {
+        if !prepared.commands.is_empty()
+            || result.outcome != Outcome::Success
+            || result.warm.is_some()
+            || !matches!(result.cache, CacheStatus::Miss | CacheStatus::Uncached)
+        {
+            return;
+        }
+        let mut kept = self.kept.lock().unwrap();
+        if task
+            .dependencies
+            .iter()
+            .all(|dependency| kept.contains(dependency))
+        {
+            kept.insert(task.id.clone());
+        }
     }
 
     fn run_task(
