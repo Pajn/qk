@@ -76,20 +76,19 @@ impl Stamp {
             .all(|values| times_settled(values, window, looked))
     }
 
-    /// Whether this stamp's modification time is more than `window`, as
+    /// Whether every time in this stamp is more than `window`, as
     /// [`crate::settle::window`] gives it for the file's filesystem, before
     /// `looked`, a time taken before the file was read: a write within the
     /// window of the last could leave the stamp as it was, so a file that
-    /// changed more recently is always read again.
+    /// changed more recently is always read again. The change time counts
+    /// too, as tools set modification times back but nothing sets change
+    /// times back.
     fn settled(&self, window: Duration, looked: SystemTime) -> bool {
-        let modified = SystemTime::UNIX_EPOCH + Duration::from_nanos(self.0[1].max(0) as u64);
-        self.0[1] >= 0 && crate::settle::older(modified, window, looked)
+        times_settled(&self.0, window, looked)
     }
 }
 
-/// Whether both times of one file's membership stamp are more than `window`
-/// before `looked`: restoring a directory's modification time must not let
-/// changes within the window go unnoticed.
+/// [`Stamp::settled`] of the values of one file's stamp.
 fn times_settled(values: &[i64], window: Duration, looked: SystemTime) -> bool {
     let modified = SystemTime::UNIX_EPOCH + Duration::from_nanos(values[1].max(0) as u64);
     if values[1] < 0 || !crate::settle::older(modified, window, looked) {
@@ -4999,7 +4998,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn recent_change_time_prevents_membership_reuse_despite_old_mtime() {
+    fn recent_change_time_prevents_reuse_despite_old_mtime() {
         use std::os::unix::fs::MetadataExt;
         let root = tempfile::tempdir().unwrap();
         let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
@@ -5014,10 +5013,11 @@ mod tests {
         let stamp = Stamp::new(&metadata);
         let window = crate::settle::window(root.path(), &metadata);
         for looked in [changed, changed + window] {
-            assert!(stamp.settled(window, looked));
+            assert!(!stamp.settled(window, looked));
             assert!(!stamp.membership_settled(window, looked));
         }
         let later = changed + window + Duration::from_millis(1);
+        assert!(stamp.settled(window, later));
         assert!(stamp.membership_settled(window, later));
     }
 
