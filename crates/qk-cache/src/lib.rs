@@ -148,6 +148,18 @@ pub struct Cache {
     /// The project graph, for `ignoreReads` entries that name dependencies;
     /// built on first use, `None` where it cannot be.
     projects: OnceLock<Option<qk_graph::ProjectGraph>>,
+    /// What restoring each task did to its outputs, by task, until it is
+    /// done: see [`Cache::restoring`].
+    restores: std::sync::Mutex<std::collections::HashMap<String, Restore>>,
+}
+
+/// What restoring a task did to its outputs.
+struct Restore {
+    /// Whether every restore of it this run left its outputs as they were.
+    kept: bool,
+    /// The output files the last restore of it that succeeded left, those
+    /// that are not directories.
+    files: Option<Vec<String>>,
 }
 
 /// Where a task's result came from.
@@ -403,27 +415,52 @@ impl Cache {
             cleanup: Default::default(),
             workspace_outputs: OnceLock::new(),
             projects: OnceLock::new(),
+            restores: Default::default(),
         }
     }
 
-    /// What `task`, now done with `result`, may have written.
+    /// Notes what a restore of `task` does to its outputs: whether it leaves
+    /// them as they were and, once it has succeeded, the output files it
+    /// leaves. A restore notes that it may write before it starts to, so
+    /// that a task one restore wrote and another then kept still counts as
+    /// having written its outputs.
+    pub(crate) fn restoring(&self, task: &str, kept: bool, files: Option<Vec<String>>) {
+        let mut restores = self.restores.lock().unwrap();
+        let restore = restores.entry(task.to_owned()).or_insert(Restore {
+            kept: true,
+            files: None,
+        });
+        restore.kept &= kept;
+        restore.files = files;
+    }
+
+    /// What `task`, now done with `result`, may have written, and the output
+    /// files its restore left, if it was taken from the cache.
     fn written(
         &self,
         workspace: &Workspace,
         task: &Task,
         prepared: &PreparedTask,
         result: Option<&TaskResult>,
-    ) -> hash::Written {
+        since: usize,
+    ) -> (hash::Written, Option<hash::RestoredOutputs>) {
+        let restore = self.restores.lock().unwrap().remove(&task.id);
         let outputs = paths::Outputs::new(workspace, task);
         if result.is_some_and(|result| {
             matches!(result.cache, CacheStatus::LocalHit | CacheStatus::RemoteHit)
         }) {
             // Taken from the cache, it ran nothing, and a restore writes
             // nothing but paths its outputs match.
-            return match outputs {
-                Ok(outputs) => hash::Written::Declared(Box::new(outputs)),
-                Err(_) => hash::Written::Anything,
+            let written = match (&restore, outputs) {
+                (Some(Restore { kept: true, .. }), _) => hash::Written::Nothing,
+                (_, Ok(outputs)) => hash::Written::Declared(Box::new(outputs)),
+                (_, Err(_)) => hash::Written::Anything,
             };
+            let files = restore.and_then(|restore| restore.files);
+            return (
+                written,
+                files.map(|files| hash::RestoredOutputs { since, files }),
+            );
         }
         if prepared.commands.is_empty() {
             // It ran no command, so it wrote nothing but the scratch
@@ -456,13 +493,14 @@ impl Cache {
                 }
                 _ => hash::Written::Anything,
             };
-            return written;
+            return (written, None);
         }
         // Its commands are trusted to write only their declared outputs.
-        match outputs {
+        let written = match outputs {
             Ok(outputs) if outputs.is_explicit() => hash::Written::Declared(Box::new(outputs)),
             _ => hash::Written::Anything,
-        }
+        };
+        (written, None)
     }
 
     /// The blobs hashed since the machine started, read on first use.
@@ -566,11 +604,19 @@ impl Cache {
         cancelled: &AtomicBool,
         restored: &dyn Fn(TaskResult),
     ) -> Result<TaskResult> {
+        // What restoring it lists is checked against the tasks done since.
+        let since = match self.snapshot.get() {
+            Some(Ok(snapshot)) => snapshot.writes_seen(),
+            _ => 0,
+        };
+        self.restores.lock().unwrap().remove(&task.id);
         let written = std::sync::Once::new();
         let write = |result: Option<&TaskResult>| {
             written.call_once(|| {
                 if let Some(Ok(snapshot)) = self.snapshot.get() {
-                    snapshot.outputs_written(self.written(workspace, task, prepared, result));
+                    let (written, restored) =
+                        self.written(workspace, task, prepared, result, since);
+                    snapshot.outputs_written(workspace, task, written, restored);
                 }
             })
         };
@@ -2132,6 +2178,26 @@ mod tests {
                 0o444
             );
         }
+        // What it hands to dependents is what listing its outputs finds.
+        let listed = || -> Vec<String> {
+            let mut files: Vec<String> = outputs
+                .entries(root)
+                .unwrap()
+                .map(Result::unwrap)
+                .filter(|(_, metadata)| !metadata.is_dir())
+                .map(|(path, _)| path)
+                .collect();
+            files.sort();
+            files
+        };
+        let handed = |kept: bool| {
+            let restore = cache.restores.lock().unwrap().remove("app:build").unwrap();
+            assert_eq!(restore.kept, kept);
+            let mut files = restore.files.unwrap();
+            files.sort();
+            assert_eq!(files, listed());
+        };
+        handed(false);
         let path = root.join("dist/nested/a.txt");
         let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
         assert!(modified >= before);
@@ -2151,6 +2217,24 @@ mod tests {
             std::fs::metadata(&path).unwrap().modified().unwrap(),
             modified
         );
+        handed(true);
+        // A file no artifact names is removed, and not handed over.
+        std::fs::write(root.join("dist/stray.txt"), "stray").unwrap();
+        assert!(
+            cache
+                .restore(
+                    root,
+                    "app:build",
+                    &Default::default(),
+                    &key,
+                    &outputs,
+                    &qk_executor::Display::Hidden,
+                    qk_executor::Shown::LocalCache,
+                )
+                .unwrap()
+        );
+        assert!(!root.join("dist/stray.txt").exists());
+        handed(false);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

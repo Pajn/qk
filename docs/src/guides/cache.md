@@ -191,11 +191,13 @@ respecting source ignore rules and excluding the consumer's own outputs. These
 files are keyed independently of selective `dependentTasksOutputFiles` inputs.
 The source list is taken once per run, so a file that a task creates without
 declaring it as an output is seen from the next run. A dependency's output
-files are listed once per run, and listed again after a task is done that may
-have written among them: one whose declared outputs may match a path there,
-or one without declared outputs that ran a command. A task that ran no command
-writes nothing; a task that writes into another task's outputs should declare
-the files it writes. A task whose filesets
+files are listed once per run, and a dependency taken from the cache is not
+listed at all: its restore says what it left. A listing is taken again after a
+task is done that may have written among those files: one whose declared
+outputs may match a path there, or one without declared outputs that ran a
+command. A task that ran no command, or whose restore left its outputs as they
+were, writes nothing; a task that writes into another task's outputs should
+declare the files it writes. A task whose filesets
 each name a path, with no `json` glob, lists only those paths and what is
 beneath them, selecting what the source list would hold there, where Git or a
 root `.nxignore` can list them; a run of such tasks alone then takes no source

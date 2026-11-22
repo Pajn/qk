@@ -1033,6 +1033,75 @@ fn forced_runs_key_the_outputs_of_uncacheable_dependencies_without_retaining_the
     assert!(stderr(&dependency_log).contains("no retained execution log"));
 }
 
+/// Dependents of tasks taken from the cache key their outputs as listing
+/// them would, whether the restore kept them, replaced them, or the task
+/// between ran no command; and see what a dependency that ran wrote.
+#[test]
+fn restored_dependency_outputs_key_dependents_as_listing_them_would() {
+    let reads = json!({"dependentTasksOutputFiles": "**/*", "transitive": true});
+    let fixture = Fixture::with_targets(json!({
+        "generate": target("generate", json!({"outputs": ["{projectRoot}/generated"], "inputs": ["{projectRoot}/src/**/*"]})),
+        "gate": {"executor": "nx:noop", "dependsOn": ["generate"]},
+        "types": target("generate-types", json!({"outputs": ["{projectRoot}/types"], "dependsOn": ["gate"], "inputs": ["{projectRoot}/src/**/*", reads]})),
+        "build": target("build", json!({"dependsOn": ["types"], "inputs": [reads]}))
+    }));
+    let tasks = ["app:generate", "app:types", "app:build"];
+    // The key each task was run under, by the latest run.
+    let recorded = || -> Vec<Value> {
+        let run: Value = serde_json::from_slice(
+            &success(fixture.qk(&fixture.root, &["show", "run", "--json"])).stdout,
+        )
+        .unwrap();
+        tasks
+            .iter()
+            .map(|id| {
+                run["tasks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|task| task["id"] == *id)
+                    .unwrap()["key"]
+                    .clone()
+            })
+            .collect()
+    };
+    // The key each task has now, from listing its dependencies' outputs.
+    let shown = || -> Vec<Value> {
+        tasks
+            .iter()
+            .map(|id| {
+                let output = success(fixture.qk(&fixture.root, &["show", "hash", id, "--json"]));
+                serde_json::from_slice::<Value>(&output.stdout).unwrap()["key"].clone()
+            })
+            .collect()
+    };
+    success(fixture.build(&fixture.root, &[]));
+    let first = recorded();
+    assert_eq!(first, shown());
+    assert_eq!(fixture.runs(), 3);
+    // Every task restored with its outputs kept.
+    success(fixture.build(&fixture.root, &[]));
+    assert_eq!(recorded(), first);
+    assert_eq!(fixture.runs(), 3);
+    // Restored again in place of files no artifact names.
+    fs::write(fixture.root.join("generated/stray.txt"), "stray\n").unwrap();
+    fs::write(fixture.root.join("types/stray.d.ts"), "stray\n").unwrap();
+    success(fixture.build(&fixture.root, &[]));
+    assert!(!fixture.root.join("generated/stray.txt").exists());
+    assert!(!fixture.root.join("types/stray.d.ts").exists());
+    assert_eq!(recorded(), first);
+    assert_eq!(fixture.runs(), 3);
+    // What a dependency that ran wrote reaches what depends on it.
+    fs::write(fixture.root.join("src/input.txt"), "two\n").unwrap();
+    success(fixture.build(&fixture.root, &[]));
+    let changed = recorded();
+    assert_eq!(fixture.runs(), 6);
+    for (before, after) in first.iter().zip(&changed) {
+        assert_ne!(before, after);
+    }
+    assert_eq!(changed, shown());
+}
+
 #[test]
 fn failures_are_not_cached() {
     let fixture = Fixture::new(target("fail", json!({})));

@@ -524,12 +524,21 @@ impl Cache {
                 if !changed {
                     self.kept.lock().unwrap().insert(task.to_owned());
                 }
+                // Its files and their contents are as listed: stamping them
+                // changes only their modification times.
+                let files = checked.stamps.iter().filter(|(_, stamp)| stamp[0] != 1);
+                self.restoring(
+                    task,
+                    true,
+                    Some(files.map(|(path, _)| path.clone()).collect()),
+                );
                 qk_executor::replay(File::open(log)?, display, qk_executor::Shown::Kept)?;
                 crate::evict::touch(&self.root.join("entries").join(format!("{key}.json")));
                 return Ok(true);
             }
         }
         drop(held_profile);
+        self.restoring(task, false, None);
         let repair = checked.filter(|checked| !checked.repair.is_empty());
         let planning_profile = crate::profile::span(task, "restore_plan");
         // Stage on the destination filesystem; no existing output is touched yet.
@@ -686,6 +695,17 @@ impl Cache {
             let _profile = crate::profile::span(task, "restore_record_outputs");
             record_outputs(root, task, key, outputs);
         }
+        // Its outputs now hold the entry's artifacts and nothing else: those
+        // not replaced were checked to be them.
+        let files = manifest
+            .artifacts
+            .iter()
+            .filter(|(_, artifact)| !matches!(artifact, Artifact::Directory { .. }));
+        self.restoring(
+            task,
+            false,
+            Some(files.map(|(path, _)| path.clone()).collect()),
+        );
         let replay_profile = crate::profile::span(task, "restore_replay");
         qk_executor::replay(File::open(log)?, display, shown)?;
         drop(replay_profile);

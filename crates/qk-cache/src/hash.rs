@@ -167,8 +167,9 @@ pub struct Snapshot {
     runtime: Mutex<HashMap<RuntimeKey, Arc<Mutex<Option<Value>>>>>,
     /// The parsed pnpm lockfile, replaced whenever its content changes.
     lockfile: Mutex<Option<Arc<Installed>>>,
-    /// Each dependency task's output files, listed when a task first asks and
-    /// dropped once a task that may have written where they lie is done.
+    /// Each dependency task's output files, listed when a task first asks or
+    /// handed over by its restore, and dropped once a task that may have
+    /// written where they lie is done.
     dependency_outputs: Mutex<Listings>,
 }
 
@@ -810,7 +811,7 @@ struct DependencyOutputs {
 #[derive(Clone)]
 pub(crate) enum Written {
     /// Nothing a listing holds: it ran no command and has no scratch or warm
-    /// paths.
+    /// paths, or it was restored with its outputs left as they were.
     Nothing,
     /// Nothing but these paths and what lies below them.
     Within(Vec<String>),
@@ -873,6 +874,16 @@ impl Listings {
             .iter()
             .all(|written| !written.touches(anchors))
     }
+}
+
+/// The output files a task's restore left in the worktree, handed to the
+/// snapshot so that its dependents need not list them again.
+pub(crate) struct RestoredOutputs {
+    /// How many writes the snapshot had seen before the restore began: see
+    /// [`Snapshot::writes_seen`].
+    pub since: usize,
+    /// Its output paths that are not directories, symlinks among them.
+    pub files: Vec<String>,
 }
 
 /// One revision of `pnpm-lock.yaml`, with digests of what it installs computed
@@ -1565,17 +1576,47 @@ impl Snapshot {
         })
     }
 
+    /// How many tasks that may have written something are done, for
+    /// [`RestoredOutputs::since`].
+    pub(crate) fn writes_seen(&self) -> usize {
+        self.dependency_outputs.lock().unwrap().writes.len()
+    }
+
     /// Once `task` is done: drops the listings what it `written` may have
-    /// touched, its own among them.
-    pub(crate) fn outputs_written(&self, written: Written) {
-        if matches!(written, Written::Nothing) {
-            return;
-        }
+    /// touched, its own among them, and keeps the listing its restore made,
+    /// unless a task done since that restore began may have touched it.
+    pub(crate) fn outputs_written(
+        &self,
+        workspace: &Workspace,
+        task: &Task,
+        written: Written,
+        restored: Option<RestoredOutputs>,
+    ) {
+        let restored = restored.and_then(|restored| {
+            let anchors: Vec<String> = Outputs::new(workspace, task)
+                .ok()?
+                .anchors()
+                .map(str::to_owned)
+                .collect();
+            Some((restored.since, anchors, restored.files))
+        });
         let mut listed = self.dependency_outputs.lock().unwrap();
-        listed
-            .by_task
-            .retain(|_, outputs| !written.touches(&outputs.anchors));
-        listed.writes.push(written);
+        let restored = restored
+            .filter(|(since, anchors, _)| listed.still_valid(*since, anchors))
+            .map(|(_, anchors, files)| DependencyOutputs {
+                anchors,
+                files,
+                values: Mutex::default(),
+            });
+        if !matches!(written, Written::Nothing) {
+            listed
+                .by_task
+                .retain(|_, outputs| !written.touches(&outputs.anchors));
+            listed.writes.push(written);
+        }
+        if let Some(restored) = restored {
+            listed.by_task.insert(task.id.clone(), Arc::new(restored));
+        }
     }
 
     /// A file an `includeIgnored` fileset read, by the content it points to
@@ -4967,7 +5008,7 @@ mod tests {
                 Some(_) => Written::Within(vec!["generated".into()]),
                 None => Written::Anything,
             };
-            snapshot.outputs_written(written);
+            snapshot.outputs_written(&workspace, &graph.tasks["app:post"], written, None);
             assert_ne!(before, keys());
         }
     }
@@ -4983,6 +5024,7 @@ mod tests {
         let before = keys();
         // A file the listing does not hold, which only a fresh listing sees.
         std::fs::write(root.path().join("generated/added"), "added").unwrap();
+        let post = &graph.tasks["app:post"];
         let declared = |patterns: &[&str]| {
             let patterns: Vec<String> = patterns.iter().map(|p| (*p).to_owned()).collect();
             Written::Declared(Box::new(Outputs::from_paths(&patterns).unwrap()))
@@ -4993,7 +5035,7 @@ mod tests {
             Written::Within(vec!["generate".into()]),
             declared(&["elsewhere/*/generated", "generate/*"]),
         ] {
-            snapshot.outputs_written(written);
+            snapshot.outputs_written(&workspace, post, written, None);
             assert_eq!(before, keys());
         }
         for written in [
@@ -5002,16 +5044,87 @@ mod tests {
             declared(&["generated/*.txt"]),
             Written::Anything,
         ] {
-            snapshot.outputs_written(Written::Nothing);
+            snapshot.outputs_written(&workspace, post, Written::Nothing, None);
             assert_eq!(before, keys());
-            snapshot.outputs_written(written.clone());
+            snapshot.outputs_written(&workspace, post, written.clone(), None);
             let after = keys();
             assert_ne!(before, after, "{written:?}");
             std::fs::remove_file(root.path().join("generated/added")).unwrap();
-            snapshot.outputs_written(Written::Anything);
+            snapshot.outputs_written(&workspace, post, Written::Anything, None);
             assert_eq!(before, keys());
             std::fs::write(root.path().join("generated/added"), "added").unwrap();
         }
+    }
+
+    /// What a restore listed stands for a dependency's outputs, unless a task
+    /// done since the restore began may have written among them.
+    #[test]
+    fn restored_listings_stand_unless_written_since() {
+        let (root, workspace, graph) = fixture(Some(json!(["{projectRoot}/elsewhere"])));
+        let snapshot = Snapshot::new(&workspace, &graph, &root.path().join("cache")).unwrap();
+        let keys =
+            || dependency_keys(&snapshot, &workspace, &graph, &graph.tasks["app:build"]).unwrap();
+        let fresh = || {
+            recheck_dependency_keys(&snapshot, &workspace, &graph, &graph.tasks["app:build"])
+                .unwrap()
+        };
+        let generate = &graph.tasks["app:gen"];
+        let post = &graph.tasks["app:post"];
+        std::fs::write(root.path().join("generated/second"), "two").unwrap();
+        // A restore that listed one of the two files, which only shows when
+        // its listing is the one used.
+        let restored = |since| RestoredOutputs {
+            since,
+            files: vec!["generated/value".into()],
+        };
+        let since = snapshot.writes_seen();
+        snapshot.outputs_written(
+            &workspace,
+            post,
+            Written::Within(vec!["elsewhere".into()]),
+            None,
+        );
+        snapshot.outputs_written(
+            &workspace,
+            generate,
+            Written::Within(vec!["generated".into()]),
+            Some(restored(since)),
+        );
+        let handed = keys();
+        assert_ne!(handed, fresh());
+        // Dropped by a write among its files, and listed again.
+        snapshot.outputs_written(
+            &workspace,
+            post,
+            Written::Within(vec!["generated".into()]),
+            None,
+        );
+        assert_eq!(keys(), fresh());
+        // Not kept when such a write came while it was restoring.
+        let since = snapshot.writes_seen();
+        snapshot.outputs_written(
+            &workspace,
+            post,
+            Written::Within(vec!["generated".into()]),
+            None,
+        );
+        snapshot.outputs_written(
+            &workspace,
+            generate,
+            Written::Nothing,
+            Some(restored(since)),
+        );
+        assert_eq!(keys(), fresh());
+        // Kept when the restore left its outputs as they were and nothing
+        // was written since.
+        let since = snapshot.writes_seen();
+        snapshot.outputs_written(
+            &workspace,
+            generate,
+            Written::Nothing,
+            Some(restored(since)),
+        );
+        assert_eq!(keys(), handed);
     }
 
     #[cfg(unix)]
@@ -5034,7 +5147,12 @@ mod tests {
             || dependency_keys(&snapshot, &workspace, &graph, &graph.tasks["app:build"]).unwrap();
         let before = keys();
         std::fs::write(root.path().join("generated/value"), "different").unwrap();
-        snapshot.outputs_written(Written::Within(vec!["generated".into()]));
+        snapshot.outputs_written(
+            &workspace,
+            &graph.tasks["app:post"],
+            Written::Within(vec!["generated".into()]),
+            None,
+        );
         assert_ne!(before["app:gen:**/*"], keys()["app:gen:**/*"]);
     }
     /// The digest of a git-ignored file an `includeIgnored` fileset reads is
