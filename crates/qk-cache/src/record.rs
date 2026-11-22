@@ -60,6 +60,29 @@ pub(crate) struct WarmRecord {
 
 const WARM_VERSION: u32 = 2;
 
+/// The fields of a [`WarmRecord`] that choose between saves, read without its
+/// groups, which can list thousands of files.
+#[derive(Deserialize)]
+pub(crate) struct WarmHeader {
+    version: u32,
+    task: String,
+    pub(super) worktree: String,
+    pub(super) saved: u64,
+    #[serde(default)]
+    pub(super) key: Vec<String>,
+}
+
+impl WarmHeader {
+    /// Checks the version and task identity as [`WarmRecord::read`] does.
+    pub(super) fn read(bytes: &[u8], task: &str) -> Result<Self> {
+        let header: Self = serde_json::from_slice(bytes)?;
+        if header.version != WARM_VERSION || header.task != task {
+            bail!("invalid warm record");
+        }
+        Ok(header)
+    }
+}
+
 impl ResultRecord {
     pub(super) fn new(key: String, log: String, artifacts: BTreeMap<String, Artifact>) -> Self {
         Self {

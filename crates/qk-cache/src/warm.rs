@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::paths::{self, Outputs};
-use crate::record::{self, Artifact, WarmGroup, WarmRecord, validate_link};
+use crate::record::{self, Artifact, WarmGroup, WarmHeader, WarmRecord, validate_link};
 use crate::store::{mode, restore_blob, set_mode, set_modified, symlink};
 use crate::{Cache, hash::digest_file, profile};
 
@@ -76,6 +76,21 @@ pub const FIELDS: &[&str] = &[
 const KEPT: usize = 8;
 /// Files restored at once.
 const RESTORERS: usize = 16;
+/// Paths a thread looks at at least as a save starts, so a short group is
+/// not split. Looking is a few system calls a path.
+const LOOKED_PER_THREAD: usize = 128;
+
+/// What a save found at one of a group's paths.
+enum Looked {
+    /// Nothing, or nothing a save keeps.
+    Gone,
+    /// A file to read and store.
+    Unread(PathBuf, fs::Metadata),
+    /// A file left as its last save or restore stored it, with its metadata.
+    Saved(Artifact, fs::Metadata),
+    /// A directory or link.
+    Other(Artifact),
+}
 
 /// A warm file to restore: its path, blob, mode, destination and modification time.
 type PendingFile<'a> = (&'a String, &'a str, u32, PathBuf, SystemTime);
@@ -1368,6 +1383,38 @@ impl Cache {
         records
     }
 
+    /// [`Self::warm_records`] without their groups, read on several threads:
+    /// the groups of a large target's saves list thousands of files, and a
+    /// save needs those of one save only.
+    fn warm_headers(&self, warm: &Warm) -> Vec<(PathBuf, WarmHeader)> {
+        let prefix = format!("{}-", self.warm_prefix(&warm.identity));
+        let paths: Vec<PathBuf> = fs::read_dir(self.root.join("warm"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".json"))
+            })
+            .map(|entry| entry.path())
+            .collect();
+        let headers = crate::hash::in_parallel(&paths, 1, |path| {
+            Ok(fs::read(path)
+                .ok()
+                .and_then(|bytes| WarmHeader::read(&bytes, &warm.identity).ok()))
+        })
+        .unwrap_or_default();
+        let mut records: Vec<(PathBuf, WarmHeader)> = paths
+            .into_iter()
+            .zip(headers)
+            .filter_map(|(path, header)| Some((path, header?)))
+            .collect();
+        records.sort_by_key(|(_, record)| std::cmp::Reverse(record.saved));
+        records
+    }
+
     /// The save to restore from, and how to name where it came from. A save
     /// whose key matches whole comes before one that matches in part; then
     /// this worktree's own before another's, which only a portable target
@@ -1924,13 +1971,14 @@ impl Cache {
         let warm = &save.warm;
         let _lock = self.lock_warm(warm)?;
         let _save = profile::span(&save.task, "warm_save");
-        let records = self.warm_records(warm);
+        let records = self.warm_headers(warm);
         // This worktree's save under the same key, else under any.
         let previous = records
             .iter()
             .filter(|(_, record)| record.worktree == save.worktree)
             .min_by_key(|(_, record)| record.key != save.key)
-            .map(|(_, record)| record);
+            .and_then(|(path, _)| WarmRecord::read(&fs::read(path).ok()?, &warm.identity).ok());
+        let previous = previous.as_ref();
         let noted: RestoredFiles = fs::read(&save.notes)
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
@@ -1951,57 +1999,28 @@ impl Cache {
             let restored_files = noted.groups.get(location.name);
             let mut group = WarmGroup::default();
             let mut pending = Vec::new();
-            for path in location.paths()? {
-                paths::safe_parents(&location.base, &path)?;
-                let absolute = location.base.join(&path);
-                let metadata = match fs::symlink_metadata(&absolute) {
-                    Err(error) if gone(&error) => continue,
-                    result => result?,
-                };
-                let artifact = if metadata.file_type().is_symlink() {
-                    let target = match fs::read_link(&absolute) {
-                        Err(error) if gone(&error) => continue,
-                        result => result?,
-                    };
-                    let target = target
-                        .to_str()
-                        .context("symlink target must be UTF-8")?
-                        .to_owned();
-                    validate_link(&path, &target)?;
-                    Artifact::Symlink {
-                        target,
-                        directory: absolute.is_dir(),
-                    }
-                } else if metadata.is_file() {
-                    let now = stamp(&metadata);
-                    let saved = known.and_then(|known| {
-                        (known.stamps.get(&path) == Some(&now))
-                            .then(|| known.artifacts.get(&path))
-                            .flatten()
-                    });
-                    let restored = restored_files
-                        .and_then(|files| files.get(&path))
-                        .filter(|(stamp, _)| *stamp == now)
-                        .map(|(_, artifact)| artifact);
-                    let reused = saved.or(restored).filter(|artifact| match artifact {
-                        Artifact::File { blob, .. } => self.root.join("blobs").join(blob).is_file(),
-                        _ => false,
-                    });
-                    let Some(artifact) = reused.cloned() else {
+            let listed: Vec<String> = location.paths()?.into_iter().collect();
+            // Nothing writes the group's directories while it is saved, so
+            // each is checked not to be a link once, not once per file in it.
+            let directories = Mutex::new(foldhash::HashSet::default());
+            let looked = crate::hash::in_parallel(&listed, LOOKED_PER_THREAD, |path| {
+                self.look_at(location, path, known, restored_files, &directories)
+            })?;
+            for (path, looked) in listed.into_iter().zip(looked) {
+                let artifact = match looked {
+                    Looked::Gone => continue,
+                    Looked::Unread(absolute, metadata) => {
                         pending.push((path, absolute, metadata));
                         continue;
-                    };
-                    group.stamps.insert(path.clone(), now);
-                    if let Some(modified) = metadata.modified().ok().and_then(nanos) {
-                        group.mtimes.insert(path.clone(), modified);
                     }
-                    artifact
-                } else if metadata.is_dir() {
-                    Artifact::Directory {
-                        mode: mode(&metadata),
+                    Looked::Saved(artifact, metadata) => {
+                        group.stamps.insert(path.clone(), stamp(&metadata));
+                        if let Some(modified) = metadata.modified().ok().and_then(nanos) {
+                            group.mtimes.insert(path.clone(), modified);
+                        }
+                        artifact
                     }
-                } else {
-                    continue;
+                    Looked::Other(artifact) => artifact,
                 };
                 group.artifacts.insert(path, artifact);
             }
@@ -2078,6 +2097,67 @@ impl Cache {
             remote.upload_warm(&self.root, &warm.identity, &identity, branch, bytes);
         }
         Ok(())
+    }
+
+    /// What a save makes of one of a group's paths: a file whose metadata
+    /// matches its last save's or restore's, and whose blob is still stored,
+    /// keeps that blob unread. `directories` are those already checked not to
+    /// be links.
+    fn look_at(
+        &self,
+        location: &Location,
+        path: &str,
+        known: Option<&WarmGroup>,
+        restored_files: Option<&GroupFiles>,
+        directories: &Mutex<foldhash::HashSet<PathBuf>>,
+    ) -> Result<Looked> {
+        let gone = |error: &std::io::Error| error.kind() == std::io::ErrorKind::NotFound;
+        paths::safe_parents_once(&location.base, path, "cache artifact", directories)?;
+        let absolute = location.base.join(path);
+        let metadata = match fs::symlink_metadata(&absolute) {
+            Err(error) if gone(&error) => return Ok(Looked::Gone),
+            result => result?,
+        };
+        if metadata.file_type().is_symlink() {
+            let target = match fs::read_link(&absolute) {
+                Err(error) if gone(&error) => return Ok(Looked::Gone),
+                result => result?,
+            };
+            let target = target
+                .to_str()
+                .context("symlink target must be UTF-8")?
+                .to_owned();
+            validate_link(path, &target)?;
+            Ok(Looked::Other(Artifact::Symlink {
+                target,
+                directory: absolute.is_dir(),
+            }))
+        } else if metadata.is_file() {
+            let now = stamp(&metadata);
+            let saved = known.and_then(|known| {
+                (known.stamps.get(path) == Some(&now))
+                    .then(|| known.artifacts.get(path))
+                    .flatten()
+            });
+            let restored = restored_files
+                .and_then(|files| files.get(path))
+                .filter(|(stamp, _)| *stamp == now)
+                .map(|(_, artifact)| artifact);
+            let reused = saved.or(restored).filter(|artifact| match artifact {
+                Artifact::File { blob, .. } => self.root.join("blobs").join(blob).is_file(),
+                _ => false,
+            });
+            Ok(match reused {
+                Some(artifact) => Looked::Saved(artifact.clone(), metadata),
+                None => Looked::Unread(absolute, metadata),
+            })
+        } else if metadata.is_dir() {
+            Ok(Looked::Other(Artifact::Directory {
+                mode: mode(&metadata),
+            }))
+        } else {
+            Ok(Looked::Gone)
+        }
     }
 
     /// On the default branch, a result taken from the cache under `key`
@@ -2202,13 +2282,19 @@ impl Save {
         prepared: &qk_executor::PreparedTask,
         adoptables: Option<&Adoptables>,
     ) -> Result<Self> {
+        // Each asks git in a process of its own, so they ask at once.
+        let (commit, branch) = std::thread::scope(|scope| {
+            let commit = scope.spawn(|| current_commit(workspace));
+            let branch = current_branch(workspace);
+            (commit.join().expect("commit lookup panicked"), branch)
+        });
         Ok(Self {
             task: task.id.clone(),
             warm: warm.clone(),
             locations: locations(workspace, task, warm)?,
             worktree: worktree(workspace),
-            commit: current_commit(workspace),
-            branch: current_branch(workspace),
+            commit,
+            branch,
             default_branch: default_branch(workspace),
             key: key_digests(workspace, warm, prepared)?,
             notes: restored_files_path(workspace, warm),
@@ -2252,6 +2338,66 @@ mod tests {
         )
         .unwrap();
         (temp, workspace, graph)
+    }
+
+    /// A save reads only the files changed since this worktree's last save,
+    /// and keeps the newest saves of the task, whoever made them.
+    #[test]
+    fn a_save_reads_only_changed_files_and_keeps_the_newest_saves() {
+        let (temp, workspace, graph) = fixture();
+        let task = &graph.tasks["app:one"];
+        let warm = config(&workspace, task).unwrap().remove(0);
+        let prepared = qk_executor::prepare(&workspace, task, &BTreeMap::new()).unwrap();
+        let cache = Cache::new(temp.path().join("cache"));
+        cache.initialize().unwrap();
+        fs::write(temp.path().join("scratch-one/other"), "first").unwrap();
+        cache
+            .save_warm(&workspace, task, &warm, &prepared, None)
+            .unwrap();
+        let blob = |path: &str| {
+            let (_, record) = cache.warm_records(&warm).remove(0);
+            match &record.groups["paths"].artifacts[path] {
+                Artifact::File { blob, .. } => blob.clone(),
+                _ => panic!("{path} was saved as no file"),
+            }
+        };
+        let state = blob("scratch-one/state");
+        // Saves other worktrees made earlier.
+        for saved in 1..=KEPT as u64 + 1 {
+            let record = WarmRecord::new(
+                warm.identity.clone(),
+                format!("elsewhere-{saved}"),
+                None,
+                saved,
+                Vec::new(),
+            );
+            cache.store_warm(&record).unwrap();
+        }
+        // A save reading the file would replace the blob that no longer
+        // holds its content; one taking the last save's leaves it.
+        fs::write(cache.root.join("blobs").join(&state), "damaged").unwrap();
+        fs::write(temp.path().join("scratch-one/other"), "second").unwrap();
+        cache
+            .save_warm(&workspace, task, &warm, &prepared, None)
+            .unwrap();
+        assert_eq!(blob("scratch-one/state"), state);
+        assert_eq!(
+            fs::read(cache.root.join("blobs").join(&state)).unwrap(),
+            b"damaged"
+        );
+        assert_eq!(
+            fs::read(cache.root.join("blobs").join(blob("scratch-one/other"))).unwrap(),
+            b"second"
+        );
+        let kept: Vec<String> = cache
+            .warm_records(&warm)
+            .into_iter()
+            .map(|(_, record)| record.worktree)
+            .collect();
+        assert_eq!(kept.len(), KEPT);
+        assert_eq!(kept[0], worktree(&workspace));
+        assert!(!kept.contains(&"elsewhere-1".to_owned()));
+        assert!(!kept.contains(&"elsewhere-2".to_owned()));
     }
 
     /// A save's commit that a shallow, partial clone lacks is not among its
