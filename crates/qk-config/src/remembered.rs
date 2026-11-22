@@ -89,9 +89,10 @@
 //!   be pointed at another file as old as the first, and then no stamp is
 //!   newer than the walk. A walk that read an ignore file or a `.git`
 //!   through a link within the workspace is therefore not remembered, and
-//!   such a workspace is walked on every load. Above the root a link is
-//!   stamped before the walk, through every link it leads to, and compared
-//!   afterwards, which does show it.
+//!   such a workspace is walked on every load. So is one that takes a
+//!   `.gitignore` or a `.git` above the root through a link: those are
+//!   looked at before the walk and compared after, but a link among the
+//!   directories one leads through can lead elsewhere for the walk alone.
 //!
 //! # When the record does not hold
 //!
@@ -275,6 +276,18 @@ pub(crate) fn before_walk(root: &Path) -> Option<Before> {
                 return None;
             }
             above.push((ancestor.to_owned(), look?.0));
+            // What the walk takes from here, the rules of a `.gitignore`
+            // and whether a `.git` is there, it may reach through a link.
+            // A link among the directories that one leads through can lead
+            // elsewhere while the walk runs and back again after, which no
+            // look before or after shows, so such a walk is not remembered.
+            let linked = [".gitignore", ".git"].iter().any(|name| {
+                std::fs::symlink_metadata(ancestor.join(name))
+                    .is_ok_and(|metadata| metadata.is_symlink())
+            });
+            if linked {
+                return None;
+            }
         }
         for name in [".gitignore", ".nxignore", ".git/info/exclude"] {
             let path = ancestor.join(name);
@@ -995,7 +1008,23 @@ mod tests {
         assert_ne!(walked, before);
         assert_eq!(shown(fixture.load()), walked);
 
-        // So too for what lies beneath a linked `.git`.
+        // So too for a `.gitignore` above the root reached through a link:
+        // no walk of it is remembered.
+        let fixture = Fixture::new();
+        write(&fixture.outer.join("old/rules"), "unrelated/\n");
+        symlink("old", fixture.outer.join("via")).unwrap();
+        std::fs::remove_file(fixture.outer.join(".gitignore")).unwrap();
+        symlink(
+            fixture.outer.join("via/rules"),
+            fixture.outer.join(".gitignore"),
+        )
+        .unwrap();
+        fixture.settle();
+        assert!(before_walk(&fixture.root).is_none());
+        assert_eq!(shown(fixture.load()), shown(fixture.walk()));
+        assert_eq!(fixture.record(), None);
+
+        // And for what lies beneath a linked `.git` in the workspace.
         let fixture = Fixture::new();
         write(&fixture.outer.join("elsewhere/info/exclude"), "apps/\n");
         symlink(fixture.outer.join("elsewhere"), fixture.root.join(".git")).unwrap();
