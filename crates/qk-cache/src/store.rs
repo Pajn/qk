@@ -505,12 +505,18 @@ impl Cache {
             artifacts.insert(path, artifact);
         }
         // The remembered blob of each file left as it was, if the store still
-        // holds it.
+        // holds it at the file's size: one cut short is stored again, which
+        // replaces it. A blob is otherwise read only when it is restored,
+        // and a restore that finds it damaged runs the task and stores the
+        // file anew.
         let reused =
             crate::hash::in_parallel(&pending, LOOKED_PER_THREAD, |(path, _, metadata)| {
                 Ok(remembered
                     .blob(path, &crate::warm::stamp(metadata))
-                    .filter(|blob| self.root.join("blobs").join(blob).is_file())
+                    .filter(|blob| {
+                        fs::metadata(self.root.join("blobs").join(blob))
+                            .is_ok_and(|held| held.is_file() && held.len() == metadata.len())
+                    })
                     .map(str::to_owned))
             })?;
         let sources: Vec<_> = pending
@@ -1156,8 +1162,9 @@ const STAMPS_PER_THREAD: usize = 256;
 /// Directories and links are left alone, and so are their stamps: setting a
 /// time through a link would change the file it points to, and setting a
 /// file's time changes nothing about the directory holding it. An error is
-/// one setting a time; one reading a stamp back only leaves the outputs
-/// unrecorded, so that the next restore checks them again.
+/// one setting a time; a stamp that cannot be read back, or that is of
+/// another file than the one checked, of another size or mode, only leaves
+/// the outputs unrecorded, so that the next restore checks them again.
 fn stamp_outputs(
     root: &Path,
     task: &str,
@@ -1176,7 +1183,8 @@ fn stamp_outputs(
         set_modified(&absolute, time)?;
         Ok(fs::symlink_metadata(&absolute)
             .ok()
-            .map(|metadata| output_stamp(&metadata)))
+            .map(|metadata| output_stamp(&metadata))
+            .filter(|stamped| same_but_times(&stamps[*path], stamped)))
     })?;
     let stamped: Option<Vec<(String, Vec<i64>)>> = files
         .iter()
@@ -1341,6 +1349,17 @@ pub(crate) fn written_since(root: &Path, outputs: &Outputs, since: SystemTime) -
         Ok(walked.into_iter().any(|written| written))
     };
     written().unwrap_or(true)
+}
+
+/// Whether two stamps of an output differ in nothing but their times: its
+/// kind, size and mode and, on Unix, its inode are the same, so setting a
+/// time is all that happened to it between them, unless it was written in
+/// place at the same size meanwhile.
+fn same_but_times(checked: &[i64], stamped: &[i64]) -> bool {
+    // Kind, size, modification time, mode; then on Unix the change time's
+    // two parts and the inode.
+    let same = |index: usize| checked.get(index) == stamped.get(index);
+    checked.len() == stamped.len() && same(0) && same(1) && same(3) && same(6)
 }
 
 /// One output's stamp, from its metadata read without following a link:
@@ -1633,9 +1652,10 @@ mod tests {
         let first = "a".repeat(64);
         publish_later(&cache, root, &first, &outputs, &log);
         let kept = published_blob(&cache, &first, "out/nested/kept");
-        // Remembered as holding other stored content, the file is not read:
-        // its entry takes the blob remembered.
-        let other = cache.put_blob(&root.join("out/changed")).unwrap();
+        // Remembered as holding other stored content of its size, the file
+        // is not read: its entry takes the blob remembered.
+        fs::write(root.join("other"), "else").unwrap();
+        let other = cache.put_blob(&root.join("other")).unwrap();
         let mut published: Published =
             serde_json::from_slice(&fs::read(Published::path(root, &outputs)).unwrap()).unwrap();
         assert_eq!(published.boot.as_deref(), Some(boot.as_str()));
@@ -1699,10 +1719,21 @@ mod tests {
         let second = "b".repeat(64);
         publish_later(&cache, root, &second, &outputs, &log);
         assert_eq!(published_blob(&cache, &second, "out/nested/kept"), kept);
-        assert_eq!(
-            fs::read(cache.root.join("blobs").join(&kept)).unwrap(),
-            b"kept"
-        );
+        let held = || fs::read(cache.root.join("blobs").join(&kept)).unwrap();
+        assert_eq!(held(), b"kept");
+        // Cut short in the store: stored again, which replaces it.
+        fs::write(cache.root.join("blobs").join(&kept), "").unwrap();
+        publish_later(&cache, root, &"d".repeat(64), &outputs, &log);
+        assert_eq!(held(), b"kept");
+        // Remembered as a blob of another size: read again.
+        let longer = cache.put_blob(&root.join("out/changed")).unwrap();
+        let mut published: Published =
+            serde_json::from_slice(&fs::read(Published::path(root, &outputs)).unwrap()).unwrap();
+        published.files.get_mut("out/nested/kept").unwrap().1 = longer;
+        published.save(root, &outputs);
+        let sized = "e".repeat(64);
+        publish_later(&cache, root, &sized, &outputs, &log);
+        assert_eq!(published_blob(&cache, &sized, "out/nested/kept"), kept);
         // Remembered in another boot, whose crash may have lost the blob's
         // contents: read again.
         let other = cache.put_blob(&root.join("out/changed")).unwrap();
@@ -2450,8 +2481,41 @@ mod tests {
         assert!(cache.kept.lock().unwrap().contains("build"));
     }
 
-    /// Setting a link's time sets the link's own, never its target's.
-    #[cfg(unix)]
+    /// A file that is not the one checked when it comes to be stamped, here
+    /// of another size, leaves the outputs unrecorded, so that the next
+    /// restore checks them.
+    #[test]
+    fn stamping_records_nothing_for_a_file_that_is_not_the_one_checked() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("out")).unwrap();
+        fs::write(root.join("out/a"), "one").unwrap();
+        let outputs = Outputs::from_patterns(&["out"]);
+        let checked = output_stamps(root, &outputs).unwrap();
+        stamp_outputs(root, "build", "key", checked.clone(), SystemTime::now()).unwrap();
+        assert!(outputs_record(root, "build").is_file());
+
+        fs::write(root.join("out/a"), "longer").unwrap();
+        stamp_outputs(root, "build", "key", checked, SystemTime::now()).unwrap();
+        assert!(!outputs_record(root, "build").exists());
+
+        let stamp = output_stamps(root, &outputs)
+            .unwrap()
+            .remove("out/a")
+            .unwrap();
+        let mut later = stamp.clone();
+        later[2] += 1;
+        assert!(same_but_times(&stamp, &later));
+        for index in [0, 1, 3] {
+            let mut other = stamp.clone();
+            other[index] += 1;
+            assert!(!same_but_times(&stamp, &other), "{index}");
+        }
+    }
+
+    /// Setting a link's time sets the link's own, never its target's, where
+    /// a time is set by path.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn setting_a_time_does_not_follow_a_link() {
         let temp = tempfile::tempdir().unwrap();
