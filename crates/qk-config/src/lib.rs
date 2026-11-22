@@ -178,8 +178,8 @@ pub const LOCAL_WORKSPACE: &str = "nx.local.json";
 
 /// Reads the workspace and project configuration files for
 /// [`Workspace::load_with`]: the text of a file by its absolute path, or
-/// `None` when it is absent.
-pub type ConfigReader<'a> = &'a dyn Fn(&Path) -> Result<Option<String>>;
+/// `None` when it is absent. Projects are read on several threads at once.
+pub type ConfigReader<'a> = &'a (dyn Fn(&Path) -> Result<Option<String>> + Sync);
 
 /// The files `load` reads, from disk.
 fn read_disk(path: &Path) -> Result<Option<String>> {
@@ -456,40 +456,38 @@ impl Workspace {
         }
         // A wrong `cli.packageManager` fails only what runs scripts.
         let package_manager = workspace.package_manager_name().unwrap_or("npm");
-        let mut roots = BTreeMap::new();
-        for (directory, in_workspaces) in
+        let directories: Vec<(PathBuf, bool)> =
             discovery::project_directories(&root, read, &mut workspace.warnings)?
-        {
-            let manifest = |name: &str| -> Result<Option<Value>> {
-                let path = directory.join(name);
-                read(&path)?
-                    .map(|text| parse_json(&text, &path.display().to_string()))
-                    .transpose()
-            };
-            let project_json = manifest("project.json")?;
-            let local = manifest(LOCAL_OVERRIDES)?;
-            let package: Option<Package> = package_json(&directory.join("package.json"))?
-                .map(serde_json::from_value)
-                .transpose()
-                .with_context(|| format!("invalid {}", directory.join("package.json").display()))?;
+                .into_iter()
+                .collect();
+        // Each directory's manifests are read and its project normalized on
+        // its own, which depends on no other project, so that happens on
+        // several threads; the results are then taken in the order of the
+        // directories, as one thread would have met them, so that the same
+        // projects make the same errors whichever thread finishes first.
+        let config = &workspace.config;
+        let loaded = parallel_map(&directories, |(directory, in_workspaces)| {
+            read_project(
+                &root,
+                directory,
+                *in_workspaces,
+                config,
+                package_manager,
+                read,
+            )
+        });
+        let mut roots = BTreeMap::new();
+        for ((directory, _), loaded) in directories.iter().zip(loaded) {
             // A project.json `read` holds absent, as at a revision before it
             // was added, makes no project of a directory with nothing else.
-            if project_json.is_none() && package.is_none() {
+            let Some(LoadedProject {
+                project,
+                package,
+                has_local,
+            }) = loaded?
+            else {
                 continue;
-            }
-            let project = normalize::project(
-                &normalize::Origin {
-                    root: &root,
-                    directory: &directory,
-                    config: &workspace.config,
-                    in_workspaces,
-                    package_manager,
-                },
-                project_json,
-                local.clone(),
-                package.as_ref(),
-            )
-            .with_context(|| format!("invalid project in {}", directory.display()))?;
+            };
             if let Some(previous) = workspace.projects.get(&project.name) {
                 bail!(
                     "duplicate project name {:?}: {} and {}",
@@ -507,27 +505,14 @@ impl Workspace {
                     project.root
                 );
             }
-            // As in Nx, a project's dependencies, scripts and lockfile
-            // importer are its root's package.json, which is not the one
-            // beside its configuration when the configuration gives
-            // another root.
-            let package = if relative_path(&root, &directory)? == project.root {
-                package
-            } else {
-                let manifest = root.join(&project.root).join("package.json");
-                package_json(&manifest)?
-                    .map(serde_json::from_value)
-                    .transpose()
-                    .with_context(|| format!("invalid {}", manifest.display()))?
-            };
-            if let Some(package) = package {
+            if let Some(package) = package? {
                 workspace.packages.insert(project.name.clone(), package);
             }
             workspace
                 .configuration_directories
-                .insert(project.name.clone(), relative_path(&root, &directory)?);
-            if local.is_some() {
-                let root = match relative_path(&root, &directory)?.as_str() {
+                .insert(project.name.clone(), relative_path(&root, directory)?);
+            if has_local {
+                let root = match relative_path(&root, directory)?.as_str() {
                     "." => String::new(),
                     directory => format!("{directory}/"),
                 };
@@ -539,6 +524,122 @@ impl Workspace {
         }
         Ok(workspace)
     }
+}
+
+/// What one directory's manifests make, before it joins the workspace.
+struct LoadedProject {
+    project: Project,
+    /// The package.json of the project's root, or the error reading it,
+    /// which [`Workspace::load_with`] reports only once the project is
+    /// known not to clash with another, as it was read after those checks.
+    package: Result<Option<Package>>,
+    /// Whether a `project.local.json` was merged in.
+    has_local: bool,
+}
+
+/// The project the manifests in `directory` make, each read with `read`, or
+/// `None` when it has neither a project.json nor a package.json.
+fn read_project(
+    root: &Path,
+    directory: &Path,
+    in_workspaces: bool,
+    config: &WorkspaceConfig,
+    package_manager: &str,
+    read: ConfigReader,
+) -> Result<Option<LoadedProject>> {
+    let json = |path: &Path| -> Result<Option<Value>> {
+        read(path)?
+            .map(|text| parse_json(&text, &path.display().to_string()))
+            .transpose()
+    };
+    let package = |path: &Path| -> Result<Option<Package>> {
+        json(path)?
+            .map(serde_json::from_value)
+            .transpose()
+            .with_context(|| format!("invalid {}", path.display()))
+    };
+    let project_json = json(&directory.join("project.json"))?;
+    let local = json(&directory.join(LOCAL_OVERRIDES))?;
+    let own_package = package(&directory.join("package.json"))?;
+    if project_json.is_none() && own_package.is_none() {
+        return Ok(None);
+    }
+    let has_local = local.is_some();
+    let project = normalize::project(
+        &normalize::Origin {
+            root,
+            directory,
+            config,
+            in_workspaces,
+            package_manager,
+        },
+        project_json,
+        local,
+        own_package.as_ref(),
+    )
+    .with_context(|| format!("invalid project in {}", directory.display()))?;
+    // As in Nx, a project's dependencies, scripts and lockfile importer are
+    // its root's package.json, which is not the one beside its
+    // configuration when the configuration gives another root.
+    let package = if relative_path(root, directory)? == project.root {
+        Ok(own_package)
+    } else {
+        package(&root.join(&project.root).join("package.json"))
+    };
+    Ok(Some(LoadedProject {
+        project,
+        package,
+        has_local,
+    }))
+}
+
+/// The most threads [`parallel_map`] uses. Reading and normalizing a
+/// project takes a fraction of a millisecond, so beyond a few threads the
+/// cost of starting them outweighs what they share.
+const MAX_LOAD_THREADS: usize = 8;
+
+/// `items` mapped by `map` on several threads, the results in the order of
+/// `items` whatever order the threads finish them in.
+fn parallel_map<T: Sync, R: Send>(items: &[T], map: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    // Each thread takes some dozens of items, so that a small workspace
+    // does not start threads it cannot use.
+    let threads = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(MAX_LOAD_THREADS)
+        .min(items.len().div_ceil(32));
+    if threads <= 1 {
+        return items.iter().map(map).collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut results: Vec<Option<R>> = std::iter::repeat_with(|| None).take(items.len()).collect();
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(item) = items.get(index) else {
+                            return done;
+                        };
+                        done.push((index, map(item)));
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            let done = worker
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            for (index, result) in done {
+                results[index] = Some(result);
+            }
+        }
+    });
+    results
+        .into_iter()
+        .map(|result| result.expect("every item is mapped"))
+        .collect()
 }
 
 impl Workspace {

@@ -25,9 +25,9 @@ pub use projections::{ProjectionFallbackKind, ProjectionFallbackPolicy, Projecti
 pub use reachability::{Decision, Kept, TaskDecision};
 pub use tasks::{TaskAnalysis, TaskCause, TaskReason, affected_tasks};
 
-use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::OnceLock;
 use subprocess::workspace_command;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -548,9 +548,9 @@ struct Changes<'a> {
     projections: Vec<ProjectionReport>,
     original_files: Option<Vec<String>>,
     workspace: &'a Workspace,
-    before_lockfile: OnceCell<std::result::Result<Lockfile, String>>,
-    after_lockfile: OnceCell<std::result::Result<Lockfile, String>>,
-    manifests: OnceCell<manifests::ManifestChange>,
+    before_lockfile: OnceLock<std::result::Result<Lockfile, String>>,
+    after_lockfile: OnceLock<std::result::Result<Lockfile, String>>,
+    manifests: OnceLock<manifests::ManifestChange>,
     files: Vec<String>,
     /// The files were named rather than compared, as with `--files`: each
     /// counts as changed whole, as in Nx.
@@ -709,9 +709,9 @@ impl<'a> Changes<'a> {
             projections: Vec::new(),
             original_files: None,
             workspace,
-            before_lockfile: OnceCell::new(),
-            after_lockfile: OnceCell::new(),
-            manifests: OnceCell::new(),
+            before_lockfile: OnceLock::new(),
+            after_lockfile: OnceLock::new(),
+            manifests: OnceLock::new(),
             files,
             whole,
             base,
