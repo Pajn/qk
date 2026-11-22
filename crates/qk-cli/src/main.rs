@@ -547,9 +547,11 @@ impl RunOptions {
     }
 
     /// Sets what Nx sets in its own environment for these options, so tasks
-    /// and the remote cache see it. Called before any thread starts, and
-    /// safe to call again.
+    /// and the remote cache see it. Called while this is the only thread,
+    /// and safe to call again: the one thread started before it, asking Git
+    /// for the repository's directories, is waited for first.
     fn export(&self) {
+        qk_cache::await_git_dirs();
         let set = |name: &str| {
             // Only this thread exists yet.
             unsafe { std::env::set_var(name, "true") }

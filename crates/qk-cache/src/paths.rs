@@ -100,7 +100,22 @@ fn git_dirs(root: &Path) -> Option<(PathBuf, PathBuf)> {
 /// worktree state, cache and history of a run are all found from them.
 pub fn prefetch_git_dirs(root: &Path) {
     let root = root.to_owned();
-    std::thread::spawn(move || git_dirs(&root));
+    let asking = std::thread::spawn(move || {
+        git_dirs(&root);
+    });
+    *PREFETCH.lock().unwrap() = Some(asking);
+}
+
+/// The thread [`prefetch_git_dirs`] started, until it is waited for.
+static PREFETCH: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
+
+/// Waits for the thread [`prefetch_git_dirs`] started, if it still runs, for
+/// a caller that needs to be the process's only thread, as one changing the
+/// environment does.
+pub fn await_git_dirs() {
+    if let Some(asking) = PREFETCH.lock().unwrap().take() {
+        let _ = asking.join();
+    }
 }
 
 fn ask_git_dirs(root: &Path) -> Option<(PathBuf, PathBuf)> {

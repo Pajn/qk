@@ -46,8 +46,8 @@ pub use inputs::{
 pub use paths::expand as expand_project_path;
 pub use paths::git as workspace_git;
 pub use paths::{
-    Outputs, cache_directory, cache_location, clear_worktree_state, prefetch_git_dirs,
-    resolved_outputs, worktree_state,
+    Outputs, await_git_dirs, cache_directory, cache_location, clear_worktree_state,
+    prefetch_git_dirs, resolved_outputs, worktree_state,
 };
 
 /// The nx.json settings of the workspace's remote store: its `s3`, as Nx's
