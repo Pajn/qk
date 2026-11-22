@@ -439,8 +439,9 @@ impl Cache {
         })
     }
 
-    /// Stores the task's outputs and log under `key`. An output file whose
-    /// stamp matches what [`Published`] remembers keeps that blob unread.
+    /// Stores the task's outputs and log under `key`: [`Self::gather`], then
+    /// [`Self::publish_gathered`], as a run does with the recheck between.
+    #[cfg(test)]
     pub(crate) fn publish(
         &self,
         root: &Path,
@@ -448,22 +449,34 @@ impl Cache {
         outputs: &Outputs,
         log: &Path,
     ) -> Result<()> {
-        self.publish_at(root, key, outputs, log, SystemTime::now())
+        let artifacts = self.gather(root, outputs)?;
+        self.publish_gathered(key, &artifacts, log)
     }
 
-    /// [`Self::publish`], begun at `started`, which judges whether a file's
-    /// stamp is settled.
-    fn publish_at(
+    /// Stores the blobs of the task's outputs, and returns the artifacts an
+    /// entry records for them. An output file whose stamp matches what
+    /// [`Published`] remembers keeps that blob unread. Nothing cites the
+    /// blobs until [`Self::publish_gathered`] does, so gathering for a result
+    /// that is then not kept leaves only blobs eviction removes.
+    pub(crate) fn gather(
         &self,
         root: &Path,
-        key: &str,
         outputs: &Outputs,
-        log: &Path,
+    ) -> Result<BTreeMap<String, Artifact>> {
+        self.gather_at(root, outputs, SystemTime::now())
+    }
+
+    /// [`Self::gather`], begun at `started`, which judges whether a file's
+    /// stamp is settled.
+    fn gather_at(
+        &self,
+        root: &Path,
+        outputs: &Outputs,
         started: SystemTime,
-    ) -> Result<()> {
+    ) -> Result<BTreeMap<String, Artifact>> {
         let boot = crate::verified::boot();
         let remembered = Published::load(root, outputs, boot.as_deref());
-        // Nothing writes the outputs while they are published, so each
+        // Nothing writes the outputs while they are gathered, so each
         // directory is checked not to be a link once, not once per file in it.
         let directories = std::sync::Mutex::new(foldhash::HashSet::default());
         let mut artifacts = BTreeMap::new();
@@ -503,14 +516,12 @@ impl Cache {
                     .filter(|blob| self.root.join("blobs").join(blob).is_file())
                     .map(str::to_owned))
             })?;
-        let mut sources: Vec<_> = pending
+        let sources: Vec<_> = pending
             .iter()
             .zip(&reused)
             .filter(|(_, reused)| reused.is_none())
             .map(|((_, source, _), _)| source.clone())
             .collect();
-        sources.push(log.to_owned());
-        // Every worker finishes before any manifest is published.
         let mut blobs = self.put_blobs(&sources).into_iter();
         let mut published = Published::new(boot);
         let mut read = Vec::new();
@@ -537,16 +548,6 @@ impl Cache {
                 },
             );
         }
-        let manifest = ResultRecord::new(
-            key.into(),
-            blobs.next().expect("log blob result")?,
-            artifacts,
-        );
-        record::publish(
-            &self.root,
-            &self.root.join("entries").join(format!("{key}.json")),
-            &manifest,
-        )?;
         // A file read with the same settled stamp before and after was not
         // written while it was read, so its blob holds what that stamp names.
         let unchanged =
@@ -562,7 +563,23 @@ impl Cache {
         if published.boot.is_some() && published != remembered {
             published.save(root, outputs);
         }
-        Ok(())
+        Ok(artifacts)
+    }
+
+    /// Stores the log and publishes the entry for `key` with `artifacts`, as
+    /// [`Self::gather`] returned them.
+    pub(crate) fn publish_gathered(
+        &self,
+        key: &str,
+        artifacts: &BTreeMap<String, Artifact>,
+        log: &Path,
+    ) -> Result<()> {
+        let manifest = ResultRecord::new(key.into(), self.put_blob(log)?, artifacts.clone());
+        record::publish(
+            &self.root,
+            &self.root.join("entries").join(format!("{key}.json")),
+            &manifest,
+        )
     }
 
     /// The local entry for `key` with the path of its log, which is checked
@@ -1425,7 +1442,8 @@ mod tests {
     /// settled.
     fn publish_later(cache: &Cache, root: &Path, key: &str, outputs: &Outputs, log: &Path) {
         let later = SystemTime::now() + Duration::from_secs(3600);
-        cache.publish_at(root, key, outputs, log, later).unwrap();
+        let artifacts = cache.gather_at(root, outputs, later).unwrap();
+        cache.publish_gathered(key, &artifacts, log).unwrap();
     }
 
     #[test]

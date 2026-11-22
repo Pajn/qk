@@ -1212,9 +1212,29 @@ impl Cache {
             .remote
             .clone()
             .map(|remote| warm::Adoptables::new(remote, self.root.clone(), task.id.clone()));
-        let warm_report = after(outcome, restored, running, adoptables.as_ref());
-        let inputs_unchanged =
-            self.inputs_match(snapshot, workspace, graph, task, prepared, &key, cancelled);
+        // The recheck reads the task's inputs; the warm save and gathering
+        // the outputs for an entry read the outputs and warm paths and write
+        // to the cache, which is no input. So the three run side by side, and
+        // the entry is published from what was gathered once the recheck
+        // finds the inputs unchanged.
+        let (warm_report, inputs_unchanged, gathered) = std::thread::scope(|scope| {
+            let recheck = scope.spawn(|| {
+                self.inputs_match(snapshot, workspace, graph, task, prepared, &key, cancelled)
+            });
+            let gathering = (outcome == Outcome::Success && !cancelled.load(Ordering::SeqCst))
+                .then(|| {
+                    scope.spawn(|| {
+                        let _publishing = profile::span(&task.id, "publish");
+                        self.gather(&workspace.root, &outputs)
+                    })
+                });
+            let warm_report = after(outcome, restored, running, adoptables.as_ref());
+            (
+                warm_report,
+                recheck.join().expect("input recheck panicked"),
+                gathering.map(|gathering| gathering.join().expect("output gathering panicked")),
+            )
+        });
         let execution = capture.take_log().map(|log| Execution {
             log,
             inputs_unchanged,
@@ -1257,11 +1277,25 @@ impl Cache {
         // The keys the result is kept under, for its warm saves.
         let mut kept_under = Vec::new();
         let kept = outcome == Outcome::Success && inputs_unchanged && capture.healthy();
+        // What was gathered, or, where a cancellation came between the
+        // recheck and gathering, what is gathered now. Every key the result
+        // is kept under records the same outputs.
+        let artifacts = kept.then(|| {
+            gathered.unwrap_or_else(|| {
+                let _publishing = profile::span(&task.id, "publish");
+                self.gather(&workspace.root, &outputs)
+            })
+        });
+        let publish_under = |key: &str| -> anyhow::Result<()> {
+            let _publishing = profile::span(&task.id, "publish_entry");
+            match &artifacts {
+                Some(Ok(artifacts)) => self.publish_gathered(key, artifacts, log.path()),
+                Some(Err(error)) => Err(anyhow::anyhow!("{error:#}")),
+                None => unreachable!("only a kept result is published"),
+            }
+        };
         if kept {
-            let publishing = profile::span(&task.id, "publish");
-            let publish = self.publish(&workspace.root, &key, &outputs, log.path());
-            drop(publishing);
-            match publish {
+            match publish_under(&key) {
                 Ok(()) => {
                     published = true;
                     kept_under.push(key.clone());
@@ -1270,7 +1304,7 @@ impl Cache {
                         remote.upload(&self.root, &key);
                     }
                     for strong in &replaced {
-                        match self.publish(&workspace.root, strong, &outputs, log.path()) {
+                        match publish_under(strong) {
                             Ok(()) => kept_under.push(strong.clone()),
                             Err(error) => qk_executor::status!(
                                 "qk: {}: could not replace a recorded cache entry ({error})",
@@ -1309,7 +1343,7 @@ impl Cache {
             (Some(Ok(set)), Some((_, weak, _))) if kept => {
                 let saved = recorded::with_values(weak, set, snapshot, &workspace.root, &unlisted)
                     .and_then(|(strong, set)| {
-                        self.publish(&workspace.root, &strong, &outputs, log.path())?;
+                        publish_under(&strong)?;
                         recorded::save(&self.root, weak, set)?;
                         // Shared, the sets are merged with those the store
                         // held when this task looked it up.
