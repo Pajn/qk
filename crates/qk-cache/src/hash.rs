@@ -990,9 +990,11 @@ pub(crate) enum Written {
     Nothing,
     /// Nothing but these paths and what lies below them.
     Within(Vec<String>),
-    /// Nothing but paths its declared outputs match: it was restored, or ran
-    /// a command, which is trusted to write only its declared outputs.
-    Declared(Box<Outputs>),
+    /// Nothing but paths its declared outputs match, and the paths beside
+    /// them with what lies below: it was restored, or ran a command, which is
+    /// trusted to write only its declared outputs, after its scratch
+    /// directories were emptied and its warm state restored.
+    Declared(Box<Outputs>, Vec<String>),
     /// Anything: it ran a command that declares no outputs.
     Anything,
 }
@@ -1005,7 +1007,9 @@ impl Written {
             Written::Within(written) => written
                 .iter()
                 .any(|a| anchors.iter().any(|b| overlaps_path(a, b))),
-            Written::Declared(outputs) => anchors.iter().any(|anchor| outputs.reaches(anchor)),
+            Written::Declared(outputs, beside) => anchors.iter().any(|anchor| {
+                outputs.reaches(anchor) || beside.iter().any(|path| overlaps_path(path, anchor))
+            }),
             Written::Anything => true,
         }
     }
@@ -1016,9 +1020,11 @@ impl std::fmt::Debug for Written {
         match self {
             Written::Nothing => f.write_str("Nothing"),
             Written::Within(paths) => f.debug_tuple("Within").field(paths).finish(),
-            Written::Declared(outputs) => {
-                f.debug_tuple("Declared").field(&outputs.globs()).finish()
-            }
+            Written::Declared(outputs, beside) => f
+                .debug_tuple("Declared")
+                .field(&outputs.globs())
+                .field(beside)
+                .finish(),
             Written::Anything => f.write_str("Anything"),
         }
     }
@@ -5409,15 +5415,18 @@ mod tests {
         // A file the listing does not hold, which only a fresh listing sees.
         std::fs::write(root.path().join("generated/added"), "added").unwrap();
         let post = &graph.tasks["app:post"];
-        let declared = |patterns: &[&str]| {
+        let beside = |patterns: &[&str], beside: &[&str]| {
             let patterns: Vec<String> = patterns.iter().map(|p| (*p).to_owned()).collect();
-            Written::Declared(Box::new(Outputs::from_paths(&patterns).unwrap()))
+            let beside = beside.iter().map(|path| (*path).to_owned()).collect();
+            Written::Declared(Box::new(Outputs::from_paths(&patterns).unwrap()), beside)
         };
+        let declared = |patterns: &[&str]| beside(patterns, &[]);
         for written in [
             Written::Nothing,
             Written::Within(vec!["elsewhere".into()]),
             Written::Within(vec!["generate".into()]),
             declared(&["elsewhere/*/generated", "generate/*"]),
+            beside(&["elsewhere/*"], &["generate", "warm"]),
         ] {
             snapshot.outputs_written(&workspace, post, written, None);
             assert_eq!(before, keys());
@@ -5426,6 +5435,9 @@ mod tests {
             Written::Within(vec!["generated/added".into()]),
             Written::Within(vec![".".into(), "generated".into()]),
             declared(&["generated/*.txt"]),
+            // Warm state restored where the outputs do not reach.
+            beside(&["elsewhere/*"], &["generated"]),
+            beside(&["elsewhere/*"], &["warm", "generated/added"]),
             Written::Anything,
         ] {
             snapshot.outputs_written(&workspace, post, Written::Nothing, None);

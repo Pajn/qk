@@ -180,7 +180,9 @@ struct Ran {
 /// and may have written anything when it declares none.
 fn commands_wrote(outputs: Result<paths::Outputs>) -> hash::Written {
     match outputs {
-        Ok(outputs) if outputs.is_explicit() => hash::Written::Declared(Box::new(outputs)),
+        Ok(outputs) if outputs.is_explicit() => {
+            hash::Written::Declared(Box::new(outputs), Vec::new())
+        }
         _ => hash::Written::Anything,
     }
 }
@@ -486,7 +488,7 @@ impl Cache {
             // nothing but paths its outputs match.
             let written = match (&restore, outputs) {
                 (Some(Restore { kept: true, .. }), _) => hash::Written::Nothing,
-                (_, Ok(outputs)) => hash::Written::Declared(Box::new(outputs)),
+                (_, Ok(outputs)) => hash::Written::Declared(Box::new(outputs), Vec::new()),
                 (_, Err(_)) => hash::Written::Anything,
             };
             let files = restore.and_then(|restore| restore.files);
@@ -495,9 +497,9 @@ impl Cache {
                 files.map(|files| hash::RestoredOutputs { since, files }),
             );
         }
-        if prepared.commands.is_empty() {
-            // It ran no command, so it wrote nothing but the scratch
-            // directories emptied before its commands and its warm paths.
+        // Whatever it runs, its scratch directories are emptied and its warm
+        // state restored first, where its outputs need not reach.
+        let beside = {
             let scratch = scratch::directories(workspace, task).and_then(|directories| {
                 directories
                     .iter()
@@ -515,20 +517,25 @@ impl Cache {
             });
             let warm = warm::config(workspace, task)
                 .and_then(|entries| paths::Outputs::from_paths(&warm::kept_paths(&entries)));
-            let written = match (scratch, warm) {
+            match (scratch, warm) {
                 (Ok(mut paths), Ok(warm)) => {
                     paths.extend(warm.anchors().map(str::to_owned));
-                    if paths.is_empty() {
-                        hash::Written::Nothing
-                    } else {
-                        hash::Written::Within(paths)
-                    }
+                    Some(paths)
                 }
-                _ => hash::Written::Anything,
-            };
-            return (written, None);
-        }
-        (commands_wrote(outputs), None)
+                _ => None,
+            }
+        };
+        let written = match (beside, prepared.commands.is_empty()) {
+            (None, _) => hash::Written::Anything,
+            // It ran no command, so it wrote nothing else.
+            (Some(beside), true) if beside.is_empty() => hash::Written::Nothing,
+            (Some(beside), true) => hash::Written::Within(beside),
+            (Some(beside), false) => match commands_wrote(outputs) {
+                hash::Written::Declared(outputs, _) => hash::Written::Declared(outputs, beside),
+                written => written,
+            },
+        };
+        (written, None)
     }
 
     /// The blobs hashed since the machine started, read on first use.
@@ -692,7 +699,7 @@ impl Cache {
                     passed.abs_diff(started.1.elapsed()) < std::time::Duration::from_secs(1)
                 });
             match commands_wrote(paths::Outputs::new(workspace, task)) {
-                hash::Written::Declared(outputs) if steady => Some(Ran {
+                hash::Written::Declared(outputs, _) if steady => Some(Ran {
                     root: workspace.root.clone(),
                     outputs,
                     started: started.0,

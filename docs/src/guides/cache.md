@@ -192,12 +192,15 @@ files are keyed independently of selective `dependentTasksOutputFiles` inputs.
 The source list is taken once per run, so a file that a task creates without
 declaring it as an output is seen from the next run. A dependency's output
 files are listed once per run, and a dependency taken from the cache is not
-listed at all: its restore says what it left. A listing is taken again after a
+listed at all: its restore says what it left, unless a task done since the
+restore began may have written among them. A listing is taken again after a
 task is done that may have written among those files: one whose declared
-outputs may match a path there, or one without declared outputs that ran a
-command. A task that ran no command, or whose restore left its outputs as they
-were, writes nothing; a task that writes into another task's outputs should
-declare the files it writes. A task whose filesets
+outputs may match a path there, one whose scratch directories or warm paths
+lie there, which are emptied and restored before it runs, or one without
+declared outputs that ran a command. A task that ran no command writes nothing
+else, and one whose restore left its outputs as they were writes nothing; a
+task that writes into another task's outputs should declare the files it
+writes. A task whose filesets
 each name a path, with no `json` glob, lists only those paths and what is
 beneath them, selecting what the source list would hold there, where Git or a
 root `.nxignore` can list them; a run of such tasks alone then takes no source
