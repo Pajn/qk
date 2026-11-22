@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
@@ -163,16 +163,14 @@ pub struct Snapshot {
     canonical_root: PathBuf,
     workspace_prefix: Option<PathBuf>,
     patterns: Mutex<HashMap<(String, bool, bool), Arc<Pattern>>>,
-    digests: Mutex<HashMap<String, (Stamp, String)>>,
-    /// Files whose digests this run used, which are saved beside those of
-    /// `files`, the source listing, which leaves out many of them: what
-    /// `includeIgnored` filesets read, other tasks' declared outputs, and
-    /// the targets of links.
-    read_files: Mutex<HashSet<String>>,
+    /// Each file's digest with the stamp it was taken at. Threads keying
+    /// files mostly find theirs here, which a read lock lets them do
+    /// together.
+    digests: RwLock<HashMap<String, Kept>>,
     /// Whether `digests` gained entries worth saving.
     digests_changed: std::sync::atomic::AtomicBool,
     /// Directories already checked not to be symlinks.
-    directories: Mutex<HashSet<PathBuf>>,
+    directories: RwLock<HashSet<PathBuf>>,
     /// Runtime input results by command and environment, computed once per run like Nx.
     runtime: Mutex<HashMap<RuntimeKey, Arc<Mutex<Option<Value>>>>>,
     /// The parsed pnpm lockfile, replaced whenever its content changes.
@@ -1207,10 +1205,9 @@ impl Snapshot {
             canonical_root: canonical_root.clone(),
             workspace_prefix: None,
             patterns: Mutex::default(),
-            digests: Mutex::default(),
+            digests: RwLock::default(),
             digests_changed: Default::default(),
-            read_files: Mutex::default(),
-            directories: Mutex::default(),
+            directories: RwLock::default(),
             runtime: Mutex::default(),
             lockfile: Mutex::default(),
             dependency_outputs: Mutex::default(),
@@ -1249,7 +1246,7 @@ impl Snapshot {
             ))
         })?;
         snapshot.lockfile = Mutex::new(lockfile);
-        snapshot.digests = Mutex::new(digests);
+        snapshot.digests = RwLock::new(digests);
         snapshot.workspace_prefix = workspace_prefix;
         Ok(snapshot)
     }
@@ -1652,18 +1649,17 @@ impl Snapshot {
             return;
         }
         self.settle();
-        let digests = self.digests.lock().unwrap();
-        let read = self.read_files.lock().unwrap();
+        let digests = self.digests.read().unwrap();
         let files = match self.files.get() {
             Some(Ok(files)) => Some(files),
             _ => None,
         };
         let entries: BTreeMap<&String, (&Stamp, &String)> = digests
             .iter()
-            .filter(|(path, _)| {
-                files.is_none_or(|files| files.contains(*path)) || read.contains(*path)
+            .filter(|(path, kept)| {
+                files.is_none_or(|files| files.contains(*path)) || kept.used.load(Ordering::Relaxed)
             })
-            .map(|(path, (stamp, digest))| (path, (stamp, digest)))
+            .map(|(path, kept)| (path, (&kept.stamp, &kept.digest)))
             .collect();
         let path = digests_path(root);
         let saved = (|| -> Result<()> {
@@ -1766,12 +1762,12 @@ impl Snapshot {
     }
 
     fn digest(&self, path: &str, absolute: &Path, metadata: &std::fs::Metadata) -> Result<String> {
-        self.read_files.lock().unwrap().insert(path.to_owned());
         let stamp = Stamp::new(metadata);
-        if let Some((known, digest)) = self.digests.lock().unwrap().get(path)
-            && *known == stamp
-        {
-            return Ok(digest.clone());
+        if let Some(kept) = self.digests.read().unwrap().get(path) {
+            kept.used.store(true, Ordering::Relaxed);
+            if kept.stamp == stamp {
+                return Ok(kept.digest.clone());
+            }
         }
         // Before reading: a write the window lets keep the stamp, made while
         // the file is read or after, would leave a digest of other contents.
@@ -1780,10 +1776,12 @@ impl Snapshot {
         // Re-check after reading so a concurrent write is never recorded as settled.
         let after = Stamp::new(&std::fs::symlink_metadata(absolute)?);
         if after == stamp && stamp.settled(crate::settle::window(absolute, metadata), reading) {
-            self.digests
-                .lock()
-                .unwrap()
-                .insert(path.to_owned(), (stamp, digest.clone()));
+            let kept = Kept {
+                stamp,
+                digest: digest.clone(),
+                used: AtomicBool::new(true),
+            };
+            self.digests.write().unwrap().insert(path.to_owned(), kept);
             self.digests_changed
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
@@ -2062,7 +2060,18 @@ fn prefetched_lockfile(path: &Path) -> Option<Arc<Installed>> {
     Some(installed)
 }
 
-fn load_digests(root: &Path) -> HashMap<String, (Stamp, String)> {
+/// A file's digest, kept while its stamp is the one it was taken at.
+struct Kept {
+    stamp: Stamp,
+    digest: String,
+    /// Whether this run asked for the file's digest. Those are saved beside
+    /// the digests of `files`, the source listing, which leaves out many of
+    /// them: what `includeIgnored` filesets read, other tasks' declared
+    /// outputs, and the targets of links.
+    used: AtomicBool,
+}
+
+fn load_digests(root: &Path) -> HashMap<String, Kept> {
     #[derive(serde::Deserialize)]
     struct Saved {
         version: u32,
@@ -2072,7 +2081,20 @@ fn load_digests(root: &Path) -> HashMap<String, (Stamp, String)> {
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Saved>(&bytes).ok())
         .filter(|saved| saved.version == 1)
-        .map(|saved| saved.entries)
+        .map(|saved| {
+            let kept = |(path, (stamp, digest))| {
+                let used = AtomicBool::new(false);
+                (
+                    path,
+                    Kept {
+                        stamp,
+                        digest,
+                        used,
+                    },
+                )
+            };
+            saved.entries.into_iter().map(kept).collect()
+        })
         .unwrap_or_default()
 }
 
@@ -5319,6 +5341,52 @@ mod tests {
         assert!(error.contains("resolves to the workspace root"), "{error}");
     }
 
+    /// A tracked file whose directory was replaced by a link is refused, and
+    /// the error names it.
+    #[cfg(unix)]
+    #[test]
+    fn an_input_beneath_a_linked_directory_is_refused_by_name() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("nx.json"), "{}").unwrap();
+        std::fs::write(
+            root.path().join("project.json"),
+            json!({"name": "app", "targets": {"read": {"command": "true", "inputs": [
+                "{projectRoot}/sources/**/*"
+            ]}}})
+            .to_string(),
+        )
+        .unwrap();
+        for directory in ["sources/plain", "sources/moved", "elsewhere"] {
+            std::fs::create_dir_all(root.path().join(directory)).unwrap();
+            std::fs::write(root.path().join(directory).join("a.ts"), "a").unwrap();
+        }
+        let git = |args: &[&str]| assert!(paths::git(root.path(), args).unwrap().status.success());
+        git(&["init", "--quiet"]);
+        git(&["add", "sources"]);
+        std::fs::remove_dir_all(root.path().join("sources/moved")).unwrap();
+        std::os::unix::fs::symlink("../elsewhere", root.path().join("sources/moved")).unwrap();
+        let workspace = Workspace::load(root.path()).unwrap();
+        let graph = TaskGraph::build(&workspace, &[Request::parse("app:read").unwrap()]).unwrap();
+        let task = &graph.tasks["app:read"];
+        let prepared = qk_executor::prepare(&workspace, task, &BTreeMap::new()).unwrap();
+        let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
+        let error = inputs(
+            &snapshot,
+            &workspace,
+            task,
+            &prepared,
+            &BTreeMap::new(),
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("cannot read input sources/moved/a.ts")
+                && error.contains("input parent is a symlink"),
+            "{error}"
+        );
+    }
+
     /// A lockfile read ahead of the snapshot is what the snapshot takes, once
     /// and for that file alone: another path, and a second asking, read the
     /// file themselves.
@@ -5427,7 +5495,7 @@ mod tests {
         assert_eq!(first, digest_file(&path).unwrap());
         // Only meaningful where both looks fell inside the window, which a
         // slow machine can miss on the shortest windows.
-        let kept = snapshot.digests.lock().unwrap().contains_key("config.yaml");
+        let kept = snapshot.digests.read().unwrap().contains_key("config.yaml");
         if before.elapsed() < window {
             assert!(!kept);
         }
@@ -5441,7 +5509,7 @@ mod tests {
         settle(&path);
         let metadata = std::fs::symlink_metadata(&path).unwrap();
         snapshot.digest("config.yaml", &path, &metadata).unwrap();
-        assert!(snapshot.digests.lock().unwrap().contains_key("config.yaml"));
+        assert!(snapshot.digests.read().unwrap().contains_key("config.yaml"));
     }
 
     /// A listing taken once every directory and policy is older than its

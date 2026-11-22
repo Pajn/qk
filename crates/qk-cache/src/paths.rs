@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 
 use anyhow::{Context, Result, bail};
 use foldhash::HashSet;
@@ -392,7 +392,7 @@ pub fn safe_parents_once(
     root: &Path,
     path: &str,
     what: &str,
-    known: &Mutex<HashSet<PathBuf>>,
+    known: &RwLock<HashSet<PathBuf>>,
 ) -> Result<()> {
     check_parents(root, path, what, Some(known))
 }
@@ -401,17 +401,24 @@ fn check_parents(
     root: &Path,
     path: &str,
     what: &str,
-    known: Option<&Mutex<HashSet<PathBuf>>>,
+    known: Option<&RwLock<HashSet<PathBuf>>>,
 ) -> Result<()> {
     validate_path(path)?;
-    let mut current = root.to_owned();
-    for part in Path::new(path)
-        .parent()
-        .into_iter()
-        .flat_map(Path::components)
+    let parent = Path::new(path).parent();
+    // A directory is added only after every one above it was added or found
+    // to be a directory, so a known parent says all of them are known: most
+    // paths share their parent with one checked before, and look once rather
+    // than once for each directory above them. Threads checking many paths
+    // at once mostly read, which a read lock lets them do together.
+    if let (Some(known), Some(parent)) = (known, parent)
+        && known.read().unwrap().contains(&root.join(parent))
     {
+        return Ok(());
+    }
+    let mut current = root.to_owned();
+    for part in parent.into_iter().flat_map(Path::components) {
         current.push(part);
-        if known.is_some_and(|known| known.lock().unwrap().contains(&current)) {
+        if known.is_some_and(|known| known.read().unwrap().contains(&current)) {
             continue;
         }
         match std::fs::symlink_metadata(&current) {
@@ -423,7 +430,7 @@ fn check_parents(
             }
             Ok(_) => {
                 if let Some(known) = known {
-                    known.lock().unwrap().insert(current.clone());
+                    known.write().unwrap().insert(current.clone());
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -2086,10 +2093,10 @@ mod tests {
     fn parents_checked_once_remember_only_directories_they_found() {
         let workspace = tempfile::tempdir().unwrap();
         let root = workspace.path();
-        let known = std::sync::Mutex::default();
+        let known = std::sync::RwLock::default();
         std::fs::create_dir_all(root.join("a/b")).unwrap();
         super::safe_parents_once(root, "a/b/c/file", "warm", &known).unwrap();
-        let seen = known.lock().unwrap().clone();
+        let seen = known.read().unwrap().clone();
         assert_eq!(seen.len(), 2);
         assert!(seen.contains(&root.join("a")) && seen.contains(&root.join("a/b")));
 
