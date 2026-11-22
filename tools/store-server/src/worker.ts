@@ -1128,10 +1128,21 @@ async function putPathSets(weak: string, request: Request, env: Env): Promise<Re
   if (upload.json.weak !== weak) {
     throw new Failure(400, "malformed", `the record is not for weak key ${weak}`);
   }
-  // The index writes the bucket and then itself before it answers, so a read
-  // that starts after this save finds it or a later one.
-  await indexOf(env).saveRecord(`pathsets/${weak}`, body);
+  await saveCitingNoBlob(`pathsets/${weak}`, body, env);
   return new Response(null, { status: 204 });
+}
+
+/** Saves `body` as the record `name`, which cites no blob. The index writes
+ * the bucket and then itself before it answers, so a read that starts after
+ * this save finds it or a later one. It is asked for room first, and the
+ * body is sent only once it has some: `busy` while it is saving as much as
+ * it takes at once. */
+async function saveCitingNoBlob(name: string, body: Uint8Array, env: Env): Promise<void> {
+  const index = indexOf(env);
+  const ticket = await index.admitSave(body.length);
+  if (ticket === null || !(await index.saveRecord(name, body, ticket))) {
+    throw new Failure(503, "busy", "the store is saving as many records as it can; try again");
+  }
 }
 
 async function putExpectations(name: string, request: Request, env: Env): Promise<Response> {
@@ -1143,8 +1154,7 @@ async function putExpectations(name: string, request: Request, env: Env): Promis
   if (upload.json.name !== name) {
     throw new Failure(400, "malformed", `the record is not named ${name}`);
   }
-  // As for path sets.
-  await indexOf(env).saveRecord(`expectations/${name}`, body);
+  await saveCitingNoBlob(`expectations/${name}`, body, env);
   return new Response(null, { status: 204 });
 }
 

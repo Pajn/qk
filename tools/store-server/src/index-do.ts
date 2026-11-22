@@ -56,6 +56,12 @@ const RECORD_ANSWER = 16 << 20;
  * that it is dropped to keep the index small, and read from the bucket again
  * when next asked for. */
 const RECORD_HELD_FOR = 30 * DAY;
+/** Bytes of records' bodies on their way to the bucket through the index at
+ * once, well within the memory a Durable Object has. A save past them is
+ * refused before its body is sent here. */
+export const SAVING_AT_ONCE = 48 << 20;
+/** How long room admitted for a save is kept while the save has not come. */
+const ADMITTED_FOR = 60_000;
 
 /** What the index says of a record citing no blob, named as its object in the
  * bucket: `held`, with its body; `apart`, stored in the bucket alone, or held
@@ -244,16 +250,51 @@ export class Index extends DurableObject<{ STORE: R2Bucket }> {
   /** Saves of records citing no blob that have not ended, by name. */
   private saves = new Map<string, Promise<void>>();
 
+  /** Room admitted for saves by `admitSave`, by ticket: its bytes, and when
+   * it is given up unless the save has come by then. */
+  private admitted = new Map<string, { bytes: number; until: number }>();
+
+  /** Admits a save of `bytes` bytes, answering the ticket `saveRecord`
+   * takes, or null while the saves admitted hold `SAVING_AT_ONCE` bytes
+   * between them. Asked before a body is sent here, so the bodies waiting
+   * for the bucket, of which one name's wait for each other, never take more
+   * memory than that. One save is always admitted when no other is. */
+  admitSave(bytes: number): string | null {
+    const now = Date.now();
+    let held = 0;
+    for (const [ticket, room] of this.admitted) {
+      if (room.until < now) {
+        this.admitted.delete(ticket);
+      } else {
+        held += room.bytes;
+      }
+    }
+    if (held > 0 && held + bytes > SAVING_AT_ONCE) {
+      return null;
+    }
+    const ticket = crypto.randomUUID();
+    this.admitted.set(ticket, { bytes, until: now + ADMITTED_FOR });
+    return ticket;
+  }
+
   /** Saves `body` as the record `name`, which cites no blob: in the bucket,
    * and here with its body when that is at most `HELD_RECORD` bytes. Bodies
-   * unread for `RECORD_HELD_FOR` are dropped on the way.
+   * unread for `RECORD_HELD_FOR` are dropped on the way. False, with nothing
+   * saved, when `ticket` is not one `admitSave` gave for a body this large
+   * and still keeps.
    *
    * The index writes the bucket itself, one save of a name after another,
    * so the save the bucket keeps is the one the index keeps. While a save
    * is on its way the index holds no body for the name and takes none in,
    * so reads go to the bucket, and a save that never ends leaves them
    * there until the next one. */
-  async saveRecord(name: string, body: Uint8Array): Promise<void> {
+  async saveRecord(name: string, body: Uint8Array, ticket: string): Promise<boolean> {
+    const room = this.admitted.get(ticket);
+    if (!room || room.bytes < body.length || room.until === Infinity) {
+      return false;
+    }
+    // Kept until the save has ended, however long it waits its turn.
+    room.until = Infinity;
     const before = this.saves.get(name);
     const save = (async () => {
       // Whatever became of the save before it, this one follows it.
@@ -281,7 +322,9 @@ export class Index extends DurableObject<{ STORE: R2Bucket }> {
     this.saves.set(name, save);
     try {
       await save;
+      return true;
     } finally {
+      this.admitted.delete(ticket);
       if (this.saves.get(name) === save) {
         this.saves.delete(name);
       }

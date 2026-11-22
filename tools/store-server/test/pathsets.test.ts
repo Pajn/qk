@@ -1,7 +1,7 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { decompress } from "fzstd";
 import { describe, expect, it } from "vitest";
-import type { Index } from "../src/index-do";
+import { type Index, SAVING_AT_ONCE } from "../src/index-do";
 import { READ, bytes, expectedPack, hash, hex, request, sha256, upload } from "./helpers";
 
 const pathSets = (weak: string, read: string, padding = 0) =>
@@ -174,7 +174,10 @@ describe("records citing no blob", () => {
   it("are the same in the index and the bucket after saves of one name at once", async () => {
     const weak = Array.from({ length: 8 }, hash);
     const records = (key: string) => ["a", "b", "c"].map((read) => upload(pathSets(key, read), []));
-    await Promise.all(weak.flatMap((key) => records(key).map((body) => request("PUT", `pathsets/${key}`, { body }))));
+    const saved = await Promise.all(
+      weak.flatMap((key) => records(key).map((body) => request("PUT", `pathsets/${key}`, { body }))),
+    );
+    expect(saved.map((response) => response.status)).toEqual(saved.map(() => 204));
 
     for (const key of weak) {
       const name = `pathsets/${key}`;
@@ -210,6 +213,36 @@ describe("records citing no blob", () => {
     expect(await getOne(weak)).toEqual(expectedPack(pathSets(weak, "after"), [], () => true));
   });
 
+  it("are refused as busy while the index is saving as much as it takes at once", async () => {
+    const weak = hash();
+    const record = upload(pathSets(weak, "waiting"), []);
+    const tickets = await runInDurableObject(index(), async (instance) => {
+      const stub = instance as unknown as Index;
+      // One save is admitted whatever its size; more only within the bound.
+      const large = stub.admitSave(SAVING_AT_ONCE);
+      expect(large).not.toBeNull();
+      expect(stub.admitSave(1)).toBeNull();
+      // A ticket saves once, and only a body it was given for.
+      expect(await stub.saveRecord(`pathsets/${hash()}`, record, "no ticket")).toBe(false);
+      return [large!];
+    });
+    const refused = await request("PUT", `pathsets/${weak}`, { body: record });
+    expect(refused.status).toBe(503);
+    expect(((await refused.json()) as { error: string }).error).toBe("busy");
+    expect(await env.STORE.head(`pathsets/${weak}`)).toBeNull();
+
+    await runInDurableObject(index(), async (instance) => {
+      const stub = instance as unknown as Index;
+      const small = new Uint8Array(8);
+      // Room is given back when its save ends.
+      expect(await stub.saveRecord(`pathsets/${hash()}`, small, tickets[0]!)).toBe(true);
+      expect(await stub.saveRecord(`pathsets/${hash()}`, small, tickets[0]!)).toBe(false);
+      const ticket = stub.admitSave(4);
+      expect(await stub.saveRecord(`pathsets/${hash()}`, small, ticket!)).toBe(false);
+    });
+    expect((await request("PUT", `pathsets/${weak}`, { body: record })).status).toBe(204);
+  });
+
   it("are never taken in from a read older than a save the index heard of", async () => {
     const weak = hash();
     const name = `pathsets/${weak}`;
@@ -222,7 +255,7 @@ describe("records citing no blob", () => {
       const [began] = stub.readRecords([name]);
       expect(began!.state).toBe("apart");
       // A save, then the slow read of the older body ends.
-      await stub.saveRecord(name, newer);
+      expect(await stub.saveRecord(name, newer, stub.admitSave(newer.length)!)).toBe(true);
       stub.fillRecord(name, (began as { version: number }).version, older);
       expect(stub.readRecords([name])).toEqual([{ state: "held", body: newer }]);
     });
