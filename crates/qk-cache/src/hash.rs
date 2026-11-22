@@ -1218,10 +1218,11 @@ impl Snapshot {
         // Every early task needs these, so loading saved digests and parsing
         // the lockfile overlap listing files.
         let (lockfile, (digests, workspace_prefix)) = std::thread::scope(|scope| {
-            let lockfile = scope.spawn(|| parse_lockfile(&workspace.root.join("pnpm-lock.yaml")));
+            let lockfile =
+                scope.spawn(|| prefetched_lockfile(&workspace.root.join("pnpm-lock.yaml")));
             let digests = scope.spawn(|| {
                 let digests = load_digests(&workspace.root);
-                let workspace_prefix = paths::git_path(&workspace.root, "--show-toplevel")
+                let workspace_prefix = paths::git_toplevel(&workspace.root)
                     .and_then(|root| root.canonicalize().ok())
                     .and_then(|root| canonical_root.strip_prefix(root).ok().map(PathBuf::from));
                 (digests, workspace_prefix)
@@ -1969,19 +1970,96 @@ impl Snapshot {
 /// Reads and parses a pnpm lockfile, `None` when there is none. One qk cannot
 /// read is reported, and kept as unreadable so tasks key its whole content.
 fn parse_lockfile(path: &Path) -> Option<Arc<Installed>> {
+    let (installed, unreadable) = read_lockfile(path)?;
+    if let Some(error) = unreadable {
+        qk_executor::status!("qk: pnpm-lock.yaml: keying tasks by the whole file ({error})");
+    }
+    Some(installed)
+}
+
+/// What [`parse_lockfile`] returns, with why qk cannot read the lockfile
+/// where it cannot, left for the caller to report.
+type ReadLockfile = Option<(Arc<Installed>, Option<String>)>;
+
+fn read_lockfile(path: &Path) -> ReadLockfile {
     let text = std::fs::read_to_string(path).ok()?;
-    let lockfile = match Lockfile::parse(&text) {
-        Ok(lockfile) => Some(lockfile),
-        Err(error) => {
-            qk_executor::status!("qk: pnpm-lock.yaml: keying tasks by the whole file ({error:#})");
-            None
-        }
+    let (lockfile, unreadable) = match Lockfile::parse(&text) {
+        Ok(lockfile) => (Some(lockfile), None),
+        Err(error) => (None, Some(format!("{error:#}"))),
     };
-    Some(Arc::new(Installed {
+    let installed = Installed {
         content: blake3::hash(text.as_bytes()).to_hex().to_string(),
         lockfile,
         digests: Mutex::default(),
-    }))
+    };
+    Some((Arc::new(installed), unreadable))
+}
+
+/// A lockfile [`prefetch_lockfile`] began reading, until a snapshot takes it.
+enum Prefetched {
+    Reading(std::thread::JoinHandle<ReadLockfile>),
+    Read(ReadLockfile),
+}
+
+static PREFETCHED: Mutex<Option<(PathBuf, Prefetched)>> = Mutex::new(None);
+
+/// Starts reading and parsing the pnpm lockfile at `root` on a thread of its
+/// own, for a command that will key tasks once it has loaded the workspace:
+/// the first snapshot built at `root` takes what the thread read rather than
+/// reading the file itself. Tasks compare the lockfile's content with what
+/// was parsed whenever they key, so one that changes after it is read here
+/// is parsed again, as one that changes after a snapshot read it is.
+pub fn prefetch_lockfile(root: &Path) {
+    let path = root.join("pnpm-lock.yaml");
+    let reading = {
+        let path = path.clone();
+        std::thread::spawn(move || read_lockfile(&path))
+    };
+    *PREFETCHED.lock().unwrap() = Some((path, Prefetched::Reading(reading)));
+}
+
+/// Waits for the thread [`prefetch_lockfile`] started, if it still runs, and
+/// keeps what it read, for a caller that needs to be the process's only
+/// thread.
+pub fn await_lockfile() {
+    let mut prefetched = PREFETCHED.lock().unwrap();
+    *prefetched = match prefetched.take() {
+        // A thread that panicked read nothing, and leaves the file to the
+        // snapshot.
+        Some((path, Prefetched::Reading(reading))) => reading
+            .join()
+            .ok()
+            .map(|read| (path, Prefetched::Read(read))),
+        other => other,
+    };
+}
+
+/// [`parse_lockfile`], taking what [`prefetch_lockfile`] read of `path`
+/// where it was started and nothing took it yet.
+fn prefetched_lockfile(path: &Path) -> Option<Arc<Installed>> {
+    let prefetched = {
+        let mut prefetched = PREFETCHED.lock().unwrap();
+        match prefetched.take() {
+            Some((read, taken)) if read == path => Some(taken),
+            other => {
+                *prefetched = other;
+                None
+            }
+        }
+    };
+    let (installed, unreadable) = match prefetched {
+        Some(Prefetched::Read(read)) => read,
+        // A thread that panicked read nothing: read it here.
+        Some(Prefetched::Reading(reading)) => match reading.join() {
+            Ok(read) => read,
+            Err(_) => return parse_lockfile(path),
+        },
+        None => return parse_lockfile(path),
+    }?;
+    if let Some(error) = unreadable {
+        qk_executor::status!("qk: pnpm-lock.yaml: keying tasks by the whole file ({error})");
+    }
+    Some(installed)
 }
 
 fn load_digests(root: &Path) -> HashMap<String, (Stamp, String)> {
@@ -5239,6 +5317,43 @@ mod tests {
         assert_ne!(before, key("app:read").unwrap());
         let error = format!("{:#}", key("app:whole").unwrap_err());
         assert!(error.contains("resolves to the workspace root"), "{error}");
+    }
+
+    /// A lockfile read ahead of the snapshot is what the snapshot takes, once
+    /// and for that file alone: another path, and a second asking, read the
+    /// file themselves.
+    #[test]
+    fn a_lockfile_read_ahead_is_taken_once_and_only_for_its_path() {
+        let ahead = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let text = "lockfileVersion: '9.0'\nimporters:\n  .: {}\n";
+        for root in [&ahead, &other] {
+            std::fs::write(root.path().join("pnpm-lock.yaml"), text).unwrap();
+        }
+        let path = ahead.path().join("pnpm-lock.yaml");
+        let content = blake3::hash(text.as_bytes()).to_hex().to_string();
+        let waiting = || {
+            PREFETCHED
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|(read, _)| *read == path)
+        };
+
+        prefetch_lockfile(ahead.path());
+        await_lockfile();
+        assert!(waiting());
+        let elsewhere = prefetched_lockfile(&other.path().join("pnpm-lock.yaml")).unwrap();
+        assert_eq!(elsewhere.content, content);
+        assert!(waiting(), "another path took the lockfile read ahead");
+
+        // Changed since it was read ahead: what was read is what is taken,
+        // and a task keying compares it with the file as it is then.
+        std::fs::write(&path, format!("{text}# later\n")).unwrap();
+        assert_eq!(prefetched_lockfile(&path).unwrap().content, content);
+        assert!(!waiting());
+        assert_ne!(prefetched_lockfile(&path).unwrap().content, content);
+        assert!(prefetched_lockfile(&ahead.path().join("absent.yaml")).is_none());
     }
 
     #[cfg(unix)]

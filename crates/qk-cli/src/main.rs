@@ -548,10 +548,11 @@ impl RunOptions {
 
     /// Sets what Nx sets in its own environment for these options, so tasks
     /// and the remote cache see it. Called while this is the only thread,
-    /// and safe to call again: the one thread started before it, asking Git
-    /// for the repository's directories, is waited for first.
+    /// and safe to call again: the threads started before it, asking Git
+    /// about the repository and parsing the lockfile, are waited for first.
     fn export(&self) {
         qk_cache::await_git_dirs();
+        qk_cache::await_lockfile();
         let set = |name: &str| {
             // Only this thread exists yet.
             unsafe { std::env::set_var(name, "true") }
@@ -1197,13 +1198,15 @@ fn run(mut cli: Cli) -> Result<i32> {
         None => find_workspace(&std::env::current_dir().context("cannot read current directory")?)?,
     };
     // A command that runs tasks finds its cache, worktree state and history
-    // from the repository's git directories: Git answers while the workspace
-    // loads.
+    // from the repository's git directories, and keys its tasks by what the
+    // lockfile installs: Git answers and the lockfile is parsed while the
+    // workspace loads.
     if matches!(
         cli.command,
         Command::Run { .. } | Command::RunMany { .. } | Command::Affected { .. }
     ) {
         qk_cache::prefetch_git_dirs(&root);
+        qk_cache::prefetch_lockfile(&root);
     }
     let workspace = Workspace::load(&root)?;
     for warning in &workspace.warnings {

@@ -35,8 +35,8 @@ use serde_json::Value;
 pub use evict::{Pruned, max_size, parse_size, prune, prune_automatic};
 pub use glob::Pattern;
 pub use hash::{
-    DependencyGlob, Selects, SourceIgnore, dependency_globs, keyed_definition, source_files,
-    task_configuration,
+    DependencyGlob, Selects, SourceIgnore, await_lockfile, dependency_globs, keyed_definition,
+    prefetch_lockfile, source_files, task_configuration,
 };
 pub use inputs::{
     InputChange, InputChanges, JsonFields, ROOT_TSCONFIG_FILES, Resolution, Resolved, TsConfig,

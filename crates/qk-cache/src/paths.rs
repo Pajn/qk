@@ -77,11 +77,33 @@ pub fn git_path(root: &Path, flag: &str) -> Option<PathBuf> {
 /// Git waits for its answer rather than starting Git again. Roots are kept by
 /// their canonical path, so one named another way shares the answer.
 fn git_dirs(root: &Path) -> Option<(PathBuf, PathBuf)> {
-    type Slot = std::sync::Arc<Mutex<Option<(PathBuf, PathBuf)>>>;
-    static KNOWN: std::sync::OnceLock<Mutex<std::collections::HashMap<PathBuf, Slot>>> =
-        std::sync::OnceLock::new();
+    static KNOWN: Asked<(PathBuf, PathBuf)> = std::sync::OnceLock::new();
+    asked_once(&KNOWN, root, || ask_git_dirs(root))
+}
+
+/// The top of the working tree `root` is in, as Git names it, or `None`
+/// where there is none. Asked once per root in a process, as [`git_dirs`]
+/// is and for the same reasons.
+pub fn git_toplevel(root: &Path) -> Option<PathBuf> {
+    static KNOWN: Asked<PathBuf> = std::sync::OnceLock::new();
+    asked_once(&KNOWN, root, || git_path(root, "--show-toplevel"))
+}
+
+/// Git's answers about roots, each kept once given.
+type Asked<T> = std::sync::OnceLock<
+    Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<Mutex<Option<T>>>>>,
+>;
+
+/// What `ask` answered for `root` earlier in this process, or what it
+/// answers now. Only an answer is kept, and a caller asking while another
+/// still waits for `ask` waits for that answer.
+fn asked_once<T: Clone>(
+    known: &'static Asked<T>,
+    root: &Path,
+    ask: impl FnOnce() -> Option<T>,
+) -> Option<T> {
     let canonical = root.canonicalize().unwrap_or_else(|_| root.to_owned());
-    let slot = KNOWN
+    let slot = known
         .get_or_init(Default::default)
         .lock()
         .unwrap()
@@ -90,30 +112,43 @@ fn git_dirs(root: &Path) -> Option<(PathBuf, PathBuf)> {
         .clone();
     let mut known = slot.lock().unwrap();
     if known.is_none() {
-        *known = ask_git_dirs(root);
+        *known = ask();
     }
     known.clone()
 }
 
-/// Starts asking Git for [`git_dirs`] at `root` on a thread of its own, for a
-/// command that will need them once it has loaded the workspace: the
-/// worktree state, cache and history of a run are all found from them.
+/// Starts asking Git for [`git_dirs`] and [`git_toplevel`] at `root`, each on
+/// a thread of its own, for a command that will need them once it has loaded
+/// the workspace: the worktree state, cache and history of a run are found
+/// from the directories, and keying its tasks needs the top of the working
+/// tree.
 pub fn prefetch_git_dirs(root: &Path) {
-    let root = root.to_owned();
-    let asking = std::thread::spawn(move || {
-        git_dirs(&root);
-    });
-    *PREFETCH.lock().unwrap() = Some(asking);
+    let asking = [
+        {
+            let root = root.to_owned();
+            std::thread::spawn(move || {
+                git_dirs(&root);
+            })
+        },
+        {
+            let root = root.to_owned();
+            std::thread::spawn(move || {
+                git_toplevel(&root);
+            })
+        },
+    ];
+    PREFETCH.lock().unwrap().extend(asking);
 }
 
-/// The thread [`prefetch_git_dirs`] started, until it is waited for.
-static PREFETCH: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
+/// The threads [`prefetch_git_dirs`] started, until they are waited for.
+static PREFETCH: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new());
 
-/// Waits for the thread [`prefetch_git_dirs`] started, if it still runs, for
-/// a caller that needs to be the process's only thread, as one changing the
-/// environment does.
+/// Waits for the threads [`prefetch_git_dirs`] started, if they still run,
+/// for a caller that needs to be the process's only thread, as one changing
+/// the environment does.
 pub fn await_git_dirs() {
-    if let Some(asking) = PREFETCH.lock().unwrap().take() {
+    let asking = std::mem::take(&mut *PREFETCH.lock().unwrap());
+    for asking in asking {
         let _ = asking.join();
     }
 }
@@ -1857,7 +1892,7 @@ mod tests {
 
     #[test]
     fn git_dirs_answer_as_git_does_for_each_and_ask_again_until_there_is_a_repository() {
-        use super::{git, git_dirs, git_path};
+        use super::{git, git_dirs, git_path, git_toplevel};
         let scratch = tempfile::tempdir().unwrap();
         // As the directory is named, not made canonical: every path compared
         // below is one Git answered, and Git on Windows cannot be given the
@@ -1867,6 +1902,7 @@ mod tests {
         std::fs::create_dir_all(main.join("apps/web")).unwrap();
         // Not a repository yet: asked again once it is.
         assert_eq!(git_dirs(&main), None);
+        assert_eq!(git_toplevel(&main), None);
         let run = |root: &std::path::Path, args: &[&str]| {
             let output = git(root, args).unwrap();
             assert!(output.status.success(), "git {args:?}: {output:?}");
@@ -1901,6 +1937,9 @@ mod tests {
                 git_path(&root, "--git-common-dir").unwrap(),
             );
             assert_eq!(git_dirs(&root), Some(separately.clone()), "{root:?}");
+            let toplevel = git_path(&root, "--show-toplevel");
+            assert!(toplevel.is_some());
+            assert_eq!(git_toplevel(&root), toplevel, "{root:?}");
             // Asked again, by another name for the same root.
             let other_name = root.join("../").join(root.file_name().unwrap());
             assert_eq!(git_dirs(&other_name), Some(separately), "{other_name:?}");
