@@ -236,10 +236,17 @@ type Found = std::sync::Mutex<Result<BTreeMap<PathBuf, (bool, Option<bool>)>>>;
 ///
 /// The workspace files are read with `read`, so that another revision's
 /// package.json, pnpm-workspace.yaml and lerna.json decide what is a project.
+///
+/// While the walk goes on, `found` is called once for each directory as soon
+/// as it is known to hold a project, with whether the workspaces would take
+/// in a package.json there, so that the project can be read meanwhile. The
+/// walk may yet find that directory's package.json ignored, so what is
+/// returned decides.
 pub(crate) fn project_directories(
     root: &Path,
     read: ConfigReader,
     warnings: &mut Vec<String>,
+    found_project: &(dyn Fn(&Path, bool) + Sync),
 ) -> Result<BTreeMap<PathBuf, bool>> {
     let package_path = root.join("package.json");
     let package = read(&package_path)?
@@ -294,8 +301,9 @@ pub(crate) fn project_directories(
     walker.run(|| {
         Box::new(|entry| {
             // A project.json makes a project; a package.json says whether
-            // the workspaces take it in.
-            let visit = || -> Result<Option<(PathBuf, Option<bool>)>> {
+            // the workspaces take it in. Either way, whether they would take
+            // in a package.json in that directory.
+            let visit = || -> Result<Option<(PathBuf, Option<bool>, bool)>> {
                 let entry = entry.context("cannot walk workspace")?;
                 if !entry.file_type().is_some_and(|kind| kind.is_file()) {
                     return Ok(None);
@@ -304,29 +312,33 @@ pub(crate) fn project_directories(
                     .path()
                     .parent()
                     .context("configuration has no parent directory")?;
-                match entry.file_name().to_str() {
-                    Some("project.json") => {
-                        return Ok(Some((directory.to_owned(), None)));
-                    }
+                let includes = || -> Result<bool> {
+                    let manifest = relative_path(root, &directory.join("package.json"))?;
+                    Ok(workspaces.includes(&manifest))
+                };
+                Ok(match entry.file_name().to_str() {
+                    Some("project.json") => Some((directory.to_owned(), None, includes()?)),
                     Some("package.json") => {
-                        let manifest = relative_path(root, entry.path())?;
-                        return Ok(Some((
-                            directory.to_owned(),
-                            Some(workspaces.includes(&manifest)),
-                        )));
+                        let included = includes()?;
+                        Some((directory.to_owned(), Some(included), included))
                     }
-                    _ => {}
-                }
-                Ok(None)
+                    _ => None,
+                })
             };
             match visit() {
-                Ok(Some((directory, manifest))) => {
+                Ok(Some((directory, manifest, includes))) => {
+                    let mut became_project = false;
                     if let Ok(found) = &mut *found.lock().unwrap() {
-                        let entry = found.entry(directory).or_default();
+                        let entry = found.entry(directory.clone()).or_default();
+                        let was_project = is_project(*entry);
                         match manifest {
                             None => entry.0 = true,
                             Some(included) => entry.1 = Some(included),
                         }
+                        became_project = !was_project && is_project(*entry);
+                    }
+                    if became_project {
+                        found_project(&directory, includes);
                     }
                 }
                 Ok(None) => {}
@@ -342,7 +354,13 @@ pub(crate) fn project_directories(
         .into_inner()
         .unwrap()?
         .into_iter()
-        .filter(|(_, (project_json, included))| *project_json || *included == Some(true))
+        .filter(|(_, found)| is_project(*found))
         .map(|(directory, (_, included))| (directory, included == Some(true)))
         .collect())
+}
+
+/// Whether a directory holding these is a project: one with a project.json,
+/// or a package.json the workspaces take in.
+fn is_project((project_json, included): (bool, Option<bool>)) -> bool {
+    project_json || included == Some(true)
 }

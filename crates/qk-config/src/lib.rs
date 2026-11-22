@@ -456,28 +456,15 @@ impl Workspace {
         }
         // A wrong `cli.packageManager` fails only what runs scripts.
         let package_manager = workspace.package_manager_name().unwrap_or("npm");
-        let directories: Vec<(PathBuf, bool)> =
-            discovery::project_directories(&root, read, &mut workspace.warnings)?
-                .into_iter()
-                .collect();
-        // Each directory's manifests are read and its project normalized on
-        // its own, which depends on no other project, so that happens on
-        // several threads; the results are then taken in the order of the
-        // directories, as one thread would have met them, so that the same
-        // projects make the same errors whichever thread finishes first.
-        let config = &workspace.config;
-        let loaded = parallel_map(&directories, |(directory, in_workspaces)| {
-            read_project(
-                &root,
-                directory,
-                *in_workspaces,
-                config,
-                package_manager,
-                read,
-            )
-        });
+        let loaded = load_projects(
+            &root,
+            &workspace.config,
+            package_manager,
+            read,
+            &mut workspace.warnings,
+        )?;
         let mut roots = BTreeMap::new();
-        for ((directory, _), loaded) in directories.iter().zip(loaded) {
+        for (directory, loaded) in loaded {
             // A project.json `read` holds absent, as at a revision before it
             // was added, makes no project of a directory with nothing else.
             let Some(LoadedProject {
@@ -510,9 +497,9 @@ impl Workspace {
             }
             workspace
                 .configuration_directories
-                .insert(project.name.clone(), relative_path(&root, directory)?);
+                .insert(project.name.clone(), relative_path(&root, &directory)?);
             if has_local {
-                let root = match relative_path(&root, directory)?.as_str() {
+                let root = match relative_path(&root, &directory)?.as_str() {
                     "." => String::new(),
                     directory => format!("{directory}/"),
                 };
@@ -593,20 +580,127 @@ fn read_project(
     }))
 }
 
-/// The most threads [`parallel_map`] uses. Reading and normalizing a
-/// project takes a fraction of a millisecond, so beyond a few threads the
-/// cost of starting them outweighs what they share.
+/// Each directory holding a project, in order, with what its manifests
+/// make.
+///
+/// A project's manifests and normalization depend on no other project, so
+/// each is read on one of a few threads as soon as the walk finds the
+/// directory, while the walk, which mostly waits on the filesystem, goes on.
+/// Those threads guess whether the workspaces take in the directory's
+/// package.json from whether one is there, as the walk does unless an
+/// ignore file hides it; once the walk is done, a project read with a guess
+/// the walk contradicts, or one the walk found without telling, is read
+/// again with what the walk found. So each project is what reading it after
+/// the walk makes, and the projects are in the order of their directories,
+/// as one thread would have met them, whichever thread finishes first.
+type Loaded = Vec<(PathBuf, Result<Option<LoadedProject>>)>;
+
+fn load_projects(
+    root: &Path,
+    config: &WorkspaceConfig,
+    package_manager: &str,
+    read: ConfigReader,
+    warnings: &mut Vec<String>,
+) -> Result<Loaded> {
+    let load = |directory: &Path, in_workspaces: bool| {
+        read_project(
+            root,
+            directory,
+            in_workspaces,
+            config,
+            package_manager,
+            read,
+        )
+    };
+    let threads = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .clamp(1, MAX_LOAD_THREADS);
+    let (send, receive) = std::sync::mpsc::channel::<(PathBuf, bool)>();
+    let receive = std::sync::Mutex::new(receive);
+    let (directories, mut early) = std::thread::scope(|scope| {
+        let loader = || {
+            let mut done = Vec::new();
+            loop {
+                let next = receive.lock().unwrap().recv();
+                let Ok((directory, includes)) = next else {
+                    return done;
+                };
+                let in_workspaces = includes
+                    && std::fs::symlink_metadata(directory.join("package.json"))
+                        .is_ok_and(|metadata| metadata.is_file());
+                let loaded = load(&directory, in_workspaces);
+                done.push((directory, (in_workspaces, loaded)));
+            }
+        };
+        // One more loader for every few dozen projects found, so that a
+        // small workspace starts no threads it cannot use.
+        let loaders = std::sync::Mutex::new(Vec::new());
+        let count = std::sync::atomic::AtomicUsize::new(0);
+        let found = |directory: &Path, includes: bool| {
+            let index = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if index.is_multiple_of(PROJECTS_PER_THREAD) && index / PROJECTS_PER_THREAD < threads {
+                loaders.lock().unwrap().push(scope.spawn(loader));
+            }
+            // The loaders outlive the walk, so they are there to receive.
+            let _ = send.send((directory.to_owned(), includes));
+        };
+        let directories = discovery::project_directories(root, read, warnings, &found);
+        drop(send);
+        let mut early = std::collections::HashMap::new();
+        for loader in loaders.into_inner().unwrap() {
+            let done = loader
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            early.extend(done);
+        }
+        directories.map(|directories| (directories, early))
+    })?;
+    let mut loaded: Vec<(PathBuf, Option<Result<Option<LoadedProject>>>)> = directories
+        .iter()
+        .map(|(directory, in_workspaces)| {
+            let early = early
+                .remove(directory)
+                .filter(|(guessed, _)| guessed == in_workspaces)
+                .map(|(_, loaded)| loaded);
+            (directory.clone(), early)
+        })
+        .collect();
+    let missing: Vec<(usize, bool)> = loaded
+        .iter()
+        .zip(directories.values())
+        .enumerate()
+        .filter(|(_, ((_, early), _))| early.is_none())
+        .map(|(index, (_, in_workspaces))| (index, *in_workspaces))
+        .collect();
+    let redone = parallel_map(&missing, |(index, in_workspaces)| {
+        load(&loaded[*index].0, *in_workspaces)
+    });
+    for ((index, _), project) in missing.iter().zip(redone) {
+        loaded[*index].1 = Some(project);
+    }
+    Ok(loaded
+        .into_iter()
+        .map(|(directory, project)| (directory, project.expect("every project is read")))
+        .collect())
+}
+
+/// The most threads projects are read on. Reading and normalizing a project
+/// takes a fraction of a millisecond, so beyond a few threads the cost of
+/// starting them outweighs what they share.
 const MAX_LOAD_THREADS: usize = 8;
+
+/// How many projects make it worth starting one more thread to read them.
+const PROJECTS_PER_THREAD: usize = 16;
 
 /// `items` mapped by `map` on several threads, the results in the order of
 /// `items` whatever order the threads finish them in.
 fn parallel_map<T: Sync, R: Send>(items: &[T], map: impl Fn(&T) -> R + Sync) -> Vec<R> {
-    // Each thread takes some dozens of items, so that a small workspace
-    // does not start threads it cannot use.
+    // One thread for every few dozen items, so that a small workspace
+    // starts no threads it cannot use.
     let threads = std::thread::available_parallelism()
         .map_or(1, std::num::NonZeroUsize::get)
         .min(MAX_LOAD_THREADS)
-        .min(items.len().div_ceil(32));
+        .min(items.len().div_ceil(PROJECTS_PER_THREAD));
     if threads <= 1 {
         return items.iter().map(map).collect();
     }

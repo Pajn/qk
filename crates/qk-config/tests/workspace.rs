@@ -1527,7 +1527,9 @@ fn many_projects(count: usize) -> TempDir {
         write(
             temp.path(),
             &format!("libs/p{index:03}/project.json"),
-            &format!(r#"{{"name":"p{index:03}","targets":{{"build":{{"command":"echo {index}"}}}}}}"#),
+            &format!(
+                r#"{{"name":"p{index:03}","targets":{{"build":{{"command":"echo {index}"}}}}}}"#
+            ),
         );
     }
     temp
@@ -1606,4 +1608,31 @@ fn reports_a_clash_before_the_package_of_a_given_root() {
     write(temp.path(), "libs/p001/package.json", r#"{"name":"p001"}"#);
     let error = format!("{:#}", load_first_last(temp.path()).unwrap_err());
     assert!(error.contains("both have root"), "{error}");
+}
+
+#[test]
+fn a_package_json_the_walk_ignores_is_not_in_the_workspaces() {
+    // The project is read while the walk goes on, as if its package.json
+    // were in the workspaces, and read again once the walk finds it ignored.
+    let temp = many_projects(100);
+    write(
+        temp.path(),
+        "package.json",
+        r#"{"name":"root","workspaces":["libs/*"]}"#,
+    );
+    write(temp.path(), "libs/p050/.gitignore", "package.json\n");
+    for index in [49, 50] {
+        write(
+            temp.path(),
+            &format!("libs/p{index:03}/package.json"),
+            &format!(r#"{{"name":"p{index:03}","scripts":{{"test":"true"}}}}"#),
+        );
+    }
+    let workspace = Workspace::load(temp.path()).unwrap();
+    let in_workspaces = |name: &str| {
+        workspace.projects[name].extra["metadata"]["js"]["isInPackageManagerWorkspaces"].clone()
+    };
+    assert_eq!(in_workspaces("p049"), json!(true));
+    assert_eq!(in_workspaces("p050"), json!(false));
+    assert!(workspace.projects["p050"].targets.contains_key("test"));
 }
