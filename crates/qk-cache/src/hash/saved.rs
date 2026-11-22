@@ -48,6 +48,7 @@
 //! without a saved inventory does, and saves what it finds.
 
 use super::*;
+use qk_state::saved::{Reader, Writer};
 
 /// What every saved file starts with, then its format.
 const MAGIC: &[u8; 8] = b"qk-list\0";
@@ -216,42 +217,7 @@ pub(super) fn save(root: &Path, identity: &Identity, membership: &Membership) ->
     let Some(bytes) = encode(identity, membership) else {
         return Ok(());
     };
-    let path = identity.file(root);
-    let directory = path.parent().context("saved listings have a directory")?;
-    std::fs::create_dir_all(directory)?;
-    let mut file = tempfile::NamedTempFile::new_in(directory)?;
-    file.write_all(&bytes)?;
-    file.persist(&path)?;
-    prune(directory);
-    Ok(())
-}
-
-/// Removes all but the [`KEPT`] most recently saved inventories, and files
-/// left by a save that was stopped while writing.
-fn prune(directory: &Path) {
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return;
-    };
-    let now = SystemTime::now();
-    let mut saved = Vec::new();
-    for entry in entries.flatten() {
-        let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified()) else {
-            continue;
-        };
-        if entry.file_name().to_string_lossy().starts_with(PREFIX) {
-            saved.push((modified, entry.path()));
-        } else if now
-            .duration_since(modified)
-            .is_ok_and(|age| age > Duration::from_secs(3600))
-        {
-            // Another run's file being written is never this old.
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
-    saved.sort();
-    for (_, path) in saved.iter().rev().skip(KEPT) {
-        let _ = std::fs::remove_file(path);
-    }
+    qk_state::saved::save(&identity.file(root), &bytes, PREFIX, KEPT)
 }
 
 /// The flags each saved stamp carries, saying what its path is in the
@@ -341,9 +307,7 @@ pub(super) fn encode(identity: &Identity, membership: &Membership) -> Option<Vec
     {
         return None;
     }
-    let digest = blake3::hash(&writer.bytes);
-    writer.bytes.extend_from_slice(digest.as_bytes());
-    Some(writer.bytes)
+    Some(qk_state::saved::seal(writer.bytes))
 }
 
 /// The inventory [`encode`] saved in `bytes`, with `template`'s settings,
@@ -353,10 +317,7 @@ pub(super) fn decode(
     identity: &Identity,
     template: Membership,
 ) -> Option<Membership> {
-    let (body, digest) = bytes.split_at_checked(bytes.len().checked_sub(32)?)?;
-    if blake3::hash(body).as_bytes() != digest {
-        return None;
-    }
+    let body = qk_state::saved::unseal(bytes)?;
     let mut reader = Reader { bytes: body };
     if reader.take(MAGIC.len())? != MAGIC
         || reader.take(4)? != FORMAT.to_le_bytes()
@@ -440,76 +401,4 @@ pub(super) fn decode(
     membership.directory_entries = directory_entries.into_iter().collect();
     membership.ignore_contents = ignore_contents.into_iter().collect();
     Some(membership)
-}
-
-/// Writes the parts of [`encode`]'s form.
-#[derive(Default)]
-struct Writer {
-    bytes: Vec<u8>,
-}
-
-impl Writer {
-    /// `value` in seven-bit groups, least significant first, each but the
-    /// last with its top bit set.
-    fn number(&mut self, mut value: u64) {
-        while value >= 0x80 {
-            self.bytes.push(value as u8 | 0x80);
-            value >>= 7;
-        }
-        self.bytes.push(value as u8);
-    }
-
-    /// `string`, as the length of what it shares with `previous` and the rest.
-    fn string(&mut self, previous: &str, string: &str) {
-        let shared = previous
-            .bytes()
-            .zip(string.bytes())
-            .take_while(|(a, b)| a == b)
-            .count();
-        self.number(shared as u64);
-        self.number((string.len() - shared) as u64);
-        self.bytes.extend_from_slice(&string.as_bytes()[shared..]);
-    }
-}
-
-/// Reads what [`Writer`] wrote, `None` past its end or where it does not
-/// read.
-struct Reader<'a> {
-    bytes: &'a [u8],
-}
-
-impl Reader<'_> {
-    fn take(&mut self, count: usize) -> Option<&[u8]> {
-        let (taken, rest) = self.bytes.split_at_checked(count)?;
-        self.bytes = rest;
-        Some(taken)
-    }
-
-    fn number(&mut self) -> Option<u64> {
-        let mut value = 0_u64;
-        for shift in (0..64).step_by(7) {
-            let byte = self.take(1)?[0];
-            value |= u64::from(byte & 0x7f).checked_shl(shift)?;
-            if byte & 0x80 == 0 {
-                return Some(value);
-            }
-        }
-        None
-    }
-
-    /// A count of things that follow, each at least a byte long: never more
-    /// than the bytes left, so a damaged count cannot ask for much memory.
-    fn count(&mut self) -> Option<usize> {
-        usize::try_from(self.number()?)
-            .ok()
-            .filter(|count| *count <= self.bytes.len())
-    }
-
-    fn string(&mut self, previous: &str) -> Option<String> {
-        let shared = usize::try_from(self.number()?).ok()?;
-        let rest = self.count()?;
-        let mut string = previous.as_bytes().get(..shared)?.to_vec();
-        string.extend_from_slice(self.take(rest)?);
-        String::from_utf8(string).ok()
-    }
 }

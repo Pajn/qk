@@ -15,7 +15,7 @@ mod record;
 pub mod recorded;
 mod remote;
 pub mod scratch;
-mod settle;
+use qk_state::settle;
 mod store;
 pub mod ultracache;
 mod verified;

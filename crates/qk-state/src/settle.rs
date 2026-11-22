@@ -43,7 +43,7 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 /// The window wherever the filesystem is not positively known.
-pub(crate) const FALLBACK: Duration = Duration::from_secs(2);
+pub const FALLBACK: Duration = Duration::from_secs(2);
 
 /// The window for the file at `path`, whose metadata, taken without following
 /// a final symlink, is `metadata`.
@@ -51,7 +51,7 @@ pub(crate) const FALLBACK: Duration = Duration::from_secs(2);
 /// A time with no fraction of a second may come from a filesystem storing
 /// whole seconds even where its kind can store finer ones, so such a file
 /// keeps the fallback whatever its filesystem.
-pub(crate) fn window(path: &Path, metadata: &std::fs::Metadata) -> Duration {
+pub fn window(path: &Path, metadata: &std::fs::Metadata) -> Duration {
     if whole_seconds(metadata) {
         return FALLBACK;
     }
@@ -61,7 +61,7 @@ pub(crate) fn window(path: &Path, metadata: &std::fs::Metadata) -> Duration {
 /// Whether `time`, read from a file, is more than `window` before `looked`,
 /// the time on this machine's clock before the file was looked at. A time
 /// after `looked`, as another machine's clock can give, never is.
-pub(crate) fn older(time: SystemTime, window: Duration, looked: SystemTime) -> bool {
+pub fn older(time: SystemTime, window: Duration, looked: SystemTime) -> bool {
     looked.duration_since(time).is_ok_and(|age| age > window)
 }
 

@@ -7,10 +7,11 @@ cargo test --workspace --locked
 cargo build --release --locked
 ```
 
-The Cargo workspace contains twelve crates:
+The Cargo workspace contains thirteen crates:
 
 | Crate | Responsibility |
 | --- | --- |
+| `qk-state` | File stamps, settle windows and the files runs save for the runs after them |
 | `qk-config` | Workspace discovery, JSONC/YAML parsing, typed project configuration and normalization |
 | `qk-graph` | Workspace edges, project selection, reverse reachability and graph export |
 | `qk-taskgraph` | Dependency expansion, configuration selection and task DAG validation |
