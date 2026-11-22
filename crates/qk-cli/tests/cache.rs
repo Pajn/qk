@@ -745,8 +745,9 @@ fn a_task_running_no_command_passes_on_whether_its_dependencies_changed() {
     assert_eq!(fixture.runs(), 2);
 }
 
-/// Long enough for what a task wrote to be told apart from what it writes
-/// next, on any filesystem: see `TIME_SLACK` in the cache's store.
+/// Long enough for what was written to be told apart from what is written
+/// next, on any filesystem: longer than the longest window the cache's
+/// `settle` gives one.
 const SETTLE: std::time::Duration = std::time::Duration::from_millis(2100);
 
 /// A task that runs every time passes on that nothing changed when it wrote
@@ -5025,7 +5026,6 @@ fn hits_leave_matching_outputs_in_place() {
 fn persisted_digests_notice_edits_that_restore_the_modification_time() {
     let fixture = Fixture::new(target("build", json!({})));
     let input = fixture.root.join("src/input.txt");
-    // Old enough that its digest is kept for the next run.
     let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
     fs::File::options()
         .write(true)
@@ -5033,6 +5033,9 @@ fn persisted_digests_notice_edits_that_restore_the_modification_time() {
         .unwrap()
         .set_modified(old)
         .unwrap();
+    // Old enough that its digest is kept for the next run: by its change
+    // time too, which setting the modification time back has just moved.
+    std::thread::sleep(SETTLE);
     success(fixture.build(&fixture.root, &[]));
     assert!(fixture.root.join(".git/qk/digests.json").is_file());
     // Nothing of qk's appears in the working tree.

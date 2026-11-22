@@ -5610,19 +5610,14 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        // Digests are only saved for files old enough to have settled.
-        let old = std::time::SystemTime::now() - Duration::from_secs(60);
         for path in ["src/a.ts", "generated/names.ts"] {
             let path = root.path().join(path);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, "x").unwrap();
-            std::fs::File::options()
-                .write(true)
-                .open(&path)
-                .unwrap()
-                .set_times(std::fs::FileTimes::new().set_modified(old))
-                .unwrap();
         }
+        // Digests are only saved for files old enough to have settled, by
+        // their change times too, which nothing sets back.
+        settle(&root.path().join("generated/names.ts"));
         assert!(
             paths::git(root.path(), &["init", "--quiet"])
                 .unwrap()
