@@ -239,6 +239,107 @@ pub(crate) fn copy_blob_contents(source: &Path, destination: &Path) -> Result<St
     }
 }
 
+/// Files a thread looks at at least, so a short list is not split.
+const LOOKED_PER_THREAD: usize = 128;
+
+/// Whether a file with `stamp`, as [`crate::warm::stamp`] makes it, last
+/// changed more than `window` before `started` that any write since changed
+/// its change time: a write within a timestamp's resolution of the last can
+/// leave its size, times and inode as they were. `window` is the file's
+/// filesystem's, see [`crate::settle::window`]. Only Unix stamps hold a
+/// change time, which every write and replacement sets and no tool sets back;
+/// elsewhere nothing is settled.
+fn settled(stamp: &[i64], started: SystemTime, window: Duration) -> bool {
+    let older = |seconds: i64, nanos: i64| {
+        seconds >= 0
+            && (0..1_000_000_000).contains(&nanos)
+            && crate::settle::older(
+                SystemTime::UNIX_EPOCH + Duration::new(seconds as u64, nanos as u32),
+                window,
+                started,
+            )
+    };
+    cfg!(unix)
+        && stamp.len() == 6
+        && stamp[1] >= 0
+        && older(stamp[1] / 1_000_000_000, stamp[1] % 1_000_000_000)
+        && older(stamp[3], stamp[4])
+}
+
+/// The blobs of the output files a worktree last published for a set of
+/// outputs, each with the file's stamp, so a later publish reads only the
+/// files that changed: a rebuild rewrites few of a large target's outputs.
+///
+/// A file is remembered only when it was read whole between two looks that
+/// found the same [`settled`] stamp: no write happened while it was read, and
+/// any write since has changed its change time, so a file with that stamp
+/// still holds what the blob holds. The blob itself is trusted as a restore
+/// trusts a blob it hashed earlier in the same boot: a crash can lose a
+/// blob's contents and keep its name, so what another boot remembered is
+/// dropped, and the next publish hashes every file, replacing any blob that
+/// lost its contents.
+#[derive(Default, PartialEq, Serialize, Deserialize)]
+struct Published {
+    /// The boot the blobs were stored or hashed in, `None` where the boot
+    /// cannot be told, and nothing is remembered.
+    boot: Option<String>,
+    /// Each file's stamp and blob, by its path relative to the workspace.
+    files: BTreeMap<String, (Vec<i64>, String)>,
+}
+
+impl Published {
+    fn new(boot: Option<String>) -> Self {
+        Self {
+            boot,
+            files: BTreeMap::new(),
+        }
+    }
+
+    /// Where a worktree keeps what it published for `outputs`, named by the
+    /// patterns: targets declaring the same outputs share it, at the cost of
+    /// files read again, never of a wrong blob.
+    fn path(root: &Path, outputs: &Outputs) -> PathBuf {
+        let name = blake3::hash(outputs.globs().join("\n").as_bytes()).to_hex();
+        paths::worktree_state(root)
+            .join("published")
+            .join(format!("{}.json", &name[..32]))
+    }
+
+    /// What was remembered in this boot, `boot`, and nothing else.
+    fn load(root: &Path, outputs: &Outputs, boot: Option<&str>) -> Self {
+        let Some(boot) = boot else {
+            return Self::default();
+        };
+        fs::read(Self::path(root, outputs))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Self>(&bytes).ok())
+            .filter(|published| published.boot.as_deref() == Some(boot))
+            .unwrap_or_default()
+    }
+
+    /// The blob of the file at `path`, if it was remembered with `stamp`.
+    fn blob(&self, path: &str, stamp: &[i64]) -> Option<&str> {
+        self.files
+            .get(path)
+            .filter(|(known, _)| known.as_slice() == stamp)
+            .map(|(_, blob)| blob.as_str())
+    }
+
+    /// Replaces the record whole, so a reader never sees half of it. Failing
+    /// to keep it costs the next publish its reads only.
+    fn save(&self, root: &Path, outputs: &Outputs) {
+        let path = Self::path(root, outputs);
+        let _ = (|| -> Result<()> {
+            let directory = path.parent().context("records have a directory")?;
+            fs::create_dir_all(directory)?;
+            let mut file = tempfile::NamedTempFile::new_in(directory)?;
+            file.write_all(&serde_json::to_vec(self)?)?;
+            file.persist(&path)?;
+            Ok(())
+        })();
+    }
+}
+
 impl Cache {
     pub(crate) fn initialize(&self) -> Result<()> {
         for directory in ["entries", "blobs", "locks", "tmp"] {
@@ -301,7 +402,9 @@ impl Cache {
         let hash = copy_blob(source, &temporary)?;
         let target = self.root.join("blobs").join(&hash);
         // Replacing is atomic and cheaper than re-reading an existing blob.
+        let length = fs::metadata(&temporary).map_or(0, |metadata| metadata.len());
         kept_or_replaced(fs::rename(&temporary, &target), &target, &hash)?;
+        crate::evict::noted(&self.root, length);
         Ok(hash)
     }
 
@@ -333,6 +436,9 @@ impl Cache {
         })
     }
 
+    /// Stores the task's outputs and log under `key`: [`Self::gather`], then
+    /// [`Self::publish_gathered`], as a run does with the recheck between.
+    #[cfg(test)]
     pub(crate) fn publish(
         &self,
         root: &Path,
@@ -340,11 +446,41 @@ impl Cache {
         outputs: &Outputs,
         log: &Path,
     ) -> Result<()> {
+        let artifacts = self.gather(root, outputs)?;
+        self.publish_gathered(key, &artifacts, log)
+    }
+
+    /// Stores the blobs of the task's outputs, and returns the artifacts an
+    /// entry records for them. An output file whose stamp matches what
+    /// [`Published`] remembers keeps that blob unread. Nothing cites the
+    /// blobs until [`Self::publish_gathered`] does, so gathering for a result
+    /// that is then not kept leaves only blobs eviction removes.
+    pub(crate) fn gather(
+        &self,
+        root: &Path,
+        outputs: &Outputs,
+    ) -> Result<BTreeMap<String, Artifact>> {
+        self.gather_at(root, outputs, SystemTime::now())
+    }
+
+    /// [`Self::gather`], begun at `started`, which judges whether a file's
+    /// stamp is settled.
+    fn gather_at(
+        &self,
+        root: &Path,
+        outputs: &Outputs,
+        started: SystemTime,
+    ) -> Result<BTreeMap<String, Artifact>> {
+        let boot = crate::verified::boot();
+        let remembered = Published::load(root, outputs, boot.as_deref());
+        // Nothing writes the outputs while they are gathered, so each
+        // directory is checked not to be a link once, not once per file in it.
+        let directories = std::sync::Mutex::new(foldhash::HashSet::default());
         let mut artifacts = BTreeMap::new();
         let mut pending = Vec::new();
         for entry in outputs.entries(root)? {
             let (path, metadata) = entry?;
-            paths::safe_parents(root, &path)?;
+            paths::safe_parents_once(root, &path, "cache artifact", &directories)?;
             let absolute = root.join(&path);
             let artifact = if metadata.file_type().is_symlink() {
                 let target = fs::read_link(&absolute)?
@@ -357,7 +493,7 @@ impl Cache {
                     directory: absolute.is_dir(),
                 }
             } else if metadata.is_file() {
-                pending.push((path, absolute, mode(&metadata)));
+                pending.push((path, absolute, metadata));
                 continue;
             } else if metadata.is_dir() {
                 Artifact::Directory {
@@ -368,27 +504,80 @@ impl Cache {
             };
             artifacts.insert(path, artifact);
         }
-        let mut sources: Vec<_> = pending
+        // The remembered blob of each file left as it was, if the store still
+        // holds it at the file's size: one cut short is stored again, which
+        // replaces it. A blob is otherwise read only when it is restored,
+        // and a restore that finds it damaged runs the task and stores the
+        // file anew.
+        let reused =
+            crate::hash::in_parallel(&pending, LOOKED_PER_THREAD, |(path, _, metadata)| {
+                Ok(remembered
+                    .blob(path, &crate::warm::stamp(metadata))
+                    .filter(|blob| {
+                        fs::metadata(self.root.join("blobs").join(blob))
+                            .is_ok_and(|held| held.is_file() && held.len() == metadata.len())
+                    })
+                    .map(str::to_owned))
+            })?;
+        let sources: Vec<_> = pending
             .iter()
-            .map(|(_, source, _)| source.clone())
+            .zip(&reused)
+            .filter(|(_, reused)| reused.is_none())
+            .map(|((_, source, _), _)| source.clone())
             .collect();
-        sources.push(log.to_owned());
-        // Every worker finishes before any manifest is published.
         let mut blobs = self.put_blobs(&sources).into_iter();
-        for (path, _, mode) in pending {
+        let mut published = Published::new(boot);
+        let mut read = Vec::new();
+        for ((path, absolute, metadata), reused) in pending.into_iter().zip(reused) {
+            let stamp = crate::warm::stamp(&metadata);
+            let blob = match reused {
+                Some(blob) => {
+                    published.files.insert(path.clone(), (stamp, blob.clone()));
+                    blob
+                }
+                None => {
+                    let blob = blobs.next().expect("output blob result")?;
+                    if settled(&stamp, started, crate::settle::window(&absolute, &metadata)) {
+                        read.push((path.clone(), absolute, stamp, blob.clone()));
+                    }
+                    blob
+                }
+            };
             artifacts.insert(
                 path,
                 Artifact::File {
-                    blob: blobs.next().expect("output blob result")?,
-                    mode,
+                    blob,
+                    mode: mode(&metadata),
                 },
             );
         }
-        let manifest = ResultRecord::new(
-            key.into(),
-            blobs.next().expect("log blob result")?,
-            artifacts,
-        );
+        // A file read with the same settled stamp before and after was not
+        // written while it was read, so its blob holds what that stamp names.
+        let unchanged =
+            crate::hash::in_parallel(&read, LOOKED_PER_THREAD, |(_, absolute, stamp, _)| {
+                Ok(fs::symlink_metadata(absolute)
+                    .is_ok_and(|metadata| crate::warm::stamp(&metadata) == *stamp))
+            })?;
+        for ((path, _, stamp, blob), unchanged) in read.into_iter().zip(unchanged) {
+            if unchanged {
+                published.files.insert(path, (stamp, blob));
+            }
+        }
+        if published.boot.is_some() && published != remembered {
+            published.save(root, outputs);
+        }
+        Ok(artifacts)
+    }
+
+    /// Stores the log and publishes the entry for `key` with `artifacts`, as
+    /// [`Self::gather`] returned them.
+    pub(crate) fn publish_gathered(
+        &self,
+        key: &str,
+        artifacts: &BTreeMap<String, Artifact>,
+        log: &Path,
+    ) -> Result<()> {
+        let manifest = ResultRecord::new(key.into(), self.put_blob(log)?, artifacts.clone());
         record::publish(
             &self.root,
             &self.root.join("entries").join(format!("{key}.json")),
@@ -485,8 +674,9 @@ impl Cache {
     /// written, so tools that compare modification times, such as `tsc -b`,
     /// see outputs newer than their inputs and dependents newer than their
     /// dependencies. Outputs a worktree already holds are kept as they are,
-    /// unless a dependency's outputs changed in this run; then they are
-    /// stamped again to stay newer.
+    /// unless a dependency's outputs may have changed in this run, as
+    /// [`Cache::left_unchanged`] tells; then they are stamped again to stay
+    /// newer.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn restore(
         &self,
@@ -509,25 +699,31 @@ impl Cache {
         if let Some(checked) = &checked
             && checked.repair.is_empty()
         {
-            let changed = {
-                let kept = self.kept.lock().unwrap();
-                checked.revalidated
-                    || dependencies
-                        .iter()
-                        .any(|dependency| !kept.contains(dependency))
-            };
-            if !changed || stamp_outputs(root, outputs, started).is_ok() {
-                if changed {
-                    record_outputs(root, task, key, outputs);
-                } else {
+            let changed = checked.revalidated
+                || dependencies
+                    .iter()
+                    .any(|dependency| !self.left_unchanged(dependency));
+            // Stamping is checked against the stamps just taken, and records
+            // the outputs from them, rather than walking the outputs again.
+            if !changed || stamp_outputs(root, task, key, checked.stamps.clone(), started).is_ok() {
+                if !changed {
                     self.kept.lock().unwrap().insert(task.to_owned());
                 }
+                // Its files and their contents are as listed: stamping them
+                // changes only their modification times.
+                let files = checked.stamps.iter().filter(|(_, stamp)| stamp[0] != 1);
+                self.restoring(
+                    task,
+                    true,
+                    Some(files.map(|(path, _)| path.clone()).collect()),
+                );
                 qk_executor::replay(File::open(log)?, display, qk_executor::Shown::Kept)?;
                 crate::evict::touch(&self.root.join("entries").join(format!("{key}.json")));
                 return Ok(true);
             }
         }
         drop(held_profile);
+        self.restoring(task, false, None);
         let repair = checked.filter(|checked| !checked.repair.is_empty());
         let planning_profile = crate::profile::span(task, "restore_plan");
         // Stage on the destination filesystem; no existing output is touched yet.
@@ -674,13 +870,27 @@ impl Cache {
         }
         drop(mode_profile);
         if repair.is_some() {
+            // Outputs kept beside repaired ones are stamped as well, and the
+            // one walk that finds them records them all.
             let _profile = crate::profile::span(task, "restore_repair_timestamps");
-            stamp_outputs(root, outputs, started)?;
+            stamp_outputs(root, task, key, output_stamps(root, outputs)?, started)?;
         }
         stage.retire();
-        let record_profile = crate::profile::span(task, "restore_record_outputs");
-        record_outputs(root, task, key, outputs);
-        drop(record_profile);
+        if repair.is_none() {
+            let _profile = crate::profile::span(task, "restore_record_outputs");
+            record_outputs(root, task, key, outputs);
+        }
+        // Its outputs now hold the entry's artifacts and nothing else: those
+        // not replaced were checked to be them.
+        let files = manifest
+            .artifacts
+            .iter()
+            .filter(|(_, artifact)| !matches!(artifact, Artifact::Directory { .. }));
+        self.restoring(
+            task,
+            false,
+            Some(files.map(|(path, _)| path.clone()).collect()),
+        );
         let replay_profile = crate::profile::span(task, "restore_replay");
         qk_executor::replay(File::open(log)?, display, shown)?;
         drop(replay_profile);
@@ -905,9 +1115,28 @@ fn outputs_record(root: &Path, task: &str) -> std::path::PathBuf {
         .join(format!("{}.json", &name[..32]))
 }
 
-/// Sets a file's modification time. Unix needs a handle only to read it;
-/// Windows one that may write its attributes.
+/// Sets a file's modification time and leaves its access time. On Linux and
+/// macOS this is one system call by path, which does not follow a link;
+/// elsewhere it takes a handle: Unix one only to read the file, Windows one
+/// that may write its attributes.
 pub(crate) fn set_modified(path: &Path, time: SystemTime) -> Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Ok(since) = time.duration_since(SystemTime::UNIX_EPOCH) {
+        use rustix::fs::{AtFlags, CWD, Timespec, Timestamps, UTIME_OMIT, utimensat};
+        let times = Timestamps {
+            last_access: Timespec {
+                tv_sec: 0,
+                tv_nsec: UTIME_OMIT,
+            },
+            last_modification: Timespec {
+                tv_sec: since.as_secs() as _,
+                tv_nsec: since.subsec_nanos().into(),
+            },
+        };
+        return utimensat(CWD, path, &times, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(std::io::Error::from)
+            .with_context(|| format!("cannot set the modification time of {}", path.display()));
+    }
     #[cfg(windows)]
     let file = {
         use std::os::windows::fs::OpenOptionsExt;
@@ -922,13 +1151,53 @@ pub(crate) fn set_modified(path: &Path, time: SystemTime) -> Result<()> {
         .with_context(|| format!("cannot set the modification time of {}", path.display()))
 }
 
-/// Stamps every output file with `time`. Links are left alone, since setting
-/// a time through one would change the file it points to.
-fn stamp_outputs(root: &Path, outputs: &Outputs, time: SystemTime) -> Result<()> {
-    for path in outputs.paths(root)? {
-        let absolute = root.join(&path);
-        if fs::symlink_metadata(&absolute)?.is_file() {
-            set_modified(&absolute, time)?;
+/// Above how many files a task's outputs are stamped on several threads.
+/// Setting a time and reading it back are two short system calls a file, so
+/// a thread pays for itself only over a few hundred of them.
+const STAMPS_PER_THREAD: usize = 256;
+
+/// Stamps every file among `stamps`, which are a task's outputs as they are
+/// now, with `time`, then records the outputs for `key`: `stamps` with each
+/// file's read again, since setting a time moves its change time too.
+/// Directories and links are left alone, and so are their stamps: setting a
+/// time through a link would change the file it points to, and setting a
+/// file's time changes nothing about the directory holding it. An error is
+/// one setting a time; a stamp that cannot be read back, or that is of
+/// another file than the one checked, of another size or mode, only leaves
+/// the outputs unrecorded, so that the next restore checks them again.
+fn stamp_outputs(
+    root: &Path,
+    task: &str,
+    key: &str,
+    mut stamps: BTreeMap<String, Vec<i64>>,
+    time: SystemTime,
+) -> Result<()> {
+    let _profile = crate::profile::span(task, "restore_stamp_outputs");
+    let files: Vec<&str> = stamps
+        .iter()
+        .filter(|(_, stamp)| stamp[0] == 0)
+        .map(|(path, _)| path.as_str())
+        .collect();
+    let stamped = crate::hash::in_parallel(&files, STAMPS_PER_THREAD, |path| {
+        let absolute = root.join(path);
+        set_modified(&absolute, time)?;
+        Ok(fs::symlink_metadata(&absolute)
+            .ok()
+            .map(|metadata| output_stamp(&metadata))
+            .filter(|stamped| same_but_times(&stamps[*path], stamped)))
+    })?;
+    let stamped: Option<Vec<(String, Vec<i64>)>> = files
+        .iter()
+        .zip(stamped)
+        .map(|(path, stamp)| Some(((*path).to_owned(), stamp?)))
+        .collect();
+    match stamped {
+        Some(stamped) => {
+            stamps.extend(stamped);
+            write_outputs_record(root, task, key, stamps);
+        }
+        None => {
+            let _ = fs::remove_file(outputs_record(root, task));
         }
     }
     Ok(())
@@ -962,38 +1231,170 @@ fn output_stamps(root: &Path, outputs: &Outputs) -> Result<BTreeMap<String, Vec<
     let mut stamps = BTreeMap::new();
     for entry in outputs.entries(root)? {
         let (path, metadata) = entry?;
-        let kind = if metadata.file_type().is_symlink() {
-            2
-        } else if metadata.is_dir() {
-            1
-        } else {
-            0
-        };
-        let modified = metadata
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-            .map_or(-1, |duration| duration.as_nanos() as i64);
-        // Unix adds the change time, inode and mode below.
-        #[cfg_attr(not(unix), allow(unused_mut))]
-        let mut stamp = vec![
-            kind,
-            metadata.len() as i64,
-            modified,
-            i64::from(mode(&metadata)),
-        ];
+        stamps.insert(path, output_stamp(&metadata));
+    }
+    Ok(stamps)
+}
+
+/// Whether anything `outputs` may match can have been written, replaced,
+/// created or removed at or after `since`, told from the times the
+/// filesystem keeps rather than from a listing taken before: a path written
+/// takes a newer modification time and, on Unix, change time, and one
+/// created, removed or renamed gives its directory a newer one. So this reads
+/// the times of every path the outputs match, of every directory they reach,
+/// which holds whatever was removed from among them, and, for a fixed prefix
+/// that is not there, of the closest directory above it that is, which
+/// changed if the prefix was removed. Negated outputs are not read, so
+/// what they exclude counts too. Whatever cannot be read counts as written.
+/// So does a time less than its filesystem's window before `since`, as
+/// [`crate::settle`] gives it: a write after `since` can carry a time that
+/// much earlier, where times are coarse or come from a clock that lags.
+pub(crate) fn written_since(root: &Path, outputs: &Outputs, since: SystemTime) -> bool {
+    let Ok(since) = since.duration_since(SystemTime::UNIX_EPOCH) else {
+        return true;
+    };
+    let since = since.as_nanos() as i128;
+    let recent = |path: &Path, metadata: &fs::Metadata| {
+        let threshold = since - crate::settle::window(path, metadata).as_nanos() as i128;
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            stamp.extend([
-                metadata.ctime(),
-                metadata.ctime_nsec(),
-                metadata.ino() as i64,
-            ]);
+            let time = |seconds: i64, nanoseconds: i64| {
+                i128::from(seconds) * 1_000_000_000 + i128::from(nanoseconds)
+            };
+            time(metadata.mtime(), metadata.mtime_nsec()) >= threshold
+                || time(metadata.ctime(), metadata.ctime_nsec()) >= threshold
         }
-        stamps.insert(path, stamp);
+        #[cfg(not(unix))]
+        metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .is_none_or(|time| time.as_nanos() as i128 >= threshold)
+    };
+    let written = || -> Result<bool> {
+        // Every path a pattern matches, whatever a negated one leaves out.
+        let reached = Outputs::from_paths(outputs.globs())?;
+        let anchors: Vec<&str> = reached.anchors().collect();
+        // What lies below each fixed prefix, taken a path beneath it at a
+        // time, so that several threads walk it. One prefix below another is
+        // walked with it.
+        let mut below = Vec::new();
+        for &anchor in &anchors {
+            if anchors.iter().any(|other| {
+                anchor
+                    .strip_prefix(other)
+                    .is_some_and(|rest| rest.starts_with('/'))
+            }) {
+                continue;
+            }
+            paths::safe_parents(root, anchor)?;
+            let start = root.join(anchor);
+            match fs::symlink_metadata(&start) {
+                // Outputs are listed through a link there, which this does
+                // not follow.
+                Ok(metadata) if metadata.file_type().is_symlink() => return Ok(true),
+                Ok(metadata) if recent(&start, &metadata) => return Ok(true),
+                Ok(metadata) if metadata.is_dir() => {
+                    for entry in fs::read_dir(&start)? {
+                        below.push(entry?.path());
+                    }
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // It may have been removed: then the closest directory
+                    // above it that is left changed. One that is there now
+                    // was there all along or has new times of its own.
+                    let mut above = Path::new(anchor).parent();
+                    loop {
+                        let directory = root.join(above.unwrap_or(Path::new("")));
+                        match fs::symlink_metadata(&directory) {
+                            Ok(metadata) if recent(&directory, &metadata) => return Ok(true),
+                            Ok(_) => break,
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                let Some(parent) = above else { return Ok(true) };
+                                above = parent.parent();
+                            }
+                            Err(_) => return Ok(true),
+                        }
+                    }
+                    continue;
+                }
+                Err(_) => return Ok(true),
+            }
+        }
+        let walked = crate::hash::in_parallel(&below, 1, |start| -> Result<bool> {
+            // Links are read as themselves, as outputs are listed below a
+            // fixed prefix.
+            let walk = walkdir::WalkDir::new(start)
+                .follow_links(false)
+                .follow_root_links(false)
+                .into_iter()
+                .filter_entry(|entry| {
+                    !entry.file_type().is_dir()
+                        || paths::relative(root, entry.path())
+                            .map_or(true, |directory| reached.reaches(&directory))
+                });
+            for entry in walk {
+                let entry = entry?;
+                let path = paths::relative(root, entry.path())?;
+                if (entry.file_type().is_dir() || reached.matches(&path))
+                    && recent(entry.path(), &entry.metadata()?)
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })?;
+        Ok(walked.into_iter().any(|written| written))
+    };
+    written().unwrap_or(true)
+}
+
+/// Whether two stamps of an output differ in nothing but their times: its
+/// kind, size and mode and, on Unix, its inode are the same, so setting a
+/// time is all that happened to it between them, unless it was written in
+/// place at the same size meanwhile.
+fn same_but_times(checked: &[i64], stamped: &[i64]) -> bool {
+    // Kind, size, modification time, mode; then on Unix the change time's
+    // two parts and the inode.
+    let same = |index: usize| checked.get(index) == stamped.get(index);
+    checked.len() == stamped.len() && same(0) && same(1) && same(3) && same(6)
+}
+
+/// One output's stamp, from its metadata read without following a link:
+/// its kind first, 0 for a file, 1 for a directory and 2 for a link.
+fn output_stamp(metadata: &fs::Metadata) -> Vec<i64> {
+    let kind = if metadata.file_type().is_symlink() {
+        2
+    } else if metadata.is_dir() {
+        1
+    } else {
+        0
+    };
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(-1, |duration| duration.as_nanos() as i64);
+    // Unix adds the change time, inode and mode below.
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut stamp = vec![
+        kind,
+        metadata.len() as i64,
+        modified,
+        i64::from(mode(metadata)),
+    ];
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        stamp.extend([
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+            metadata.ino() as i64,
+        ]);
     }
-    Ok(stamps)
+    stamp
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1004,11 +1405,16 @@ struct OutputRecord {
 
 /// Records the outputs a worktree now holds for a task's key.
 pub(crate) fn record_outputs(root: &Path, task: &str, key: &str, outputs: &Outputs) {
-    let record = output_stamps(root, outputs).and_then(|stamps| {
-        Ok(serde_json::to_vec(&OutputRecord {
-            key: key.to_owned(),
-            outputs: stamps,
-        })?)
+    if let Ok(stamps) = output_stamps(root, outputs) {
+        write_outputs_record(root, task, key, stamps);
+    }
+}
+
+/// Records `stamps` as the outputs a worktree holds for a task's key.
+fn write_outputs_record(root: &Path, task: &str, key: &str, stamps: BTreeMap<String, Vec<i64>>) {
+    let record = serde_json::to_vec(&OutputRecord {
+        key: key.to_owned(),
+        outputs: stamps,
     });
     let path = outputs_record(root, task);
     if let Ok(record) = record
@@ -1134,6 +1540,281 @@ fn outputs_held(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The blob an entry stores for `path`.
+    fn published_blob(cache: &Cache, key: &str, path: &str) -> String {
+        let manifest = ResultRecord::read(
+            &fs::read(cache.root.join("entries").join(format!("{key}.json"))).unwrap(),
+            key,
+        )
+        .unwrap();
+        match &manifest.artifacts[path] {
+            Artifact::File { blob, .. } => blob.clone(),
+            other => panic!("{path} is no file: {:?}", serde_json::to_string(other)),
+        }
+    }
+
+    /// A workspace with two output files and a log, and a cache in it.
+    fn publishing() -> (tempfile::TempDir, Cache, Outputs) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("out/nested")).unwrap();
+        fs::write(root.join("out/nested/kept"), "kept").unwrap();
+        fs::write(root.join("out/changed"), "before").unwrap();
+        fs::write(root.join("log"), "").unwrap();
+        let cache = Cache::new(root.join("cache"));
+        cache.initialize().unwrap();
+        (temp, cache, Outputs::from_patterns(&["out"]))
+    }
+
+    /// Publishes as an hour from now, when every file just written is
+    /// settled.
+    fn publish_later(cache: &Cache, root: &Path, key: &str, outputs: &Outputs, log: &Path) {
+        let later = SystemTime::now() + Duration::from_secs(3600);
+        publish_at(cache, root, key, outputs, log, later);
+    }
+
+    /// Publishes as if it started at `started`.
+    fn publish_at(
+        cache: &Cache,
+        root: &Path,
+        key: &str,
+        outputs: &Outputs,
+        log: &Path,
+        started: SystemTime,
+    ) {
+        let artifacts = cache.gather_at(root, outputs, started).unwrap();
+        cache.publish_gathered(key, &artifacts, log).unwrap();
+    }
+
+    #[test]
+    fn a_stamp_is_settled_once_both_its_times_are_old_enough() {
+        let started = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let stamp = |modified: u64, changed: u64| {
+            vec![
+                4,
+                (modified * 1_000_000_000) as i64,
+                0o644,
+                changed as i64,
+                0,
+                7,
+            ]
+        };
+        let fallback = crate::settle::FALLBACK;
+        assert_eq!(
+            settled(&stamp(999_990, 999_990), started, fallback),
+            cfg!(unix)
+        );
+        // Changed within the two seconds of the coarsest timestamps.
+        assert!(!settled(&stamp(999_990, 999_999), started, fallback));
+        assert!(!settled(&stamp(999_999, 999_990), started, fallback));
+        // A filesystem with a shorter window settles them a second on, and
+        // not within that window.
+        let short = Duration::from_millis(10);
+        assert_eq!(
+            settled(&stamp(999_999, 999_999), started, short),
+            cfg!(unix)
+        );
+        let just = started - Duration::from_millis(5);
+        let within = |modified: SystemTime, changed: SystemTime| {
+            let since = |time: SystemTime| time.duration_since(SystemTime::UNIX_EPOCH).unwrap();
+            vec![
+                4,
+                since(modified).as_nanos() as i64,
+                0o644,
+                since(changed).as_secs() as i64,
+                i64::from(since(changed).subsec_nanos()),
+                7,
+            ]
+        };
+        let old = started - Duration::from_secs(10);
+        assert_eq!(settled(&within(old, old), started, short), cfg!(unix));
+        assert!(!settled(&within(just, old), started, short));
+        assert!(!settled(&within(old, just), started, short));
+        // Times after the publish began, as a clock set back leaves them.
+        assert!(!settled(&stamp(1_000_005, 999_990), started, short));
+        assert!(!settled(&stamp(999_990, 1_000_005), started, short));
+        // A stamp without a change time.
+        assert!(!settled(&[4, 999_990_000_000_000, 0o644], started, short));
+    }
+
+    #[test]
+    fn a_settled_output_left_as_it_was_keeps_its_blob_unread() {
+        let Some(boot) = crate::verified::boot() else {
+            return;
+        };
+        if !cfg!(unix) {
+            return;
+        }
+        let (temp, cache, outputs) = publishing();
+        let root = temp.path();
+        let log = root.join("log");
+        let first = "a".repeat(64);
+        publish_later(&cache, root, &first, &outputs, &log);
+        let kept = published_blob(&cache, &first, "out/nested/kept");
+        // Remembered as holding other stored content of its size, the file
+        // is not read: its entry takes the blob remembered.
+        fs::write(root.join("other"), "else").unwrap();
+        let other = cache.put_blob(&root.join("other")).unwrap();
+        let mut published: Published =
+            serde_json::from_slice(&fs::read(Published::path(root, &outputs)).unwrap()).unwrap();
+        assert_eq!(published.boot.as_deref(), Some(boot.as_str()));
+        assert_eq!(published.files["out/nested/kept"].1, kept);
+        published.files.get_mut("out/nested/kept").unwrap().1 = other.clone();
+        published.save(root, &outputs);
+        // The other file changes, size and all, and is read again.
+        fs::write(root.join("out/changed"), "after, longer").unwrap();
+        let second = "b".repeat(64);
+        publish_later(&cache, root, &second, &outputs, &log);
+        assert_eq!(published_blob(&cache, &second, "out/nested/kept"), other);
+        assert_eq!(
+            published_blob(&cache, &second, "out/changed"),
+            digest_file(&root.join("out/changed")).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_file_written_just_before_a_publish_is_read_on_the_next() {
+        let (temp, cache, outputs) = publishing();
+        let root = temp.path();
+        let log = root.join("log");
+        let first = "a".repeat(64);
+        // Published as the first file was written, within any filesystem's
+        // window of every one, whatever the time this test takes to get here.
+        let written = fs::symlink_metadata(root.join("out/nested/kept"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        publish_at(&cache, root, &first, &outputs, &log, written);
+        // Written within a timestamp's resolution of the read, the files'
+        // stamps cannot tell a later write, so neither is remembered.
+        let published: Published = fs::read(Published::path(root, &outputs))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        assert!(published.files.is_empty());
+        // Rewritten at once with as many bytes, as an incremental build may.
+        fs::write(root.join("out/changed"), "behind").unwrap();
+        let second = "b".repeat(64);
+        cache.publish(root, &second, &outputs, &log).unwrap();
+        assert_eq!(
+            published_blob(&cache, &second, "out/changed"),
+            digest_file(&root.join("out/changed")).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_remembered_blob_the_store_lost_or_another_boot_stored_is_not_taken() {
+        if crate::verified::boot().is_none() || !cfg!(unix) {
+            return;
+        }
+        let (temp, cache, outputs) = publishing();
+        let root = temp.path();
+        let log = root.join("log");
+        let first = "a".repeat(64);
+        publish_later(&cache, root, &first, &outputs, &log);
+        let kept = published_blob(&cache, &first, "out/nested/kept");
+        // Gone from the store, as eviction leaves it: stored again.
+        fs::remove_file(cache.root.join("blobs").join(&kept)).unwrap();
+        let second = "b".repeat(64);
+        publish_later(&cache, root, &second, &outputs, &log);
+        assert_eq!(published_blob(&cache, &second, "out/nested/kept"), kept);
+        let held = || fs::read(cache.root.join("blobs").join(&kept)).unwrap();
+        assert_eq!(held(), b"kept");
+        // Cut short in the store: stored again, which replaces it.
+        fs::write(cache.root.join("blobs").join(&kept), "").unwrap();
+        publish_later(&cache, root, &"d".repeat(64), &outputs, &log);
+        assert_eq!(held(), b"kept");
+        // Remembered as a blob of another size: read again.
+        let longer = cache.put_blob(&root.join("out/changed")).unwrap();
+        let mut published: Published =
+            serde_json::from_slice(&fs::read(Published::path(root, &outputs)).unwrap()).unwrap();
+        published.files.get_mut("out/nested/kept").unwrap().1 = longer;
+        published.save(root, &outputs);
+        let sized = "e".repeat(64);
+        publish_later(&cache, root, &sized, &outputs, &log);
+        assert_eq!(published_blob(&cache, &sized, "out/nested/kept"), kept);
+        // Remembered in another boot, whose crash may have lost the blob's
+        // contents: read again.
+        let other = cache.put_blob(&root.join("out/changed")).unwrap();
+        let mut published: Published =
+            serde_json::from_slice(&fs::read(Published::path(root, &outputs)).unwrap()).unwrap();
+        published.boot = Some("another boot".into());
+        published.files.get_mut("out/nested/kept").unwrap().1 = other;
+        published.save(root, &outputs);
+        let third = "c".repeat(64);
+        publish_later(&cache, root, &third, &outputs, &log);
+        assert_eq!(published_blob(&cache, &third, "out/nested/kept"), kept);
+    }
+
+    /// What a task wrote among its outputs is told by times: a file it
+    /// rewrote, one it removed, a fixed prefix it removed, a file it added
+    /// beside them and one a negated output leaves out all count; what lies
+    /// outside the outputs, and outputs untouched, do not. What cannot be
+    /// told, as times too close to the start or a linked fixed prefix,
+    /// counts as written.
+    #[test]
+    fn outputs_count_as_written_by_their_times_and_their_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let cases = [
+            "untouched",
+            "rewritten",
+            "removed",
+            "gone",
+            "added",
+            "excluded",
+            "outside",
+        ];
+        for case in cases {
+            fs::create_dir_all(root.join(case).join("out/nested")).unwrap();
+            fs::create_dir_all(root.join(case).join("other")).unwrap();
+            for path in ["out/nested/a.txt", "out/nested/b.txt", "out/skip.txt"] {
+                fs::write(root.join(case).join(path), "value").unwrap();
+            }
+        }
+        let outputs = |case: &str| {
+            Outputs::from_paths(&[
+                format!("{case}/out/**/*.txt"),
+                format!("!{case}/out/skip.txt"),
+            ])
+            .unwrap()
+        };
+        // Files written after a time count as written since it. Their times
+        // would too from within their filesystem's window before it, which
+        // is too short on some filesystems to be met here.
+        let early = SystemTime::now() - Duration::from_millis(100);
+        assert!(written_since(root, &outputs("untouched"), early));
+
+        std::thread::sleep(crate::settle::FALLBACK + Duration::from_millis(100));
+        let since = SystemTime::now();
+        fs::write(root.join("rewritten/out/nested/a.txt"), "value").unwrap();
+        fs::remove_file(root.join("removed/out/nested/b.txt")).unwrap();
+        fs::remove_dir_all(root.join("gone/out")).unwrap();
+        fs::write(root.join("added/out/nested/c.md"), "value").unwrap();
+        fs::write(root.join("excluded/out/skip.txt"), "value").unwrap();
+        fs::write(root.join("outside/other/a.txt"), "value").unwrap();
+        let written: Vec<_> = cases
+            .iter()
+            .filter(|case| written_since(root, &outputs(case), since))
+            .collect();
+        assert_eq!(
+            written,
+            ["rewritten", "removed", "gone", "added", "excluded"]
+                .iter()
+                .collect::<Vec<_>>()
+        );
+        // Outputs that were never there were not written.
+        let absent = Outputs::from_paths(&["missing/out/**".to_owned()]).unwrap();
+        assert!(!written_since(root, &absent, since));
+        // Outputs listed through a link at their fixed prefix cannot be told.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("untouched/out", root.join("linked")).unwrap();
+            let linked = Outputs::from_paths(&["linked/**".to_owned()]).unwrap();
+            assert!(written_since(root, &linked, since));
+        }
+    }
 
     /// An entry is usable where restoring it would not fail before it
     /// touched an output: whole, within the task's outputs, its blobs held.
@@ -1720,6 +2401,132 @@ mod tests {
             outputs_held(root, "build", &key, &outputs, &manifest),
             Some(false)
         );
+    }
+
+    /// Held outputs are stamped again after a dependency changed, enough of
+    /// them to take several threads, and recorded as they are then, so that
+    /// the next restore finds them unchanged without hashing them. A link
+    /// keeps its own time.
+    #[test]
+    fn held_outputs_are_stamped_after_a_changed_dependency_and_recorded() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("out/nested")).unwrap();
+        let count = 3 * STAMPS_PER_THREAD;
+        for index in 0..count {
+            fs::write(root.join(format!("out/nested/file-{index:04}")), "value").unwrap();
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("nested/file-0000", root.join("out/link")).unwrap();
+        let log = root.join("log");
+        fs::write(&log, "").unwrap();
+        let cache = Cache::new(root.join("cache"));
+        cache.initialize().unwrap();
+        let outputs = Outputs::from_patterns(&["out"]);
+        let key = "f".repeat(64);
+        cache.publish(root, &key, &outputs, &log).unwrap();
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        for index in 0..count {
+            set_modified(&root.join(format!("out/nested/file-{index:04}")), old).unwrap();
+        }
+        let link_time = || {
+            fs::symlink_metadata(root.join("out/link"))
+                .ok()
+                .map(|metadata| metadata.modified().unwrap())
+        };
+        let link_before = link_time();
+        record_outputs(root, "build", &key, &outputs);
+        let manifest = ResultRecord::read(
+            &fs::read(cache.root.join("entries").join(format!("{key}.json"))).unwrap(),
+            &key,
+        )
+        .unwrap();
+        let restore = |dependencies: &BTreeSet<String>| {
+            cache
+                .restore(
+                    root,
+                    "build",
+                    dependencies,
+                    &key,
+                    &outputs,
+                    &qk_executor::Display::Hidden,
+                    qk_executor::Shown::LocalCache,
+                )
+                .unwrap()
+        };
+        let before = SystemTime::now();
+        // A dependency that is not among the kept changed in this run.
+        assert!(restore(&BTreeSet::from(["dependency".to_owned()])));
+        for index in 0..count {
+            let file = root.join(format!("out/nested/file-{index:04}"));
+            assert!(fs::metadata(&file).unwrap().modified().unwrap() >= before);
+        }
+        assert_eq!(link_time(), link_before);
+        assert!(!cache.kept.lock().unwrap().contains("build"));
+        // Recorded as stamped: held, and found so without being hashed.
+        assert_eq!(
+            outputs_held(root, "build", &key, &outputs, &manifest),
+            Some(false)
+        );
+        assert_eq!(
+            output_stamps(root, &outputs).unwrap(),
+            check_outputs(root, "build", &key, &outputs, &manifest)
+                .unwrap()
+                .stamps
+        );
+        // With nothing changed before it, the outputs are kept as they are.
+        let stamped = output_stamps(root, &outputs).unwrap();
+        assert!(restore(&BTreeSet::new()));
+        assert_eq!(output_stamps(root, &outputs).unwrap(), stamped);
+        assert!(cache.kept.lock().unwrap().contains("build"));
+    }
+
+    /// A file that is not the one checked when it comes to be stamped, here
+    /// of another size, leaves the outputs unrecorded, so that the next
+    /// restore checks them.
+    #[test]
+    fn stamping_records_nothing_for_a_file_that_is_not_the_one_checked() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("out")).unwrap();
+        fs::write(root.join("out/a"), "one").unwrap();
+        let outputs = Outputs::from_patterns(&["out"]);
+        let checked = output_stamps(root, &outputs).unwrap();
+        stamp_outputs(root, "build", "key", checked.clone(), SystemTime::now()).unwrap();
+        assert!(outputs_record(root, "build").is_file());
+
+        fs::write(root.join("out/a"), "longer").unwrap();
+        stamp_outputs(root, "build", "key", checked, SystemTime::now()).unwrap();
+        assert!(!outputs_record(root, "build").exists());
+
+        let stamp = output_stamps(root, &outputs)
+            .unwrap()
+            .remove("out/a")
+            .unwrap();
+        let mut later = stamp.clone();
+        later[2] += 1;
+        assert!(same_but_times(&stamp, &later));
+        for index in [0, 1, 3] {
+            let mut other = stamp.clone();
+            other[index] += 1;
+            assert!(!same_but_times(&stamp, &other), "{index}");
+        }
+    }
+
+    /// Setting a link's time sets the link's own, never its target's, where
+    /// a time is set by path.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn setting_a_time_does_not_follow_a_link() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        fs::write(&target, "target").unwrap();
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        set_modified(&target, old).unwrap();
+        set_modified(&link, SystemTime::UNIX_EPOCH + Duration::from_secs(200)).unwrap();
+        assert_eq!(fs::metadata(&target).unwrap().modified().unwrap(), old);
     }
 
     #[test]

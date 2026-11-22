@@ -15,6 +15,7 @@ mod record;
 pub mod recorded;
 mod remote;
 pub mod scratch;
+mod settle;
 mod store;
 pub mod ultracache;
 mod verified;
@@ -136,8 +137,12 @@ pub struct Cache {
     /// The blobs hashed since the machine started, which restores need not
     /// hash again.
     verified: OnceLock<verified::Verified>,
-    /// The tasks whose outputs this run left exactly as they were.
+    /// The tasks restored with the outputs a worktree held kept exactly as
+    /// they were.
     kept: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    /// The tasks run this run that may have left their outputs as they were,
+    /// told once a dependent asks: see [`Cache::left_unchanged`].
+    passing: std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<Passing>>>,
     /// Warm state being saved in the background.
     saves: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>,
     cleanup: std::sync::Mutex<Option<store::Cleanup>>,
@@ -146,6 +151,49 @@ pub struct Cache {
     /// The project graph, for `ignoreReads` entries that name dependencies;
     /// built on first use, `None` where it cannot be.
     projects: OnceLock<Option<qk_graph::ProjectGraph>>,
+    /// What restoring each task did to its outputs, by task, until it is
+    /// done: see [`Cache::restoring`].
+    restores: std::sync::Mutex<std::collections::HashMap<String, Restore>>,
+}
+
+/// A task that ran, succeeded and restored no warm state, which left its
+/// outputs as they were if every task it depends on did and, when it ran
+/// commands, they wrote none of its outputs.
+struct Passing {
+    dependencies: Vec<String>,
+    /// For one that ran commands, what they may have written.
+    ran: Option<Ran>,
+    /// The answer, once a dependent asked.
+    unchanged: OnceLock<bool>,
+}
+
+/// What a task's commands may have written: its declared outputs, from when
+/// it started.
+struct Ran {
+    root: PathBuf,
+    outputs: Box<paths::Outputs>,
+    started: std::time::SystemTime,
+}
+
+/// What a task's commands may have written, given its `outputs`: they are
+/// trusted to write only the outputs it declares, none for `outputs: []`,
+/// and may have written anything when it declares none.
+fn commands_wrote(outputs: Result<paths::Outputs>) -> hash::Written {
+    match outputs {
+        Ok(outputs) if outputs.is_explicit() => {
+            hash::Written::Declared(Box::new(outputs), Vec::new())
+        }
+        _ => hash::Written::Anything,
+    }
+}
+
+/// What restoring a task did to its outputs.
+struct Restore {
+    /// Whether every restore of it this run left its outputs as they were.
+    kept: bool,
+    /// The output files the last restore of it that succeeded left, those
+    /// that are not directories.
+    files: Option<Vec<String>>,
 }
 
 /// Where a task's result came from.
@@ -397,11 +445,97 @@ impl Cache {
             prefetches: OnceLock::new(),
             verified: OnceLock::new(),
             kept: Default::default(),
+            passing: Default::default(),
             saves: Default::default(),
             cleanup: Default::default(),
             workspace_outputs: OnceLock::new(),
             projects: OnceLock::new(),
+            restores: Default::default(),
         }
+    }
+
+    /// Notes what a restore of `task` does to its outputs: whether it leaves
+    /// them as they were and, once it has succeeded, the output files it
+    /// leaves. A restore notes that it may write before it starts to, so
+    /// that a task one restore wrote and another then kept still counts as
+    /// having written its outputs.
+    pub(crate) fn restoring(&self, task: &str, kept: bool, files: Option<Vec<String>>) {
+        let mut restores = self.restores.lock().unwrap();
+        let restore = restores.entry(task.to_owned()).or_insert(Restore {
+            kept: true,
+            files: None,
+        });
+        restore.kept &= kept;
+        restore.files = files;
+    }
+
+    /// What `task`, now done with `result`, may have written, and the output
+    /// files its restore left, if it was taken from the cache.
+    fn written(
+        &self,
+        workspace: &Workspace,
+        task: &Task,
+        prepared: &PreparedTask,
+        result: Option<&TaskResult>,
+        since: usize,
+    ) -> (hash::Written, Option<hash::RestoredOutputs>) {
+        let restore = self.restores.lock().unwrap().remove(&task.id);
+        let outputs = paths::Outputs::new(workspace, task);
+        if result.is_some_and(|result| {
+            matches!(result.cache, CacheStatus::LocalHit | CacheStatus::RemoteHit)
+        }) {
+            // Taken from the cache, it ran nothing, and a restore writes
+            // nothing but paths its outputs match.
+            let written = match (&restore, outputs) {
+                (Some(Restore { kept: true, .. }), _) => hash::Written::Nothing,
+                (_, Ok(outputs)) => hash::Written::Declared(Box::new(outputs), Vec::new()),
+                (_, Err(_)) => hash::Written::Anything,
+            };
+            let files = restore.and_then(|restore| restore.files);
+            return (
+                written,
+                files.map(|files| hash::RestoredOutputs { since, files }),
+            );
+        }
+        // Whatever it runs, its scratch directories are emptied and its warm
+        // state restored first, where its outputs need not reach.
+        let beside = {
+            let scratch = scratch::directories(workspace, task).and_then(|directories| {
+                directories
+                    .iter()
+                    .map(|directory| {
+                        let relative = directory
+                            .strip_prefix(&workspace.root)
+                            .ok()
+                            .and_then(std::path::Path::to_str)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("scratch directory outside the workspace")
+                            })?;
+                        Ok(relative.replace('\\', "/"))
+                    })
+                    .collect::<Result<Vec<_>>>()
+            });
+            let warm = warm::config(workspace, task)
+                .and_then(|entries| paths::Outputs::from_paths(&warm::kept_paths(&entries)));
+            match (scratch, warm) {
+                (Ok(mut paths), Ok(warm)) => {
+                    paths.extend(warm.anchors().map(str::to_owned));
+                    Some(paths)
+                }
+                _ => None,
+            }
+        };
+        let written = match (beside, prepared.commands.is_empty()) {
+            (None, _) => hash::Written::Anything,
+            // It ran no command, so it wrote nothing else.
+            (Some(beside), true) if beside.is_empty() => hash::Written::Nothing,
+            (Some(beside), true) => hash::Written::Within(beside),
+            (Some(beside), false) => match commands_wrote(outputs) {
+                hash::Written::Declared(outputs, _) => hash::Written::Declared(outputs, beside),
+                written => written,
+            },
+        };
+        (written, None)
     }
 
     /// The blobs hashed since the machine started, read on first use.
@@ -505,21 +639,115 @@ impl Cache {
         cancelled: &AtomicBool,
         restored: &dyn Fn(TaskResult),
     ) -> Result<TaskResult> {
+        // What its commands wrote is told by times from here on.
+        let started = (std::time::SystemTime::now(), std::time::Instant::now());
+        // What restoring it lists is checked against the tasks done since.
+        let since = match self.snapshot.get() {
+            Some(Ok(snapshot)) => snapshot.writes_seen(),
+            _ => 0,
+        };
+        self.restores.lock().unwrap().remove(&task.id);
         let written = std::sync::Once::new();
-        let write = || {
+        let write = |result: Option<&TaskResult>| {
             written.call_once(|| {
                 if let Some(Ok(snapshot)) = self.snapshot.get() {
-                    snapshot.outputs_written(workspace, task);
+                    let (written, restored) =
+                        self.written(workspace, task, prepared, result, since);
+                    snapshot.outputs_written(workspace, task, written, restored);
                 }
             })
         };
         let early = |result: TaskResult| {
-            write();
+            write(Some(&result));
             restored(result);
         };
         let result = self.run_task(workspace, graph, task, prepared, cancelled, &early);
-        write();
+        if let Ok(result) = &result {
+            self.passing(workspace, task, prepared, result, started);
+        }
+        write(result.as_ref().ok());
         result
+    }
+
+    /// Notes a task that ran, succeeded and restored no warm state as one
+    /// that may have left its outputs as they were: see
+    /// [`Self::left_unchanged`]. One that restored warm state may have
+    /// written, and one taken from the cache counts as its restore found it.
+    /// One that ran commands declaring no outputs may have written anything,
+    /// and so may one during which the clock was set: what is told from
+    /// times needs a clock that only went forward, as fast as time passed.
+    fn passing(
+        &self,
+        workspace: &Workspace,
+        task: &Task,
+        prepared: &PreparedTask,
+        result: &TaskResult,
+        started: (std::time::SystemTime, std::time::Instant),
+    ) {
+        if result.outcome != Outcome::Success
+            || result.warm.is_some()
+            || !matches!(result.cache, CacheStatus::Miss | CacheStatus::Uncached)
+        {
+            return;
+        }
+        let ran = if prepared.commands.is_empty() {
+            None
+        } else {
+            let steady = std::time::SystemTime::now()
+                .duration_since(started.0)
+                .is_ok_and(|passed| {
+                    passed.abs_diff(started.1.elapsed()) < std::time::Duration::from_secs(1)
+                });
+            match commands_wrote(paths::Outputs::new(workspace, task)) {
+                hash::Written::Declared(outputs, _) if steady => Some(Ran {
+                    root: workspace.root.clone(),
+                    outputs,
+                    started: started.0,
+                }),
+                _ => return,
+            }
+        };
+        self.passing.lock().unwrap().insert(
+            task.id.clone(),
+            std::sync::Arc::new(Passing {
+                dependencies: task.dependencies.iter().cloned().collect(),
+                ran,
+                unchanged: OnceLock::new(),
+            }),
+        );
+    }
+
+    /// Whether this run left `task`'s outputs as they were, so that what
+    /// depends on it need not stamp its own outputs again for its sake. It
+    /// did when it was restored with the outputs the worktree held, or when
+    /// it ran, succeeded and restored no warm state, every task it depends on
+    /// left theirs as they were, and either it ran no command, as `nx:noop`
+    /// targets do, or its commands, trusted to write only its declared
+    /// outputs, left every one of them, and every directory among them, with
+    /// times from before it started.
+    ///
+    /// The answer for a task that ran is worked out once, when a dependent
+    /// first asks, which is only when one is about to keep its outputs. Being
+    /// wrong this way can only cost a tool that compares times work it
+    /// could have skipped, as it then finds an input newer than an output;
+    /// whatever cannot be told counts as changed.
+    pub(crate) fn left_unchanged(&self, task: &str) -> bool {
+        if self.kept.lock().unwrap().contains(task) {
+            return true;
+        }
+        let Some(passing) = self.passing.lock().unwrap().get(task).cloned() else {
+            return false;
+        };
+        *passing.unchanged.get_or_init(|| {
+            passing
+                .dependencies
+                .iter()
+                .all(|dependency| self.left_unchanged(dependency))
+                && passing.ran.as_ref().is_none_or(|ran| {
+                    let _profile = profile::span(task, "outputs_unwritten_check");
+                    !store::written_since(&ran.root, &ran.outputs, ran.started)
+                })
+        })
     }
 
     fn run_task(
@@ -1079,9 +1307,29 @@ impl Cache {
             .remote
             .clone()
             .map(|remote| warm::Adoptables::new(remote, self.root.clone(), task.id.clone()));
-        let warm_report = after(outcome, restored, running, adoptables.as_ref());
-        let inputs_unchanged =
-            self.inputs_match(snapshot, workspace, graph, task, prepared, &key, cancelled);
+        // The recheck reads the task's inputs; the warm save and gathering
+        // the outputs for an entry read the outputs and warm paths and write
+        // to the cache, which is no input. So the three run side by side, and
+        // the entry is published from what was gathered once the recheck
+        // finds the inputs unchanged.
+        let (warm_report, inputs_unchanged, gathered) = std::thread::scope(|scope| {
+            let recheck = scope.spawn(|| {
+                self.inputs_match(snapshot, workspace, graph, task, prepared, &key, cancelled)
+            });
+            let gathering = (outcome == Outcome::Success && !cancelled.load(Ordering::SeqCst))
+                .then(|| {
+                    scope.spawn(|| {
+                        let _publishing = profile::span(&task.id, "publish");
+                        self.gather(&workspace.root, &outputs)
+                    })
+                });
+            let warm_report = after(outcome, restored, running, adoptables.as_ref());
+            (
+                warm_report,
+                recheck.join().expect("input recheck panicked"),
+                gathering.map(|gathering| gathering.join().expect("output gathering panicked")),
+            )
+        });
         let execution = capture.take_log().map(|log| Execution {
             log,
             inputs_unchanged,
@@ -1124,11 +1372,25 @@ impl Cache {
         // The keys the result is kept under, for its warm saves.
         let mut kept_under = Vec::new();
         let kept = outcome == Outcome::Success && inputs_unchanged && capture.healthy();
+        // What was gathered, or, where a cancellation came between the
+        // recheck and gathering, what is gathered now. Every key the result
+        // is kept under records the same outputs.
+        let artifacts = kept.then(|| {
+            gathered.unwrap_or_else(|| {
+                let _publishing = profile::span(&task.id, "publish");
+                self.gather(&workspace.root, &outputs)
+            })
+        });
+        let publish_under = |key: &str| -> anyhow::Result<()> {
+            let _publishing = profile::span(&task.id, "publish_entry");
+            match &artifacts {
+                Some(Ok(artifacts)) => self.publish_gathered(key, artifacts, log.path()),
+                Some(Err(error)) => Err(anyhow::anyhow!("{error:#}")),
+                None => unreachable!("only a kept result is published"),
+            }
+        };
         if kept {
-            let publishing = profile::span(&task.id, "publish");
-            let publish = self.publish(&workspace.root, &key, &outputs, log.path());
-            drop(publishing);
-            match publish {
+            match publish_under(&key) {
                 Ok(()) => {
                     published = true;
                     kept_under.push(key.clone());
@@ -1137,7 +1399,7 @@ impl Cache {
                         remote.upload(&self.root, &key);
                     }
                     for strong in &replaced {
-                        match self.publish(&workspace.root, strong, &outputs, log.path()) {
+                        match publish_under(strong) {
                             Ok(()) => kept_under.push(strong.clone()),
                             Err(error) => qk_executor::status!(
                                 "qk: {}: could not replace a recorded cache entry ({error})",
@@ -1176,7 +1438,7 @@ impl Cache {
             (Some(Ok(set)), Some((_, weak, _))) if kept => {
                 let saved = recorded::with_values(weak, set, snapshot, &workspace.root, &unlisted)
                     .and_then(|(strong, set)| {
-                        self.publish(&workspace.root, &strong, &outputs, log.path())?;
+                        publish_under(&strong)?;
                         recorded::save(&self.root, weak, set)?;
                         // Shared, the sets are merged with those the store
                         // held when this task looked it up.
@@ -1658,18 +1920,30 @@ impl Cache {
             return false;
         }
         let _profile = profile::span(&task.id, "inputs_recheck");
-        let after = hash::recheck_dependency_keys(snapshot, workspace, graph, task).and_then(
-            |dependencies| {
-                hash::fingerprint(
-                    snapshot,
-                    workspace,
-                    task,
-                    prepared,
-                    &dependencies,
-                    cancelled,
-                )
-            },
-        );
+        // The task's own inputs hold its dependencies' outputs only as the
+        // keys `recheck_dependency_keys` returns, so the two are read side by
+        // side and joined as `hash::fingerprint` joins them.
+        let (dependencies, inputs) = std::thread::scope(|scope| {
+            let dependencies =
+                scope.spawn(|| hash::recheck_dependency_keys(snapshot, workspace, graph, task));
+            let inputs = hash::inputs(
+                snapshot,
+                workspace,
+                task,
+                prepared,
+                &BTreeMap::new(),
+                cancelled,
+            );
+            (
+                dependencies.join().expect("dependency recheck panicked"),
+                inputs,
+            )
+        });
+        let after = dependencies.and_then(|dependencies| {
+            let mut inputs = inputs?;
+            inputs["dependencies"] = serde_json::json!(dependencies);
+            hash::key(&inputs)
+        });
         if after.as_deref().ok() != Some(before) {
             if task.definition.cache == Some(true) {
                 if self.reuse {
@@ -1881,6 +2155,74 @@ fn upstream(graph: &TaskGraph, task: &Task) -> BTreeSet<recorded::TargetOf> {
 mod tests {
     use super::*;
 
+    /// The recheck keys a task as keying it did, the dependency outputs it
+    /// reads among its inputs, and tells either changing.
+    #[test]
+    fn the_recheck_keys_a_task_as_keying_did() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(root.join("nx.json"), "{}").unwrap();
+        std::fs::write(
+            root.join("project.json"),
+            serde_json::json!({"name": "app", "targets": {
+                "generate": {"command": "true", "outputs": ["{projectRoot}/generated"]},
+                "build": {"command": "true", "dependsOn": ["generate"], "inputs": [
+                    "{projectRoot}/src/**/*", {"dependentTasksOutputFiles": "**/*.txt"}
+                ]}
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        for path in ["src/main.txt", "generated/value.txt"] {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "first").unwrap();
+        }
+        let workspace = Workspace::load(root).unwrap();
+        let graph = TaskGraph::build(
+            &workspace,
+            &[qk_taskgraph::Request::parse("app:build").unwrap()],
+        )
+        .unwrap();
+        let task = &graph.tasks["app:build"];
+        let prepared = qk_executor::prepare(&workspace, task, &BTreeMap::new()).unwrap();
+        let cancelled = AtomicBool::new(false);
+        let cache = Cache::new(root.join(".qk/cache"));
+        let snapshot = || hash::Snapshot::watched(&workspace, &graph, &cache.root).unwrap();
+        let keyed = |snapshot: &hash::Snapshot| {
+            let dependencies = hash::dependency_keys(snapshot, &workspace, &graph, task).unwrap();
+            assert!(!dependencies.is_empty());
+            hash::fingerprint(
+                snapshot,
+                &workspace,
+                task,
+                &prepared,
+                &dependencies,
+                &cancelled,
+            )
+            .unwrap()
+        };
+        let rechecks = |key: &str| {
+            cache.inputs_match(
+                &snapshot(),
+                &workspace,
+                &graph,
+                task,
+                &prepared,
+                key,
+                &cancelled,
+            )
+        };
+        let key = keyed(&snapshot());
+        assert!(rechecks(&key));
+        std::fs::write(root.join("generated/value.txt"), "second").unwrap();
+        assert!(!rechecks(&key));
+        let key = keyed(&snapshot());
+        assert!(rechecks(&key));
+        std::fs::write(root.join("src/main.txt"), "second").unwrap();
+        assert!(!rechecks(&key));
+    }
+
     #[test]
     fn concurrent_blob_writes_keep_results_ordered_and_repair_corruption() {
         let workspace = tempfile::tempdir().unwrap();
@@ -2045,6 +2387,26 @@ mod tests {
                 0o444
             );
         }
+        // What it hands to dependents is what listing its outputs finds.
+        let listed = || -> Vec<String> {
+            let mut files: Vec<String> = outputs
+                .entries(root)
+                .unwrap()
+                .map(Result::unwrap)
+                .filter(|(_, metadata)| !metadata.is_dir())
+                .map(|(path, _)| path)
+                .collect();
+            files.sort();
+            files
+        };
+        let handed = |kept: bool| {
+            let restore = cache.restores.lock().unwrap().remove("app:build").unwrap();
+            assert_eq!(restore.kept, kept);
+            let mut files = restore.files.unwrap();
+            files.sort();
+            assert_eq!(files, listed());
+        };
+        handed(false);
         let path = root.join("dist/nested/a.txt");
         let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
         assert!(modified >= before);
@@ -2064,6 +2426,24 @@ mod tests {
             std::fs::metadata(&path).unwrap().modified().unwrap(),
             modified
         );
+        handed(true);
+        // A file no artifact names is removed, and not handed over.
+        std::fs::write(root.join("dist/stray.txt"), "stray").unwrap();
+        assert!(
+            cache
+                .restore(
+                    root,
+                    "app:build",
+                    &Default::default(),
+                    &key,
+                    &outputs,
+                    &qk_executor::Display::Hidden,
+                    qk_executor::Shown::LocalCache,
+                )
+                .unwrap()
+        );
+        assert!(!root.join("dist/stray.txt").exists());
+        handed(false);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

@@ -1084,7 +1084,7 @@ impl Before {
 const ASKED_FOR: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 /// Where it is noted that the store was asked for `weak`'s path sets: apart
-/// from `pathsets/`, whose size eviction measures again when it changes.
+/// from `pathsets/`, whose files eviction counts toward the cache's size.
 fn asked_location(cache: &Path, weak: &str) -> PathBuf {
     cache.join("remote").join("asked").join(weak)
 }

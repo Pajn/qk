@@ -156,12 +156,14 @@ Profiling is disabled by default and reads no clocks while disabled.
 Timings cover dependency inputs, declared inputs, runtime commands, remote
 fetches, local restore phases, restoring and saving
 [warm state](../guides/warm-state.md), the command itself (`execute`), the
-input recheck after it (`inputs_recheck`) and storing its result
-(`publish`). Input resolution also times listing the workspace's files
-(`inventory_list`), listing only the paths a task's filesets name
-(`inventory_paths`), waiting for another task's listing (`inventory_wait`) and
-parsing `pnpm-lock.yaml` (`lockfile_parse`); each is charged to the task that
-needed it. A remote fetch also times waiting for the store's index
+input recheck after it (`inputs_recheck`) and storing its result: its
+outputs (`publish`), alongside the recheck and the warm save, then each entry
+once the recheck passes (`publish_entry`). Input resolution also times
+listing the workspace's files, or those of the directories a run's filesets
+start from (`inventory_list`), listing only the paths a
+task's filesets name (`inventory_paths`), waiting for another task's listing
+(`inventory_wait`) and parsing `pnpm-lock.yaml` (`lockfile_parse`); each is
+charged to the task that needed it. A remote fetch also times waiting for the store's index
 (`remote_index_wait`), waiting for the store to respond (`remote_response`) and
 receiving the entry (`remote_body`). From a store server that sends a
 `Server-Timing` header, as qk's does, `remote_response` adds it as `server`:
@@ -178,7 +180,8 @@ timed under the task `prefetch`, and a run that prefetched ends with
 `claimed` by a task, and the `bytes` received. Runtime lines identify the command; other lines identify the task.
 Spans can overlap: runtime evaluation and the inventory are part of input
 resolution, restore phases are part of local restoration, and storing new warm
-files is part of saving warm state. Do not sum them as exclusive costs. Shared runtime commands are timed only when
+files is part of saving warm state, which runs beside the input recheck and
+`publish`. Do not sum them as exclusive costs. Shared runtime commands are timed only when
 evaluated, so a task reusing a result has no separate runtime line.
 
 The flag leaves task stdout and cache results unchanged. Timings are diagnostic

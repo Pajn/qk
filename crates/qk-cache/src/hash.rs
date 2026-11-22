@@ -64,43 +64,47 @@ impl Stamp {
         Self(values)
     }
 
-    /// Membership stamps also use change time: restoring a directory's mtime
-    /// must not allow changes inside a coarse timestamp window to go unnoticed.
-    fn membership_settled(&self) -> bool {
+    /// Whether a membership stamp, with the stamp of a symlink's target after
+    /// its own, was older than `window` at `looked`: see [`Self::settled`].
+    fn membership_settled(&self, window: Duration, looked: SystemTime) -> bool {
         #[cfg(unix)]
         let width = 6;
         #[cfg(not(unix))]
         let width = 2;
-        self.0.chunks_exact(width).all(|values| {
-            let modified = SystemTime::UNIX_EPOCH + Duration::from_nanos(values[1].max(0) as u64);
-            let settled = |time| {
-                SystemTime::now()
-                    .duration_since(time)
-                    .is_ok_and(|age| age > Duration::from_secs(2))
-            };
-            if values[1] < 0 || !settled(modified) {
-                return false;
-            }
-            #[cfg(unix)]
-            {
-                let changed = SystemTime::UNIX_EPOCH
-                    + Duration::new(values[2].max(0) as u64, values[3].max(0) as u32);
-                values[2] >= 0 && settled(changed)
-            }
-            #[cfg(not(unix))]
-            true
-        })
+        self.0
+            .chunks_exact(width)
+            .all(|values| times_settled(values, window, looked))
     }
 
-    /// A file written within the timestamp resolution window could change again
-    /// without changing its stamp, so recent files are always re-read.
-    fn settled(&self) -> bool {
-        let modified = SystemTime::UNIX_EPOCH + Duration::from_nanos(self.0[1].max(0) as u64);
-        self.0[1] >= 0
-            && SystemTime::now()
-                .duration_since(modified)
-                .is_ok_and(|age| age > Duration::from_secs(2))
+    /// Whether every time in this stamp is more than `window`, as
+    /// [`crate::settle::window`] gives it for the file's filesystem, before
+    /// `looked`, a time taken before the file was read: a write within the
+    /// window of the last could leave the stamp as it was, so a file that
+    /// changed more recently is always read again. The change time counts
+    /// too, as tools set modification times back but nothing sets change
+    /// times back.
+    fn settled(&self, window: Duration, looked: SystemTime) -> bool {
+        times_settled(&self.0, window, looked)
     }
+}
+
+/// [`Stamp::settled`] of the values of one file's stamp.
+fn times_settled(values: &[i64], window: Duration, looked: SystemTime) -> bool {
+    let modified = SystemTime::UNIX_EPOCH + Duration::from_nanos(values[1].max(0) as u64);
+    if values[1] < 0 || !crate::settle::older(modified, window, looked) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        let changed = SystemTime::UNIX_EPOCH
+            + Duration::new(
+                values[2].max(0) as u64,
+                values[3].clamp(0, 999_999_999) as u32,
+            );
+        values[2] >= 0 && crate::settle::older(changed, window, looked)
+    }
+    #[cfg(not(unix))]
+    true
 }
 
 /// Digests persisted between runs in the worktree's state, keyed by path and
@@ -134,6 +138,10 @@ pub struct Snapshot {
     listed_ignore: std::sync::OnceLock<Arc<SourceIgnore>>,
     extra_candidates: BTreeSet<String>,
     membership: Mutex<Option<Arc<Membership>>>,
+    /// What a snapshot for keying inventories and lists when every task's
+    /// file inputs lie beneath a few paths: see [`Self::listing`]. `None`
+    /// when it takes the whole workspace.
+    scope: Option<Arc<Scope>>,
     membership_prefixes: Mutex<HashMap<String, Arc<Vec<PathBuf>>>>,
     /// Each task's [`FilePlan`], by its id and declared inputs.
     plans: Mutex<HashMap<(String, String), Arc<FilePlan>>>,
@@ -156,9 +164,11 @@ pub struct Snapshot {
     workspace_prefix: Option<PathBuf>,
     patterns: Mutex<HashMap<(String, bool, bool), Arc<Pattern>>>,
     digests: Mutex<HashMap<String, (Stamp, String)>>,
-    /// Files `includeIgnored` filesets read, whose digests are saved beside
-    /// those of `files`, which may not list them.
-    ignored_files: Mutex<BTreeSet<String>>,
+    /// Files whose digests this run used, which are saved beside those of
+    /// `files`, the source listing, which leaves out many of them: what
+    /// `includeIgnored` filesets read, other tasks' declared outputs, and
+    /// the targets of links.
+    read_files: Mutex<HashSet<String>>,
     /// Whether `digests` gained entries worth saving.
     digests_changed: std::sync::atomic::AtomicBool,
     /// Directories already checked not to be symlinks.
@@ -167,11 +177,10 @@ pub struct Snapshot {
     runtime: Mutex<HashMap<RuntimeKey, Arc<Mutex<Option<Value>>>>>,
     /// The parsed pnpm lockfile, replaced whenever its content changes.
     lockfile: Mutex<Option<Arc<Installed>>>,
-    /// Each dependency task's output files, listed when a task first asks and
-    /// dropped once a task whose outputs overlap them is done.
-    dependency_outputs: Mutex<HashMap<String, Arc<DependencyOutputs>>>,
-    /// Counts drops, so a listing taken while a task finished is not kept.
-    outputs_written: std::sync::atomic::AtomicU64,
+    /// Each dependency task's output files, listed when a task first asks or
+    /// handed over by its restore, and dropped once a task that may have
+    /// written where they lie is done.
+    dependency_outputs: Mutex<Listings>,
 }
 
 /// Membership depends on directory entries and Git/ignore listing policy, not
@@ -194,6 +203,80 @@ struct Membership {
     settled: bool,
     /// When the refresh that produced this inventory began listing.
     listed: Option<Instant>,
+    /// When this inventory began taking its stamps, before any of them: what
+    /// it captured holds only if its stamps had settled by then.
+    stamped: SystemTime,
+    /// The paths this inventory and its listing cover, when not the whole
+    /// workspace: see [`Scope`].
+    scope: Option<Arc<Scope>>,
+}
+
+/// Workspace-relative paths a narrowed inventory and listing cover: what is
+/// at each of them or beneath it. The inventory reads every directory
+/// beneath them, and of each directory leading to them only the names that
+/// lead on and its ignore files, which together decide what is a source
+/// there. No path lies beneath another.
+#[derive(PartialEq, Eq)]
+struct Scope {
+    paths: BTreeSet<String>,
+    /// The same paths, for comparing paths by component.
+    relative: BTreeSet<PathBuf>,
+}
+
+/// Where a directory lies with respect to a [`Scope`].
+#[derive(PartialEq, Eq)]
+enum Reach {
+    /// At one of its paths or beneath it.
+    Within,
+    /// Above one of its paths.
+    Toward,
+    Outside,
+}
+
+impl Scope {
+    /// The scope of `paths`, without those beneath another of them.
+    fn new(paths: impl IntoIterator<Item = String>) -> Self {
+        let mut relative: BTreeSet<PathBuf> = BTreeSet::new();
+        // In component order a path comes before those beneath it, so the
+        // last one kept is the only one that can hold the next.
+        for path in paths
+            .into_iter()
+            .map(PathBuf::from)
+            .collect::<BTreeSet<_>>()
+        {
+            if relative.last().is_none_or(|last| !path.starts_with(last)) {
+                relative.insert(path);
+            }
+        }
+        Self {
+            paths: relative
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect(),
+            relative,
+        }
+    }
+
+    /// Where the workspace-relative `path` lies: see [`Reach`].
+    fn reach(&self, path: &Path) -> Reach {
+        if path
+            .ancestors()
+            .any(|ancestor| self.relative.contains(ancestor))
+        {
+            return Reach::Within;
+        }
+        // Paths beneath `path` follow it in component order.
+        match self.relative.range(path.to_owned()..).next() {
+            Some(below) if below.starts_with(path) => Reach::Toward,
+            _ => Reach::Outside,
+        }
+    }
+
+    /// Whether the workspace-relative `path` is at one of its paths or
+    /// beneath one.
+    fn holds(&self, path: &str) -> bool {
+        self.reach(Path::new(path)) == Reach::Within
+    }
 }
 
 /// A candidate listing and the ignore policy captured with it. Keeping both
@@ -212,6 +295,12 @@ struct FilePlan {
     /// select is at one of these paths or beneath it, and listing those alone
     /// selects what listing the workspace would.
     paths: Option<BTreeSet<String>>,
+    /// The fixed directories or paths its filesets that select files start
+    /// from, when each has one and it has no `json` glob: then every file it
+    /// selects is at one of these or beneath it, as for `paths`, though
+    /// matching rather than named. An exclusion only takes away what one
+    /// that selects files would, so it needs none.
+    prefixes: Option<BTreeSet<String>>,
     /// Its `dependentTasksOutputFiles` globs, each with whether it is
     /// transitive.
     dependency_outputs: Vec<(String, bool)>,
@@ -225,6 +314,18 @@ const WALKERS: usize = 8;
 /// Threads listing source files when ignore files are read on the way. Past a
 /// few, more threads add system time faster than they save time.
 const LISTERS: usize = 4;
+/// Paths a narrowed listing covers at most. Git matches every file it lists
+/// against each path asked for: in a large monorepo, asking for 256 took
+/// about as long as listing everything, and fewer cost less in proportion.
+/// Below this, a narrowed listing costs at most about what the whole one does.
+const SCOPE_PATHS: usize = 200;
+
+/// What a run needs listed of the workspace's files: see [`Snapshot::listing`].
+enum Listing {
+    Nothing,
+    Within(Scope),
+    Whole,
+}
 
 /// Whether `name` is an ignore file, whose rules change which files are sources.
 fn is_policy(name: &std::ffi::OsStr) -> bool {
@@ -232,7 +333,8 @@ fn is_policy(name: &std::ffi::OsStr) -> bool {
 }
 
 impl Membership {
-    /// Inventory source directories and policy stamps before a new listing.
+    /// Inventory source directories and policy stamps before a new listing,
+    /// of the whole workspace or of `scope` alone.
     fn new(
         root: &Path,
         files: &BTreeSet<String>,
@@ -240,6 +342,7 @@ impl Membership {
         outputs: &[Outputs],
         cache: Option<&Path>,
         git_policies: Option<&BTreeSet<PathBuf>>,
+        scope: Option<&Arc<Scope>>,
     ) -> Result<Self> {
         let mut output_anchors: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
         for (index, outputs) in outputs.iter().enumerate() {
@@ -250,6 +353,7 @@ impl Membership {
                     .push(index);
             }
         }
+        let stamped = SystemTime::now();
         let mut membership = Self {
             files: Arc::new(BTreeSet::new()),
             source_ignore: source_ignore.clone(),
@@ -270,6 +374,8 @@ impl Membership {
             ignore_contents: BTreeMap::new(),
             settled: false,
             listed: None,
+            stamped,
+            scope: scope.cloned(),
         };
         // Finding Git's own policy files takes several Git processes, which
         // run while the directories are read. They are stamped as soon as
@@ -455,8 +561,15 @@ impl Membership {
     }
 
     /// The names [`Self::entries`] keeps, before it checks that the inventory
-    /// already watches each directory and policy among them.
+    /// already watches each directory and policy among them. Of a directory
+    /// leading to a narrowed inventory's scope, those are the names that lead
+    /// on and its ignore files: what else it holds lists nothing there.
     fn listed(&self, directory: &Path) -> Result<Option<BTreeSet<(OsString, u8)>>> {
+        let relative_directory = directory.strip_prefix(&self.root).unwrap_or(directory);
+        let toward = self
+            .scope
+            .as_ref()
+            .filter(|scope| scope.reach(relative_directory) != Reach::Within);
         let entries = match std::fs::read_dir(directory) {
             Ok(entries) => entries,
             Err(error)
@@ -469,7 +582,6 @@ impl Membership {
             }
             Err(error) => return Err(error.into()),
         };
-        let relative_directory = directory.strip_prefix(&self.root).unwrap_or(directory);
         let mut outputs = BTreeSet::new();
         for ancestor in relative_directory.ancestors() {
             if let Some(indices) = self.output_anchors.get(ancestor) {
@@ -500,6 +612,12 @@ impl Membership {
             {
                 continue;
             }
+            if let Some(scope) = toward
+                && !is_policy(&name)
+                && scope.reach(relative) == Reach::Outside
+            {
+                continue;
+            }
             let kind = entry.file_type()?;
             if !kind.is_dir()
                 && !is_policy(&name)
@@ -526,9 +644,12 @@ impl Membership {
     }
 
     /// Check source-relevant directory membership and every listing policy.
-    /// Recent directory stamps require fresh entry names; recent ignore files
-    /// require matching contents, while other listing policies must settle.
-    fn state(&self, prefixes: Option<&[PathBuf]>) -> Result<(bool, bool)> {
+    /// Directories and ignore files whose stamps were recent when this
+    /// inventory stamped them require fresh entry names and matching contents:
+    /// what it captured may predate a change their stamps do not show. Other
+    /// listing policies must have settled by `looked`, a time taken before
+    /// they are stamped again, for the result to say they have.
+    fn state(&self, prefixes: Option<&[PathBuf]>, looked: SystemTime) -> Result<(bool, bool)> {
         let mut settled = true;
         let selected = prefixes.map(|prefixes| {
             let mut selected = BTreeSet::new();
@@ -589,7 +710,15 @@ impl Membership {
             }
         };
         for (path, before, directory) in paths {
-            let after = membership_stamp(path)?;
+            let (after, window) = match membership_look(path)? {
+                Some((stamp, window)) => (Some(stamp), window),
+                None => (None, crate::settle::FALLBACK),
+            };
+            let recent = |looked| {
+                after
+                    .as_ref()
+                    .is_some_and(|stamp| !stamp.membership_settled(window, looked))
+            };
             if let Some(captured) = directory {
                 if after.is_some() && captured.is_none() {
                     return Ok((false, false));
@@ -598,21 +727,14 @@ impl Membership {
                 // source-relevant names rather than relisting the whole workspace.
                 // Recent directories are always read, even with an equal stamp:
                 // coarse timestamps can conceal an addition or removal.
-                if *before != after
-                    || after
-                        .as_ref()
-                        .is_some_and(|stamp| !stamp.membership_settled())
-                {
+                if *before != after || recent(self.stamped) {
                     let entries = self.entries(path)?;
                     if entries.as_ref() != captured || membership_stamp(path)? != after {
                         return Ok((false, false));
                     }
                 }
             } else {
-                let recent = after
-                    .as_ref()
-                    .is_some_and(|stamp| !stamp.membership_settled());
-                if (*before != after || recent)
+                if (*before != after || recent(self.stamped))
                     && let Some(content) = self.ignore_contents.get(path)
                 {
                     if ignore_content(path, &after)?.as_ref() != Some(content) {
@@ -623,7 +745,7 @@ impl Membership {
                 if *before != after {
                     return Ok((false, false));
                 }
-                settled &= !recent;
+                settled &= !recent(looked);
             }
         }
         Ok((true, settled))
@@ -641,15 +763,35 @@ impl Membership {
     /// policies, so a change made while listing shows in a later comparison.
     /// `rebuilt` says whether the stamps were taken for this listing.
     fn list(&mut self, extra: &BTreeSet<String>, rebuilt: bool) -> Result<()> {
-        let mut files = source_files(&self.root)?;
+        let mut files = match &self.scope {
+            None => source_files(&self.root)?,
+            // Where Git cannot list the scope's paths apart, the workspace
+            // listing would walk or ask Git of the whole: what that lists
+            // in the scope is what it holds.
+            Some(scope) => match source_files_at(&self.root, &scope.paths)? {
+                Some(files) => files,
+                None => source_files(&self.root)?
+                    .into_iter()
+                    .filter(|path| scope.holds(path))
+                    .collect(),
+            },
+        };
         exclude_artifacts(&mut files, &self.outputs, self.cache.as_deref());
         let ignore = SourceIgnore::new(&self.root)?;
-        files.extend(extra.iter().filter(|path| !ignore.matches(path)).cloned());
+        files.extend(
+            extra
+                .iter()
+                .filter(|path| {
+                    !ignore.matches(path)
+                        && self.scope.as_ref().is_none_or(|scope| scope.holds(path))
+                })
+                .cloned(),
+        );
         self.source_ignore = Arc::new(ignore);
         self.files = Arc::new(files);
         // An unstable inventory or recent policy never enables the fast path.
         // Keep candidates so a rebuild also watches tracked, ignored parents.
-        self.settled = rebuilt && self.covers(&self.files) && self.state(None)?.1;
+        self.settled = rebuilt && self.covers(&self.files) && self.state(None, self.stamped)?.1;
         Ok(())
     }
 
@@ -672,29 +814,48 @@ impl Membership {
 /// Find Git index, exclusion and config files that can change source visibility,
 /// including absent policy files whose later creation must invalidate reuse.
 fn git_membership_policies(root: &Path) -> BTreeSet<PathBuf> {
+    // No question needs another's answer, so the three Git processes run at
+    // once: each costs about as long as reading a few hundred directories.
+    let (paths, origins, excludes) = std::thread::scope(|scope| {
+        let paths = scope.spawn(|| {
+            paths::git(
+                root,
+                &[
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-path",
+                    "index",
+                    "--git-path",
+                    "info/exclude",
+                    "--git-path",
+                    "config",
+                    "--git-path",
+                    "config.worktree",
+                ],
+            )
+        });
+        let origins =
+            scope.spawn(|| paths::git(root, &["config", "--null", "--show-origin", "--list"]));
+        let excludes = paths::git(
+            root,
+            &["config", "--null", "--path", "--get", "core.excludesfile"],
+        );
+        (
+            paths.join().expect("git policy thread panicked"),
+            origins.join().expect("git policy thread panicked"),
+            excludes,
+        )
+    });
     let mut policies = BTreeSet::new();
-    if let Ok(output) = paths::git(
-        root,
-        &[
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-path",
-            "index",
-            "--git-path",
-            "info/exclude",
-            "--git-path",
-            "config",
-            "--git-path",
-            "config.worktree",
-        ],
-    ) && output.status.success()
+    if let Ok(output) = paths
+        && output.status.success()
         && let Ok(paths) = String::from_utf8(output.stdout)
     {
         policies.extend(paths.lines().map(PathBuf::from));
     }
     // Config can include other files. Track every origin used by Git, as
     // well as currently missing standard config and excludes files.
-    if let Ok(output) = paths::git(root, &["config", "--null", "--show-origin", "--list"])
+    if let Ok(output) = origins
         && output.status.success()
     {
         // NUL mode emits raw origins, without Git's C-style path quoting,
@@ -725,10 +886,8 @@ fn git_membership_policies(root: &Path) -> BTreeSet<PathBuf> {
             }
         }
     }
-    if let Ok(output) = paths::git(
-        root,
-        &["config", "--null", "--path", "--get", "core.excludesfile"],
-    ) && output.status.success()
+    if let Ok(output) = excludes
+        && output.status.success()
         && let Ok(path) = String::from_utf8(output.stdout)
     {
         policies.insert(root.join(path.strip_suffix('\0').unwrap_or(&path)));
@@ -773,19 +932,34 @@ fn ignore_content(path: &Path, expected: &Option<Stamp>) -> Result<Option<String
 
 /// Stamp a directory or listing policy, including a symlink's resolved target.
 fn membership_stamp(path: &Path) -> Result<Option<Stamp>> {
+    Ok(membership_look(path)?.map(|(stamp, _)| stamp))
+}
+
+/// [`membership_stamp`], with the window of [`crate::settle::window`] that
+/// covers each file it stamps.
+fn membership_look(path: &Path) -> Result<Option<(Stamp, Duration)>> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
             let mut stamp = Stamp::new(&metadata);
+            let mut window = crate::settle::window(path, &metadata);
             if metadata.is_symlink() {
                 // Follow the current chain on every check. In-place target
                 // edits or retargeted intermediate links can change policy.
                 match std::fs::metadata(path) {
-                    Ok(target) => stamp.0.extend(Stamp::new(&target).0),
+                    Ok(target) => {
+                        stamp.0.extend(Stamp::new(&target).0);
+                        // Asked of the target's own filesystem, which holds a
+                        // regular file or directory and is not followed again.
+                        window = window.max(match std::fs::canonicalize(path) {
+                            Ok(resolved) => crate::settle::window(&resolved, &target),
+                            Err(_) => crate::settle::FALLBACK,
+                        });
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => stamp.0[1] = -1,
                     Err(error) => return Err(error.into()),
                 }
             }
-            Ok(Some(stamp))
+            Ok(Some((stamp, window)))
         }
         Err(error)
             if matches!(
@@ -805,6 +979,92 @@ struct DependencyOutputs {
     anchors: Vec<String>,
     files: Vec<String>,
     values: Mutex<HashMap<String, Value>>,
+}
+
+/// What a task that is done may have written in the workspace, which decides
+/// the listings of dependency outputs that can no longer be trusted.
+#[derive(Clone)]
+pub(crate) enum Written {
+    /// Nothing a listing holds: it ran no command and has no scratch or warm
+    /// paths, or it was restored with its outputs left as they were.
+    Nothing,
+    /// Nothing but these paths and what lies below them.
+    Within(Vec<String>),
+    /// Nothing but paths its declared outputs match, and the paths beside
+    /// them with what lies below: it was restored, or ran a command, which is
+    /// trusted to write only its declared outputs, after its scratch
+    /// directories were emptied and its warm state restored.
+    Declared(Box<Outputs>, Vec<String>),
+    /// Anything: it ran a command that declares no outputs.
+    Anything,
+}
+
+impl Written {
+    /// Whether what was written may touch a listing anchored at `anchors`.
+    fn touches(&self, anchors: &[String]) -> bool {
+        match self {
+            Written::Nothing => false,
+            Written::Within(written) => written
+                .iter()
+                .any(|a| anchors.iter().any(|b| overlaps_path(a, b))),
+            Written::Declared(outputs, beside) => anchors.iter().any(|anchor| {
+                outputs.reaches(anchor) || beside.iter().any(|path| overlaps_path(path, anchor))
+            }),
+            Written::Anything => true,
+        }
+    }
+}
+
+impl std::fmt::Debug for Written {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Written::Nothing => f.write_str("Nothing"),
+            Written::Within(paths) => f.debug_tuple("Within").field(paths).finish(),
+            Written::Declared(outputs, beside) => f
+                .debug_tuple("Declared")
+                .field(&outputs.globs())
+                .field(beside)
+                .finish(),
+            Written::Anything => f.write_str("Anything"),
+        }
+    }
+}
+
+/// Whether one of two workspace-relative paths is the other or lies below it.
+fn overlaps_path(a: &str, b: &str) -> bool {
+    a == b
+        || b.strip_prefix(a).is_some_and(|rest| rest.starts_with('/'))
+        || a.strip_prefix(b).is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// The dependency-output listings a snapshot keeps, and what each task done
+/// so far may have written, in the order they were done.
+#[derive(Default)]
+struct Listings {
+    by_task: HashMap<String, Arc<DependencyOutputs>>,
+    /// Kept for the run, so a listing taken while a task was being done is
+    /// checked against what that task wrote: see [`Listings::still_valid`].
+    writes: Vec<Written>,
+}
+
+impl Listings {
+    /// Whether a listing anchored at `anchors`, which began once the first
+    /// `since` writes were done, misses nothing a later one wrote.
+    fn still_valid(&self, since: usize, anchors: &[String]) -> bool {
+        self.writes[since.min(self.writes.len())..]
+            .iter()
+            .all(|written| !written.touches(anchors))
+    }
+}
+
+/// The output files a task's restore left in the worktree, handed to the
+/// snapshot so that its dependents need not list them again.
+pub(crate) struct RestoredOutputs {
+    /// How many writes the snapshot had seen before the restore began: see
+    /// [`Snapshot::writes_seen`].
+    pub since: usize,
+    /// Its output paths that are not directories, symlinks among them.
+    pub files: Vec<String>,
 }
 
 /// One revision of `pnpm-lock.yaml`, with digests of what it installs computed
@@ -913,6 +1173,7 @@ impl Snapshot {
             listed_ignore: std::sync::OnceLock::new(),
             extra_candidates: BTreeSet::new(),
             membership: Mutex::default(),
+            scope: None,
             membership_prefixes: Mutex::default(),
             plans: Mutex::default(),
             source_exclusions,
@@ -948,12 +1209,11 @@ impl Snapshot {
             patterns: Mutex::default(),
             digests: Mutex::default(),
             digests_changed: Default::default(),
-            ignored_files: Mutex::default(),
+            read_files: Mutex::default(),
             directories: Mutex::default(),
             runtime: Mutex::default(),
             lockfile: Mutex::default(),
             dependency_outputs: Mutex::default(),
-            outputs_written: Default::default(),
         };
         // Every early task needs these, so loading saved digests and parsing
         // the lockfile overlap listing files.
@@ -970,10 +1230,15 @@ impl Snapshot {
             // of such tasks alone never lists the workspace. Without an
             // inventory, each task's refresh takes one, and reports why it
             // cannot, as for a plain listing.
-            if snapshot.lists(workspace, graph) {
-                if watched {
+            match snapshot.listing(workspace, graph) {
+                Listing::Nothing => {}
+                Listing::Within(scope) if watched => {
+                    snapshot.scope = Some(Arc::new(scope));
                     snapshot.watch();
-                } else {
+                }
+                _ if watched => snapshot.watch(),
+                // Inspection resolves every task from the whole listing.
+                _ => {
                     snapshot.files()?;
                 }
             }
@@ -1001,6 +1266,7 @@ impl Snapshot {
         let exclusions = self.source_exclusions.clone();
         let cache = self.cache_relative.clone();
         let extra = self.extra_candidates.clone();
+        let scope = self.scope.clone();
         let listing = std::thread::spawn(move || {
             let _listing = crate::profile::span("snapshot", "inventory_list");
             // No earlier listing names tracked files beneath directories the
@@ -1013,6 +1279,7 @@ impl Snapshot {
                 &exclusions,
                 cache.as_deref(),
                 None,
+                scope.as_ref(),
             )?;
             membership.list(&extra, true)?;
             membership.listed = Some(listed);
@@ -1035,7 +1302,11 @@ impl Snapshot {
             return;
         };
         let _ = self.listed_ignore.set(membership.source_ignore.clone());
-        let _ = self.files.set(Ok((*membership.files).clone()));
+        // A narrowed listing is no initial candidate list, which is the
+        // whole workspace's: that is listed on first use, if any.
+        if membership.scope.is_none() {
+            let _ = self.files.set(Ok((*membership.files).clone()));
+        }
         *self.membership.lock().unwrap() = Some(Arc::new(membership));
     }
 
@@ -1046,16 +1317,38 @@ impl Snapshot {
         self.listed_ignore.get().unwrap_or(&self.built_ignore)
     }
 
-    /// Whether a task of `graph` needs the workspace's files listed: one
-    /// whose filesets match rather than name paths, or one a recording may
-    /// key, whose declared selection is compared with what it read.
-    fn lists(&self, workspace: &Workspace, graph: &TaskGraph) -> bool {
-        graph.tasks.values().any(|task| {
-            task.definition.extra.contains_key("qk:ultracache")
-                || !self
-                    .file_plan(workspace, task)
-                    .is_ok_and(|plan| plan.paths.is_some())
-        })
+    /// What a run of `graph`'s tasks needs listed of the workspace's files:
+    /// nothing when each task's filesets name paths, which are listed for it
+    /// alone; the whole workspace for a task with a fileset that has no
+    /// fixed directory, or one a recording may key, whose declared selection
+    /// is compared with what it read; and otherwise the directories the
+    /// tasks' filesets start from, together, unless there are so many of
+    /// them that asking Git for each would cost what listing everything does.
+    fn listing(&self, workspace: &Workspace, graph: &TaskGraph) -> Listing {
+        let mut prefixes = BTreeSet::new();
+        for task in graph.tasks.values() {
+            // One in mode "off" is neither recorded nor keyed by a recording;
+            // one whose settings cannot be read is taken as recorded.
+            if !matches!(crate::ultracache::Settings::of(task), Ok(None)) {
+                return Listing::Whole;
+            }
+            match self.file_plan(workspace, task) {
+                Ok(plan) if plan.paths.is_some() => {}
+                Ok(plan) => match &plan.prefixes {
+                    Some(paths) => prefixes.extend(paths.iter().cloned()),
+                    None => return Listing::Whole,
+                },
+                Err(_) => return Listing::Whole,
+            }
+        }
+        if prefixes.is_empty() {
+            return Listing::Nothing;
+        }
+        let scope = Scope::new(prefixes);
+        if scope.paths.len() > SCOPE_PATHS {
+            return Listing::Whole;
+        }
+        Listing::Within(scope)
     }
 
     /// The initial candidate list: the workspace's source files, without
@@ -1098,24 +1391,31 @@ impl Snapshot {
         let cancelled = AtomicBool::new(false);
         let mut resolver = Resolver::new(self, workspace, None, &cancelled, &empty);
         resolver.task_inputs(task)?;
-        let paths = resolver
-            .json_globs
-            .is_empty()
+        // A fileset of the workspace root, or a path that is no plain
+        // relative one, is left to the listing.
+        let plain = |pattern: &FilePattern| {
+            !pattern.prefix.is_empty()
+                && pattern
+                    .prefix
+                    .split('/')
+                    .all(|segment| !matches!(segment, "" | "." | ".."))
+        };
+        let patterns = || resolver.scopes.values().flat_map(|scope| &scope.patterns);
+        let listable = resolver.json_globs.is_empty();
+        let paths = listable
             .then(|| {
-                resolver
-                    .scopes
-                    .values()
-                    .flat_map(|scope| &scope.patterns)
+                patterns()
                     .map(|pattern| {
-                        // A fileset of the workspace root, or a path that is
-                        // no plain relative one, is left to the listing.
-                        let plain = !pattern.prefix.is_empty()
-                            && pattern
-                                .prefix
-                                .split('/')
-                                .all(|segment| !matches!(segment, "" | "." | ".."));
-                        (pattern.rest.is_none() && plain).then(|| pattern.prefix.clone())
+                        (pattern.rest.is_none() && plain(pattern)).then(|| pattern.prefix.clone())
                     })
+                    .collect::<Option<BTreeSet<_>>>()
+            })
+            .flatten();
+        let prefixes = listable
+            .then(|| {
+                patterns()
+                    .filter(|pattern| !pattern.excluded)
+                    .map(|pattern| plain(pattern).then(|| pattern.prefix.clone()))
                     .collect::<Option<BTreeSet<_>>>()
             })
             .flatten();
@@ -1129,6 +1429,7 @@ impl Snapshot {
             .collect();
         let plan = Arc::new(FilePlan {
             paths,
+            prefixes,
             dependency_outputs,
         });
         self.plans.lock().unwrap().insert(key, plan.clone());
@@ -1167,18 +1468,24 @@ impl Snapshot {
 
     /// The candidates `task`'s filesets select from. Filesets that each name
     /// a path select only what is at that path or beneath it, so listing
-    /// those paths alone selects what listing the workspace would.
+    /// those paths alone selects what listing the workspace would. Filesets
+    /// that match beneath fixed directories select only there too, so the
+    /// snapshot's narrowed listing serves them when it covers those.
     fn task_candidates(&self, workspace: &Workspace, task: &Task) -> Result<Candidates> {
-        if let Ok(plan) = self.file_plan(workspace, task)
-            && let Some(paths) = &plan.paths
-        {
+        let plan = self.file_plan(workspace, task).ok();
+        if let Some(paths) = plan.as_ref().and_then(|plan| plan.paths.as_ref()) {
             let _listing = crate::profile::span(&task.id, "inventory_paths");
             if let Some(candidates) = self.candidates_at(paths)? {
                 return Ok(candidates);
             }
         }
+        let scope = self.scope.as_ref().filter(|scope| {
+            plan.as_ref()
+                .and_then(|plan| plan.prefixes.as_ref())
+                .is_some_and(|prefixes| prefixes.iter().all(|prefix| scope.holds(prefix)))
+        });
         let prefixes = self.membership_prefixes(workspace, task)?;
-        self.current_files_for(&workspace.root, Some(&prefixes), &task.id)
+        self.current_files_for(&workspace.root, Some(&prefixes), scope, &task.id)
     }
 
     /// Restrict directory checks to the positive fileset prefixes a task reads.
@@ -1231,25 +1538,37 @@ impl Snapshot {
     /// Content changes are checked separately by the file digest cache.
     #[cfg(test)]
     fn current_files(&self, root: &Path) -> Result<Arc<BTreeSet<String>>> {
-        Ok(self.current_files_for(root, None, "test")?.files)
+        Ok(self.current_files_for(root, None, None, "test")?.files)
     }
 
     /// Refresh candidates as needed, returning their policy in the same snapshot.
+    /// With `scope`, which holds every path the caller selects from, the
+    /// candidates may be those of the scope alone; without it, they are the
+    /// whole workspace's.
     fn current_files_for(
         &self,
         root: &Path,
         prefixes: Option<&[PathBuf]>,
+        scope: Option<&Arc<Scope>>,
         task: &str,
     ) -> Result<Candidates> {
         let requested = Instant::now();
         self.settle();
+        // Whether an inventory, and the listing taken with it, covers what
+        // the caller selects from: a narrowed one never serves a caller
+        // reaching beyond its scope, which needs another taken.
+        let serves = |entry: &Membership| match (&entry.scope, scope) {
+            (None, _) => true,
+            (Some(covered), Some(scope)) => Arc::ptr_eq(covered, scope),
+            (Some(_), None) => false,
+        };
         loop {
             let previous = self.membership.lock().unwrap().clone();
             // Immutable entries let independent fingerprints validate their
             // directory stamps concurrently. Only a refresh needs serialization.
             let (unchanged, settled) = match &previous {
-                Some(entry) => entry.state(prefixes)?,
-                None => (false, false),
+                Some(entry) if serves(entry) => entry.state(prefixes, SystemTime::now())?,
+                _ => (false, false),
             };
             if settled && previous.as_ref().unwrap().settled {
                 return Ok(previous.as_ref().unwrap().candidates());
@@ -1265,6 +1584,7 @@ impl Snapshot {
             // workspace in turn.
             if let Some(entry) = &*cached
                 && entry.listed.is_some_and(|listed| listed >= requested)
+                && serves(entry)
             {
                 return Ok(entry.candidates());
             }
@@ -1286,16 +1606,21 @@ impl Snapshot {
             // once before enabling reuse (including any newly created empty dirs).
             // Recent directories are checked by freshly reading their child names.
             let rebuilt = !unchanged || settled;
+            let empty = BTreeSet::new();
             let mut membership = if !rebuilt {
                 Arc::unwrap_or_clone(cached.take().unwrap())
             } else {
                 // Capture directories before listing files, then compare afterward.
                 // An addition during listing must not hide behind a newer stamp.
+                // A narrowed one is taken for a caller it may serve, without
+                // the whole listing, which an inventory of the same scope
+                // lacking leaves it unsettled until the next.
                 Membership::new(
                     root,
                     match cached.as_ref() {
-                        Some(entry) => &entry.files,
-                        None => self.files()?,
+                        Some(entry) if entry.scope.as_ref() == scope => &entry.files,
+                        _ if scope.is_some() => &empty,
+                        _ => self.files()?,
                     },
                     self.source_ignore(),
                     &self.source_exclusions,
@@ -1304,6 +1629,7 @@ impl Snapshot {
                         .as_ref()
                         .filter(|entry| unchanged && entry.settled)
                         .map(|entry| &entry.git_policies),
+                    scope,
                 )?
             };
             membership.list(&self.extra_candidates, rebuilt)?;
@@ -1314,8 +1640,9 @@ impl Snapshot {
         }
     }
 
-    /// Saves the digests of files that still exist, for the next run. A run
-    /// that listed no files keeps every digest, until one that lists them.
+    /// Saves the digests of files that still exist, for the next run: those
+    /// the run listed or read. A run that listed no files keeps every
+    /// digest, until one that lists them.
     pub fn save_digests(&self, root: &Path) {
         if !self
             .digests_changed
@@ -1325,7 +1652,7 @@ impl Snapshot {
         }
         self.settle();
         let digests = self.digests.lock().unwrap();
-        let ignored = self.ignored_files.lock().unwrap();
+        let read = self.read_files.lock().unwrap();
         let files = match self.files.get() {
             Some(Ok(files)) => Some(files),
             _ => None,
@@ -1333,7 +1660,7 @@ impl Snapshot {
         let entries: BTreeMap<&String, (&Stamp, &String)> = digests
             .iter()
             .filter(|(path, _)| {
-                files.is_none_or(|files| files.contains(*path)) || ignored.contains(*path)
+                files.is_none_or(|files| files.contains(*path)) || read.contains(*path)
             })
             .map(|(path, (stamp, digest))| (path, (stamp, digest)))
             .collect();
@@ -1399,8 +1726,16 @@ impl Snapshot {
         if let Some(membership) = self.membership.get_mut().unwrap() {
             let membership = Arc::make_mut(membership);
             let ignore = membership.source_ignore.clone();
-            Arc::make_mut(&mut membership.files)
-                .extend(paths.iter().filter(|path| !ignore.matches(path)).cloned());
+            let scope = membership.scope.clone();
+            Arc::make_mut(&mut membership.files).extend(
+                paths
+                    .iter()
+                    .filter(|path| {
+                        !ignore.matches(path)
+                            && scope.as_ref().is_none_or(|scope| scope.holds(path))
+                    })
+                    .cloned(),
+            );
             membership.settled &= membership.covers(&membership.files);
         }
         self
@@ -1430,16 +1765,20 @@ impl Snapshot {
     }
 
     fn digest(&self, path: &str, absolute: &Path, metadata: &std::fs::Metadata) -> Result<String> {
+        self.read_files.lock().unwrap().insert(path.to_owned());
         let stamp = Stamp::new(metadata);
         if let Some((known, digest)) = self.digests.lock().unwrap().get(path)
             && *known == stamp
         {
             return Ok(digest.clone());
         }
+        // Before reading: a write the window lets keep the stamp, made while
+        // the file is read or after, would leave a digest of other contents.
+        let reading = SystemTime::now();
         let digest = digest_file(absolute)?;
         // Re-check after reading so a concurrent write is never recorded as settled.
         let after = Stamp::new(&std::fs::symlink_metadata(absolute)?);
-        if after == stamp && stamp.settled() {
+        if after == stamp && stamp.settled(crate::settle::window(absolute, metadata), reading) {
             self.digests
                 .lock()
                 .unwrap()
@@ -1457,22 +1796,24 @@ impl Snapshot {
         workspace: &Workspace,
         task: &Task,
     ) -> Result<Arc<DependencyOutputs>> {
-        if let Some(outputs) = self.dependency_outputs.lock().unwrap().get(&task.id) {
-            return Ok(outputs.clone());
-        }
-        let written = self
-            .outputs_written
-            .load(std::sync::atomic::Ordering::SeqCst);
+        let since = {
+            let listed = self.dependency_outputs.lock().unwrap();
+            if let Some(outputs) = listed.by_task.get(&task.id) {
+                return Ok(outputs.clone());
+            }
+            listed.writes.len()
+        };
         let outputs = Arc::new(self.fresh_dependency_outputs(workspace, task)?);
         let mut listed = self.dependency_outputs.lock().unwrap();
-        if self
-            .outputs_written
-            .load(std::sync::atomic::Ordering::SeqCst)
-            != written
-        {
+        // A task done while this one listed may have written what it read.
+        if !listed.still_valid(since, &outputs.anchors) {
             return Ok(outputs);
         }
-        Ok(listed.entry(task.id.clone()).or_insert(outputs).clone())
+        Ok(listed
+            .by_task
+            .entry(task.id.clone())
+            .or_insert(outputs)
+            .clone())
     }
 
     /// Re-list artifacts for verification, without reusing earlier content values.
@@ -1496,28 +1837,47 @@ impl Snapshot {
         })
     }
 
-    /// Drops the listings `task` may have changed, once it is done. Without
-    /// its outputs, every listing goes.
-    pub(crate) fn outputs_written(&self, workspace: &Workspace, task: &Task) {
-        let anchors: Option<Vec<String>> = Outputs::new(workspace, task)
-            .ok()
-            .filter(Outputs::is_explicit)
-            .map(|outputs| outputs.anchors().map(str::to_owned).collect());
-        let overlap = |a: &str, b: &str| {
-            a == b
-                || b.strip_prefix(a).is_some_and(|rest| rest.starts_with('/'))
-                || a.strip_prefix(b).is_some_and(|rest| rest.starts_with('/'))
-        };
-        let mut listed = self.dependency_outputs.lock().unwrap();
-        self.outputs_written
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        listed.retain(|_, outputs| {
-            anchors.as_ref().is_some_and(|written| {
-                !written
-                    .iter()
-                    .any(|a| outputs.anchors.iter().any(|b| overlap(a, b)))
-            })
+    /// How many tasks that may have written something are done, for
+    /// [`RestoredOutputs::since`].
+    pub(crate) fn writes_seen(&self) -> usize {
+        self.dependency_outputs.lock().unwrap().writes.len()
+    }
+
+    /// Once `task` is done: drops the listings what it `written` may have
+    /// touched, its own among them, and keeps the listing its restore made,
+    /// unless a task done since that restore began may have touched it.
+    pub(crate) fn outputs_written(
+        &self,
+        workspace: &Workspace,
+        task: &Task,
+        written: Written,
+        restored: Option<RestoredOutputs>,
+    ) {
+        let restored = restored.and_then(|restored| {
+            let anchors: Vec<String> = Outputs::new(workspace, task)
+                .ok()?
+                .anchors()
+                .map(str::to_owned)
+                .collect();
+            Some((restored.since, anchors, restored.files))
         });
+        let mut listed = self.dependency_outputs.lock().unwrap();
+        let restored = restored
+            .filter(|(since, anchors, _)| listed.still_valid(*since, anchors))
+            .map(|(_, anchors, files)| DependencyOutputs {
+                anchors,
+                files,
+                values: Mutex::default(),
+            });
+        if !matches!(written, Written::Nothing) {
+            listed
+                .by_task
+                .retain(|_, outputs| !written.touches(&outputs.anchors));
+            listed.writes.push(written);
+        }
+        if let Some(restored) = restored {
+            listed.by_task.insert(task.id.clone(), Arc::new(restored));
+        }
     }
 
     /// A file an `includeIgnored` fileset read, by the content it points to
@@ -1531,7 +1891,6 @@ impl Snapshot {
             Err(error) => return Err(error.into()),
         };
         let mode = crate::store::mode(&metadata) & 0o111 != 0;
-        self.ignored_files.lock().unwrap().insert(path.to_owned());
         Ok(Some(
             json!({"content":self.digest(path, &absolute, &metadata)?, "mode":mode}),
         ))
@@ -3467,7 +3826,7 @@ const FILES_PER_THREAD: usize = 256;
 /// taking `per_thread` of them at least. Reading files is mostly system
 /// calls, which wait apart from each other. The error is the first in
 /// `items`' order, as one thread taking them in turn would return.
-fn in_parallel<T: Sync, R: Send>(
+pub(crate) fn in_parallel<T: Sync, R: Send>(
     items: &[T],
     per_thread: usize,
     f: impl Fn(&T) -> Result<R> + Sync,
@@ -4170,8 +4529,16 @@ mod tests {
         std::fs::create_dir(root.path().join("src")).unwrap();
         std::fs::write(root.path().join("src/original"), "one").unwrap();
         let ignore = Arc::new(SourceIgnore::new(root.path()).unwrap());
-        let mut membership =
-            Membership::new(root.path(), &BTreeSet::new(), &ignore, &[], None, None).unwrap();
+        let mut membership = Membership::new(
+            root.path(),
+            &BTreeSet::new(),
+            &ignore,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         // Model a change made after the walk but before the listing: the
         // listing shows it, and the stamps taken earlier do not.
         std::fs::rename(
@@ -4183,7 +4550,7 @@ mod tests {
         assert!(membership.files.contains("src/renamed"));
         assert!(!membership.files.contains("src/original"));
         assert!(!membership.settled);
-        assert!(!membership.state(None).unwrap().0);
+        assert!(!membership.state(None, SystemTime::now()).unwrap().0);
     }
 
     #[test]
@@ -4192,8 +4559,16 @@ mod tests {
         std::fs::create_dir_all(root.path().join("src/nested")).unwrap();
         std::thread::sleep(Duration::from_millis(2100));
         let ignore = Arc::new(SourceIgnore::new(root.path()).unwrap());
-        let membership =
-            Membership::new(root.path(), &BTreeSet::new(), &ignore, &[], None, None).unwrap();
+        let membership = Membership::new(
+            root.path(),
+            &BTreeSet::new(),
+            &ignore,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let files = |paths: &[&str]| paths.iter().map(|path| (*path).to_owned()).collect();
         assert!(membership.covers(&files(&["top", "src/a", "src/nested/b", "src/nested/c"])));
         assert!(!membership.covers(&files(&["src/nested/b", "src/missing/c"])));
@@ -4265,7 +4640,7 @@ mod tests {
         snapshot.current_files(root.path()).unwrap();
         let membership = snapshot.membership.lock().unwrap().clone().unwrap();
         std::fs::write(&policy, "bravo\n").unwrap();
-        assert!(!membership.state(None).unwrap().0);
+        assert!(!membership.state(None, SystemTime::now()).unwrap().0);
     }
 
     #[test]
@@ -4284,7 +4659,7 @@ mod tests {
             .unwrap()
             .insert((OsString::from("new-empty"), 1));
         assert!(membership.entries(root.path()).unwrap().is_none());
-        assert!(!membership.state(None).unwrap().0);
+        assert!(!membership.state(None, SystemTime::now()).unwrap().0);
     }
 
     #[test]
@@ -4303,7 +4678,7 @@ mod tests {
             .unwrap()
             .insert((OsString::from(".nxignore"), 0));
         assert!(membership.entries(root.path()).unwrap().is_none());
-        assert!(!membership.state(None).unwrap().0);
+        assert!(!membership.state(None, SystemTime::now()).unwrap().0);
     }
 
     #[test]
@@ -4434,15 +4809,15 @@ mod tests {
         let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
         let snapshot = Snapshot::new(&workspace, &graph, &root.path().join("cache")).unwrap();
         let first = snapshot
-            .current_files_for(root.path(), None, "test")
+            .current_files_for(root.path(), None, None, "test")
             .unwrap();
         policy("beta");
         let second = snapshot
-            .current_files_for(root.path(), None, "test")
+            .current_files_for(root.path(), None, None, "test")
             .unwrap();
         policy("gamma");
         let third = snapshot
-            .current_files_for(root.path(), None, "test")
+            .current_files_for(root.path(), None, None, "test")
             .unwrap();
         // Deterministically pause two fingerprints after candidate acquisition,
         // then let another fingerprint refresh policy twice before they resolve.
@@ -4508,17 +4883,17 @@ mod tests {
                 .membership_prefixes(&workspace, &graph.tasks["app:build"])
                 .unwrap();
             let before = snapshot
-                .current_files_for(&workspace.root, Some(&left), "test")
+                .current_files_for(&workspace.root, Some(&left), None, "test")
                 .unwrap();
             std::fs::write(root.path().join("right/empty/new.txt"), "right").unwrap();
             let unrelated = snapshot
-                .current_files_for(&workspace.root, Some(&left), "test")
+                .current_files_for(&workspace.root, Some(&left), None, "test")
                 .unwrap();
             assert!(Arc::ptr_eq(&before.files, &unrelated.files));
             assert!(!unrelated.files.contains("right/empty/new.txt"));
             assert!(
                 snapshot
-                    .current_files_for(&workspace.root, Some(&right), "test")
+                    .current_files_for(&workspace.root, Some(&right), None, "test")
                     .unwrap()
                     .files
                     .contains("right/empty/new.txt")
@@ -4527,7 +4902,7 @@ mod tests {
             std::fs::write(root.path().join("left/empty/nested/new.txt"), "left").unwrap();
             assert!(
                 snapshot
-                    .current_files_for(&workspace.root, Some(&left), "test")
+                    .current_files_for(&workspace.root, Some(&left), None, "test")
                     .unwrap()
                     .files
                     .contains("left/empty/nested/new.txt")
@@ -4535,7 +4910,7 @@ mod tests {
             std::fs::write(root.path().join("right/empty/another.txt"), "right").unwrap();
             assert!(
                 snapshot
-                    .current_files_for(&workspace.root, Some(&all), "test")
+                    .current_files_for(&workspace.root, Some(&all), None, "test")
                     .unwrap()
                     .files
                     .contains("right/empty/another.txt")
@@ -4561,7 +4936,7 @@ mod tests {
                 .membership_prefixes(&workspace, &graph.tasks["app:build"])
                 .unwrap();
             snapshot
-                .current_files_for(&workspace.root, Some(&prefixes), "test")
+                .current_files_for(&workspace.root, Some(&prefixes), None, "test")
                 .unwrap();
             std::fs::write(
                 root.path().join("config/empty/new.json"),
@@ -4570,7 +4945,7 @@ mod tests {
             .unwrap();
             assert!(
                 snapshot
-                    .current_files_for(&workspace.root, Some(&prefixes), "test")
+                    .current_files_for(&workspace.root, Some(&prefixes), None, "test")
                     .unwrap()
                     .files
                     .contains("config/empty/new.json")
@@ -4776,6 +5151,11 @@ mod tests {
         std::fs::write(policy.path(), "hidden\n").unwrap();
         std::os::unix::fs::symlink(policy.path(), root.path().join(".gitignore")).unwrap();
         std::fs::write(root.path().join("hidden"), "source").unwrap();
+        let written = Instant::now();
+        let window = crate::settle::window(
+            policy.path(),
+            &std::fs::symlink_metadata(policy.path()).unwrap(),
+        );
         let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
         assert!(
             !snapshot
@@ -4783,15 +5163,16 @@ mod tests {
                 .unwrap()
                 .contains("hidden")
         );
-        assert!(
-            !snapshot
-                .membership
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .settled
-        );
+        // Listed within the policy's window of its write, as a slow machine
+        // can miss on the shortest windows, the listing is not reused.
+        let unsettled = !snapshot
+            .membership
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .settled;
+        assert!(unsettled || written.elapsed() >= window);
         std::thread::sleep(Duration::from_millis(2100));
         let before = snapshot.current_files(root.path()).unwrap();
         assert!(Arc::ptr_eq(
@@ -4862,7 +5243,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn recent_change_time_prevents_membership_reuse_despite_old_mtime() {
+    fn recent_change_time_prevents_reuse_despite_old_mtime() {
         use std::os::unix::fs::MetadataExt;
         let root = tempfile::tempdir().unwrap();
         let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
@@ -4872,9 +5253,117 @@ mod tests {
             .unwrap();
         let metadata = std::fs::metadata(root.path()).unwrap();
         assert!(metadata.ctime() > 1);
+        let changed = SystemTime::UNIX_EPOCH
+            + Duration::new(metadata.ctime() as u64, metadata.ctime_nsec() as u32);
         let stamp = Stamp::new(&metadata);
-        assert!(stamp.settled());
-        assert!(!stamp.membership_settled());
+        let window = crate::settle::window(root.path(), &metadata);
+        for looked in [changed, changed + window] {
+            assert!(!stamp.settled(window, looked));
+            assert!(!stamp.membership_settled(window, looked));
+        }
+        let later = changed + window + Duration::from_millis(1);
+        assert!(stamp.settled(window, later));
+        assert!(stamp.membership_settled(window, later));
+    }
+
+    /// A file's stamp is trusted once both its times are older than its
+    /// filesystem's window, and not within it, whatever that window is.
+    #[test]
+    fn a_stamp_settles_after_its_filesystems_window() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("file");
+        std::fs::write(&path, "same").unwrap();
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        #[allow(unused_mut)]
+        let mut newest = metadata.modified().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            newest = newest.max(
+                SystemTime::UNIX_EPOCH
+                    + Duration::new(metadata.ctime() as u64, metadata.ctime_nsec() as u32),
+            );
+        }
+        let stamp = Stamp::new(&metadata);
+        for window in [
+            crate::settle::window(&path, &metadata),
+            crate::settle::FALLBACK,
+            Duration::from_millis(10),
+        ] {
+            assert!(!stamp.settled(window, newest));
+            assert!(!stamp.settled(window, newest + window / 2));
+            assert!(stamp.settled(window, newest + window + Duration::from_millis(1)));
+        }
+    }
+
+    /// A file rewritten with as many bytes inside its filesystem's window of
+    /// the last write is read again: its digest was not kept.
+    #[test]
+    fn a_same_size_rewrite_within_the_window_is_read_again() {
+        let (root, workspace, graph) =
+            literal_fixture(false, true, json!(["{workspaceRoot}/config.yaml"]));
+        let path = root.path().join("config.yaml");
+        let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
+        std::fs::write(&path, "first").unwrap();
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        let window = crate::settle::window(&path, &metadata);
+        let before = Instant::now();
+        let first = snapshot.digest("config.yaml", &path, &metadata).unwrap();
+        assert_eq!(first, digest_file(&path).unwrap());
+        // Only meaningful where both looks fell inside the window, which a
+        // slow machine can miss on the shortest windows.
+        let kept = snapshot.digests.lock().unwrap().contains_key("config.yaml");
+        if before.elapsed() < window {
+            assert!(!kept);
+        }
+        std::fs::write(&path, "again").unwrap();
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        let second = snapshot.digest("config.yaml", &path, &metadata).unwrap();
+        if before.elapsed() < window {
+            assert_eq!(second, digest_file(&path).unwrap());
+        }
+        // Past the window, a file's digest is kept, and taken for its stamp.
+        settle(&path);
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        snapshot.digest("config.yaml", &path, &metadata).unwrap();
+        assert!(snapshot.digests.lock().unwrap().contains_key("config.yaml"));
+    }
+
+    /// A listing taken once every directory and policy is older than its
+    /// filesystem's window is reused, and one taken within it is not.
+    #[test]
+    fn a_listing_is_reused_once_its_filesystems_window_has_passed() {
+        let (root, workspace, graph) = fixture(Some(json!(["{projectRoot}/dist"])));
+        std::fs::write(root.path().join(".gitignore"), "ignored/\n").unwrap();
+        let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
+        snapshot.current_files(root.path()).unwrap();
+        settle(&root.path().join(".gitignore"));
+        settle(root.path());
+        // The first look past the window stamps the inventory again.
+        let settled = snapshot.current_files(root.path()).unwrap();
+        assert!(
+            snapshot
+                .membership
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .settled
+        );
+        assert!(Arc::ptr_eq(
+            &settled,
+            &snapshot.current_files(root.path()).unwrap()
+        ));
+        // A policy rewritten with as many bytes is read again.
+        std::fs::write(root.path().join(".gitignore"), "src/xxxx\n").unwrap();
+        let changed = snapshot.current_files(root.path()).unwrap();
+        assert!(!Arc::ptr_eq(&settled, &changed));
+    }
+
+    /// Waits until a file just written is older than its filesystem's window.
+    fn settle(path: &Path) {
+        let metadata = std::fs::symlink_metadata(path).unwrap();
+        std::thread::sleep(crate::settle::window(path, &metadata) + Duration::from_millis(20));
     }
 
     #[test]
@@ -4897,16 +5386,141 @@ mod tests {
     #[test]
     fn undeclared_writes_invalidate_dependency_values() {
         for outputs in [None, Some(json!(["{projectRoot}/generated"]))] {
-            let (root, workspace, graph) = fixture(outputs);
+            let (root, workspace, graph) = fixture(outputs.clone());
             let snapshot = Snapshot::new(&workspace, &graph, &root.path().join("cache")).unwrap();
             let keys = || {
                 dependency_keys(&snapshot, &workspace, &graph, &graph.tasks["app:build"]).unwrap()
             };
             let before = keys();
             std::fs::write(root.path().join("generated/value"), "different").unwrap();
-            snapshot.outputs_written(&workspace, &graph.tasks["app:post"]);
+            // As `post` would have written, having run its command.
+            let written = match &outputs {
+                Some(_) => Written::Within(vec!["generated".into()]),
+                None => Written::Anything,
+            };
+            snapshot.outputs_written(&workspace, &graph.tasks["app:post"], written, None);
             assert_ne!(before, keys());
         }
+    }
+
+    /// A listing is kept until a task that may have written where it lies is
+    /// done: one that wrote nothing, or wrote elsewhere, leaves it.
+    #[test]
+    fn listings_are_dropped_only_by_writes_that_touch_them() {
+        let (root, workspace, graph) = fixture(Some(json!(["{projectRoot}/elsewhere"])));
+        let snapshot = Snapshot::new(&workspace, &graph, &root.path().join("cache")).unwrap();
+        let keys =
+            || dependency_keys(&snapshot, &workspace, &graph, &graph.tasks["app:build"]).unwrap();
+        let before = keys();
+        // A file the listing does not hold, which only a fresh listing sees.
+        std::fs::write(root.path().join("generated/added"), "added").unwrap();
+        let post = &graph.tasks["app:post"];
+        let beside = |patterns: &[&str], beside: &[&str]| {
+            let patterns: Vec<String> = patterns.iter().map(|p| (*p).to_owned()).collect();
+            let beside = beside.iter().map(|path| (*path).to_owned()).collect();
+            Written::Declared(Box::new(Outputs::from_paths(&patterns).unwrap()), beside)
+        };
+        let declared = |patterns: &[&str]| beside(patterns, &[]);
+        for written in [
+            Written::Nothing,
+            Written::Within(vec!["elsewhere".into()]),
+            Written::Within(vec!["generate".into()]),
+            declared(&["elsewhere/*/generated", "generate/*"]),
+            beside(&["elsewhere/*"], &["generate", "warm"]),
+        ] {
+            snapshot.outputs_written(&workspace, post, written, None);
+            assert_eq!(before, keys());
+        }
+        for written in [
+            Written::Within(vec!["generated/added".into()]),
+            Written::Within(vec![".".into(), "generated".into()]),
+            declared(&["generated/*.txt"]),
+            // Warm state restored where the outputs do not reach.
+            beside(&["elsewhere/*"], &["generated"]),
+            beside(&["elsewhere/*"], &["warm", "generated/added"]),
+            Written::Anything,
+        ] {
+            snapshot.outputs_written(&workspace, post, Written::Nothing, None);
+            assert_eq!(before, keys());
+            snapshot.outputs_written(&workspace, post, written.clone(), None);
+            let after = keys();
+            assert_ne!(before, after, "{written:?}");
+            std::fs::remove_file(root.path().join("generated/added")).unwrap();
+            snapshot.outputs_written(&workspace, post, Written::Anything, None);
+            assert_eq!(before, keys());
+            std::fs::write(root.path().join("generated/added"), "added").unwrap();
+        }
+    }
+
+    /// What a restore listed stands for a dependency's outputs, unless a task
+    /// done since the restore began may have written among them.
+    #[test]
+    fn restored_listings_stand_unless_written_since() {
+        let (root, workspace, graph) = fixture(Some(json!(["{projectRoot}/elsewhere"])));
+        let snapshot = Snapshot::new(&workspace, &graph, &root.path().join("cache")).unwrap();
+        let keys =
+            || dependency_keys(&snapshot, &workspace, &graph, &graph.tasks["app:build"]).unwrap();
+        let fresh = || {
+            recheck_dependency_keys(&snapshot, &workspace, &graph, &graph.tasks["app:build"])
+                .unwrap()
+        };
+        let generate = &graph.tasks["app:gen"];
+        let post = &graph.tasks["app:post"];
+        std::fs::write(root.path().join("generated/second"), "two").unwrap();
+        // A restore that listed one of the two files, which only shows when
+        // its listing is the one used.
+        let restored = |since| RestoredOutputs {
+            since,
+            files: vec!["generated/value".into()],
+        };
+        let since = snapshot.writes_seen();
+        snapshot.outputs_written(
+            &workspace,
+            post,
+            Written::Within(vec!["elsewhere".into()]),
+            None,
+        );
+        snapshot.outputs_written(
+            &workspace,
+            generate,
+            Written::Within(vec!["generated".into()]),
+            Some(restored(since)),
+        );
+        let handed = keys();
+        assert_ne!(handed, fresh());
+        // Dropped by a write among its files, and listed again.
+        snapshot.outputs_written(
+            &workspace,
+            post,
+            Written::Within(vec!["generated".into()]),
+            None,
+        );
+        assert_eq!(keys(), fresh());
+        // Not kept when such a write came while it was restoring.
+        let since = snapshot.writes_seen();
+        snapshot.outputs_written(
+            &workspace,
+            post,
+            Written::Within(vec!["generated".into()]),
+            None,
+        );
+        snapshot.outputs_written(
+            &workspace,
+            generate,
+            Written::Nothing,
+            Some(restored(since)),
+        );
+        assert_eq!(keys(), fresh());
+        // Kept when the restore left its outputs as they were and nothing
+        // was written since.
+        let since = snapshot.writes_seen();
+        snapshot.outputs_written(
+            &workspace,
+            generate,
+            Written::Nothing,
+            Some(restored(since)),
+        );
+        assert_eq!(keys(), handed);
     }
 
     #[cfg(unix)]
@@ -4929,7 +5543,12 @@ mod tests {
             || dependency_keys(&snapshot, &workspace, &graph, &graph.tasks["app:build"]).unwrap();
         let before = keys();
         std::fs::write(root.path().join("generated/value"), "different").unwrap();
-        snapshot.outputs_written(&workspace, &graph.tasks["app:post"]);
+        snapshot.outputs_written(
+            &workspace,
+            &graph.tasks["app:post"],
+            Written::Within(vec!["generated".into()]),
+            None,
+        );
         assert_ne!(before["app:gen:**/*"], keys()["app:gen:**/*"]);
     }
     /// The digest of a git-ignored file an `includeIgnored` fileset reads is
@@ -4950,13 +5569,7 @@ mod tests {
         std::fs::create_dir(root.path().join("generated")).unwrap();
         std::fs::write(root.path().join("generated/schema.json"), "{}").unwrap();
         // Digests are only saved for files old enough to have settled.
-        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
-        std::fs::File::options()
-            .write(true)
-            .open(root.path().join("generated/schema.json"))
-            .unwrap()
-            .set_times(std::fs::FileTimes::new().set_modified(old))
-            .unwrap();
+        settle(&root.path().join("generated/schema.json"));
         let git = |args: &[&str]| assert!(paths::git(root.path(), args).unwrap().status.success());
         git(&["init", "--quiet"]);
         let workspace = Workspace::load(root.path()).unwrap();
@@ -4976,6 +5589,72 @@ mod tests {
         .unwrap();
         snapshot.save_digests(root.path());
         assert!(load_digests(root.path()).contains_key("generated/schema.json"));
+    }
+
+    /// A run that lists the workspace saves the digests of the files it read
+    /// beside the listing, such as another task's outputs, gitignored, that a
+    /// task keys, and drops those of files it neither listed nor read.
+    #[test]
+    fn digests_of_other_tasks_outputs_a_task_keys_are_saved() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("nx.json"), "{}").unwrap();
+        std::fs::write(root.path().join(".gitignore"), "generated/\n").unwrap();
+        std::fs::write(
+            root.path().join("project.json"),
+            json!({"name": "app", "targets": {
+                "gen": {"command": "true", "outputs": ["{projectRoot}/generated"]},
+                "build": {"command": "true", "dependsOn": ["gen"], "inputs": [
+                    "{projectRoot}/src/**/*", {"dependentTasksOutputFiles": "**/*.ts"}
+                ]}
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        for path in ["src/a.ts", "generated/names.ts"] {
+            let path = root.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "x").unwrap();
+        }
+        // Digests are only saved for files old enough to have settled, by
+        // their change times too, which nothing sets back. Each file has a
+        // window of its own.
+        for path in ["src/a.ts", "generated/names.ts"] {
+            settle(&root.path().join(path));
+        }
+        assert!(
+            paths::git(root.path(), &["init", "--quiet"])
+                .unwrap()
+                .status
+                .success()
+        );
+        let path = digests_path(root.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            json!({"version": 1, "entries": {"generated/gone.ts": [[1, 2], "digest"]}}).to_string(),
+        )
+        .unwrap();
+        let workspace = Workspace::load(root.path()).unwrap();
+        let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
+        let snapshot = Snapshot::new(&workspace, &graph, &root.path().join("cache")).unwrap();
+        assert!(!snapshot.files().unwrap().contains("generated/names.ts"));
+        let task = &graph.tasks["app:build"];
+        let prepared = qk_executor::prepare(&workspace, task, &BTreeMap::new()).unwrap();
+        let dependencies = dependency_keys(&snapshot, &workspace, &graph, task).unwrap();
+        inputs(
+            &snapshot,
+            &workspace,
+            task,
+            &prepared,
+            &dependencies,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        snapshot.save_digests(root.path());
+        let saved = load_digests(root.path());
+        assert!(saved.contains_key("src/a.ts"));
+        assert!(saved.contains_key("generated/names.ts"));
+        assert!(!saved.contains_key("generated/gone.ts"));
     }
 
     /// A workspace whose `app:build` reads `inputs`, beside `app:gen`, which
@@ -5006,7 +5685,7 @@ mod tests {
             }})
             .to_string(),
         );
-        write(".gitignore", "ignored.yaml\n*.log\n");
+        write(".gitignore", "ignored.yaml\n*.log\nskip/\n");
         if nxignore {
             write(".nxignore", "nx-ignored.yaml\n");
         }
@@ -5022,6 +5701,7 @@ mod tests {
             "dir/a.txt",
             "dir/x.log",
             "dir/deep/b.txt",
+            "dir/skip/c.txt",
             "dist/out.txt",
             "warm/state.bin",
             "scratch/tmp.txt",
@@ -5284,7 +5964,7 @@ mod tests {
                 &dependencies,
                 &cancelled,
                 &snapshot
-                    .current_files_for(root.path(), None, "test")
+                    .current_files_for(root.path(), None, None, "test")
                     .unwrap(),
             )
             .unwrap();
@@ -5319,6 +5999,12 @@ mod tests {
                 json!({"command": "true", "inputs": ["{workspaceRoot}/config.yaml"],
                     "qk:ultracache": {}}),
                 true,
+            ),
+            // Not recorded, so keyed by its declared inputs alone.
+            (
+                json!({"command": "true", "inputs": ["{workspaceRoot}/config.yaml"],
+                    "qk:ultracache": {"mode": "off"}}),
+                false,
             ),
         ] {
             let root = tempfile::tempdir().unwrap();
@@ -5373,19 +6059,323 @@ mod tests {
         assert_eq!(snapshot.file_plan(&workspace, &task).unwrap().paths, None);
     }
 
+    /// Globs beneath fixed directories, as filesets of the tasks a run keys
+    /// alone, are keyed from a listing and an inventory of those directories
+    /// together, and key as they would from the workspace's listing: with
+    /// exclusions, with or without a directory of their own, ignore files at
+    /// any depth, an ignored directory beneath one, another task's declared
+    /// outputs that its dependent selects and others do not, a directory
+    /// that is not there, one that is a link, and `node_modules`.
+    #[test]
+    fn glob_inputs_beneath_directories_key_as_the_workspace_listing_does() {
+        let inputs = json!([
+            "{workspaceRoot}/dir/**/*",
+            "!{workspaceRoot}/dir/deep/**",
+            "{projectRoot}/sub/**/*.yaml",
+            "!{projectRoot}/**/kept.yaml",
+            "{workspaceRoot}/dist/**/*",
+            "{workspaceRoot}/missing/**/*",
+            "{workspaceRoot}/link-dir/**/*",
+            "{workspaceRoot}/link-file/**",
+            "{workspaceRoot}/node_modules/**/*",
+            "{workspaceRoot}/config.yaml",
+            {"fileset": "{projectRoot}/warm/**/*", "includeIgnored": true},
+        ]);
+        for (git, nxignore) in [(true, false), (true, true), (false, true), (false, false)] {
+            for upstream in [false, true] {
+                let (_root, workspace, mut graph) = literal_fixture(git, nxignore, inputs.clone());
+                if upstream {
+                    let build = graph.tasks.get_mut("app:build").unwrap();
+                    build.dependencies.insert("app:gen".into());
+                }
+                let cache = workspace.root.join("cache");
+                let task = &graph.tasks["app:build"];
+                let prepared = qk_executor::prepare(&workspace, task, &BTreeMap::new()).unwrap();
+                let inputs = |snapshot: &Snapshot| {
+                    super::inputs(
+                        snapshot,
+                        &workspace,
+                        task,
+                        &prepared,
+                        &BTreeMap::new(),
+                        &AtomicBool::new(false),
+                    )
+                    .unwrap()
+                };
+                let label = format!("git {git}, nxignore {nxignore}, upstream {upstream}");
+                let watched = Snapshot::watched(&workspace, &graph, &cache).unwrap();
+                let scope = watched.scope.clone().expect(&label);
+                assert_eq!(
+                    scope.paths,
+                    [
+                        "config.yaml",
+                        "dir",
+                        "dist",
+                        "link-dir",
+                        "link-file",
+                        "missing",
+                        "node_modules",
+                        "sub"
+                    ]
+                    .map(str::to_owned)
+                    .into(),
+                    "{label}"
+                );
+                let narrowed = inputs(&watched);
+                // The narrowed listing is no initial candidate list.
+                assert!(watched.files.get().is_none(), "{label}");
+                let membership = watched.membership.lock().unwrap().clone().unwrap();
+                assert!(membership.scope.is_some(), "{label}");
+                assert!(
+                    !membership
+                        .directories
+                        .contains(&workspace.root.join("warm"))
+                );
+                let listed = Snapshot::new(&workspace, &graph, &cache).unwrap();
+                listed.files().unwrap();
+                assert_eq!(narrowed, inputs(&listed), "{label}");
+                let files = &narrowed["files"];
+                assert!(files.get("dir/a.txt").is_some(), "{label}");
+                assert!(files.get("sub/kept.yaml").is_none(), "{label}");
+                for path in ["dir/deep/b.txt", "dir/skip/c.txt", "dir/x.log"] {
+                    assert!(files.get(path).is_none(), "{path}, {label}");
+                }
+                assert_eq!(files.get("dist/out.txt").is_some(), upstream, "{label}");
+            }
+        }
+    }
+
+    /// Paths with every directory beneath them, listed with an inventory of
+    /// those alone, list what the workspace's listing holds there.
+    #[test]
+    fn narrowed_listings_hold_what_the_workspace_listing_holds_there() {
+        for (git, nxignore) in [(true, false), (true, true), (false, true), (false, false)] {
+            let (root, workspace, graph) = literal_fixture(git, nxignore, json!([]));
+            let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache"))
+                .unwrap()
+                .with_candidates(&["gone/file".into(), "dir/removed.txt".into()]);
+            let all = snapshot.current_files(root.path()).unwrap();
+            let sets = LITERAL_PATHS
+                .iter()
+                .map(|path| BTreeSet::from([path.to_string()]))
+                .chain([
+                    LITERAL_PATHS.iter().map(|path| path.to_string()).collect(),
+                    BTreeSet::from(["gone".to_owned(), "dir".to_owned(), "missing".to_owned()]),
+                    BTreeSet::from(["dir/deep".to_owned(), "sub".to_owned()]),
+                ]);
+            for paths in sets {
+                let scope = Arc::new(Scope::new(paths.clone()));
+                let mut membership = Membership::new(
+                    root.path(),
+                    &BTreeSet::new(),
+                    snapshot.source_ignore(),
+                    &snapshot.source_exclusions,
+                    snapshot.cache_relative.as_deref(),
+                    None,
+                    Some(&scope),
+                )
+                .unwrap();
+                membership.list(&snapshot.extra_candidates, true).unwrap();
+                let expected: BTreeSet<String> = all
+                    .iter()
+                    .filter(|path| scope.holds(path))
+                    .cloned()
+                    .collect();
+                let label = format!("{paths:?} with git {git}, nxignore {nxignore}");
+                assert_eq!(*membership.files, expected, "{label}");
+                // Nothing outside the scope is read, but the directories
+                // leading to it.
+                for directory in &membership.directories {
+                    let relative = directory.strip_prefix(root.path()).unwrap();
+                    assert!(
+                        scope.reach(relative) != Reach::Outside,
+                        "{relative:?}, {label}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A narrowed inventory lets a listing be reused while nothing it covers
+    /// changed, whatever changes elsewhere, and a change to what it covers,
+    /// to an ignore file above it, to Git's index or to a directory leading
+    /// to it lists again what the workspace's listing would hold there. A
+    /// caller reaching beyond it gets the whole workspace's listing.
+    #[test]
+    fn a_narrowed_inventory_guards_what_it_covers() {
+        let inputs = json!([
+            "{workspaceRoot}/dir/deep/**/*",
+            "{workspaceRoot}/sub/**/*",
+            "{workspaceRoot}/missing/inner/**/*",
+        ]);
+        let mut fixtures = Vec::new();
+        for (git, nxignore) in [(true, false), (true, true), (false, true), (false, false)] {
+            let (root, workspace, graph) = literal_fixture(git, nxignore, inputs.clone());
+            let snapshot = snapshot(&workspace, &graph, true);
+            fixtures.push((root, workspace, graph, snapshot, git, nxignore));
+        }
+        // Recent policies keep any listing from being reused.
+        std::thread::sleep(Duration::from_millis(2100));
+        for (root, workspace, graph, snapshot, git, nxignore) in fixtures {
+            let task = &graph.tasks["app:build"];
+            let scope = snapshot.scope.clone().unwrap();
+            let label = format!("git {git}, nxignore {nxignore}");
+            // The task's candidates, checked against a fresh listing of the
+            // whole workspace there.
+            let candidates = |step: &str| {
+                let files = snapshot.task_candidates(&workspace, task).unwrap().files;
+                let fresh = Snapshot::new(&workspace, &graph, &workspace.root.join("cache"))
+                    .unwrap()
+                    .current_files(root.path())
+                    .unwrap();
+                let held = |files: &BTreeSet<String>| -> BTreeSet<String> {
+                    files
+                        .iter()
+                        .filter(|path| scope.holds(path))
+                        .cloned()
+                        .collect()
+                };
+                assert_eq!(held(&files), held(&fresh), "{step}, {label}");
+                files
+            };
+            let write = |path: &str| {
+                let path = root.path().join(path);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, "new").unwrap();
+            };
+            candidates("first");
+            let settled = candidates("settled");
+            assert!(Arc::ptr_eq(&settled, &candidates("reused")), "{label}");
+            for path in [
+                "outside/new.txt",
+                "top.txt",
+                "dir/beside.txt",
+                "dist/new.txt",
+            ] {
+                write(path);
+            }
+            std::fs::create_dir(root.path().join("dir/empty")).unwrap();
+            assert!(Arc::ptr_eq(&settled, &candidates("outside")), "{label}");
+            write("dir/deep/new.txt");
+            assert!(candidates("within").contains("dir/deep/new.txt"));
+            // Git lists a tracked file whatever ignores it, so an untracked
+            // one shows the rules.
+            std::fs::write(root.path().join("dir/.gitignore"), "deep/new.txt\n").unwrap();
+            assert!(!candidates("new ignore file above").contains("dir/deep/new.txt"));
+            std::fs::write(root.path().join("dir/.gitignore"), "deep/old.txt\n").unwrap();
+            assert!(candidates("edited ignore file above").contains("dir/deep/new.txt"));
+            write("missing/inner/x.txt");
+            assert!(candidates("created beneath").contains("missing/inner/x.txt"));
+            if git {
+                let added = paths::git(root.path(), &["add", "--force", "sub/nested-ignored.yaml"]);
+                assert!(added.unwrap().status.success());
+                assert_eq!(
+                    candidates("index").contains("sub/nested-ignored.yaml"),
+                    !nxignore,
+                    "{label}"
+                );
+            }
+            #[cfg(unix)]
+            {
+                std::fs::rename(root.path().join("dir/deep"), root.path().join("dir/copy"))
+                    .unwrap();
+                std::os::unix::fs::symlink("copy", root.path().join("dir/deep")).unwrap();
+                assert!(!candidates("linked").contains("dir/deep/new.txt"));
+            }
+            // Beyond the scope, the whole workspace's listing.
+            let whole = snapshot.current_files(root.path()).unwrap();
+            let fresh = Snapshot::new(&workspace, &graph, &workspace.root.join("cache"))
+                .unwrap()
+                .current_files(root.path())
+                .unwrap();
+            assert_eq!(whole, fresh, "{label}");
+            assert!(whole.contains("top.txt"), "{label}");
+            candidates("after the whole listing");
+        }
+    }
+
+    /// A run lists the directories its tasks' globs start from together, the
+    /// whole workspace when one of them has none, and nothing when each
+    /// names paths.
+    #[test]
+    fn a_run_lists_the_directories_its_globs_start_from() {
+        let (_root, workspace, mut graph) = literal_fixture(true, false, json!([]));
+        let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
+        let build = graph.tasks.remove("app:build").unwrap();
+        graph.tasks.clear();
+        let mut listing = |inputs: &[Value]| {
+            graph.tasks.clear();
+            for (index, inputs) in inputs.iter().enumerate() {
+                let mut task = build.clone();
+                task.id = format!("app:task{index}");
+                task.definition.inputs = Some(inputs.as_array().unwrap().clone());
+                graph.tasks.insert(task.id.clone(), task);
+            }
+            match snapshot.listing(&workspace, &graph) {
+                Listing::Nothing => None,
+                Listing::Within(scope) => Some(Some(scope.paths)),
+                Listing::Whole => Some(None),
+            }
+        };
+        let paths =
+            |paths: &[&str]| Some(Some(paths.iter().map(|path| path.to_string()).collect()));
+        assert_eq!(listing(&[json!(["{workspaceRoot}/a"])]), None);
+        assert_eq!(
+            listing(&[
+                json!(["{workspaceRoot}/a/**/*", "!{workspaceRoot}/**/*.md"]),
+                json!(["{workspaceRoot}/a/b/*.ts", "{workspaceRoot}/c"]),
+                json!(["{workspaceRoot}/ab/**", "{workspaceRoot}/config.yaml"]),
+            ]),
+            paths(&["a", "ab", "c", "config.yaml"])
+        );
+        for whole in [
+            json!(["{workspaceRoot}/**/*.ts"]),
+            json!(["{workspaceRoot}/*/src/**"]),
+            json!([{"json": "{workspaceRoot}/a/*.json"}]),
+            json!([]),
+        ] {
+            let mut inputs = vec![json!(["{workspaceRoot}/a/**"]), whole.clone()];
+            if whole == json!([]) {
+                // The default inputs of a project at the workspace root.
+                inputs[1] = json!(["default"]);
+            }
+            assert_eq!(listing(&inputs), Some(None), "{whole}");
+        }
+        let many: Vec<Value> = (0..=SCOPE_PATHS)
+            .map(|index| json!([format!("{{workspaceRoot}}/d{index}/**")]))
+            .collect();
+        assert_eq!(listing(&many), Some(None));
+        // A task recordings may key compares its declared selection with
+        // what it read, from the whole listing; one not recorded needs none.
+        for (settings, whole) in [
+            (json!({}), true),
+            (json!({"mode": "record"}), true),
+            (json!({"mode": "unknown"}), true),
+            (json!({"mode": "off"}), false),
+        ] {
+            let mut recorded = build.clone();
+            recorded.definition.inputs = Some(vec![json!("{workspaceRoot}/a/**")]);
+            recorded
+                .definition
+                .extra
+                .insert("qk:ultracache".into(), settings.clone());
+            graph.tasks.clear();
+            graph.tasks.insert(recorded.id.clone(), recorded);
+            assert_eq!(
+                matches!(snapshot.listing(&workspace, &graph), Listing::Whole),
+                whole,
+                "{settings}"
+            );
+        }
+    }
+
     /// A run that lists no files keeps the digests saved before, beside its
     /// own, until a run that lists them leaves out those of files gone.
     #[test]
     fn unlisted_runs_keep_saved_digests() {
         let (root, workspace, graph) =
             literal_fixture(false, true, json!(["{workspaceRoot}/config.yaml"]));
-        let old = std::time::SystemTime::now() - Duration::from_secs(60);
-        std::fs::File::options()
-            .write(true)
-            .open(root.path().join("config.yaml"))
-            .unwrap()
-            .set_times(std::fs::FileTimes::new().set_modified(old))
-            .unwrap();
+        settle(&root.path().join("config.yaml"));
         let path = digests_path(root.path());
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(

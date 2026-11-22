@@ -190,14 +190,44 @@ outputs after dependencies complete, including newly generated files, while
 respecting source ignore rules and excluding the consumer's own outputs. These
 files are keyed independently of selective `dependentTasksOutputFiles` inputs.
 The source list is taken once per run, so a file that a task creates without
-declaring it as an output is seen from the next run. A task whose filesets
+declaring it as an output is seen from the next run. A dependency's output
+files are listed once per run, and a dependency taken from the cache is not
+listed at all: its restore says what it left, unless a task done since the
+restore began may have written among them. A listing is taken again after a
+task is done that may have written among those files: one whose declared
+outputs may match a path there, one whose scratch directories or warm paths
+lie there, which are emptied and restored before it runs, or one without
+declared outputs that ran a command. A task that ran no command writes nothing
+else, and one whose restore left its outputs as they were writes nothing; a
+task that writes into another task's outputs should declare the files it
+writes. A task whose filesets
 each name a path, with no `json` glob, lists only those paths and what is
 beneath them, selecting what the source list would hold there, where Git or a
 root `.nxignore` can list them; a run of such tasks alone then takes no source
-list, unless a sandbox, input analysis or Ultracache's recordings need one. File contents are re-read whenever their metadata changes; their
+list, unless a sandbox, input analysis or Ultracache's recordings need one.
+When the filesets of every task in a run that select files each start from a
+fixed directory, as `{projectRoot}/**/*` does for a project not at the
+workspace root, the run lists those directories together, with what is
+beneath them, in place of the workspace, selecting what the source list would
+hold there; with more than 200 of them it lists the workspace. File contents are re-read whenever their metadata changes; their
 digests persist between runs in the worktree's state, keyed by
 path, size, modification time and, on Unix, change time, inode and mode, so a
-warm run reads only files whose metadata changed. Without
+warm run reads only files whose metadata changed.
+Two writes close enough together can be given the same times, so a digest is
+kept only for a file whose times were older than its filesystem's timestamp
+window when it was read; a file that changed more recently is read again. The
+window is 10 ms on APFS on macOS, and 100 ms on ext4, XFS, Btrfs and tmpfs on
+Linux, which store nanoseconds taken from a clock that advances at least once
+per kernel tick. Everywhere else it is two seconds, which covers FAT: on
+network filesystems, whose times come from another machine's clock; on FUSE,
+9p, virtiofs and overlay filesystems, whose times are only as fine as what
+lies beneath; on Windows; and for any file whose times hold no fraction of a
+second. The same window applies to the workspace's file list. A directory that
+changed within it has its names read again, and the list is reused when they
+are the names it was taken with. A listing policy that changed within it, such
+as a file under `.git`, keeps the list from being reused until the window has
+passed.
+Without
 `inputs`, a task uses `default` and `^default`; `default` is
 `{projectRoot}/**/*` unless a named input overrides it. As in Nx, a
 project's filesets select only the files it owns, leaving out those of
@@ -309,6 +339,14 @@ key does not depend on where qk ran. The entry is
 saved only when the task succeeds and its inputs are unchanged afterwards.
 Declared dependency outputs are rechecked too. Cache keys use a new schema so
 entries saved before these artifact checks are not reused.
+The outputs are stored while the inputs are rechecked and warm state is
+saved, and the entry naming them is written once the recheck finds the inputs
+unchanged. An output file whose size, times, inode and mode are what they were
+when the worktree last stored it, since the machine started, keeps that blob
+without being read again. A file is remembered only when it had last changed
+more than its filesystem's timestamp window, described under
+[Inputs](#inputs), before it was read, and did not change while it was read: a
+write within that window can leave all of these as they were.
 On a hit, qk removes existing files matching the declared outputs, copies the
 cached outputs into place and replays the recorded stdout and stderr. As in
 Nx, outputs a worktree already holds for the key are left as they are: after
@@ -331,8 +369,18 @@ they were built from and newer than the outputs of the tasks they depend on.
 Tools that decide what to rebuild by comparing modification times, such as
 `tsc --build`, then find restored outputs up to date. Outputs a worktree
 already holds are stamped again when a dependency's outputs changed in the
-run, so they stay the newer. Symbolic links and directories keep their
-times.
+run, so they stay the newer. A dependency changed its outputs unless it was
+restored with the outputs the worktree held, or it ran, succeeded, restored
+no warm state, none of its own dependencies changed theirs, and either it
+runs no command, as `nx:noop` targets do, or it declares its outputs and its
+commands left every file they match, and every directory among them, with
+times from before it started, by more than the window in which their
+filesystem could give a later write the same time. A command is trusted to
+write only its declared outputs, as when listing them, so one declaring
+`outputs: []` changes none; one without `outputs` counts as changed whenever
+it runs. Telling whether a command wrote takes one listing of its outputs,
+only once a task depending on it is about to keep its own. Symbolic links and
+directories keep their times.
 
 Entries unused for a week are evicted after each run, as in Nx, and the
 cache stays under a size limit. See [remote caching](remote-cache.md#storage-limits)

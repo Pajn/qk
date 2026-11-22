@@ -82,7 +82,7 @@ impl Verified {
 }
 
 /// What tells this boot from others, as a file name.
-fn boot() -> Option<String> {
+pub(crate) fn boot() -> Option<String> {
     #[cfg(target_os = "linux")]
     {
         let id = fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;

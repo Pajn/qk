@@ -51,6 +51,22 @@ fn process_helper() {
         fs::write("generated/value.txt", format!("generated:{input}")).unwrap();
         return;
     }
+    // Does what the file `request` beside the counter asks, writing both
+    // files when it asks nothing.
+    if mode == "regenerate" {
+        let request = fs::read_to_string(counter.with_file_name("request")).unwrap_or_default();
+        match request.as_str() {
+            "nothing" => {}
+            "rewrite" => fs::write("generated/value.txt", "generated\n").unwrap(),
+            "delete" => fs::remove_file("generated/extra.txt").unwrap(),
+            _ => {
+                fs::create_dir_all("generated").unwrap();
+                fs::write("generated/value.txt", "generated\n").unwrap();
+                fs::write("generated/extra.txt", "extra\n").unwrap();
+            }
+        }
+        return;
+    }
     if mode == "generate-graphql" {
         fs::create_dir_all("apps/a/graphql/nested").unwrap();
         fs::write("apps/a/graphql/nested/output.txt", input).unwrap();
@@ -700,6 +716,115 @@ fn restored_outputs_are_newer_than_their_inputs_and_dependencies() {
     assert_eq!(fixture.runs(), 2);
 }
 
+/// A target that runs no command, as `nx:noop`'s, passes on whether the
+/// tasks it depends on changed their outputs: with nothing changed, what
+/// depends on it keeps its outputs as they are; after a restore, it stamps
+/// them again to stay the newer.
+#[test]
+fn a_task_running_no_command_passes_on_whether_its_dependencies_changed() {
+    let fixture = Fixture::with_targets(json!({
+        "gen": target("generate", json!({"outputs": ["{projectRoot}/generated"]})),
+        "group": {"executor": "nx:noop", "dependsOn": ["gen"]},
+        "build": target("build", json!({"dependsOn": ["group"]})),
+    }));
+    success(fixture.build(&fixture.root, &[]));
+    let generated = fixture.root.join("generated/value.txt");
+    let built = fixture.root.join("dist/nested/out.txt");
+
+    let times = (modified(&generated), modified(&built));
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let kept = success(fixture.build(&fixture.root, &[]));
+    assert!(stderr(&kept).contains("qk: cache hit app:build"));
+    assert_eq!((modified(&generated), modified(&built)), times);
+
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    fs::remove_dir_all(fixture.root.join("generated")).unwrap();
+    success(fixture.build(&fixture.root, &[]));
+    assert!(modified(&generated) > times.0);
+    assert!(modified(&built) >= modified(&generated));
+    assert_eq!(fixture.runs(), 2);
+}
+
+/// Long enough for what was written to be told apart from what is written
+/// next, on any filesystem: longer than the longest window the cache's
+/// `settle` gives one.
+const SETTLE: std::time::Duration = std::time::Duration::from_millis(2100);
+
+/// A task that runs every time passes on that nothing changed when it wrote
+/// none of its declared outputs: what depends on it keeps its outputs as
+/// they are. When it rewrites one, even with the same content, or removes
+/// one, what depends on it stamps its outputs again to stay the newer.
+#[test]
+fn a_task_writing_none_of_its_outputs_passes_on_that_nothing_changed() {
+    let fixture = Fixture::with_targets(json!({
+        "gen": target(
+            "regenerate",
+            json!({"cache": false, "outputs": ["{projectRoot}/generated/*.txt"]}),
+        ),
+        "group": {"executor": "nx:noop", "dependsOn": ["gen"]},
+        "build": target("build", json!({"dependsOn": ["group"]})),
+    }));
+    let request = |what: &str| fs::write(fixture.counter.with_file_name("request"), what).unwrap();
+    success(fixture.build(&fixture.root, &[]));
+    let generated = fixture.root.join("generated/value.txt");
+    let built = fixture.root.join("dist/nested/out.txt");
+
+    request("nothing");
+    std::thread::sleep(SETTLE);
+    let times = (modified(&generated), modified(&built));
+    for _ in 0..2 {
+        let kept = success(fixture.build(&fixture.root, &[]));
+        assert!(stderr(&kept).contains("qk: cache hit app:build"));
+        assert_eq!((modified(&generated), modified(&built)), times);
+    }
+
+    request("rewrite");
+    success(fixture.build(&fixture.root, &[]));
+    assert!(modified(&generated) > times.0);
+    assert!(modified(&built) > times.1);
+    assert!(modified(&built) >= modified(&generated));
+
+    request("nothing");
+    std::thread::sleep(SETTLE);
+    let times = (modified(&generated), modified(&built));
+    success(fixture.build(&fixture.root, &[]));
+    assert_eq!((modified(&generated), modified(&built)), times);
+
+    request("delete");
+    success(fixture.build(&fixture.root, &[]));
+    assert!(!fixture.root.join("generated/extra.txt").exists());
+    assert!(modified(&built) > times.1);
+    // Built once; the generator ran in every one of the six runs.
+    assert_eq!(fixture.runs(), 7);
+}
+
+/// A task that runs a command without declared outputs may have written
+/// anything, so what depends on it stamps its outputs again each time. One
+/// declaring `outputs: []` is trusted, as ever, to write nothing other tasks
+/// read, so what depends on it keeps its outputs as they are.
+#[test]
+fn a_running_task_counts_as_changed_unless_it_declares_its_outputs() {
+    for (outputs, kept) in [(None, false), (Some(json!([])), true)] {
+        let mut generator = target("regenerate", json!({"cache": false}));
+        match outputs {
+            Some(outputs) => generator["outputs"] = outputs,
+            None => drop(generator.as_object_mut().unwrap().remove("outputs")),
+        }
+        let fixture = Fixture::with_targets(json!({
+            "gen": generator,
+            "build": target("build", json!({"dependsOn": ["gen"]})),
+        }));
+        success(fixture.build(&fixture.root, &[]));
+        fs::write(fixture.counter.with_file_name("request"), "nothing").unwrap();
+        std::thread::sleep(SETTLE);
+        let built = fixture.root.join("dist/nested/out.txt");
+        let before = modified(&built);
+        let hit = success(fixture.build(&fixture.root, &[]));
+        assert!(stderr(&hit).contains("qk: cache hit app:build"));
+        assert_eq!(modified(&built) == before, kept);
+    }
+}
+
 #[test]
 /// Reset removes only the selected state and preserves recorded run history.
 fn reset_clears_the_cache_and_worktree_state_but_keeps_history() {
@@ -1002,6 +1127,75 @@ fn forced_runs_key_the_outputs_of_uncacheable_dependencies_without_retaining_the
     );
     assert!(!dependency_log.status.success());
     assert!(stderr(&dependency_log).contains("no retained execution log"));
+}
+
+/// Dependents of tasks taken from the cache key their outputs as listing
+/// them would, whether the restore kept them, replaced them, or the task
+/// between ran no command; and see what a dependency that ran wrote.
+#[test]
+fn restored_dependency_outputs_key_dependents_as_listing_them_would() {
+    let reads = json!({"dependentTasksOutputFiles": "**/*", "transitive": true});
+    let fixture = Fixture::with_targets(json!({
+        "generate": target("generate", json!({"outputs": ["{projectRoot}/generated"], "inputs": ["{projectRoot}/src/**/*"]})),
+        "gate": {"executor": "nx:noop", "dependsOn": ["generate"]},
+        "types": target("generate-types", json!({"outputs": ["{projectRoot}/types"], "dependsOn": ["gate"], "inputs": ["{projectRoot}/src/**/*", reads]})),
+        "build": target("build", json!({"dependsOn": ["types"], "inputs": [reads]}))
+    }));
+    let tasks = ["app:generate", "app:types", "app:build"];
+    // The key each task was run under, by the latest run.
+    let recorded = || -> Vec<Value> {
+        let run: Value = serde_json::from_slice(
+            &success(fixture.qk(&fixture.root, &["show", "run", "--json"])).stdout,
+        )
+        .unwrap();
+        tasks
+            .iter()
+            .map(|id| {
+                run["tasks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|task| task["id"] == *id)
+                    .unwrap()["key"]
+                    .clone()
+            })
+            .collect()
+    };
+    // The key each task has now, from listing its dependencies' outputs.
+    let shown = || -> Vec<Value> {
+        tasks
+            .iter()
+            .map(|id| {
+                let output = success(fixture.qk(&fixture.root, &["show", "hash", id, "--json"]));
+                serde_json::from_slice::<Value>(&output.stdout).unwrap()["key"].clone()
+            })
+            .collect()
+    };
+    success(fixture.build(&fixture.root, &[]));
+    let first = recorded();
+    assert_eq!(first, shown());
+    assert_eq!(fixture.runs(), 3);
+    // Every task restored with its outputs kept.
+    success(fixture.build(&fixture.root, &[]));
+    assert_eq!(recorded(), first);
+    assert_eq!(fixture.runs(), 3);
+    // Restored again in place of files no artifact names.
+    fs::write(fixture.root.join("generated/stray.txt"), "stray\n").unwrap();
+    fs::write(fixture.root.join("types/stray.d.ts"), "stray\n").unwrap();
+    success(fixture.build(&fixture.root, &[]));
+    assert!(!fixture.root.join("generated/stray.txt").exists());
+    assert!(!fixture.root.join("types/stray.d.ts").exists());
+    assert_eq!(recorded(), first);
+    assert_eq!(fixture.runs(), 3);
+    // What a dependency that ran wrote reaches what depends on it.
+    fs::write(fixture.root.join("src/input.txt"), "two\n").unwrap();
+    success(fixture.build(&fixture.root, &[]));
+    let changed = recorded();
+    assert_eq!(fixture.runs(), 6);
+    for (before, after) in first.iter().zip(&changed) {
+        assert_ne!(before, after);
+    }
+    assert_eq!(changed, shown());
 }
 
 #[test]
@@ -4832,7 +5026,6 @@ fn hits_leave_matching_outputs_in_place() {
 fn persisted_digests_notice_edits_that_restore_the_modification_time() {
     let fixture = Fixture::new(target("build", json!({})));
     let input = fixture.root.join("src/input.txt");
-    // Old enough that its digest is kept for the next run.
     let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
     fs::File::options()
         .write(true)
@@ -4840,6 +5033,9 @@ fn persisted_digests_notice_edits_that_restore_the_modification_time() {
         .unwrap()
         .set_modified(old)
         .unwrap();
+    // Old enough that its digest is kept for the next run: by its change
+    // time too, which setting the modification time back has just moved.
+    std::thread::sleep(SETTLE);
     success(fixture.build(&fixture.root, &[]));
     assert!(fixture.root.join(".git/qk/digests.json").is_file());
     // Nothing of qk's appears in the working tree.

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Mutex;
@@ -660,6 +660,23 @@ impl Outputs {
         roots
     }
 
+    /// Whether a path these outputs match may be `directory`, lie below it
+    /// or hold it, told from the patterns alone: whether writing nothing but
+    /// such paths can change what is at or below `directory`. Negated
+    /// patterns are not read, so what they leave out counts too.
+    pub(crate) fn reaches(&self, directory: &str) -> bool {
+        let overlaps = |a: &str, b: &str| {
+            a == b
+                || b.strip_prefix(a).is_some_and(|rest| rest.starts_with('/'))
+                || a.strip_prefix(b).is_some_and(|rest| rest.starts_with('/'))
+        };
+        self.complete.iter().any(|root| overlaps(root, directory))
+            || self
+                .globs
+                .iter()
+                .any(|glob| may_match_below(glob, directory))
+    }
+
     pub fn matches(&self, path: &str) -> bool {
         let any = |patterns: &PatternSet| {
             !patterns.is_empty()
@@ -677,7 +694,7 @@ impl Outputs {
     }
 
     pub fn paths(&self, root: &Path) -> Result<BTreeSet<String>> {
-        self.listing(root).map(|(paths, _)| paths)
+        self.listing(root, false).map(|(paths, _)| paths)
     }
 
     pub(crate) fn entries<'a>(&self, root: &'a Path) -> Result<OutputEntries<'a>> {
@@ -709,7 +726,7 @@ impl Outputs {
                 })));
             }
         }
-        let (paths, mut traversal) = self.listing(root)?;
+        let (paths, mut traversal) = self.listing(root, true)?;
         Ok(Box::new(paths.into_iter().map(move |path| {
             let absolute = root.join(&path);
             let metadata = match traversal.metadata.remove(&absolute) {
@@ -720,7 +737,9 @@ impl Outputs {
         })))
     }
 
-    fn listing(&self, root: &Path) -> Result<(BTreeSet<String>, Traversal)> {
+    /// The paths the outputs match, with the reads made to find them, which
+    /// keep the metadata of every path found when `keep_metadata` is set.
+    fn listing(&self, root: &Path, keep_metadata: bool) -> Result<(BTreeSet<String>, Traversal)> {
         if let Some(segments) = self.simple_segments()? {
             for anchor in &self.anchors {
                 safe_parents(root, anchor)?;
@@ -735,7 +754,10 @@ impl Outputs {
                     Err(error) => return Err(error.into()),
                 }
             }
-            let mut traversal = Traversal::default();
+            let mut traversal = Traversal {
+                keep_metadata,
+                ..Traversal::default()
+            };
             let mut candidates = BTreeSet::new();
             for (glob, pattern) in self.globs.iter().zip(&segments) {
                 let fixed = pattern
@@ -849,10 +871,14 @@ enum Segment {
     Glob(Pattern),
 }
 
+/// One listing's reads of the filesystem, each made once.
 #[derive(Default)]
 struct Traversal {
-    metadata: BTreeMap<PathBuf, std::fs::Metadata>,
-    directories: BTreeMap<PathBuf, Vec<PathBuf>>,
+    /// Whether the metadata of what lies below a path the patterns match
+    /// whole is kept too, for [`Outputs::entries`], which reports it.
+    keep_metadata: bool,
+    metadata: HashMap<PathBuf, std::fs::Metadata>,
+    directories: HashMap<PathBuf, Vec<PathBuf>>,
 }
 
 impl Traversal {
@@ -880,6 +906,36 @@ impl Traversal {
         Ok(&self.directories[path])
     }
 
+    /// Everything below the directory `path`, without following links. A
+    /// directory is read to its end and closed before those in it are read,
+    /// so a deep tree holds one directory open at a time, not one for each
+    /// level.
+    fn below(&mut self, root: &Path, path: &Path, paths: &mut BTreeSet<String>) -> Result<()> {
+        let mut directories = Vec::new();
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let child = entry.path();
+            // The type the directory entry carries is enough to go on, but
+            // what keeps metadata reads it here rather than again later.
+            let directory = if self.keep_metadata {
+                let metadata = entry.metadata()?;
+                let directory = metadata.is_dir();
+                self.metadata.insert(child.clone(), metadata);
+                directory
+            } else {
+                entry.file_type()?.is_dir()
+            };
+            paths.insert(relative(root, &child)?);
+            if directory {
+                directories.push(child);
+            }
+        }
+        for directory in directories {
+            self.below(root, &directory, paths)?;
+        }
+        Ok(())
+    }
+
     fn expand(
         &mut self,
         root: &Path,
@@ -891,11 +947,10 @@ impl Traversal {
             return Ok(());
         };
         let Some((segment, rest)) = segments.split_first() else {
-            for entry in walkdir::WalkDir::new(path)
-                .follow_links(false)
-                .follow_root_links(false)
-            {
-                paths.insert(relative(root, entry?.path())?);
+            paths.insert(relative(root, path)?);
+            // Links are not followed, so a link to a directory is one path.
+            if metadata.is_dir() {
+                self.below(root, path, paths)?;
             }
             return Ok(());
         };
@@ -1885,6 +1940,90 @@ mod tests {
             assert_eq!(metadata.file_type(), expected.file_type());
             assert_eq!(metadata.len(), expected.len());
             assert_eq!(metadata.modified().unwrap(), expected.modified().unwrap());
+        }
+    }
+
+    /// Outputs reach a directory when a path they match may be it, lie below
+    /// it or hold it; a glob's literal segments rule out the rest.
+    #[test]
+    fn outputs_reach_what_their_patterns_may_match() {
+        let outputs = Outputs::from_paths(&[
+            "apps/*/src/generated/**".into(),
+            "packages/*/manifest.json".into(),
+            "tools/out".into(),
+            "!apps/kept/src/generated/keep".into(),
+        ])
+        .unwrap();
+        for directory in [
+            "apps",
+            "apps/a",
+            "apps/a/src",
+            "apps/a/src/generated",
+            "apps/a/src/generated/deep",
+            "apps/kept/src/generated/keep",
+            "packages/p",
+            "packages/p/manifest.json",
+            "packages/p/manifest.json/below",
+            "tools",
+            "tools/out",
+            "tools/out/inner",
+        ] {
+            assert!(outputs.reaches(directory), "{directory}");
+        }
+        for directory in [
+            "apps/a/dist",
+            "apps/a/src/other",
+            "packages/p/dist",
+            "tools/other",
+            "elsewhere",
+            "app",
+        ] {
+            assert!(!outputs.reaches(directory), "{directory}");
+        }
+    }
+
+    /// A wildcard that matches a directory takes all of it, without following
+    /// links, and each path's metadata is what reading it again would give.
+    #[test]
+    fn wildcard_entries_take_matched_directories_whole() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        std::fs::create_dir_all(root.join("apps/a/out/types/nested/empty")).unwrap();
+        std::fs::write(root.join("apps/a/out/types/index.d.ts"), "one").unwrap();
+        std::fs::write(root.join("apps/a/out/types/nested/deep.d.ts"), "two").unwrap();
+        std::fs::write(root.join("apps/a/out/single.js"), "three").unwrap();
+        std::fs::create_dir_all(root.join("outside/hidden")).unwrap();
+        std::fs::write(root.join("outside/hidden/file"), "four").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("outside"), root.join("apps/a/out/link")).unwrap();
+        let outputs = Outputs::from_paths(&["apps/*/out/*".into()]).unwrap();
+        let entries = outputs
+            .entries(root)
+            .unwrap()
+            .collect::<anyhow::Result<Vec<_>>>()
+            .unwrap();
+        let paths: std::collections::BTreeSet<_> =
+            entries.iter().map(|(path, _)| path.clone()).collect();
+        assert_eq!(entries.len(), paths.len());
+        assert_eq!(paths, outputs.paths(root).unwrap());
+        let mut expected: std::collections::BTreeSet<String> = [
+            "apps/a/out/single.js",
+            "apps/a/out/types",
+            "apps/a/out/types/index.d.ts",
+            "apps/a/out/types/nested",
+            "apps/a/out/types/nested/deep.d.ts",
+            "apps/a/out/types/nested/empty",
+        ]
+        .map(str::to_owned)
+        .into();
+        if cfg!(unix) {
+            expected.insert("apps/a/out/link".into());
+        }
+        assert_eq!(paths, expected);
+        for (path, metadata) in entries {
+            let read = std::fs::symlink_metadata(root.join(&path)).unwrap();
+            assert_eq!(metadata.file_type(), read.file_type(), "{path}");
+            assert_eq!(metadata.len(), read.len(), "{path}");
         }
     }
 
