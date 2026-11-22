@@ -316,6 +316,11 @@ key does not depend on where qk ran. The entry is
 saved only when the task succeeds and its inputs are unchanged afterwards.
 Declared dependency outputs are rechecked too. Cache keys use a new schema so
 entries saved before these artifact checks are not reused.
+An output file whose size, times, inode and mode are what they were when the
+worktree last stored it, since the machine started, keeps that blob without
+being read again. A file is remembered only when it had last changed more
+than two seconds before it was read and did not change while it was read: a
+write within a timestamp's resolution can leave all of these as they were.
 On a hit, qk removes existing files matching the declared outputs, copies the
 cached outputs into place and replays the recorded stdout and stderr. As in
 Nx, outputs a worktree already holds for the key are left as they are: after

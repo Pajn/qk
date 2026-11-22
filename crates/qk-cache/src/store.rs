@@ -239,6 +239,110 @@ pub(crate) fn copy_blob_contents(source: &Path, destination: &Path) -> Result<St
     }
 }
 
+/// Files a thread looks at at least, so a short list is not split.
+const LOOKED_PER_THREAD: usize = 128;
+
+/// How long before a file is read it must have last changed for its stamp to
+/// tell every later write apart: a write within a timestamp's resolution of
+/// the last can leave its size, times and inode as they were. Two seconds
+/// covers the coarsest timestamps of the filesystems qk runs on.
+const SETTLED: Duration = Duration::from_secs(2);
+
+/// Whether a file with `stamp`, as [`crate::warm::stamp`] makes it, last
+/// changed long enough before `started` that any write since changed its
+/// change time. Only Unix stamps hold a change time, which every write and
+/// replacement sets and no tool sets back; elsewhere nothing is settled.
+fn settled(stamp: &[i64], started: SystemTime) -> bool {
+    let older = |seconds: i64, nanos: i64| {
+        seconds >= 0
+            && (0..1_000_000_000).contains(&nanos)
+            && started
+                .duration_since(
+                    SystemTime::UNIX_EPOCH + Duration::new(seconds as u64, nanos as u32),
+                )
+                .is_ok_and(|age| age > SETTLED)
+    };
+    cfg!(unix)
+        && stamp.len() == 6
+        && stamp[1] >= 0
+        && older(stamp[1] / 1_000_000_000, stamp[1] % 1_000_000_000)
+        && older(stamp[3], stamp[4])
+}
+
+/// The blobs of the output files a worktree last published for a set of
+/// outputs, each with the file's stamp, so a later publish reads only the
+/// files that changed: a rebuild rewrites few of a large target's outputs.
+///
+/// A file is remembered only when it was read whole between two looks that
+/// found the same [`settled`] stamp: no write happened while it was read, and
+/// any write since has changed its change time, so a file with that stamp
+/// still holds what the blob holds. The blob itself is trusted as a restore
+/// trusts a blob it hashed earlier in the same boot: a crash can lose a
+/// blob's contents and keep its name, so what another boot remembered is
+/// dropped, and the next publish hashes every file, replacing any blob that
+/// lost its contents.
+#[derive(Default, PartialEq, Serialize, Deserialize)]
+struct Published {
+    /// The boot the blobs were stored or hashed in, `None` where the boot
+    /// cannot be told, and nothing is remembered.
+    boot: Option<String>,
+    /// Each file's stamp and blob, by its path relative to the workspace.
+    files: BTreeMap<String, (Vec<i64>, String)>,
+}
+
+impl Published {
+    fn new(boot: Option<String>) -> Self {
+        Self {
+            boot,
+            files: BTreeMap::new(),
+        }
+    }
+
+    /// Where a worktree keeps what it published for `outputs`, named by the
+    /// patterns: targets declaring the same outputs share it, at the cost of
+    /// files read again, never of a wrong blob.
+    fn path(root: &Path, outputs: &Outputs) -> PathBuf {
+        let name = blake3::hash(outputs.globs().join("\n").as_bytes()).to_hex();
+        paths::worktree_state(root)
+            .join("published")
+            .join(format!("{}.json", &name[..32]))
+    }
+
+    /// What was remembered in this boot, `boot`, and nothing else.
+    fn load(root: &Path, outputs: &Outputs, boot: Option<&str>) -> Self {
+        let Some(boot) = boot else {
+            return Self::default();
+        };
+        fs::read(Self::path(root, outputs))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Self>(&bytes).ok())
+            .filter(|published| published.boot.as_deref() == Some(boot))
+            .unwrap_or_default()
+    }
+
+    /// The blob of the file at `path`, if it was remembered with `stamp`.
+    fn blob(&self, path: &str, stamp: &[i64]) -> Option<&str> {
+        self.files
+            .get(path)
+            .filter(|(known, _)| known.as_slice() == stamp)
+            .map(|(_, blob)| blob.as_str())
+    }
+
+    /// Replaces the record whole, so a reader never sees half of it. Failing
+    /// to keep it costs the next publish its reads only.
+    fn save(&self, root: &Path, outputs: &Outputs) {
+        let path = Self::path(root, outputs);
+        let _ = (|| -> Result<()> {
+            let directory = path.parent().context("records have a directory")?;
+            fs::create_dir_all(directory)?;
+            let mut file = tempfile::NamedTempFile::new_in(directory)?;
+            file.write_all(&serde_json::to_vec(self)?)?;
+            file.persist(&path)?;
+            Ok(())
+        })();
+    }
+}
+
 impl Cache {
     pub(crate) fn initialize(&self) -> Result<()> {
         for directory in ["entries", "blobs", "locks", "tmp"] {
@@ -335,6 +439,8 @@ impl Cache {
         })
     }
 
+    /// Stores the task's outputs and log under `key`. An output file whose
+    /// stamp matches what [`Published`] remembers keeps that blob unread.
     pub(crate) fn publish(
         &self,
         root: &Path,
@@ -342,11 +448,29 @@ impl Cache {
         outputs: &Outputs,
         log: &Path,
     ) -> Result<()> {
+        self.publish_at(root, key, outputs, log, SystemTime::now())
+    }
+
+    /// [`Self::publish`], begun at `started`, which judges whether a file's
+    /// stamp is settled.
+    fn publish_at(
+        &self,
+        root: &Path,
+        key: &str,
+        outputs: &Outputs,
+        log: &Path,
+        started: SystemTime,
+    ) -> Result<()> {
+        let boot = crate::verified::boot();
+        let remembered = Published::load(root, outputs, boot.as_deref());
+        // Nothing writes the outputs while they are published, so each
+        // directory is checked not to be a link once, not once per file in it.
+        let directories = std::sync::Mutex::new(foldhash::HashSet::default());
         let mut artifacts = BTreeMap::new();
         let mut pending = Vec::new();
         for entry in outputs.entries(root)? {
             let (path, metadata) = entry?;
-            paths::safe_parents(root, &path)?;
+            paths::safe_parents_once(root, &path, "cache artifact", &directories)?;
             let absolute = root.join(&path);
             let artifact = if metadata.file_type().is_symlink() {
                 let target = fs::read_link(&absolute)?
@@ -359,7 +483,7 @@ impl Cache {
                     directory: absolute.is_dir(),
                 }
             } else if metadata.is_file() {
-                pending.push((path, absolute, mode(&metadata)));
+                pending.push((path, absolute, metadata));
                 continue;
             } else if metadata.is_dir() {
                 Artifact::Directory {
@@ -370,19 +494,46 @@ impl Cache {
             };
             artifacts.insert(path, artifact);
         }
+        // The remembered blob of each file left as it was, if the store still
+        // holds it.
+        let reused =
+            crate::hash::in_parallel(&pending, LOOKED_PER_THREAD, |(path, _, metadata)| {
+                Ok(remembered
+                    .blob(path, &crate::warm::stamp(metadata))
+                    .filter(|blob| self.root.join("blobs").join(blob).is_file())
+                    .map(str::to_owned))
+            })?;
         let mut sources: Vec<_> = pending
             .iter()
-            .map(|(_, source, _)| source.clone())
+            .zip(&reused)
+            .filter(|(_, reused)| reused.is_none())
+            .map(|((_, source, _), _)| source.clone())
             .collect();
         sources.push(log.to_owned());
         // Every worker finishes before any manifest is published.
         let mut blobs = self.put_blobs(&sources).into_iter();
-        for (path, _, mode) in pending {
+        let mut published = Published::new(boot);
+        let mut read = Vec::new();
+        for ((path, absolute, metadata), reused) in pending.into_iter().zip(reused) {
+            let stamp = crate::warm::stamp(&metadata);
+            let blob = match reused {
+                Some(blob) => {
+                    published.files.insert(path.clone(), (stamp, blob.clone()));
+                    blob
+                }
+                None => {
+                    let blob = blobs.next().expect("output blob result")?;
+                    if settled(&stamp, started) {
+                        read.push((path.clone(), absolute, stamp, blob.clone()));
+                    }
+                    blob
+                }
+            };
             artifacts.insert(
                 path,
                 Artifact::File {
-                    blob: blobs.next().expect("output blob result")?,
-                    mode,
+                    blob,
+                    mode: mode(&metadata),
                 },
             );
         }
@@ -395,7 +546,23 @@ impl Cache {
             &self.root,
             &self.root.join("entries").join(format!("{key}.json")),
             &manifest,
-        )
+        )?;
+        // A file read with the same settled stamp before and after was not
+        // written while it was read, so its blob holds what that stamp names.
+        let unchanged =
+            crate::hash::in_parallel(&read, LOOKED_PER_THREAD, |(_, absolute, stamp, _)| {
+                Ok(fs::symlink_metadata(absolute)
+                    .is_ok_and(|metadata| crate::warm::stamp(&metadata) == *stamp))
+            })?;
+        for ((path, _, stamp, blob), unchanged) in read.into_iter().zip(unchanged) {
+            if unchanged {
+                published.files.insert(path, (stamp, blob));
+            }
+        }
+        if published.boot.is_some() && published != remembered {
+            published.save(root, outputs);
+        }
+        Ok(())
     }
 
     /// The local entry for `key` with the path of its log, which is checked
@@ -1227,6 +1394,154 @@ fn outputs_held(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The blob an entry stores for `path`.
+    fn published_blob(cache: &Cache, key: &str, path: &str) -> String {
+        let manifest = ResultRecord::read(
+            &fs::read(cache.root.join("entries").join(format!("{key}.json"))).unwrap(),
+            key,
+        )
+        .unwrap();
+        match &manifest.artifacts[path] {
+            Artifact::File { blob, .. } => blob.clone(),
+            other => panic!("{path} is no file: {:?}", serde_json::to_string(other)),
+        }
+    }
+
+    /// A workspace with two output files and a log, and a cache in it.
+    fn publishing() -> (tempfile::TempDir, Cache, Outputs) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join("out/nested")).unwrap();
+        fs::write(root.join("out/nested/kept"), "kept").unwrap();
+        fs::write(root.join("out/changed"), "before").unwrap();
+        fs::write(root.join("log"), "").unwrap();
+        let cache = Cache::new(root.join("cache"));
+        cache.initialize().unwrap();
+        (temp, cache, Outputs::from_patterns(&["out"]))
+    }
+
+    /// Publishes as an hour from now, when every file just written is
+    /// settled.
+    fn publish_later(cache: &Cache, root: &Path, key: &str, outputs: &Outputs, log: &Path) {
+        let later = SystemTime::now() + Duration::from_secs(3600);
+        cache.publish_at(root, key, outputs, log, later).unwrap();
+    }
+
+    #[test]
+    fn a_stamp_is_settled_once_both_its_times_are_old_enough() {
+        let started = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let stamp = |modified: u64, changed: u64| {
+            vec![
+                4,
+                (modified * 1_000_000_000) as i64,
+                0o644,
+                changed as i64,
+                0,
+                7,
+            ]
+        };
+        assert_eq!(settled(&stamp(999_990, 999_990), started), cfg!(unix));
+        // Changed within the resolution of the coarsest timestamps.
+        assert!(!settled(&stamp(999_990, 999_999), started));
+        assert!(!settled(&stamp(999_999, 999_990), started));
+        // Times after the publish began, as a clock set back leaves them.
+        assert!(!settled(&stamp(1_000_005, 999_990), started));
+        assert!(!settled(&stamp(999_990, 1_000_005), started));
+        // A stamp without a change time.
+        assert!(!settled(&[4, 999_990_000_000_000, 0o644], started));
+    }
+
+    #[test]
+    fn a_settled_output_left_as_it_was_keeps_its_blob_unread() {
+        let Some(boot) = crate::verified::boot() else {
+            return;
+        };
+        if !cfg!(unix) {
+            return;
+        }
+        let (temp, cache, outputs) = publishing();
+        let root = temp.path();
+        let log = root.join("log");
+        let first = "a".repeat(64);
+        publish_later(&cache, root, &first, &outputs, &log);
+        let kept = published_blob(&cache, &first, "out/nested/kept");
+        // Remembered as holding other stored content, the file is not read:
+        // its entry takes the blob remembered.
+        let other = cache.put_blob(&root.join("out/changed")).unwrap();
+        let mut published: Published =
+            serde_json::from_slice(&fs::read(Published::path(root, &outputs)).unwrap()).unwrap();
+        assert_eq!(published.boot.as_deref(), Some(boot.as_str()));
+        assert_eq!(published.files["out/nested/kept"].1, kept);
+        published.files.get_mut("out/nested/kept").unwrap().1 = other.clone();
+        published.save(root, &outputs);
+        // The other file changes, size and all, and is read again.
+        fs::write(root.join("out/changed"), "after, longer").unwrap();
+        let second = "b".repeat(64);
+        publish_later(&cache, root, &second, &outputs, &log);
+        assert_eq!(published_blob(&cache, &second, "out/nested/kept"), other);
+        assert_eq!(
+            published_blob(&cache, &second, "out/changed"),
+            digest_file(&root.join("out/changed")).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_file_written_just_before_a_publish_is_read_on_the_next() {
+        let (temp, cache, outputs) = publishing();
+        let root = temp.path();
+        let log = root.join("log");
+        let first = "a".repeat(64);
+        cache.publish(root, &first, &outputs, &log).unwrap();
+        // Written within a timestamp's resolution of the read, the files'
+        // stamps cannot tell a later write, so neither is remembered.
+        let published: Published = fs::read(Published::path(root, &outputs))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        assert!(published.files.is_empty());
+        // Rewritten at once with as many bytes, as an incremental build may.
+        fs::write(root.join("out/changed"), "behind").unwrap();
+        let second = "b".repeat(64);
+        cache.publish(root, &second, &outputs, &log).unwrap();
+        assert_eq!(
+            published_blob(&cache, &second, "out/changed"),
+            digest_file(&root.join("out/changed")).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_remembered_blob_the_store_lost_or_another_boot_stored_is_not_taken() {
+        if crate::verified::boot().is_none() || !cfg!(unix) {
+            return;
+        }
+        let (temp, cache, outputs) = publishing();
+        let root = temp.path();
+        let log = root.join("log");
+        let first = "a".repeat(64);
+        publish_later(&cache, root, &first, &outputs, &log);
+        let kept = published_blob(&cache, &first, "out/nested/kept");
+        // Gone from the store, as eviction leaves it: stored again.
+        fs::remove_file(cache.root.join("blobs").join(&kept)).unwrap();
+        let second = "b".repeat(64);
+        publish_later(&cache, root, &second, &outputs, &log);
+        assert_eq!(published_blob(&cache, &second, "out/nested/kept"), kept);
+        assert_eq!(
+            fs::read(cache.root.join("blobs").join(&kept)).unwrap(),
+            b"kept"
+        );
+        // Remembered in another boot, whose crash may have lost the blob's
+        // contents: read again.
+        let other = cache.put_blob(&root.join("out/changed")).unwrap();
+        let mut published: Published =
+            serde_json::from_slice(&fs::read(Published::path(root, &outputs)).unwrap()).unwrap();
+        published.boot = Some("another boot".into());
+        published.files.get_mut("out/nested/kept").unwrap().1 = other;
+        published.save(root, &outputs);
+        let third = "c".repeat(64);
+        publish_later(&cache, root, &third, &outputs, &log);
+        assert_eq!(published_blob(&cache, &third, "out/nested/kept"), kept);
+    }
 
     /// An entry is usable where restoring it would not fail before it
     /// touched an output: whole, within the task's outputs, its blobs held.

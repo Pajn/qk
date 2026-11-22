@@ -1089,7 +1089,7 @@ pub(crate) fn branches_at(root: &Path, default: String) -> Vec<String> {
 }
 
 /// Metadata used to detect files unchanged since their save or restore.
-fn stamp(metadata: &fs::Metadata) -> Vec<i64> {
+pub(crate) fn stamp(metadata: &fs::Metadata) -> Vec<i64> {
     let modified = metadata
         .modified()
         .ok()
