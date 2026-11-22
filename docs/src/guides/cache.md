@@ -364,7 +364,8 @@ restored with the outputs the worktree held, or it ran, succeeded, restored
 no warm state, none of its own dependencies changed theirs, and either it
 runs no command, as `nx:noop` targets do, or it declares its outputs and its
 commands left every file they match, and every directory among them, with
-times from more than two seconds before it started. A command is trusted to
+times from before it started, by more than the window in which their
+filesystem could give a later write the same time. A command is trusted to
 write only its declared outputs, as when listing them, so one declaring
 `outputs: []` changes none; one without `outputs` counts as changed whenever
 it runs. Telling whether a command wrote takes one listing of its outputs,

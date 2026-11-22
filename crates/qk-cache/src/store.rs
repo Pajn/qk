@@ -1228,13 +1228,6 @@ fn output_stamps(root: &Path, outputs: &Outputs) -> Result<BTreeMap<String, Vec<
     Ok(stamps)
 }
 
-/// How long before a time a file's own times may fall although it was written
-/// after it: filesystems that keep coarse times round them down, by up to two
-/// seconds on FAT, and some kernels take them from a clock that lags the one
-/// a process reads. As [`crate::hash`] treats files written in the last two
-/// seconds as unsettled, so this treats a time that close as later.
-const TIME_SLACK: Duration = Duration::from_secs(2);
-
 /// Whether anything `outputs` may match can have been written, replaced,
 /// created or removed at or after `since`, told from the times the
 /// filesystem keeps rather than from a listing taken before: a path written
@@ -1244,17 +1237,17 @@ const TIME_SLACK: Duration = Duration::from_secs(2);
 /// which holds whatever was removed from among them, and, for a fixed prefix
 /// that is not there, of the closest directory above it that is, which
 /// changed if the prefix was removed. Negated outputs are not read, so
-/// what they exclude counts too. Whatever cannot be read counts as written,
-/// and so does a time within [`TIME_SLACK`] before `since`.
+/// what they exclude counts too. Whatever cannot be read counts as written.
+/// So does a time less than its filesystem's window before `since`, as
+/// [`crate::settle`] gives it: a write after `since` can carry a time that
+/// much earlier, where times are coarse or come from a clock that lags.
 pub(crate) fn written_since(root: &Path, outputs: &Outputs, since: SystemTime) -> bool {
-    let Some(threshold) = since
-        .checked_sub(TIME_SLACK)
-        .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
-    else {
+    let Ok(since) = since.duration_since(SystemTime::UNIX_EPOCH) else {
         return true;
     };
-    let threshold = threshold.as_nanos() as i128;
-    let recent = |metadata: &fs::Metadata| {
+    let since = since.as_nanos() as i128;
+    let recent = |path: &Path, metadata: &fs::Metadata| {
+        let threshold = since - crate::settle::window(path, metadata).as_nanos() as i128;
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
@@ -1293,7 +1286,7 @@ pub(crate) fn written_since(root: &Path, outputs: &Outputs, since: SystemTime) -
                 // Outputs are listed through a link there, which this does
                 // not follow.
                 Ok(metadata) if metadata.file_type().is_symlink() => return Ok(true),
-                Ok(metadata) if recent(&metadata) => return Ok(true),
+                Ok(metadata) if recent(&start, &metadata) => return Ok(true),
                 Ok(metadata) if metadata.is_dir() => {
                     for entry in fs::read_dir(&start)? {
                         below.push(entry?.path());
@@ -1308,7 +1301,7 @@ pub(crate) fn written_since(root: &Path, outputs: &Outputs, since: SystemTime) -
                     loop {
                         let directory = root.join(above.unwrap_or(Path::new("")));
                         match fs::symlink_metadata(&directory) {
-                            Ok(metadata) if recent(&metadata) => return Ok(true),
+                            Ok(metadata) if recent(&directory, &metadata) => return Ok(true),
                             Ok(_) => break,
                             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                                 let Some(parent) = above else { return Ok(true) };
@@ -1338,7 +1331,7 @@ pub(crate) fn written_since(root: &Path, outputs: &Outputs, since: SystemTime) -
                 let entry = entry?;
                 let path = paths::relative(root, entry.path())?;
                 if (entry.file_type().is_dir() || reached.matches(&path))
-                    && recent(&entry.metadata()?)
+                    && recent(entry.path(), &entry.metadata()?)
                 {
                     return Ok(true);
                 }
@@ -1756,11 +1749,13 @@ mod tests {
             ])
             .unwrap()
         };
-        // Times within the slack before the task started count as written.
-        let early = SystemTime::now();
+        // Files written after a time count as written since it. Their times
+        // would too from within their filesystem's window before it, which
+        // is too short on some filesystems to be met here.
+        let early = SystemTime::now() - Duration::from_millis(100);
         assert!(written_since(root, &outputs("untouched"), early));
 
-        std::thread::sleep(TIME_SLACK + Duration::from_millis(100));
+        std::thread::sleep(crate::settle::FALLBACK + Duration::from_millis(100));
         let since = SystemTime::now();
         fs::write(root.join("rewritten/out/nested/a.txt"), "value").unwrap();
         fs::remove_file(root.join("removed/out/nested/b.txt")).unwrap();
