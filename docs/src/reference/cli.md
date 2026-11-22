@@ -159,7 +159,8 @@ fetches, local restore phases, restoring and saving
 input recheck after it (`inputs_recheck`) and storing its result: its
 outputs (`publish`), alongside the recheck and the warm save, then each entry
 once the recheck passes (`publish_entry`). Input resolution also times
-listing the workspace's files (`inventory_list`), listing only the paths a
+listing the workspace's files, or those of the directories a run's filesets
+start from (`inventory_list`), listing only the paths a
 task's filesets name (`inventory_paths`), waiting for another task's listing
 (`inventory_wait`) and parsing `pnpm-lock.yaml` (`lockfile_parse`); each is
 charged to the task that needed it. A remote fetch also times waiting for the store's index

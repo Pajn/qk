@@ -138,6 +138,10 @@ pub struct Snapshot {
     listed_ignore: std::sync::OnceLock<Arc<SourceIgnore>>,
     extra_candidates: BTreeSet<String>,
     membership: Mutex<Option<Arc<Membership>>>,
+    /// What a snapshot for keying inventories and lists when every task's
+    /// file inputs lie beneath a few paths: see [`Self::listing`]. `None`
+    /// when it takes the whole workspace.
+    scope: Option<Arc<Scope>>,
     membership_prefixes: Mutex<HashMap<String, Arc<Vec<PathBuf>>>>,
     /// Each task's [`FilePlan`], by its id and declared inputs.
     plans: Mutex<HashMap<(String, String), Arc<FilePlan>>>,
@@ -200,6 +204,77 @@ struct Membership {
     /// When this inventory began taking its stamps, before any of them: what
     /// it captured holds only if its stamps had settled by then.
     stamped: SystemTime,
+    /// The paths this inventory and its listing cover, when not the whole
+    /// workspace: see [`Scope`].
+    scope: Option<Arc<Scope>>,
+}
+
+/// Workspace-relative paths a narrowed inventory and listing cover: what is
+/// at each of them or beneath it. The inventory reads every directory
+/// beneath them, and of each directory leading to them only the names that
+/// lead on and its ignore files, which together decide what is a source
+/// there. No path lies beneath another.
+#[derive(PartialEq, Eq)]
+struct Scope {
+    paths: BTreeSet<String>,
+    /// The same paths, for comparing paths by component.
+    relative: BTreeSet<PathBuf>,
+}
+
+/// Where a directory lies with respect to a [`Scope`].
+#[derive(PartialEq, Eq)]
+enum Reach {
+    /// At one of its paths or beneath it.
+    Within,
+    /// Above one of its paths.
+    Toward,
+    Outside,
+}
+
+impl Scope {
+    /// The scope of `paths`, without those beneath another of them.
+    fn new(paths: impl IntoIterator<Item = String>) -> Self {
+        let mut relative: BTreeSet<PathBuf> = BTreeSet::new();
+        // In component order a path comes before those beneath it, so the
+        // last one kept is the only one that can hold the next.
+        for path in paths
+            .into_iter()
+            .map(PathBuf::from)
+            .collect::<BTreeSet<_>>()
+        {
+            if relative.last().is_none_or(|last| !path.starts_with(last)) {
+                relative.insert(path);
+            }
+        }
+        Self {
+            paths: relative
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect(),
+            relative,
+        }
+    }
+
+    /// Where the workspace-relative `path` lies: see [`Reach`].
+    fn reach(&self, path: &Path) -> Reach {
+        if path
+            .ancestors()
+            .any(|ancestor| self.relative.contains(ancestor))
+        {
+            return Reach::Within;
+        }
+        // Paths beneath `path` follow it in component order.
+        match self.relative.range(path.to_owned()..).next() {
+            Some(below) if below.starts_with(path) => Reach::Toward,
+            _ => Reach::Outside,
+        }
+    }
+
+    /// Whether the workspace-relative `path` is at one of its paths or
+    /// beneath one.
+    fn holds(&self, path: &str) -> bool {
+        self.reach(Path::new(path)) == Reach::Within
+    }
 }
 
 /// A candidate listing and the ignore policy captured with it. Keeping both
@@ -218,6 +293,12 @@ struct FilePlan {
     /// select is at one of these paths or beneath it, and listing those alone
     /// selects what listing the workspace would.
     paths: Option<BTreeSet<String>>,
+    /// The fixed directories or paths its filesets that select files start
+    /// from, when each has one and it has no `json` glob: then every file it
+    /// selects is at one of these or beneath it, as for `paths`, though
+    /// matching rather than named. An exclusion only takes away what one
+    /// that selects files would, so it needs none.
+    prefixes: Option<BTreeSet<String>>,
     /// Its `dependentTasksOutputFiles` globs, each with whether it is
     /// transitive.
     dependency_outputs: Vec<(String, bool)>,
@@ -231,6 +312,18 @@ const WALKERS: usize = 8;
 /// Threads listing source files when ignore files are read on the way. Past a
 /// few, more threads add system time faster than they save time.
 const LISTERS: usize = 4;
+/// Paths a narrowed listing covers at most. Git matches every file it lists
+/// against each path asked for: in a large monorepo, asking for 256 took
+/// about as long as listing everything, and fewer cost less in proportion.
+/// Below this, a narrowed listing costs at most about what the whole one does.
+const SCOPE_PATHS: usize = 200;
+
+/// What a run needs listed of the workspace's files: see [`Snapshot::listing`].
+enum Listing {
+    Nothing,
+    Within(Scope),
+    Whole,
+}
 
 /// Whether `name` is an ignore file, whose rules change which files are sources.
 fn is_policy(name: &std::ffi::OsStr) -> bool {
@@ -238,7 +331,8 @@ fn is_policy(name: &std::ffi::OsStr) -> bool {
 }
 
 impl Membership {
-    /// Inventory source directories and policy stamps before a new listing.
+    /// Inventory source directories and policy stamps before a new listing,
+    /// of the whole workspace or of `scope` alone.
     fn new(
         root: &Path,
         files: &BTreeSet<String>,
@@ -246,6 +340,7 @@ impl Membership {
         outputs: &[Outputs],
         cache: Option<&Path>,
         git_policies: Option<&BTreeSet<PathBuf>>,
+        scope: Option<&Arc<Scope>>,
     ) -> Result<Self> {
         let mut output_anchors: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
         for (index, outputs) in outputs.iter().enumerate() {
@@ -278,6 +373,7 @@ impl Membership {
             settled: false,
             listed: None,
             stamped,
+            scope: scope.cloned(),
         };
         // Finding Git's own policy files takes several Git processes, which
         // run while the directories are read. They are stamped as soon as
@@ -463,8 +559,15 @@ impl Membership {
     }
 
     /// The names [`Self::entries`] keeps, before it checks that the inventory
-    /// already watches each directory and policy among them.
+    /// already watches each directory and policy among them. Of a directory
+    /// leading to a narrowed inventory's scope, those are the names that lead
+    /// on and its ignore files: what else it holds lists nothing there.
     fn listed(&self, directory: &Path) -> Result<Option<BTreeSet<(OsString, u8)>>> {
+        let relative_directory = directory.strip_prefix(&self.root).unwrap_or(directory);
+        let toward = self
+            .scope
+            .as_ref()
+            .filter(|scope| scope.reach(relative_directory) != Reach::Within);
         let entries = match std::fs::read_dir(directory) {
             Ok(entries) => entries,
             Err(error)
@@ -477,7 +580,6 @@ impl Membership {
             }
             Err(error) => return Err(error.into()),
         };
-        let relative_directory = directory.strip_prefix(&self.root).unwrap_or(directory);
         let mut outputs = BTreeSet::new();
         for ancestor in relative_directory.ancestors() {
             if let Some(indices) = self.output_anchors.get(ancestor) {
@@ -505,6 +607,12 @@ impl Membership {
                 || relative
                     .ancestors()
                     .any(|root| self.excluded_roots.contains(root))
+            {
+                continue;
+            }
+            if let Some(scope) = toward
+                && !is_policy(&name)
+                && scope.reach(relative) == Reach::Outside
             {
                 continue;
             }
@@ -653,10 +761,30 @@ impl Membership {
     /// policies, so a change made while listing shows in a later comparison.
     /// `rebuilt` says whether the stamps were taken for this listing.
     fn list(&mut self, extra: &BTreeSet<String>, rebuilt: bool) -> Result<()> {
-        let mut files = source_files(&self.root)?;
+        let mut files = match &self.scope {
+            None => source_files(&self.root)?,
+            // Where Git cannot list the scope's paths apart, the workspace
+            // listing would walk or ask Git of the whole: what that lists
+            // in the scope is what it holds.
+            Some(scope) => match source_files_at(&self.root, &scope.paths)? {
+                Some(files) => files,
+                None => source_files(&self.root)?
+                    .into_iter()
+                    .filter(|path| scope.holds(path))
+                    .collect(),
+            },
+        };
         exclude_artifacts(&mut files, &self.outputs, self.cache.as_deref());
         let ignore = SourceIgnore::new(&self.root)?;
-        files.extend(extra.iter().filter(|path| !ignore.matches(path)).cloned());
+        files.extend(
+            extra
+                .iter()
+                .filter(|path| {
+                    !ignore.matches(path)
+                        && self.scope.as_ref().is_none_or(|scope| scope.holds(path))
+                })
+                .cloned(),
+        );
         self.source_ignore = Arc::new(ignore);
         self.files = Arc::new(files);
         // An unstable inventory or recent policy never enables the fast path.
@@ -1037,6 +1165,7 @@ impl Snapshot {
             listed_ignore: std::sync::OnceLock::new(),
             extra_candidates: BTreeSet::new(),
             membership: Mutex::default(),
+            scope: None,
             membership_prefixes: Mutex::default(),
             plans: Mutex::default(),
             source_exclusions,
@@ -1093,10 +1222,15 @@ impl Snapshot {
             // of such tasks alone never lists the workspace. Without an
             // inventory, each task's refresh takes one, and reports why it
             // cannot, as for a plain listing.
-            if snapshot.lists(workspace, graph) {
-                if watched {
+            match snapshot.listing(workspace, graph) {
+                Listing::Nothing => {}
+                Listing::Within(scope) if watched => {
+                    snapshot.scope = Some(Arc::new(scope));
                     snapshot.watch();
-                } else {
+                }
+                _ if watched => snapshot.watch(),
+                // Inspection resolves every task from the whole listing.
+                _ => {
                     snapshot.files()?;
                 }
             }
@@ -1124,6 +1258,7 @@ impl Snapshot {
         let exclusions = self.source_exclusions.clone();
         let cache = self.cache_relative.clone();
         let extra = self.extra_candidates.clone();
+        let scope = self.scope.clone();
         let listing = std::thread::spawn(move || {
             let _listing = crate::profile::span("snapshot", "inventory_list");
             // No earlier listing names tracked files beneath directories the
@@ -1136,6 +1271,7 @@ impl Snapshot {
                 &exclusions,
                 cache.as_deref(),
                 None,
+                scope.as_ref(),
             )?;
             membership.list(&extra, true)?;
             membership.listed = Some(listed);
@@ -1158,7 +1294,11 @@ impl Snapshot {
             return;
         };
         let _ = self.listed_ignore.set(membership.source_ignore.clone());
-        let _ = self.files.set(Ok((*membership.files).clone()));
+        // A narrowed listing is no initial candidate list, which is the
+        // whole workspace's: that is listed on first use, if any.
+        if membership.scope.is_none() {
+            let _ = self.files.set(Ok((*membership.files).clone()));
+        }
         *self.membership.lock().unwrap() = Some(Arc::new(membership));
     }
 
@@ -1169,16 +1309,36 @@ impl Snapshot {
         self.listed_ignore.get().unwrap_or(&self.built_ignore)
     }
 
-    /// Whether a task of `graph` needs the workspace's files listed: one
-    /// whose filesets match rather than name paths, or one a recording may
-    /// key, whose declared selection is compared with what it read.
-    fn lists(&self, workspace: &Workspace, graph: &TaskGraph) -> bool {
-        graph.tasks.values().any(|task| {
-            task.definition.extra.contains_key("qk:ultracache")
-                || !self
-                    .file_plan(workspace, task)
-                    .is_ok_and(|plan| plan.paths.is_some())
-        })
+    /// What a run of `graph`'s tasks needs listed of the workspace's files:
+    /// nothing when each task's filesets name paths, which are listed for it
+    /// alone; the whole workspace for a task with a fileset that has no
+    /// fixed directory, or one a recording may key, whose declared selection
+    /// is compared with what it read; and otherwise the directories the
+    /// tasks' filesets start from, together, unless there are so many of
+    /// them that asking Git for each would cost what listing everything does.
+    fn listing(&self, workspace: &Workspace, graph: &TaskGraph) -> Listing {
+        let mut prefixes = BTreeSet::new();
+        for task in graph.tasks.values() {
+            if task.definition.extra.contains_key("qk:ultracache") {
+                return Listing::Whole;
+            }
+            match self.file_plan(workspace, task) {
+                Ok(plan) if plan.paths.is_some() => {}
+                Ok(plan) => match &plan.prefixes {
+                    Some(paths) => prefixes.extend(paths.iter().cloned()),
+                    None => return Listing::Whole,
+                },
+                Err(_) => return Listing::Whole,
+            }
+        }
+        if prefixes.is_empty() {
+            return Listing::Nothing;
+        }
+        let scope = Scope::new(prefixes);
+        if scope.paths.len() > SCOPE_PATHS {
+            return Listing::Whole;
+        }
+        Listing::Within(scope)
     }
 
     /// The initial candidate list: the workspace's source files, without
@@ -1221,24 +1381,31 @@ impl Snapshot {
         let cancelled = AtomicBool::new(false);
         let mut resolver = Resolver::new(self, workspace, None, &cancelled, &empty);
         resolver.task_inputs(task)?;
-        let paths = resolver
-            .json_globs
-            .is_empty()
+        // A fileset of the workspace root, or a path that is no plain
+        // relative one, is left to the listing.
+        let plain = |pattern: &FilePattern| {
+            !pattern.prefix.is_empty()
+                && pattern
+                    .prefix
+                    .split('/')
+                    .all(|segment| !matches!(segment, "" | "." | ".."))
+        };
+        let patterns = || resolver.scopes.values().flat_map(|scope| &scope.patterns);
+        let listable = resolver.json_globs.is_empty();
+        let paths = listable
             .then(|| {
-                resolver
-                    .scopes
-                    .values()
-                    .flat_map(|scope| &scope.patterns)
+                patterns()
                     .map(|pattern| {
-                        // A fileset of the workspace root, or a path that is
-                        // no plain relative one, is left to the listing.
-                        let plain = !pattern.prefix.is_empty()
-                            && pattern
-                                .prefix
-                                .split('/')
-                                .all(|segment| !matches!(segment, "" | "." | ".."));
-                        (pattern.rest.is_none() && plain).then(|| pattern.prefix.clone())
+                        (pattern.rest.is_none() && plain(pattern)).then(|| pattern.prefix.clone())
                     })
+                    .collect::<Option<BTreeSet<_>>>()
+            })
+            .flatten();
+        let prefixes = listable
+            .then(|| {
+                patterns()
+                    .filter(|pattern| !pattern.excluded)
+                    .map(|pattern| plain(pattern).then(|| pattern.prefix.clone()))
                     .collect::<Option<BTreeSet<_>>>()
             })
             .flatten();
@@ -1252,6 +1419,7 @@ impl Snapshot {
             .collect();
         let plan = Arc::new(FilePlan {
             paths,
+            prefixes,
             dependency_outputs,
         });
         self.plans.lock().unwrap().insert(key, plan.clone());
@@ -1290,18 +1458,24 @@ impl Snapshot {
 
     /// The candidates `task`'s filesets select from. Filesets that each name
     /// a path select only what is at that path or beneath it, so listing
-    /// those paths alone selects what listing the workspace would.
+    /// those paths alone selects what listing the workspace would. Filesets
+    /// that match beneath fixed directories select only there too, so the
+    /// snapshot's narrowed listing serves them when it covers those.
     fn task_candidates(&self, workspace: &Workspace, task: &Task) -> Result<Candidates> {
-        if let Ok(plan) = self.file_plan(workspace, task)
-            && let Some(paths) = &plan.paths
-        {
+        let plan = self.file_plan(workspace, task).ok();
+        if let Some(paths) = plan.as_ref().and_then(|plan| plan.paths.as_ref()) {
             let _listing = crate::profile::span(&task.id, "inventory_paths");
             if let Some(candidates) = self.candidates_at(paths)? {
                 return Ok(candidates);
             }
         }
+        let scope = self.scope.as_ref().filter(|scope| {
+            plan.as_ref()
+                .and_then(|plan| plan.prefixes.as_ref())
+                .is_some_and(|prefixes| prefixes.iter().all(|prefix| scope.holds(prefix)))
+        });
         let prefixes = self.membership_prefixes(workspace, task)?;
-        self.current_files_for(&workspace.root, Some(&prefixes), &task.id)
+        self.current_files_for(&workspace.root, Some(&prefixes), scope, &task.id)
     }
 
     /// Restrict directory checks to the positive fileset prefixes a task reads.
@@ -1354,25 +1528,37 @@ impl Snapshot {
     /// Content changes are checked separately by the file digest cache.
     #[cfg(test)]
     fn current_files(&self, root: &Path) -> Result<Arc<BTreeSet<String>>> {
-        Ok(self.current_files_for(root, None, "test")?.files)
+        Ok(self.current_files_for(root, None, None, "test")?.files)
     }
 
     /// Refresh candidates as needed, returning their policy in the same snapshot.
+    /// With `scope`, which holds every path the caller selects from, the
+    /// candidates may be those of the scope alone; without it, they are the
+    /// whole workspace's.
     fn current_files_for(
         &self,
         root: &Path,
         prefixes: Option<&[PathBuf]>,
+        scope: Option<&Arc<Scope>>,
         task: &str,
     ) -> Result<Candidates> {
         let requested = Instant::now();
         self.settle();
+        // Whether an inventory, and the listing taken with it, covers what
+        // the caller selects from: a narrowed one never serves a caller
+        // reaching beyond its scope, which needs another taken.
+        let serves = |entry: &Membership| match (&entry.scope, scope) {
+            (None, _) => true,
+            (Some(covered), Some(scope)) => Arc::ptr_eq(covered, scope),
+            (Some(_), None) => false,
+        };
         loop {
             let previous = self.membership.lock().unwrap().clone();
             // Immutable entries let independent fingerprints validate their
             // directory stamps concurrently. Only a refresh needs serialization.
             let (unchanged, settled) = match &previous {
-                Some(entry) => entry.state(prefixes, SystemTime::now())?,
-                None => (false, false),
+                Some(entry) if serves(entry) => entry.state(prefixes, SystemTime::now())?,
+                _ => (false, false),
             };
             if settled && previous.as_ref().unwrap().settled {
                 return Ok(previous.as_ref().unwrap().candidates());
@@ -1388,6 +1574,7 @@ impl Snapshot {
             // workspace in turn.
             if let Some(entry) = &*cached
                 && entry.listed.is_some_and(|listed| listed >= requested)
+                && serves(entry)
             {
                 return Ok(entry.candidates());
             }
@@ -1409,16 +1596,21 @@ impl Snapshot {
             // once before enabling reuse (including any newly created empty dirs).
             // Recent directories are checked by freshly reading their child names.
             let rebuilt = !unchanged || settled;
+            let empty = BTreeSet::new();
             let mut membership = if !rebuilt {
                 Arc::unwrap_or_clone(cached.take().unwrap())
             } else {
                 // Capture directories before listing files, then compare afterward.
                 // An addition during listing must not hide behind a newer stamp.
+                // A narrowed one is taken for a caller it may serve, without
+                // the whole listing, which an inventory of the same scope
+                // lacking leaves it unsettled until the next.
                 Membership::new(
                     root,
                     match cached.as_ref() {
-                        Some(entry) => &entry.files,
-                        None => self.files()?,
+                        Some(entry) if entry.scope.as_ref() == scope => &entry.files,
+                        _ if scope.is_some() => &empty,
+                        _ => self.files()?,
                     },
                     self.source_ignore(),
                     &self.source_exclusions,
@@ -1427,6 +1619,7 @@ impl Snapshot {
                         .as_ref()
                         .filter(|entry| unchanged && entry.settled)
                         .map(|entry| &entry.git_policies),
+                    scope,
                 )?
             };
             membership.list(&self.extra_candidates, rebuilt)?;
@@ -1522,8 +1715,16 @@ impl Snapshot {
         if let Some(membership) = self.membership.get_mut().unwrap() {
             let membership = Arc::make_mut(membership);
             let ignore = membership.source_ignore.clone();
-            Arc::make_mut(&mut membership.files)
-                .extend(paths.iter().filter(|path| !ignore.matches(path)).cloned());
+            let scope = membership.scope.clone();
+            Arc::make_mut(&mut membership.files).extend(
+                paths
+                    .iter()
+                    .filter(|path| {
+                        !ignore.matches(path)
+                            && scope.as_ref().is_none_or(|scope| scope.holds(path))
+                    })
+                    .cloned(),
+            );
             membership.settled &= membership.covers(&membership.files);
         }
         self
@@ -4317,8 +4518,16 @@ mod tests {
         std::fs::create_dir(root.path().join("src")).unwrap();
         std::fs::write(root.path().join("src/original"), "one").unwrap();
         let ignore = Arc::new(SourceIgnore::new(root.path()).unwrap());
-        let mut membership =
-            Membership::new(root.path(), &BTreeSet::new(), &ignore, &[], None, None).unwrap();
+        let mut membership = Membership::new(
+            root.path(),
+            &BTreeSet::new(),
+            &ignore,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         // Model a change made after the walk but before the listing: the
         // listing shows it, and the stamps taken earlier do not.
         std::fs::rename(
@@ -4339,8 +4548,16 @@ mod tests {
         std::fs::create_dir_all(root.path().join("src/nested")).unwrap();
         std::thread::sleep(Duration::from_millis(2100));
         let ignore = Arc::new(SourceIgnore::new(root.path()).unwrap());
-        let membership =
-            Membership::new(root.path(), &BTreeSet::new(), &ignore, &[], None, None).unwrap();
+        let membership = Membership::new(
+            root.path(),
+            &BTreeSet::new(),
+            &ignore,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let files = |paths: &[&str]| paths.iter().map(|path| (*path).to_owned()).collect();
         assert!(membership.covers(&files(&["top", "src/a", "src/nested/b", "src/nested/c"])));
         assert!(!membership.covers(&files(&["src/nested/b", "src/missing/c"])));
@@ -4581,15 +4798,15 @@ mod tests {
         let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
         let snapshot = Snapshot::new(&workspace, &graph, &root.path().join("cache")).unwrap();
         let first = snapshot
-            .current_files_for(root.path(), None, "test")
+            .current_files_for(root.path(), None, None, "test")
             .unwrap();
         policy("beta");
         let second = snapshot
-            .current_files_for(root.path(), None, "test")
+            .current_files_for(root.path(), None, None, "test")
             .unwrap();
         policy("gamma");
         let third = snapshot
-            .current_files_for(root.path(), None, "test")
+            .current_files_for(root.path(), None, None, "test")
             .unwrap();
         // Deterministically pause two fingerprints after candidate acquisition,
         // then let another fingerprint refresh policy twice before they resolve.
@@ -4655,17 +4872,17 @@ mod tests {
                 .membership_prefixes(&workspace, &graph.tasks["app:build"])
                 .unwrap();
             let before = snapshot
-                .current_files_for(&workspace.root, Some(&left), "test")
+                .current_files_for(&workspace.root, Some(&left), None, "test")
                 .unwrap();
             std::fs::write(root.path().join("right/empty/new.txt"), "right").unwrap();
             let unrelated = snapshot
-                .current_files_for(&workspace.root, Some(&left), "test")
+                .current_files_for(&workspace.root, Some(&left), None, "test")
                 .unwrap();
             assert!(Arc::ptr_eq(&before.files, &unrelated.files));
             assert!(!unrelated.files.contains("right/empty/new.txt"));
             assert!(
                 snapshot
-                    .current_files_for(&workspace.root, Some(&right), "test")
+                    .current_files_for(&workspace.root, Some(&right), None, "test")
                     .unwrap()
                     .files
                     .contains("right/empty/new.txt")
@@ -4674,7 +4891,7 @@ mod tests {
             std::fs::write(root.path().join("left/empty/nested/new.txt"), "left").unwrap();
             assert!(
                 snapshot
-                    .current_files_for(&workspace.root, Some(&left), "test")
+                    .current_files_for(&workspace.root, Some(&left), None, "test")
                     .unwrap()
                     .files
                     .contains("left/empty/nested/new.txt")
@@ -4682,7 +4899,7 @@ mod tests {
             std::fs::write(root.path().join("right/empty/another.txt"), "right").unwrap();
             assert!(
                 snapshot
-                    .current_files_for(&workspace.root, Some(&all), "test")
+                    .current_files_for(&workspace.root, Some(&all), None, "test")
                     .unwrap()
                     .files
                     .contains("right/empty/another.txt")
@@ -4708,7 +4925,7 @@ mod tests {
                 .membership_prefixes(&workspace, &graph.tasks["app:build"])
                 .unwrap();
             snapshot
-                .current_files_for(&workspace.root, Some(&prefixes), "test")
+                .current_files_for(&workspace.root, Some(&prefixes), None, "test")
                 .unwrap();
             std::fs::write(
                 root.path().join("config/empty/new.json"),
@@ -4717,7 +4934,7 @@ mod tests {
             .unwrap();
             assert!(
                 snapshot
-                    .current_files_for(&workspace.root, Some(&prefixes), "test")
+                    .current_files_for(&workspace.root, Some(&prefixes), None, "test")
                     .unwrap()
                     .files
                     .contains("config/empty/new.json")
@@ -5385,7 +5602,7 @@ mod tests {
             }})
             .to_string(),
         );
-        write(".gitignore", "ignored.yaml\n*.log\n");
+        write(".gitignore", "ignored.yaml\n*.log\nskip/\n");
         if nxignore {
             write(".nxignore", "nx-ignored.yaml\n");
         }
@@ -5401,6 +5618,7 @@ mod tests {
             "dir/a.txt",
             "dir/x.log",
             "dir/deep/b.txt",
+            "dir/skip/c.txt",
             "dist/out.txt",
             "warm/state.bin",
             "scratch/tmp.txt",
@@ -5663,7 +5881,7 @@ mod tests {
                 &dependencies,
                 &cancelled,
                 &snapshot
-                    .current_files_for(root.path(), None, "test")
+                    .current_files_for(root.path(), None, None, "test")
                     .unwrap(),
             )
             .unwrap();
@@ -5750,6 +5968,311 @@ mod tests {
         assert_eq!(plan.paths, Some(BTreeSet::from(["config.yaml".to_owned()])));
         task.definition.inputs = Some(vec![json!("{workspaceRoot}/dir/**")]);
         assert_eq!(snapshot.file_plan(&workspace, &task).unwrap().paths, None);
+    }
+
+    /// Globs beneath fixed directories, as filesets of the tasks a run keys
+    /// alone, are keyed from a listing and an inventory of those directories
+    /// together, and key as they would from the workspace's listing: with
+    /// exclusions, with or without a directory of their own, ignore files at
+    /// any depth, an ignored directory beneath one, another task's declared
+    /// outputs that its dependent selects and others do not, a directory
+    /// that is not there, one that is a link, and `node_modules`.
+    #[test]
+    fn glob_inputs_beneath_directories_key_as_the_workspace_listing_does() {
+        let inputs = json!([
+            "{workspaceRoot}/dir/**/*",
+            "!{workspaceRoot}/dir/deep/**",
+            "{projectRoot}/sub/**/*.yaml",
+            "!{projectRoot}/**/kept.yaml",
+            "{workspaceRoot}/dist/**/*",
+            "{workspaceRoot}/missing/**/*",
+            "{workspaceRoot}/link-dir/**/*",
+            "{workspaceRoot}/link-file/**",
+            "{workspaceRoot}/node_modules/**/*",
+            "{workspaceRoot}/config.yaml",
+            {"fileset": "{projectRoot}/warm/**/*", "includeIgnored": true},
+        ]);
+        for (git, nxignore) in [(true, false), (true, true), (false, true), (false, false)] {
+            for upstream in [false, true] {
+                let (_root, workspace, mut graph) = literal_fixture(git, nxignore, inputs.clone());
+                if upstream {
+                    let build = graph.tasks.get_mut("app:build").unwrap();
+                    build.dependencies.insert("app:gen".into());
+                }
+                let cache = workspace.root.join("cache");
+                let task = &graph.tasks["app:build"];
+                let prepared = qk_executor::prepare(&workspace, task, &BTreeMap::new()).unwrap();
+                let inputs = |snapshot: &Snapshot| {
+                    super::inputs(
+                        snapshot,
+                        &workspace,
+                        task,
+                        &prepared,
+                        &BTreeMap::new(),
+                        &AtomicBool::new(false),
+                    )
+                    .unwrap()
+                };
+                let label = format!("git {git}, nxignore {nxignore}, upstream {upstream}");
+                let watched = Snapshot::watched(&workspace, &graph, &cache).unwrap();
+                let scope = watched.scope.clone().expect(&label);
+                assert_eq!(
+                    scope.paths,
+                    [
+                        "config.yaml",
+                        "dir",
+                        "dist",
+                        "link-dir",
+                        "link-file",
+                        "missing",
+                        "node_modules",
+                        "sub"
+                    ]
+                    .map(str::to_owned)
+                    .into(),
+                    "{label}"
+                );
+                let narrowed = inputs(&watched);
+                // The narrowed listing is no initial candidate list.
+                assert!(watched.files.get().is_none(), "{label}");
+                let membership = watched.membership.lock().unwrap().clone().unwrap();
+                assert!(membership.scope.is_some(), "{label}");
+                assert!(
+                    !membership
+                        .directories
+                        .contains(&workspace.root.join("warm"))
+                );
+                let listed = Snapshot::new(&workspace, &graph, &cache).unwrap();
+                listed.files().unwrap();
+                assert_eq!(narrowed, inputs(&listed), "{label}");
+                let files = &narrowed["files"];
+                assert!(files.get("dir/a.txt").is_some(), "{label}");
+                assert!(files.get("sub/kept.yaml").is_none(), "{label}");
+                for path in ["dir/deep/b.txt", "dir/skip/c.txt", "dir/x.log"] {
+                    assert!(files.get(path).is_none(), "{path}, {label}");
+                }
+                assert_eq!(files.get("dist/out.txt").is_some(), upstream, "{label}");
+            }
+        }
+    }
+
+    /// Paths with every directory beneath them, listed with an inventory of
+    /// those alone, list what the workspace's listing holds there.
+    #[test]
+    fn narrowed_listings_hold_what_the_workspace_listing_holds_there() {
+        for (git, nxignore) in [(true, false), (true, true), (false, true), (false, false)] {
+            let (root, workspace, graph) = literal_fixture(git, nxignore, json!([]));
+            let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache"))
+                .unwrap()
+                .with_candidates(&["gone/file".into(), "dir/removed.txt".into()]);
+            let all = snapshot.current_files(root.path()).unwrap();
+            let sets = LITERAL_PATHS
+                .iter()
+                .map(|path| BTreeSet::from([path.to_string()]))
+                .chain([
+                    LITERAL_PATHS.iter().map(|path| path.to_string()).collect(),
+                    BTreeSet::from(["gone".to_owned(), "dir".to_owned(), "missing".to_owned()]),
+                    BTreeSet::from(["dir/deep".to_owned(), "sub".to_owned()]),
+                ]);
+            for paths in sets {
+                let scope = Arc::new(Scope::new(paths.clone()));
+                let mut membership = Membership::new(
+                    root.path(),
+                    &BTreeSet::new(),
+                    snapshot.source_ignore(),
+                    &snapshot.source_exclusions,
+                    snapshot.cache_relative.as_deref(),
+                    None,
+                    Some(&scope),
+                )
+                .unwrap();
+                membership.list(&snapshot.extra_candidates, true).unwrap();
+                let expected: BTreeSet<String> = all
+                    .iter()
+                    .filter(|path| scope.holds(path))
+                    .cloned()
+                    .collect();
+                let label = format!("{paths:?} with git {git}, nxignore {nxignore}");
+                assert_eq!(*membership.files, expected, "{label}");
+                // Nothing outside the scope is read, but the directories
+                // leading to it.
+                for directory in &membership.directories {
+                    let relative = directory.strip_prefix(root.path()).unwrap();
+                    assert!(
+                        scope.reach(relative) != Reach::Outside,
+                        "{relative:?}, {label}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A narrowed inventory lets a listing be reused while nothing it covers
+    /// changed, whatever changes elsewhere, and a change to what it covers,
+    /// to an ignore file above it, to Git's index or to a directory leading
+    /// to it lists again what the workspace's listing would hold there. A
+    /// caller reaching beyond it gets the whole workspace's listing.
+    #[test]
+    fn a_narrowed_inventory_guards_what_it_covers() {
+        let inputs = json!([
+            "{workspaceRoot}/dir/deep/**/*",
+            "{workspaceRoot}/sub/**/*",
+            "{workspaceRoot}/missing/inner/**/*",
+        ]);
+        let mut fixtures = Vec::new();
+        for (git, nxignore) in [(true, false), (true, true), (false, true), (false, false)] {
+            let (root, workspace, graph) = literal_fixture(git, nxignore, inputs.clone());
+            let snapshot = snapshot(&workspace, &graph, true);
+            fixtures.push((root, workspace, graph, snapshot, git, nxignore));
+        }
+        // Recent policies keep any listing from being reused.
+        std::thread::sleep(Duration::from_millis(2100));
+        for (root, workspace, graph, snapshot, git, nxignore) in fixtures {
+            let task = &graph.tasks["app:build"];
+            let scope = snapshot.scope.clone().unwrap();
+            let label = format!("git {git}, nxignore {nxignore}");
+            // The task's candidates, checked against a fresh listing of the
+            // whole workspace there.
+            let candidates = |step: &str| {
+                let files = snapshot.task_candidates(&workspace, task).unwrap().files;
+                let fresh = Snapshot::new(&workspace, &graph, &workspace.root.join("cache"))
+                    .unwrap()
+                    .current_files(root.path())
+                    .unwrap();
+                let held = |files: &BTreeSet<String>| -> BTreeSet<String> {
+                    files
+                        .iter()
+                        .filter(|path| scope.holds(path))
+                        .cloned()
+                        .collect()
+                };
+                assert_eq!(held(&files), held(&fresh), "{step}, {label}");
+                files
+            };
+            let write = |path: &str| {
+                let path = root.path().join(path);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, "new").unwrap();
+            };
+            candidates("first");
+            let settled = candidates("settled");
+            assert!(Arc::ptr_eq(&settled, &candidates("reused")), "{label}");
+            for path in [
+                "outside/new.txt",
+                "top.txt",
+                "dir/beside.txt",
+                "dist/new.txt",
+            ] {
+                write(path);
+            }
+            std::fs::create_dir(root.path().join("dir/empty")).unwrap();
+            assert!(Arc::ptr_eq(&settled, &candidates("outside")), "{label}");
+            write("dir/deep/new.txt");
+            assert!(candidates("within").contains("dir/deep/new.txt"));
+            // Git lists a tracked file whatever ignores it, so an untracked
+            // one shows the rules.
+            std::fs::write(root.path().join("dir/.gitignore"), "deep/new.txt\n").unwrap();
+            assert!(!candidates("new ignore file above").contains("dir/deep/new.txt"));
+            std::fs::write(root.path().join("dir/.gitignore"), "deep/old.txt\n").unwrap();
+            assert!(candidates("edited ignore file above").contains("dir/deep/new.txt"));
+            write("missing/inner/x.txt");
+            assert!(candidates("created beneath").contains("missing/inner/x.txt"));
+            if git {
+                let added = paths::git(root.path(), &["add", "--force", "sub/nested-ignored.yaml"]);
+                assert!(added.unwrap().status.success());
+                assert_eq!(
+                    candidates("index").contains("sub/nested-ignored.yaml"),
+                    !nxignore,
+                    "{label}"
+                );
+            }
+            #[cfg(unix)]
+            {
+                std::fs::rename(root.path().join("dir/deep"), root.path().join("dir/copy"))
+                    .unwrap();
+                std::os::unix::fs::symlink("copy", root.path().join("dir/deep")).unwrap();
+                assert!(!candidates("linked").contains("dir/deep/new.txt"));
+            }
+            // Beyond the scope, the whole workspace's listing.
+            let whole = snapshot.current_files(root.path()).unwrap();
+            let fresh = Snapshot::new(&workspace, &graph, &workspace.root.join("cache"))
+                .unwrap()
+                .current_files(root.path())
+                .unwrap();
+            assert_eq!(whole, fresh, "{label}");
+            assert!(whole.contains("top.txt"), "{label}");
+            candidates("after the whole listing");
+        }
+    }
+
+    /// A run lists the directories its tasks' globs start from together, the
+    /// whole workspace when one of them has none, and nothing when each
+    /// names paths.
+    #[test]
+    fn a_run_lists_the_directories_its_globs_start_from() {
+        let (_root, workspace, mut graph) = literal_fixture(true, false, json!([]));
+        let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
+        let build = graph.tasks.remove("app:build").unwrap();
+        graph.tasks.clear();
+        let mut listing = |inputs: &[Value]| {
+            graph.tasks.clear();
+            for (index, inputs) in inputs.iter().enumerate() {
+                let mut task = build.clone();
+                task.id = format!("app:task{index}");
+                task.definition.inputs = Some(inputs.as_array().unwrap().clone());
+                graph.tasks.insert(task.id.clone(), task);
+            }
+            match snapshot.listing(&workspace, &graph) {
+                Listing::Nothing => None,
+                Listing::Within(scope) => Some(Some(scope.paths)),
+                Listing::Whole => Some(None),
+            }
+        };
+        let paths =
+            |paths: &[&str]| Some(Some(paths.iter().map(|path| path.to_string()).collect()));
+        assert_eq!(listing(&[json!(["{workspaceRoot}/a"])]), None);
+        assert_eq!(
+            listing(&[
+                json!(["{workspaceRoot}/a/**/*", "!{workspaceRoot}/**/*.md"]),
+                json!(["{workspaceRoot}/a/b/*.ts", "{workspaceRoot}/c"]),
+                json!(["{workspaceRoot}/ab/**", "{workspaceRoot}/config.yaml"]),
+            ]),
+            paths(&["a", "ab", "c", "config.yaml"])
+        );
+        for whole in [
+            json!(["{workspaceRoot}/**/*.ts"]),
+            json!(["{workspaceRoot}/*/src/**"]),
+            json!([{"json": "{workspaceRoot}/a/*.json"}]),
+            json!([]),
+        ] {
+            let mut inputs = vec![json!(["{workspaceRoot}/a/**"]), whole.clone()];
+            if whole == json!([]) {
+                // The default inputs of a project at the workspace root.
+                inputs[1] = json!(["default"]);
+            }
+            assert_eq!(listing(&inputs), Some(None), "{whole}");
+        }
+        let many: Vec<Value> = (0..=SCOPE_PATHS)
+            .map(|index| json!([format!("{{workspaceRoot}}/d{index}/**")]))
+            .collect();
+        assert_eq!(listing(&many), Some(None));
+        // A task recordings may key compares its declared selection with
+        // what it read, from the whole listing.
+        for (settings, whole) in [(json!({}), true), (json!({"mode": "record"}), true)] {
+            let mut recorded = build.clone();
+            recorded.definition.inputs = Some(vec![json!("{workspaceRoot}/a/**")]);
+            recorded
+                .definition
+                .extra
+                .insert("qk:ultracache".into(), settings.clone());
+            graph.tasks.clear();
+            graph.tasks.insert(recorded.id.clone(), recorded);
+            assert_eq!(
+                matches!(snapshot.listing(&workspace, &graph), Listing::Whole),
+                whole,
+                "{settings}"
+            );
+        }
     }
 
     /// A run that lists no files keeps the digests saved before, beside its

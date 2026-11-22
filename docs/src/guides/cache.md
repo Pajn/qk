@@ -201,7 +201,12 @@ declare the files it writes. A task whose filesets
 each name a path, with no `json` glob, lists only those paths and what is
 beneath them, selecting what the source list would hold there, where Git or a
 root `.nxignore` can list them; a run of such tasks alone then takes no source
-list, unless a sandbox, input analysis or Ultracache's recordings need one. File contents are re-read whenever their metadata changes; their
+list, unless a sandbox, input analysis or Ultracache's recordings need one.
+When the filesets of every task in a run that select files each start from a
+fixed directory, as `{projectRoot}/**/*` does for a project not at the
+workspace root, the run lists those directories together, with what is
+beneath them, in place of the workspace, selecting what the source list would
+hold there; with more than 200 of them it lists the workspace. File contents are re-read whenever their metadata changes; their
 digests persist between runs in the worktree's state, keyed by
 path, size, modification time and, on Unix, change time, inode and mode, so a
 warm run reads only files whose metadata changed.
