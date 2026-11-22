@@ -907,9 +907,28 @@ fn outputs_record(root: &Path, task: &str) -> std::path::PathBuf {
         .join(format!("{}.json", &name[..32]))
 }
 
-/// Sets a file's modification time. Unix needs a handle only to read it;
-/// Windows one that may write its attributes.
+/// Sets a file's modification time and leaves its access time. On Linux and
+/// macOS this is one system call by path, which does not follow a link;
+/// elsewhere it takes a handle: Unix one only to read the file, Windows one
+/// that may write its attributes.
 pub(crate) fn set_modified(path: &Path, time: SystemTime) -> Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Ok(since) = time.duration_since(SystemTime::UNIX_EPOCH) {
+        use rustix::fs::{AtFlags, CWD, Timespec, Timestamps, UTIME_OMIT, utimensat};
+        let times = Timestamps {
+            last_access: Timespec {
+                tv_sec: 0,
+                tv_nsec: UTIME_OMIT,
+            },
+            last_modification: Timespec {
+                tv_sec: since.as_secs() as _,
+                tv_nsec: since.subsec_nanos().into(),
+            },
+        };
+        return utimensat(CWD, path, &times, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(std::io::Error::from)
+            .with_context(|| format!("cannot set the modification time of {}", path.display()));
+    }
     #[cfg(windows)]
     let file = {
         use std::os::windows::fs::OpenOptionsExt;
@@ -1722,6 +1741,21 @@ mod tests {
             outputs_held(root, "build", &key, &outputs, &manifest),
             Some(false)
         );
+    }
+
+    /// Setting a link's time sets the link's own, never its target's.
+    #[cfg(unix)]
+    #[test]
+    fn setting_a_time_does_not_follow_a_link() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        fs::write(&target, "target").unwrap();
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        set_modified(&target, old).unwrap();
+        set_modified(&link, SystemTime::UNIX_EPOCH + Duration::from_secs(200)).unwrap();
+        assert_eq!(fs::metadata(&target).unwrap().modified().unwrap(), old);
     }
 
     #[test]
