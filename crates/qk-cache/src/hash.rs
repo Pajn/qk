@@ -1319,7 +1319,9 @@ impl Snapshot {
     fn listing(&self, workspace: &Workspace, graph: &TaskGraph) -> Listing {
         let mut prefixes = BTreeSet::new();
         for task in graph.tasks.values() {
-            if task.definition.extra.contains_key("qk:ultracache") {
+            // One in mode "off" is neither recorded nor keyed by a recording;
+            // one whose settings cannot be read is taken as recorded.
+            if !matches!(crate::ultracache::Settings::of(task), Ok(None)) {
                 return Listing::Whole;
             }
             match self.file_plan(workspace, task) {
@@ -5917,6 +5919,12 @@ mod tests {
                     "qk:ultracache": {}}),
                 true,
             ),
+            // Not recorded, so keyed by its declared inputs alone.
+            (
+                json!({"command": "true", "inputs": ["{workspaceRoot}/config.yaml"],
+                    "qk:ultracache": {"mode": "off"}}),
+                false,
+            ),
         ] {
             let root = tempfile::tempdir().unwrap();
             std::fs::write(root.path().join("nx.json"), "{}").unwrap();
@@ -6257,8 +6265,13 @@ mod tests {
             .collect();
         assert_eq!(listing(&many), Some(None));
         // A task recordings may key compares its declared selection with
-        // what it read, from the whole listing.
-        for (settings, whole) in [(json!({}), true), (json!({"mode": "record"}), true)] {
+        // what it read, from the whole listing; one not recorded needs none.
+        for (settings, whole) in [
+            (json!({}), true),
+            (json!({"mode": "record"}), true),
+            (json!({"mode": "unknown"}), true),
+            (json!({"mode": "off"}), false),
+        ] {
             let mut recorded = build.clone();
             recorded.definition.inputs = Some(vec![json!("{workspaceRoot}/a/**")]);
             recorded
