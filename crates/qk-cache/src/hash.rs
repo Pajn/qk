@@ -168,10 +168,8 @@ pub struct Snapshot {
     /// The parsed pnpm lockfile, replaced whenever its content changes.
     lockfile: Mutex<Option<Arc<Installed>>>,
     /// Each dependency task's output files, listed when a task first asks and
-    /// dropped once a task whose outputs overlap them is done.
-    dependency_outputs: Mutex<HashMap<String, Arc<DependencyOutputs>>>,
-    /// Counts drops, so a listing taken while a task finished is not kept.
-    outputs_written: std::sync::atomic::AtomicU64,
+    /// dropped once a task that may have written where they lie is done.
+    dependency_outputs: Mutex<Listings>,
 }
 
 /// Membership depends on directory entries and Git/ignore listing policy, not
@@ -807,6 +805,76 @@ struct DependencyOutputs {
     values: Mutex<HashMap<String, Value>>,
 }
 
+/// What a task that is done may have written in the workspace, which decides
+/// the listings of dependency outputs that can no longer be trusted.
+#[derive(Clone)]
+pub(crate) enum Written {
+    /// Nothing a listing holds: it ran no command and has no scratch or warm
+    /// paths.
+    Nothing,
+    /// Nothing but these paths and what lies below them.
+    Within(Vec<String>),
+    /// Nothing but paths its declared outputs match: it was restored, or ran
+    /// a command, which is trusted to write only its declared outputs.
+    Declared(Box<Outputs>),
+    /// Anything: it ran a command that declares no outputs.
+    Anything,
+}
+
+impl Written {
+    /// Whether what was written may touch a listing anchored at `anchors`.
+    fn touches(&self, anchors: &[String]) -> bool {
+        match self {
+            Written::Nothing => false,
+            Written::Within(written) => written
+                .iter()
+                .any(|a| anchors.iter().any(|b| overlaps_path(a, b))),
+            Written::Declared(outputs) => anchors.iter().any(|anchor| outputs.reaches(anchor)),
+            Written::Anything => true,
+        }
+    }
+}
+
+impl std::fmt::Debug for Written {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Written::Nothing => f.write_str("Nothing"),
+            Written::Within(paths) => f.debug_tuple("Within").field(paths).finish(),
+            Written::Declared(outputs) => {
+                f.debug_tuple("Declared").field(&outputs.globs()).finish()
+            }
+            Written::Anything => f.write_str("Anything"),
+        }
+    }
+}
+
+/// Whether one of two workspace-relative paths is the other or lies below it.
+fn overlaps_path(a: &str, b: &str) -> bool {
+    a == b
+        || b.strip_prefix(a).is_some_and(|rest| rest.starts_with('/'))
+        || a.strip_prefix(b).is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// The dependency-output listings a snapshot keeps, and what each task done
+/// so far may have written, in the order they were done.
+#[derive(Default)]
+struct Listings {
+    by_task: HashMap<String, Arc<DependencyOutputs>>,
+    /// Kept for the run, so a listing taken while a task was being done is
+    /// checked against what that task wrote: see [`Listings::still_valid`].
+    writes: Vec<Written>,
+}
+
+impl Listings {
+    /// Whether a listing anchored at `anchors`, which began once the first
+    /// `since` writes were done, misses nothing a later one wrote.
+    fn still_valid(&self, since: usize, anchors: &[String]) -> bool {
+        self.writes[since.min(self.writes.len())..]
+            .iter()
+            .all(|written| !written.touches(anchors))
+    }
+}
+
 /// One revision of `pnpm-lock.yaml`, with digests of what it installs computed
 /// once and shared by every task that asks.
 struct Installed {
@@ -953,7 +1021,6 @@ impl Snapshot {
             runtime: Mutex::default(),
             lockfile: Mutex::default(),
             dependency_outputs: Mutex::default(),
-            outputs_written: Default::default(),
         };
         // Every early task needs these, so loading saved digests and parsing
         // the lockfile overlap listing files.
@@ -1457,22 +1524,24 @@ impl Snapshot {
         workspace: &Workspace,
         task: &Task,
     ) -> Result<Arc<DependencyOutputs>> {
-        if let Some(outputs) = self.dependency_outputs.lock().unwrap().get(&task.id) {
-            return Ok(outputs.clone());
-        }
-        let written = self
-            .outputs_written
-            .load(std::sync::atomic::Ordering::SeqCst);
+        let since = {
+            let listed = self.dependency_outputs.lock().unwrap();
+            if let Some(outputs) = listed.by_task.get(&task.id) {
+                return Ok(outputs.clone());
+            }
+            listed.writes.len()
+        };
         let outputs = Arc::new(self.fresh_dependency_outputs(workspace, task)?);
         let mut listed = self.dependency_outputs.lock().unwrap();
-        if self
-            .outputs_written
-            .load(std::sync::atomic::Ordering::SeqCst)
-            != written
-        {
+        // A task done while this one listed may have written what it read.
+        if !listed.still_valid(since, &outputs.anchors) {
             return Ok(outputs);
         }
-        Ok(listed.entry(task.id.clone()).or_insert(outputs).clone())
+        Ok(listed
+            .by_task
+            .entry(task.id.clone())
+            .or_insert(outputs)
+            .clone())
     }
 
     /// Re-list artifacts for verification, without reusing earlier content values.
@@ -1496,28 +1565,17 @@ impl Snapshot {
         })
     }
 
-    /// Drops the listings `task` may have changed, once it is done. Without
-    /// its outputs, every listing goes.
-    pub(crate) fn outputs_written(&self, workspace: &Workspace, task: &Task) {
-        let anchors: Option<Vec<String>> = Outputs::new(workspace, task)
-            .ok()
-            .filter(Outputs::is_explicit)
-            .map(|outputs| outputs.anchors().map(str::to_owned).collect());
-        let overlap = |a: &str, b: &str| {
-            a == b
-                || b.strip_prefix(a).is_some_and(|rest| rest.starts_with('/'))
-                || a.strip_prefix(b).is_some_and(|rest| rest.starts_with('/'))
-        };
+    /// Once `task` is done: drops the listings what it `written` may have
+    /// touched, its own among them.
+    pub(crate) fn outputs_written(&self, written: Written) {
+        if matches!(written, Written::Nothing) {
+            return;
+        }
         let mut listed = self.dependency_outputs.lock().unwrap();
-        self.outputs_written
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        listed.retain(|_, outputs| {
-            anchors.as_ref().is_some_and(|written| {
-                !written
-                    .iter()
-                    .any(|a| outputs.anchors.iter().any(|b| overlap(a, b)))
-            })
-        });
+        listed
+            .by_task
+            .retain(|_, outputs| !written.touches(&outputs.anchors));
+        listed.writes.push(written);
     }
 
     /// A file an `includeIgnored` fileset read, by the content it points to
@@ -4897,15 +4955,62 @@ mod tests {
     #[test]
     fn undeclared_writes_invalidate_dependency_values() {
         for outputs in [None, Some(json!(["{projectRoot}/generated"]))] {
-            let (root, workspace, graph) = fixture(outputs);
+            let (root, workspace, graph) = fixture(outputs.clone());
             let snapshot = Snapshot::new(&workspace, &graph, &root.path().join("cache")).unwrap();
             let keys = || {
                 dependency_keys(&snapshot, &workspace, &graph, &graph.tasks["app:build"]).unwrap()
             };
             let before = keys();
             std::fs::write(root.path().join("generated/value"), "different").unwrap();
-            snapshot.outputs_written(&workspace, &graph.tasks["app:post"]);
+            // As `post` would have written, having run its command.
+            let written = match &outputs {
+                Some(_) => Written::Within(vec!["generated".into()]),
+                None => Written::Anything,
+            };
+            snapshot.outputs_written(written);
             assert_ne!(before, keys());
+        }
+    }
+
+    /// A listing is kept until a task that may have written where it lies is
+    /// done: one that wrote nothing, or wrote elsewhere, leaves it.
+    #[test]
+    fn listings_are_dropped_only_by_writes_that_touch_them() {
+        let (root, workspace, graph) = fixture(Some(json!(["{projectRoot}/elsewhere"])));
+        let snapshot = Snapshot::new(&workspace, &graph, &root.path().join("cache")).unwrap();
+        let keys =
+            || dependency_keys(&snapshot, &workspace, &graph, &graph.tasks["app:build"]).unwrap();
+        let before = keys();
+        // A file the listing does not hold, which only a fresh listing sees.
+        std::fs::write(root.path().join("generated/added"), "added").unwrap();
+        let declared = |patterns: &[&str]| {
+            let patterns: Vec<String> = patterns.iter().map(|p| (*p).to_owned()).collect();
+            Written::Declared(Box::new(Outputs::from_paths(&patterns).unwrap()))
+        };
+        for written in [
+            Written::Nothing,
+            Written::Within(vec!["elsewhere".into()]),
+            Written::Within(vec!["generate".into()]),
+            declared(&["elsewhere/*/generated", "generate/*"]),
+        ] {
+            snapshot.outputs_written(written);
+            assert_eq!(before, keys());
+        }
+        for written in [
+            Written::Within(vec!["generated/added".into()]),
+            Written::Within(vec![".".into(), "generated".into()]),
+            declared(&["generated/*.txt"]),
+            Written::Anything,
+        ] {
+            snapshot.outputs_written(Written::Nothing);
+            assert_eq!(before, keys());
+            snapshot.outputs_written(written.clone());
+            let after = keys();
+            assert_ne!(before, after, "{written:?}");
+            std::fs::remove_file(root.path().join("generated/added")).unwrap();
+            snapshot.outputs_written(Written::Anything);
+            assert_eq!(before, keys());
+            std::fs::write(root.path().join("generated/added"), "added").unwrap();
         }
     }
 
@@ -4929,7 +5034,7 @@ mod tests {
             || dependency_keys(&snapshot, &workspace, &graph, &graph.tasks["app:build"]).unwrap();
         let before = keys();
         std::fs::write(root.path().join("generated/value"), "different").unwrap();
-        snapshot.outputs_written(&workspace, &graph.tasks["app:post"]);
+        snapshot.outputs_written(Written::Within(vec!["generated".into()]));
         assert_ne!(before["app:gen:**/*"], keys()["app:gen:**/*"]);
     }
     /// The digest of a git-ignored file an `includeIgnored` fileset reads is

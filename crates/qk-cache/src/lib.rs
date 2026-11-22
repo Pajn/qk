@@ -406,6 +406,65 @@ impl Cache {
         }
     }
 
+    /// What `task`, now done with `result`, may have written.
+    fn written(
+        &self,
+        workspace: &Workspace,
+        task: &Task,
+        prepared: &PreparedTask,
+        result: Option<&TaskResult>,
+    ) -> hash::Written {
+        let outputs = paths::Outputs::new(workspace, task);
+        if result.is_some_and(|result| {
+            matches!(result.cache, CacheStatus::LocalHit | CacheStatus::RemoteHit)
+        }) {
+            // Taken from the cache, it ran nothing, and a restore writes
+            // nothing but paths its outputs match.
+            return match outputs {
+                Ok(outputs) => hash::Written::Declared(Box::new(outputs)),
+                Err(_) => hash::Written::Anything,
+            };
+        }
+        if prepared.commands.is_empty() {
+            // It ran no command, so it wrote nothing but the scratch
+            // directories emptied before its commands and its warm paths.
+            let scratch = scratch::directories(workspace, task).and_then(|directories| {
+                directories
+                    .iter()
+                    .map(|directory| {
+                        let relative = directory
+                            .strip_prefix(&workspace.root)
+                            .ok()
+                            .and_then(std::path::Path::to_str)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("scratch directory outside the workspace")
+                            })?;
+                        Ok(relative.replace('\\', "/"))
+                    })
+                    .collect::<Result<Vec<_>>>()
+            });
+            let warm = warm::config(workspace, task)
+                .and_then(|entries| paths::Outputs::from_paths(&warm::kept_paths(&entries)));
+            let written = match (scratch, warm) {
+                (Ok(mut paths), Ok(warm)) => {
+                    paths.extend(warm.anchors().map(str::to_owned));
+                    if paths.is_empty() {
+                        hash::Written::Nothing
+                    } else {
+                        hash::Written::Within(paths)
+                    }
+                }
+                _ => hash::Written::Anything,
+            };
+            return written;
+        }
+        // Its commands are trusted to write only their declared outputs.
+        match outputs {
+            Ok(outputs) if outputs.is_explicit() => hash::Written::Declared(Box::new(outputs)),
+            _ => hash::Written::Anything,
+        }
+    }
+
     /// The blobs hashed since the machine started, read on first use.
     pub(crate) fn verified(&self) -> &verified::Verified {
         self.verified
@@ -508,22 +567,22 @@ impl Cache {
         restored: &dyn Fn(TaskResult),
     ) -> Result<TaskResult> {
         let written = std::sync::Once::new();
-        let write = || {
+        let write = |result: Option<&TaskResult>| {
             written.call_once(|| {
                 if let Some(Ok(snapshot)) = self.snapshot.get() {
-                    snapshot.outputs_written(workspace, task);
+                    snapshot.outputs_written(self.written(workspace, task, prepared, result));
                 }
             })
         };
         let early = |result: TaskResult| {
-            write();
+            write(Some(&result));
             restored(result);
         };
         let result = self.run_task(workspace, graph, task, prepared, cancelled, &early);
         if let Ok(result) = &result {
             self.pass_on_kept(task, prepared, result);
         }
-        write();
+        write(result.as_ref().ok());
         result
     }
 

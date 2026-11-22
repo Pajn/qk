@@ -660,6 +660,23 @@ impl Outputs {
         roots
     }
 
+    /// Whether a path these outputs match may be `directory`, lie below it
+    /// or hold it, told from the patterns alone: whether writing nothing but
+    /// such paths can change what is at or below `directory`. Negated
+    /// patterns are not read, so what they leave out counts too.
+    pub(crate) fn reaches(&self, directory: &str) -> bool {
+        let overlaps = |a: &str, b: &str| {
+            a == b
+                || b.strip_prefix(a).is_some_and(|rest| rest.starts_with('/'))
+                || a.strip_prefix(b).is_some_and(|rest| rest.starts_with('/'))
+        };
+        self.complete.iter().any(|root| overlaps(root, directory))
+            || self
+                .globs
+                .iter()
+                .any(|glob| may_match_below(glob, directory))
+    }
+
     pub fn matches(&self, path: &str) -> bool {
         let any = |patterns: &PatternSet| {
             !patterns.is_empty()
@@ -1916,6 +1933,45 @@ mod tests {
             assert_eq!(metadata.file_type(), expected.file_type());
             assert_eq!(metadata.len(), expected.len());
             assert_eq!(metadata.modified().unwrap(), expected.modified().unwrap());
+        }
+    }
+
+    /// Outputs reach a directory when a path they match may be it, lie below
+    /// it or hold it; a glob's literal segments rule out the rest.
+    #[test]
+    fn outputs_reach_what_their_patterns_may_match() {
+        let outputs = Outputs::from_paths(&[
+            "apps/*/src/generated/**".into(),
+            "packages/*/manifest.json".into(),
+            "tools/out".into(),
+            "!apps/kept/src/generated/keep".into(),
+        ])
+        .unwrap();
+        for directory in [
+            "apps",
+            "apps/a",
+            "apps/a/src",
+            "apps/a/src/generated",
+            "apps/a/src/generated/deep",
+            "apps/kept/src/generated/keep",
+            "packages/p",
+            "packages/p/manifest.json",
+            "packages/p/manifest.json/below",
+            "tools",
+            "tools/out",
+            "tools/out/inner",
+        ] {
+            assert!(outputs.reaches(directory), "{directory}");
+        }
+        for directory in [
+            "apps/a/dist",
+            "apps/a/src/other",
+            "packages/p/dist",
+            "tools/other",
+            "elsewhere",
+            "app",
+        ] {
+            assert!(!outputs.reaches(directory), "{directory}");
         }
     }
 
