@@ -1128,32 +1128,10 @@ async function putPathSets(weak: string, request: Request, env: Env): Promise<Re
   if (upload.json.weak !== weak) {
     throw new Failure(400, "malformed", `the record is not for weak key ${weak}`);
   }
-  await saveCitingNoBlob(env.STORE, indexOf(env), `pathsets/${weak}`, body);
+  // The index writes the bucket and then itself before it answers, so a read
+  // that starts after this save finds it or a later one.
+  await indexOf(env).saveRecord(`pathsets/${weak}`, body);
   return new Response(null, { status: 204 });
-}
-
-/** Saves `body` as the record `name`, which cites no blob: in the bucket,
- * then in the index. The index comes after the bucket, so a read the index
- * sends there meanwhile finds this save or a later one, and before the
- * answer, so every read that starts after it does.
- *
- * Two saves of one name at once can reach the index in the other order than
- * they reached the bucket, which would leave the index answering one and the
- * bucket holding the other. So a save looks at the bucket once the index has
- * it, and where the bucket kept another save, leaves the index without the
- * body: reads then go to the bucket, and take in what it holds. */
-export async function saveCitingNoBlob(
-  bucket: Pick<R2Bucket, "put" | "head">,
-  index: Pick<DurableObjectStub<Index>, "saveRecord">,
-  name: string,
-  body: Uint8Array,
-): Promise<void> {
-  const saved = await bucket.put(name, body, { httpMetadata: { contentType: "application/x-qk-upload" } });
-  await index.saveRecord(name, body.length <= HELD_RECORD ? body : null);
-  const kept = await bucket.head(name);
-  if (kept?.etag !== saved.etag) {
-    await index.saveRecord(name, null);
-  }
 }
 
 async function putExpectations(name: string, request: Request, env: Env): Promise<Response> {
@@ -1165,7 +1143,8 @@ async function putExpectations(name: string, request: Request, env: Env): Promis
   if (upload.json.name !== name) {
     throw new Failure(400, "malformed", `the record is not named ${name}`);
   }
-  await saveCitingNoBlob(env.STORE, indexOf(env), `expectations/${name}`, body);
+  // As for path sets.
+  await indexOf(env).saveRecord(`expectations/${name}`, body);
   return new Response(null, { status: 204 });
 }
 

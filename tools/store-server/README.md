@@ -44,11 +44,11 @@ beside their copies in the bucket. Every run reads them, and a read of a
 small object from R2 takes the Worker a request to the bucket's region,
 where the index answers many from memory in one call: a run's
 `POST pathsets/fetch` costs one call to the index, not a read per weak key.
-Each `PUT` writes the bucket, then the index, then answers, so a read
-never finds a save older than the last that succeeded. Two saves of one name
-at once can reach the index in the other order than the bucket, so a `PUT`
-then looks at the bucket, and where it kept the other save, leaves the index
-without the body, for reads to take from the bucket. A record over 1 MiB
+Each `PUT` hands its record to the index, which writes the bucket, then
+itself, then answers, one save of a name after another: a read never finds a
+save older than the last that succeeded, and the index and the bucket keep
+the same save of a name. While a save is on its way the index holds no body
+for the name, so reads go to the bucket. A record over 1 MiB
 is listed without its body and read from the bucket, as is one unread for 30
 days, until it is read again. Records stored before the index held them are
 listed by the same alarm after the blobs, and taken in as they are read;

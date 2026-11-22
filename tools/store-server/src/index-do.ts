@@ -89,7 +89,7 @@ export class Index extends DurableObject<{ STORE: R2Bucket }> {
       CREATE TABLE IF NOT EXISTS sequence (name TEXT PRIMARY KEY, value INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS blobs (hash TEXT PRIMARY KEY, size INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS listing (name TEXT PRIMARY KEY, value TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS records (name TEXT PRIMARY KEY, body BLOB, version INTEGER NOT NULL, used INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS records (name TEXT PRIMARY KEY, body BLOB, version INTEGER NOT NULL, used INTEGER NOT NULL, saving INTEGER NOT NULL DEFAULT 0);
       CREATE INDEX IF NOT EXISTS records_used ON records (used);
     `);
     // Bundles came later than the table.
@@ -241,23 +241,51 @@ export class Index extends DurableObject<{ STORE: R2Bucket }> {
     });
   }
 
-  /** Notes a record just saved as `name` in the bucket, replacing what the
-   * index held of it: with its body when it is at most `HELD_RECORD` bytes,
-   * otherwise as stored in the bucket alone. Bodies unread for
-   * `RECORD_HELD_FOR` are dropped on the way. */
-  saveRecord(name: string, body: Uint8Array | null): void {
-    const now = Date.now();
-    const held = body !== null && body.length <= HELD_RECORD ? body : null;
-    this.ctx.storage.transactionSync(() => {
+  /** Saves of records citing no blob that have not ended, by name. */
+  private saves = new Map<string, Promise<void>>();
+
+  /** Saves `body` as the record `name`, which cites no blob: in the bucket,
+   * and here with its body when that is at most `HELD_RECORD` bytes. Bodies
+   * unread for `RECORD_HELD_FOR` are dropped on the way.
+   *
+   * The index writes the bucket itself, one save of a name after another,
+   * so the save the bucket keeps is the one the index keeps. While a save
+   * is on its way the index holds no body for the name and takes none in,
+   * so reads go to the bucket, and a save that never ends leaves them
+   * there until the next one. */
+  async saveRecord(name: string, body: Uint8Array): Promise<void> {
+    const before = this.saves.get(name);
+    const save = (async () => {
+      // Whatever became of the save before it, this one follows it.
+      await before?.catch(() => {});
       this.sql.exec(
-        "INSERT OR REPLACE INTO records (name, body, version, used) VALUES (?, ?, ?, ?)",
+        `INSERT INTO records (name, body, version, used, saving) VALUES (?, NULL, ?, ?, 1)
+         ON CONFLICT (name) DO UPDATE SET body = NULL, version = excluded.version, saving = 1`,
         name,
-        held && buffer(held),
         this.nextVersion(),
-        now,
+        Date.now(),
       );
-      this.sql.exec("UPDATE records SET body = NULL WHERE used < ? AND body IS NOT NULL", now - RECORD_HELD_FOR);
-    });
+      await this.env.STORE.put(name, body, { httpMetadata: { contentType: "application/x-qk-upload" } });
+      const now = Date.now();
+      this.ctx.storage.transactionSync(() => {
+        this.sql.exec(
+          "INSERT OR REPLACE INTO records (name, body, version, used, saving) VALUES (?, ?, ?, ?, 0)",
+          name,
+          body.length <= HELD_RECORD ? buffer(body) : null,
+          this.nextVersion(),
+          now,
+        );
+        this.sql.exec("UPDATE records SET body = NULL WHERE used < ? AND body IS NOT NULL", now - RECORD_HELD_FOR);
+      });
+    })();
+    this.saves.set(name, save);
+    try {
+      await save;
+    } finally {
+      if (this.saves.get(name) === save) {
+        this.saves.delete(name);
+      }
+    }
   }
 
   /** What the index says of each of `names`, records citing no blob, in
@@ -319,10 +347,11 @@ export class Index extends DurableObject<{ STORE: R2Bucket }> {
   }
 
   /** Takes in the body of the record `name`, as just read from the bucket,
-   * unless the index has heard of a save since the read began: `version` is
-   * that of the row the read was answered `apart` from, or null when the
-   * index had none. So a slow read of an older body never replaces a newer
-   * save's. A record too large to hold is left as it is. */
+   * unless the index has heard of a save since the read began, or one is on
+   * its way: `version` is that of the row the read was answered `apart`
+   * from, or null when the index had none. So a slow read of an older body
+   * never replaces a newer save's. A record too large to hold is left as it
+   * is. */
   fillRecord(name: string, version: number | null, body: Uint8Array): void {
     if (body.length > HELD_RECORD) {
       return;
@@ -338,7 +367,7 @@ export class Index extends DurableObject<{ STORE: R2Bucket }> {
       );
     } else {
       this.sql.exec(
-        "UPDATE records SET body = ?, used = ? WHERE name = ? AND version = ? AND body IS NULL",
+        "UPDATE records SET body = ?, used = ? WHERE name = ? AND version = ? AND body IS NULL AND saving = 0",
         buffer(body),
         now,
         name,
