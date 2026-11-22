@@ -151,6 +151,21 @@ describe("records citing no blob", () => {
     expect(await fetchMany([weak])).toEqual([[weak, expectedPack(record, [], () => true)]]);
   });
 
+  it("are answered by the index up to what one read of it carries, and as apart past that", async () => {
+    const names = Array.from({ length: 24 }, () => `pathsets/${hash()}`);
+    const size = 900 << 10;
+    const states = await runInDurableObject(index(), (instance) => {
+      const stub = instance as unknown as Index;
+      for (const name of names) {
+        stub.saveRecord(name, new Uint8Array(size));
+      }
+      return stub.readRecords(names).map(({ state }) => state);
+    });
+    // Every record is held; the bodies of those past 16 MiB stay unread.
+    const held = Math.floor((16 << 20) / size);
+    expect(states).toEqual(names.map((_, at) => (at < held ? "held" : "apart")));
+  });
+
   it("are never taken in from a read older than a save the index heard of", async () => {
     const weak = hash();
     const name = `pathsets/${weak}`;

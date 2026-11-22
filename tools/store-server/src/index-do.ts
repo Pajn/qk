@@ -265,35 +265,56 @@ export class Index extends DurableObject<{ STORE: R2Bucket }> {
    * bytes; past that a held record is answered as `apart`. */
   readRecords(names: string[]): RecordState[] {
     const now = Date.now();
-    const rows = new Map<string, { body: ArrayBuffer | null; version: number; used: number }>();
+    // Sizes before bodies, so that a request naming more held records than
+    // one answer carries never has all their bodies in memory at once.
+    const rows = new Map<string, { size: number | null; version: number; used: number }>();
     for (let start = 0; start < names.length; start += BOUND) {
       const chunk = names.slice(start, start + BOUND);
-      const found = this.sql.exec<{ name: string; body: ArrayBuffer | null; version: number; used: number }>(
-        `SELECT name, body, version, used FROM records WHERE name IN (${chunk.map(() => "?").join(", ")})`,
+      const found = this.sql.exec<{ name: string; size: number | null; version: number; used: number }>(
+        `SELECT name, length(body) AS size, version, used FROM records WHERE name IN (${chunk.map(() => "?").join(", ")})`,
         ...chunk,
       );
-      for (const { name, body, version, used } of found) {
-        rows.set(name, { body, version, used });
+      for (const { name, size, version, used } of found) {
+        rows.set(name, { size, version, used });
       }
     }
     // Reading renews a body's hold, at most once a day, so that reads seldom
     // write.
-    const renewed = [...rows].filter(([, row]) => row.body !== null && row.used < now - DAY).map(([name]) => name);
+    const renewed = [...rows].filter(([, row]) => row.size !== null && row.used < now - DAY).map(([name]) => name);
     for (let start = 0; start < renewed.length; start += BOUND - 1) {
       const chunk = renewed.slice(start, start + BOUND - 1);
       this.sql.exec(`UPDATE records SET used = ? WHERE name IN (${chunk.map(() => "?").join(", ")})`, now, ...chunk);
     }
     let answered = 0;
+    const answer = new Set<string>();
+    for (const name of names) {
+      const size = rows.get(name)?.size;
+      if (size != null && !answer.has(name) && answered + size <= RECORD_ANSWER) {
+        answered += size;
+        answer.add(name);
+      }
+    }
+    // Nothing else runs between the two reads, so each body is the one whose
+    // size was counted.
+    const bodies = new Map<string, ArrayBuffer>();
+    const fitting = [...answer];
+    for (let start = 0; start < fitting.length; start += BOUND) {
+      const chunk = fitting.slice(start, start + BOUND);
+      const found = this.sql.exec<{ name: string; body: ArrayBuffer }>(
+        `SELECT name, body FROM records WHERE name IN (${chunk.map(() => "?").join(", ")})`,
+        ...chunk,
+      );
+      for (const { name, body } of found) {
+        bodies.set(name, body);
+      }
+    }
     return names.map((name): RecordState => {
       const row = rows.get(name);
       if (!row) {
         return this.recordsListed(name) ? { state: "none" } : { state: "unknown" };
       }
-      if (row.body === null || answered + row.body.byteLength > RECORD_ANSWER) {
-        return { state: "apart", version: row.version };
-      }
-      answered += row.body.byteLength;
-      return { state: "held", body: new Uint8Array(row.body) };
+      const body = bodies.get(name);
+      return body ? { state: "held", body: new Uint8Array(body) } : { state: "apart", version: row.version };
     });
   }
 
