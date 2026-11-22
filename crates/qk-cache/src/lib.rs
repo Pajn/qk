@@ -136,10 +136,12 @@ pub struct Cache {
     /// The blobs hashed since the machine started, which restores need not
     /// hash again.
     verified: OnceLock<verified::Verified>,
-    /// The tasks whose outputs this run left exactly as they were: restored
-    /// with the outputs a worktree held kept, or run with no command after
-    /// tasks that all were.
+    /// The tasks restored with the outputs a worktree held kept exactly as
+    /// they were.
     kept: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    /// The tasks run this run that may have left their outputs as they were,
+    /// told once a dependent asks: see [`Cache::left_unchanged`].
+    passing: std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<Passing>>>,
     /// Warm state being saved in the background.
     saves: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>,
     cleanup: std::sync::Mutex<Option<store::Cleanup>>,
@@ -151,6 +153,35 @@ pub struct Cache {
     /// What restoring each task did to its outputs, by task, until it is
     /// done: see [`Cache::restoring`].
     restores: std::sync::Mutex<std::collections::HashMap<String, Restore>>,
+}
+
+/// A task that ran, succeeded and restored no warm state, which left its
+/// outputs as they were if every task it depends on did and, when it ran
+/// commands, they wrote none of its outputs.
+struct Passing {
+    dependencies: Vec<String>,
+    /// For one that ran commands, what they may have written.
+    ran: Option<Ran>,
+    /// The answer, once a dependent asked.
+    unchanged: OnceLock<bool>,
+}
+
+/// What a task's commands may have written: its declared outputs, from when
+/// it started.
+struct Ran {
+    root: PathBuf,
+    outputs: Box<paths::Outputs>,
+    started: std::time::SystemTime,
+}
+
+/// What a task's commands may have written, given its `outputs`: they are
+/// trusted to write only the outputs it declares, none for `outputs: []`,
+/// and may have written anything when it declares none.
+fn commands_wrote(outputs: Result<paths::Outputs>) -> hash::Written {
+    match outputs {
+        Ok(outputs) if outputs.is_explicit() => hash::Written::Declared(Box::new(outputs)),
+        _ => hash::Written::Anything,
+    }
 }
 
 /// What restoring a task did to its outputs.
@@ -411,6 +442,7 @@ impl Cache {
             prefetches: OnceLock::new(),
             verified: OnceLock::new(),
             kept: Default::default(),
+            passing: Default::default(),
             saves: Default::default(),
             cleanup: Default::default(),
             workspace_outputs: OnceLock::new(),
@@ -495,12 +527,7 @@ impl Cache {
             };
             return (written, None);
         }
-        // Its commands are trusted to write only their declared outputs.
-        let written = match outputs {
-            Ok(outputs) if outputs.is_explicit() => hash::Written::Declared(Box::new(outputs)),
-            _ => hash::Written::Anything,
-        };
-        (written, None)
+        (commands_wrote(outputs), None)
     }
 
     /// The blobs hashed since the machine started, read on first use.
@@ -604,6 +631,8 @@ impl Cache {
         cancelled: &AtomicBool,
         restored: &dyn Fn(TaskResult),
     ) -> Result<TaskResult> {
+        // What its commands wrote is told by times from here on.
+        let started = (std::time::SystemTime::now(), std::time::Instant::now());
         // What restoring it lists is checked against the tasks done since.
         let since = match self.snapshot.get() {
             Some(Ok(snapshot)) => snapshot.writes_seen(),
@@ -626,33 +655,91 @@ impl Cache {
         };
         let result = self.run_task(workspace, graph, task, prepared, cancelled, &early);
         if let Ok(result) = &result {
-            self.pass_on_kept(task, prepared, result);
+            self.passing(workspace, task, prepared, result, started);
         }
         write(result.as_ref().ok());
         result
     }
 
-    /// Counts a task that ran no command, as `nx:noop`'s, as having left its
-    /// outputs as they were when every task it depends on did: it wrote
-    /// nothing, so what depends on it need not stamp its own outputs again
-    /// for its sake. One that restored warm state may have written, and one
-    /// taken from the cache was counted as its restore found it.
-    fn pass_on_kept(&self, task: &Task, prepared: &PreparedTask, result: &TaskResult) {
-        if !prepared.commands.is_empty()
-            || result.outcome != Outcome::Success
+    /// Notes a task that ran, succeeded and restored no warm state as one
+    /// that may have left its outputs as they were: see
+    /// [`Self::left_unchanged`]. One that restored warm state may have
+    /// written, and one taken from the cache counts as its restore found it.
+    /// One that ran commands declaring no outputs may have written anything,
+    /// and so may one during which the clock was set: what is told from
+    /// times needs a clock that only went forward, as fast as time passed.
+    fn passing(
+        &self,
+        workspace: &Workspace,
+        task: &Task,
+        prepared: &PreparedTask,
+        result: &TaskResult,
+        started: (std::time::SystemTime, std::time::Instant),
+    ) {
+        if result.outcome != Outcome::Success
             || result.warm.is_some()
             || !matches!(result.cache, CacheStatus::Miss | CacheStatus::Uncached)
         {
             return;
         }
-        let mut kept = self.kept.lock().unwrap();
-        if task
-            .dependencies
-            .iter()
-            .all(|dependency| kept.contains(dependency))
-        {
-            kept.insert(task.id.clone());
+        let ran = if prepared.commands.is_empty() {
+            None
+        } else {
+            let steady = std::time::SystemTime::now()
+                .duration_since(started.0)
+                .is_ok_and(|passed| {
+                    passed.abs_diff(started.1.elapsed()) < std::time::Duration::from_secs(1)
+                });
+            match commands_wrote(paths::Outputs::new(workspace, task)) {
+                hash::Written::Declared(outputs) if steady => Some(Ran {
+                    root: workspace.root.clone(),
+                    outputs,
+                    started: started.0,
+                }),
+                _ => return,
+            }
+        };
+        self.passing.lock().unwrap().insert(
+            task.id.clone(),
+            std::sync::Arc::new(Passing {
+                dependencies: task.dependencies.iter().cloned().collect(),
+                ran,
+                unchanged: OnceLock::new(),
+            }),
+        );
+    }
+
+    /// Whether this run left `task`'s outputs as they were, so that what
+    /// depends on it need not stamp its own outputs again for its sake. It
+    /// did when it was restored with the outputs the worktree held, or when
+    /// it ran, succeeded and restored no warm state, every task it depends on
+    /// left theirs as they were, and either it ran no command, as `nx:noop`
+    /// targets do, or its commands, trusted to write only its declared
+    /// outputs, left every one of them, and every directory among them, with
+    /// times from before it started.
+    ///
+    /// The answer for a task that ran is worked out once, when a dependent
+    /// first asks, which is only when one is about to keep its outputs. Being
+    /// wrong this way can only cost a tool that compares times work it
+    /// could have skipped, as it then finds an input newer than an output;
+    /// whatever cannot be told counts as changed.
+    pub(crate) fn left_unchanged(&self, task: &str) -> bool {
+        if self.kept.lock().unwrap().contains(task) {
+            return true;
         }
+        let Some(passing) = self.passing.lock().unwrap().get(task).cloned() else {
+            return false;
+        };
+        *passing.unchanged.get_or_init(|| {
+            passing
+                .dependencies
+                .iter()
+                .all(|dependency| self.left_unchanged(dependency))
+                && passing.ran.as_ref().is_none_or(|ran| {
+                    let _profile = profile::span(task, "outputs_unwritten_check");
+                    !store::written_since(&ran.root, &ran.outputs, ran.started)
+                })
+        })
     }
 
     fn run_task(

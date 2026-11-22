@@ -51,6 +51,22 @@ fn process_helper() {
         fs::write("generated/value.txt", format!("generated:{input}")).unwrap();
         return;
     }
+    // Does what the file `request` beside the counter asks, writing both
+    // files when it asks nothing.
+    if mode == "regenerate" {
+        let request = fs::read_to_string(counter.with_file_name("request")).unwrap_or_default();
+        match request.as_str() {
+            "nothing" => {}
+            "rewrite" => fs::write("generated/value.txt", "generated\n").unwrap(),
+            "delete" => fs::remove_file("generated/extra.txt").unwrap(),
+            _ => {
+                fs::create_dir_all("generated").unwrap();
+                fs::write("generated/value.txt", "generated\n").unwrap();
+                fs::write("generated/extra.txt", "extra\n").unwrap();
+            }
+        }
+        return;
+    }
     if mode == "generate-graphql" {
         fs::create_dir_all("apps/a/graphql/nested").unwrap();
         fs::write("apps/a/graphql/nested/output.txt", input).unwrap();
@@ -727,6 +743,85 @@ fn a_task_running_no_command_passes_on_whether_its_dependencies_changed() {
     assert!(modified(&generated) > times.0);
     assert!(modified(&built) >= modified(&generated));
     assert_eq!(fixture.runs(), 2);
+}
+
+/// Long enough for what a task wrote to be told apart from what it writes
+/// next, on any filesystem: see `TIME_SLACK` in the cache's store.
+const SETTLE: std::time::Duration = std::time::Duration::from_millis(2100);
+
+/// A task that runs every time passes on that nothing changed when it wrote
+/// none of its declared outputs: what depends on it keeps its outputs as
+/// they are. When it rewrites one, even with the same content, or removes
+/// one, what depends on it stamps its outputs again to stay the newer.
+#[test]
+fn a_task_writing_none_of_its_outputs_passes_on_that_nothing_changed() {
+    let fixture = Fixture::with_targets(json!({
+        "gen": target(
+            "regenerate",
+            json!({"cache": false, "outputs": ["{projectRoot}/generated/*.txt"]}),
+        ),
+        "group": {"executor": "nx:noop", "dependsOn": ["gen"]},
+        "build": target("build", json!({"dependsOn": ["group"]})),
+    }));
+    let request = |what: &str| fs::write(fixture.counter.with_file_name("request"), what).unwrap();
+    success(fixture.build(&fixture.root, &[]));
+    let generated = fixture.root.join("generated/value.txt");
+    let built = fixture.root.join("dist/nested/out.txt");
+
+    request("nothing");
+    std::thread::sleep(SETTLE);
+    let times = (modified(&generated), modified(&built));
+    for _ in 0..2 {
+        let kept = success(fixture.build(&fixture.root, &[]));
+        assert!(stderr(&kept).contains("qk: cache hit app:build"));
+        assert_eq!((modified(&generated), modified(&built)), times);
+    }
+
+    request("rewrite");
+    success(fixture.build(&fixture.root, &[]));
+    assert!(modified(&generated) > times.0);
+    assert!(modified(&built) > times.1);
+    assert!(modified(&built) >= modified(&generated));
+
+    request("nothing");
+    std::thread::sleep(SETTLE);
+    let times = (modified(&generated), modified(&built));
+    success(fixture.build(&fixture.root, &[]));
+    assert_eq!((modified(&generated), modified(&built)), times);
+
+    request("delete");
+    success(fixture.build(&fixture.root, &[]));
+    assert!(!fixture.root.join("generated/extra.txt").exists());
+    assert!(modified(&built) > times.1);
+    // Built once; the generator ran in every one of the six runs.
+    assert_eq!(fixture.runs(), 7);
+}
+
+/// A task that runs a command without declared outputs may have written
+/// anything, so what depends on it stamps its outputs again each time. One
+/// declaring `outputs: []` is trusted, as ever, to write nothing other tasks
+/// read, so what depends on it keeps its outputs as they are.
+#[test]
+fn a_running_task_counts_as_changed_unless_it_declares_its_outputs() {
+    for (outputs, kept) in [(None, false), (Some(json!([])), true)] {
+        let mut generator = target("regenerate", json!({"cache": false}));
+        match outputs {
+            Some(outputs) => generator["outputs"] = outputs,
+            None => drop(generator.as_object_mut().unwrap().remove("outputs")),
+        }
+        let fixture = Fixture::with_targets(json!({
+            "gen": generator,
+            "build": target("build", json!({"dependsOn": ["gen"]})),
+        }));
+        success(fixture.build(&fixture.root, &[]));
+        fs::write(fixture.counter.with_file_name("request"), "nothing").unwrap();
+        std::thread::sleep(SETTLE);
+        let built = fixture.root.join("dist/nested/out.txt");
+        let before = modified(&built);
+        let hit = success(fixture.build(&fixture.root, &[]));
+        assert!(stderr(&hit).contains("qk: cache hit app:build"));
+        assert_eq!(modified(&built) == before, kept);
+    }
 }
 
 #[test]

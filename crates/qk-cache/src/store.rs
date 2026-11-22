@@ -671,8 +671,9 @@ impl Cache {
     /// written, so tools that compare modification times, such as `tsc -b`,
     /// see outputs newer than their inputs and dependents newer than their
     /// dependencies. Outputs a worktree already holds are kept as they are,
-    /// unless a dependency's outputs changed in this run; then they are
-    /// stamped again to stay newer.
+    /// unless a dependency's outputs may have changed in this run, as
+    /// [`Cache::left_unchanged`] tells; then they are stamped again to stay
+    /// newer.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn restore(
         &self,
@@ -695,13 +696,10 @@ impl Cache {
         if let Some(checked) = &checked
             && checked.repair.is_empty()
         {
-            let changed = {
-                let kept = self.kept.lock().unwrap();
-                checked.revalidated
-                    || dependencies
-                        .iter()
-                        .any(|dependency| !kept.contains(dependency))
-            };
+            let changed = checked.revalidated
+                || dependencies
+                    .iter()
+                    .any(|dependency| !self.left_unchanged(dependency));
             // Stamping is checked against the stamps just taken, and records
             // the outputs from them, rather than walking the outputs again.
             if !changed || stamp_outputs(root, task, key, checked.stamps.clone(), started).is_ok() {
@@ -1233,6 +1231,128 @@ fn output_stamps(root: &Path, outputs: &Outputs) -> Result<BTreeMap<String, Vec<
     Ok(stamps)
 }
 
+/// How long before a time a file's own times may fall although it was written
+/// after it: filesystems that keep coarse times round them down, by up to two
+/// seconds on FAT, and some kernels take them from a clock that lags the one
+/// a process reads. As [`crate::hash`] treats files written in the last two
+/// seconds as unsettled, so this treats a time that close as later.
+const TIME_SLACK: Duration = Duration::from_secs(2);
+
+/// Whether anything `outputs` may match can have been written, replaced,
+/// created or removed at or after `since`, told from the times the
+/// filesystem keeps rather than from a listing taken before: a path written
+/// takes a newer modification time and, on Unix, change time, and one
+/// created, removed or renamed gives its directory a newer one. So this reads
+/// the times of every path the outputs match, of every directory they reach,
+/// which holds whatever was removed from among them, and, for a fixed prefix
+/// that is not there, of the closest directory above it that is, which
+/// changed if the prefix was removed. Negated outputs are not read, so
+/// what they exclude counts too. Whatever cannot be read counts as written,
+/// and so does a time within [`TIME_SLACK`] before `since`.
+pub(crate) fn written_since(root: &Path, outputs: &Outputs, since: SystemTime) -> bool {
+    let Some(threshold) = since
+        .checked_sub(TIME_SLACK)
+        .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+    else {
+        return true;
+    };
+    let threshold = threshold.as_nanos() as i128;
+    let recent = |metadata: &fs::Metadata| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let time = |seconds: i64, nanoseconds: i64| {
+                i128::from(seconds) * 1_000_000_000 + i128::from(nanoseconds)
+            };
+            time(metadata.mtime(), metadata.mtime_nsec()) >= threshold
+                || time(metadata.ctime(), metadata.ctime_nsec()) >= threshold
+        }
+        #[cfg(not(unix))]
+        metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .is_none_or(|time| time.as_nanos() as i128 >= threshold)
+    };
+    let written = || -> Result<bool> {
+        // Every path a pattern matches, whatever a negated one leaves out.
+        let reached = Outputs::from_paths(outputs.globs())?;
+        let anchors: Vec<&str> = reached.anchors().collect();
+        // What lies below each fixed prefix, taken a path beneath it at a
+        // time, so that several threads walk it. One prefix below another is
+        // walked with it.
+        let mut below = Vec::new();
+        for &anchor in &anchors {
+            if anchors.iter().any(|other| {
+                anchor
+                    .strip_prefix(other)
+                    .is_some_and(|rest| rest.starts_with('/'))
+            }) {
+                continue;
+            }
+            paths::safe_parents(root, anchor)?;
+            let start = root.join(anchor);
+            match fs::symlink_metadata(&start) {
+                // Outputs are listed through a link there, which this does
+                // not follow.
+                Ok(metadata) if metadata.file_type().is_symlink() => return Ok(true),
+                Ok(metadata) if recent(&metadata) => return Ok(true),
+                Ok(metadata) if metadata.is_dir() => {
+                    for entry in fs::read_dir(&start)? {
+                        below.push(entry?.path());
+                    }
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // It may have been removed: then the closest directory
+                    // above it that is left changed. One that is there now
+                    // was there all along or has new times of its own.
+                    let mut above = Path::new(anchor).parent();
+                    loop {
+                        let directory = root.join(above.unwrap_or(Path::new("")));
+                        match fs::symlink_metadata(&directory) {
+                            Ok(metadata) if recent(&metadata) => return Ok(true),
+                            Ok(_) => break,
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                let Some(parent) = above else { return Ok(true) };
+                                above = parent.parent();
+                            }
+                            Err(_) => return Ok(true),
+                        }
+                    }
+                    continue;
+                }
+                Err(_) => return Ok(true),
+            }
+        }
+        let walked = crate::hash::in_parallel(&below, 1, |start| -> Result<bool> {
+            // Links are read as themselves, as outputs are listed below a
+            // fixed prefix.
+            let walk = walkdir::WalkDir::new(start)
+                .follow_links(false)
+                .follow_root_links(false)
+                .into_iter()
+                .filter_entry(|entry| {
+                    !entry.file_type().is_dir()
+                        || paths::relative(root, entry.path())
+                            .map_or(true, |directory| reached.reaches(&directory))
+                });
+            for entry in walk {
+                let entry = entry?;
+                let path = paths::relative(root, entry.path())?;
+                if (entry.file_type().is_dir() || reached.matches(&path))
+                    && recent(&entry.metadata()?)
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })?;
+        Ok(walked.into_iter().any(|written| written))
+    };
+    written().unwrap_or(true)
+}
+
 /// One output's stamp, from its metadata read without following a link:
 /// its kind first, 0 for a file, 1 for a directory and 2 for a link.
 fn output_stamp(metadata: &fs::Metadata) -> Vec<i64> {
@@ -1559,6 +1679,73 @@ mod tests {
         let third = "c".repeat(64);
         publish_later(&cache, root, &third, &outputs, &log);
         assert_eq!(published_blob(&cache, &third, "out/nested/kept"), kept);
+    }
+
+    /// What a task wrote among its outputs is told by times: a file it
+    /// rewrote, one it removed, a fixed prefix it removed, a file it added
+    /// beside them and one a negated output leaves out all count; what lies
+    /// outside the outputs, and outputs untouched, do not. What cannot be
+    /// told, as times too close to the start or a linked fixed prefix,
+    /// counts as written.
+    #[test]
+    fn outputs_count_as_written_by_their_times_and_their_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let cases = [
+            "untouched",
+            "rewritten",
+            "removed",
+            "gone",
+            "added",
+            "excluded",
+            "outside",
+        ];
+        for case in cases {
+            fs::create_dir_all(root.join(case).join("out/nested")).unwrap();
+            fs::create_dir_all(root.join(case).join("other")).unwrap();
+            for path in ["out/nested/a.txt", "out/nested/b.txt", "out/skip.txt"] {
+                fs::write(root.join(case).join(path), "value").unwrap();
+            }
+        }
+        let outputs = |case: &str| {
+            Outputs::from_paths(&[
+                format!("{case}/out/**/*.txt"),
+                format!("!{case}/out/skip.txt"),
+            ])
+            .unwrap()
+        };
+        // Times within the slack before the task started count as written.
+        let early = SystemTime::now();
+        assert!(written_since(root, &outputs("untouched"), early));
+
+        std::thread::sleep(TIME_SLACK + Duration::from_millis(100));
+        let since = SystemTime::now();
+        fs::write(root.join("rewritten/out/nested/a.txt"), "value").unwrap();
+        fs::remove_file(root.join("removed/out/nested/b.txt")).unwrap();
+        fs::remove_dir_all(root.join("gone/out")).unwrap();
+        fs::write(root.join("added/out/nested/c.md"), "value").unwrap();
+        fs::write(root.join("excluded/out/skip.txt"), "value").unwrap();
+        fs::write(root.join("outside/other/a.txt"), "value").unwrap();
+        let written: Vec<_> = cases
+            .iter()
+            .filter(|case| written_since(root, &outputs(case), since))
+            .collect();
+        assert_eq!(
+            written,
+            ["rewritten", "removed", "gone", "added", "excluded"]
+                .iter()
+                .collect::<Vec<_>>()
+        );
+        // Outputs that were never there were not written.
+        let absent = Outputs::from_paths(&["missing/out/**".to_owned()]).unwrap();
+        assert!(!written_since(root, &absent, since));
+        // Outputs listed through a link at their fixed prefix cannot be told.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("untouched/out", root.join("linked")).unwrap();
+            let linked = Outputs::from_paths(&["linked/**".to_owned()]).unwrap();
+            assert!(written_since(root, &linked, since));
+        }
     }
 
     /// An entry is usable where restoring it would not fail before it
