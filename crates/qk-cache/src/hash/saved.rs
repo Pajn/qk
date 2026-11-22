@@ -167,7 +167,7 @@ pub(super) fn restore(
     root: &Path,
     identity: &Identity,
     template: Membership,
-    source_ignore: SourceIgnore,
+    (source_ignore, read): (SourceIgnore, RootRules),
 ) -> Option<Membership> {
     // Taken before any stamp is looked at again, so a policy is only taken
     // as settled when it was by then.
@@ -191,7 +191,12 @@ pub(super) fn restore(
             // `settled` is that of the run that saved it, which is only
             // saved settled; the state says whether every policy has
             // settled since.
-            matches!(membership.state(None, looked), Ok((true, true))).then_some(membership)
+            // The rules read must also be the ones the listing was taken
+            // with: a root ignore file there only while they were read shows
+            // in no stamp, and its directory's names are as they were.
+            (matches!(membership.state(None, looked), Ok((true, true)))
+                && membership.vouches(&read))
+            .then_some(membership)
         })();
         (
             policies.join().expect("git policy thread panicked"),

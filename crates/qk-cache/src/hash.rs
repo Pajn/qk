@@ -144,6 +144,15 @@ struct Membership {
     git_policies: BTreeSet<PathBuf>,
     ignore_contents: BTreeMap<PathBuf, String>,
     settled: bool,
+    /// Whether this inventory's listing is known to be of exactly what it
+    /// stamped, which saving it for later runs needs beyond `settled`:
+    /// nothing it stamps moved, or was too recent to tell, between its
+    /// stamps and the end of its listing, and the root's ignore rules its
+    /// matcher was built from are those it captured. A file removed and put
+    /// back while the listing was taken leaves the names as captured and the
+    /// listing without it; a run keeps such a listing for itself, as it
+    /// would take the same one again, but does not hand it on.
+    exact: bool,
     /// When the refresh that produced this inventory began listing.
     listed: Option<Instant>,
     /// When this inventory began taking its stamps, before any of them: what
@@ -412,6 +421,7 @@ impl Membership {
             git_policies: BTreeSet::new(),
             ignore_contents: BTreeMap::new(),
             settled: false,
+            exact: false,
             listed: None,
             stamped: SystemTime::now(),
             scope: scope.cloned(),
@@ -616,6 +626,19 @@ impl Membership {
     /// listing policies must have settled by `looked`, a time taken before
     /// they are stamped again, for the result to say they have.
     fn state(&self, prefixes: Option<&[PathBuf]>, looked: SystemTime) -> Result<(bool, bool)> {
+        self.state_noting(prefixes, looked, &AtomicBool::new(false))
+    }
+
+    /// [`Self::state`], setting `reread` when a directory's names or an
+    /// ignore file's rules had to be read again to tell: its stamp moved, or
+    /// was too recent to trust. What was read then is what was captured, but
+    /// something happened there in between.
+    fn state_noting(
+        &self,
+        prefixes: Option<&[PathBuf]>,
+        looked: SystemTime,
+        reread: &AtomicBool,
+    ) -> Result<(bool, bool)> {
         let mut settled = true;
         let selected = prefixes.map(|prefixes| {
             let mut selected = BTreeSet::new();
@@ -685,8 +708,11 @@ impl Membership {
             if changed.load(Ordering::Relaxed) {
                 return Ok(Ok(Some(true)));
             }
-            let verdict = self.check(path, before, *directory, looked);
-            if !matches!(verdict, Ok(Some(_))) {
+            let verdict = self.check(path, before, *directory, looked, reread);
+            // Only a change answers for the paths not looked at yet: after a
+            // failure they are still looked at, and one that changed lists
+            // again rather than failing the run.
+            if matches!(verdict, Ok(None)) {
                 changed.store(true, Ordering::Relaxed);
             }
             Ok(verdict)
@@ -716,6 +742,7 @@ impl Membership {
         before: &Option<Stamp>,
         directory: Option<Option<&BTreeSet<(OsString, u8)>>>,
         looked: SystemTime,
+        reread: &AtomicBool,
     ) -> Result<Option<bool>> {
         let (after, window) = match membership_look(path)? {
             Some((stamp, window)) => (Some(stamp), window),
@@ -735,6 +762,7 @@ impl Membership {
             // Recent directories are always read, even with an equal stamp:
             // coarse timestamps can conceal an addition or removal.
             if *before != after || recent(self.stamped) {
+                reread.store(true, Ordering::Relaxed);
                 let entries = self.entries(path)?;
                 if entries.as_ref() != captured || membership_stamp(path)? != after {
                     return Ok(None);
@@ -745,6 +773,7 @@ impl Membership {
         if (*before != after || recent(self.stamped))
             && let Some(content) = self.ignore_contents.get(path)
         {
+            reread.store(true, Ordering::Relaxed);
             if ignore_content(path, &after)?.as_ref() != Some(content) {
                 return Ok(None);
             }
@@ -782,7 +811,7 @@ impl Membership {
             },
         };
         exclude_artifacts(&mut files, &self.outputs, self.cache.as_deref());
-        let ignore = SourceIgnore::new(&self.root)?;
+        let (ignore, read) = SourceIgnore::read(&self.root)?;
         files.extend(
             extra
                 .iter()
@@ -796,8 +825,21 @@ impl Membership {
         self.files = Arc::new(files);
         // An unstable inventory or recent policy never enables the fast path.
         // Keep candidates so a rebuild also watches tracked, ignored parents.
-        self.settled = rebuilt && self.covers(&self.files) && self.state(None, self.stamped)?.1;
+        let reread = AtomicBool::new(false);
+        self.settled = rebuilt
+            && self.covers(&self.files)
+            && self.state_noting(None, self.stamped, &reread)?.1;
+        self.exact = self.settled && !reread.load(Ordering::Relaxed) && self.vouches(&read);
         Ok(())
+    }
+
+    /// Whether the root's ignore files as a matcher `read` them are as this
+    /// inventory captured them: each with the content it holds a digest of,
+    /// or absent where it holds none. A file that was there only while the
+    /// matcher was built shows here and in no stamp.
+    fn vouches(&self, read: &[(PathBuf, Option<String>)]) -> bool {
+        read.iter()
+            .all(|(path, content)| self.ignore_contents.get(path) == content.as_ref())
     }
 
     /// Whether every directory above each of `files` has a stamp. Files share
@@ -1333,7 +1375,7 @@ impl Snapshot {
                 cache.as_deref(),
                 &extra,
             );
-            if let Ok(source_ignore) = SourceIgnore::new(&root) {
+            if let Ok(source_ignore) = SourceIgnore::read(&root) {
                 let _loading = crate::profile::span("snapshot", "inventory_restore");
                 let template = Membership::empty(
                     &root,
@@ -1371,8 +1413,9 @@ impl Snapshot {
             )?;
             membership.list(&extra, true)?;
             membership.listed = Some(listed);
-            // Only a settled inventory is saved: see `saved`.
-            if save && membership.settled {
+            // Only a settled inventory whose listing is exactly of what it
+            // stamped is saved: see `saved`.
+            if save && membership.settled && membership.exact {
                 membership.save_as = Some(identity);
             }
             Ok(membership)
@@ -2280,19 +2323,56 @@ fn under<'a>(files: &'a BTreeSet<String>, prefix: &'a str) -> impl Iterator<Item
 /// Compiled root ignore rules used by input discovery and project watching.
 pub struct SourceIgnore(ignore::gitignore::Gitignore);
 
+/// The root's ignore files as [`SourceIgnore::read`] read them: each with a
+/// digest of its content, or `None` for one that is not there.
+type RootRules = Vec<(PathBuf, Option<String>)>;
+
 impl SourceIgnore {
     /// Root ignore rules shared by caching and watch, including tracked files.
     pub fn new(root: &Path) -> Result<Self> {
+        Ok(Self::read(root)?.0)
+    }
+
+    /// [`Self::new`], with a digest of each of the root's ignore files as
+    /// it was read, `None` for one that is not there. Each file is read
+    /// once, and the rules are built from what was read, so the digest is
+    /// of the rules: an inventory compares it with the content it captured.
+    fn read(root: &Path) -> Result<(Self, RootRules)> {
         let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
+        let mut read = Vec::new();
         for name in [".gitignore", ".nxignore"] {
             let path = root.join(name);
-            if path.is_file()
-                && let Some(error) = builder.add(path)
-            {
-                return Err(error.into());
+            let content = match std::fs::read(&path) {
+                Ok(content) => content,
+                // Not there, or not a file, as a directory of that name.
+                Err(_) if !path.is_file() => {
+                    read.push((path, None));
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| format!("cannot read {}", path.display()));
+                }
+            };
+            let text = std::str::from_utf8(&content)
+                .with_context(|| format!("{} is not UTF-8", path.display()))?;
+            for (index, line) in text.lines().enumerate() {
+                // As Git does, a byte order mark before the first rule is
+                // not part of it.
+                let line = if index == 0 {
+                    line.trim_start_matches('\u{feff}')
+                } else {
+                    line
+                };
+                builder
+                    .add_line(Some(path.clone()), line)
+                    .map_err(|error| {
+                        anyhow::anyhow!("{}: line {}: {error}", path.display(), index + 1)
+                    })?;
             }
+            let digest = blake3::hash(&content).to_hex().to_string();
+            read.push((path, Some(digest)));
         }
-        Ok(Self(builder.build()?))
+        Ok((Self(builder.build()?), read))
     }
 
     fn matches_directory(&self, path: &str) -> bool {
@@ -6946,12 +7026,17 @@ mod tests {
                 assert!(!restored, "{label}");
                 assert_ne!(after, before, "{label}");
                 before = after;
+                // A run this soon after the change saves nothing: what
+                // changed is too recent to tell what a listing saw of it.
+                // Once it has settled, a run lists again and saves, and
+                // that serves the run after.
                 if index {
                     std::thread::sleep(Duration::from_millis(2100));
-                    run(change);
+                } else {
+                    settle(&path("packages/app"));
                 }
-                // What it saved, with any directory it stamped recently,
-                // serves the next run.
+                let (_, key, label) = run(change);
+                assert_eq!(key, before, "{label}");
                 let (restored, key, label) = run(change);
                 assert!(restored, "{label}");
                 assert_eq!(key, before, "{label}");
@@ -6986,30 +7071,110 @@ mod tests {
         .unwrap();
     }
 
+    /// An inventory is handed on to later runs only when its listing is
+    /// exactly of what it stamped: not when a directory was changed too
+    /// recently to tell, nor when one changed while it was listed, though
+    /// its names are as captured, nor when the root's ignore rules as read
+    /// are not those it captured.
     #[test]
-    fn a_change_a_recent_stamp_hides_from_the_saving_run_is_seen_by_the_next() {
+    fn an_inventory_is_exact_only_when_nothing_moved_while_it_was_listed() {
         let (_root, workspace, graph) = saved_listing_fixture(true);
         std::thread::sleep(Duration::from_millis(2100));
-        let directory = workspace.root.join("packages/app");
-        // Changed just before a run saves its inventory: the stamp it
-        // takes of the directory is recent.
-        std::fs::write(directory.join("first.txt"), "a").unwrap();
-        let (restored, before) = saved_listing_run(&workspace, &graph, "saving");
-        assert!(!restored);
-        let (restored, _) = saved_listing_run(&workspace, &graph, "recent but unchanged");
-        assert!(restored);
-        // Changed again right after, on a filesystem whose times are coarse
-        // enough that the directory keeps the stamp the run saved.
-        std::fs::write(directory.join("second.txt"), "b").unwrap();
-        let snapshot = snapshot(&workspace, &graph, true);
-        resave(&workspace.root, &snapshot, |membership| {
-            let stamp = membership_stamp(&directory).unwrap();
-            assert!(membership.stamps.insert(directory.clone(), stamp).is_some());
+        let root = &workspace.root;
+        let snapshot = snapshot(&workspace, &graph, false);
+        let take = |between: &dyn Fn(&mut Membership)| {
+            let mut membership = Membership::new(
+                root,
+                &BTreeSet::new(),
+                &snapshot.built_ignore,
+                &snapshot.source_exclusions,
+                snapshot.cache_relative.as_deref(),
+                None,
+                snapshot.scope.as_ref(),
+            )
+            .unwrap();
+            between(&mut membership);
+            membership.list(&snapshot.extra_candidates, true).unwrap();
+            membership
+        };
+        let untouched = take(&|_| {});
+        assert!(untouched.settled && untouched.exact);
+
+        // Stamped as if everything had changed just before.
+        let recent = take(&|membership| {
+            membership.stamped = SystemTime::UNIX_EPOCH;
         });
-        drop(snapshot);
-        let (restored, after) = saved_listing_run(&workspace, &graph, "hidden change");
-        assert!(!restored);
-        assert_ne!(after, before);
+        assert!(!recent.exact);
+
+        // A file removed and put back between the stamps and the listing:
+        // the names are as captured, and the directory's stamp is not.
+        let file = root.join("packages/app/a.txt");
+        let moved = take(&|_| {
+            std::fs::remove_file(&file).unwrap();
+            std::fs::write(&file, "packages/app/a.txt").unwrap();
+        });
+        assert!(moved.settled && !moved.exact);
+        assert!(moved.files.contains("packages/app/a.txt"));
+
+        // The rules a matcher read, against those captured.
+        let (_, read) = SourceIgnore::read(root).unwrap();
+        assert!(untouched.vouches(&read));
+        let ignore = root.join(".gitignore");
+        let other = Some(blake3::hash(b"other rules").to_hex().to_string());
+        assert!(!untouched.vouches(&[(ignore.clone(), other)]));
+        assert!(!untouched.vouches(&[(ignore, None)]));
+        assert!(untouched.vouches(&[(root.join(".nxignore"), None)]));
+        assert!(!untouched.vouches(&[(root.join(".nxignore"), Some(String::new()))]));
+    }
+
+    /// A workspace with both of the root's ignore files has its listing
+    /// saved and taken: the rules of each are among those captured.
+    #[test]
+    fn a_saved_listing_is_taken_with_both_root_ignore_files() {
+        for narrowed in [true, false] {
+            let (root, workspace, graph) = saved_listing_fixture(narrowed);
+            std::fs::write(root.path().join(".nxignore"), "packages/other\n").unwrap();
+            std::thread::sleep(Duration::from_millis(2100));
+            let (restored, before) = saved_listing_run(&workspace, &graph, "saving");
+            assert!(!restored, "narrowed {narrowed}");
+            let (restored, after) = saved_listing_run(&workspace, &graph, "unchanged");
+            assert!(restored, "narrowed {narrowed}");
+            assert_eq!(before, after);
+        }
+    }
+
+    /// A saved listing is not taken with ignore rules other than those it
+    /// was taken with, though every stamp holds: a root ignore file there
+    /// only while the rules were read shows in no stamp.
+    #[test]
+    fn a_saved_listing_is_not_taken_with_other_rules_than_it_was_listed_with() {
+        let (_root, workspace, graph) = saved_listing_fixture(true);
+        std::thread::sleep(Duration::from_millis(2100));
+        saved_listing_run(&workspace, &graph, "saving");
+        let root = &workspace.root;
+        let snapshot = snapshot(&workspace, &graph, true);
+        let restore = |change: &dyn Fn(&mut RootRules)| {
+            let identity = saved::Identity::new(
+                root,
+                snapshot.scope.as_deref(),
+                &snapshot.source_exclusions,
+                snapshot.cache_relative.as_deref(),
+                &snapshot.extra_candidates,
+            );
+            let template = Membership::empty(
+                root,
+                &snapshot.built_ignore,
+                &snapshot.source_exclusions,
+                snapshot.cache_relative.as_deref(),
+                snapshot.scope.as_ref(),
+            );
+            let (ignore, mut read) = SourceIgnore::read(root).unwrap();
+            change(&mut read);
+            saved::restore(root, &identity, template, (ignore, read)).is_some()
+        };
+        assert!(restore(&|_| {}));
+        assert!(!restore(&|read| read[0].1 = None));
+        assert!(!restore(&|read| read[1].1 = Some(String::new())));
     }
 
     #[test]
