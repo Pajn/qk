@@ -2044,6 +2044,12 @@ fn execute_narrowed(
         qk_executor::report::write_all(true, title.start(ui::Paint::log()).as_bytes());
     }
     let started = std::time::SystemTime::now();
+    // The history records the commit the run began at: Git names it while
+    // the tasks run, rather than after them.
+    let revision = {
+        let root = workspace.root.clone();
+        std::thread::spawn(move || history::revision(&root))
+    };
     let result = qk_runner::run(
         workspace,
         &graph,
@@ -2078,6 +2084,7 @@ fn execute_narrowed(
         &graph,
         &result,
         started,
+        revision.join().unwrap_or(None),
         options.report.as_deref(),
     );
     if !skip_cache && result.exit_code != 130 {
