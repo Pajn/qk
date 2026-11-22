@@ -5616,8 +5616,11 @@ mod tests {
             std::fs::write(&path, "x").unwrap();
         }
         // Digests are only saved for files old enough to have settled, by
-        // their change times too, which nothing sets back.
-        settle(&root.path().join("generated/names.ts"));
+        // their change times too, which nothing sets back. Each file has a
+        // window of its own.
+        for path in ["src/a.ts", "generated/names.ts"] {
+            settle(&root.path().join(path));
+        }
         assert!(
             paths::git(root.path(), &["init", "--quiet"])
                 .unwrap()
