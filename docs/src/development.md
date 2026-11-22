@@ -163,7 +163,7 @@ version tag. See [npm's trusted publishing documentation](https://docs.npmjs.com
 
 ### crates.io releases
 
-The release workflow publishes all ten workspace crates to crates.io through
+The release workflow publishes every workspace crate to crates.io through
 OIDC, with `qk-cli` published after its internal dependencies. Install the CLI
 with `cargo install qk-cli --locked`. Internal crate dependencies use exact
 workspace versions so a release consistently uses the matching source.
@@ -194,11 +194,15 @@ Trusted Publishing on crates.io. See [crates.io's setup guide](https://crates.io
 
 crates.io requires an initial local publication before trust can be configured.
 `qk-cli` already has a metadata-only `0.0.0` reservation, whose isolated source
-is retained in `tools/crates-io/qk-cli`. The nine dependency crates also need an
-initial publication and trust configuration before the first workflow release.
+is retained in `tools/crates-io/qk-cli`. Every other crate needs an initial
+publication and trust configuration before the first workflow release that
+includes it, and so does a crate added to the workspace later: until then the
+release cannot publish it, nor what depends on it.
 Generate their metadata-only `0.0.0` reservations with
 `python3 tools/crates-io/bootstrap.py --out /tmp/qk-cargo-bootstrap`, then publish
 each generated manifest locally with `cargo publish --manifest-path <manifest>`.
+For a crate added later, publish its generated manifest alone: the names of the
+others are held by their releases.
 These placeholders have no public API; functional releases use the workspace
 source and version.
 Subsequent releases need no long-lived Cargo token in GitHub secrets. The
