@@ -277,9 +277,11 @@ counts as a use. Outputs shared between entries are stored once and deleted only
 with the last entry citing them. Stored outputs no entry cites, scratch files
 and locks of evicted entries are removed once they are an hour old, since a
 concurrent run may still be writing them; outputs a remote fetch in progress
-relies on are kept whatever their age. A run under the limit only sums the
-cache's size; the full pass runs at most hourly unless the cache is over its
-limit.
+relies on are kept whatever their age. Between full passes a run does not
+measure the cache: it takes the size the last full pass counted and adds
+what runs have stored since. The full pass, which counts exactly, runs at
+least hourly, and sooner once that size is over the limit. Files changed in
+the cache by anything but qk are seen at the next full pass.
 
 `NX_CACHE_DIRECTORY`, else nx.json `cacheDirectory`, moves the cache, as in
 Nx: a path relative to the workspace root, with qk's entries in `qk/v1`

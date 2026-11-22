@@ -338,6 +338,7 @@ fn read_inline(
         let mut file = tempfile::NamedTempFile::new_in(root.join("tmp"))?;
         file.as_file_mut().write_all(bytes)?;
         file.persist(root.join("blobs").join(blob))?;
+        crate::evict::noted(root, bytes.len() as u64);
         Ok(())
     };
     let (sender, receiver) = std::sync::mpsc::sync_channel::<(&str, Vec<u8>)>(BLOB_WRITERS * 2);
@@ -413,6 +414,7 @@ fn read_inline(
                     bail!("remote blob {blob} does not match its hash");
                 }
                 file.persist(&target)?;
+                crate::evict::noted(root, length);
             }
             Ok(())
         })();
@@ -506,6 +508,7 @@ pub(super) fn read_blob(root: &Path, hash: &str, body: impl Read) -> Result<u64>
         bail!("remote blob {hash} does not match its hash");
     }
     file.persist(root.join("blobs").join(hash))?;
+    crate::evict::noted(root, expanded);
     Ok(received)
 }
 

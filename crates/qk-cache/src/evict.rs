@@ -208,10 +208,12 @@ pub fn prune(root: &Path, limit: u64) -> Result<Pruned> {
     prune_inner(root, limit, false)
 }
 
-/// Enforces the limit after a run, reusing size accounting while the cache's
-/// directories are unchanged. Normal publication replaces records atomically
-/// and blobs are immutable, so directory changes invalidate the memo. A full
-/// reconciliation still runs at least once an hour.
+/// Enforces the limit after a run. Within an hour of the last full prune, and
+/// while the cache's [ledger](Ledger) puts it within the limit, it reads that
+/// size rather than measuring: publishing reports what it adds, so a run that
+/// saved something does not stat the whole cache to learn so. Otherwise, as
+/// when the ledger's size is over the limit, it prunes in full, which counts
+/// the cache exactly.
 pub fn prune_automatic(root: &Path, limit: u64) -> Result<Pruned> {
     prune_inner(root, limit, true)
 }
@@ -227,9 +229,13 @@ fn prune_inner(root: &Path, limit: u64, automatic: bool) -> Result<Pruned> {
         .and_then(|metadata| metadata.modified().ok())
         .and_then(|modified| SystemTime::now().duration_since(modified).ok())
         .is_some_and(|age| age < IN_FLIGHT);
+    // What this process wrote and has not reported yet counts too.
+    grew(root, 0);
     if automatic && recent {
-        let size = cached_size(root)?;
-        if size <= limit {
+        let now = SystemTime::now();
+        if let Some(size) = with_ledger(root, |ledger| ledger.size(now))?
+            && size <= limit
+        {
             return Ok(Pruned {
                 size,
                 ..Pruned::default()
@@ -244,10 +250,11 @@ fn prune_inner(root: &Path, limit: u64, automatic: bool) -> Result<Pruned> {
     if guard.try_lock_exclusive().is_err() {
         return Ok(Pruned::default());
     }
-    // Never associate a computed post-eviction size with stamps taken only
-    // after eviction: a concurrent publisher could have added uncounted bytes.
-    let _ = fs::remove_file(root.join("locks").join(".size"));
     let _ = guard.set_modified(SystemTime::now());
+    // Where the ledger stood before any file is looked at: a publisher that
+    // reports after this point may be counted twice, which is safe, and one
+    // that reported before it had its files in place, so the count sees them.
+    let counting_from = with_ledger(root, |ledger| ledger.added)?;
     // Held until deletion ends, so no pin is made while blobs are deleted.
     let gate = pin_gate(root)?;
     gate.lock_exclusive()?;
@@ -371,124 +378,119 @@ fn prune_inner(root: &Path, limit: u64, automatic: bool) -> Result<Pruned> {
             let _ = fs::remove_file(item.path());
         }
     }
-    pruned.size = if automatic { cached_size(root)? } else { size };
+    // Eviction's deletions are in `size`; what was published meanwhile is in
+    // the ledger after `counting_from`.
+    let _ = with_ledger(root, |ledger| {
+        ledger.counted = Some(Counted {
+            at: now,
+            size,
+            added: counting_from,
+        });
+    });
+    pruned.size = size;
     Ok(pruned)
 }
 
-// Recent timestamps may have coarse resolution on the backing filesystem.
-const STAMP_SETTLE: Duration = Duration::from_secs(2);
+/// Where the size ledger lives: under `locks/`, whose dot-named items are
+/// not lock files.
+fn ledger_path(root: &Path) -> PathBuf {
+    root.join("locks").join(".ledger")
+}
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct DirectoryStamp {
-    modified: SystemTime,
-    len: u64,
-    #[cfg(unix)]
-    identity: (u64, u64, i64, i64),
+/// What the cache's size is known to be without measuring it: the last full
+/// count, plus every byte reported added since it began.
+///
+/// `added` only grows. A count notes where `added` stood before it looked at
+/// any file, so a file published while it ran is either counted or reported
+/// after that point, or both, and never neither: the size the ledger gives
+/// can be too large, never too small, for writes that report. Too large only
+/// brings the next full count forward. Deletions are not reported, nor are
+/// changes made outside qk; the full count, at least hourly, corrects both.
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct Ledger {
+    added: u64,
+    counted: Option<Counted>,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct SizeMemo {
-    measured: SystemTime,
-    stamps: Vec<Option<DirectoryStamp>>,
+struct Counted {
+    /// When the count began.
+    at: SystemTime,
     size: u64,
+    /// `added` when the count began.
+    added: u64,
 }
 
-fn directory_stamps(root: &Path) -> Result<Vec<Option<DirectoryStamp>>> {
-    ["entries", "blobs", "warm", "pathsets", "projections"]
-        .iter()
-        .map(|name| {
-            let metadata = match fs::metadata(root.join(name)) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(error) => return Err(error.into()),
-            };
-            #[cfg(unix)]
-            use std::os::unix::fs::MetadataExt;
-            Ok(Some(DirectoryStamp {
-                modified: metadata.modified()?,
-                len: metadata.len(),
-                #[cfg(unix)]
-                identity: (
-                    metadata.dev(),
-                    metadata.ino(),
-                    metadata.ctime(),
-                    metadata.ctime_nsec(),
-                ),
-            }))
-        })
-        .collect()
+impl Ledger {
+    /// The cache's size, unless the last count is missing or over an hour old,
+    /// or `added` went back, as it does when the ledger was lost and remade.
+    fn size(&self, now: SystemTime) -> Option<u64> {
+        let counted = self.counted.as_ref()?;
+        let fresh = now
+            .duration_since(counted.at)
+            .is_ok_and(|age| age < IN_FLIGHT);
+        let since = self.added.checked_sub(counted.added)?;
+        fresh.then(|| counted.size.saturating_add(since))
+    }
 }
 
-fn settled(stamps: &[Option<DirectoryStamp>], now: SystemTime) -> bool {
-    stamps.iter().flatten().all(|stamp| {
-        let old_enough = |time| {
-            now.duration_since(time)
-                .is_ok_and(|age| age >= STAMP_SETTLE)
-        };
-        if !old_enough(stamp.modified) {
-            return false;
+/// Runs `change` on the ledger with it locked, and writes back what it leaves.
+/// An unreadable ledger reads as empty, which has no count and so sends the
+/// next automatic prune to a full one.
+fn with_ledger<T>(root: &Path, change: impl FnOnce(&mut Ledger) -> T) -> Result<T> {
+    use std::io::{Read, Seek};
+    let mut file = File::options()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(ledger_path(root))?;
+    // Read and written through the locked handle, which Windows also allows.
+    file.lock_exclusive()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let mut ledger: Ledger = serde_json::from_slice(&bytes).unwrap_or_default();
+    let result = change(&mut ledger);
+    let after = serde_json::to_vec(&ledger)?;
+    if after != bytes {
+        file.rewind()?;
+        file.set_len(0)?;
+        file.write_all(&after)?;
+    }
+    Ok(result)
+}
+
+/// Bytes this process put in caches and has not yet entered in their ledger,
+/// by cache root. Blobs are noted here as they are written, often many at
+/// once on several threads, and entered with the manifest that cites them,
+/// so a save locks the ledger once rather than once a blob.
+static UNREPORTED: std::sync::Mutex<BTreeMap<PathBuf, u64>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// Notes that `bytes` were just put in the cache at `root`, in a blob already
+/// in place. They reach the ledger with the next [`grew`] or prune.
+pub(crate) fn noted(root: &Path, bytes: u64) {
+    let mut unreported = UNREPORTED.lock().unwrap_or_else(|error| error.into_inner());
+    *unreported.entry(root.to_owned()).or_default() += bytes;
+}
+
+/// Enters `bytes`, just put in the cache at `root` and already in place, in
+/// its ledger, with everything [`noted`] holds, for whichever cache it was
+/// noted. Call it after the files are in place, never before, so a count that
+/// began earlier sees them or this. A failure loses only accuracy, which the
+/// next full count restores.
+pub(crate) fn grew(root: &Path, bytes: u64) {
+    // Held while the ledgers are written, so a prune on another thread never
+    // finds bytes taken from here and not yet in a ledger.
+    let mut unreported = UNREPORTED.lock().unwrap_or_else(|error| error.into_inner());
+    *unreported.entry(root.to_owned()).or_default() += bytes;
+    for (root, bytes) in std::mem::take(&mut *unreported) {
+        if bytes > 0 {
+            let _ = with_ledger(&root, |ledger| {
+                ledger.added = ledger.added.saturating_add(bytes)
+            });
         }
-        #[cfg(unix)]
-        {
-            let (_, _, seconds, nanos) = stamp.identity;
-            if seconds < 0 || !(0..1_000_000_000).contains(&nanos) {
-                return false;
-            }
-            let changed = SystemTime::UNIX_EPOCH + Duration::new(seconds as u64, nanos as u32);
-            if !old_enough(changed) {
-                return false;
-            }
-        }
-        true
-    })
-}
-
-fn cached_size(root: &Path) -> Result<u64> {
-    let memo_path = root.join("locks").join(".size");
-    let now = SystemTime::now();
-    let before = directory_stamps(root)?;
-    if settled(&before, now)
-        && let Some(memo) = fs::read(&memo_path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<SizeMemo>(&bytes).ok())
-        && now
-            .duration_since(memo.measured)
-            .is_ok_and(|age| age < IN_FLIGHT)
-        && memo.stamps == before
-    {
-        return Ok(memo.size);
     }
-    let size = ["entries", "blobs", "warm", "pathsets", "projections"]
-        .iter()
-        .zip(&before)
-        .filter(|(_, stamp)| stamp.is_some())
-        .try_fold(0u64, |total, (name, _)| {
-            directory_size(&root.join(name)).map(|size| total.saturating_add(size))
-        })?;
-    let after = directory_stamps(root)?;
-    if before == after && settled(&after, now) {
-        let memo = SizeMemo {
-            measured: now,
-            stamps: after,
-            size,
-        };
-        // Concurrent writers can replace this memo safely: readers still compare
-        // its stamps with the current directories. Partial writes are misses.
-        let mut temporary = tempfile::NamedTempFile::new_in(root.join("locks"))?;
-        serde_json::to_writer(temporary.as_file_mut(), &memo)?;
-        temporary.persist(&memo_path).map_err(|error| error.error)?;
-    } else {
-        let _ = fs::remove_file(memo_path);
-    }
-    Ok(size)
-}
-
-fn directory_size(directory: &Path) -> Result<u64> {
-    let mut size = 0;
-    for item in fs::read_dir(directory)? {
-        size += item?.metadata()?.len();
-    }
-    Ok(size)
 }
 
 #[cfg(test)]
@@ -602,50 +604,134 @@ mod tests {
         drop(pinning.join().unwrap());
     }
 
+    /// `prune`, retried while another test's child holds `.prune`, which
+    /// makes a full prune do nothing.
+    fn retried(prune: impl Fn() -> Result<Pruned>) -> Pruned {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let pruned = prune().unwrap();
+            if pruned != Pruned::default() || std::time::Instant::now() > deadline {
+                return pruned;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn automatic_size(root: &Path, limit: u64) -> u64 {
+        retried(|| prune_automatic(root, limit)).size
+    }
+
+    fn ledger(root: &Path) -> Ledger {
+        serde_json::from_slice(&fs::read(ledger_path(root)).unwrap()).unwrap()
+    }
+
     #[test]
-    fn automatic_size_memo_reuses_and_reconciles() {
+    fn automatic_prunes_read_the_size_from_the_ledger() {
         let root = fixture();
         let root = root.path();
-        // No memo can be trusted while directory timestamps are recent.
-        assert_eq!(prune_automatic(root, 1_000).unwrap().size, 110);
-        assert!(!root.join("locks/.size").exists());
-        std::thread::sleep(STAMP_SETTLE + Duration::from_millis(100));
-        assert_eq!(prune_automatic(root, 1_000).unwrap().size, 110);
-        assert!(root.join("locks/.size").exists());
+        // No count yet: the automatic prune counts in full.
+        assert_eq!(automatic_size(root, 1_000), 110);
+        assert_eq!(ledger(root).counted.unwrap().size, 110);
 
-        // Unsupported external in-place changes intentionally demonstrate that
-        // the automatic path reads only directory stamps, rather than each file.
+        // Files changed without reporting, as outside qk, are not seen until
+        // the next full count: the automatic prune reads no file but the
+        // ledger.
         fs::write(root.join("blobs/a"), [0; 200]).unwrap();
-        touch(&root.join("entries/a.json"));
+        fs::write(root.join("entries/b.json"), [0; 50]).unwrap();
         assert_eq!(prune_automatic(root, 1_000).unwrap().size, 110);
-        assert_eq!(prune(root, 1_000).unwrap().size, 210);
-        assert!(!root.join("locks/.size").exists());
 
-        assert_eq!(prune_automatic(root, 1_000).unwrap().size, 210);
-        fs::write(root.join("locks/.size"), b"corrupt").unwrap();
-        assert_eq!(prune_automatic(root, 1_000).unwrap().size, 210);
-        let mut memo: SizeMemo =
-            serde_json::from_slice(&fs::read(root.join("locks/.size")).unwrap()).unwrap();
-        memo.measured = SystemTime::UNIX_EPOCH;
-        memo.size = 0;
-        fs::write(root.join("locks/.size"), serde_json::to_vec(&memo).unwrap()).unwrap();
-        assert_eq!(prune_automatic(root, 1_000).unwrap().size, 210);
+        // What publishing reports is added, blobs noted before the manifest
+        // citing them included.
+        noted(root, 20);
+        grew(root, 10);
+        assert_eq!(prune_automatic(root, 1_000).unwrap().size, 140);
+        // Blobs noted with no manifest after them count from the next prune.
+        noted(root, 5);
+        assert_eq!(prune_automatic(root, 1_000).unwrap().size, 145);
 
-        // An atomic publication invalidates accounting immediately.
-        let temp = root.join("entries/new.tmp");
-        fs::write(&temp, [0; 30]).unwrap();
-        fs::rename(temp, root.join("entries/new.json")).unwrap();
-        assert_eq!(prune_automatic(root, 1_000).unwrap().size, 240);
-        fs::create_dir(root.join("warm")).unwrap();
-        fs::write(root.join("warm/a.json"), [0; 40]).unwrap();
-        assert_eq!(prune_automatic(root, 1_000).unwrap().size, 280);
-        std::thread::sleep(STAMP_SETTLE + Duration::from_millis(100));
-        assert_eq!(prune_automatic(root, 1_000).unwrap().size, 280);
-        assert!(root.join("locks/.size").exists());
-        // A lower limit must still trigger eviction with an unchanged memo.
-        let result = prune_automatic(root, 250).unwrap();
-        assert!(result.entries > 0);
-        assert!(result.size <= 250);
+        // An explicit prune counts exactly, and the next automatic one starts
+        // from that.
+        assert_eq!(retried(|| prune(root, 1_000)).size, 260);
+        assert_eq!(prune_automatic(root, 1_000).unwrap().size, 260);
+
+        // A ledger over the limit sends the prune to a full count, which
+        // finds the cache within it and evicts nothing.
+        grew(root, 800);
+        let pruned = retried(|| prune_automatic(root, 1_000));
+        assert_eq!((pruned.size, pruned.entries), (260, 0));
+        assert_eq!(prune_automatic(root, 1_000).unwrap().size, 260);
+
+        // A lower limit still evicts.
+        let pruned = retried(|| prune_automatic(root, 200));
+        assert!(pruned.entries > 0);
+        assert!(pruned.size <= 200);
+    }
+
+    #[test]
+    fn an_unusable_ledger_sends_an_automatic_prune_to_a_full_count() {
+        let root = fixture();
+        let root = root.path();
+        assert_eq!(automatic_size(root, 1_000), 110);
+        fs::write(root.join("blobs/c"), [0; 40]).unwrap();
+        for unusable in [
+            // Unreadable.
+            b"corrupt".to_vec(),
+            // Counted over an hour ago.
+            serde_json::to_vec(&Ledger {
+                added: 0,
+                counted: Some(Counted {
+                    at: SystemTime::now() - IN_FLIGHT,
+                    size: 0,
+                    added: 0,
+                }),
+            })
+            .unwrap(),
+            // Remade after it was lost: added went back.
+            serde_json::to_vec(&Ledger {
+                added: 1,
+                counted: Some(Counted {
+                    at: SystemTime::now(),
+                    size: 0,
+                    added: 2,
+                }),
+            })
+            .unwrap(),
+        ] {
+            fs::write(ledger_path(root), unusable).unwrap();
+            assert_eq!(automatic_size(root, 1_000), 150);
+        }
+    }
+
+    #[test]
+    fn what_is_published_while_a_count_runs_is_not_lost() {
+        let root = fixture();
+        let root = root.path();
+        retried(|| prune(root, 1_000));
+        // A publisher reports after the count noted where the ledger stood,
+        // whether or not the count saw its file: counted twice at worst.
+        let counting_from = with_ledger(root, |ledger| ledger.added).unwrap();
+        fs::write(root.join("entries/b.json"), [0; 30]).unwrap();
+        grew(root, 30);
+        with_ledger(root, |ledger| {
+            ledger.counted = Some(Counted {
+                at: SystemTime::now(),
+                size: 110,
+                added: counting_from,
+            })
+        })
+        .unwrap();
+        assert_eq!(prune_automatic(root, 1_000).unwrap().size, 140);
+    }
+
+    #[test]
+    fn publishing_a_record_reports_its_size() {
+        let root = fixture();
+        let root = root.path();
+        fs::create_dir(root.join("tmp")).unwrap();
+        retried(|| prune(root, 1_000));
+        let before = ledger(root).added;
+        crate::record::publish_bytes(root, &root.join("entries/b.json"), &[b' '; 25]).unwrap();
+        assert_eq!(ledger(root).added - before, 25);
     }
 
     #[test]

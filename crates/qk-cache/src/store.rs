@@ -301,7 +301,9 @@ impl Cache {
         let hash = copy_blob(source, &temporary)?;
         let target = self.root.join("blobs").join(&hash);
         // Replacing is atomic and cheaper than re-reading an existing blob.
+        let length = fs::metadata(&temporary).map_or(0, |metadata| metadata.len());
         kept_or_replaced(fs::rename(&temporary, &target), &target, &hash)?;
+        crate::evict::noted(&self.root, length);
         Ok(hash)
     }
 

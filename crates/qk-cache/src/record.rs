@@ -202,7 +202,10 @@ fn publish_with(
 ) -> Result<()> {
     let mut file = tempfile::NamedTempFile::new_in(root.join("tmp"))?;
     write(file.as_file_mut())?;
+    let length = file.as_file().metadata()?.len();
     file.persist(destination)?;
+    // With the blobs written for it, which are in place before it is.
+    crate::evict::grew(root, length);
     Ok(())
 }
 
