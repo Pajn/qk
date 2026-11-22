@@ -226,7 +226,8 @@ impl Fetching {
     /// the cache, when that is under a day old, so the run need not wait for
     /// the store; else what the fetch gives once it ends. A fetch that ends
     /// saves what it gave in place of the copy, for the next run, whether or
-    /// not this one waited for it; one that fails leaves the copy as it was.
+    /// not this one waited for it; one that fails leaves the copy as it was
+    /// and gives it, when it is under a day old, however soon it failed.
     pub fn wait(mut self) -> BTreeMap<String, Expectation> {
         let Some(running) = self.0.take() else {
             return BTreeMap::new();
@@ -327,7 +328,10 @@ pub fn fetch(workspace: &Workspace, environment: &BTreeMap<OsString, OsString>) 
                             "qk: remote task expectations unavailable ({error:#})"
                         );
                     }
-                    return BTreeMap::new();
+                    // A run that finds the fetch already ended takes what it
+                    // returns, so a store that failed at once still leaves
+                    // the run the copy it would have started from.
+                    return load(&path, SystemTime::now()).unwrap_or_default();
                 }
             };
             if let Err(error) = save(&root, &path, fetched.as_ref())

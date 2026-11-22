@@ -2666,6 +2666,14 @@ fn a_run_starts_from_the_expectations_the_last_fetch_saved() {
         started.elapsed()
     );
     server.state.lock().unwrap().hold_get.clear();
+    // Nor does one that fails, however soon: the run has the copy either way.
+    fs::remove_file(&history).unwrap();
+    server.state.lock().unwrap().fail_get = [".json".to_owned()].into();
+    assert_eq!(
+        order(&[("QK_REMOTE_EXPECTATIONS", "read")]),
+        "b-slow\na-fast\n"
+    );
+    server.state.lock().unwrap().fail_get.clear();
 }
 
 #[test]
