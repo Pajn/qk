@@ -803,6 +803,19 @@ impl Outputs {
                     Err(error) => return Err(error.into()),
                 }
             }
+            if !symlink && walks.len() < 2 * ROOTS_PER_THREAD {
+                // Too few for a second thread: listed as they are walked,
+                // without holding the whole listing at once.
+                let walked = walks
+                    .into_iter()
+                    .flat_map(|walk| walkdir::WalkDir::new(walk).follow_links(false));
+                return Ok(Box::new(walked.map(move |entry| {
+                    let entry = entry?;
+                    let path = relative(root, entry.path())?;
+                    validate_path(&path)?;
+                    Ok((path, entry.metadata()?))
+                })));
+            }
             if !symlink {
                 // Each root is walked whole, and many of them on several
                 // threads: what is listed, and its order, is each root's
