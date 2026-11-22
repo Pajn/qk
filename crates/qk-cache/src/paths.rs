@@ -509,6 +509,10 @@ fn normalize(path: &str) -> Result<String> {
 
 type OutputEntries<'a> = Box<dyn Iterator<Item = Result<(String, std::fs::Metadata)>> + 'a>;
 
+/// Output roots a thread walks at least when a task's outputs are listed, so
+/// that the few roots most tasks declare are walked without starting one.
+const ROOTS_PER_THREAD: usize = 4;
+
 #[derive(Clone)]
 pub struct Outputs {
     patterns: Vec<Pattern>,
@@ -755,18 +759,28 @@ impl Outputs {
             for anchor in self.complete_roots() {
                 let absolute = root.join(anchor);
                 match std::fs::symlink_metadata(&absolute) {
-                    Ok(_) => walks.push(walkdir::WalkDir::new(absolute).follow_links(false)),
+                    Ok(_) => walks.push(absolute),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => return Err(error.into()),
                 }
             }
             if !symlink {
-                return Ok(Box::new(walks.into_iter().flatten().map(move |entry| {
-                    let entry = entry?;
-                    let path = relative(root, entry.path())?;
-                    validate_path(&path)?;
-                    Ok((path, entry.metadata()?))
-                })));
+                // Each root is walked whole, and many of them on several
+                // threads: what is listed, and its order, is each root's
+                // walk in turn either way.
+                let walked = crate::hash::in_parallel(&walks, ROOTS_PER_THREAD, |walk| {
+                    let entries = walkdir::WalkDir::new(walk).follow_links(false);
+                    Ok(entries
+                        .into_iter()
+                        .map(|entry| {
+                            let entry = entry?;
+                            let path = relative(root, entry.path())?;
+                            validate_path(&path)?;
+                            Ok((path, entry.metadata()?))
+                        })
+                        .collect::<Vec<Result<_>>>())
+                })?;
+                return Ok(Box::new(walked.into_iter().flatten()));
             }
         }
         let (paths, mut traversal) = self.listing(root, true)?;
@@ -2457,6 +2471,44 @@ mod tests {
                 results => panic!("different results for {patterns:?}: {results:?}"),
             }
         }
+    }
+
+    /// Many output roots are walked on several threads, and listed as they
+    /// are when walked one after another: each root's walk in turn.
+    #[test]
+    fn many_output_roots_are_listed_in_the_order_of_the_roots() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        let mut declared: Vec<String> = (0..40).rev().map(|n| format!("out/{n:02}")).collect();
+        for (n, directory) in declared.iter().enumerate() {
+            std::fs::create_dir_all(root.join(directory).join("nested")).unwrap();
+            std::fs::write(root.join(directory).join("nested/file"), "x").unwrap();
+            if n % 3 == 0 {
+                std::fs::write(root.join(directory).join("top"), "x").unwrap();
+            }
+        }
+        // One that is not there is passed over.
+        declared.insert(7, "out/absent".into());
+        let outputs = Outputs::from_paths(&declared).unwrap();
+        let roots = outputs.complete_roots();
+        assert!(roots.len() > 8 * super::ROOTS_PER_THREAD);
+        let mut expected = Vec::new();
+        for directory in roots
+            .iter()
+            .filter(|directory| root.join(directory).exists())
+        {
+            let walked = walkdir::WalkDir::new(root.join(directory)).follow_links(false);
+            for entry in walked {
+                expected.push(super::relative(root, entry.unwrap().path()).unwrap());
+            }
+        }
+        let listed: Vec<String> = outputs
+            .entries(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().0)
+            .collect();
+        assert_eq!(listed, expected);
+        assert_eq!(listed.len(), 40 * 3 + 14);
     }
 
     #[test]
