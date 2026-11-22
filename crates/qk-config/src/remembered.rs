@@ -28,16 +28,17 @@
 //!   Every directory the walk reads is stamped, the root among them.
 //! - In each directory the walk reads, its `.gitignore` and `.nxignore`: the
 //!   walker reads each by its path, following links, whether or not it is
-//!   itself ignored. Each that is there is stamped, with the target of a
-//!   link; one being added or removed shows in its directory's stamp.
+//!   itself ignored. Each that is there is stamped; one being added or
+//!   removed shows in its directory's stamp. Where one is a link, the walk
+//!   is not remembered: see below.
 //! - In each directory the walk reads that holds a `.git` entry,
 //!   `.git/info/exclude`, which the walker reads as that path and nothing
 //!   else: with `require_git(false)` it never follows a `.git` file to a
 //!   linked worktree's directories, so beneath a `.git` file there is
-//!   nothing to read. Beneath a `.git` directory, or a link, `.git/info` is
-//!   stamped as well as `exclude`, as adding or removing `exclude` changes
-//!   `info` and nothing the walk reads; one without `info` is not
-//!   remembered.
+//!   nothing to read. Beneath a `.git` directory, `.git/info` is stamped
+//!   as well as `exclude`, as adding or removing `exclude` changes `info`
+//!   and nothing the walk reads; one without `info` is not remembered, nor
+//!   is one where `.git`, `info` or `exclude` is a link.
 //! - Above the root, the `.gitignore` files from its parent up to the
 //!   repository's top, which the walk adds as rules of its own, and which
 //!   directory that top is: the nearest from the root up holding a `.git`.
@@ -83,6 +84,14 @@
 //!   the stamps with the result for the loads after it.
 //! - A record with stamps is taken while every stamp is still what it was:
 //!   each had settled when the walk began, so an unchanged one is trusted.
+//! - Stamps taken after the walk show nothing of what it read through a
+//!   link: the link, or a link among the directories it leads through, can
+//!   be pointed at another file as old as the first, and then no stamp is
+//!   newer than the walk. A walk that read an ignore file or a `.git`
+//!   through a link within the workspace is therefore not remembered, and
+//!   such a workspace is walked on every load. Above the root a link is
+//!   stamped before the walk, through every link it leads to, and compared
+//!   afterwards, which does show it.
 //!
 //! # When the record does not hold
 //!
@@ -422,21 +431,35 @@ fn stamps(read: &[PathBuf], began: SystemTime) -> Option<Looked> {
             seen.push((path, Seen::Stamp(look.map(|(stamp, _)| stamp))));
             Some(())
         };
+        // Whether something is at a path, when it is no link. What the
+        // walker read through a link cannot be shown unchanged by stamps
+        // taken after the walk: the link, or one among the directories it
+        // leads through, may since lead to another file as old as the
+        // first, and nothing stamped here would be newer than the walk. So
+        // a walk that read through one is not remembered.
+        let plain = |path: &Path| match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_symlink() => None,
+            Ok(metadata) => Some(Some(metadata)),
+            Err(_) => Some(None),
+        };
         stamp(directory.clone(), true)?;
         for name in [".gitignore", ".nxignore"] {
             let path = directory.join(name);
-            if std::fs::symlink_metadata(&path).is_ok() {
+            if plain(&path)?.is_some() {
                 stamp(path, true)?;
             }
         }
-        match std::fs::symlink_metadata(directory.join(".git")) {
+        match plain(&directory.join(".git"))? {
             // Nothing lies beneath a file.
-            Ok(metadata) if metadata.is_file() => {}
-            Ok(_) => {
-                stamp(directory.join(".git/info"), true)?;
-                stamp(directory.join(".git/info/exclude"), false)?;
+            Some(metadata) if metadata.is_file() => {}
+            Some(_) => {
+                let info = directory.join(".git/info");
+                plain(&info)?;
+                plain(&info.join("exclude"))?;
+                stamp(info.clone(), true)?;
+                stamp(info.join("exclude"), false)?;
             }
-            Err(_) => {}
+            None => {}
         }
         Some(seen)
     };
@@ -911,26 +934,14 @@ mod tests {
             ),
         ];
         #[cfg(unix)]
-        changes.extend([
-            (
-                "a directory replaced by a link",
-                nothing as Change,
-                (|f| {
-                    std::fs::rename(f.root.join("apps/c"), f.outer.join("c")).unwrap();
-                    std::os::unix::fs::symlink(f.outer.join("c"), f.root.join("apps/c")).unwrap();
-                }) as Change,
-            ),
-            (
-                "a linked ignore file's target edited",
-                |f| {
-                    write(&f.outer.join("rules"), "dist/\n");
-                    std::fs::remove_file(f.root.join(".gitignore")).unwrap();
-                    std::os::unix::fs::symlink(f.outer.join("rules"), f.root.join(".gitignore"))
-                        .unwrap();
-                },
-                |f| write(&f.outer.join("rules"), "dist/\nc/\n"),
-            ),
-        ]);
+        changes.extend([(
+            "a directory replaced by a link",
+            nothing as Change,
+            (|f| {
+                std::fs::rename(f.root.join("apps/c"), f.outer.join("c")).unwrap();
+                std::os::unix::fs::symlink(f.outer.join("c"), f.root.join("apps/c")).unwrap();
+            }) as Change,
+        )]);
         for stage in [Stage::Walked, Stage::Stamped] {
             for (name, setup, change) in &changes {
                 let fixture = Fixture::new();
@@ -948,6 +959,49 @@ mod tests {
                 assert_eq!(shown(fixture.load()), walked, "{name}, {stage:?}");
             }
         }
+    }
+
+    /// A walk that read an ignore file through a link is never taken again:
+    /// stamps taken after it cannot show that the link, or a link among the
+    /// directories it leads through, still leads where the walk read. Such
+    /// a workspace is walked on every load, and each load finds what a walk
+    /// does.
+    #[cfg(unix)]
+    #[test]
+    fn a_walk_that_read_through_a_link_is_not_taken_again() {
+        use std::os::unix::fs::symlink;
+        let fixture = Fixture::new();
+        // The rules are reached through a linked directory.
+        write(&fixture.outer.join("old/rules"), "dist/\n");
+        write(&fixture.outer.join("new/rules"), "dist/\nc/\n");
+        symlink("old", fixture.outer.join("via")).unwrap();
+        std::fs::remove_file(fixture.root.join(".gitignore")).unwrap();
+        symlink(
+            fixture.outer.join("via/rules"),
+            fixture.root.join(".gitignore"),
+        )
+        .unwrap();
+        fixture.settle();
+        for _ in 0..2 {
+            assert_eq!(shown(fixture.load()), shown(fixture.walk()));
+            assert_eq!(fixture.record(), Some((Stage::Walked, false)));
+        }
+        // The linked directory now leads to other rules, as old as the
+        // first, and neither the link in the workspace nor a file changed.
+        let before = shown(fixture.walk());
+        std::fs::remove_file(fixture.outer.join("via")).unwrap();
+        symlink("new", fixture.outer.join("via")).unwrap();
+        let walked = shown(fixture.walk());
+        assert_ne!(walked, before);
+        assert_eq!(shown(fixture.load()), walked);
+
+        // So too for what lies beneath a linked `.git`.
+        let fixture = Fixture::new();
+        write(&fixture.outer.join("elsewhere/info/exclude"), "apps/\n");
+        symlink(fixture.outer.join("elsewhere"), fixture.root.join(".git")).unwrap();
+        fixture.settle();
+        assert_eq!(shown(fixture.load()), shown(fixture.walk()));
+        assert_eq!(fixture.record(), Some((Stage::Walked, false)));
     }
 
     /// What the walk does not read can change without the record failing to
