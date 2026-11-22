@@ -164,9 +164,11 @@ pub struct Snapshot {
     workspace_prefix: Option<PathBuf>,
     patterns: Mutex<HashMap<(String, bool, bool), Arc<Pattern>>>,
     digests: Mutex<HashMap<String, (Stamp, String)>>,
-    /// Files `includeIgnored` filesets read, whose digests are saved beside
-    /// those of `files`, which may not list them.
-    ignored_files: Mutex<BTreeSet<String>>,
+    /// Files whose digests this run used, which are saved beside those of
+    /// `files`, the source listing, which leaves out many of them: what
+    /// `includeIgnored` filesets read, other tasks' declared outputs, and
+    /// the targets of links.
+    read_files: Mutex<HashSet<String>>,
     /// Whether `digests` gained entries worth saving.
     digests_changed: std::sync::atomic::AtomicBool,
     /// Directories already checked not to be symlinks.
@@ -1201,7 +1203,7 @@ impl Snapshot {
             patterns: Mutex::default(),
             digests: Mutex::default(),
             digests_changed: Default::default(),
-            ignored_files: Mutex::default(),
+            read_files: Mutex::default(),
             directories: Mutex::default(),
             runtime: Mutex::default(),
             lockfile: Mutex::default(),
@@ -1632,8 +1634,9 @@ impl Snapshot {
         }
     }
 
-    /// Saves the digests of files that still exist, for the next run. A run
-    /// that listed no files keeps every digest, until one that lists them.
+    /// Saves the digests of files that still exist, for the next run: those
+    /// the run listed or read. A run that listed no files keeps every
+    /// digest, until one that lists them.
     pub fn save_digests(&self, root: &Path) {
         if !self
             .digests_changed
@@ -1643,7 +1646,7 @@ impl Snapshot {
         }
         self.settle();
         let digests = self.digests.lock().unwrap();
-        let ignored = self.ignored_files.lock().unwrap();
+        let read = self.read_files.lock().unwrap();
         let files = match self.files.get() {
             Some(Ok(files)) => Some(files),
             _ => None,
@@ -1651,7 +1654,7 @@ impl Snapshot {
         let entries: BTreeMap<&String, (&Stamp, &String)> = digests
             .iter()
             .filter(|(path, _)| {
-                files.is_none_or(|files| files.contains(*path)) || ignored.contains(*path)
+                files.is_none_or(|files| files.contains(*path)) || read.contains(*path)
             })
             .map(|(path, (stamp, digest))| (path, (stamp, digest)))
             .collect();
@@ -1756,6 +1759,7 @@ impl Snapshot {
     }
 
     fn digest(&self, path: &str, absolute: &Path, metadata: &std::fs::Metadata) -> Result<String> {
+        self.read_files.lock().unwrap().insert(path.to_owned());
         let stamp = Stamp::new(metadata);
         if let Some((known, digest)) = self.digests.lock().unwrap().get(path)
             && *known == stamp
@@ -1881,7 +1885,6 @@ impl Snapshot {
             Err(error) => return Err(error.into()),
         };
         let mode = crate::store::mode(&metadata) & 0o111 != 0;
-        self.ignored_files.lock().unwrap().insert(path.to_owned());
         Ok(Some(
             json!({"content":self.digest(path, &absolute, &metadata)?, "mode":mode}),
         ))
@@ -5574,6 +5577,74 @@ mod tests {
         .unwrap();
         snapshot.save_digests(root.path());
         assert!(load_digests(root.path()).contains_key("generated/schema.json"));
+    }
+
+    /// A run that lists the workspace saves the digests of the files it read
+    /// beside the listing, such as another task's outputs, gitignored, that a
+    /// task keys, and drops those of files it neither listed nor read.
+    #[test]
+    fn digests_of_other_tasks_outputs_a_task_keys_are_saved() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("nx.json"), "{}").unwrap();
+        std::fs::write(root.path().join(".gitignore"), "generated/\n").unwrap();
+        std::fs::write(
+            root.path().join("project.json"),
+            json!({"name": "app", "targets": {
+                "gen": {"command": "true", "outputs": ["{projectRoot}/generated"]},
+                "build": {"command": "true", "dependsOn": ["gen"], "inputs": [
+                    "{projectRoot}/src/**/*", {"dependentTasksOutputFiles": "**/*.ts"}
+                ]}
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        // Digests are only saved for files old enough to have settled.
+        let old = std::time::SystemTime::now() - Duration::from_secs(60);
+        for path in ["src/a.ts", "generated/names.ts"] {
+            let path = root.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "x").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(old))
+                .unwrap();
+        }
+        assert!(
+            paths::git(root.path(), &["init", "--quiet"])
+                .unwrap()
+                .status
+                .success()
+        );
+        let path = digests_path(root.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            json!({"version": 1, "entries": {"generated/gone.ts": [[1, 2], "digest"]}}).to_string(),
+        )
+        .unwrap();
+        let workspace = Workspace::load(root.path()).unwrap();
+        let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
+        let snapshot = Snapshot::new(&workspace, &graph, &root.path().join("cache")).unwrap();
+        assert!(!snapshot.files().unwrap().contains("generated/names.ts"));
+        let task = &graph.tasks["app:build"];
+        let prepared = qk_executor::prepare(&workspace, task, &BTreeMap::new()).unwrap();
+        let dependencies = dependency_keys(&snapshot, &workspace, &graph, task).unwrap();
+        inputs(
+            &snapshot,
+            &workspace,
+            task,
+            &prepared,
+            &dependencies,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        snapshot.save_digests(root.path());
+        let saved = load_digests(root.path());
+        assert!(saved.contains_key("src/a.ts"));
+        assert!(saved.contains_key("generated/names.ts"));
+        assert!(!saved.contains_key("generated/gone.ts"));
     }
 
     /// A workspace whose `app:build` reads `inputs`, beside `app:gen`, which
