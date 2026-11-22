@@ -233,6 +233,7 @@ pub fn worktree_state(root: &Path) -> PathBuf {
 /// removed one by one rather than the directory as a whole.
 const WORKTREE_ENTRIES: &[&str] = &[
     "digests.json",
+    "listings",
     "lockfile-digests.json",
     "outputs",
     "restore",
@@ -241,9 +242,9 @@ const WORKTREE_ENTRIES: &[&str] = &[
     "warm",
 ];
 
-/// Removes a worktree's state: its file and lockfile digests, the outputs it
-/// records holding, its warm directories, the logs `--output-style=summary` kept and
-/// any restores or sandboxes left behind.
+/// Removes a worktree's state: its file and lockfile digests and saved source
+/// listings, the outputs it records holding, its warm directories, the logs
+/// `--output-style=summary` kept and any restores or sandboxes left behind.
 pub fn clear_worktree_state(root: &Path) -> Result<()> {
     let state = worktree_state(root);
     for entry in WORKTREE_ENTRIES {
@@ -520,6 +521,8 @@ pub struct Outputs {
     globs: Vec<String>,
     /// Negated patterns: what they match is never an output.
     negations: Vec<Pattern>,
+    /// `negations` as written, without their `!`.
+    negated_globs: Vec<String>,
     /// `patterns` and `negations`, each matched as one set.
     matched: PatternSet,
     negated: PatternSet,
@@ -542,12 +545,14 @@ impl Outputs {
         let mut compiled = Vec::new();
         let mut globs = Vec::new();
         let mut negations = Vec::new();
+        let mut negated_globs = Vec::new();
         let mut anchors = BTreeSet::new();
         let mut complete = BTreeSet::new();
         for pattern in patterns {
             if let Some(excluded) = pattern.strip_prefix('!') {
                 validate_pattern(excluded)?;
                 negations.push(Pattern::new(excluded, false)?);
+                negated_globs.push(excluded.to_owned());
                 continue;
             }
             validate_pattern(pattern)?;
@@ -568,6 +573,7 @@ impl Outputs {
             patterns: compiled,
             globs,
             negations,
+            negated_globs,
             anchors,
             complete,
             explicit: true,
@@ -599,6 +605,7 @@ impl Outputs {
                 .map(|pattern| (*pattern).to_owned())
                 .collect(),
             negations: Vec::new(),
+            negated_globs: Vec::new(),
             explicit: true,
         }
     }
@@ -609,6 +616,7 @@ impl Outputs {
         let mut patterns = Vec::new();
         let mut globs = Vec::new();
         let mut negations = Vec::new();
+        let mut negated_globs = Vec::new();
         let mut anchors = BTreeSet::new();
         let mut complete = BTreeSet::new();
         for output in resolved {
@@ -619,6 +627,7 @@ impl Outputs {
             validate_pattern(&pattern)?;
             if negated {
                 negations.push(Pattern::new(&pattern, false)?);
+                negated_globs.push(pattern);
                 continue;
             }
             let (anchor, glob) = crate::ignored::partition(&pattern);
@@ -651,6 +660,7 @@ impl Outputs {
             patterns,
             globs,
             negations,
+            negated_globs,
             anchors,
             complete,
             explicit,
@@ -672,6 +682,13 @@ impl Outputs {
     /// The patterns as written, without the negated ones.
     pub(crate) fn globs(&self) -> &[String] {
         &self.globs
+    }
+
+    /// What decides which paths [`Self::matches`] and [`Self::complete_roots`]
+    /// accept: the patterns and negated patterns as written, and whether the
+    /// target declares them. Two outputs with equal descriptions match alike.
+    pub(crate) fn describe(&self) -> (&[String], &[String], bool) {
+        (&self.globs, &self.negated_globs, self.explicit)
     }
 
     /// Fixed directory prefixes; every matching path lies below one of them.

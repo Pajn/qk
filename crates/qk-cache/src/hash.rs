@@ -23,6 +23,8 @@ use crate::inputs::{
 };
 use crate::paths::{self, Outputs, Pattern};
 
+mod saved;
+
 pub fn digest_file(path: &Path) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
     let mut reader = File::open(path)?;
@@ -133,6 +135,9 @@ pub struct Snapshot {
     /// tasks are keyed, see [`Self::settle`]. A task whose file inputs name
     /// paths needs neither, so it is keyed, and runs, without waiting.
     listing: Mutex<Option<std::thread::JoinHandle<Result<Membership>>>>,
+    /// Saving that inventory for later runs, which [`Self::settle`] starts
+    /// once it is kept, see [`saved`], and the end of the run waits for.
+    saving: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// The ignore policy read with that listing, which then replaces
     /// `built_ignore`.
     listed_ignore: std::sync::OnceLock<Arc<SourceIgnore>>,
@@ -181,6 +186,14 @@ pub struct Snapshot {
     dependency_outputs: Mutex<Listings>,
 }
 
+impl Drop for Snapshot {
+    /// A run that ends without saving its digests still finishes saving its
+    /// listing, rather than stop it with its file not yet moved into place.
+    fn drop(&mut self) {
+        self.finish_saving();
+    }
+}
+
 /// Membership depends on directory entries and Git/ignore listing policy, not
 /// on every source file's contents. Empty directories must also be watched.
 #[derive(Clone)]
@@ -207,6 +220,12 @@ struct Membership {
     /// The paths this inventory and its listing cover, when not the whole
     /// workspace: see [`Scope`].
     scope: Option<Arc<Scope>>,
+    /// Whether this inventory and its listing were saved by an earlier run
+    /// and found to hold still: see [`saved::restore`].
+    restored: bool,
+    /// What to save this inventory under for later runs, once it is kept:
+    /// set on one taken afresh for a snapshot, see [`Snapshot::watch`].
+    save_as: Option<saved::Identity>,
 }
 
 /// Workspace-relative paths a narrowed inventory and listing cover: what is
@@ -346,39 +365,7 @@ impl Membership {
         git_policies: Option<&BTreeSet<PathBuf>>,
         scope: Option<&Arc<Scope>>,
     ) -> Result<Self> {
-        let mut output_anchors: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
-        for (index, outputs) in outputs.iter().enumerate() {
-            for anchor in outputs.anchors() {
-                output_anchors
-                    .entry(PathBuf::from(anchor))
-                    .or_default()
-                    .push(index);
-            }
-        }
-        let stamped = SystemTime::now();
-        let mut membership = Self {
-            files: Arc::new(BTreeSet::new()),
-            source_ignore: source_ignore.clone(),
-            stamps: BTreeMap::new(),
-            directories: BTreeSet::new(),
-            directory_entries: BTreeMap::new(),
-            root: root.to_owned(),
-            outputs: outputs.to_vec(),
-            output_anchors,
-            excluded_roots: outputs
-                .iter()
-                .flat_map(Outputs::complete_roots)
-                .map(PathBuf::from)
-                .collect(),
-            cache: cache.map(PathBuf::from),
-            policies: BTreeSet::new(),
-            git_policies: BTreeSet::new(),
-            ignore_contents: BTreeMap::new(),
-            settled: false,
-            listed: None,
-            stamped,
-            scope: scope.cloned(),
-        };
+        let mut membership = Self::empty(root, source_ignore, outputs, cache, scope);
         // Finding Git's own policy files takes several Git processes, which
         // run while the directories are read. They are stamped as soon as
         // they are found: a config rewritten during the walk could name an
@@ -454,6 +441,51 @@ impl Membership {
             }
         }
         Ok(membership)
+    }
+
+    /// An inventory of nothing yet, for what `outputs`, `cache` and `scope`
+    /// leave to list, beginning now.
+    fn empty(
+        root: &Path,
+        source_ignore: &Arc<SourceIgnore>,
+        outputs: &[Outputs],
+        cache: Option<&Path>,
+        scope: Option<&Arc<Scope>>,
+    ) -> Self {
+        let mut output_anchors: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
+        for (index, outputs) in outputs.iter().enumerate() {
+            for anchor in outputs.anchors() {
+                output_anchors
+                    .entry(PathBuf::from(anchor))
+                    .or_default()
+                    .push(index);
+            }
+        }
+        Self {
+            files: Arc::new(BTreeSet::new()),
+            source_ignore: source_ignore.clone(),
+            stamps: BTreeMap::new(),
+            directories: BTreeSet::new(),
+            directory_entries: BTreeMap::new(),
+            root: root.to_owned(),
+            outputs: outputs.to_vec(),
+            output_anchors,
+            excluded_roots: outputs
+                .iter()
+                .flat_map(Outputs::complete_roots)
+                .map(PathBuf::from)
+                .collect(),
+            cache: cache.map(PathBuf::from),
+            policies: BTreeSet::new(),
+            git_policies: BTreeSet::new(),
+            ignore_contents: BTreeMap::new(),
+            settled: false,
+            listed: None,
+            stamped: SystemTime::now(),
+            scope: scope.cloned(),
+            restored: false,
+            save_as: None,
+        }
     }
 
     /// Stamp each directory from the root, then capture its names from the
@@ -1289,6 +1321,7 @@ impl Snapshot {
             root: workspace.root.clone(),
             files: std::sync::OnceLock::new(),
             listing: Mutex::default(),
+            saving: Mutex::default(),
             listed_ignore: std::sync::OnceLock::new(),
             extra_candidates: BTreeSet::new(),
             membership: Mutex::default(),
@@ -1391,6 +1424,39 @@ impl Snapshot {
         let scope = self.scope.clone();
         let listing = std::thread::spawn(move || {
             let _listing = crate::profile::span("snapshot", "inventory_list");
+            // An earlier run's inventory, taken for what this one would
+            // take, serves as one taken now when its stamps still hold.
+            let identity = saved::Identity::new(
+                &root,
+                scope.as_deref(),
+                &exclusions,
+                cache.as_deref(),
+                &extra,
+            );
+            if let Ok(source_ignore) = SourceIgnore::new(&root) {
+                let _loading = crate::profile::span("snapshot", "inventory_restore");
+                let template = Membership::empty(
+                    &root,
+                    &ignore,
+                    &exclusions,
+                    cache.as_deref(),
+                    scope.as_ref(),
+                );
+                if let Some(mut membership) =
+                    saved::restore(&root, &identity, template, source_ignore)
+                {
+                    membership.listed = Some(listed);
+                    return Ok(membership);
+                }
+            }
+            // Made before the inventory is stamped, so that saving it later
+            // writes only within this directory and changes no stamp the
+            // inventory holds. Making the worktree's state directory would
+            // change the stamp of the workspace root or of `.git`, which
+            // holds it, while tasks are keyed, so a run that finds none saves
+            // nothing: saving its digests at its end makes it.
+            let save = paths::worktree_state(&root).is_dir()
+                && std::fs::create_dir_all(saved::directory(&root)).is_ok();
             // No earlier listing names tracked files beneath directories the
             // walk skips, so such a file leaves the inventory unsettled and
             // the first refresh watches its parents.
@@ -1405,6 +1471,10 @@ impl Snapshot {
             )?;
             membership.list(&extra, true)?;
             membership.listed = Some(listed);
+            // Only a settled inventory is saved: see `saved`.
+            if save && membership.settled {
+                membership.save_as = Some(identity);
+            }
             Ok(membership)
         });
         *self.listing.get_mut().unwrap() = Some(listing);
@@ -1420,7 +1490,7 @@ impl Snapshot {
             return;
         };
         let _waiting = crate::profile::span("snapshot", "inventory_wait");
-        let Ok(membership) = pending.join().expect("listing thread panicked") else {
+        let Ok(mut membership) = pending.join().expect("listing thread panicked") else {
             return;
         };
         let _ = self.listed_ignore.set(membership.source_ignore.clone());
@@ -1429,7 +1499,27 @@ impl Snapshot {
         if membership.scope.is_none() {
             let _ = self.files.set(Ok((*membership.files).clone()));
         }
-        *self.membership.lock().unwrap() = Some(Arc::new(membership));
+        let save_as = membership.save_as.take();
+        let membership = Arc::new(membership);
+        // Saved while tasks are keyed, as this run keeps it: what a task
+        // adds to it later is this run's alone.
+        if let Some(identity) = save_as {
+            let root = self.root.clone();
+            let kept = membership.clone();
+            *self.saving.lock().unwrap() = Some(std::thread::spawn(move || {
+                if let Err(error) = saved::save(&root, &identity, &kept) {
+                    qk_executor::status!("qk: could not save the source listing: {error:#}");
+                }
+            }));
+        }
+        *self.membership.lock().unwrap() = Some(membership);
+    }
+
+    /// Waits for the inventory [`Self::settle`] is saving, if any.
+    fn finish_saving(&self) {
+        if let Some(saving) = self.saving.lock().unwrap().take() {
+            let _ = saving.join();
+        }
     }
 
     /// The ignore policy that decides which files are sources: the one read
@@ -1767,6 +1857,7 @@ impl Snapshot {
     /// digest, until one that lists them. The digests of what the lockfile
     /// installs are saved beside them.
     pub fn save_digests(&self, root: &Path) {
+        self.finish_saving();
         let installed = self.lockfile.lock().unwrap().clone();
         if let Some(installed) = installed
             && let Err(error) = installed.save(root)
@@ -6776,5 +6867,391 @@ mod tests {
         snapshot.save_digests(root.path());
         let saved = load_digests(root.path());
         assert!(saved.contains_key("config.yaml") && !saved.contains_key("elsewhere.txt"));
+    }
+
+    /// A Git workspace whose `app:build` reads beneath `packages/app` when
+    /// `narrowed`, so a run lists that alone, and otherwise the whole
+    /// workspace; with its state directory made, as a worktree that ran qk
+    /// before has it, so saving does not move the stamp of `.git`.
+    fn saved_listing_fixture(narrowed: bool) -> (tempfile::TempDir, Workspace, TaskGraph) {
+        let root = tempfile::tempdir().unwrap();
+        let write = |path: &str, content: &str| {
+            let path = root.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        };
+        write("nx.json", "{}");
+        let input = if narrowed {
+            "{workspaceRoot}/packages/app/**/*"
+        } else {
+            "{workspaceRoot}/**/*"
+        };
+        write(
+            "project.json",
+            &json!({"name": "app", "targets": {
+                "build": {"command": "true", "inputs": [input]}
+            }})
+            .to_string(),
+        );
+        write(".gitignore", "*.log\n");
+        for path in [
+            "packages/app/a.txt",
+            "packages/app/sub/b.txt",
+            "packages/app/skip.log",
+            "packages/other/c.txt",
+        ] {
+            write(path, path);
+        }
+        for args in [&["init", "-q"][..], &["add", "-A"]] {
+            assert!(paths::git(root.path(), args).unwrap().status.success());
+        }
+        std::fs::create_dir_all(paths::worktree_state(root.path())).unwrap();
+        let workspace = Workspace::load(root.path()).unwrap();
+        let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
+        (root, workspace, graph)
+    }
+
+    /// Runs `app:build`'s keying as a run does: whether its snapshot took
+    /// the saved listing, and its key, which is checked against that of a
+    /// snapshot listing afresh without any inventory.
+    fn saved_listing_run(workspace: &Workspace, graph: &TaskGraph, label: &str) -> (bool, String) {
+        let cache = workspace.root.join("cache");
+        let task = &graph.tasks["app:build"];
+        let prepared = qk_executor::prepare(workspace, task, &BTreeMap::new()).unwrap();
+        let key = |snapshot: &Snapshot| {
+            fingerprint(
+                snapshot,
+                workspace,
+                task,
+                &prepared,
+                &BTreeMap::new(),
+                &AtomicBool::new(false),
+            )
+            .unwrap()
+        };
+        let snapshot = Snapshot::watched(workspace, graph, &cache).unwrap();
+        snapshot.settle();
+        let restored = snapshot
+            .membership
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .restored;
+        let keyed = key(&snapshot);
+        // Dropping it waits for its listing to be saved.
+        drop(snapshot);
+        let fresh = Snapshot::new(workspace, graph, &cache).unwrap();
+        assert_eq!(keyed, key(&fresh), "{label}, restored {restored}");
+        (restored, keyed)
+    }
+
+    #[test]
+    fn a_saved_listing_is_taken_while_it_holds_and_each_change_lists_again() {
+        for narrowed in [true, false] {
+            let (root, workspace, graph) = saved_listing_fixture(narrowed);
+            let path = |path: &str| root.path().join(path);
+            let git = |args: &[&str]| {
+                assert!(paths::git(root.path(), args).unwrap().status.success());
+            };
+            let run = |label: &str| {
+                let (restored, key) = saved_listing_run(&workspace, &graph, label);
+                (restored, key, format!("{label}, narrowed {narrowed}"))
+            };
+            // Recent policies keep an inventory from being saved.
+            std::thread::sleep(Duration::from_millis(2100));
+            let (restored, mut before, label) = run("first");
+            assert!(!restored, "{label}");
+            let saved = Snapshot::watched(&workspace, &graph, &workspace.root.join("cache"))
+                .unwrap()
+                .scope
+                .is_some();
+            assert_eq!(saved, narrowed, "{label}");
+            let (restored, key, label) = run("unchanged");
+            assert!(restored, "{label}");
+            assert_eq!(key, before, "{label}");
+            // Each change, and whether it changes Git's index, whose recent
+            // stamp keeps the next inventory from being saved.
+            type Change<'a> = (&'a str, Box<dyn Fn() + 'a>, bool);
+            let changes: Vec<Change> = vec![
+                (
+                    "a file added",
+                    Box::new(|| std::fs::write(path("packages/app/added.txt"), "a").unwrap()),
+                    false,
+                ),
+                (
+                    "a file removed",
+                    Box::new(|| std::fs::remove_file(path("packages/app/a.txt")).unwrap()),
+                    false,
+                ),
+                (
+                    "a file renamed",
+                    Box::new(|| {
+                        std::fs::rename(
+                            path("packages/app/added.txt"),
+                            path("packages/app/renamed.txt"),
+                        )
+                        .unwrap()
+                    }),
+                    false,
+                ),
+                (
+                    "a directory added",
+                    Box::new(|| {
+                        std::fs::create_dir(path("packages/app/fresh")).unwrap();
+                        std::fs::write(path("packages/app/fresh/c.txt"), "c").unwrap();
+                    }),
+                    false,
+                ),
+                (
+                    "an ignore file added in scope",
+                    Box::new(|| {
+                        std::fs::write(path("packages/app/.gitignore"), "renamed.txt\n").unwrap()
+                    }),
+                    false,
+                ),
+                (
+                    "an ignore file edited in scope",
+                    Box::new(|| {
+                        std::fs::write(path("packages/app/.gitignore"), "fresh/\n").unwrap()
+                    }),
+                    false,
+                ),
+                (
+                    "an ignore file added above the scope",
+                    Box::new(|| {
+                        std::fs::write(path("packages/.gitignore"), "renamed.txt\n").unwrap()
+                    }),
+                    false,
+                ),
+                (
+                    "an ignore file edited above the scope",
+                    Box::new(|| std::fs::write(path(".gitignore"), "*.log\n!skip.log\n").unwrap()),
+                    false,
+                ),
+                (
+                    "an ignored file added to the index",
+                    Box::new(|| git(&["add", "-f", "packages/app/fresh/c.txt"])),
+                    true,
+                ),
+                (
+                    "a tracked file removed from the index",
+                    Box::new(|| git(&["rm", "-q", "--cached", "packages/app/fresh/c.txt"])),
+                    true,
+                ),
+            ];
+            for (change, make, index) in changes {
+                make();
+                let (restored, after, label) = run(change);
+                assert!(!restored, "{label}");
+                assert_ne!(after, before, "{label}");
+                before = after;
+                if index {
+                    std::thread::sleep(Duration::from_millis(2100));
+                    run(change);
+                }
+                // What it saved, with any directory it stamped recently,
+                // serves the next run.
+                let (restored, key, label) = run(change);
+                assert!(restored, "{label}");
+                assert_eq!(key, before, "{label}");
+            }
+        }
+    }
+
+    /// Replaces the inventory saved for `snapshot`'s identity by `change` of
+    /// it, as saved by a run that saw what `change` makes it see.
+    fn resave(root: &Path, snapshot: &Snapshot, change: impl FnOnce(&mut Membership)) {
+        let identity = saved::Identity::new(
+            root,
+            snapshot.scope.as_deref(),
+            &snapshot.source_exclusions,
+            snapshot.cache_relative.as_deref(),
+            &snapshot.extra_candidates,
+        );
+        let template = Membership::empty(
+            root,
+            &snapshot.built_ignore,
+            &snapshot.source_exclusions,
+            snapshot.cache_relative.as_deref(),
+            snapshot.scope.as_ref(),
+        );
+        let bytes = std::fs::read(identity.file(root)).unwrap();
+        let mut membership = saved::decode(&bytes, &identity, template).unwrap();
+        change(&mut membership);
+        std::fs::write(
+            identity.file(root),
+            saved::encode(&identity, &membership).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_change_a_recent_stamp_hides_from_the_saving_run_is_seen_by_the_next() {
+        let (_root, workspace, graph) = saved_listing_fixture(true);
+        std::thread::sleep(Duration::from_millis(2100));
+        let directory = workspace.root.join("packages/app");
+        // Changed just before a run saves its inventory: the stamp it
+        // takes of the directory is recent.
+        std::fs::write(directory.join("first.txt"), "a").unwrap();
+        let (restored, before) = saved_listing_run(&workspace, &graph, "saving");
+        assert!(!restored);
+        let (restored, _) = saved_listing_run(&workspace, &graph, "recent but unchanged");
+        assert!(restored);
+        // Changed again right after, on a filesystem whose times are coarse
+        // enough that the directory keeps the stamp the run saved.
+        std::fs::write(directory.join("second.txt"), "b").unwrap();
+        let snapshot = snapshot(&workspace, &graph, true);
+        resave(&workspace.root, &snapshot, |membership| {
+            let stamp = membership_stamp(&directory).unwrap();
+            assert!(membership.stamps.insert(directory.clone(), stamp).is_some());
+        });
+        drop(snapshot);
+        let (restored, after) = saved_listing_run(&workspace, &graph, "hidden change");
+        assert!(!restored);
+        assert_ne!(after, before);
+    }
+
+    #[test]
+    fn a_saved_listing_is_not_taken_when_git_names_other_policy_files() {
+        let (_root, workspace, graph) = saved_listing_fixture(true);
+        std::thread::sleep(Duration::from_millis(2100));
+        saved_listing_run(&workspace, &graph, "saving");
+        let (restored, _) = saved_listing_run(&workspace, &graph, "unchanged");
+        assert!(restored);
+        // A policy file Git no longer names, as when its configuration
+        // reads another, though no stamped file changed.
+        let snapshot = snapshot(&workspace, &graph, true);
+        resave(&workspace.root, &snapshot, |membership| {
+            let gone = workspace.root.join("no-longer-named");
+            membership.git_policies.insert(gone.clone());
+            membership.policies.insert(gone.clone());
+            membership.stamps.insert(gone, None);
+        });
+        drop(snapshot);
+        let (restored, _) = saved_listing_run(&workspace, &graph, "other policies");
+        assert!(!restored);
+    }
+
+    #[test]
+    fn a_saved_listing_that_does_not_read_is_listed_again_and_replaced() {
+        let (_root, workspace, graph) = saved_listing_fixture(true);
+        std::thread::sleep(Duration::from_millis(2100));
+        saved_listing_run(&workspace, &graph, "saving");
+        let snapshot = snapshot(&workspace, &graph, true);
+        let identity = saved::Identity::new(
+            &workspace.root,
+            snapshot.scope.as_deref(),
+            &snapshot.source_exclusions,
+            snapshot.cache_relative.as_deref(),
+            &snapshot.extra_candidates,
+        );
+        drop(snapshot);
+        let file = identity.file(&workspace.root);
+        let whole = std::fs::read(&file).unwrap();
+        let mut flipped = whole.clone();
+        flipped[whole.len() / 2] ^= 1;
+        for damaged in [&whole[..whole.len() / 2], &flipped[..], &[][..]] {
+            std::fs::write(&file, damaged).unwrap();
+            let (restored, _) = saved_listing_run(&workspace, &graph, "damaged");
+            assert!(!restored);
+            let (restored, _) = saved_listing_run(&workspace, &graph, "replaced");
+            assert!(restored);
+        }
+    }
+
+    #[test]
+    fn a_run_makes_no_state_directory_to_save_its_listing_in() {
+        let (_root, workspace, graph) = fixture(None);
+        std::thread::sleep(Duration::from_millis(2100));
+        let state = paths::worktree_state(&workspace.root);
+        let restored = || {
+            let snapshot = snapshot(&workspace, &graph, true);
+            snapshot.settle();
+            let membership = snapshot.membership.lock().unwrap().clone().unwrap();
+            assert!(membership.settled);
+            membership.restored
+        };
+        // Making it would change the workspace root's stamp while tasks
+        // are keyed: the run saves nothing.
+        assert!(!restored());
+        assert!(!state.exists());
+        assert!(!restored());
+        // Once a run made it, as saving digests does, a run saves there.
+        std::fs::create_dir_all(&state).unwrap();
+        std::thread::sleep(Duration::from_millis(2100));
+        assert!(!restored());
+        assert!(restored());
+    }
+
+    #[test]
+    fn saved_inventories_read_back_as_saved_and_only_for_their_identity() {
+        let (root, workspace, graph) = saved_listing_fixture(true);
+        std::thread::sleep(Duration::from_millis(2100));
+        let snapshot = snapshot(&workspace, &graph, true);
+        snapshot.settle();
+        let membership = snapshot.membership.lock().unwrap().clone().unwrap();
+        assert!(membership.settled);
+        let scope = snapshot.scope.as_deref();
+        let outputs = &snapshot.source_exclusions;
+        let cache = snapshot.cache_relative.as_deref();
+        let none = BTreeSet::new();
+        let identity = saved::Identity::new(root.path(), scope, outputs, cache, &none);
+        let template = || {
+            Membership::empty(
+                root.path(),
+                &snapshot.built_ignore,
+                outputs,
+                cache,
+                snapshot.scope.as_ref(),
+            )
+        };
+        let bytes = saved::encode(&identity, &membership).unwrap();
+        let read = saved::decode(&bytes, &identity, template()).unwrap();
+        assert_eq!(read.files, membership.files);
+        assert!(read.stamps == membership.stamps);
+        assert_eq!(read.directories, membership.directories);
+        assert_eq!(read.directory_entries, membership.directory_entries);
+        assert_eq!(read.policies, membership.policies);
+        assert_eq!(read.git_policies, membership.git_policies);
+        assert_eq!(read.ignore_contents, membership.ignore_contents);
+        assert_eq!(read.stamped, membership.stamped);
+        // Whatever the process was asked to list, with what, makes another
+        // identity, whose file is another.
+        let other_scope = Scope::new(["packages/other".to_owned()]);
+        let other_outputs = vec![Outputs::from_paths(&["packages/app/out".into()]).unwrap()];
+        let negated = vec![
+            Outputs::from_paths(&["packages/app/out".into(), "!packages/app/out/kept".into()])
+                .unwrap(),
+        ];
+        let others = [
+            saved::Identity::new(&root.path().join("packages"), scope, outputs, cache, &none),
+            saved::Identity::new(root.path(), None, outputs, cache, &none),
+            saved::Identity::new(root.path(), Some(&other_scope), outputs, cache, &none),
+            saved::Identity::new(root.path(), scope, &other_outputs, cache, &none),
+            saved::Identity::new(root.path(), scope, &negated, cache, &none),
+            saved::Identity::new(root.path(), scope, outputs, Some(Path::new("other")), &none),
+            saved::Identity::new(
+                root.path(),
+                scope,
+                outputs,
+                cache,
+                &BTreeSet::from(["gone".to_owned()]),
+            ),
+        ];
+        for (index, other) in others.iter().enumerate() {
+            assert!(*other != identity, "{index}");
+            assert!(
+                saved::decode(&bytes, other, template()).is_none(),
+                "{index}"
+            );
+            assert_ne!(
+                other.file(root.path()),
+                identity.file(root.path()),
+                "{index}"
+            );
+        }
+        std::fs::write(root.path().join(".nxignore"), "").unwrap();
+        assert!(saved::Identity::new(root.path(), scope, outputs, cache, &none) != identity);
     }
 }
