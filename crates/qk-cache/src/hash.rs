@@ -312,6 +312,10 @@ const WALKERS: usize = 8;
 /// Threads listing source files when ignore files are read on the way. Past a
 /// few, more threads add system time faster than they save time.
 const LISTERS: usize = 4;
+/// Stamps a thread of [`Membership::state`] looks at at least, so a short
+/// list is not split: a look costs a few microseconds, starting a thread
+/// tens of them.
+const STAMPS_PER_THREAD: usize = 256;
 /// Paths a narrowed listing covers at most. Git matches every file it lists
 /// against each path asked for: in a large monorepo, asking for 256 took
 /// about as long as listing everything, and fewer cost less in proportion.
@@ -707,46 +711,85 @@ impl Membership {
                 }))
             }
         };
-        for (path, before, directory) in paths {
-            let (after, window) = match membership_look(path)? {
-                Some((stamp, window)) => (Some(stamp), window),
-                None => (None, crate::settle::FALLBACK),
-            };
-            let recent = |looked| {
-                after
-                    .as_ref()
-                    .is_some_and(|stamp| !stamp.membership_settled(window, looked))
-            };
-            if let Some(captured) = directory {
-                if after.is_some() && captured.is_none() {
-                    return Ok((false, false));
-                }
-                // Output publication changes its parent's timestamp too. Check
-                // source-relevant names rather than relisting the whole workspace.
-                // Recent directories are always read, even with an equal stamp:
-                // coarse timestamps can conceal an addition or removal.
-                if *before != after || recent(self.stamped) {
-                    let entries = self.entries(path)?;
-                    if entries.as_ref() != captured || membership_stamp(path)? != after {
-                        return Ok((false, false));
-                    }
-                }
-            } else {
-                if (*before != after || recent(self.stamped))
-                    && let Some(content) = self.ignore_contents.get(path)
-                {
-                    if ignore_content(path, &after)?.as_ref() != Some(content) {
-                        return Ok((false, false));
-                    }
-                    continue;
-                }
-                if *before != after {
-                    return Ok((false, false));
-                }
-                settled &= !recent(looked);
+        // Paths are looked at on several threads when there are many: each
+        // look is a system call or a few, which wait apart from each other.
+        // Once one path is found changed, the answer is known and the rest
+        // are passed over.
+        let paths: Vec<Checked> = paths.collect();
+        let changed = AtomicBool::new(false);
+        let verdicts = in_parallel(&paths, STAMPS_PER_THREAD, |(path, before, directory)| {
+            if changed.load(Ordering::Relaxed) {
+                return Ok(Ok(Some(true)));
+            }
+            let verdict = self.check(path, before, *directory, looked);
+            if !matches!(verdict, Ok(Some(_))) {
+                changed.store(true, Ordering::Relaxed);
+            }
+            Ok(verdict)
+        })?;
+        // A path found changed answers whatever another failed with: taking
+        // the inventory again meets that failure where it matters.
+        let mut failure = None;
+        for verdict in verdicts {
+            match verdict {
+                Ok(None) => return Ok((false, false)),
+                Ok(Some(path_settled)) => settled &= path_settled,
+                Err(error) => failure = failure.or(Some(error)),
             }
         }
-        Ok((true, settled))
+        match failure {
+            Some(error) => Err(error),
+            None => Ok((true, settled)),
+        }
+    }
+
+    /// [`Self::state`] of one path, with its stamp `before` and, for a
+    /// directory, the names captured for it if any: `None` when it changed,
+    /// and otherwise whether it had settled by `looked`.
+    fn check(
+        &self,
+        path: &Path,
+        before: &Option<Stamp>,
+        directory: Option<Option<&BTreeSet<(OsString, u8)>>>,
+        looked: SystemTime,
+    ) -> Result<Option<bool>> {
+        let (after, window) = match membership_look(path)? {
+            Some((stamp, window)) => (Some(stamp), window),
+            None => (None, crate::settle::FALLBACK),
+        };
+        let recent = |looked| {
+            after
+                .as_ref()
+                .is_some_and(|stamp| !stamp.membership_settled(window, looked))
+        };
+        if let Some(captured) = directory {
+            if after.is_some() && captured.is_none() {
+                return Ok(None);
+            }
+            // Output publication changes its parent's timestamp too. Check
+            // source-relevant names rather than relisting the whole workspace.
+            // Recent directories are always read, even with an equal stamp:
+            // coarse timestamps can conceal an addition or removal.
+            if *before != after || recent(self.stamped) {
+                let entries = self.entries(path)?;
+                if entries.as_ref() != captured || membership_stamp(path)? != after {
+                    return Ok(None);
+                }
+            }
+            return Ok(Some(true));
+        }
+        if (*before != after || recent(self.stamped))
+            && let Some(content) = self.ignore_contents.get(path)
+        {
+            if ignore_content(path, &after)?.as_ref() != Some(content) {
+                return Ok(None);
+            }
+            return Ok(Some(true));
+        }
+        if *before != after {
+            return Ok(None);
+        }
+        Ok(Some(!recent(looked)))
     }
 
     /// Retain a matched listing and policy for use after releasing the lock.
