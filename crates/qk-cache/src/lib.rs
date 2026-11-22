@@ -15,6 +15,7 @@ mod record;
 pub mod recorded;
 mod remote;
 pub mod scratch;
+mod settle;
 mod store;
 pub mod ultracache;
 mod verified;

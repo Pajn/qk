@@ -242,25 +242,22 @@ pub(crate) fn copy_blob_contents(source: &Path, destination: &Path) -> Result<St
 /// Files a thread looks at at least, so a short list is not split.
 const LOOKED_PER_THREAD: usize = 128;
 
-/// How long before a file is read it must have last changed for its stamp to
-/// tell every later write apart: a write within a timestamp's resolution of
-/// the last can leave its size, times and inode as they were. Two seconds
-/// covers the coarsest timestamps of the filesystems qk runs on.
-const SETTLED: Duration = Duration::from_secs(2);
-
 /// Whether a file with `stamp`, as [`crate::warm::stamp`] makes it, last
-/// changed long enough before `started` that any write since changed its
-/// change time. Only Unix stamps hold a change time, which every write and
-/// replacement sets and no tool sets back; elsewhere nothing is settled.
-fn settled(stamp: &[i64], started: SystemTime) -> bool {
+/// changed more than `window` before `started` that any write since changed
+/// its change time: a write within a timestamp's resolution of the last can
+/// leave its size, times and inode as they were. `window` is the file's
+/// filesystem's, see [`crate::settle::window`]. Only Unix stamps hold a
+/// change time, which every write and replacement sets and no tool sets back;
+/// elsewhere nothing is settled.
+fn settled(stamp: &[i64], started: SystemTime, window: Duration) -> bool {
     let older = |seconds: i64, nanos: i64| {
         seconds >= 0
             && (0..1_000_000_000).contains(&nanos)
-            && started
-                .duration_since(
-                    SystemTime::UNIX_EPOCH + Duration::new(seconds as u64, nanos as u32),
-                )
-                .is_ok_and(|age| age > SETTLED)
+            && crate::settle::older(
+                SystemTime::UNIX_EPOCH + Duration::new(seconds as u64, nanos as u32),
+                window,
+                started,
+            )
     };
     cfg!(unix)
         && stamp.len() == 6
@@ -534,7 +531,7 @@ impl Cache {
                 }
                 None => {
                     let blob = blobs.next().expect("output blob result")?;
-                    if settled(&stamp, started) {
+                    if settled(&stamp, started, crate::settle::window(&absolute, &metadata)) {
                         read.push((path.clone(), absolute, stamp, blob.clone()));
                     }
                     blob
@@ -1562,7 +1559,19 @@ mod tests {
     /// settled.
     fn publish_later(cache: &Cache, root: &Path, key: &str, outputs: &Outputs, log: &Path) {
         let later = SystemTime::now() + Duration::from_secs(3600);
-        let artifacts = cache.gather_at(root, outputs, later).unwrap();
+        publish_at(cache, root, key, outputs, log, later);
+    }
+
+    /// Publishes as if it started at `started`.
+    fn publish_at(
+        cache: &Cache,
+        root: &Path,
+        key: &str,
+        outputs: &Outputs,
+        log: &Path,
+        started: SystemTime,
+    ) {
+        let artifacts = cache.gather_at(root, outputs, started).unwrap();
         cache.publish_gathered(key, &artifacts, log).unwrap();
     }
 
@@ -1579,15 +1588,42 @@ mod tests {
                 7,
             ]
         };
-        assert_eq!(settled(&stamp(999_990, 999_990), started), cfg!(unix));
-        // Changed within the resolution of the coarsest timestamps.
-        assert!(!settled(&stamp(999_990, 999_999), started));
-        assert!(!settled(&stamp(999_999, 999_990), started));
+        let fallback = crate::settle::FALLBACK;
+        assert_eq!(
+            settled(&stamp(999_990, 999_990), started, fallback),
+            cfg!(unix)
+        );
+        // Changed within the two seconds of the coarsest timestamps.
+        assert!(!settled(&stamp(999_990, 999_999), started, fallback));
+        assert!(!settled(&stamp(999_999, 999_990), started, fallback));
+        // A filesystem with a shorter window settles them a second on, and
+        // not within that window.
+        let short = Duration::from_millis(10);
+        assert_eq!(
+            settled(&stamp(999_999, 999_999), started, short),
+            cfg!(unix)
+        );
+        let just = started - Duration::from_millis(5);
+        let within = |modified: SystemTime, changed: SystemTime| {
+            let since = |time: SystemTime| time.duration_since(SystemTime::UNIX_EPOCH).unwrap();
+            vec![
+                4,
+                since(modified).as_nanos() as i64,
+                0o644,
+                since(changed).as_secs() as i64,
+                i64::from(since(changed).subsec_nanos()),
+                7,
+            ]
+        };
+        let old = started - Duration::from_secs(10);
+        assert_eq!(settled(&within(old, old), started, short), cfg!(unix));
+        assert!(!settled(&within(just, old), started, short));
+        assert!(!settled(&within(old, just), started, short));
         // Times after the publish began, as a clock set back leaves them.
-        assert!(!settled(&stamp(1_000_005, 999_990), started));
-        assert!(!settled(&stamp(999_990, 1_000_005), started));
+        assert!(!settled(&stamp(1_000_005, 999_990), started, short));
+        assert!(!settled(&stamp(999_990, 1_000_005), started, short));
         // A stamp without a change time.
-        assert!(!settled(&[4, 999_990_000_000_000, 0o644], started));
+        assert!(!settled(&[4, 999_990_000_000_000, 0o644], started, short));
     }
 
     #[test]
@@ -1630,7 +1666,13 @@ mod tests {
         let root = temp.path();
         let log = root.join("log");
         let first = "a".repeat(64);
-        cache.publish(root, &first, &outputs, &log).unwrap();
+        // Published as the first file was written, within any filesystem's
+        // window of every one, whatever the time this test takes to get here.
+        let written = fs::symlink_metadata(root.join("out/nested/kept"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        publish_at(&cache, root, &first, &outputs, &log, written);
         // Written within a timestamp's resolution of the read, the files'
         // stamps cannot tell a later write, so neither is remembered.
         let published: Published = fs::read(Published::path(root, &outputs))

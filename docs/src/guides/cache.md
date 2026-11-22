@@ -204,7 +204,20 @@ root `.nxignore` can list them; a run of such tasks alone then takes no source
 list, unless a sandbox, input analysis or Ultracache's recordings need one. File contents are re-read whenever their metadata changes; their
 digests persist between runs in the worktree's state, keyed by
 path, size, modification time and, on Unix, change time, inode and mode, so a
-warm run reads only files whose metadata changed. Without
+warm run reads only files whose metadata changed.
+Two writes close enough together can be given the same times, so a digest is
+kept only for a file whose times were older than its filesystem's timestamp
+window when it was read; a file that changed more recently is read again. The
+window is 10 ms on APFS on macOS, and 100 ms on ext4, XFS, Btrfs and tmpfs on
+Linux, which store nanoseconds taken from a clock that advances at least once
+per kernel tick. Everywhere else it is two seconds, which covers FAT: on
+network filesystems, whose times come from another machine's clock; on FUSE,
+9p, virtiofs and overlay filesystems, whose times are only as fine as what
+lies beneath; on Windows; and for any file whose times hold no fraction of a
+second. The same window decides how long a directory or listing policy that
+just changed, such as a file under `.git`, keeps the workspace's file list
+from being reused.
+Without
 `inputs`, a task uses `default` and `^default`; `default` is
 `{projectRoot}/**/*` unless a named input overrides it. As in Nx, a
 project's filesets select only the files it owns, leaving out those of
@@ -321,9 +334,9 @@ saved, and the entry naming them is written once the recheck finds the inputs
 unchanged. An output file whose size, times, inode and mode are what they were
 when the worktree last stored it, since the machine started, keeps that blob
 without being read again. A file is remembered only when it had last changed
-more than two seconds before it was read and did not change while it was
-read: a write within a timestamp's resolution can leave all of these as they
-were.
+more than its filesystem's timestamp window, described under
+[Inputs](#inputs), before it was read, and did not change while it was read: a
+write within that window can leave all of these as they were.
 On a hit, qk removes existing files matching the declared outputs, copies the
 cached outputs into place and replays the recorded stdout and stderr. As in
 Nx, outputs a worktree already holds for the key are left as they are: after

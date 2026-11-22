@@ -64,43 +64,48 @@ impl Stamp {
         Self(values)
     }
 
-    /// Membership stamps also use change time: restoring a directory's mtime
-    /// must not allow changes inside a coarse timestamp window to go unnoticed.
-    fn membership_settled(&self) -> bool {
+    /// Whether a membership stamp, with the stamp of a symlink's target after
+    /// its own, was older than `window` at `looked`: see [`Self::settled`].
+    fn membership_settled(&self, window: Duration, looked: SystemTime) -> bool {
         #[cfg(unix)]
         let width = 6;
         #[cfg(not(unix))]
         let width = 2;
-        self.0.chunks_exact(width).all(|values| {
-            let modified = SystemTime::UNIX_EPOCH + Duration::from_nanos(values[1].max(0) as u64);
-            let settled = |time| {
-                SystemTime::now()
-                    .duration_since(time)
-                    .is_ok_and(|age| age > Duration::from_secs(2))
-            };
-            if values[1] < 0 || !settled(modified) {
-                return false;
-            }
-            #[cfg(unix)]
-            {
-                let changed = SystemTime::UNIX_EPOCH
-                    + Duration::new(values[2].max(0) as u64, values[3].max(0) as u32);
-                values[2] >= 0 && settled(changed)
-            }
-            #[cfg(not(unix))]
-            true
-        })
+        self.0
+            .chunks_exact(width)
+            .all(|values| times_settled(values, window, looked))
     }
 
-    /// A file written within the timestamp resolution window could change again
-    /// without changing its stamp, so recent files are always re-read.
-    fn settled(&self) -> bool {
+    /// Whether this stamp's modification time is more than `window`, as
+    /// [`crate::settle::window`] gives it for the file's filesystem, before
+    /// `looked`, a time taken before the file was read: a write within the
+    /// window of the last could leave the stamp as it was, so a file that
+    /// changed more recently is always read again.
+    fn settled(&self, window: Duration, looked: SystemTime) -> bool {
         let modified = SystemTime::UNIX_EPOCH + Duration::from_nanos(self.0[1].max(0) as u64);
-        self.0[1] >= 0
-            && SystemTime::now()
-                .duration_since(modified)
-                .is_ok_and(|age| age > Duration::from_secs(2))
+        self.0[1] >= 0 && crate::settle::older(modified, window, looked)
     }
+}
+
+/// Whether both times of one file's membership stamp are more than `window`
+/// before `looked`: restoring a directory's modification time must not let
+/// changes within the window go unnoticed.
+fn times_settled(values: &[i64], window: Duration, looked: SystemTime) -> bool {
+    let modified = SystemTime::UNIX_EPOCH + Duration::from_nanos(values[1].max(0) as u64);
+    if values[1] < 0 || !crate::settle::older(modified, window, looked) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        let changed = SystemTime::UNIX_EPOCH
+            + Duration::new(
+                values[2].max(0) as u64,
+                values[3].clamp(0, 999_999_999) as u32,
+            );
+        values[2] >= 0 && crate::settle::older(changed, window, looked)
+    }
+    #[cfg(not(unix))]
+    true
 }
 
 /// Digests persisted between runs in the worktree's state, keyed by path and
@@ -193,6 +198,9 @@ struct Membership {
     settled: bool,
     /// When the refresh that produced this inventory began listing.
     listed: Option<Instant>,
+    /// When this inventory began taking its stamps, before any of them: what
+    /// it captured holds only if its stamps had settled by then.
+    stamped: SystemTime,
 }
 
 /// A candidate listing and the ignore policy captured with it. Keeping both
@@ -249,6 +257,7 @@ impl Membership {
                     .push(index);
             }
         }
+        let stamped = SystemTime::now();
         let mut membership = Self {
             files: Arc::new(BTreeSet::new()),
             source_ignore: source_ignore.clone(),
@@ -269,6 +278,7 @@ impl Membership {
             ignore_contents: BTreeMap::new(),
             settled: false,
             listed: None,
+            stamped,
         };
         // Finding Git's own policy files takes several Git processes, which
         // run while the directories are read. They are stamped as soon as
@@ -525,9 +535,12 @@ impl Membership {
     }
 
     /// Check source-relevant directory membership and every listing policy.
-    /// Recent directory stamps require fresh entry names; recent ignore files
-    /// require matching contents, while other listing policies must settle.
-    fn state(&self, prefixes: Option<&[PathBuf]>) -> Result<(bool, bool)> {
+    /// Directories and ignore files whose stamps were recent when this
+    /// inventory stamped them require fresh entry names and matching contents:
+    /// what it captured may predate a change their stamps do not show. Other
+    /// listing policies must have settled by `looked`, a time taken before
+    /// they are stamped again, for the result to say they have.
+    fn state(&self, prefixes: Option<&[PathBuf]>, looked: SystemTime) -> Result<(bool, bool)> {
         let mut settled = true;
         let selected = prefixes.map(|prefixes| {
             let mut selected = BTreeSet::new();
@@ -588,7 +601,15 @@ impl Membership {
             }
         };
         for (path, before, directory) in paths {
-            let after = membership_stamp(path)?;
+            let (after, window) = match membership_look(path)? {
+                Some((stamp, window)) => (Some(stamp), window),
+                None => (None, crate::settle::FALLBACK),
+            };
+            let recent = |looked| {
+                after
+                    .as_ref()
+                    .is_some_and(|stamp| !stamp.membership_settled(window, looked))
+            };
             if let Some(captured) = directory {
                 if after.is_some() && captured.is_none() {
                     return Ok((false, false));
@@ -597,21 +618,14 @@ impl Membership {
                 // source-relevant names rather than relisting the whole workspace.
                 // Recent directories are always read, even with an equal stamp:
                 // coarse timestamps can conceal an addition or removal.
-                if *before != after
-                    || after
-                        .as_ref()
-                        .is_some_and(|stamp| !stamp.membership_settled())
-                {
+                if *before != after || recent(self.stamped) {
                     let entries = self.entries(path)?;
                     if entries.as_ref() != captured || membership_stamp(path)? != after {
                         return Ok((false, false));
                     }
                 }
             } else {
-                let recent = after
-                    .as_ref()
-                    .is_some_and(|stamp| !stamp.membership_settled());
-                if (*before != after || recent)
+                if (*before != after || recent(self.stamped))
                     && let Some(content) = self.ignore_contents.get(path)
                 {
                     if ignore_content(path, &after)?.as_ref() != Some(content) {
@@ -622,7 +636,7 @@ impl Membership {
                 if *before != after {
                     return Ok((false, false));
                 }
-                settled &= !recent;
+                settled &= !recent(looked);
             }
         }
         Ok((true, settled))
@@ -648,7 +662,7 @@ impl Membership {
         self.files = Arc::new(files);
         // An unstable inventory or recent policy never enables the fast path.
         // Keep candidates so a rebuild also watches tracked, ignored parents.
-        self.settled = rebuilt && self.covers(&self.files) && self.state(None)?.1;
+        self.settled = rebuilt && self.covers(&self.files) && self.state(None, self.stamped)?.1;
         Ok(())
     }
 
@@ -772,19 +786,34 @@ fn ignore_content(path: &Path, expected: &Option<Stamp>) -> Result<Option<String
 
 /// Stamp a directory or listing policy, including a symlink's resolved target.
 fn membership_stamp(path: &Path) -> Result<Option<Stamp>> {
+    Ok(membership_look(path)?.map(|(stamp, _)| stamp))
+}
+
+/// [`membership_stamp`], with the window of [`crate::settle::window`] that
+/// covers each file it stamps.
+fn membership_look(path: &Path) -> Result<Option<(Stamp, Duration)>> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
             let mut stamp = Stamp::new(&metadata);
+            let mut window = crate::settle::window(path, &metadata);
             if metadata.is_symlink() {
                 // Follow the current chain on every check. In-place target
                 // edits or retargeted intermediate links can change policy.
                 match std::fs::metadata(path) {
-                    Ok(target) => stamp.0.extend(Stamp::new(&target).0),
+                    Ok(target) => {
+                        stamp.0.extend(Stamp::new(&target).0);
+                        // Asked of the target's own filesystem, which holds a
+                        // regular file or directory and is not followed again.
+                        window = window.max(match std::fs::canonicalize(path) {
+                            Ok(resolved) => crate::settle::window(&resolved, &target),
+                            Err(_) => crate::settle::FALLBACK,
+                        });
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => stamp.0[1] = -1,
                     Err(error) => return Err(error.into()),
                 }
             }
-            Ok(Some(stamp))
+            Ok(Some((stamp, window)))
         }
         Err(error)
             if matches!(
@@ -1326,7 +1355,7 @@ impl Snapshot {
             // Immutable entries let independent fingerprints validate their
             // directory stamps concurrently. Only a refresh needs serialization.
             let (unchanged, settled) = match &previous {
-                Some(entry) => entry.state(prefixes)?,
+                Some(entry) => entry.state(prefixes, SystemTime::now())?,
                 None => (false, false),
             };
             if settled && previous.as_ref().unwrap().settled {
@@ -1514,10 +1543,13 @@ impl Snapshot {
         {
             return Ok(digest.clone());
         }
+        // Before reading: a write the window lets keep the stamp, made while
+        // the file is read or after, would leave a digest of other contents.
+        let reading = SystemTime::now();
         let digest = digest_file(absolute)?;
         // Re-check after reading so a concurrent write is never recorded as settled.
         let after = Stamp::new(&std::fs::symlink_metadata(absolute)?);
-        if after == stamp && stamp.settled() {
+        if after == stamp && stamp.settled(crate::settle::window(absolute, metadata), reading) {
             self.digests
                 .lock()
                 .unwrap()
@@ -4282,7 +4314,7 @@ mod tests {
         assert!(membership.files.contains("src/renamed"));
         assert!(!membership.files.contains("src/original"));
         assert!(!membership.settled);
-        assert!(!membership.state(None).unwrap().0);
+        assert!(!membership.state(None, SystemTime::now()).unwrap().0);
     }
 
     #[test]
@@ -4364,7 +4396,7 @@ mod tests {
         snapshot.current_files(root.path()).unwrap();
         let membership = snapshot.membership.lock().unwrap().clone().unwrap();
         std::fs::write(&policy, "bravo\n").unwrap();
-        assert!(!membership.state(None).unwrap().0);
+        assert!(!membership.state(None, SystemTime::now()).unwrap().0);
     }
 
     #[test]
@@ -4383,7 +4415,7 @@ mod tests {
             .unwrap()
             .insert((OsString::from("new-empty"), 1));
         assert!(membership.entries(root.path()).unwrap().is_none());
-        assert!(!membership.state(None).unwrap().0);
+        assert!(!membership.state(None, SystemTime::now()).unwrap().0);
     }
 
     #[test]
@@ -4402,7 +4434,7 @@ mod tests {
             .unwrap()
             .insert((OsString::from(".nxignore"), 0));
         assert!(membership.entries(root.path()).unwrap().is_none());
-        assert!(!membership.state(None).unwrap().0);
+        assert!(!membership.state(None, SystemTime::now()).unwrap().0);
     }
 
     #[test]
@@ -4875,6 +4907,11 @@ mod tests {
         std::fs::write(policy.path(), "hidden\n").unwrap();
         std::os::unix::fs::symlink(policy.path(), root.path().join(".gitignore")).unwrap();
         std::fs::write(root.path().join("hidden"), "source").unwrap();
+        let written = Instant::now();
+        let window = crate::settle::window(
+            policy.path(),
+            &std::fs::symlink_metadata(policy.path()).unwrap(),
+        );
         let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
         assert!(
             !snapshot
@@ -4882,15 +4919,16 @@ mod tests {
                 .unwrap()
                 .contains("hidden")
         );
-        assert!(
-            !snapshot
-                .membership
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .settled
-        );
+        // Listed within the policy's window of its write, as a slow machine
+        // can miss on the shortest windows, the listing is not reused.
+        let unsettled = !snapshot
+            .membership
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .settled;
+        assert!(unsettled || written.elapsed() >= window);
         std::thread::sleep(Duration::from_millis(2100));
         let before = snapshot.current_files(root.path()).unwrap();
         assert!(Arc::ptr_eq(
@@ -4971,9 +5009,116 @@ mod tests {
             .unwrap();
         let metadata = std::fs::metadata(root.path()).unwrap();
         assert!(metadata.ctime() > 1);
+        let changed = SystemTime::UNIX_EPOCH
+            + Duration::new(metadata.ctime() as u64, metadata.ctime_nsec() as u32);
         let stamp = Stamp::new(&metadata);
-        assert!(stamp.settled());
-        assert!(!stamp.membership_settled());
+        let window = crate::settle::window(root.path(), &metadata);
+        for looked in [changed, changed + window] {
+            assert!(stamp.settled(window, looked));
+            assert!(!stamp.membership_settled(window, looked));
+        }
+        let later = changed + window + Duration::from_millis(1);
+        assert!(stamp.membership_settled(window, later));
+    }
+
+    /// A file's stamp is trusted once both its times are older than its
+    /// filesystem's window, and not within it, whatever that window is.
+    #[test]
+    fn a_stamp_settles_after_its_filesystems_window() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("file");
+        std::fs::write(&path, "same").unwrap();
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        #[allow(unused_mut)]
+        let mut newest = metadata.modified().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            newest = newest.max(
+                SystemTime::UNIX_EPOCH
+                    + Duration::new(metadata.ctime() as u64, metadata.ctime_nsec() as u32),
+            );
+        }
+        let stamp = Stamp::new(&metadata);
+        for window in [
+            crate::settle::window(&path, &metadata),
+            crate::settle::FALLBACK,
+            Duration::from_millis(10),
+        ] {
+            assert!(!stamp.settled(window, newest));
+            assert!(!stamp.settled(window, newest + window / 2));
+            assert!(stamp.settled(window, newest + window + Duration::from_millis(1)));
+        }
+    }
+
+    /// A file rewritten with as many bytes inside its filesystem's window of
+    /// the last write is read again: its digest was not kept.
+    #[test]
+    fn a_same_size_rewrite_within_the_window_is_read_again() {
+        let (root, workspace, graph) =
+            literal_fixture(false, true, json!(["{workspaceRoot}/config.yaml"]));
+        let path = root.path().join("config.yaml");
+        let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
+        std::fs::write(&path, "first").unwrap();
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        let window = crate::settle::window(&path, &metadata);
+        let before = Instant::now();
+        let first = snapshot.digest("config.yaml", &path, &metadata).unwrap();
+        assert_eq!(first, digest_file(&path).unwrap());
+        // Only meaningful where both looks fell inside the window, which a
+        // slow machine can miss on the shortest windows.
+        let kept = snapshot.digests.lock().unwrap().contains_key("config.yaml");
+        if before.elapsed() < window {
+            assert!(!kept);
+        }
+        std::fs::write(&path, "again").unwrap();
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        let second = snapshot.digest("config.yaml", &path, &metadata).unwrap();
+        if before.elapsed() < window {
+            assert_eq!(second, digest_file(&path).unwrap());
+        }
+        // Past the window, a file's digest is kept, and taken for its stamp.
+        settle(&path);
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        snapshot.digest("config.yaml", &path, &metadata).unwrap();
+        assert!(snapshot.digests.lock().unwrap().contains_key("config.yaml"));
+    }
+
+    /// A listing taken once every directory and policy is older than its
+    /// filesystem's window is reused, and one taken within it is not.
+    #[test]
+    fn a_listing_is_reused_once_its_filesystems_window_has_passed() {
+        let (root, workspace, graph) = fixture(Some(json!(["{projectRoot}/dist"])));
+        std::fs::write(root.path().join(".gitignore"), "ignored/\n").unwrap();
+        let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
+        snapshot.current_files(root.path()).unwrap();
+        settle(&root.path().join(".gitignore"));
+        settle(root.path());
+        // The first look past the window stamps the inventory again.
+        let settled = snapshot.current_files(root.path()).unwrap();
+        assert!(
+            snapshot
+                .membership
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .settled
+        );
+        assert!(Arc::ptr_eq(
+            &settled,
+            &snapshot.current_files(root.path()).unwrap()
+        ));
+        // A policy rewritten with as many bytes is read again.
+        std::fs::write(root.path().join(".gitignore"), "src/xxxx\n").unwrap();
+        let changed = snapshot.current_files(root.path()).unwrap();
+        assert!(!Arc::ptr_eq(&settled, &changed));
+    }
+
+    /// Waits until a file just written is older than its filesystem's window.
+    fn settle(path: &Path) {
+        let metadata = std::fs::symlink_metadata(path).unwrap();
+        std::thread::sleep(crate::settle::window(path, &metadata) + Duration::from_millis(20));
     }
 
     #[test]
@@ -5173,13 +5318,7 @@ mod tests {
         std::fs::create_dir(root.path().join("generated")).unwrap();
         std::fs::write(root.path().join("generated/schema.json"), "{}").unwrap();
         // Digests are only saved for files old enough to have settled.
-        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
-        std::fs::File::options()
-            .write(true)
-            .open(root.path().join("generated/schema.json"))
-            .unwrap()
-            .set_times(std::fs::FileTimes::new().set_modified(old))
-            .unwrap();
+        settle(&root.path().join("generated/schema.json"));
         let git = |args: &[&str]| assert!(paths::git(root.path(), args).unwrap().status.success());
         git(&["init", "--quiet"]);
         let workspace = Workspace::load(root.path()).unwrap();
@@ -5602,13 +5741,7 @@ mod tests {
     fn unlisted_runs_keep_saved_digests() {
         let (root, workspace, graph) =
             literal_fixture(false, true, json!(["{workspaceRoot}/config.yaml"]));
-        let old = std::time::SystemTime::now() - Duration::from_secs(60);
-        std::fs::File::options()
-            .write(true)
-            .open(root.path().join("config.yaml"))
-            .unwrap()
-            .set_times(std::fs::FileTimes::new().set_modified(old))
-            .unwrap();
+        settle(&root.path().join("config.yaml"));
         let path = digests_path(root.path());
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
