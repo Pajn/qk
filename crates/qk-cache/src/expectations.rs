@@ -13,13 +13,19 @@
 //! history makes of its own. `QK_REMOTE_EXPECTATIONS` narrows what a run may
 //! do with them: `read` reads them without adding to them, and `off` leaves
 //! them alone.
+//!
+//! What a fetch gives is saved in the local cache, for the branches it was
+//! fetched for, so that the next run can start from it at once rather than
+//! wait for the store, while its own fetch refreshes the copy. A copy older
+//! than a day is not used.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use qk_config::Workspace;
 use serde::{Deserialize, Serialize};
@@ -195,28 +201,92 @@ fn remote(
 /// A fetch of the expectations the remote store holds, running beside
 /// whatever the run does until it needs them. Dropped unwaited, as when local
 /// history has every task, it is left to end on its own, and says nothing:
-/// the run does not wait for a fetch whose answer it does not need.
-pub struct Fetching(Option<(JoinHandle<Expected>, Arc<AtomicBool>)>);
+/// the run does not wait for a fetch whose answer it does not need. Either
+/// way, what it fetches is saved for the next run: see [`Fetching::wait`].
+pub struct Fetching(Option<Running>);
+
+struct Running {
+    fetch: JoinHandle<Expected>,
+    wanted: Arc<AtomicBool>,
+    /// Where the cache is and the branches fetched for, once the fetch's
+    /// thread has asked Git, which tells where the last fetch's copy is.
+    saved: mpsc::Receiver<PathBuf>,
+}
 
 /// What each task is expected to take, by its id.
 type Expected = BTreeMap<String, Expectation>;
 
+/// How old a saved copy of the store's expectations may be and still be
+/// used rather than waited for.
+const SAVED_FOR: Duration = Duration::from_secs(24 * 60 * 60);
+
 impl Fetching {
-    /// What each task is expected to take, once the fetch has ended.
+    /// What each task is expected to take: what the fetch gave, when it has
+    /// ended; else what the last fetch for the same branches gave, saved in
+    /// the cache, when that is under a day old, so the run need not wait for
+    /// the store; else what the fetch gives once it ends. A fetch that ends
+    /// saves what it gave in place of the copy, for the next run, whether or
+    /// not this one waited for it; one that fails leaves the copy as it was
+    /// and gives it, when it is under a day old, however soon it failed.
     pub fn wait(mut self) -> BTreeMap<String, Expectation> {
-        self.0
-            .take()
-            .and_then(|(fetch, _)| fetch.join().ok())
-            .unwrap_or_default()
+        let Some(running) = self.0.take() else {
+            return BTreeMap::new();
+        };
+        if !running.fetch.is_finished()
+            && let Ok(path) = running.saved.recv()
+            && let Some(saved) = load(&path, SystemTime::now())
+        {
+            // The fetch goes on to refresh the copy; whatever stops it is
+            // the next run's to report.
+            running.wanted.store(false, Ordering::Relaxed);
+            return saved;
+        }
+        running.fetch.join().unwrap_or_default()
     }
 }
 
 impl Drop for Fetching {
     fn drop(&mut self) {
-        if let Some((_, wanted)) = self.0.take() {
-            wanted.store(false, Ordering::Relaxed);
+        if let Some(running) = self.0.take() {
+            running.wanted.store(false, Ordering::Relaxed);
         }
     }
+}
+
+/// Where the copy of the expectations fetched for `branches`, in order, is
+/// saved in the cache at `root`.
+fn saved_path(root: &Path, branches: &[String]) -> PathBuf {
+    root.join("expectations")
+        .join(remote::expectations_name(&branches.join("\0")))
+}
+
+/// The copy saved at `path`, when there is one that can be read and it was
+/// saved within [`SAVED_FOR`] of `now`.
+fn load(path: &Path, now: SystemTime) -> Option<Expected> {
+    let file = std::fs::File::open(path).ok()?;
+    let saved = file.metadata().ok()?.modified().ok()?;
+    if now.duration_since(saved).unwrap_or_default() > SAVED_FOR {
+        return None;
+    }
+    serde_json::from_reader(std::io::BufReader::new(file)).ok()
+}
+
+/// Saves `expected` as the copy at `path`, in the cache at `root`, or removes
+/// the copy when the store holds nothing: whole or not at all, since another
+/// run can read it at any moment.
+fn save(root: &Path, path: &Path, expected: Option<&Expected>) -> std::io::Result<()> {
+    let Some(expected) = expected else {
+        return match std::fs::remove_file(path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        };
+    };
+    std::fs::create_dir_all(root.join("tmp"))?;
+    std::fs::create_dir_all(path.parent().expect("a copy is in a directory"))?;
+    let mut file = tempfile::NamedTempFile::new_in(root.join("tmp"))?;
+    serde_json::to_writer(std::io::BufWriter::new(file.as_file_mut()), expected)?;
+    file.persist(path).map_err(|error| error.error)?;
+    Ok(())
 }
 
 /// Starts fetching what each task is expected to take from the record the
@@ -235,23 +305,48 @@ pub fn fetch(workspace: &Workspace, environment: &BTreeMap<OsString, OsString>) 
     let Some(remote) = remote(workspace, environment) else {
         return Fetching(None);
     };
-    let root = paths::cache_location(workspace);
-    let branches = warm::branches(workspace);
+    // Where the cache is and which branch is checked out are asked of Git on
+    // the fetch's thread, so the run does not wait for Git to start.
+    let configured = paths::configured_cache_location(workspace);
+    let workspace_root = workspace.root.clone();
+    let default = warm::default_branch(workspace);
     let wanted = Arc::new(AtomicBool::new(true));
+    let (send_saved, saved) = mpsc::channel();
     let fetch = std::thread::spawn({
         let wanted = wanted.clone();
-        move || match remote.fetch_usable_expectations(&root, &branches) {
-            Ok(Some((bytes, branch))) => read(&bytes, &branch),
-            Ok(None) => BTreeMap::new(),
-            Err(error) => {
-                if wanted.load(Ordering::Relaxed) {
-                    qk_executor::status!("qk: remote task expectations unavailable ({error:#})");
+        move || {
+            let root = configured.unwrap_or_else(|| paths::cache_directory(&workspace_root));
+            let branches = warm::branches_at(&workspace_root, default);
+            let path = saved_path(&root, &branches);
+            let _ = send_saved.send(path.clone());
+            let fetched = match remote.fetch_usable_expectations(&root, &branches) {
+                Ok(Some((bytes, branch))) => Some(read(&bytes, &branch)),
+                Ok(None) => None,
+                Err(error) => {
+                    if wanted.load(Ordering::Relaxed) {
+                        qk_executor::status!(
+                            "qk: remote task expectations unavailable ({error:#})"
+                        );
+                    }
+                    // A run that finds the fetch already ended takes what it
+                    // returns, so a store that failed at once still leaves
+                    // the run the copy it would have started from.
+                    return load(&path, SystemTime::now()).unwrap_or_default();
                 }
-                BTreeMap::new()
+            };
+            if let Err(error) = save(&root, &path, fetched.as_ref())
+                && wanted.load(Ordering::Relaxed)
+            {
+                qk_executor::status!("qk: could not save remote task expectations: {error}");
             }
+            fetched.unwrap_or_default()
         }
     });
-    Fetching(Some((fetch, wanted)))
+    Fetching(Some(Running {
+        fetch,
+        wanted,
+        saved,
+    }))
 }
 
 /// Adds each task's run in `runs` to the record the remote store holds, and
@@ -300,6 +395,23 @@ mod tests {
             cores: 2,
             memory,
         }
+    }
+
+    #[test]
+    fn a_saved_copy_is_used_for_a_day() {
+        let root = tempfile::tempdir().unwrap();
+        let branches = ["feature".to_owned(), "main".to_owned()];
+        let path = saved_path(root.path(), &branches);
+        assert_ne!(path, saved_path(root.path(), &branches[1..]));
+        let expected: Expected = [("app:a".to_owned(), run(10, Some(3)))].into();
+        save(root.path(), &path, Some(&expected)).unwrap();
+        let now = SystemTime::now();
+        assert_eq!(load(&path, now), Some(expected));
+        assert_eq!(load(&path, now + SAVED_FOR + Duration::from_secs(60)), None);
+        // A store that holds nothing for the branches removes it.
+        save(root.path(), &path, None).unwrap();
+        assert_eq!(load(&path, now), None);
+        save(root.path(), &path, None).unwrap();
     }
 
     #[test]

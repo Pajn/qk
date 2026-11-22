@@ -36,6 +36,9 @@ pub(super) struct Server {
     /// Whether the server answered `POST blobs/fetch` with `404`, as one that
     /// sends blobs only one each.
     fetches_one_each: AtomicBool,
+    /// Whether the server answered `POST pathsets/fetch` with `404`, as one
+    /// that sends path sets only one weak key each.
+    path_sets_one_each: AtomicBool,
 }
 
 /// The store server `config`, nx.json's `qk:storeServer` object, names, with its
@@ -59,6 +62,7 @@ pub(super) fn configure(
         session: OnceLock::new(),
         sessioning: Mutex::new(None),
         fetches_one_each: AtomicBool::new(false),
+        path_sets_one_each: AtomicBool::new(false),
     })
 }
 
@@ -108,15 +112,7 @@ impl Server {
             .get(self.url(path))
             .header("Authorization", self.authorization())
             .call()?;
-        // What of the wait the server spent, as it says: the rest is the
-        // network and what is in front of it.
-        if let Some(timing) = response
-            .headers()
-            .get("server-timing")
-            .and_then(|value| value.to_str().ok())
-        {
-            waiting.note("server", timing);
-        }
+        timed(&mut waiting, &response);
         drop(waiting);
         match response.status().as_u16() {
             200 => Ok(Some(Box::new(io::BufReader::new(
@@ -198,10 +194,20 @@ impl Store for Server {
 
     fn get(&self, object: Object, task: &str) -> Result<Option<Body>> {
         let mut path = self.path(object);
-        if !matches!(object, Object::Blob(_))
-            && let Some(session) = self.session()
-        {
-            path.push_str(&format!("?session={session}"));
+        // Path sets and expectations are records citing no blob, so the
+        // session has nothing to leave out of them, and they are not held up
+        // until it is made.
+        let cites_blobs = !matches!(
+            object,
+            Object::Blob(_) | Object::PathSets(_) | Object::Expectations(_)
+        );
+        if cites_blobs {
+            let waiting = crate::profile::span(task, "remote_session_wait");
+            let session = self.session();
+            drop(waiting);
+            if let Some(session) = session {
+                path.push_str(&format!("?session={session}"));
+            }
         }
         self.read(&path, task)
     }
@@ -311,6 +317,31 @@ impl Store for Server {
         }
     }
 
+    fn get_path_sets(&self, weak: &[String], task: &str) -> Result<Option<Body>> {
+        if self.path_sets_one_each.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let mut waiting = crate::profile::span(task, "remote_response");
+        let response = self
+            .agent
+            .post(self.url("pathsets/fetch"))
+            .header("Authorization", self.authorization())
+            .header("Content-Type", "application/json")
+            .send(serde_json::json!({ "weak": weak }).to_string())?;
+        timed(&mut waiting, &response);
+        drop(waiting);
+        match response.status().as_u16() {
+            200 => Ok(Some(Box::new(io::BufReader::new(
+                response.into_body().into_reader(),
+            )))),
+            404 => {
+                self.path_sets_one_each.store(true, Ordering::Relaxed);
+                Ok(None)
+            }
+            _ => Err(failure("POST pathsets/fetch", response)),
+        }
+    }
+
     fn blobs_held(&self, blobs: &[String]) -> Result<Option<Held>> {
         let mut held = Held::default();
         for asked in blobs.chunks(MISSING_QUERY) {
@@ -398,6 +429,18 @@ impl Store for Server {
             200..=299 => Ok(()),
             _ => Err(failure("POST runs", response)),
         }
+    }
+}
+
+/// Notes on `waiting` what of the wait the server spent, as `response` says:
+/// the rest is the network and what is in front of it.
+fn timed(waiting: &mut crate::profile::Span<'_>, response: &ureq::http::Response<ureq::Body>) {
+    if let Some(timing) = response
+        .headers()
+        .get("server-timing")
+        .and_then(|value| value.to_str().ok())
+    {
+        waiting.note("server", timing);
     }
 }
 
@@ -504,6 +547,68 @@ mod tests {
         assert_eq!(
             format!("{error:#}"),
             "POST sessions returned 503: the store could not answer; try again"
+        );
+    }
+
+    /// A server at the URL `answer_once` gives.
+    fn server_at(url: &str) -> Server {
+        let base = url.trim_end_matches("/v4/sessions");
+        configure(&serde_json::json!({ "url": base }), |name| {
+            (name == "QK_STORE_SERVER_TOKEN").then(|| "t".to_owned())
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_server_without_many_path_sets_at_once_is_asked_one_each_from_then_on() {
+        let body = r#"{"error":"not_found","message":"no such request"}"#;
+        let answer = format!(
+            "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let server = server_at(&answer_once(answer));
+        let weak = ["a".repeat(64)];
+        assert!(server.get_path_sets(&weak, "run").unwrap().is_none());
+        // Not asked again: the one answer it gives was given.
+        assert!(server.get_path_sets(&weak, "run").unwrap().is_none());
+    }
+
+    #[test]
+    fn many_path_sets_at_once_are_the_answer_the_server_gives() {
+        let mut body = b"qks1".to_vec();
+        body.extend_from_slice(&1u32.to_le_bytes());
+        // Bytes that are text too, as `answer_once` sends text.
+        body.extend_from_slice(&[0x11; 32]);
+        body.extend_from_slice(&0u64.to_le_bytes());
+        let mut answer =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+        answer.extend_from_slice(&body);
+        let server = server_at(&answer_once(String::from_utf8(answer).unwrap()));
+        let weak = ["11".repeat(32)];
+        let mut received = Vec::new();
+        server
+            .get_path_sets(&weak, "run")
+            .unwrap()
+            .unwrap()
+            .read_to_end(&mut received)
+            .unwrap();
+        assert_eq!(received, body);
+    }
+
+    #[test]
+    fn a_refused_request_for_many_path_sets_says_why() {
+        let body = r#"{"error":"busy","message":"the store could not answer; try again"}"#;
+        let answer = format!(
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let server = server_at(&answer_once(answer));
+        let Err(error) = server.get_path_sets(&["a".repeat(64)], "run") else {
+            panic!("a refused request was taken as an answer");
+        };
+        assert_eq!(
+            format!("{error:#}"),
+            "POST pathsets/fetch returned 503: the store could not answer; try again"
         );
     }
 }

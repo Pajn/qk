@@ -72,9 +72,20 @@ const BLOB_FETCHERS: usize = 8;
 /// protocol allows: an answer carries at most 64 MiB of them, and smaller
 /// requests spread a fetch over more connections.
 const BLOBS_AT_ONCE: usize = 1024;
+/// Weak keys asked for in one `POST pathsets/fetch`, as many as the protocol
+/// allows.
+const PATH_SETS_AT_ONCE: usize = 4096;
+/// Weak keys whose path sets are fetched at once, one request each, from a
+/// store that answers no more than one in a request.
+const PATH_SET_FETCHERS: usize = 8;
 /// Blobs stored apart requested at once by every fetch together, leaving
 /// connections for entries and uploads.
 const BLOB_REQUESTS: usize = 24;
+/// Path sets fetched at once for lookups that restore nothing. A task taken
+/// from the cache does not wait for its own, so in a run of such tasks they
+/// would otherwise all be in flight together, beside the fetches of tasks
+/// that do wait.
+const SHADOW_FETCHES: usize = 8;
 /// Blobs one upload places at once. Placing a blob stored apart takes a
 /// request asking the store for it and, where the store lacks it, one sending
 /// it, so a record of thousands of them would otherwise take as many round
@@ -144,6 +155,9 @@ pub struct Remote {
     kept_apart: Mutex<HashMap<String, Vec<String>>>,
     /// Requests for blobs stored apart that may start now.
     blob_requests: Slots,
+    /// Fetches of path sets for lookups that restore nothing that may start
+    /// now.
+    shadow_fetches: Slots,
     /// Fetches in progress, by key, so a key is fetched once however many
     /// ask for it at a time.
     flights: Mutex<HashMap<String, Arc<Flight>>>,
@@ -547,6 +561,7 @@ impl Remote {
             bundles: AtomicBool::new(true),
             kept_apart: Mutex::default(),
             blob_requests: Slots::new(BLOB_REQUESTS),
+            shadow_fetches: Slots::new(SHADOW_FETCHES),
             flights: Mutex::default(),
             prefetch: prefetch::Prefetch::default(),
             prefetching: true,
@@ -823,6 +838,138 @@ impl Remote {
                 Ok(())
             })?;
         Ok(fetched.map(|(record, _, _)| record))
+    }
+
+    /// [`Self::fetch_path_sets`] for a lookup that restores nothing, at most
+    /// [`SHADOW_FETCHES`] at a time.
+    pub(crate) fn fetch_shadow_path_sets(
+        &self,
+        root: &Path,
+        weak: &str,
+        task: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let waiting = crate::profile::span(task, "remote_shadow_wait");
+        let _slot = self.shadow_fetches.take();
+        drop(waiting);
+        self.fetch_path_sets(root, weak, task)
+    }
+
+    /// The path sets the store holds for each of `weak`, by weak key, as
+    /// [`fetch_path_sets`](Self::fetch_path_sets) answers each of them: in
+    /// one request where the store answers many at once, as a store server's
+    /// `POST pathsets/fetch` does, so that a run's lookups wait on one round
+    /// trip rather than one each. An answer leaving some out, past what one
+    /// answer carries, is followed by another asking for them, until one
+    /// lists none of what it was asked. The rest, and every weak key of a
+    /// store that answers none that way or of a request that failed, are
+    /// fetched one each, a few at a time, so each weak key's answer and error
+    /// are those it would have had on its own. `task` names the request in
+    /// profile timings.
+    // Until the shadow lookup asks for a run's path sets together.
+    #[allow(dead_code)]
+    pub(crate) fn fetch_many_path_sets(
+        &self,
+        root: &Path,
+        weak: &[String],
+        task: &str,
+    ) -> HashMap<String, Result<Option<Vec<u8>>>> {
+        let mut seen = HashSet::new();
+        let unique: Vec<String> = weak
+            .iter()
+            .filter(|weak| seen.insert(weak.as_str()))
+            .cloned()
+            .collect();
+        let mut answers = HashMap::with_capacity(unique.len());
+        let mut rest = Vec::new();
+        let mut queue: Vec<Vec<String>> = unique
+            .chunks(PATH_SETS_AT_ONCE)
+            .map(<[String]>::to_vec)
+            .collect();
+        while let Some(asked) = queue.pop() {
+            let names: HashSet<&str> = asked.iter().map(String::as_str).collect();
+            let answer = self.store.get_path_sets(&asked, task).and_then(|body| {
+                body.map(|body| {
+                    let mut receiving = crate::profile::span(task, "remote_body");
+                    let read = pack::read_path_sets(body, &names);
+                    if let Ok((listed, received)) = &read {
+                        receiving.count("bytes", *received);
+                        receiving.count("path_sets", listed.len() as u64);
+                    }
+                    read.map(|(listed, _)| listed)
+                })
+                .transpose()
+            });
+            let listed = match answer {
+                Ok(Some(listed)) => listed,
+                Ok(None) | Err(_) => {
+                    rest.extend(asked);
+                    continue;
+                }
+            };
+            let missed: Vec<String> = asked
+                .iter()
+                .filter(|weak| !listed.iter().any(|(listed, _)| listed == *weak))
+                .cloned()
+                .collect();
+            if listed.is_empty() {
+                rest.extend(missed);
+                continue;
+            }
+            if !missed.is_empty() {
+                queue.push(missed);
+            }
+            for (weak, pack) in listed {
+                let record = match pack {
+                    Some(pack) => self.read_path_sets_pack(root, &weak, &pack, task),
+                    None => Ok(None),
+                };
+                answers.insert(weak, record);
+            }
+        }
+        let queue = Mutex::new(rest.into_iter());
+        let fetched = Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            for _ in 0..PATH_SET_FETCHERS {
+                scope.spawn(|| {
+                    loop {
+                        // Taken on its own, so the queue is not held through
+                        // the request.
+                        let next = queue.lock().unwrap().next();
+                        let Some(weak) = next else { return };
+                        let record = self.fetch_path_sets(root, &weak, task);
+                        fetched.lock().unwrap().push((weak, record));
+                    }
+                });
+            }
+        });
+        answers.extend(fetched.into_inner().unwrap());
+        answers
+    }
+
+    /// The record of path sets for `weak` in `pack`, read as
+    /// [`fetch_pack`](Self::fetch_pack) reads the pack
+    /// [`fetch_path_sets`](Self::fetch_path_sets) fetches.
+    fn read_path_sets_pack(
+        &self,
+        root: &Path,
+        weak: &str,
+        pack: &[u8],
+        task: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let mut transfer = pack::Transfer::default();
+        let apart = AtomicU64::new(0);
+        let object = Object::PathSets(weak);
+        let read = pack::read(
+            root,
+            pack,
+            |_| Ok(()),
+            &mut transfer,
+            |missing| self.fetch_blobs(root, object, &missing, task, &apart),
+        );
+        match read {
+            Err(error) if error.is::<MissingBlob>() => Ok(None),
+            read => read.map(|(record, _pin)| Some(record)),
+        }
     }
 
     /// Queues a task's warm record for its branch, after the blobs it cites.
@@ -1967,6 +2114,13 @@ mod flight_tests {
         /// frame.
         bundles: Arc<Mutex<Vec<Vec<String>>>>,
         bundled: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+        /// How many weak keys it answers the path sets of in one request, as
+        /// a store server does, or `None` when it answers one each.
+        path_sets_answer: Option<usize>,
+        /// Requests for many weak keys' path sets, and how many of them to
+        /// fail as a reset connection would.
+        path_set_requests: Arc<AtomicUsize>,
+        failing_path_set_requests: AtomicUsize,
     }
 
     fn name(object: Object) -> String {
@@ -2030,6 +2184,43 @@ mod flight_tests {
             file.read_to_end(&mut bytes)?;
             self.objects.lock().unwrap().insert(name(object), bytes);
             Ok(())
+        }
+
+        fn get_path_sets(&self, weak: &[String], _: &str) -> Result<Option<Body>> {
+            let Some(most) = self.path_sets_answer else {
+                return Ok(None);
+            };
+            self.path_set_requests.fetch_add(1, Ordering::SeqCst);
+            let failing = self.failing_path_set_requests.fetch_update(
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+                |left| left.checked_sub(1),
+            );
+            if failing.is_ok() {
+                return Err(ureq::Error::Io(std::io::Error::from(
+                    std::io::ErrorKind::ConnectionReset,
+                ))
+                .into());
+            }
+            std::thread::sleep(Duration::from_millis(200));
+            let objects = self.objects.lock().unwrap();
+            let listed: Vec<(&String, Option<&Vec<u8>>)> = weak
+                .iter()
+                .take(most)
+                .map(|weak| (weak, objects.get(&format!("pathsets/{weak}"))))
+                .collect();
+            let mut answer = b"qks1".to_vec();
+            answer.extend_from_slice(&(listed.len() as u32).to_le_bytes());
+            for (weak, pack) in &listed {
+                answer.extend(
+                    (0..32).map(|at| u8::from_str_radix(&weak[at * 2..at * 2 + 2], 16).unwrap()),
+                );
+                answer.extend_from_slice(&(pack.map_or(0, Vec::len) as u64).to_le_bytes());
+            }
+            for pack in listed.iter().filter_map(|(_, pack)| *pack) {
+                answer.extend_from_slice(pack);
+            }
+            Ok(Some(Box::new(std::io::Cursor::new(answer))))
         }
 
         fn blobs_held(&self, blobs: &[String]) -> Result<Option<store::Held>> {
@@ -2412,6 +2603,104 @@ mod flight_tests {
                 "{failures:?}"
             );
             assert_eq!(remote.store.has(Object::PathSets(&weak)).unwrap(), sent);
+        }
+    }
+
+    /// A remote over `memory` holding path sets for five weak keys, which it
+    /// answers with, and a weak key it holds none for.
+    fn holding_path_sets(memory: Memory) -> (tempfile::TempDir, Arc<Remote>, Vec<String>, String) {
+        let root = cache();
+        let remote = Arc::new(Remote::new(
+            Box::new(memory),
+            Mode::ReadWrite,
+            None,
+            u64::MAX,
+        ));
+        let held: Vec<String> = (0..5).map(|at| format!("{at}").repeat(64)).collect();
+        for weak in &held {
+            remote.upload_path_sets(root.path(), weak, path_sets(weak));
+        }
+        assert!(remote.finish().is_empty());
+        (root, remote, held, "f".repeat(64))
+    }
+
+    fn path_sets(weak: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({ "version": 1, "weak": weak, "sets": [] })).unwrap()
+    }
+
+    /// Asks `remote` for the path sets of `held` and `absent`, some of them
+    /// twice, checking each answer.
+    fn fetch_many(remote: &Remote, root: &Path, held: &[String], absent: &str) {
+        let mut asked = held.to_vec();
+        asked.push(absent.to_owned());
+        asked.push(held[0].clone());
+        let answers = remote.fetch_many_path_sets(root, &asked, "run");
+        assert_eq!(answers.len(), held.len() + 1);
+        for weak in held {
+            assert_eq!(
+                answers[weak].as_ref().unwrap().as_deref(),
+                Some(&path_sets(weak)[..])
+            );
+        }
+        assert!(answers[absent].as_ref().unwrap().is_none());
+    }
+
+    #[test]
+    fn the_path_sets_of_many_weak_keys_come_in_one_request() {
+        let (requests, reads) = (Arc::default(), Arc::default());
+        let (root, remote, held, absent) = holding_path_sets(Memory {
+            path_sets_answer: Some(usize::MAX),
+            path_set_requests: Arc::clone(&requests),
+            reads: Arc::clone(&reads),
+            ..Memory::default()
+        });
+        fetch_many(&remote, root.path(), &held, &absent);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn path_sets_an_answer_leaves_out_are_asked_for_again() {
+        let (requests, reads) = (Arc::default(), Arc::default());
+        let (root, remote, held, absent) = holding_path_sets(Memory {
+            path_sets_answer: Some(2),
+            path_set_requests: Arc::clone(&requests),
+            reads: Arc::clone(&reads),
+            ..Memory::default()
+        });
+        fetch_many(&remote, root.path(), &held, &absent);
+        // Six weak keys, two an answer.
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn path_sets_are_fetched_one_each_a_few_at_a_time_where_many_cannot_be() {
+        // A store that answers one each, one whose answer lists none of what
+        // it was asked, and one whose request fails.
+        for (answer, failing) in [(None, 0), (Some(0), 0), (Some(usize::MAX), 1)] {
+            let (requests, reads) = (Arc::default(), Arc::default());
+            let (root, remote, held, absent) = holding_path_sets(Memory {
+                path_sets_answer: answer,
+                path_set_requests: Arc::clone(&requests),
+                failing_path_set_requests: AtomicUsize::new(failing),
+                reads: Arc::clone(&reads),
+                ..Memory::default()
+            });
+            let started = std::time::Instant::now();
+            fetch_many(&remote, root.path(), &held, &absent);
+            assert_eq!(
+                requests.load(Ordering::SeqCst),
+                usize::from(answer.is_some()),
+                "{answer:?}"
+            );
+            assert_eq!(reads.load(Ordering::SeqCst), held.len() + 1, "{answer:?}");
+            // Each read takes 200 ms; six one after another would take 1.2 s.
+            assert!(
+                started.elapsed() < Duration::from_millis(1000),
+                "{answer:?}: {:?}",
+                started.elapsed()
+            );
         }
     }
 

@@ -1533,6 +1533,57 @@ fn server_build(fixture: &Fixture, token: &str, env: &[(&str, &str)]) -> Output 
     command.output().unwrap()
 }
 
+/// Path sets cite no blob, so fetching them does not wait for the session
+/// that tells the store server which blobs this machine holds.
+#[test]
+fn path_sets_are_fetched_without_waiting_for_the_session() {
+    let server = store_server::FakeStoreServer::start();
+    let fixture = Fixture::new(target(
+        "build",
+        json!({
+            "inputs": ["{projectRoot}/src/**/*"],
+            "qk:ultracache": {"mode": "on"},
+        }),
+    ));
+    with_store_server(&fixture, &server);
+    success(server_build(&fixture, store_server::WRITE_TOKEN, &[]));
+    // Its declared key misses, and it has no path set, so it asks the store
+    // for them; the blobs the first run kept make a session worth opening.
+    fs::write(fixture.root.join("src/input.txt"), "two\n").unwrap();
+    {
+        let mut state = server.state.lock().unwrap();
+        state.hold_sessions = true;
+        state.requests.clear();
+    }
+    let running = fixture
+        .command(&fixture.root, &["run", "app:build"])
+        .env("QK_STORE_SERVER_TOKEN", store_server::WRITE_TOKEN)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Released once the path sets are asked for, or after a while without
+    // that, so that a run that waits for the session still ends.
+    let asked = || {
+        server
+            .state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|(request, _)| request.starts_with("GET /v4/pathsets/"))
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !asked() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let asked_while_held = asked();
+    server.state.lock().unwrap().hold_sessions = false;
+    success(running.wait_with_output().unwrap());
+    assert!(asked_while_held, "the path sets waited for the session");
+    assert_eq!(fixture.runs(), 2);
+}
+
 #[cfg(unix)]
 fn cache_path(fixture: &Fixture) -> PathBuf {
     PathBuf::from(
@@ -2570,6 +2621,61 @@ fn a_machine_without_history_takes_expectations_from_the_remote_store() {
     }
 }
 
+// The targets are POSIX shell commands.
+#[cfg(unix)]
+#[test]
+fn a_run_starts_from_the_expectations_the_last_fetch_saved() {
+    let server = s3::FakeS3::start();
+    let task = |name: &str, seconds: &str| json!({"command": format!("echo {name} >> started; sleep {seconds}"), "cache": false});
+    let fixture = Fixture::with_targets(json!({
+        "a-fast": task("a-fast", "0.1"), "b-slow": task("b-slow", "0.6")
+    }));
+    with_remote(&fixture, &server, json!({}));
+    let history = fixture.root.join(".git/qk/history.db");
+    let order = |env: &[(&str, &str)]| {
+        let _ = fs::remove_file(fixture.root.join("started"));
+        let mut command = fixture.command(
+            &fixture.root,
+            &["run-many", "-t", "a-fast,b-slow", "--parallel", "1"],
+        );
+        command
+            .env("AWS_ACCESS_KEY_ID", "key")
+            .env("AWS_SECRET_ACCESS_KEY", "secret")
+            .env_remove("NX_POWERPACK_CACHE_MODE")
+            .envs(env.iter().copied());
+        success(command.output().unwrap());
+        fs::read_to_string(fixture.root.join("started")).unwrap()
+    };
+    assert_eq!(order(&[]), "a-fast\nb-slow\n");
+    // Without history or a saved copy, the run waits for the store, and saves
+    // what it fetched.
+    fs::remove_file(&history).unwrap();
+    assert_eq!(order(&[]), "b-slow\na-fast\n");
+    // With the copy, a store that never answers holds nothing up: reading
+    // only, so nothing waits to add to the record either.
+    fs::remove_file(&history).unwrap();
+    server.state.lock().unwrap().hold_get = [".json".to_owned()].into();
+    let started = std::time::Instant::now();
+    assert_eq!(
+        order(&[("QK_REMOTE_EXPECTATIONS", "read")]),
+        "b-slow\na-fast\n"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    server.state.lock().unwrap().hold_get.clear();
+    // Nor does one that fails, however soon: the run has the copy either way.
+    fs::remove_file(&history).unwrap();
+    server.state.lock().unwrap().fail_get = [".json".to_owned()].into();
+    assert_eq!(
+        order(&[("QK_REMOTE_EXPECTATIONS", "read")]),
+        "b-slow\na-fast\n"
+    );
+    server.state.lock().unwrap().fail_get.clear();
+}
+
 #[test]
 fn a_variable_keeps_a_run_from_writing_or_reading_expectations() {
     let server = s3::FakeS3::start();
@@ -2687,6 +2793,130 @@ fn remote_build_command_at(fixture: &Fixture, root: &Path, env: &[(&str, &str)])
         command.env(name, value);
     }
     command
+}
+
+/// A task taken from the cache whose lookup by its recordings in mode
+/// `"record"` waits for the store is done all the same: what depends on it is
+/// restored meanwhile, and the run still reports what its recordings would
+/// have done.
+#[test]
+fn a_restored_task_does_not_wait_for_its_shadow_lookup() {
+    let server = s3::FakeS3::start();
+    let fixture = Fixture::with_targets(json!({
+        "build": target("build", json!({
+            "inputs": ["{projectRoot}/src/**/*"],
+            "qk:ultracache": {"mode": "record"},
+        })),
+        "generate": target("generate", json!({
+            "inputs": ["{projectRoot}/src/**/*"],
+            "outputs": ["{projectRoot}/generated"],
+            "dependsOn": ["build"],
+        })),
+    }));
+    let report = fixture.root.parent().unwrap().join("report.json");
+    let generate = || {
+        let mut command = fixture.command(
+            &fixture.root,
+            &["run", "app:generate", "--report", report.to_str().unwrap()],
+        );
+        command
+            .env("AWS_ACCESS_KEY_ID", "key")
+            .env("AWS_SECRET_ACCESS_KEY", "secret")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        command
+    };
+    // Kept here, before the store is configured, so that the store is
+    // asked for the path sets only in the run that follows.
+    success(generate().output().unwrap());
+    assert_eq!(fixture.runs(), 2);
+    with_remote(&fixture, &server, json!({}));
+    fs::remove_dir_all(fixture.root.join("generated")).unwrap();
+    {
+        let mut state = server.state.lock().unwrap();
+        state.hold_get_containing.insert("/pathsets/".into());
+        state.requests.clear();
+    }
+    let running = generate().spawn().unwrap();
+    // Released once the dependent is restored, or after a while without it,
+    // so that a run that waits for the path sets still ends.
+    let restored = fixture.root.join("generated/value.txt");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !restored.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let restored_while_held = restored.exists()
+        && server
+            .state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .all(|request| !request.contains("/pathsets/"));
+    server.state.lock().unwrap().hold_get_containing.clear();
+    success(running.wait_with_output().unwrap());
+    assert!(
+        restored_while_held,
+        "the dependent waited for the path sets"
+    );
+    assert_eq!(fixture.runs(), 2);
+    let report: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+    let task = |id: &str| {
+        report["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|task| task["id"] == id)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(task("app:build")["cache"], "local-hit");
+    assert_eq!(task("app:build")["shadow"]["kind"], "unrecorded");
+    assert_eq!(task("app:generate")["cache"], "local-hit");
+}
+
+/// A lookup in mode `"record"` takes the store's answer for a task's path
+/// sets from a moment ago rather than asking again; mode `"on"`, which
+/// restores what it finds, asks all the same.
+#[test]
+fn a_shadow_lookup_does_not_ask_the_store_again_for_a_while() {
+    let server = s3::FakeS3::start();
+    let fixture = Fixture::new(target(
+        "build",
+        json!({
+            "inputs": ["{projectRoot}/src/**/*"],
+            "qk:ultracache": {"mode": "record"},
+        }),
+    ));
+    with_remote(&fixture, &server, json!({}));
+    let asked = || {
+        let mut state = server.state.lock().unwrap();
+        let asked = state
+            .requests
+            .iter()
+            .filter(|request| request.starts_with("GET ") && request.contains("/pathsets/"))
+            .count();
+        state.requests.clear();
+        asked
+    };
+    success(remote_build(&fixture, &[]));
+    assert_eq!(asked(), 1);
+    success(remote_build(&fixture, &[]));
+    assert_eq!(asked(), 0, "the store was asked again");
+    // A change to a file input leaves the weak key as it was, and misses the
+    // declared key, so mode "on" asks the store for path sets.
+    fs::write(fixture.root.join("src/input.txt"), "two\n").unwrap();
+    fs::write(
+        fixture.root.join("project.json"),
+        json!({"name": "app", "targets": {"build": target("build", json!({
+            "inputs": ["{projectRoot}/src/**/*"],
+            "qk:ultracache": {"mode": "on"},
+        }))}})
+        .to_string(),
+    )
+    .unwrap();
+    success(remote_build(&fixture, &[]));
+    assert_eq!(asked(), 1, "mode on did not ask the store");
 }
 
 fn clear_local_cache(fixture: &Fixture) {
@@ -4072,6 +4302,29 @@ fn an_input_naming_the_workspace_file_keys_its_resolution_keys() {
     success(fixture.build(&fixture.root, &[]));
     fs::write(fixture.root.join("pnpm-workspace.yaml"), workspace("1.1.0")).unwrap();
     assert!(stderr(&success(fixture.build(&fixture.root, &[]))).contains("cache miss"));
+    assert_eq!(fixture.runs(), 2);
+}
+
+/// Git's variables for how pathspecs are read do not reach qk's listings,
+/// whose pathspecs it writes with magic: a task naming a file is keyed by it.
+#[test]
+fn a_task_naming_a_path_is_keyed_by_it_whatever_git_is_told_of_pathspecs() {
+    let fixture = Fixture::new(target(
+        "build",
+        json!({"inputs": ["{workspaceRoot}/settings.yaml"]}),
+    ));
+    let settings = fixture.root.join("settings.yaml");
+    fs::write(&settings, "level: 1\n").unwrap();
+    let build = || {
+        let mut command = fixture.command(&fixture.root, &["run", "app:build"]);
+        command.env("GIT_LITERAL_PATHSPECS", "1");
+        success(command.output().unwrap())
+    };
+    build();
+    build();
+    assert_eq!(fixture.runs(), 1);
+    fs::write(&settings, "level: 2\n").unwrap();
+    build();
     assert_eq!(fixture.runs(), 2);
 }
 

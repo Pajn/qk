@@ -45,6 +45,11 @@ fn git_command(root: &Path, args: &[&str]) -> Command {
         "GIT_PREFIX",
         "GIT_SHALLOW_FILE",
         "GIT_COMMON_DIR",
+        // qk's pathspecs are read as it writes them, magic included.
+        "GIT_LITERAL_PATHSPECS",
+        "GIT_GLOB_PATHSPECS",
+        "GIT_NOGLOB_PATHSPECS",
+        "GIT_ICASE_PATHSPECS",
     ] {
         command.env_remove(name);
     }
@@ -58,6 +63,88 @@ pub fn git_path(root: &Path, flag: &str) -> Option<PathBuf> {
     }
     let path = String::from_utf8(result.stdout).ok()?;
     Some(PathBuf::from(path.trim_end_matches(['\r', '\n'])))
+}
+
+/// The worktree's git directory and the repository's common one, as Git
+/// names them at `root`, or `None` when `root` is not in a repository.
+///
+/// Git is asked once per root in a process, both in one `rev-parse`: a run
+/// needs them for its worktree state, cache and history, and where a
+/// repository keeps them does not change while qk runs. `git` does not
+/// inherit the variables that select a repository, so the answer depends on
+/// `root` alone. Only an answer is kept: a root that is not in a repository
+/// yet is asked again. A caller asking while another is still waiting for
+/// Git waits for its answer rather than starting Git again. Roots are kept by
+/// their canonical path, so one named another way shares the answer.
+fn git_dirs(root: &Path) -> Option<(PathBuf, PathBuf)> {
+    type Slot = std::sync::Arc<Mutex<Option<(PathBuf, PathBuf)>>>;
+    static KNOWN: std::sync::OnceLock<Mutex<std::collections::HashMap<PathBuf, Slot>>> =
+        std::sync::OnceLock::new();
+    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_owned());
+    let slot = KNOWN
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .entry(canonical)
+        .or_default()
+        .clone();
+    let mut known = slot.lock().unwrap();
+    if known.is_none() {
+        *known = ask_git_dirs(root);
+    }
+    known.clone()
+}
+
+/// Starts asking Git for [`git_dirs`] at `root` on a thread of its own, for a
+/// command that will need them once it has loaded the workspace: the
+/// worktree state, cache and history of a run are all found from them.
+pub fn prefetch_git_dirs(root: &Path) {
+    let root = root.to_owned();
+    let asking = std::thread::spawn(move || {
+        git_dirs(&root);
+    });
+    *PREFETCH.lock().unwrap() = Some(asking);
+}
+
+/// The thread [`prefetch_git_dirs`] started, until it is waited for.
+static PREFETCH: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
+
+/// Waits for the thread [`prefetch_git_dirs`] started, if it still runs, for
+/// a caller that needs to be the process's only thread, as one changing the
+/// environment does.
+pub fn await_git_dirs() {
+    if let Some(asking) = PREFETCH.lock().unwrap().take() {
+        let _ = asking.join();
+    }
+}
+
+fn ask_git_dirs(root: &Path) -> Option<(PathBuf, PathBuf)> {
+    let result = git(
+        root,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-dir",
+            "--git-common-dir",
+        ],
+    )
+    .ok()?;
+    if !result.status.success() {
+        return None;
+    }
+    let output = String::from_utf8(result.stdout).ok()?;
+    let lines: Vec<&str> = output
+        .lines()
+        .map(|line| line.trim_end_matches('\r'))
+        .collect();
+    match lines[..] {
+        [git_dir, common] => Some((PathBuf::from(git_dir), PathBuf::from(common))),
+        // A path with a line break in it: ask for each on its own.
+        _ => Some((
+            git_path(root, "--git-dir")?,
+            git_path(root, "--git-common-dir")?,
+        )),
+    }
 }
 
 /// The worktree's git directory and the repository's common one, read from
@@ -97,7 +184,8 @@ pub fn worktree_state(root: &Path) -> PathBuf {
     if let Some(state) = known.lock().unwrap().get(root) {
         return state.clone();
     }
-    let state = git_path(root, "--git-dir")
+    let state = git_dirs(root)
+        .map(|(git_dir, _)| git_dir)
         .or_else(|| dot_git(root).map(|(git_dir, _)| git_dir))
         .map(|dir| dir.join("qk"))
         .unwrap_or_else(|| root.join(".qk"));
@@ -146,10 +234,16 @@ pub fn clear_worktree_state(root: &Path) -> Result<()> {
 /// `qk/v1` inside so they never mix with Nx's; each relative to the workspace
 /// root. Otherwise [`cache_directory`], shared by the repository's worktrees.
 pub fn cache_location(workspace: &Workspace) -> PathBuf {
+    configured_cache_location(workspace).unwrap_or_else(|| cache_directory(&workspace.root))
+}
+
+/// [`cache_location`] when a variable or nx.json names it, which needs no
+/// Git; `None` when it is [`cache_directory`].
+pub(crate) fn configured_cache_location(workspace: &Workspace) -> Option<PathBuf> {
     if let Some(directory) =
         std::env::var_os("QK_CACHE_DIRECTORY").filter(|value| !value.is_empty())
     {
-        return resolved(&workspace.root.join(directory).join("v1"));
+        return Some(resolved(&workspace.root.join(directory).join("v1")));
     }
     let configured = std::env::var_os("NX_CACHE_DIRECTORY")
         .filter(|value| !value.is_empty())
@@ -167,10 +261,7 @@ pub fn cache_location(workspace: &Workspace) -> PathBuf {
                 .filter(|directory| !directory.is_empty())
                 .map(PathBuf::from)
         });
-    match configured {
-        Some(directory) => resolved(&workspace.root.join(directory).join("qk/v1")),
-        None => cache_directory(&workspace.root),
-    }
+    configured.map(|directory| resolved(&workspace.root.join(directory).join("qk/v1")))
 }
 
 /// `path` with its `.` and `..` resolved by name, so that it compares equal to
@@ -196,7 +287,8 @@ fn resolved(path: &Path) -> PathBuf {
 
 /// The cache's default place, in the repository's common git directory.
 pub fn cache_directory(root: &Path) -> PathBuf {
-    git_path(root, "--git-common-dir")
+    git_dirs(root)
+        .map(|(_, common)| common)
         .or_else(|| dot_git(root).map(|(_, common)| common))
         .map(|dir| dir.join("qk/cache/v1"))
         .unwrap_or_else(|| root.join(".qk/cache/v1"))
@@ -307,6 +399,8 @@ fn check_parents(
 }
 
 pub use crate::glob::Pattern;
+use crate::glob::PatternSet;
+use globset::Candidate;
 
 /// A fileset path with its tokens replaced, as Nx resolves an input's:
 /// `{projectRoot}` and `{projectName}` anywhere, and `{workspaceRoot}` only
@@ -379,6 +473,9 @@ pub struct Outputs {
     globs: Vec<String>,
     /// Negated patterns: what they match is never an output.
     negations: Vec<Pattern>,
+    /// `patterns` and `negations`, each matched as one set.
+    matched: PatternSet,
+    negated: PatternSet,
     /// The directories the patterns are read from, their leading literal
     /// segments with escapes read, as Nx's `partition_glob` takes them.
     anchors: BTreeSet<String>,
@@ -419,6 +516,8 @@ impl Outputs {
             anchors.insert(anchor);
         }
         Ok(Self {
+            matched: PatternSet::new(&compiled)?,
+            negated: PatternSet::new(&negations)?,
             patterns: compiled,
             globs,
             negations,
@@ -431,11 +530,14 @@ impl Outputs {
     /// Outputs from already-expanded patterns, for tests without a workspace.
     #[cfg(test)]
     pub fn from_patterns(patterns: &[&str]) -> Self {
+        let compiled: Vec<_> = patterns
+            .iter()
+            .map(|pattern| Pattern::new(pattern, false).unwrap())
+            .collect();
         Self {
-            patterns: patterns
-                .iter()
-                .map(|pattern| Pattern::new(pattern, false).unwrap())
-                .collect(),
+            matched: PatternSet::new(&compiled).unwrap(),
+            negated: PatternSet::new(&[]).unwrap(),
+            patterns: compiled,
             globs: patterns
                 .iter()
                 .map(|pattern| (*pattern).to_owned())
@@ -497,6 +599,8 @@ impl Outputs {
             anchors.insert(anchor);
         }
         Ok(Self {
+            matched: PatternSet::new(&patterns)?,
+            negated: PatternSet::new(&negations)?,
             patterns,
             globs,
             negations,
@@ -557,18 +661,19 @@ impl Outputs {
     }
 
     pub fn matches(&self, path: &str) -> bool {
-        let any = |patterns: &[Pattern]| {
-            Path::new(path)
-                .ancestors()
-                .any(|ancestor| patterns.iter().any(|pattern| pattern.is_match(ancestor)))
+        let any = |patterns: &PatternSet| {
+            !patterns.is_empty()
+                && Path::new(path)
+                    .ancestors()
+                    .any(|ancestor| patterns.is_match_candidate(&Candidate::new(ancestor)))
         };
         (self.complete.iter().any(|root| {
             path == root
                 || path
                     .strip_prefix(root)
                     .is_some_and(|suffix| suffix.starts_with('/'))
-        }) || any(&self.patterns))
-            && !any(&self.negations)
+        }) || any(&self.matched))
+            && !any(&self.negated)
     }
 
     pub fn paths(&self, root: &Path) -> Result<BTreeSet<String>> {
@@ -1693,6 +1798,61 @@ mod tests {
         );
         assert_eq!(dot_git(&base.join("main")), Some((common.clone(), common)));
         assert_eq!(dot_git(&base.join("elsewhere")), None);
+    }
+
+    #[test]
+    fn git_dirs_answer_as_git_does_for_each_and_ask_again_until_there_is_a_repository() {
+        use super::{git, git_dirs, git_path};
+        let scratch = tempfile::tempdir().unwrap();
+        // As the directory is named, not made canonical: every path compared
+        // below is one Git answered, and Git on Windows cannot be given the
+        // `\\?\` form a canonical path takes there.
+        let base = scratch.path().to_owned();
+        let main = base.join("main");
+        std::fs::create_dir_all(main.join("apps/web")).unwrap();
+        // Not a repository yet: asked again once it is.
+        assert_eq!(git_dirs(&main), None);
+        let run = |root: &std::path::Path, args: &[&str]| {
+            let output = git(root, args).unwrap();
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+        };
+        run(&main, &["init", "--quiet"]);
+        run(
+            &main,
+            &[
+                "-c",
+                "user.name=qk",
+                "-c",
+                "user.email=qk@example.com",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "first",
+            ],
+        );
+        run(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                base.join("linked").to_str().unwrap(),
+            ],
+        );
+        for root in [main.clone(), main.join("apps/web"), base.join("linked")] {
+            let separately = (
+                git_path(&root, "--git-dir").unwrap(),
+                git_path(&root, "--git-common-dir").unwrap(),
+            );
+            assert_eq!(git_dirs(&root), Some(separately.clone()), "{root:?}");
+            // Asked again, by another name for the same root.
+            let other_name = root.join("../").join(root.file_name().unwrap());
+            assert_eq!(git_dirs(&other_name), Some(separately), "{other_name:?}");
+        }
+        let (linked_dir, linked_common) = git_dirs(&base.join("linked")).unwrap();
+        assert_ne!(linked_dir, linked_common);
+        assert_eq!(linked_common, git_dirs(&main).unwrap().1);
     }
 
     #[test]

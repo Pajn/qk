@@ -1031,6 +1031,11 @@ fn locations(workspace: &Workspace, task: &Task, warm: &Warm) -> Result<Vec<Loca
 /// The branch being built: from CI when it checks out a detached head, else
 /// from git. `None` when there is no branch to name.
 pub(crate) fn current_branch(workspace: &Workspace) -> Option<String> {
+    current_branch_at(&workspace.root)
+}
+
+/// [`current_branch`] of the workspace at `root`.
+fn current_branch_at(root: &Path) -> Option<String> {
     for name in ["GITHUB_HEAD_REF", "GITHUB_REF_NAME"] {
         if let Ok(value) = std::env::var(name)
             && !value.is_empty()
@@ -1038,13 +1043,13 @@ pub(crate) fn current_branch(workspace: &Workspace) -> Option<String> {
             return Some(value);
         }
     }
-    let output = paths::git(&workspace.root, &["rev-parse", "--abbrev-ref", "HEAD"]).ok()?;
+    let output = paths::git(root, &["rev-parse", "--abbrev-ref", "HEAD"]).ok()?;
     let branch = String::from_utf8(output.stdout).ok()?.trim().to_owned();
     (output.status.success() && !branch.is_empty() && branch != "HEAD").then_some(branch)
 }
 
 /// The workspace's default branch: nx.json `defaultBase`, else `main`.
-fn default_branch(workspace: &Workspace) -> String {
+pub(crate) fn default_branch(workspace: &Workspace) -> String {
     let default = workspace.config.default_base.as_deref().unwrap_or("main");
     default
         .strip_prefix("origin/")
@@ -1055,8 +1060,13 @@ fn default_branch(workspace: &Workspace) -> String {
 /// The branches to take warm state from, in order: the current one, then the
 /// workspace's default branch.
 pub(crate) fn branches(workspace: &Workspace) -> Vec<String> {
-    let default = default_branch(workspace);
-    let mut branches: Vec<String> = current_branch(workspace).into_iter().collect();
+    branches_at(&workspace.root, default_branch(workspace))
+}
+
+/// [`branches`] of the workspace at `root`, whose default branch is
+/// `default`: what another thread can work out without the workspace.
+pub(crate) fn branches_at(root: &Path, default: String) -> Vec<String> {
+    let mut branches: Vec<String> = current_branch_at(root).into_iter().collect();
     if !branches.contains(&default) {
         branches.push(default);
     }

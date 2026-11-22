@@ -45,7 +45,9 @@ or spiked and exited, between two samples is. The scheduler [waits for memory](r
 from these peaks. The run
 summary gives the most the run's tasks used together and the three tasks
 that used the most, and `qk show task` what the task used in each run. The
-newest 200 runs are kept. The schema is versioned in `schema_version`.
+newest 200 runs are kept. Once what older runs held is three quarters of
+the file and at least 16 MiB, recording a run gives that space back to the
+filesystem. The schema is versioned in `schema_version`.
 
 `qk show hash <task> --against <run-id>` compares the key a task would have
 now with its key in a recorded run, without running it; see

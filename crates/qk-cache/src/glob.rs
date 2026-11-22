@@ -17,13 +17,58 @@
 //! only add inputs.
 
 use anyhow::{Result, bail};
-use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
+use globset::{Candidate, Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 
 #[derive(Clone)]
 pub struct Pattern {
     included: GlobSet,
     excluded: GlobSet,
+    /// The globs of `included`, so a [`PatternSet`] can match them with
+    /// those of other patterns.
+    globs: Vec<Glob>,
     prefixes: Vec<String>,
+}
+
+/// Patterns matched together: a path matches when any of them does. The
+/// including globs of patterns without excluding ones share one glob set, so
+/// a path is prepared for matching once rather than once per pattern.
+#[derive(Clone)]
+pub struct PatternSet {
+    plain: GlobSet,
+    /// Patterns with excluding globs, which apply only to their own matches.
+    other: Vec<Pattern>,
+}
+
+impl PatternSet {
+    pub fn new(patterns: &[Pattern]) -> Result<Self> {
+        let mut plain = GlobSetBuilder::new();
+        let mut other = Vec::new();
+        for pattern in patterns {
+            if pattern.excluded.is_empty() && !pattern.globs.is_empty() {
+                for glob in &pattern.globs {
+                    plain.add(glob.clone());
+                }
+            } else {
+                other.push(pattern.clone());
+            }
+        }
+        Ok(Self {
+            plain: plain.build()?,
+            other,
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.plain.is_empty() && self.other.is_empty()
+    }
+
+    pub fn is_match_candidate(&self, path: &Candidate) -> bool {
+        self.plain.is_match_candidate(path)
+            || self
+                .other
+                .iter()
+                .any(|pattern| pattern.is_match_candidate(path))
+    }
 }
 
 impl Pattern {
@@ -47,6 +92,7 @@ impl Pattern {
     fn from_globs(patterns: &[&str], negated: bool) -> Result<Self> {
         let mut included = GlobSetBuilder::new();
         let mut excluded = GlobSetBuilder::new();
+        let mut including = Vec::new();
         let mut prefixes = Vec::new();
         for pattern in patterns {
             let globs = if negated
@@ -71,7 +117,8 @@ impl Pattern {
                 if excludes && !negated {
                     excluded.add(compiled);
                 } else {
-                    included.add(compiled);
+                    included.add(compiled.clone());
+                    including.push(compiled);
                     prefixes.push(prefix(&glob));
                 }
             }
@@ -82,6 +129,7 @@ impl Pattern {
         Ok(Self {
             included: included.build()?,
             excluded: excluded.build()?,
+            globs: including,
             prefixes,
         })
     }
@@ -103,12 +151,16 @@ impl Pattern {
     /// As Nx's glob sets: an including glob matches and no excluding one, or,
     /// with only excluding globs, none of them.
     pub fn is_match(&self, path: impl AsRef<std::path::Path>) -> bool {
-        let path = path.as_ref();
-        let excluded = self.excluded.is_match(path);
+        self.is_match_candidate(&Candidate::new(path.as_ref()))
+    }
+
+    /// [`Self::is_match`] for a path already prepared for matching.
+    pub fn is_match_candidate(&self, path: &Candidate) -> bool {
+        let excluded = self.excluded.is_match_candidate(path);
         if self.included.is_empty() {
             !excluded
         } else {
-            !excluded && self.included.is_match(path)
+            !excluded && self.included.is_match_candidate(path)
         }
     }
 }
@@ -400,6 +452,52 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_pattern_set_matches_what_any_of_its_patterns_matches() {
+        let patterns: Vec<_> = [
+            ("dist/**", false),
+            ("out/**/*.js", false),
+            ("cfg/{a,b}/*.json", false),
+            ("+(x|y)/z", false),
+            ("build/!(keep)/**", false),
+            ("tmp/*.log", true),
+        ]
+        .iter()
+        .map(|(pattern, negated)| Pattern::new(pattern, *negated).unwrap())
+        .collect();
+        let paths = [
+            "dist",
+            "dist/a/b",
+            "out/x.js",
+            "out/deep/x.js",
+            "out/x.ts",
+            "cfg/a/c.json",
+            "cfg/c/c.json",
+            "x/z",
+            "xy/z",
+            "build/drop/file",
+            "build/keep/file",
+            "tmp/a.log",
+            "tmp/a.txt",
+            "",
+        ];
+        for count in 0..=patterns.len() {
+            let set = PatternSet::new(&patterns[..count]).unwrap();
+            assert_eq!(set.is_empty(), count == 0);
+            for path in paths {
+                assert_eq!(
+                    set.is_match_candidate(&Candidate::new(path)),
+                    patterns[..count]
+                        .iter()
+                        .any(|pattern| pattern.is_match(path)),
+                    "{path} against {count} patterns"
+                );
+            }
+        }
+        // A negated group excludes, so its pattern is matched on its own.
+        assert_eq!(PatternSet::new(&patterns).unwrap().other.len(), 1);
+    }
 
     /// The expansion as Nx's `convert_glob` writes it, `!` for excluding.
     fn nx(pattern: &str) -> Vec<String> {

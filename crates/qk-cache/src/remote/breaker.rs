@@ -174,6 +174,11 @@ impl Store for Breaker {
         self.counted(body)
     }
 
+    fn get_path_sets(&self, weak: &[String], task: &str) -> Result<Option<Body>> {
+        let body = self.ask(|| Ok(None), || self.store.get_path_sets(weak, task));
+        self.counted(body)
+    }
+
     fn location(&self) -> String {
         self.store.location()
     }

@@ -366,6 +366,8 @@ pub fn resolve_tasks(
 ) -> Result<BTreeMap<String, Resolved>> {
     let cache = paths::cache_location(workspace);
     let snapshot = hash::Snapshot::new(workspace, graph, &cache)?.with_candidates(extra);
+    // Every resolution chooses from the listing.
+    snapshot.files()?;
     let cancelled = AtomicBool::new(false);
     graph
         .tasks
@@ -388,6 +390,7 @@ pub struct Resolution {
 pub fn resolve_each(workspace: &Workspace, graph: &TaskGraph) -> Result<Resolution> {
     let cache = paths::cache_location(workspace);
     let snapshot = hash::Snapshot::new(workspace, graph, &cache)?;
+    let candidates = snapshot.files()?.clone();
     let cancelled = AtomicBool::new(false);
     let tasks = graph
         .tasks
@@ -398,10 +401,7 @@ pub fn resolve_each(workspace: &Workspace, graph: &TaskGraph) -> Result<Resoluti
             (id.clone(), resolved)
         })
         .collect();
-    Ok(Resolution {
-        candidates: snapshot.files.clone(),
-        tasks,
-    })
+    Ok(Resolution { candidates, tasks })
 }
 
 /// A changed input's meaning, independent of revision loading and task reports.

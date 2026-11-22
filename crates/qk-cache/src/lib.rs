@@ -46,8 +46,8 @@ pub use inputs::{
 pub use paths::expand as expand_project_path;
 pub use paths::git as workspace_git;
 pub use paths::{
-    Outputs, cache_directory, cache_location, clear_worktree_state, resolved_outputs,
-    worktree_state,
+    Outputs, await_git_dirs, cache_directory, cache_location, clear_worktree_state,
+    prefetch_git_dirs, resolved_outputs, worktree_state,
 };
 
 /// The nx.json settings of the workspace's remote store: its `s3`, as Nx's
@@ -249,10 +249,12 @@ enum Shadowing {
     /// there is no store to ask.
     Settled(Shadow),
     /// Waiting for the path sets the store holds, with the lookup of the
-    /// path sets held here, none of which has a result here.
+    /// path sets held here, none of which has a result here. Without a
+    /// fetch, the store was asked a moment ago, and what it held then is
+    /// held here: the lookup goes on with the results it holds alone.
     Fetching {
         search: lookup::Search,
-        fetch: std::thread::JoinHandle<Result<Option<Vec<u8>>>>,
+        fetch: Option<std::thread::JoinHandle<Result<Option<Vec<u8>>>>>,
     },
 }
 
@@ -480,13 +482,20 @@ impl Cache {
     ) -> std::result::Result<&hash::Snapshot, String> {
         self.snapshot
             .get_or_init(|| {
-                hash::Snapshot::new(workspace, graph, &self.root)
+                hash::Snapshot::watched(workspace, graph, &self.root)
                     .map_err(|error| format!("cannot snapshot the workspace: {error:#}"))
             })
             .as_ref()
             .map_err(Clone::clone)
     }
 
+    /// Runs `task`, or takes its result from the cache.
+    ///
+    /// A task taken from the cache in mode `"record"` whose shadow lookup
+    /// waits for the remote store is done before that lookup is: `restored`
+    /// is told its result then, without its `shadow`, and its outputs count
+    /// as written, so that what depends on it can start. The result returned
+    /// once the store has answered differs from it only in its `shadow`.
     pub fn run(
         &self,
         workspace: &Workspace,
@@ -494,11 +503,22 @@ impl Cache {
         task: &Task,
         prepared: &PreparedTask,
         cancelled: &AtomicBool,
+        restored: &dyn Fn(TaskResult),
     ) -> Result<TaskResult> {
-        let result = self.run_task(workspace, graph, task, prepared, cancelled);
-        if let Some(Ok(snapshot)) = self.snapshot.get() {
-            snapshot.outputs_written(workspace, task);
-        }
+        let written = std::sync::Once::new();
+        let write = || {
+            written.call_once(|| {
+                if let Some(Ok(snapshot)) = self.snapshot.get() {
+                    snapshot.outputs_written(workspace, task);
+                }
+            })
+        };
+        let early = |result: TaskResult| {
+            write();
+            restored(result);
+        };
+        let result = self.run_task(workspace, graph, task, prepared, cancelled, &early);
+        write();
         result
     }
 
@@ -509,6 +529,7 @@ impl Cache {
         task: &Task,
         prepared: &PreparedTask,
         cancelled: &AtomicBool,
+        done: &dyn Fn(TaskResult),
     ) -> Result<TaskResult> {
         let cacheable = task.definition.cache == Some(true);
         // Held until the task is done, whether it ran or came from the cache.
@@ -633,8 +654,7 @@ impl Cache {
             Err(reason) => return bypass(reason),
         };
         let dependency_profile = profile::span(&task.id, "dependency_inputs");
-        let dependencies = match hash::dependency_keys(snapshot, workspace, graph, task, cancelled)
-        {
+        let dependencies = match hash::dependency_keys(snapshot, workspace, graph, task) {
             Ok(dependencies) => dependencies,
             Err(error) => return bypass(format!("{error:#}")),
         };
@@ -712,7 +732,7 @@ impl Cache {
         };
         // Inputs may have changed while another worktree held this key's lock.
         if waited
-            && hash::recheck_dependency_keys(snapshot, workspace, graph, task, cancelled)
+            && hash::recheck_dependency_keys(snapshot, workspace, graph, task)
                 .and_then(|dependencies| {
                     hash::fingerprint(
                         snapshot,
@@ -861,6 +881,8 @@ impl Cache {
                 }
             }
         }
+        // Whether what its recordings would have done waits for the store.
+        let fetching = matches!(shadowing, Some(Shadowing::Fetching { .. }));
         // What its recordings would have done, once the store has said.
         let mut settle = |recordings: &mut Option<(Vec<recorded::PathSet>, String, _)>| {
             let shadowing = shadowing.take()?;
@@ -900,6 +922,18 @@ impl Cache {
                 remote.resolved(&key);
                 remote.prefetched(&key)
             });
+        // Its result, taken from the cache. Restored, it is done: what depends
+        // on it need not wait for the store to say what its recordings would
+        // have done, which only its report reads, so `done` is told it first.
+        let hit = |cache: CacheStatus, shadow: Option<Shadow>| TaskResult {
+            outcome: Outcome::Success,
+            cache,
+            key: keyed.clone(),
+            warm: None,
+            execution: None,
+            recorded: unrecorded.clone(),
+            shadow,
+        };
         let local_profile = profile::span(&task.id, "local_restore");
         let restored = if declared && !self.cold {
             self.restore(
@@ -937,6 +971,15 @@ impl Cache {
                         qk_executor::report::Cached::Hit
                     },
                 });
+                let status = if claimed {
+                    CacheStatus::RemoteHit
+                } else {
+                    CacheStatus::LocalHit
+                };
+                drop(local_profile);
+                if fetching {
+                    done(hit(status, None));
+                }
                 let shadow = settle(&mut recordings);
                 let shadow = self.with_changes(
                     shadow,
@@ -944,19 +987,7 @@ impl Cache {
                     (snapshot, workspace, graph, task, prepared, &unlisted),
                     cancelled,
                 );
-                return Ok(TaskResult {
-                    outcome: Outcome::Success,
-                    cache: if claimed {
-                        CacheStatus::RemoteHit
-                    } else {
-                        CacheStatus::LocalHit
-                    },
-                    key: keyed,
-                    warm: None,
-                    execution: None,
-                    recorded: unrecorded,
-                    shadow,
-                });
+                return Ok(hit(status, shadow));
             }
             Ok(false) => {}
             Err(error) => {
@@ -989,6 +1020,9 @@ impl Cache {
                         id: task.id.clone(),
                         cached: qk_executor::report::Cached::RemoteHit,
                     });
+                    if fetching {
+                        done(hit(CacheStatus::RemoteHit, None));
+                    }
                     let shadow = settle(&mut recordings);
                     let shadow = self.with_changes(
                         shadow,
@@ -996,15 +1030,7 @@ impl Cache {
                         (snapshot, workspace, graph, task, prepared, &unlisted),
                         cancelled,
                     );
-                    return Ok(TaskResult {
-                        outcome: Outcome::Success,
-                        cache: CacheStatus::RemoteHit,
-                        key: keyed,
-                        warm: None,
-                        execution: None,
-                        recorded: unrecorded,
-                        shadow,
-                    });
+                    return Ok(hit(CacheStatus::RemoteHit, shadow));
                 }
                 Ok(false) => {}
                 Err(error) => {
@@ -1431,6 +1457,15 @@ impl Cache {
         }) else {
             return Shadowing::Settled(lookup::unfound(sets));
         };
+        // Asked a moment ago, the store most likely holds what it held then,
+        // which only a recording made since would change: a verdict, unlike
+        // a result restored by one, can lag that little behind.
+        if recorded::asked_lately(&self.root, weak) {
+            return Shadowing::Fetching {
+                search,
+                fetch: None,
+            };
+        }
         let (remote, root, weak, id) = (
             std::sync::Arc::clone(remote),
             self.root.clone(),
@@ -1439,7 +1474,9 @@ impl Cache {
         );
         Shadowing::Fetching {
             search,
-            fetch: std::thread::spawn(move || remote.fetch_path_sets(&root, &weak, &id)),
+            fetch: Some(std::thread::spawn(move || {
+                remote.fetch_shadow_path_sets(&root, &weak, &id)
+            })),
         }
     }
 
@@ -1462,10 +1499,21 @@ impl Cache {
             Shadowing::Settled(shadow) => return shadow,
             Shadowing::Fetching { search, fetch } => (search, fetch),
         };
-        let fetched = fetch
-            .join()
-            .unwrap_or_else(|_| Err(anyhow::anyhow!("fetching them panicked")));
-        let added = self.merged(fetched, weak, task);
+        let added = match fetch {
+            Some(fetch) => {
+                let fetched = fetch
+                    .join()
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("fetching them panicked")));
+                // Asked, for a while, once what the store held is held here
+                // too: an answer that could not be merged is asked for again.
+                let merged = self.merge(fetched, weak);
+                if merged.is_ok() {
+                    recorded::asked(&self.root, weak);
+                }
+                self.or_unavailable(merged, task)
+            }
+            None => Vec::new(),
+        };
         let strong =
             |set: &recorded::PathSet| recording_key(weak, set, snapshot, workspace, unlisted, task);
         let checking = Checking {
@@ -1485,15 +1533,33 @@ impl Cache {
         weak: &str,
         task: &Task,
     ) -> Vec<recorded::PathSet> {
-        fetched
-            .and_then(|record| match record {
-                Some(record) => recorded::merge(&self.root, weak, &record),
-                None => Ok(Vec::new()),
-            })
-            .unwrap_or_else(|error| {
-                qk_executor::status!("qk: {}: remote path sets unavailable ({error:#})", task.id);
-                Vec::new()
-            })
+        self.or_unavailable(self.merge(fetched, weak), task)
+    }
+
+    /// The path sets of the record the store held, `fetched`, that are new
+    /// here, merged into those held here, or why they could not be.
+    fn merge(
+        &self,
+        fetched: Result<Option<Vec<u8>>>,
+        weak: &str,
+    ) -> Result<Vec<recorded::PathSet>> {
+        fetched.and_then(|record| match record {
+            Some(record) => recorded::merge(&self.root, weak, &record),
+            None => Ok(Vec::new()),
+        })
+    }
+
+    /// `merged`, or none after saying why the store's path sets could not be
+    /// had for `task`.
+    fn or_unavailable(
+        &self,
+        merged: Result<Vec<recorded::PathSet>>,
+        task: &Task,
+    ) -> Vec<recorded::PathSet> {
+        merged.unwrap_or_else(|error| {
+            qk_executor::status!("qk: {}: remote path sets unavailable ({error:#})", task.id);
+            Vec::new()
+        })
     }
 
     /// Whether the local cache holds a result under `key`.
@@ -1592,8 +1658,8 @@ impl Cache {
             return false;
         }
         let _profile = profile::span(&task.id, "inputs_recheck");
-        let after = hash::recheck_dependency_keys(snapshot, workspace, graph, task, cancelled)
-            .and_then(|dependencies| {
+        let after = hash::recheck_dependency_keys(snapshot, workspace, graph, task).and_then(
+            |dependencies| {
                 hash::fingerprint(
                     snapshot,
                     workspace,
@@ -1602,7 +1668,8 @@ impl Cache {
                     &dependencies,
                     cancelled,
                 )
-            });
+            },
+        );
         if after.as_deref().ok() != Some(before) {
             if task.definition.cache == Some(true) {
                 if self.reuse {
@@ -1626,24 +1693,26 @@ impl Cache {
 /// A task's key, and the inputs it is computed from, or why it has none.
 pub type Keyed = std::result::Result<(String, Value), String>;
 
-/// The key each task in `graph` would be cached under if it ran now, and what
-/// it is computed from, without running a task. Runtime inputs are executed,
-/// and the dependency outputs a task reads are taken as they are on disk.
-pub fn keys(
+/// The key the task `id` of `graph` would be cached under if it ran now, and
+/// what it is computed from, without running a task. Runtime inputs are
+/// executed, and the dependency outputs it reads are taken as they are on
+/// disk. No other task's key is computed: a task's key holds what its
+/// dependencies' outputs are, not their keys.
+pub fn key(
     workspace: &Workspace,
     graph: &TaskGraph,
     prepared: &BTreeMap<String, PreparedTask>,
+    id: &str,
     cancelled: &AtomicBool,
-) -> Result<BTreeMap<String, Keyed>> {
-    let snapshot = hash::Snapshot::new(workspace, graph, &paths::cache_location(workspace))?;
-    Ok(graph
+) -> Result<Keyed> {
+    let task = graph
         .tasks
-        .values()
-        .map(|task| {
-            let keyed = key_now(&snapshot, workspace, graph, task, prepared, cancelled);
-            (task.id.clone(), keyed)
-        })
-        .collect())
+        .get(id)
+        .ok_or_else(|| anyhow::anyhow!("task {id} is not in the task graph"))?;
+    let snapshot = hash::Snapshot::watched(workspace, graph, &paths::cache_location(workspace))?;
+    Ok(key_now(
+        &snapshot, workspace, graph, task, prepared, cancelled,
+    ))
 }
 
 fn key_now(
@@ -1655,8 +1724,7 @@ fn key_now(
     cancelled: &AtomicBool,
 ) -> Keyed {
     let failed = |error: anyhow::Error| format!("{}: {error:#}", task.id);
-    let dependencies =
-        hash::dependency_keys(snapshot, workspace, graph, task, cancelled).map_err(failed)?;
+    let dependencies = hash::dependency_keys(snapshot, workspace, graph, task).map_err(failed)?;
     let inputs = hash::inputs(
         snapshot,
         workspace,

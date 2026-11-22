@@ -39,6 +39,8 @@ pub struct State {
     pub omit_all: bool,
     /// Answer `POST blobs/fetch` with 404, as a server from before it.
     pub no_fetch: bool,
+    /// Answer `POST pathsets/fetch` with 404, as a server from before it.
+    pub no_path_sets_fetch: bool,
     /// The bytes of frames one answer to `POST blobs/fetch` carries at most,
     /// rather than the protocol's 64 MiB.
     pub fetch_budget: Option<usize>,
@@ -49,6 +51,8 @@ pub struct State {
     pub whole_listings: usize,
     /// Answer every write with 503, as a store that cannot take them now.
     pub refuse_writes: bool,
+    /// Hold `POST sessions` until it is cleared.
+    pub hold_sessions: bool,
     pub latency: Duration,
 }
 
@@ -210,6 +214,9 @@ fn serve(stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
     }
     let mut body = vec![0; length];
     reader.read_exact(&mut body)?;
+    while method == "POST" && path == "/v4/sessions" && state.lock().unwrap().hold_sessions {
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let latency = state.lock().unwrap().latency;
     std::thread::sleep(latency);
     let writes =
@@ -382,6 +389,42 @@ fn handle(
             }
             for (_, frame) in listed {
                 answer.extend(frame);
+            }
+            found(answer)
+        }
+        ("POST", "pathsets/fetch") => {
+            if state.no_path_sets_fetch {
+                return missing();
+            }
+            let asked: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            let mut listed: Vec<(String, Vec<u8>)> = Vec::new();
+            for weak in asked["weak"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+            {
+                if listed.iter().any(|(listed, _)| listed == weak) {
+                    continue;
+                }
+                let pack = state
+                    .records
+                    .get(&format!("pathsets/{weak}"))
+                    .and_then(|body| parse_upload(body))
+                    .map(|upload| compose(state, &upload, |_| false))
+                    .unwrap_or_default();
+                listed.push((weak.to_owned(), pack));
+            }
+            let mut answer = b"qks1".to_vec();
+            answer.extend_from_slice(&(listed.len() as u32).to_le_bytes());
+            for (weak, pack) in &listed {
+                answer.extend(
+                    (0..32).map(|at| u8::from_str_radix(&weak[at * 2..at * 2 + 2], 16).unwrap()),
+                );
+                answer.extend_from_slice(&(pack.len() as u64).to_le_bytes());
+            }
+            for (_, pack) in listed {
+                answer.extend(pack);
             }
             found(answer)
         }

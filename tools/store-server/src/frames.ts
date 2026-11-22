@@ -15,7 +15,7 @@ export const LARGEST_RECORD = 1 << 30;
  * descriptor with no flags, a 128 KiB window, then blocks of at most 128 KiB. */
 export function rawFrame(data: Uint8Array): Uint8Array {
   const blocks = Math.max(1, Math.ceil(data.length / LARGEST_BLOCK));
-  const frame = new Uint8Array(6 + blocks * 3 + data.length);
+  const frame = new Uint8Array(rawFrameLength(data.length));
   frame.set(ZSTD_MAGIC, 0);
   frame[4] = 0x00;
   frame[5] = 0x38;
@@ -33,6 +33,11 @@ export function rawFrame(data: Uint8Array): Uint8Array {
     at += 3 + size;
   }
   return frame;
+}
+
+/** The length of the raw frame of `length` bytes. */
+export function rawFrameLength(length: number): number {
+  return 6 + Math.max(1, Math.ceil(length / LARGEST_BLOCK)) * 3 + length;
 }
 
 /** A blob an upload names: its hash, its raw length, and the length of its
@@ -230,7 +235,7 @@ export const APART = 0;
  * record's length and the record, the blob count, and each blob's placement
  * and raw length. */
 export function packHeader(record: Uint8Array, tags: { placement: number; raw: number }[]): Uint8Array {
-  const bytes = new Uint8Array(4 + 8 + record.length + 4 + tags.length * 9);
+  const bytes = new Uint8Array(packHeaderLength(record, tags.length));
   const view = new DataView(bytes.buffer);
   bytes.set(PACK_MAGIC, 0);
   view.setBigUint64(4, BigInt(record.length), true);
@@ -244,6 +249,11 @@ export function packHeader(record: Uint8Array, tags: { placement: number; raw: n
     at += 9;
   }
   return bytes;
+}
+
+/** The length of the pack header of `record` with `blobs` blobs. */
+export function packHeaderLength(record: Uint8Array, blobs: number): number {
+  return 4 + 8 + record.length + 4 + blobs * 9;
 }
 
 export function u32(value: number): Uint8Array {

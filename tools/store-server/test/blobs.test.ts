@@ -17,12 +17,16 @@ async function storeBefore(text: string) {
 }
 
 /** Makes the index one that has not yet listed the blobs stored before it
- * held them. The listing it schedules on its own is finished first, so that
- * it cannot complete behind the test's back. */
+ * held them. The listings it schedules on its own, of blobs and then of
+ * records, are finished first, so that none can complete behind the test's
+ * back. */
 async function unlisted(): Promise<void> {
-  while (!(await index().blobsStored([])).complete) {
-    await runInDurableObject(index(), (instance) => instance.alarm!());
-  }
+  await runInDurableObject(index(), async (instance, state) => {
+    while ((await state.storage.getAlarm()) !== null) {
+      await state.storage.deleteAlarm();
+      await instance.alarm!();
+    }
+  });
   await runInDurableObject(index(), async (_, state) => {
     await state.storage.deleteAlarm();
     state.storage.sql.exec("DELETE FROM listing");
