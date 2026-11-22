@@ -1804,7 +1804,10 @@ mod tests {
     fn git_dirs_answer_as_git_does_for_each_and_ask_again_until_there_is_a_repository() {
         use super::{git, git_dirs, git_path};
         let scratch = tempfile::tempdir().unwrap();
-        let base = std::fs::canonicalize(scratch.path()).unwrap();
+        // As the directory is named, not made canonical: every path compared
+        // below is one Git answered, and Git on Windows cannot be given the
+        // `\\?\` form a canonical path takes there.
+        let base = scratch.path().to_owned();
         let main = base.join("main");
         std::fs::create_dir_all(main.join("apps/web")).unwrap();
         // Not a repository yet: asked again once it is.
