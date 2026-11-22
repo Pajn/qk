@@ -222,9 +222,11 @@ per kernel tick. Everywhere else it is two seconds, which covers FAT: on
 network filesystems, whose times come from another machine's clock; on FUSE,
 9p, virtiofs and overlay filesystems, whose times are only as fine as what
 lies beneath; on Windows; and for any file whose times hold no fraction of a
-second. The same window decides how long a directory or listing policy that
-just changed, such as a file under `.git`, keeps the workspace's file list
-from being reused.
+second. The same window applies to the workspace's file list. A directory that
+changed within it has its names read again, and the list is reused when they
+are the names it was taken with. A listing policy that changed within it, such
+as a file under `.git`, keeps the list from being reused until the window has
+passed.
 Without
 `inputs`, a task uses `default` and `^default`; `default` is
 `{projectRoot}/**/*` unless a named input overrides it. As in Nx, a
