@@ -45,6 +45,11 @@ fn git_command(root: &Path, args: &[&str]) -> Command {
         "GIT_PREFIX",
         "GIT_SHALLOW_FILE",
         "GIT_COMMON_DIR",
+        // qk's pathspecs are read as it writes them, magic included.
+        "GIT_LITERAL_PATHSPECS",
+        "GIT_GLOB_PATHSPECS",
+        "GIT_NOGLOB_PATHSPECS",
+        "GIT_ICASE_PATHSPECS",
     ] {
         command.env_remove(name);
     }

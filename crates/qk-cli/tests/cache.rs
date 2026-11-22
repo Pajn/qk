@@ -4305,6 +4305,29 @@ fn an_input_naming_the_workspace_file_keys_its_resolution_keys() {
     assert_eq!(fixture.runs(), 2);
 }
 
+/// Git's variables for how pathspecs are read do not reach qk's listings,
+/// whose pathspecs it writes with magic: a task naming a file is keyed by it.
+#[test]
+fn a_task_naming_a_path_is_keyed_by_it_whatever_git_is_told_of_pathspecs() {
+    let fixture = Fixture::new(target(
+        "build",
+        json!({"inputs": ["{workspaceRoot}/settings.yaml"]}),
+    ));
+    let settings = fixture.root.join("settings.yaml");
+    fs::write(&settings, "level: 1\n").unwrap();
+    let build = || {
+        let mut command = fixture.command(&fixture.root, &["run", "app:build"]);
+        command.env("GIT_LITERAL_PATHSPECS", "1");
+        success(command.output().unwrap())
+    };
+    build();
+    build();
+    assert_eq!(fixture.runs(), 1);
+    fs::write(&settings, "level: 2\n").unwrap();
+    build();
+    assert_eq!(fixture.runs(), 2);
+}
+
 #[test]
 fn dependency_inputs_cover_transitive_dependencies_like_nx() {
     let temp = TempDir::new().unwrap();
