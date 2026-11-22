@@ -2000,11 +2000,8 @@ impl Cache {
             let mut group = WarmGroup::default();
             let mut pending = Vec::new();
             let listed: Vec<String> = location.paths()?.into_iter().collect();
-            // Nothing writes the group's directories while it is saved, so
-            // each is checked not to be a link once, not once per file in it.
-            let directories = Mutex::new(foldhash::HashSet::default());
             let looked = crate::hash::in_parallel(&listed, LOOKED_PER_THREAD, |path| {
-                self.look_at(location, path, known, restored_files, &directories)
+                self.look_at(location, path, known, restored_files)
             })?;
             for (path, looked) in listed.into_iter().zip(looked) {
                 let artifact = match looked {
@@ -2101,18 +2098,19 @@ impl Cache {
 
     /// What a save makes of one of a group's paths: a file whose metadata
     /// matches its last save's or restore's, and whose blob is still stored,
-    /// keeps that blob unread. `directories` are those already checked not to
-    /// be links.
+    /// keeps that blob unread.
     fn look_at(
         &self,
         location: &Location,
         path: &str,
         known: Option<&WarmGroup>,
         restored_files: Option<&GroupFiles>,
-        directories: &Mutex<foldhash::HashSet<PathBuf>>,
     ) -> Result<Looked> {
         let gone = |error: &std::io::Error| error.kind() == std::io::ErrorKind::NotFound;
-        paths::safe_parents_once(&location.base, path, "cache artifact", directories)?;
+        // For each file, though files share their directories: tasks of the
+        // group may run while it is saved, and a directory one of them
+        // replaces by a link must not be read through.
+        paths::safe_parents(&location.base, path)?;
         let absolute = location.base.join(path);
         let metadata = match fs::symlink_metadata(&absolute) {
             Err(error) if gone(&error) => return Ok(Looked::Gone),
