@@ -1825,18 +1825,30 @@ impl Cache {
             return false;
         }
         let _profile = profile::span(&task.id, "inputs_recheck");
-        let after = hash::recheck_dependency_keys(snapshot, workspace, graph, task).and_then(
-            |dependencies| {
-                hash::fingerprint(
-                    snapshot,
-                    workspace,
-                    task,
-                    prepared,
-                    &dependencies,
-                    cancelled,
-                )
-            },
-        );
+        // The task's own inputs hold its dependencies' outputs only as the
+        // keys `recheck_dependency_keys` returns, so the two are read side by
+        // side and joined as `hash::fingerprint` joins them.
+        let (dependencies, inputs) = std::thread::scope(|scope| {
+            let dependencies =
+                scope.spawn(|| hash::recheck_dependency_keys(snapshot, workspace, graph, task));
+            let inputs = hash::inputs(
+                snapshot,
+                workspace,
+                task,
+                prepared,
+                &BTreeMap::new(),
+                cancelled,
+            );
+            (
+                dependencies.join().expect("dependency recheck panicked"),
+                inputs,
+            )
+        });
+        let after = dependencies.and_then(|dependencies| {
+            let mut inputs = inputs?;
+            inputs["dependencies"] = serde_json::json!(dependencies);
+            hash::key(&inputs)
+        });
         if after.as_deref().ok() != Some(before) {
             if task.definition.cache == Some(true) {
                 if self.reuse {
@@ -2047,6 +2059,74 @@ fn upstream(graph: &TaskGraph, task: &Task) -> BTreeSet<recorded::TargetOf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The recheck keys a task as keying it did, the dependency outputs it
+    /// reads among its inputs, and tells either changing.
+    #[test]
+    fn the_recheck_keys_a_task_as_keying_did() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(root.join("nx.json"), "{}").unwrap();
+        std::fs::write(
+            root.join("project.json"),
+            serde_json::json!({"name": "app", "targets": {
+                "generate": {"command": "true", "outputs": ["{projectRoot}/generated"]},
+                "build": {"command": "true", "dependsOn": ["generate"], "inputs": [
+                    "{projectRoot}/src/**/*", {"dependentTasksOutputFiles": "**/*.txt"}
+                ]}
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        for path in ["src/main.txt", "generated/value.txt"] {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "first").unwrap();
+        }
+        let workspace = Workspace::load(root).unwrap();
+        let graph = TaskGraph::build(
+            &workspace,
+            &[qk_taskgraph::Request::parse("app:build").unwrap()],
+        )
+        .unwrap();
+        let task = &graph.tasks["app:build"];
+        let prepared = qk_executor::prepare(&workspace, task, &BTreeMap::new()).unwrap();
+        let cancelled = AtomicBool::new(false);
+        let cache = Cache::new(root.join(".qk/cache"));
+        let snapshot = || hash::Snapshot::watched(&workspace, &graph, &cache.root).unwrap();
+        let keyed = |snapshot: &hash::Snapshot| {
+            let dependencies = hash::dependency_keys(snapshot, &workspace, &graph, task).unwrap();
+            assert!(!dependencies.is_empty());
+            hash::fingerprint(
+                snapshot,
+                &workspace,
+                task,
+                &prepared,
+                &dependencies,
+                &cancelled,
+            )
+            .unwrap()
+        };
+        let rechecks = |key: &str| {
+            cache.inputs_match(
+                &snapshot(),
+                &workspace,
+                &graph,
+                task,
+                &prepared,
+                key,
+                &cancelled,
+            )
+        };
+        let key = keyed(&snapshot());
+        assert!(rechecks(&key));
+        std::fs::write(root.join("generated/value.txt"), "second").unwrap();
+        assert!(!rechecks(&key));
+        let key = keyed(&snapshot());
+        assert!(rechecks(&key));
+        std::fs::write(root.join("src/main.txt"), "second").unwrap();
+        assert!(!rechecks(&key));
+    }
 
     #[test]
     fn concurrent_blob_writes_keep_results_ordered_and_repair_corruption() {
