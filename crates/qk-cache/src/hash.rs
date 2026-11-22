@@ -684,29 +684,48 @@ impl Membership {
 /// Find Git index, exclusion and config files that can change source visibility,
 /// including absent policy files whose later creation must invalidate reuse.
 fn git_membership_policies(root: &Path) -> BTreeSet<PathBuf> {
+    // No question needs another's answer, so the three Git processes run at
+    // once: each costs about as long as reading a few hundred directories.
+    let (paths, origins, excludes) = std::thread::scope(|scope| {
+        let paths = scope.spawn(|| {
+            paths::git(
+                root,
+                &[
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-path",
+                    "index",
+                    "--git-path",
+                    "info/exclude",
+                    "--git-path",
+                    "config",
+                    "--git-path",
+                    "config.worktree",
+                ],
+            )
+        });
+        let origins =
+            scope.spawn(|| paths::git(root, &["config", "--null", "--show-origin", "--list"]));
+        let excludes = paths::git(
+            root,
+            &["config", "--null", "--path", "--get", "core.excludesfile"],
+        );
+        (
+            paths.join().expect("git policy thread panicked"),
+            origins.join().expect("git policy thread panicked"),
+            excludes,
+        )
+    });
     let mut policies = BTreeSet::new();
-    if let Ok(output) = paths::git(
-        root,
-        &[
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-path",
-            "index",
-            "--git-path",
-            "info/exclude",
-            "--git-path",
-            "config",
-            "--git-path",
-            "config.worktree",
-        ],
-    ) && output.status.success()
+    if let Ok(output) = paths
+        && output.status.success()
         && let Ok(paths) = String::from_utf8(output.stdout)
     {
         policies.extend(paths.lines().map(PathBuf::from));
     }
     // Config can include other files. Track every origin used by Git, as
     // well as currently missing standard config and excludes files.
-    if let Ok(output) = paths::git(root, &["config", "--null", "--show-origin", "--list"])
+    if let Ok(output) = origins
         && output.status.success()
     {
         // NUL mode emits raw origins, without Git's C-style path quoting,
@@ -737,10 +756,8 @@ fn git_membership_policies(root: &Path) -> BTreeSet<PathBuf> {
             }
         }
     }
-    if let Ok(output) = paths::git(
-        root,
-        &["config", "--null", "--path", "--get", "core.excludesfile"],
-    ) && output.status.success()
+    if let Ok(output) = excludes
+        && output.status.success()
         && let Ok(path) = String::from_utf8(output.stdout)
     {
         policies.insert(root.join(path.strip_suffix('\0').unwrap_or(&path)));
