@@ -741,6 +741,8 @@ mod tests {
     #[test]
     fn a_change_to_anything_the_walk_depends_on_makes_the_next_load_walk() {
         fn nothing(_: &Fixture) {}
+        // Unix adds the changes that need links.
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut changes: Vec<(&str, Change, Change)> = vec![
             ("a project.json added", nothing, |f| {
                 write(&f.root.join("apps/d/project.json"), r#"{"name":"d"}"#)
