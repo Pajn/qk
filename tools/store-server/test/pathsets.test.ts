@@ -2,6 +2,7 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { decompress } from "fzstd";
 import { describe, expect, it } from "vitest";
 import type { Index } from "../src/index-do";
+import { saveCitingNoBlob } from "../src/worker";
 import { READ, bytes, expectedPack, hash, hex, request, sha256, upload } from "./helpers";
 
 const pathSets = (weak: string, read: string, padding = 0) =>
@@ -164,6 +165,31 @@ describe("records citing no blob", () => {
     // Every record is held; the bodies of those past 16 MiB stay unread.
     const held = Math.floor((16 << 20) / size);
     expect(states).toEqual(names.map((_, at) => (at < held ? "held" : "apart")));
+  });
+
+  it("are read from the bucket where another save of the name reached it last", async () => {
+    const weak = hash();
+    const name = `pathsets/${weak}`;
+    const [first, second] = [pathSets(weak, "first"), pathSets(weak, "second")];
+    // The second save happens whole between the first one's write to the
+    // bucket and its save in the index, which is then the older of the two.
+    let raced = false;
+    const bucket: Pick<R2Bucket, "put" | "head"> = {
+      head: (key: string) => env.STORE.head(key),
+      put: (async (key: string, value: Uint8Array, options: R2PutOptions) => {
+        const put = await env.STORE.put(key, value, options);
+        if (!raced) {
+          raced = true;
+          await saveCitingNoBlob(env.STORE, index(), name, upload(second, []));
+        }
+        return put;
+      }) as R2Bucket["put"],
+    };
+    await saveCitingNoBlob(bucket, index(), name, upload(first, []));
+
+    const expected = expectedPack(second, [], () => true);
+    expect(await getOne(weak)).toEqual(expected);
+    expect(await fetchMany([weak])).toEqual([[weak, expected]]);
   });
 
   it("are never taken in from a read older than a save the index heard of", async () => {
