@@ -1504,12 +1504,13 @@ impl Cache {
                 let fetched = fetch
                     .join()
                     .unwrap_or_else(|_| Err(anyhow::anyhow!("fetching them panicked")));
-                let answered = fetched.is_ok();
-                let added = self.merged(fetched, weak, task);
-                if answered {
+                // Asked, for a while, once what the store held is held here
+                // too: an answer that could not be merged is asked for again.
+                let merged = self.merge(fetched, weak);
+                if merged.is_ok() {
                     recorded::asked(&self.root, weak);
                 }
-                added
+                self.or_unavailable(merged, task)
             }
             None => Vec::new(),
         };
@@ -1532,15 +1533,33 @@ impl Cache {
         weak: &str,
         task: &Task,
     ) -> Vec<recorded::PathSet> {
-        fetched
-            .and_then(|record| match record {
-                Some(record) => recorded::merge(&self.root, weak, &record),
-                None => Ok(Vec::new()),
-            })
-            .unwrap_or_else(|error| {
-                qk_executor::status!("qk: {}: remote path sets unavailable ({error:#})", task.id);
-                Vec::new()
-            })
+        self.or_unavailable(self.merge(fetched, weak), task)
+    }
+
+    /// The path sets of the record the store held, `fetched`, that are new
+    /// here, merged into those held here, or why they could not be.
+    fn merge(
+        &self,
+        fetched: Result<Option<Vec<u8>>>,
+        weak: &str,
+    ) -> Result<Vec<recorded::PathSet>> {
+        fetched.and_then(|record| match record {
+            Some(record) => recorded::merge(&self.root, weak, &record),
+            None => Ok(Vec::new()),
+        })
+    }
+
+    /// `merged`, or none after saying why the store's path sets could not be
+    /// had for `task`.
+    fn or_unavailable(
+        &self,
+        merged: Result<Vec<recorded::PathSet>>,
+        task: &Task,
+    ) -> Vec<recorded::PathSet> {
+        merged.unwrap_or_else(|error| {
+            qk_executor::status!("qk: {}: remote path sets unavailable ({error:#})", task.id);
+            Vec::new()
+        })
     }
 
     /// Whether the local cache holds a result under `key`.
