@@ -2070,8 +2070,9 @@ fn execute_narrowed(
         qk_executor::report::write_all(true, title.start(ui::Paint::log()).as_bytes());
     }
     let started = std::time::SystemTime::now();
-    // The history records the commit the run began at: Git names it while
-    // the tasks run, rather than after them.
+    // The history records the commit checked out for the run: Git is asked
+    // as the tasks start and answers while they run, rather than after
+    // them. A commit made in that moment may be the one named.
     let revision = {
         let root = workspace.root.clone();
         std::thread::spawn(move || history::revision(&root))
