@@ -214,19 +214,58 @@ pub(crate) fn save(directory: &Path, root: &Path, record: &Record) -> Result<()>
     qk_state::saved::save(&file(directory, root), &bytes, PREFIX, KEPT)
 }
 
+/// What a walk about to begin is remembered with: see [`before_walk`].
+pub(crate) struct Before {
+    /// When the walk began, before anything was looked at.
+    began: SystemTime,
+    /// What lies outside the directories the walk reads, as it was then.
+    outside: Looked,
+    /// The stamp, as it was then, of each directory above the root whose
+    /// entries decide what the walk finds: those up to the repository's
+    /// top, or every one where no directory from the root up holds a
+    /// `.git`.
+    above: Vec<(PathBuf, Stamp)>,
+}
+
 /// What a walk of the workspace at the canonical `root` about to begin
-/// needs remembered before it begins: the time, and what lies outside the
-/// directories it reads. `None` when one of those had not settled, as then
-/// the walk cannot be remembered.
-pub(crate) fn before_walk(root: &Path) -> Option<(SystemTime, Looked)> {
+/// needs remembered before it begins: the time, what lies outside the
+/// directories it reads, and the stamps of the directories above the root.
+/// `None` when one of those had not settled, as then the walk cannot be
+/// remembered.
+///
+/// A file that is not there has no stamp to show that it appeared. A
+/// `.gitignore` or a `.git` put above the root while the walk runs changes
+/// what the walk finds, and taken away afterwards it leaves everything
+/// looked at here as it was. It does change the stamp of the directory it
+/// was put in, so the directories where one would count are stamped here
+/// and again once the walk is done: see [`walked`]. Those are the ones from
+/// the root's parent up to the repository's top, whose `.gitignore` files
+/// the walk adds and where a nearer `.git` would make another top; above
+/// the top nothing counts, and without a top a `.git` anywhere above would
+/// make one. A workspace that is the repository's top has none. The stamps
+/// are not kept afterwards, as whatever else comes and goes in those
+/// directories between loads says nothing about the walk.
+pub(crate) fn before_walk(root: &Path) -> Option<Before> {
     let began = SystemTime::now();
     let mut outside = Vec::new();
+    let mut above = Vec::new();
+    // Whether a `.git` was found from the root up to the last directory.
+    let mut topped = false;
     for ancestor in root.ancestors() {
         let git = ancestor.join(".git");
         let presence = presence(&git);
         outside.push((git, Seen::Presence(presence)));
+        let beneath_top = !topped;
+        topped |= presence != 0;
         if ancestor == root {
             continue;
+        }
+        if beneath_top {
+            let look = qk_state::look(ancestor).ok()?;
+            if !settled(&look, began) {
+                return None;
+            }
+            above.push((ancestor.to_owned(), look?.0));
         }
         for name in [".gitignore", ".nxignore", ".git/info/exclude"] {
             let path = ancestor.join(name);
@@ -243,24 +282,31 @@ pub(crate) fn before_walk(root: &Path) -> Option<(SystemTime, Looked)> {
             .iter()
             .all(|path| outside.iter().any(|(looked, _)| looked == path))
     );
-    Some((began, outside))
-}
-
-/// The record of a walk that began at `began`, when `outside` was as
-/// [`before_walk`] found it, read the directories `read` and found
-/// `manifests`.
-pub(crate) fn walked(
-    began: SystemTime,
-    outside: Looked,
-    read: Vec<PathBuf>,
-    manifests: Manifests,
-) -> Record {
-    Record {
-        manifests,
+    Some(Before {
         began,
         outside,
+        above,
+    })
+}
+
+/// The record of a walk that began as `before` found things, read the
+/// directories `read` and found `manifests`. `None` when a directory above
+/// the root no longer has the stamp it had: something came or went there
+/// while the walk ran, which the walk may have read and the next load may
+/// not find.
+pub(crate) fn walked(before: Before, read: Vec<PathBuf>, manifests: Manifests) -> Option<Record> {
+    let unchanged = before.above.iter().all(|(directory, stamp)| {
+        qk_state::look(directory)
+            .ok()
+            .flatten()
+            .is_some_and(|(now, _)| now == *stamp)
+    });
+    unchanged.then_some(Record {
+        manifests,
+        began: before.began,
+        outside: before.outside,
         within: Within::Read(read),
-    }
+    })
 }
 
 /// Whether `look` shows nothing there, or a stamp that had settled by
@@ -603,7 +649,12 @@ mod tests {
             PathBuf::from("/workspace"),
             PathBuf::from("/workspace/packages"),
         ];
-        let record = walked(began, outside.clone(), read.clone(), manifests.clone());
+        let before = |outside: &Looked| Before {
+            began,
+            outside: outside.clone(),
+            above: Vec::new(),
+        };
+        let record = walked(before(&outside), read.clone(), manifests.clone()).unwrap();
         let stamps = vec![(
             PathBuf::from("/workspace"),
             Seen::Stamp(Some(Stamp(vec![4, 5]))),
@@ -621,7 +672,7 @@ mod tests {
             damaged[20] ^= 1;
             assert!(decode(&damaged, &identity).is_none());
         }
-        let record = walked(began, outside, read.clone(), manifests);
+        let record = walked(before(&outside), read.clone(), manifests).unwrap();
         let bytes = encode(&record, &identity).unwrap();
         let decoded = decode(&bytes, &identity).unwrap();
         assert!(matches!(&decoded.within, Within::Read(directories) if *directories == read));
@@ -731,6 +782,43 @@ mod tests {
                 assert_eq!(self.record(), Some((Stage::Stamped, true)));
             }
         }
+    }
+
+    /// A walk is not remembered when something came or went, while it ran,
+    /// in a directory above the root whose entries decide what it finds:
+    /// an ignore file there for the walk alone leaves nothing else to show
+    /// it. Only the directories up to the repository's top are looked at.
+    #[test]
+    fn a_walk_is_not_remembered_when_a_directory_above_it_changed_meanwhile() {
+        let fixture = Fixture::new();
+        fixture.settle();
+        let before = before_walk(&fixture.root).unwrap();
+        let above: Vec<&Path> = before
+            .above
+            .iter()
+            .map(|(path, _)| path.as_path())
+            .collect();
+        assert_eq!(above, [fixture.outer.as_path()]);
+        assert!(walked(before, Vec::new(), Manifests::new()).is_some());
+
+        let before = before_walk(&fixture.root).unwrap();
+        let came = fixture.outer.join(".nxignore");
+        write(&came, "apps/\n");
+        std::fs::remove_file(&came).unwrap();
+        assert!(walked(before, Vec::new(), Manifests::new()).is_none());
+        // Changed too recently to tell what a walk beginning now reads.
+        assert!(before_walk(&fixture.root).is_none());
+        fixture.settle();
+        assert!(before_walk(&fixture.root).is_some());
+
+        // A workspace that is the repository's top depends on nothing
+        // above it.
+        std::fs::create_dir(fixture.root.join(".git")).unwrap();
+        fixture.settle();
+        let before = before_walk(&fixture.root).unwrap();
+        assert!(before.above.is_empty());
+        write(&came, "apps/\n");
+        assert!(walked(before, Vec::new(), Manifests::new()).is_some());
     }
 
     type Change = fn(&Fixture);

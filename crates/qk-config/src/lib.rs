@@ -744,12 +744,10 @@ fn load_projects(
         manifests,
         read: walked,
     } = directories;
-    if let (Some(directory), Some((began, outside)), Some(walked)) = (remember, before, walked) {
-        remember_in(
-            directory,
-            root,
-            remembered::walked(began, outside, walked, manifests),
-        );
+    if let (Some(directory), Some(before), Some(walked)) = (remember, before, walked)
+        && let Some(record) = remembered::walked(before, walked, manifests)
+    {
+        remember_in(directory, root, record);
     }
     let mut loaded: Vec<(PathBuf, Option<Result<Option<LoadedProject>>>)> = directories
         .iter()
