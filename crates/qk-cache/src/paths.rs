@@ -906,8 +906,12 @@ impl Traversal {
         Ok(&self.directories[path])
     }
 
-    /// Everything below the directory `path`, without following links.
+    /// Everything below the directory `path`, without following links. A
+    /// directory is read to its end and closed before those in it are read,
+    /// so a deep tree holds one directory open at a time, not one for each
+    /// level.
     fn below(&mut self, root: &Path, path: &Path, paths: &mut BTreeSet<String>) -> Result<()> {
+        let mut directories = Vec::new();
         for entry in std::fs::read_dir(path)? {
             let entry = entry?;
             let child = entry.path();
@@ -923,8 +927,11 @@ impl Traversal {
             };
             paths.insert(relative(root, &child)?);
             if directory {
-                self.below(root, &child, paths)?;
+                directories.push(child);
             }
+        }
+        for directory in directories {
+            self.below(root, &directory, paths)?;
         }
         Ok(())
     }
