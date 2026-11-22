@@ -233,7 +233,9 @@ fn prune_inner(root: &Path, limit: u64, automatic: bool) -> Result<Pruned> {
     grew(root, 0);
     if automatic && recent {
         let now = SystemTime::now();
-        if let Some(size) = with_ledger(root, |ledger| ledger.size(now))?
+        // A ledger that cannot be read, or written where it is missing, as
+        // on a full disk, says nothing: the cache is counted and pruned.
+        if let Ok(Some(size)) = with_ledger(root, |ledger| ledger.size(now))
             && size <= limit
         {
             return Ok(Pruned {
@@ -254,7 +256,9 @@ fn prune_inner(root: &Path, limit: u64, automatic: bool) -> Result<Pruned> {
     // Where the ledger stood before any file is looked at: a publisher that
     // reports after this point may be counted twice, which is safe, and one
     // that reported before it had its files in place, so the count sees them.
-    let counting_from = with_ledger(root, |ledger| ledger.added)?;
+    // A ledger that cannot be read or written must not keep a full disk from
+    // being pruned: the count is then made and enforced, and not recorded.
+    let counting_from = with_ledger(root, |ledger| ledger.added).ok();
     // Held until deletion ends, so no pin is made while blobs are deleted.
     let gate = pin_gate(root)?;
     gate.lock_exclusive()?;
@@ -387,14 +391,18 @@ fn prune_inner(root: &Path, limit: u64, automatic: bool) -> Result<Pruned> {
         }
     }
     // Eviction's deletions are in `size`; what was published meanwhile is in
-    // the ledger after `counting_from`.
-    let _ = with_ledger(root, |ledger| {
-        ledger.counted = Some(Counted {
-            at: now,
-            size,
-            added: counting_from,
+    // the ledger after `counting_from`. Without that, there is nothing to
+    // count on from, and the count an earlier prune recorded stands: it
+    // leaves out only what this one deleted.
+    if let Some(added) = counting_from {
+        let _ = with_ledger(root, |ledger| {
+            ledger.counted = Some(Counted {
+                at: now,
+                size,
+                added,
+            });
         });
-    });
+    }
     pruned.size = size;
     Ok(pruned)
 }
@@ -734,6 +742,21 @@ mod tests {
             fs::write(ledger_path(root), unusable).unwrap();
             assert_eq!(automatic_size(root, 1_000), 150);
         }
+    }
+
+    /// A ledger that cannot be opened, as one that cannot be made on a full
+    /// disk, keeps no prune from counting the cache and evicting from it.
+    #[test]
+    fn a_ledger_that_cannot_be_opened_does_not_stop_a_prune() {
+        let root = fixture();
+        let root = root.path();
+        fs::create_dir_all(ledger_path(root)).unwrap();
+        assert!(with_ledger(root, |ledger| ledger.added).is_err());
+        assert_eq!(automatic_size(root, 1_000), 110);
+        assert_eq!(retried(|| prune(root, 1_000)).size, 110);
+        let pruned = retried(|| prune_automatic(root, 100));
+        assert!(pruned.entries > 0);
+        assert!(pruned.size < 110);
     }
 
     #[test]
