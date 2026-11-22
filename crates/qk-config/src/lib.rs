@@ -182,6 +182,11 @@ pub const LOCAL_WORKSPACE: &str = "nx.local.json";
 /// `None` when it is absent. Projects are read on several threads at once.
 pub type ConfigReader<'a> = &'a (dyn Fn(&Path) -> Result<Option<String>> + Sync);
 
+/// Reads the workspace's own configuration files for
+/// [`WorkspaceConfig::read`], as a [`ConfigReader`] does, on the calling
+/// thread alone: it need not be shared between threads.
+pub type WorkspaceConfigReader<'a> = &'a dyn Fn(&Path) -> Result<Option<String>>;
+
 /// The files `load` reads, from disk.
 fn read_disk(path: &Path) -> Result<Option<String>> {
     match std::fs::read_to_string(path) {
@@ -241,7 +246,7 @@ struct ConfigFiles {
 
 /// nx.json with the file it extends and nx.local.json merged in, each read
 /// with `read`, under the canonical `root`.
-fn read_config(root: &Path, read: ConfigReader) -> Result<ConfigFiles> {
+fn read_config(root: &Path, read: WorkspaceConfigReader) -> Result<ConfigFiles> {
     let json = |path: &Path| -> Result<Option<Value>> {
         read(path)?
             .map(|text| parse_json(&text, &path.display().to_string()))
@@ -310,7 +315,7 @@ impl WorkspaceConfig {
     /// The configuration of the workspace at the canonical `root`, with
     /// nx.json, the file it extends and nx.local.json each read with `read`
     /// and merged as [`Workspace::load`] merges them.
-    pub fn read(root: &Path, read: ConfigReader) -> Result<Self> {
+    pub fn read(root: &Path, read: WorkspaceConfigReader) -> Result<Self> {
         Ok(read_config(root, read)?.config)
     }
 
