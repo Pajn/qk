@@ -3,7 +3,7 @@
 //! read again. A stamp stands in for what it holds only once it has settled:
 //! see [`crate::settle`].
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
@@ -90,65 +90,114 @@ fn times_settled(values: &[i64], window: Duration, looked: SystemTime) -> bool {
 const LINKS: usize = 40;
 
 /// The stamp of `path`, a directory or file, `None` when there is nothing
-/// there; for a symlink, its own with, after it, that of each link it leads
-/// through and of the target they lead to now, so retargeting any link of
-/// the chain or editing the target in place changes it. With it, the window
-/// of [`crate::settle::window`] that covers each file it stamps.
+/// there; for a symlink, its own with, after it, that of each link met on
+/// the way to what it leads to and of what is reached, so retargeting any
+/// link on that way, or editing the target in place, changes it. With it,
+/// the window of [`crate::settle::window`] that covers each file it stamps.
 pub fn look(path: &Path) -> Result<Option<(Stamp, Duration)>> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            let mut stamp = Stamp::new(&metadata);
-            let mut window = crate::settle::window(path, &metadata);
-            // Each link is stamped as it is followed: one in the middle of a
-            // chain can be pointed elsewhere while the first link and the
-            // file reached both keep their stamps.
-            let mut link = path.to_owned();
-            let mut metadata = metadata;
-            let mut followed = 0;
-            while metadata.is_symlink() {
-                followed += 1;
-                let next = match std::fs::read_link(&link) {
-                    Ok(target) => link.parent().unwrap_or(Path::new("")).join(target),
-                    Err(_) => {
-                        stamp.0[1] = -1;
-                        break;
-                    }
-                };
-                match std::fs::symlink_metadata(&next) {
-                    Ok(target) if followed < LINKS => {
-                        stamp.0.extend(Stamp::new(&target).0);
-                        window = window.max(crate::settle::window(&next, &target));
-                        link = next;
-                        metadata = target;
-                    }
-                    // A chain too long to follow leads nowhere.
-                    Ok(_) => {
-                        stamp.0[1] = -1;
-                        break;
-                    }
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                        ) =>
-                    {
-                        stamp.0[1] = -1;
-                        break;
-                    }
-                    Err(error) => return Err(error.into()),
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if absent(&error) => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot inspect {}", path.display()));
+        }
+    };
+    let mut stamp = Stamp::new(&metadata);
+    let mut window = crate::settle::window(path, &metadata);
+    if metadata.is_symlink() && !follow(path, &mut stamp, &mut window)? {
+        // It leads nowhere, or through more links than are followed.
+        stamp.0[1] = -1;
+    }
+    Ok(Some((stamp, window)))
+}
+
+/// Whether `error` says that nothing is at a path.
+fn absent(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
+}
+
+/// Follows the link at `link` to what it leads to, a name at a time, adding
+/// to `stamp` the stamp of each link met on the way and of what is reached,
+/// and widening `window` to cover them. Whether anything was reached.
+///
+/// A link is met where the path ends and also among the directories it
+/// leads through: `rules -> shared/rules` reads another file once `shared`,
+/// itself a link, is pointed elsewhere, though `rules` and both files are
+/// left as they were. So the path is not handed to the system whole, which
+/// would follow such a link unseen.
+fn follow(link: &Path, stamp: &mut Stamp, window: &mut Duration) -> Result<bool> {
+    // The directory reached so far, through no link left to follow, and the
+    // names still to take from it, the next one last.
+    let mut reached = link.parent().unwrap_or(Path::new("")).to_owned();
+    let mut ahead: Vec<std::ffi::OsString> = Vec::new();
+    // Puts what a link names in place of the link.
+    fn splice(target: &Path, reached: &mut PathBuf, ahead: &mut Vec<std::ffi::OsString>) {
+        if target.is_absolute() {
+            reached.clear();
+        }
+        let mut names = Vec::new();
+        for component in target.components() {
+            match component {
+                std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                    reached.push(component.as_os_str());
                 }
+                name => names.push(name.as_os_str().to_owned()),
             }
-            Ok(Some((stamp, window)))
         }
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-            ) =>
-        {
-            Ok(None)
+        ahead.extend(names.into_iter().rev());
+    }
+    let mut note = |path: &Path, metadata: &std::fs::Metadata| {
+        stamp.0.extend(Stamp::new(metadata).0);
+        *window = (*window).max(crate::settle::window(path, metadata));
+    };
+    let Ok(target) = std::fs::read_link(link) else {
+        return Ok(false);
+    };
+    splice(&target, &mut reached, &mut ahead);
+    let mut followed = 1;
+    while let Some(name) = ahead.pop() {
+        if name == "." {
+            continue;
         }
-        Err(error) => Err(error).with_context(|| format!("cannot inspect {}", path.display())),
+        if name == ".." {
+            reached.pop();
+            continue;
+        }
+        let candidate = reached.join(&name);
+        let metadata = match std::fs::symlink_metadata(&candidate) {
+            Ok(metadata) => metadata,
+            Err(error) if absent(&error) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.is_symlink() {
+            followed += 1;
+            // A chain too long to follow leads nowhere, as a loop does.
+            if followed > LINKS {
+                return Ok(false);
+            }
+            note(&candidate, &metadata);
+            let Ok(target) = std::fs::read_link(&candidate) else {
+                return Ok(false);
+            };
+            splice(&target, &mut reached, &mut ahead);
+        } else if ahead.is_empty() {
+            note(&candidate, &metadata);
+            return Ok(true);
+        } else {
+            reached = candidate;
+        }
+    }
+    // The link named a directory by `.` and `..` alone.
+    match std::fs::symlink_metadata(&reached) {
+        Ok(metadata) => {
+            note(&reached, &metadata);
+            Ok(true)
+        }
+        Err(error) if absent(&error) => Ok(false),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -185,5 +234,54 @@ mod tests {
         symlink("loop", at("loop")).unwrap();
         assert_eq!(look(&at("loop")).unwrap().unwrap().0.0[1], -1);
         assert!(look(&at("absent")).unwrap().is_none());
+    }
+
+    /// A link among the directories a link leads through is stamped too:
+    /// pointed elsewhere and back again, it is another link, though the
+    /// first link and the file reached are as they were.
+    #[test]
+    fn a_look_stamps_the_links_among_the_directories_it_leads_through() {
+        let directory = tempfile::tempdir().unwrap();
+        let at = |name: &str| directory.path().join(name);
+        for name in ["old", "new", "old/sub"] {
+            std::fs::create_dir(at(name)).unwrap();
+        }
+        std::fs::write(at("old/rules"), "same").unwrap();
+        std::fs::write(at("new/rules"), "same").unwrap();
+        symlink("old", at("via")).unwrap();
+        symlink("via/rules", at("first")).unwrap();
+        let (before, _) = look(&at("first")).unwrap().unwrap();
+        // The link, the linked directory and the file.
+        assert_eq!(before.0.len(), 3 * WIDTH);
+
+        let point = |to: &str| {
+            std::fs::remove_file(at("via")).unwrap();
+            symlink(to, at("via")).unwrap();
+        };
+        point("new");
+        let (elsewhere, _) = look(&at("first")).unwrap().unwrap();
+        assert_ne!(elsewhere, before);
+        point("old");
+        let (back, _) = look(&at("first")).unwrap().unwrap();
+        assert_eq!(back.0[..WIDTH], before.0[..WIDTH]);
+        assert_eq!(back.0[2 * WIDTH..], before.0[2 * WIDTH..]);
+        assert_ne!(back, before);
+
+        // `..` is taken from where the links before it led, and an absolute
+        // target from the top.
+        symlink("via/sub/../rules", at("around")).unwrap();
+        let (around, _) = look(&at("around")).unwrap().unwrap();
+        assert_eq!(around.0[WIDTH..], back.0[WIDTH..]);
+        // By its real path, as the directory's own may lead through links.
+        let real = directory.path().canonicalize().unwrap();
+        symlink(real.join("old/rules"), at("absolute")).unwrap();
+        let (absolute, _) = look(&at("absolute")).unwrap().unwrap();
+        assert_eq!(absolute.0.len(), 2 * WIDTH);
+        assert_eq!(absolute.0[WIDTH..], back.0[2 * WIDTH..]);
+        // A link naming its own directory reaches that directory.
+        symlink(".", at("here")).unwrap();
+        let (here, _) = look(&at("here")).unwrap().unwrap();
+        let (plain, _) = look(directory.path()).unwrap().unwrap();
+        assert_eq!(here.0[WIDTH..], plain.0);
     }
 }
