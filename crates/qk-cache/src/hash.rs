@@ -7170,10 +7170,12 @@ mod tests {
         let via = outside.join("via");
         let policy = root.join("packages/app/.gitignore");
         // Not everyone may make a link everywhere: then there is nothing
-        // to tell.
+        // to tell. The project's own checks run where links can be made,
+        // so there the test must not pass by telling nothing.
         if link(&outside.join("one"), &via, true).is_err()
             || link(&via.join("rules"), &policy, false).is_err()
         {
+            assert!(std::env::var_os("CI").is_none(), "no link could be made");
             return;
         }
         std::thread::sleep(Duration::from_millis(2100));
