@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
@@ -23,6 +23,8 @@ use crate::inputs::{
 };
 use crate::paths::{self, Outputs, Pattern};
 
+mod saved;
+
 pub fn digest_file(path: &Path) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
     let mut reader = File::open(path)?;
@@ -37,75 +39,7 @@ pub fn digest_file(path: &Path) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-/// Metadata that changes whenever a file's content can have changed: size,
-/// modification time and, on Unix, change time, inode and mode.
-#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-struct Stamp(Vec<i64>);
-
-impl Stamp {
-    fn new(metadata: &std::fs::Metadata) -> Self {
-        let modified = metadata
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
-            .map_or(-1, |duration| duration.as_nanos() as i64);
-        #[allow(unused_mut)]
-        let mut values = vec![metadata.len() as i64, modified];
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            values.extend([
-                metadata.ctime(),
-                metadata.ctime_nsec(),
-                metadata.ino() as i64,
-                i64::from(metadata.mode()),
-            ]);
-        }
-        Self(values)
-    }
-
-    /// Whether a membership stamp, with the stamp of a symlink's target after
-    /// its own, was older than `window` at `looked`: see [`Self::settled`].
-    fn membership_settled(&self, window: Duration, looked: SystemTime) -> bool {
-        #[cfg(unix)]
-        let width = 6;
-        #[cfg(not(unix))]
-        let width = 2;
-        self.0
-            .chunks_exact(width)
-            .all(|values| times_settled(values, window, looked))
-    }
-
-    /// Whether every time in this stamp is more than `window`, as
-    /// [`crate::settle::window`] gives it for the file's filesystem, before
-    /// `looked`, a time taken before the file was read: a write within the
-    /// window of the last could leave the stamp as it was, so a file that
-    /// changed more recently is always read again. The change time counts
-    /// too, as tools set modification times back but nothing sets change
-    /// times back.
-    fn settled(&self, window: Duration, looked: SystemTime) -> bool {
-        times_settled(&self.0, window, looked)
-    }
-}
-
-/// [`Stamp::settled`] of the values of one file's stamp.
-fn times_settled(values: &[i64], window: Duration, looked: SystemTime) -> bool {
-    let modified = SystemTime::UNIX_EPOCH + Duration::from_nanos(values[1].max(0) as u64);
-    if values[1] < 0 || !crate::settle::older(modified, window, looked) {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        let changed = SystemTime::UNIX_EPOCH
-            + Duration::new(
-                values[2].max(0) as u64,
-                values[3].clamp(0, 999_999_999) as u32,
-            );
-        values[2] >= 0 && crate::settle::older(changed, window, looked)
-    }
-    #[cfg(not(unix))]
-    true
-}
+use qk_state::Stamp;
 
 /// Digests persisted between runs in the worktree's state, keyed by path and
 /// stamp, so a warm run reads only the files that changed. Stamps include the
@@ -133,6 +67,9 @@ pub struct Snapshot {
     /// tasks are keyed, see [`Self::settle`]. A task whose file inputs name
     /// paths needs neither, so it is keyed, and runs, without waiting.
     listing: Mutex<Option<std::thread::JoinHandle<Result<Membership>>>>,
+    /// Saving that inventory for later runs, which [`Self::settle`] starts
+    /// once it is kept, see [`saved`], and the end of the run waits for.
+    saving: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// The ignore policy read with that listing, which then replaces
     /// `built_ignore`.
     listed_ignore: std::sync::OnceLock<Arc<SourceIgnore>>,
@@ -163,16 +100,14 @@ pub struct Snapshot {
     canonical_root: PathBuf,
     workspace_prefix: Option<PathBuf>,
     patterns: Mutex<HashMap<(String, bool, bool), Arc<Pattern>>>,
-    digests: Mutex<HashMap<String, (Stamp, String)>>,
-    /// Files whose digests this run used, which are saved beside those of
-    /// `files`, the source listing, which leaves out many of them: what
-    /// `includeIgnored` filesets read, other tasks' declared outputs, and
-    /// the targets of links.
-    read_files: Mutex<HashSet<String>>,
+    /// Each file's digest with the stamp it was taken at. Threads keying
+    /// files mostly find theirs here, which a read lock lets them do
+    /// together.
+    digests: RwLock<HashMap<String, Kept>>,
     /// Whether `digests` gained entries worth saving.
     digests_changed: std::sync::atomic::AtomicBool,
     /// Directories already checked not to be symlinks.
-    directories: Mutex<HashSet<PathBuf>>,
+    directories: RwLock<HashSet<PathBuf>>,
     /// Runtime input results by command and environment, computed once per run like Nx.
     runtime: Mutex<HashMap<RuntimeKey, Arc<Mutex<Option<Value>>>>>,
     /// The parsed pnpm lockfile, replaced whenever its content changes.
@@ -181,6 +116,14 @@ pub struct Snapshot {
     /// handed over by its restore, and dropped once a task that may have
     /// written where they lie is done.
     dependency_outputs: Mutex<Listings>,
+}
+
+impl Drop for Snapshot {
+    /// A run that ends without saving its digests still finishes saving its
+    /// listing, rather than stop it with its file not yet moved into place.
+    fn drop(&mut self) {
+        self.finish_saving();
+    }
 }
 
 /// Membership depends on directory entries and Git/ignore listing policy, not
@@ -201,6 +144,17 @@ struct Membership {
     git_policies: BTreeSet<PathBuf>,
     ignore_contents: BTreeMap<PathBuf, String>,
     settled: bool,
+    /// Whether this inventory's listing is known to be of exactly what it
+    /// stamped, which saving it for later runs needs beyond `settled`:
+    /// nothing it stamps moved, or was too recent to tell, between its
+    /// stamps and the end of its listing, and the root's ignore rules its
+    /// matcher was built from are those it captured. A file removed and put
+    /// back while the listing was taken leaves the names as captured and the
+    /// listing without it; a run keeps such a listing for itself, as it
+    /// would take the same one again, but does not hand it on. Where stamps
+    /// hold no change time, neither is one that stamps anything through a
+    /// link.
+    exact: bool,
     /// When the refresh that produced this inventory began listing.
     listed: Option<Instant>,
     /// When this inventory began taking its stamps, before any of them: what
@@ -209,6 +163,12 @@ struct Membership {
     /// The paths this inventory and its listing cover, when not the whole
     /// workspace: see [`Scope`].
     scope: Option<Arc<Scope>>,
+    /// Whether this inventory and its listing were saved by an earlier run
+    /// and found to hold still: see [`saved::restore`].
+    restored: bool,
+    /// What to save this inventory under for later runs, once it is kept:
+    /// set on one taken afresh for a snapshot, see [`Snapshot::watch`].
+    save_as: Option<saved::Identity>,
 }
 
 /// Workspace-relative paths a narrowed inventory and listing cover: what is
@@ -314,6 +274,10 @@ const WALKERS: usize = 8;
 /// Threads listing source files when ignore files are read on the way. Past a
 /// few, more threads add system time faster than they save time.
 const LISTERS: usize = 4;
+/// Stamps a thread of [`Membership::state`] looks at at least, so a short
+/// list is not split: a look costs a few microseconds, starting a thread
+/// tens of them.
+const STAMPS_PER_THREAD: usize = 256;
 /// Paths a narrowed listing covers at most. Git matches every file it lists
 /// against each path asked for: in a large monorepo, asking for 256 took
 /// about as long as listing everything, and fewer cost less in proportion.
@@ -344,39 +308,7 @@ impl Membership {
         git_policies: Option<&BTreeSet<PathBuf>>,
         scope: Option<&Arc<Scope>>,
     ) -> Result<Self> {
-        let mut output_anchors: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
-        for (index, outputs) in outputs.iter().enumerate() {
-            for anchor in outputs.anchors() {
-                output_anchors
-                    .entry(PathBuf::from(anchor))
-                    .or_default()
-                    .push(index);
-            }
-        }
-        let stamped = SystemTime::now();
-        let mut membership = Self {
-            files: Arc::new(BTreeSet::new()),
-            source_ignore: source_ignore.clone(),
-            stamps: BTreeMap::new(),
-            directories: BTreeSet::new(),
-            directory_entries: BTreeMap::new(),
-            root: root.to_owned(),
-            outputs: outputs.to_vec(),
-            output_anchors,
-            excluded_roots: outputs
-                .iter()
-                .flat_map(Outputs::complete_roots)
-                .map(PathBuf::from)
-                .collect(),
-            cache: cache.map(PathBuf::from),
-            policies: BTreeSet::new(),
-            git_policies: BTreeSet::new(),
-            ignore_contents: BTreeMap::new(),
-            settled: false,
-            listed: None,
-            stamped,
-            scope: scope.cloned(),
-        };
+        let mut membership = Self::empty(root, source_ignore, outputs, cache, scope);
         // Finding Git's own policy files takes several Git processes, which
         // run while the directories are read. They are stamped as soon as
         // they are found: a config rewritten during the walk could name an
@@ -452,6 +384,52 @@ impl Membership {
             }
         }
         Ok(membership)
+    }
+
+    /// An inventory of nothing yet, for what `outputs`, `cache` and `scope`
+    /// leave to list, beginning now.
+    fn empty(
+        root: &Path,
+        source_ignore: &Arc<SourceIgnore>,
+        outputs: &[Outputs],
+        cache: Option<&Path>,
+        scope: Option<&Arc<Scope>>,
+    ) -> Self {
+        let mut output_anchors: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
+        for (index, outputs) in outputs.iter().enumerate() {
+            for anchor in outputs.anchors() {
+                output_anchors
+                    .entry(PathBuf::from(anchor))
+                    .or_default()
+                    .push(index);
+            }
+        }
+        Self {
+            files: Arc::new(BTreeSet::new()),
+            source_ignore: source_ignore.clone(),
+            stamps: BTreeMap::new(),
+            directories: BTreeSet::new(),
+            directory_entries: BTreeMap::new(),
+            root: root.to_owned(),
+            outputs: outputs.to_vec(),
+            output_anchors,
+            excluded_roots: outputs
+                .iter()
+                .flat_map(Outputs::complete_roots)
+                .map(PathBuf::from)
+                .collect(),
+            cache: cache.map(PathBuf::from),
+            policies: BTreeSet::new(),
+            git_policies: BTreeSet::new(),
+            ignore_contents: BTreeMap::new(),
+            settled: false,
+            exact: false,
+            listed: None,
+            stamped: SystemTime::now(),
+            scope: scope.cloned(),
+            restored: false,
+            save_as: None,
+        }
     }
 
     /// Stamp each directory from the root, then capture its names from the
@@ -650,6 +628,19 @@ impl Membership {
     /// listing policies must have settled by `looked`, a time taken before
     /// they are stamped again, for the result to say they have.
     fn state(&self, prefixes: Option<&[PathBuf]>, looked: SystemTime) -> Result<(bool, bool)> {
+        self.state_noting(prefixes, looked, &AtomicBool::new(false))
+    }
+
+    /// [`Self::state`], setting `reread` when a directory's names or an
+    /// ignore file's rules had to be read again to tell: its stamp moved, or
+    /// was too recent to trust. What was read then is what was captured, but
+    /// something happened there in between.
+    fn state_noting(
+        &self,
+        prefixes: Option<&[PathBuf]>,
+        looked: SystemTime,
+        reread: &AtomicBool,
+    ) -> Result<(bool, bool)> {
         let mut settled = true;
         let selected = prefixes.map(|prefixes| {
             let mut selected = BTreeSet::new();
@@ -709,46 +700,91 @@ impl Membership {
                 }))
             }
         };
-        for (path, before, directory) in paths {
-            let (after, window) = match membership_look(path)? {
-                Some((stamp, window)) => (Some(stamp), window),
-                None => (None, crate::settle::FALLBACK),
-            };
-            let recent = |looked| {
-                after
-                    .as_ref()
-                    .is_some_and(|stamp| !stamp.membership_settled(window, looked))
-            };
-            if let Some(captured) = directory {
-                if after.is_some() && captured.is_none() {
-                    return Ok((false, false));
-                }
-                // Output publication changes its parent's timestamp too. Check
-                // source-relevant names rather than relisting the whole workspace.
-                // Recent directories are always read, even with an equal stamp:
-                // coarse timestamps can conceal an addition or removal.
-                if *before != after || recent(self.stamped) {
-                    let entries = self.entries(path)?;
-                    if entries.as_ref() != captured || membership_stamp(path)? != after {
-                        return Ok((false, false));
-                    }
-                }
-            } else {
-                if (*before != after || recent(self.stamped))
-                    && let Some(content) = self.ignore_contents.get(path)
-                {
-                    if ignore_content(path, &after)?.as_ref() != Some(content) {
-                        return Ok((false, false));
-                    }
-                    continue;
-                }
-                if *before != after {
-                    return Ok((false, false));
-                }
-                settled &= !recent(looked);
+        // Paths are looked at on several threads when there are many: each
+        // look is a system call or a few, which wait apart from each other.
+        // Once one path is found changed, the answer is known and the rest
+        // are passed over.
+        let paths: Vec<Checked> = paths.collect();
+        let changed = AtomicBool::new(false);
+        let verdicts = in_parallel(&paths, STAMPS_PER_THREAD, |(path, before, directory)| {
+            if changed.load(Ordering::Relaxed) {
+                return Ok(Ok(Some(true)));
+            }
+            let verdict = self.check(path, before, *directory, looked, reread);
+            // Only a change answers for the paths not looked at yet: after a
+            // failure they are still looked at, and one that changed lists
+            // again rather than failing the run.
+            if matches!(verdict, Ok(None)) {
+                changed.store(true, Ordering::Relaxed);
+            }
+            Ok(verdict)
+        })?;
+        // A path found changed answers whatever another failed with: taking
+        // the inventory again meets that failure where it matters.
+        let mut failure = None;
+        for verdict in verdicts {
+            match verdict {
+                Ok(None) => return Ok((false, false)),
+                Ok(Some(path_settled)) => settled &= path_settled,
+                Err(error) => failure = failure.or(Some(error)),
             }
         }
-        Ok((true, settled))
+        match failure {
+            Some(error) => Err(error),
+            None => Ok((true, settled)),
+        }
+    }
+
+    /// [`Self::state`] of one path, with its stamp `before` and, for a
+    /// directory, the names captured for it if any: `None` when it changed,
+    /// and otherwise whether it had settled by `looked`.
+    fn check(
+        &self,
+        path: &Path,
+        before: &Option<Stamp>,
+        directory: Option<Option<&BTreeSet<(OsString, u8)>>>,
+        looked: SystemTime,
+        reread: &AtomicBool,
+    ) -> Result<Option<bool>> {
+        let (after, window) = match membership_look(path)? {
+            Some((stamp, window)) => (Some(stamp), window),
+            None => (None, crate::settle::FALLBACK),
+        };
+        let recent = |looked| {
+            after
+                .as_ref()
+                .is_some_and(|stamp| !stamp.look_settled(window, looked))
+        };
+        if let Some(captured) = directory {
+            if after.is_some() && captured.is_none() {
+                return Ok(None);
+            }
+            // Output publication changes its parent's timestamp too. Check
+            // source-relevant names rather than relisting the whole workspace.
+            // Recent directories are always read, even with an equal stamp:
+            // coarse timestamps can conceal an addition or removal.
+            if *before != after || recent(self.stamped) {
+                reread.store(true, Ordering::Relaxed);
+                let entries = self.entries(path)?;
+                if entries.as_ref() != captured || membership_stamp(path)? != after {
+                    return Ok(None);
+                }
+            }
+            return Ok(Some(true));
+        }
+        if (*before != after || recent(self.stamped))
+            && let Some(content) = self.ignore_contents.get(path)
+        {
+            reread.store(true, Ordering::Relaxed);
+            if ignore_content(path, &after)?.as_ref() != Some(content) {
+                return Ok(None);
+            }
+            return Ok(Some(true));
+        }
+        if *before != after {
+            return Ok(None);
+        }
+        Ok(Some(!recent(looked)))
     }
 
     /// Retain a matched listing and policy for use after releasing the lock.
@@ -777,7 +813,7 @@ impl Membership {
             },
         };
         exclude_artifacts(&mut files, &self.outputs, self.cache.as_deref());
-        let ignore = SourceIgnore::new(&self.root)?;
+        let (ignore, read) = SourceIgnore::read(&self.root)?;
         files.extend(
             extra
                 .iter()
@@ -791,8 +827,27 @@ impl Membership {
         self.files = Arc::new(files);
         // An unstable inventory or recent policy never enables the fast path.
         // Keep candidates so a rebuild also watches tracked, ignored parents.
-        self.settled = rebuilt && self.covers(&self.files) && self.state(None, self.stamped)?.1;
+        let reread = AtomicBool::new(false);
+        self.settled = rebuilt
+            && self.covers(&self.files)
+            && self.state_noting(None, self.stamped, &reread)?.1;
+        // A stamp holds a change time on Unix alone. Without one, a link
+        // moved aside while the listing was taken and put back afterwards
+        // has the stamp it had, so what was read through a link cannot be
+        // shown to be what was stamped, and such an inventory is not exact.
+        let through_link = !cfg!(unix) && self.stamps.values().flatten().any(Stamp::through_link);
+        self.exact =
+            self.settled && !reread.load(Ordering::Relaxed) && !through_link && self.vouches(&read);
         Ok(())
+    }
+
+    /// Whether the root's ignore files as a matcher `read` them are as this
+    /// inventory captured them: each with the content it holds a digest of,
+    /// or absent where it holds none. A file that was there only while the
+    /// matcher was built shows here and in no stamp.
+    fn vouches(&self, read: &[(PathBuf, Option<String>)]) -> bool {
+        read.iter()
+            .all(|(path, content)| self.ignore_contents.get(path) == content.as_ref())
     }
 
     /// Whether every directory above each of `files` has a stamp. Files share
@@ -936,41 +991,9 @@ fn membership_stamp(path: &Path) -> Result<Option<Stamp>> {
 }
 
 /// [`membership_stamp`], with the window of [`crate::settle::window`] that
-/// covers each file it stamps.
+/// covers each file it stamps: see [`qk_state::look`].
 fn membership_look(path: &Path) -> Result<Option<(Stamp, Duration)>> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            let mut stamp = Stamp::new(&metadata);
-            let mut window = crate::settle::window(path, &metadata);
-            if metadata.is_symlink() {
-                // Follow the current chain on every check. In-place target
-                // edits or retargeted intermediate links can change policy.
-                match std::fs::metadata(path) {
-                    Ok(target) => {
-                        stamp.0.extend(Stamp::new(&target).0);
-                        // Asked of the target's own filesystem, which holds a
-                        // regular file or directory and is not followed again.
-                        window = window.max(match std::fs::canonicalize(path) {
-                            Ok(resolved) => crate::settle::window(&resolved, &target),
-                            Err(_) => crate::settle::FALLBACK,
-                        });
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => stamp.0[1] = -1,
-                    Err(error) => return Err(error.into()),
-                }
-            }
-            Ok(Some((stamp, window)))
-        }
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-            ) =>
-        {
-            Ok(None)
-        }
-        Err(error) => Err(error).with_context(|| format!("cannot inspect {}", path.display())),
-    }
+    qk_state::look(path)
 }
 
 /// One dependency task's output files, and the value of each one a pattern
@@ -1074,6 +1097,30 @@ struct Installed {
     /// `None` when the file cannot be read as a pnpm v9 lockfile.
     lockfile: Option<Lockfile>,
     digests: Mutex<HashMap<String, String>>,
+    /// Whether `digests` holds one computed since they were last recalled or
+    /// saved.
+    computed: AtomicBool,
+}
+
+/// What [`Installed::save`] writes: the digests of what one revision of the
+/// lockfile installs, as one version of qk computes them.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedInstalled {
+    version: u32,
+    qk: String,
+    content: String,
+    digests: BTreeMap<String, String>,
+}
+
+/// The form of [`SavedInstalled`] and of the digests in it. Raise it with
+/// any change to what a digest of the lockfile covers, so that no digest
+/// saved before the change is taken for one computed after it.
+const SAVED_INSTALLED: u32 = 1;
+
+/// Where a worktree keeps the digests of what its lockfile installs between
+/// runs.
+fn installed_path(root: &Path) -> PathBuf {
+    paths::worktree_state(root).join("lockfile-digests.json")
 }
 
 impl Installed {
@@ -1091,7 +1138,61 @@ impl Installed {
             .lock()
             .unwrap()
             .insert(key.to_owned(), digest.clone());
+        self.computed.store(true, Ordering::Relaxed);
         digest
+    }
+
+    /// Takes the digests an earlier run saved for this revision of the
+    /// lockfile. A digest is computed from the lockfile's text alone, so one
+    /// saved for the same text by the same qk is the one this run would
+    /// compute: walking what an importer or a package installs takes
+    /// milliseconds that every run would otherwise spend before its first
+    /// task is keyed. Anything else saved is ignored.
+    fn recall(&self, root: &Path) {
+        let saved = std::fs::read(installed_path(root))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<SavedInstalled>(&bytes).ok())
+            .filter(|saved| {
+                saved.version == SAVED_INSTALLED
+                    && saved.qk == env!("CARGO_PKG_VERSION")
+                    && saved.content == self.content
+            });
+        if let Some(saved) = saved {
+            let mut digests = self.digests.lock().unwrap();
+            for (key, digest) in saved.digests {
+                digests.entry(key).or_insert(digest);
+            }
+        }
+    }
+
+    /// Saves the digests for the next run, when this one computed any.
+    fn save(&self, root: &Path) -> Result<()> {
+        if !self.computed.swap(false, Ordering::Relaxed) {
+            return Ok(());
+        }
+        let saved = SavedInstalled {
+            version: SAVED_INSTALLED,
+            qk: env!("CARGO_PKG_VERSION").to_owned(),
+            content: self.content.clone(),
+            digests: self
+                .digests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(key, digest)| (key.clone(), digest.clone()))
+                .collect(),
+        };
+        let path = installed_path(root);
+        let directory = path.parent().context("lockfile digests have a directory")?;
+        std::fs::create_dir_all(directory)?;
+        let mut file = tempfile::NamedTempFile::new_in(directory)?;
+        {
+            let mut writer = std::io::BufWriter::new(file.as_file_mut());
+            serde_json::to_writer(&mut writer, &saved)?;
+            writer.flush()?;
+        }
+        file.persist(&path)?;
+        Ok(())
     }
 }
 
@@ -1170,6 +1271,7 @@ impl Snapshot {
             root: workspace.root.clone(),
             files: std::sync::OnceLock::new(),
             listing: Mutex::default(),
+            saving: Mutex::default(),
             listed_ignore: std::sync::OnceLock::new(),
             extra_candidates: BTreeSet::new(),
             membership: Mutex::default(),
@@ -1207,10 +1309,9 @@ impl Snapshot {
             canonical_root: canonical_root.clone(),
             workspace_prefix: None,
             patterns: Mutex::default(),
-            digests: Mutex::default(),
+            digests: RwLock::default(),
             digests_changed: Default::default(),
-            read_files: Mutex::default(),
-            directories: Mutex::default(),
+            directories: RwLock::default(),
             runtime: Mutex::default(),
             lockfile: Mutex::default(),
             dependency_outputs: Mutex::default(),
@@ -1218,10 +1319,11 @@ impl Snapshot {
         // Every early task needs these, so loading saved digests and parsing
         // the lockfile overlap listing files.
         let (lockfile, (digests, workspace_prefix)) = std::thread::scope(|scope| {
-            let lockfile = scope.spawn(|| parse_lockfile(&workspace.root.join("pnpm-lock.yaml")));
+            let lockfile =
+                scope.spawn(|| prefetched_lockfile(&workspace.root.join("pnpm-lock.yaml")));
             let digests = scope.spawn(|| {
                 let digests = load_digests(&workspace.root);
-                let workspace_prefix = paths::git_path(&workspace.root, "--show-toplevel")
+                let workspace_prefix = paths::git_toplevel(&workspace.root)
                     .and_then(|root| root.canonicalize().ok())
                     .and_then(|root| canonical_root.strip_prefix(root).ok().map(PathBuf::from));
                 (digests, workspace_prefix)
@@ -1247,8 +1349,11 @@ impl Snapshot {
                 digests.join().expect("digest thread panicked"),
             ))
         })?;
+        if let Some(installed) = &lockfile {
+            installed.recall(&workspace.root);
+        }
         snapshot.lockfile = Mutex::new(lockfile);
-        snapshot.digests = Mutex::new(digests);
+        snapshot.digests = RwLock::new(digests);
         snapshot.workspace_prefix = workspace_prefix;
         Ok(snapshot)
     }
@@ -1269,6 +1374,39 @@ impl Snapshot {
         let scope = self.scope.clone();
         let listing = std::thread::spawn(move || {
             let _listing = crate::profile::span("snapshot", "inventory_list");
+            // An earlier run's inventory, taken for what this one would
+            // take, serves as one taken now when its stamps still hold.
+            let identity = saved::Identity::new(
+                &root,
+                scope.as_deref(),
+                &exclusions,
+                cache.as_deref(),
+                &extra,
+            );
+            if let Ok(source_ignore) = SourceIgnore::read(&root) {
+                let _loading = crate::profile::span("snapshot", "inventory_restore");
+                let template = Membership::empty(
+                    &root,
+                    &ignore,
+                    &exclusions,
+                    cache.as_deref(),
+                    scope.as_ref(),
+                );
+                if let Some(mut membership) =
+                    saved::restore(&root, &identity, template, source_ignore)
+                {
+                    membership.listed = Some(listed);
+                    return Ok(membership);
+                }
+            }
+            // Made before the inventory is stamped, so that saving it later
+            // writes only within this directory and changes no stamp the
+            // inventory holds. Making the worktree's state directory would
+            // change the stamp of the workspace root or of `.git`, which
+            // holds it, while tasks are keyed, so a run that finds none saves
+            // nothing: saving its digests at its end makes it.
+            let save = paths::worktree_state(&root).is_dir()
+                && std::fs::create_dir_all(saved::directory(&root)).is_ok();
             // No earlier listing names tracked files beneath directories the
             // walk skips, so such a file leaves the inventory unsettled and
             // the first refresh watches its parents.
@@ -1283,6 +1421,11 @@ impl Snapshot {
             )?;
             membership.list(&extra, true)?;
             membership.listed = Some(listed);
+            // Only a settled inventory whose listing is exactly of what it
+            // stamped is saved: see `saved`.
+            if save && membership.settled && membership.exact {
+                membership.save_as = Some(identity);
+            }
             Ok(membership)
         });
         *self.listing.get_mut().unwrap() = Some(listing);
@@ -1298,7 +1441,7 @@ impl Snapshot {
             return;
         };
         let _waiting = crate::profile::span("snapshot", "inventory_wait");
-        let Ok(membership) = pending.join().expect("listing thread panicked") else {
+        let Ok(mut membership) = pending.join().expect("listing thread panicked") else {
             return;
         };
         let _ = self.listed_ignore.set(membership.source_ignore.clone());
@@ -1307,7 +1450,27 @@ impl Snapshot {
         if membership.scope.is_none() {
             let _ = self.files.set(Ok((*membership.files).clone()));
         }
-        *self.membership.lock().unwrap() = Some(Arc::new(membership));
+        let save_as = membership.save_as.take();
+        let membership = Arc::new(membership);
+        // Saved while tasks are keyed, as this run keeps it: what a task
+        // adds to it later is this run's alone.
+        if let Some(identity) = save_as {
+            let root = self.root.clone();
+            let kept = membership.clone();
+            *self.saving.lock().unwrap() = Some(std::thread::spawn(move || {
+                if let Err(error) = saved::save(&root, &identity, &kept) {
+                    qk_executor::status!("qk: could not save the source listing: {error:#}");
+                }
+            }));
+        }
+        *self.membership.lock().unwrap() = Some(membership);
+    }
+
+    /// Waits for the inventory [`Self::settle`] is saving, if any.
+    fn finish_saving(&self) {
+        if let Some(saving) = self.saving.lock().unwrap().take() {
+            let _ = saving.join();
+        }
     }
 
     /// The ignore policy that decides which files are sources: the one read
@@ -1642,8 +1805,16 @@ impl Snapshot {
 
     /// Saves the digests of files that still exist, for the next run: those
     /// the run listed or read. A run that listed no files keeps every
-    /// digest, until one that lists them.
+    /// digest, until one that lists them. The digests of what the lockfile
+    /// installs are saved beside them.
     pub fn save_digests(&self, root: &Path) {
+        self.finish_saving();
+        let installed = self.lockfile.lock().unwrap().clone();
+        if let Some(installed) = installed
+            && let Err(error) = installed.save(root)
+        {
+            qk_executor::status!("qk: could not save lockfile digests: {error:#}");
+        }
         if !self
             .digests_changed
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -1651,18 +1822,17 @@ impl Snapshot {
             return;
         }
         self.settle();
-        let digests = self.digests.lock().unwrap();
-        let read = self.read_files.lock().unwrap();
+        let digests = self.digests.read().unwrap();
         let files = match self.files.get() {
             Some(Ok(files)) => Some(files),
             _ => None,
         };
         let entries: BTreeMap<&String, (&Stamp, &String)> = digests
             .iter()
-            .filter(|(path, _)| {
-                files.is_none_or(|files| files.contains(*path)) || read.contains(*path)
+            .filter(|(path, kept)| {
+                files.is_none_or(|files| files.contains(*path)) || kept.used.load(Ordering::Relaxed)
             })
-            .map(|(path, (stamp, digest))| (path, (stamp, digest)))
+            .map(|(path, kept)| (path, (&kept.stamp, &kept.digest)))
             .collect();
         let path = digests_path(root);
         let saved = (|| -> Result<()> {
@@ -1708,6 +1878,7 @@ impl Snapshot {
         let Some(installed) = parsed else {
             return Ok(None);
         };
+        installed.recall(root);
         *current = Some(installed.clone());
         Ok(Some(installed))
     }
@@ -1765,12 +1936,12 @@ impl Snapshot {
     }
 
     fn digest(&self, path: &str, absolute: &Path, metadata: &std::fs::Metadata) -> Result<String> {
-        self.read_files.lock().unwrap().insert(path.to_owned());
         let stamp = Stamp::new(metadata);
-        if let Some((known, digest)) = self.digests.lock().unwrap().get(path)
-            && *known == stamp
-        {
-            return Ok(digest.clone());
+        if let Some(kept) = self.digests.read().unwrap().get(path) {
+            kept.used.store(true, Ordering::Relaxed);
+            if kept.stamp == stamp {
+                return Ok(kept.digest.clone());
+            }
         }
         // Before reading: a write the window lets keep the stamp, made while
         // the file is read or after, would leave a digest of other contents.
@@ -1779,10 +1950,12 @@ impl Snapshot {
         // Re-check after reading so a concurrent write is never recorded as settled.
         let after = Stamp::new(&std::fs::symlink_metadata(absolute)?);
         if after == stamp && stamp.settled(crate::settle::window(absolute, metadata), reading) {
-            self.digests
-                .lock()
-                .unwrap()
-                .insert(path.to_owned(), (stamp, digest.clone()));
+            let kept = Kept {
+                stamp,
+                digest: digest.clone(),
+                used: AtomicBool::new(true),
+            };
+            self.digests.write().unwrap().insert(path.to_owned(), kept);
             self.digests_changed
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
@@ -1969,22 +2142,111 @@ impl Snapshot {
 /// Reads and parses a pnpm lockfile, `None` when there is none. One qk cannot
 /// read is reported, and kept as unreadable so tasks key its whole content.
 fn parse_lockfile(path: &Path) -> Option<Arc<Installed>> {
+    let (installed, unreadable) = read_lockfile(path)?;
+    if let Some(error) = unreadable {
+        qk_executor::status!("qk: pnpm-lock.yaml: keying tasks by the whole file ({error})");
+    }
+    Some(installed)
+}
+
+/// What [`parse_lockfile`] returns, with why qk cannot read the lockfile
+/// where it cannot, left for the caller to report.
+type ReadLockfile = Option<(Arc<Installed>, Option<String>)>;
+
+fn read_lockfile(path: &Path) -> ReadLockfile {
     let text = std::fs::read_to_string(path).ok()?;
-    let lockfile = match Lockfile::parse(&text) {
-        Ok(lockfile) => Some(lockfile),
-        Err(error) => {
-            qk_executor::status!("qk: pnpm-lock.yaml: keying tasks by the whole file ({error:#})");
-            None
-        }
+    let (lockfile, unreadable) = match Lockfile::parse(&text) {
+        Ok(lockfile) => (Some(lockfile), None),
+        Err(error) => (None, Some(format!("{error:#}"))),
     };
-    Some(Arc::new(Installed {
+    let installed = Installed {
         content: blake3::hash(text.as_bytes()).to_hex().to_string(),
         lockfile,
         digests: Mutex::default(),
-    }))
+        computed: AtomicBool::new(false),
+    };
+    Some((Arc::new(installed), unreadable))
 }
 
-fn load_digests(root: &Path) -> HashMap<String, (Stamp, String)> {
+/// A lockfile [`prefetch_lockfile`] began reading, until a snapshot takes it.
+enum Prefetched {
+    Reading(std::thread::JoinHandle<ReadLockfile>),
+    Read(ReadLockfile),
+}
+
+static PREFETCHED: Mutex<Option<(PathBuf, Prefetched)>> = Mutex::new(None);
+
+/// Starts reading and parsing the pnpm lockfile at `root` on a thread of its
+/// own, for a command that will key tasks once it has loaded the workspace:
+/// the first snapshot built at `root` takes what the thread read rather than
+/// reading the file itself. Tasks compare the lockfile's content with what
+/// was parsed whenever they key, so one that changes after it is read here
+/// is parsed again, as one that changes after a snapshot read it is.
+pub fn prefetch_lockfile(root: &Path) {
+    let path = root.join("pnpm-lock.yaml");
+    let reading = {
+        let path = path.clone();
+        std::thread::spawn(move || read_lockfile(&path))
+    };
+    *PREFETCHED.lock().unwrap() = Some((path, Prefetched::Reading(reading)));
+}
+
+/// Waits for the thread [`prefetch_lockfile`] started, if it still runs, and
+/// keeps what it read, for a caller that needs to be the process's only
+/// thread.
+pub fn await_lockfile() {
+    let mut prefetched = PREFETCHED.lock().unwrap();
+    *prefetched = match prefetched.take() {
+        // A thread that panicked read nothing, and leaves the file to the
+        // snapshot.
+        Some((path, Prefetched::Reading(reading))) => reading
+            .join()
+            .ok()
+            .map(|read| (path, Prefetched::Read(read))),
+        other => other,
+    };
+}
+
+/// [`parse_lockfile`], taking what [`prefetch_lockfile`] read of `path`
+/// where it was started and nothing took it yet.
+fn prefetched_lockfile(path: &Path) -> Option<Arc<Installed>> {
+    let prefetched = {
+        let mut prefetched = PREFETCHED.lock().unwrap();
+        match prefetched.take() {
+            Some((read, taken)) if read == path => Some(taken),
+            other => {
+                *prefetched = other;
+                None
+            }
+        }
+    };
+    let (installed, unreadable) = match prefetched {
+        Some(Prefetched::Read(read)) => read,
+        // A thread that panicked read nothing: read it here.
+        Some(Prefetched::Reading(reading)) => match reading.join() {
+            Ok(read) => read,
+            Err(_) => return parse_lockfile(path),
+        },
+        None => return parse_lockfile(path),
+    }?;
+    if let Some(error) = unreadable {
+        qk_executor::status!("qk: pnpm-lock.yaml: keying tasks by the whole file ({error})");
+    }
+    Some(installed)
+}
+
+/// A file's digest, kept while its stamp is the one it was taken at.
+struct Kept {
+    stamp: Stamp,
+    digest: String,
+    /// Whether this run asked for the file's digest. Those are saved beside
+    /// the digests of `files`, the source listing, which leaves out many of
+    /// them: what `includeIgnored` filesets read, other tasks' declared
+    /// outputs, and the targets of links.
+    used: AtomicBool,
+}
+
+fn load_digests(root: &Path) -> HashMap<String, Kept> {
     #[derive(serde::Deserialize)]
     struct Saved {
         version: u32,
@@ -1994,7 +2256,20 @@ fn load_digests(root: &Path) -> HashMap<String, (Stamp, String)> {
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Saved>(&bytes).ok())
         .filter(|saved| saved.version == 1)
-        .map(|saved| saved.entries)
+        .map(|saved| {
+            let kept = |(path, (stamp, digest))| {
+                let used = AtomicBool::new(false);
+                (
+                    path,
+                    Kept {
+                        stamp,
+                        digest,
+                        used,
+                    },
+                )
+            };
+            saved.entries.into_iter().map(kept).collect()
+        })
         .unwrap_or_default()
 }
 
@@ -2056,19 +2331,56 @@ fn under<'a>(files: &'a BTreeSet<String>, prefix: &'a str) -> impl Iterator<Item
 /// Compiled root ignore rules used by input discovery and project watching.
 pub struct SourceIgnore(ignore::gitignore::Gitignore);
 
+/// The root's ignore files as [`SourceIgnore::read`] read them: each with a
+/// digest of its content, or `None` for one that is not there.
+type RootRules = Vec<(PathBuf, Option<String>)>;
+
 impl SourceIgnore {
     /// Root ignore rules shared by caching and watch, including tracked files.
     pub fn new(root: &Path) -> Result<Self> {
+        Ok(Self::read(root)?.0)
+    }
+
+    /// [`Self::new`], with a digest of each of the root's ignore files as
+    /// it was read, `None` for one that is not there. Each file is read
+    /// once, and the rules are built from what was read, so the digest is
+    /// of the rules: an inventory compares it with the content it captured.
+    fn read(root: &Path) -> Result<(Self, RootRules)> {
         let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
+        let mut read = Vec::new();
         for name in [".gitignore", ".nxignore"] {
             let path = root.join(name);
-            if path.is_file()
-                && let Some(error) = builder.add(path)
-            {
-                return Err(error.into());
+            let content = match std::fs::read(&path) {
+                Ok(content) => content,
+                // Not there, or not a file, as a directory of that name.
+                Err(_) if !path.is_file() => {
+                    read.push((path, None));
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| format!("cannot read {}", path.display()));
+                }
+            };
+            let text = std::str::from_utf8(&content)
+                .with_context(|| format!("{} is not UTF-8", path.display()))?;
+            for (index, line) in text.lines().enumerate() {
+                // As Git does, a byte order mark before the first rule is
+                // not part of it.
+                let line = if index == 0 {
+                    line.trim_start_matches('\u{feff}')
+                } else {
+                    line
+                };
+                builder
+                    .add_line(Some(path.clone()), line)
+                    .map_err(|error| {
+                        anyhow::anyhow!("{}: line {}: {error}", path.display(), index + 1)
+                    })?;
             }
+            let digest = blake3::hash(&content).to_hex().to_string();
+            read.push((path, Some(digest)));
         }
-        Ok(Self(builder.build()?))
+        Ok((Self(builder.build()?), read))
     }
 
     fn matches_directory(&self, path: &str) -> bool {
@@ -5241,6 +5553,145 @@ mod tests {
         assert!(error.contains("resolves to the workspace root"), "{error}");
     }
 
+    /// A tracked file whose directory was replaced by a link is refused, and
+    /// the error names it.
+    #[cfg(unix)]
+    #[test]
+    fn an_input_beneath_a_linked_directory_is_refused_by_name() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("nx.json"), "{}").unwrap();
+        std::fs::write(
+            root.path().join("project.json"),
+            json!({"name": "app", "targets": {"read": {"command": "true", "inputs": [
+                "{projectRoot}/sources/**/*"
+            ]}}})
+            .to_string(),
+        )
+        .unwrap();
+        for directory in ["sources/plain", "sources/moved", "elsewhere"] {
+            std::fs::create_dir_all(root.path().join(directory)).unwrap();
+            std::fs::write(root.path().join(directory).join("a.ts"), "a").unwrap();
+        }
+        let git = |args: &[&str]| assert!(paths::git(root.path(), args).unwrap().status.success());
+        git(&["init", "--quiet"]);
+        git(&["add", "sources"]);
+        std::fs::remove_dir_all(root.path().join("sources/moved")).unwrap();
+        std::os::unix::fs::symlink("../elsewhere", root.path().join("sources/moved")).unwrap();
+        let workspace = Workspace::load(root.path()).unwrap();
+        let graph = TaskGraph::build(&workspace, &[Request::parse("app:read").unwrap()]).unwrap();
+        let task = &graph.tasks["app:read"];
+        let prepared = qk_executor::prepare(&workspace, task, &BTreeMap::new()).unwrap();
+        let snapshot = Snapshot::new(&workspace, &graph, &workspace.root.join("cache")).unwrap();
+        let error = inputs(
+            &snapshot,
+            &workspace,
+            task,
+            &prepared,
+            &BTreeMap::new(),
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("cannot read input sources/moved/a.ts")
+                && error.contains("input parent is a symlink"),
+            "{error}"
+        );
+    }
+
+    /// The digests of what a lockfile installs are taken from an earlier run
+    /// only for the same text of the lockfile, saved by the same qk in the
+    /// same form. Otherwise they are computed.
+    #[test]
+    fn saved_lockfile_digests_are_recalled_only_for_the_same_lockfile_and_qk() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("pnpm-lock.yaml");
+        let text = "lockfileVersion: '9.0'\nimporters:\n  .: {}\n";
+        let read = |text: &str| {
+            std::fs::write(&path, text).unwrap();
+            read_lockfile(&path).unwrap().0
+        };
+        let computes = |installed: &Installed| {
+            let mut computed = false;
+            let digest = installed.digest("package:tool", || {
+                computed = true;
+                BTreeSet::from(["tool@1.0.0".to_owned()])
+            });
+            (digest, computed)
+        };
+
+        let first = read(text);
+        let (digest, computed) = computes(&first);
+        assert!(computed);
+        first.save(root.path()).unwrap();
+        let saved = std::fs::read_to_string(installed_path(root.path())).unwrap();
+
+        // The same lockfile: recalled, and nothing more to save.
+        let same = read(text);
+        same.recall(root.path());
+        assert_eq!(computes(&same), (digest.clone(), false));
+        assert!(!same.computed.load(Ordering::Relaxed));
+
+        // Another revision of the lockfile computes its own.
+        let other = read(&format!("{text}# another revision\n"));
+        other.recall(root.path());
+        assert!(computes(&other).1);
+
+        // Saved by another qk, or in another form, with another digest.
+        let version = format!("\"version\":{SAVED_INSTALLED}");
+        let qk = format!("\"qk\":\"{}\"", env!("CARGO_PKG_VERSION"));
+        assert!(saved.contains(&version) && saved.contains(&qk) && saved.contains(&digest));
+        for (field, replaced) in [(&version, "\"version\":0"), (&qk, "\"qk\":\"0.0.0\"")] {
+            let foreign = saved.replace(field, replaced).replace(&digest, "stale");
+            std::fs::write(installed_path(root.path()), foreign).unwrap();
+            let fresh = read(text);
+            fresh.recall(root.path());
+            assert_eq!(computes(&fresh), (digest.clone(), true), "{replaced}");
+        }
+        // One that does not read is ignored too.
+        std::fs::write(installed_path(root.path()), "{").unwrap();
+        let fresh = read(text);
+        fresh.recall(root.path());
+        assert_eq!(computes(&fresh), (digest, true));
+    }
+
+    /// A lockfile read ahead of the snapshot is what the snapshot takes, once
+    /// and for that file alone: another path, and a second asking, read the
+    /// file themselves.
+    #[test]
+    fn a_lockfile_read_ahead_is_taken_once_and_only_for_its_path() {
+        let ahead = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let text = "lockfileVersion: '9.0'\nimporters:\n  .: {}\n";
+        for root in [&ahead, &other] {
+            std::fs::write(root.path().join("pnpm-lock.yaml"), text).unwrap();
+        }
+        let path = ahead.path().join("pnpm-lock.yaml");
+        let content = blake3::hash(text.as_bytes()).to_hex().to_string();
+        let waiting = || {
+            PREFETCHED
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|(read, _)| *read == path)
+        };
+
+        prefetch_lockfile(ahead.path());
+        await_lockfile();
+        assert!(waiting());
+        let elsewhere = prefetched_lockfile(&other.path().join("pnpm-lock.yaml")).unwrap();
+        assert_eq!(elsewhere.content, content);
+        assert!(waiting(), "another path took the lockfile read ahead");
+
+        // Changed since it was read ahead: what was read is what is taken,
+        // and a task keying compares it with the file as it is then.
+        std::fs::write(&path, format!("{text}# later\n")).unwrap();
+        assert_eq!(prefetched_lockfile(&path).unwrap().content, content);
+        assert!(!waiting());
+        assert_ne!(prefetched_lockfile(&path).unwrap().content, content);
+        assert!(prefetched_lockfile(&ahead.path().join("absent.yaml")).is_none());
+    }
+
     #[cfg(unix)]
     #[test]
     fn recent_change_time_prevents_reuse_despite_old_mtime() {
@@ -5259,11 +5710,11 @@ mod tests {
         let window = crate::settle::window(root.path(), &metadata);
         for looked in [changed, changed + window] {
             assert!(!stamp.settled(window, looked));
-            assert!(!stamp.membership_settled(window, looked));
+            assert!(!stamp.look_settled(window, looked));
         }
         let later = changed + window + Duration::from_millis(1);
         assert!(stamp.settled(window, later));
-        assert!(stamp.membership_settled(window, later));
+        assert!(stamp.look_settled(window, later));
     }
 
     /// A file's stamp is trusted once both its times are older than its
@@ -5312,7 +5763,7 @@ mod tests {
         assert_eq!(first, digest_file(&path).unwrap());
         // Only meaningful where both looks fell inside the window, which a
         // slow machine can miss on the shortest windows.
-        let kept = snapshot.digests.lock().unwrap().contains_key("config.yaml");
+        let kept = snapshot.digests.read().unwrap().contains_key("config.yaml");
         if before.elapsed() < window {
             assert!(!kept);
         }
@@ -5326,7 +5777,7 @@ mod tests {
         settle(&path);
         let metadata = std::fs::symlink_metadata(&path).unwrap();
         snapshot.digest("config.yaml", &path, &metadata).unwrap();
-        assert!(snapshot.digests.lock().unwrap().contains_key("config.yaml"));
+        assert!(snapshot.digests.read().unwrap().contains_key("config.yaml"));
     }
 
     /// A listing taken once every directory and policy is older than its
@@ -6404,5 +6855,555 @@ mod tests {
         snapshot.save_digests(root.path());
         let saved = load_digests(root.path());
         assert!(saved.contains_key("config.yaml") && !saved.contains_key("elsewhere.txt"));
+    }
+
+    /// A Git workspace whose `app:build` reads beneath `packages/app` when
+    /// `narrowed`, so a run lists that alone, and otherwise the whole
+    /// workspace; with its state directory made, as a worktree that ran qk
+    /// before has it, so saving does not move the stamp of `.git`.
+    fn saved_listing_fixture(narrowed: bool) -> (tempfile::TempDir, Workspace, TaskGraph) {
+        let root = tempfile::tempdir().unwrap();
+        let write = |path: &str, content: &str| {
+            let path = root.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        };
+        write("nx.json", "{}");
+        let input = if narrowed {
+            "{workspaceRoot}/packages/app/**/*"
+        } else {
+            "{workspaceRoot}/**/*"
+        };
+        write(
+            "project.json",
+            &json!({"name": "app", "targets": {
+                "build": {"command": "true", "inputs": [input]}
+            }})
+            .to_string(),
+        );
+        write(".gitignore", "*.log\n");
+        for path in [
+            "packages/app/a.txt",
+            "packages/app/sub/b.txt",
+            "packages/app/skip.log",
+            "packages/other/c.txt",
+        ] {
+            write(path, path);
+        }
+        for args in [&["init", "-q"][..], &["add", "-A"]] {
+            assert!(paths::git(root.path(), args).unwrap().status.success());
+        }
+        std::fs::create_dir_all(paths::worktree_state(root.path())).unwrap();
+        let workspace = Workspace::load(root.path()).unwrap();
+        let graph = TaskGraph::build(&workspace, &[Request::parse("app:build").unwrap()]).unwrap();
+        (root, workspace, graph)
+    }
+
+    /// Runs `app:build`'s keying as a run does: whether its snapshot took
+    /// the saved listing, and its key, which is checked against that of a
+    /// snapshot listing afresh without any inventory.
+    fn saved_listing_run(workspace: &Workspace, graph: &TaskGraph, label: &str) -> (bool, String) {
+        let cache = workspace.root.join("cache");
+        let task = &graph.tasks["app:build"];
+        let prepared = qk_executor::prepare(workspace, task, &BTreeMap::new()).unwrap();
+        let key = |snapshot: &Snapshot| {
+            fingerprint(
+                snapshot,
+                workspace,
+                task,
+                &prepared,
+                &BTreeMap::new(),
+                &AtomicBool::new(false),
+            )
+            .unwrap()
+        };
+        let snapshot = Snapshot::watched(workspace, graph, &cache).unwrap();
+        snapshot.settle();
+        let restored = snapshot
+            .membership
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .restored;
+        let keyed = key(&snapshot);
+        // Dropping it waits for its listing to be saved.
+        drop(snapshot);
+        let fresh = Snapshot::new(workspace, graph, &cache).unwrap();
+        assert_eq!(keyed, key(&fresh), "{label}, restored {restored}");
+        (restored, keyed)
+    }
+
+    #[test]
+    fn a_saved_listing_is_taken_while_it_holds_and_each_change_lists_again() {
+        for narrowed in [true, false] {
+            let (root, workspace, graph) = saved_listing_fixture(narrowed);
+            let path = |path: &str| root.path().join(path);
+            let git = |args: &[&str]| {
+                assert!(paths::git(root.path(), args).unwrap().status.success());
+            };
+            let run = |label: &str| {
+                let (restored, key) = saved_listing_run(&workspace, &graph, label);
+                (restored, key, format!("{label}, narrowed {narrowed}"))
+            };
+            // Recent policies keep an inventory from being saved.
+            std::thread::sleep(Duration::from_millis(2100));
+            let (restored, mut before, label) = run("first");
+            assert!(!restored, "{label}");
+            let saved = Snapshot::watched(&workspace, &graph, &workspace.root.join("cache"))
+                .unwrap()
+                .scope
+                .is_some();
+            assert_eq!(saved, narrowed, "{label}");
+            let (restored, key, label) = run("unchanged");
+            assert!(restored, "{label}");
+            assert_eq!(key, before, "{label}");
+            // Each change, and whether it changes Git's index, whose recent
+            // stamp keeps the next inventory from being saved.
+            type Change<'a> = (&'a str, Box<dyn Fn() + 'a>, bool);
+            let changes: Vec<Change> = vec![
+                (
+                    "a file added",
+                    Box::new(|| std::fs::write(path("packages/app/added.txt"), "a").unwrap()),
+                    false,
+                ),
+                (
+                    "a file removed",
+                    Box::new(|| std::fs::remove_file(path("packages/app/a.txt")).unwrap()),
+                    false,
+                ),
+                (
+                    "a file renamed",
+                    Box::new(|| {
+                        std::fs::rename(
+                            path("packages/app/added.txt"),
+                            path("packages/app/renamed.txt"),
+                        )
+                        .unwrap()
+                    }),
+                    false,
+                ),
+                (
+                    "a directory added",
+                    Box::new(|| {
+                        std::fs::create_dir(path("packages/app/fresh")).unwrap();
+                        std::fs::write(path("packages/app/fresh/c.txt"), "c").unwrap();
+                    }),
+                    false,
+                ),
+                (
+                    "an ignore file added in scope",
+                    Box::new(|| {
+                        std::fs::write(path("packages/app/.gitignore"), "renamed.txt\n").unwrap()
+                    }),
+                    false,
+                ),
+                (
+                    "an ignore file edited in scope",
+                    Box::new(|| {
+                        std::fs::write(path("packages/app/.gitignore"), "fresh/\n").unwrap()
+                    }),
+                    false,
+                ),
+                (
+                    "an ignore file added above the scope",
+                    Box::new(|| {
+                        std::fs::write(path("packages/.gitignore"), "renamed.txt\n").unwrap()
+                    }),
+                    false,
+                ),
+                (
+                    "an ignore file edited above the scope",
+                    Box::new(|| std::fs::write(path(".gitignore"), "*.log\n!skip.log\n").unwrap()),
+                    false,
+                ),
+                (
+                    "an ignored file added to the index",
+                    Box::new(|| git(&["add", "-f", "packages/app/fresh/c.txt"])),
+                    true,
+                ),
+                (
+                    "a tracked file removed from the index",
+                    Box::new(|| git(&["rm", "-q", "--cached", "packages/app/fresh/c.txt"])),
+                    true,
+                ),
+            ];
+            for (change, make, index) in changes {
+                make();
+                let (restored, after, label) = run(change);
+                assert!(!restored, "{label}");
+                assert_ne!(after, before, "{label}");
+                before = after;
+                // A run this soon after the change saves nothing: what
+                // changed is too recent to tell what a listing saw of it.
+                // Once it has settled, a run lists again and saves, and
+                // that serves the run after.
+                if index {
+                    std::thread::sleep(Duration::from_millis(2100));
+                } else {
+                    settle(&path("packages/app"));
+                }
+                let (_, key, label) = run(change);
+                assert_eq!(key, before, "{label}");
+                let (restored, key, label) = run(change);
+                assert!(restored, "{label}");
+                assert_eq!(key, before, "{label}");
+            }
+        }
+    }
+
+    /// Replaces the inventory saved for `snapshot`'s identity by `change` of
+    /// it, as saved by a run that saw what `change` makes it see.
+    fn resave(root: &Path, snapshot: &Snapshot, change: impl FnOnce(&mut Membership)) {
+        let identity = saved::Identity::new(
+            root,
+            snapshot.scope.as_deref(),
+            &snapshot.source_exclusions,
+            snapshot.cache_relative.as_deref(),
+            &snapshot.extra_candidates,
+        );
+        let template = Membership::empty(
+            root,
+            &snapshot.built_ignore,
+            &snapshot.source_exclusions,
+            snapshot.cache_relative.as_deref(),
+            snapshot.scope.as_ref(),
+        );
+        let bytes = std::fs::read(identity.file(root)).unwrap();
+        let mut membership = saved::decode(&bytes, &identity, template).unwrap();
+        change(&mut membership);
+        std::fs::write(
+            identity.file(root),
+            saved::encode(&identity, &membership).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// An inventory is handed on to later runs only when its listing is
+    /// exactly of what it stamped: not when a directory was changed too
+    /// recently to tell, nor when one changed while it was listed, though
+    /// its names are as captured, nor when the root's ignore rules as read
+    /// are not those it captured.
+    #[test]
+    fn an_inventory_is_exact_only_when_nothing_moved_while_it_was_listed() {
+        let (_root, workspace, graph) = saved_listing_fixture(true);
+        std::thread::sleep(Duration::from_millis(2100));
+        let root = &workspace.root;
+        let snapshot = snapshot(&workspace, &graph, false);
+        let take = |between: &dyn Fn(&mut Membership)| {
+            let mut membership = Membership::new(
+                root,
+                &BTreeSet::new(),
+                &snapshot.built_ignore,
+                &snapshot.source_exclusions,
+                snapshot.cache_relative.as_deref(),
+                None,
+                snapshot.scope.as_ref(),
+            )
+            .unwrap();
+            between(&mut membership);
+            membership.list(&snapshot.extra_candidates, true).unwrap();
+            membership
+        };
+        let untouched = take(&|_| {});
+        assert!(untouched.settled && untouched.exact);
+
+        // Stamped as if everything had changed just before.
+        let recent = take(&|membership| {
+            membership.stamped = SystemTime::UNIX_EPOCH;
+        });
+        assert!(!recent.exact);
+
+        // A file removed and put back between the stamps and the listing:
+        // the names are as captured, and the directory's stamp is not.
+        let file = root.join("packages/app/a.txt");
+        let moved = take(&|_| {
+            std::fs::remove_file(&file).unwrap();
+            std::fs::write(&file, "packages/app/a.txt").unwrap();
+        });
+        assert!(moved.settled && !moved.exact);
+        assert!(moved.files.contains("packages/app/a.txt"));
+
+        // The rules a matcher read, against those captured.
+        let (_, read) = SourceIgnore::read(root).unwrap();
+        assert!(untouched.vouches(&read));
+        let ignore = root.join(".gitignore");
+        let other = Some(blake3::hash(b"other rules").to_hex().to_string());
+        assert!(!untouched.vouches(&[(ignore.clone(), other)]));
+        assert!(!untouched.vouches(&[(ignore, None)]));
+        assert!(untouched.vouches(&[(root.join(".nxignore"), None)]));
+        assert!(!untouched.vouches(&[(root.join(".nxignore"), Some(String::new()))]));
+    }
+
+    /// A link to a file, or to a directory, where the system has them.
+    fn link(target: &Path, link: &Path, directory: bool) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            let _ = directory;
+            std::os::unix::fs::symlink(target, link)
+        }
+        #[cfg(windows)]
+        {
+            if directory {
+                std::os::windows::fs::symlink_dir(target, link)
+            } else {
+                std::os::windows::fs::symlink_file(target, link)
+            }
+        }
+    }
+
+    /// An ignore file read through a link, by way of a linked directory
+    /// outside the workspace: an inventory stamping it is handed on only
+    /// where a stamp would show that link moved aside and put back, which
+    /// takes a change time. With the link swapped for another and put back
+    /// while it is listed, the inventory is not handed on anywhere.
+    #[test]
+    fn an_inventory_stamped_through_a_link_is_exact_only_where_stamps_show_it_put_back() {
+        let (_root, workspace, graph) = saved_listing_fixture(true);
+        let root = &workspace.root;
+        let outside = tempfile::tempdir().unwrap();
+        let outside = outside.path().canonicalize().unwrap();
+        for (directory, rules) in [("one", "skip.log\n"), ("two", "a.txt\n")] {
+            std::fs::create_dir(outside.join(directory)).unwrap();
+            std::fs::write(outside.join(directory).join("rules"), rules).unwrap();
+        }
+        let via = outside.join("via");
+        let policy = root.join("packages/app/.gitignore");
+        // Not everyone may make a link everywhere: then there is nothing
+        // to tell. The project's own checks run where links can be made,
+        // so there the test must not pass by telling nothing.
+        if link(&outside.join("one"), &via, true).is_err()
+            || link(&via.join("rules"), &policy, false).is_err()
+        {
+            assert!(std::env::var_os("CI").is_none(), "no link could be made");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(2100));
+        let snapshot = snapshot(&workspace, &graph, false);
+        let take = |between: &dyn Fn()| {
+            let mut membership = Membership::new(
+                root,
+                &BTreeSet::new(),
+                &snapshot.built_ignore,
+                &snapshot.source_exclusions,
+                snapshot.cache_relative.as_deref(),
+                None,
+                snapshot.scope.as_ref(),
+            )
+            .unwrap();
+            between();
+            membership.list(&snapshot.extra_candidates, true).unwrap();
+            membership
+        };
+        let untouched = take(&|| {});
+        let stamp = untouched.stamps[&policy].as_ref().unwrap();
+        assert!(stamp.through_link());
+        assert!(untouched.settled);
+        assert_eq!(untouched.exact, cfg!(unix));
+
+        let aside = outside.join("aside");
+        let swapped = take(&|| {
+            std::fs::rename(&via, &aside).unwrap();
+            link(&outside.join("two"), &via, true).unwrap();
+            // A linked directory is removed as a directory where it is one.
+            std::fs::remove_file(&via)
+                .or_else(|_| std::fs::remove_dir(&via))
+                .unwrap();
+            std::fs::rename(&aside, &via).unwrap();
+        });
+        assert!(!swapped.exact);
+    }
+
+    /// A workspace with both of the root's ignore files has its listing
+    /// saved and taken: the rules of each are among those captured.
+    #[test]
+    fn a_saved_listing_is_taken_with_both_root_ignore_files() {
+        for narrowed in [true, false] {
+            let (root, workspace, graph) = saved_listing_fixture(narrowed);
+            std::fs::write(root.path().join(".nxignore"), "packages/other\n").unwrap();
+            std::thread::sleep(Duration::from_millis(2100));
+            let (restored, before) = saved_listing_run(&workspace, &graph, "saving");
+            assert!(!restored, "narrowed {narrowed}");
+            let (restored, after) = saved_listing_run(&workspace, &graph, "unchanged");
+            assert!(restored, "narrowed {narrowed}");
+            assert_eq!(before, after);
+        }
+    }
+
+    /// A saved listing is not taken with ignore rules other than those it
+    /// was taken with, though every stamp holds: a root ignore file there
+    /// only while the rules were read shows in no stamp.
+    #[test]
+    fn a_saved_listing_is_not_taken_with_other_rules_than_it_was_listed_with() {
+        let (_root, workspace, graph) = saved_listing_fixture(true);
+        std::thread::sleep(Duration::from_millis(2100));
+        saved_listing_run(&workspace, &graph, "saving");
+        let root = &workspace.root;
+        let snapshot = snapshot(&workspace, &graph, true);
+        let restore = |change: &dyn Fn(&mut RootRules)| {
+            let identity = saved::Identity::new(
+                root,
+                snapshot.scope.as_deref(),
+                &snapshot.source_exclusions,
+                snapshot.cache_relative.as_deref(),
+                &snapshot.extra_candidates,
+            );
+            let template = Membership::empty(
+                root,
+                &snapshot.built_ignore,
+                &snapshot.source_exclusions,
+                snapshot.cache_relative.as_deref(),
+                snapshot.scope.as_ref(),
+            );
+            let (ignore, mut read) = SourceIgnore::read(root).unwrap();
+            change(&mut read);
+            saved::restore(root, &identity, template, (ignore, read)).is_some()
+        };
+        assert!(restore(&|_| {}));
+        assert!(!restore(&|read| read[0].1 = None));
+        assert!(!restore(&|read| read[1].1 = Some(String::new())));
+    }
+
+    #[test]
+    fn a_saved_listing_is_not_taken_when_git_names_other_policy_files() {
+        let (_root, workspace, graph) = saved_listing_fixture(true);
+        std::thread::sleep(Duration::from_millis(2100));
+        saved_listing_run(&workspace, &graph, "saving");
+        let (restored, _) = saved_listing_run(&workspace, &graph, "unchanged");
+        assert!(restored);
+        // A policy file Git no longer names, as when its configuration
+        // reads another, though no stamped file changed.
+        let snapshot = snapshot(&workspace, &graph, true);
+        resave(&workspace.root, &snapshot, |membership| {
+            let gone = workspace.root.join("no-longer-named");
+            membership.git_policies.insert(gone.clone());
+            membership.policies.insert(gone.clone());
+            membership.stamps.insert(gone, None);
+        });
+        drop(snapshot);
+        let (restored, _) = saved_listing_run(&workspace, &graph, "other policies");
+        assert!(!restored);
+    }
+
+    #[test]
+    fn a_saved_listing_that_does_not_read_is_listed_again_and_replaced() {
+        let (_root, workspace, graph) = saved_listing_fixture(true);
+        std::thread::sleep(Duration::from_millis(2100));
+        saved_listing_run(&workspace, &graph, "saving");
+        let snapshot = snapshot(&workspace, &graph, true);
+        let identity = saved::Identity::new(
+            &workspace.root,
+            snapshot.scope.as_deref(),
+            &snapshot.source_exclusions,
+            snapshot.cache_relative.as_deref(),
+            &snapshot.extra_candidates,
+        );
+        drop(snapshot);
+        let file = identity.file(&workspace.root);
+        let whole = std::fs::read(&file).unwrap();
+        let mut flipped = whole.clone();
+        flipped[whole.len() / 2] ^= 1;
+        for damaged in [&whole[..whole.len() / 2], &flipped[..], &[][..]] {
+            std::fs::write(&file, damaged).unwrap();
+            let (restored, _) = saved_listing_run(&workspace, &graph, "damaged");
+            assert!(!restored);
+            let (restored, _) = saved_listing_run(&workspace, &graph, "replaced");
+            assert!(restored);
+        }
+    }
+
+    #[test]
+    fn a_run_makes_no_state_directory_to_save_its_listing_in() {
+        let (_root, workspace, graph) = fixture(None);
+        std::thread::sleep(Duration::from_millis(2100));
+        let state = paths::worktree_state(&workspace.root);
+        let restored = || {
+            let snapshot = snapshot(&workspace, &graph, true);
+            snapshot.settle();
+            let membership = snapshot.membership.lock().unwrap().clone().unwrap();
+            assert!(membership.settled);
+            membership.restored
+        };
+        // Making it would change the workspace root's stamp while tasks
+        // are keyed: the run saves nothing.
+        assert!(!restored());
+        assert!(!state.exists());
+        assert!(!restored());
+        // Once a run made it, as saving digests does, a run saves there.
+        std::fs::create_dir_all(&state).unwrap();
+        std::thread::sleep(Duration::from_millis(2100));
+        assert!(!restored());
+        assert!(restored());
+    }
+
+    #[test]
+    fn saved_inventories_read_back_as_saved_and_only_for_their_identity() {
+        let (root, workspace, graph) = saved_listing_fixture(true);
+        std::thread::sleep(Duration::from_millis(2100));
+        let snapshot = snapshot(&workspace, &graph, true);
+        snapshot.settle();
+        let membership = snapshot.membership.lock().unwrap().clone().unwrap();
+        assert!(membership.settled);
+        let scope = snapshot.scope.as_deref();
+        let outputs = &snapshot.source_exclusions;
+        let cache = snapshot.cache_relative.as_deref();
+        let none = BTreeSet::new();
+        let identity = saved::Identity::new(root.path(), scope, outputs, cache, &none);
+        let template = || {
+            Membership::empty(
+                root.path(),
+                &snapshot.built_ignore,
+                outputs,
+                cache,
+                snapshot.scope.as_ref(),
+            )
+        };
+        let bytes = saved::encode(&identity, &membership).unwrap();
+        let read = saved::decode(&bytes, &identity, template()).unwrap();
+        assert_eq!(read.files, membership.files);
+        assert!(read.stamps == membership.stamps);
+        assert_eq!(read.directories, membership.directories);
+        assert_eq!(read.directory_entries, membership.directory_entries);
+        assert_eq!(read.policies, membership.policies);
+        assert_eq!(read.git_policies, membership.git_policies);
+        assert_eq!(read.ignore_contents, membership.ignore_contents);
+        assert_eq!(read.stamped, membership.stamped);
+        // Whatever the process was asked to list, with what, makes another
+        // identity, whose file is another.
+        let other_scope = Scope::new(["packages/other".to_owned()]);
+        let other_outputs = vec![Outputs::from_paths(&["packages/app/out".into()]).unwrap()];
+        let negated = vec![
+            Outputs::from_paths(&["packages/app/out".into(), "!packages/app/out/kept".into()])
+                .unwrap(),
+        ];
+        let others = [
+            saved::Identity::new(&root.path().join("packages"), scope, outputs, cache, &none),
+            saved::Identity::new(root.path(), None, outputs, cache, &none),
+            saved::Identity::new(root.path(), Some(&other_scope), outputs, cache, &none),
+            saved::Identity::new(root.path(), scope, &other_outputs, cache, &none),
+            saved::Identity::new(root.path(), scope, &negated, cache, &none),
+            saved::Identity::new(root.path(), scope, outputs, Some(Path::new("other")), &none),
+            saved::Identity::new(
+                root.path(),
+                scope,
+                outputs,
+                cache,
+                &BTreeSet::from(["gone".to_owned()]),
+            ),
+        ];
+        for (index, other) in others.iter().enumerate() {
+            assert!(*other != identity, "{index}");
+            assert!(
+                saved::decode(&bytes, other, template()).is_none(),
+                "{index}"
+            );
+            assert_ne!(
+                other.file(root.path()),
+                identity.file(root.path()),
+                "{index}"
+            );
+        }
+        std::fs::write(root.path().join(".nxignore"), "").unwrap();
+        assert!(saved::Identity::new(root.path(), scope, outputs, cache, &none) != identity);
     }
 }

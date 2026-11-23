@@ -548,28 +548,37 @@ impl RunOptions {
 
     /// Sets what Nx sets in its own environment for these options, so tasks
     /// and the remote cache see it. Called while this is the only thread,
-    /// and safe to call again: the one thread started before it, asking Git
-    /// for the repository's directories, is waited for first.
+    /// and safe to call again: the threads started before it, asking Git
+    /// about the repository, parsing the lockfile and saving the record of
+    /// the workspace's projects, are waited for first, unless the
+    /// environment already holds what it would set, as after it was called
+    /// before those threads started.
     fn export(&self) {
-        qk_cache::await_git_dirs();
-        let set = |name: &str| {
-            // Only this thread exists yet.
-            unsafe { std::env::set_var(name, "true") }
-        };
-        // As in Nx, always `true` or `false`.
-        // Only this thread exists yet.
-        unsafe { std::env::set_var("NX_VERBOSE_LOGGING", self.verbose().to_string()) }
+        // As in Nx, NX_VERBOSE_LOGGING is always `true` or `false`.
+        let mut exported = vec![("NX_VERBOSE_LOGGING", self.verbose().to_string())];
         if self.skips_cache() {
-            set("NX_SKIP_NX_CACHE");
+            exported.push(("NX_SKIP_NX_CACHE", "true".to_owned()));
         }
         // As Nx's normalizeNxArgsRunner, `--runner` wins over the variable;
         // the cache reads runner options such as selectivelyHashTsConfig.
         if let Some(runner) = &self.ignored.runner {
-            // Only this thread exists yet.
-            unsafe { std::env::set_var("NX_TASKS_RUNNER", runner) }
+            exported.push(("NX_TASKS_RUNNER", runner.clone()));
         }
         if self.skip_remote_cache {
-            set("NX_SKIP_REMOTE_CACHE");
+            exported.push(("NX_SKIP_REMOTE_CACHE", "true".to_owned()));
+        }
+        if exported
+            .iter()
+            .all(|(name, value)| std::env::var_os(name).is_some_and(|set| set == value.as_str()))
+        {
+            return;
+        }
+        qk_cache::await_git_dirs();
+        qk_cache::await_lockfile();
+        qk_config::finish_remembering();
+        for (name, value) in exported {
+            // Only this thread exists now.
+            unsafe { std::env::set_var(name, value) }
         }
     }
 }
@@ -946,7 +955,11 @@ fn main() {
             std::process::exit(1);
         }
     };
-    match run(Cli::parse_from(args::normalize(args, &Cli::command()))) {
+    let result = run(Cli::parse_from(args::normalize(args, &Cli::command())));
+    // A record of the workspace's projects being saved is finished before
+    // the process ends, which would stop it.
+    qk_config::finish_remembering();
+    match result {
         Ok(0) => {}
         Ok(code) => std::process::exit(code),
         Err(error) => {
@@ -1196,16 +1209,29 @@ fn run(mut cli: Cli) -> Result<i32> {
         Some(path) => path,
         None => find_workspace(&std::env::current_dir().context("cannot read current directory")?)?,
     };
+    // A command that runs tasks sets its environment while this is still
+    // the only thread, so that setting it later finds it set and need not
+    // wait for the threads started below.
+    if let Command::Run { options, .. }
+    | Command::RunMany { options, .. }
+    | Command::Affected { options, .. } = &cli.command
+    {
+        options.export();
+    }
     // A command that runs tasks finds its cache, worktree state and history
-    // from the repository's git directories: Git answers while the workspace
-    // loads.
+    // from the repository's git directories, and keys its tasks by what the
+    // lockfile installs: Git answers and the lockfile is parsed while the
+    // workspace loads.
     if matches!(
         cli.command,
         Command::Run { .. } | Command::RunMany { .. } | Command::Affected { .. }
     ) {
         qk_cache::prefetch_git_dirs(&root);
+        qk_cache::prefetch_lockfile(&root);
     }
-    let workspace = Workspace::load(&root)?;
+    // Which directories hold a project is remembered between commands in
+    // the worktree's state, which a load finds without waiting for Git.
+    let workspace = Workspace::load_remembering(&root, &qk_cache::projects_record(&root))?;
     for warning in &workspace.warnings {
         eprintln!("qk: warning: {warning}");
     }
@@ -1293,6 +1319,9 @@ fn run(mut cli: Cli) -> Result<i32> {
                 }
             }
             if all || only_workspace_data {
+                // The record this command's load may still be saving goes
+                // with the rest.
+                qk_config::finish_remembering();
                 qk_cache::clear_worktree_state(&workspace.root)?;
                 writeln!(stdout, "Removed this worktree's state.")?;
             }
@@ -2041,6 +2070,15 @@ fn execute_narrowed(
         qk_executor::report::write_all(true, title.start(ui::Paint::log()).as_bytes());
     }
     let started = std::time::SystemTime::now();
+    // The history records a commit for the run: Git is asked on a thread
+    // started just before the tasks, and its answer is taken when the run
+    // is recorded. It names the commit checked out when it looked, which
+    // may be before the first task starts or, at the latest, as the run
+    // is recorded.
+    let revision = {
+        let root = workspace.root.clone();
+        std::thread::spawn(move || history::revision(&root))
+    };
     let result = qk_runner::run(
         workspace,
         &graph,
@@ -2075,6 +2113,7 @@ fn execute_narrowed(
         &graph,
         &result,
         started,
+        revision.join().unwrap_or(None),
         options.report.as_deref(),
     );
     if !skip_cache && result.exit_code != 130 {

@@ -1810,6 +1810,7 @@ dependencies = [
  "qk-graph",
  "qk-input-analysis",
  "qk-lockfile",
+ "qk-state",
  "qk-taskgraph",
  "rustix",
  "rusty-s3",
@@ -1861,8 +1862,10 @@ name = "qk-config"
 version = "0.27.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "ignore",
  "jsonc-parser",
+ "qk-state",
  "serde",
  "serde_json",
  "serde_yaml_ng",
@@ -1953,6 +1956,17 @@ dependencies = [
  "sysinfo",
  "tempfile",
  "walkdir",
+]
+
+[[package]]
+name = "qk-state"
+version = "0.27.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "libc",
+ "serde",
+ "tempfile",
 ]
 
 [[package]]

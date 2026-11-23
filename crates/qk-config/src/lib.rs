@@ -7,6 +7,7 @@ mod merge;
 pub mod minimatch;
 mod normalize;
 mod overrides;
+mod remembered;
 mod selector;
 
 use std::collections::BTreeMap;
@@ -178,8 +179,13 @@ pub const LOCAL_WORKSPACE: &str = "nx.local.json";
 
 /// Reads the workspace and project configuration files for
 /// [`Workspace::load_with`]: the text of a file by its absolute path, or
-/// `None` when it is absent.
-pub type ConfigReader<'a> = &'a dyn Fn(&Path) -> Result<Option<String>>;
+/// `None` when it is absent. Projects are read on several threads at once.
+pub type ConfigReader<'a> = &'a (dyn Fn(&Path) -> Result<Option<String>> + Sync);
+
+/// Reads the workspace's own configuration files for
+/// [`WorkspaceConfig::read`], as a [`ConfigReader`] does, on the calling
+/// thread alone: it need not be shared between threads.
+pub type WorkspaceConfigReader<'a> = &'a dyn Fn(&Path) -> Result<Option<String>>;
 
 /// The files `load` reads, from disk.
 fn read_disk(path: &Path) -> Result<Option<String>> {
@@ -240,7 +246,7 @@ struct ConfigFiles {
 
 /// nx.json with the file it extends and nx.local.json merged in, each read
 /// with `read`, under the canonical `root`.
-fn read_config(root: &Path, read: ConfigReader) -> Result<ConfigFiles> {
+fn read_config(root: &Path, read: WorkspaceConfigReader) -> Result<ConfigFiles> {
     let json = |path: &Path| -> Result<Option<Value>> {
         read(path)?
             .map(|text| parse_json(&text, &path.display().to_string()))
@@ -309,7 +315,7 @@ impl WorkspaceConfig {
     /// The configuration of the workspace at the canonical `root`, with
     /// nx.json, the file it extends and nx.local.json each read with `read`
     /// and merged as [`Workspace::load`] merges them.
-    pub fn read(root: &Path, read: ConfigReader) -> Result<Self> {
+    pub fn read(root: &Path, read: WorkspaceConfigReader) -> Result<Self> {
         Ok(read_config(root, read)?.config)
     }
 
@@ -374,15 +380,37 @@ impl Project {
 }
 
 impl Workspace {
+    /// The workspace at `root`, read from disk, its projects found by
+    /// walking every directory.
     pub fn load(root: &Path) -> Result<Self> {
         Self::load_with(root, &read_disk)
+    }
+
+    /// As [`Workspace::load`], but which directories hold a project.json or
+    /// a package.json is taken from the record an earlier load saved in
+    /// `directory` when it shows that a walk would find the same, and
+    /// otherwise found by walking and saved there for the next load, on a
+    /// thread of its own that [`finish_remembering`] waits for. The loaded
+    /// workspace is what [`Workspace::load`] gives either way. `directory`
+    /// belongs to the caller, which removes it to forget the records.
+    pub fn load_remembering(root: &Path, directory: &Path) -> Result<Self> {
+        Self::load_from(root, &read_disk, Some(directory))
     }
 
     /// As [`Workspace::load`], with nx.json, the file it extends,
     /// nx.local.json, each project's `project.json` and `project.local.json`
     /// and every package.json read with `read`: the workspace another revision
     /// of those files makes.
+    ///
+    /// The projects are always found by walking: a record of what is on
+    /// disk says nothing of what another revision holds.
     pub fn load_with(root: &Path, read: ConfigReader) -> Result<Self> {
+        Self::load_from(root, read, None)
+    }
+
+    /// [`Workspace::load_with`], remembering what the walk finds in
+    /// `remember`, when given: see [`Workspace::load_remembering`].
+    fn load_from(root: &Path, read: ConfigReader, remember: Option<&Path>) -> Result<Self> {
         let root = root
             .canonicalize()
             .map(simplified)
@@ -456,40 +484,26 @@ impl Workspace {
         }
         // A wrong `cli.packageManager` fails only what runs scripts.
         let package_manager = workspace.package_manager_name().unwrap_or("npm");
+        let loaded = load_projects(
+            &root,
+            &workspace.config,
+            package_manager,
+            read,
+            &mut workspace.warnings,
+            remember,
+        )?;
         let mut roots = BTreeMap::new();
-        for (directory, in_workspaces) in
-            discovery::project_directories(&root, read, &mut workspace.warnings)?
-        {
-            let manifest = |name: &str| -> Result<Option<Value>> {
-                let path = directory.join(name);
-                read(&path)?
-                    .map(|text| parse_json(&text, &path.display().to_string()))
-                    .transpose()
-            };
-            let project_json = manifest("project.json")?;
-            let local = manifest(LOCAL_OVERRIDES)?;
-            let package: Option<Package> = package_json(&directory.join("package.json"))?
-                .map(serde_json::from_value)
-                .transpose()
-                .with_context(|| format!("invalid {}", directory.join("package.json").display()))?;
+        for (directory, loaded) in loaded {
             // A project.json `read` holds absent, as at a revision before it
             // was added, makes no project of a directory with nothing else.
-            if project_json.is_none() && package.is_none() {
+            let Some(LoadedProject {
+                project,
+                package,
+                has_local,
+            }) = loaded?
+            else {
                 continue;
-            }
-            let project = normalize::project(
-                &normalize::Origin {
-                    root: &root,
-                    directory: &directory,
-                    config: &workspace.config,
-                    in_workspaces,
-                    package_manager,
-                },
-                project_json,
-                local.clone(),
-                package.as_ref(),
-            )
-            .with_context(|| format!("invalid project in {}", directory.display()))?;
+            };
             if let Some(previous) = workspace.projects.get(&project.name) {
                 bail!(
                     "duplicate project name {:?}: {} and {}",
@@ -507,26 +521,13 @@ impl Workspace {
                     project.root
                 );
             }
-            // As in Nx, a project's dependencies, scripts and lockfile
-            // importer are its root's package.json, which is not the one
-            // beside its configuration when the configuration gives
-            // another root.
-            let package = if relative_path(&root, &directory)? == project.root {
-                package
-            } else {
-                let manifest = root.join(&project.root).join("package.json");
-                package_json(&manifest)?
-                    .map(serde_json::from_value)
-                    .transpose()
-                    .with_context(|| format!("invalid {}", manifest.display()))?
-            };
-            if let Some(package) = package {
+            if let Some(package) = package? {
                 workspace.packages.insert(project.name.clone(), package);
             }
             workspace
                 .configuration_directories
                 .insert(project.name.clone(), relative_path(&root, &directory)?);
-            if local.is_some() {
+            if has_local {
                 let root = match relative_path(&root, &directory)?.as_str() {
                     "." => String::new(),
                     directory => format!("{directory}/"),
@@ -539,6 +540,341 @@ impl Workspace {
         }
         Ok(workspace)
     }
+}
+
+/// What one directory's manifests make, before it joins the workspace.
+struct LoadedProject {
+    project: Project,
+    /// The package.json of the project's root, or the error reading it,
+    /// which [`Workspace::load_with`] reports only once the project is
+    /// known not to clash with another, as it was read after those checks.
+    package: Result<Option<Package>>,
+    /// Whether a `project.local.json` was merged in.
+    has_local: bool,
+}
+
+/// The project the manifests in `directory` make, each read with `read`, or
+/// `None` when it has neither a project.json nor a package.json.
+fn read_project(
+    root: &Path,
+    directory: &Path,
+    in_workspaces: bool,
+    config: &WorkspaceConfig,
+    package_manager: &str,
+    read: ConfigReader,
+) -> Result<Option<LoadedProject>> {
+    let json = |path: &Path| -> Result<Option<Value>> {
+        read(path)?
+            .map(|text| parse_json(&text, &path.display().to_string()))
+            .transpose()
+    };
+    let package = |path: &Path| -> Result<Option<Package>> {
+        json(path)?
+            .map(serde_json::from_value)
+            .transpose()
+            .with_context(|| format!("invalid {}", path.display()))
+    };
+    let project_json = json(&directory.join("project.json"))?;
+    let local = json(&directory.join(LOCAL_OVERRIDES))?;
+    let own_package = package(&directory.join("package.json"))?;
+    if project_json.is_none() && own_package.is_none() {
+        return Ok(None);
+    }
+    let has_local = local.is_some();
+    let project = normalize::project(
+        &normalize::Origin {
+            root,
+            directory,
+            config,
+            in_workspaces,
+            package_manager,
+        },
+        project_json,
+        local,
+        own_package.as_ref(),
+    )
+    .with_context(|| format!("invalid project in {}", directory.display()))?;
+    // As in Nx, a project's dependencies, scripts and lockfile importer are
+    // its root's package.json, which is not the one beside its
+    // configuration when the configuration gives another root.
+    let package = if relative_path(root, directory)? == project.root {
+        Ok(own_package)
+    } else {
+        package(&root.join(&project.root).join("package.json"))
+    };
+    Ok(Some(LoadedProject {
+        project,
+        package,
+        has_local,
+    }))
+}
+
+/// Each directory holding a project, in order, with what its manifests
+/// make.
+///
+/// A project's manifests and normalization depend on no other project, so
+/// each is read on one of a few threads as soon as the walk finds the
+/// directory, while the walk, which mostly waits on the filesystem, goes on.
+/// Those threads guess whether the workspaces take in the directory's
+/// package.json from whether one is there, as the walk does unless an
+/// ignore file hides it; once the walk is done, a project read with a guess
+/// the walk contradicts, or one the walk found without telling, is read
+/// again with what the walk found. So each project is what reading it after
+/// the walk makes, and the projects are in the order of their directories,
+/// as one thread would have met them, whichever thread finishes first.
+///
+/// With `remember`, the directories are taken from the record an earlier
+/// load saved there when it still holds, and otherwise walked and saved
+/// there: see [`remembered`]. The workspaces are read either way, before
+/// anything else, so their warnings come first as they did.
+type Loaded = Vec<(PathBuf, Result<Option<LoadedProject>>)>;
+
+fn load_projects(
+    root: &Path,
+    config: &WorkspaceConfig,
+    package_manager: &str,
+    read: ConfigReader,
+    warnings: &mut Vec<String>,
+    remember: Option<&Path>,
+) -> Result<Loaded> {
+    let load = |directory: &Path, in_workspaces: bool| {
+        read_project(
+            root,
+            directory,
+            in_workspaces,
+            config,
+            package_manager,
+            read,
+        )
+    };
+    let workspaces = discovery::workspaces(root, read, warnings)?;
+    if let Some(directory) = remember
+        && let Some(record) = remembered::recall(directory, root)
+    {
+        // The projects the record names are read at once, in their order,
+        // while it is checked. Once it is found not to hold, the projects
+        // not yet read are passed over, and what was read is thrown away.
+        let projects: Vec<(PathBuf, bool)> =
+            discovery::projects(root, record.manifests(), &workspaces)?
+                .into_iter()
+                .collect();
+        let changed = std::sync::atomic::AtomicBool::new(false);
+        let (verdict, loaded) = std::thread::scope(|scope| {
+            let verdict = scope.spawn(|| {
+                let verdict = record.holds();
+                if matches!(verdict, remembered::Verdict::Changed) {
+                    changed.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                verdict
+            });
+            let loaded = parallel_map(&projects, |(directory, in_workspaces)| {
+                (!changed.load(std::sync::atomic::Ordering::Relaxed))
+                    .then(|| load(directory, *in_workspaces))
+            });
+            (
+                verdict
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+                loaded,
+            )
+        });
+        let holds = match verdict {
+            remembered::Verdict::Changed => false,
+            remembered::Verdict::Holds => true,
+            remembered::Verdict::Stamped(stamps) => {
+                // Stamped once, the record is compared from now on.
+                remember_in(directory, root, record.stamped(stamps));
+                true
+            }
+        };
+        if holds {
+            return Ok(projects
+                .into_iter()
+                .map(|(directory, _)| directory)
+                .zip(
+                    loaded
+                        .into_iter()
+                        .map(|loaded| loaded.expect("every project is read")),
+                )
+                .collect());
+        }
+    }
+    // What a walk about to begin is remembered with is looked at first.
+    let before = remember.and_then(|_| remembered::before_walk(root));
+    let threads = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .clamp(1, MAX_LOAD_THREADS);
+    let (send, receive) = std::sync::mpsc::channel::<(PathBuf, bool)>();
+    let receive = std::sync::Mutex::new(receive);
+    let (directories, mut early) = std::thread::scope(|scope| {
+        let loader = || {
+            let mut done = Vec::new();
+            loop {
+                let next = receive.lock().unwrap().recv();
+                let Ok((directory, includes)) = next else {
+                    return done;
+                };
+                let in_workspaces = includes
+                    && std::fs::symlink_metadata(directory.join("package.json"))
+                        .is_ok_and(|metadata| metadata.is_file());
+                let loaded = load(&directory, in_workspaces);
+                done.push((directory, (in_workspaces, loaded)));
+            }
+        };
+        // One more loader for every few dozen projects found, so that a
+        // small workspace starts no threads it cannot use.
+        let loaders = std::sync::Mutex::new(Vec::new());
+        let count = std::sync::atomic::AtomicUsize::new(0);
+        let found = |directory: &Path, includes: bool| {
+            let index = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if index.is_multiple_of(PROJECTS_PER_THREAD) && index / PROJECTS_PER_THREAD < threads {
+                loaders.lock().unwrap().push(scope.spawn(loader));
+            }
+            // The loaders outlive the walk, so they are there to receive.
+            let _ = send.send((directory.to_owned(), includes));
+        };
+        let walked = discovery::project_directories(root, &workspaces, &found, before.is_some());
+        drop(send);
+        let mut early = std::collections::HashMap::new();
+        for loader in loaders.into_inner().unwrap() {
+            let done = loader
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            early.extend(done);
+        }
+        walked.map(|walked| (walked, early))
+    })?;
+    let discovery::Walked {
+        projects: directories,
+        manifests,
+        read: walked,
+    } = directories;
+    if let (Some(directory), Some(before), Some(walked)) = (remember, before, walked)
+        && let Some(record) = remembered::walked(before, walked, manifests)
+    {
+        remember_in(directory, root, record);
+    }
+    let mut loaded: Vec<(PathBuf, Option<Result<Option<LoadedProject>>>)> = directories
+        .iter()
+        .map(|(directory, in_workspaces)| {
+            let early = early
+                .remove(directory)
+                .filter(|(guessed, _)| guessed == in_workspaces)
+                .map(|(_, loaded)| loaded);
+            (directory.clone(), early)
+        })
+        .collect();
+    let missing: Vec<(usize, bool)> = loaded
+        .iter()
+        .zip(directories.values())
+        .enumerate()
+        .filter(|(_, ((_, early), _))| early.is_none())
+        .map(|(index, (_, in_workspaces))| (index, *in_workspaces))
+        .collect();
+    let redone = parallel_map(&missing, |(index, in_workspaces)| {
+        load(&loaded[*index].0, *in_workspaces)
+    });
+    for ((index, _), project) in missing.iter().zip(redone) {
+        loaded[*index].1 = Some(project);
+    }
+    Ok(loaded
+        .into_iter()
+        .map(|(directory, project)| (directory, project.expect("every project is read")))
+        .collect())
+}
+
+/// How many records [`Workspace::load_remembering`] is saving, and the
+/// signal that one is done.
+static SAVING: (std::sync::Mutex<usize>, std::sync::Condvar) =
+    (std::sync::Mutex::new(0), std::sync::Condvar::new());
+
+/// Saves `record` of the workspace at `root` in `directory` on a thread of
+/// its own, which [`finish_remembering`] waits for.
+fn remember_in(directory: &Path, root: &Path, record: remembered::Record) {
+    let directory = directory.to_owned();
+    let root = root.to_owned();
+    /// Counts a save done however it ends.
+    struct Done;
+    impl Drop for Done {
+        fn drop(&mut self) {
+            *SAVING
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) -= 1;
+            SAVING.1.notify_all();
+        }
+    }
+    *SAVING.0.lock().unwrap() += 1;
+    let done = Done;
+    // Saving is only for later loads, which walk when it fails, or when no
+    // thread can be started for it: the save then counts as done at once,
+    // as dropping what the thread was to run drops `done` with it.
+    let _ = std::thread::Builder::new().spawn(move || {
+        let _done = done;
+        let _ = remembered::save(&directory, &root, &record);
+    });
+}
+
+/// Waits for the records [`Workspace::load_remembering`] is still saving,
+/// for a process about to end, which would otherwise stop them unsaved.
+pub fn finish_remembering() {
+    let (saving, done) = &SAVING;
+    let mut saving = saving.lock().unwrap();
+    while *saving > 0 {
+        saving = done.wait(saving).unwrap();
+    }
+}
+
+/// The most threads projects are read on. Reading and normalizing a project
+/// takes a fraction of a millisecond, so beyond a few threads the cost of
+/// starting them outweighs what they share.
+const MAX_LOAD_THREADS: usize = 8;
+
+/// How many projects make it worth starting one more thread to read them.
+const PROJECTS_PER_THREAD: usize = 16;
+
+/// `items` mapped by `map` on several threads, the results in the order of
+/// `items` whatever order the threads finish them in.
+fn parallel_map<T: Sync, R: Send>(items: &[T], map: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    // One thread for every few dozen items, so that a small workspace
+    // starts no threads it cannot use.
+    let threads = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(MAX_LOAD_THREADS)
+        .min(items.len().div_ceil(PROJECTS_PER_THREAD));
+    if threads <= 1 {
+        return items.iter().map(map).collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut results: Vec<Option<R>> = std::iter::repeat_with(|| None).take(items.len()).collect();
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(item) = items.get(index) else {
+                            return done;
+                        };
+                        done.push((index, map(item)));
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            let done = worker
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            for (index, result) in done {
+                results[index] = Some(result);
+            }
+        }
+    });
+    results
+        .into_iter()
+        .map(|result| result.expect("every item is mapped"))
+        .collect()
 }
 
 impl Workspace {

@@ -15,6 +15,7 @@ foldhash.workspace = true
 globset.workspace = true
 ignore.workspace = true
 qk-config.workspace = true
+qk-state.workspace = true
 qk-graph.workspace = true
 qk-taskgraph.workspace = true
 qk-executor.workspace = true

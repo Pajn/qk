@@ -209,7 +209,19 @@ When the filesets of every task in a run that select files each start from a
 fixed directory, as `{projectRoot}/**/*` does for a project not at the
 workspace root, the run lists those directories together, with what is
 beneath them, in place of the workspace, selecting what the source list would
-hold there; with more than 200 of them it lists the workspace. File contents are re-read whenever their metadata changes; their
+hold there; with more than 200 of them it lists the workspace. A run saves
+the list it took, with the metadata of every directory it read and of the
+ignore and Git files that decide what is a source, in the worktree's state.
+It saves nothing when one of those changed within the timestamp window below
+before the list was taken, or while it was, since the list may then not be of
+what the metadata says; nor when the worktree has no state directory yet,
+which a run makes as it ends. The next run asking for the same list takes it
+instead of listing again when Git names the same policy files, the root's
+ignore rules read as they did, and none of the metadata changed. A directory
+whose metadata did change is read again, and the list is still taken when it
+holds the same names: saving a file through a rename, or an output written
+beside sources, moves a directory's times without changing what is a source.
+File contents are re-read whenever their metadata changes; their
 digests persist between runs in the worktree's state, keyed by
 path, size, modification time and, on Unix, change time, inode and mode, so a
 warm run reads only files whose metadata changed.

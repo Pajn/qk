@@ -9,8 +9,10 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+blake3.workspace = true
 ignore.workspace = true
 jsonc-parser.workspace = true
+qk-state.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true

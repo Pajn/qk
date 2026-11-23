@@ -250,7 +250,8 @@ disk. See [Store proxy](../guides/remote-cache.md#store-proxy).
 disk fraction. See [Storage limits](../guides/remote-cache.md).
 
 `reset`, or its alias `clear-cache`, removes the local cache and this
-worktree's state: file digests, output records and warm directories. The
+worktree's state: file digests, saved source lists, the record of which
+directories hold projects, output records and warm directories. The
 cache is shared by the repository's worktrees, so resetting clears it for
 all of them. Run history and the remote cache are kept. `--only-cache` and
 `--only-workspace-data` (or `--onlyCache` and `--onlyWorkspaceData`) limit it

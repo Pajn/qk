@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 
 use anyhow::{Context, Result, bail};
 use foldhash::HashSet;
@@ -77,11 +77,33 @@ pub fn git_path(root: &Path, flag: &str) -> Option<PathBuf> {
 /// Git waits for its answer rather than starting Git again. Roots are kept by
 /// their canonical path, so one named another way shares the answer.
 fn git_dirs(root: &Path) -> Option<(PathBuf, PathBuf)> {
-    type Slot = std::sync::Arc<Mutex<Option<(PathBuf, PathBuf)>>>;
-    static KNOWN: std::sync::OnceLock<Mutex<std::collections::HashMap<PathBuf, Slot>>> =
-        std::sync::OnceLock::new();
+    static KNOWN: Asked<(PathBuf, PathBuf)> = std::sync::OnceLock::new();
+    asked_once(&KNOWN, root, || ask_git_dirs(root))
+}
+
+/// The top of the working tree `root` is in, as Git names it, or `None`
+/// where there is none. Asked once per root in a process, as [`git_dirs`]
+/// is and for the same reasons.
+pub fn git_toplevel(root: &Path) -> Option<PathBuf> {
+    static KNOWN: Asked<PathBuf> = std::sync::OnceLock::new();
+    asked_once(&KNOWN, root, || git_path(root, "--show-toplevel"))
+}
+
+/// Git's answers about roots, each kept once given.
+type Asked<T> = std::sync::OnceLock<
+    Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<Mutex<Option<T>>>>>,
+>;
+
+/// What `ask` answered for `root` earlier in this process, or what it
+/// answers now. Only an answer is kept, and a caller asking while another
+/// still waits for `ask` waits for that answer.
+fn asked_once<T: Clone>(
+    known: &'static Asked<T>,
+    root: &Path,
+    ask: impl FnOnce() -> Option<T>,
+) -> Option<T> {
     let canonical = root.canonicalize().unwrap_or_else(|_| root.to_owned());
-    let slot = KNOWN
+    let slot = known
         .get_or_init(Default::default)
         .lock()
         .unwrap()
@@ -90,30 +112,43 @@ fn git_dirs(root: &Path) -> Option<(PathBuf, PathBuf)> {
         .clone();
     let mut known = slot.lock().unwrap();
     if known.is_none() {
-        *known = ask_git_dirs(root);
+        *known = ask();
     }
     known.clone()
 }
 
-/// Starts asking Git for [`git_dirs`] at `root` on a thread of its own, for a
-/// command that will need them once it has loaded the workspace: the
-/// worktree state, cache and history of a run are all found from them.
+/// Starts asking Git for [`git_dirs`] and [`git_toplevel`] at `root`, each on
+/// a thread of its own, for a command that will need them once it has loaded
+/// the workspace: the worktree state, cache and history of a run are found
+/// from the directories, and keying its tasks needs the top of the working
+/// tree.
 pub fn prefetch_git_dirs(root: &Path) {
-    let root = root.to_owned();
-    let asking = std::thread::spawn(move || {
-        git_dirs(&root);
-    });
-    *PREFETCH.lock().unwrap() = Some(asking);
+    let asking = [
+        {
+            let root = root.to_owned();
+            std::thread::spawn(move || {
+                git_dirs(&root);
+            })
+        },
+        {
+            let root = root.to_owned();
+            std::thread::spawn(move || {
+                git_toplevel(&root);
+            })
+        },
+    ];
+    PREFETCH.lock().unwrap().extend(asking);
 }
 
-/// The thread [`prefetch_git_dirs`] started, until it is waited for.
-static PREFETCH: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
+/// The threads [`prefetch_git_dirs`] started, until they are waited for.
+static PREFETCH: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new());
 
-/// Waits for the thread [`prefetch_git_dirs`] started, if it still runs, for
-/// a caller that needs to be the process's only thread, as one changing the
-/// environment does.
+/// Waits for the threads [`prefetch_git_dirs`] started, if they still run,
+/// for a caller that needs to be the process's only thread, as one changing
+/// the environment does.
 pub fn await_git_dirs() {
-    if let Some(asking) = PREFETCH.lock().unwrap().take() {
+    let asking = std::mem::take(&mut *PREFETCH.lock().unwrap());
+    for asking in asking {
         let _ = asking.join();
     }
 }
@@ -193,25 +228,49 @@ pub fn worktree_state(root: &Path) -> PathBuf {
     state
 }
 
+/// Where a worktree keeps the record of which of its directories hold a
+/// project, for [`qk_config::Workspace::load_remembering`]: `projects` in the
+/// state directory [`worktree_state`] names, with the worktree's git
+/// directory read from the `.git` entry at or above `root` rather than asked
+/// of Git. Loading the workspace is the first thing a command does, and
+/// Git takes several times longer to answer than finding the record saves,
+/// so a load cannot wait for it. Git finds the same directory unless its
+/// environment or configuration says otherwise; then the record is kept
+/// beside the `.git` entry instead, which only matters to
+/// [`clear_worktree_state`], which removes both.
+pub fn projects_record(root: &Path) -> PathBuf {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_owned());
+    dot_git(&root)
+        .map(|(git_dir, _)| git_dir.join("qk"))
+        .unwrap_or_else(|| root.join(".qk"))
+        .join(PROJECTS)
+}
+
+/// The entry of [`worktree_state`] [`projects_record`] names.
+const PROJECTS: &str = "projects";
+
 /// What [`worktree_state`] holds. Inside Git, the state directory of the main
 /// worktree also holds the shared cache and run history, so these entries are
 /// removed one by one rather than the directory as a whole.
 const WORKTREE_ENTRIES: &[&str] = &[
     "digests.json",
+    "listings",
+    "lockfile-digests.json",
     "outputs",
+    PROJECTS,
     "restore",
     "sandbox",
     "terminal-outputs",
     "warm",
 ];
 
-/// Removes a worktree's state: its file digests, the outputs it records
-/// holding, its warm directories, the logs `--output-style=summary` kept and
-/// any restores or sandboxes left behind.
+/// Removes a worktree's state: its file and lockfile digests, saved source
+/// listings and record of its projects, the outputs it records holding, its warm directories, the logs
+/// `--output-style=summary` kept and any restores or sandboxes left behind.
 pub fn clear_worktree_state(root: &Path) -> Result<()> {
     let state = worktree_state(root);
-    for entry in WORKTREE_ENTRIES {
-        let path = state.join(entry);
+    let entries = WORKTREE_ENTRIES.iter().map(|entry| state.join(entry));
+    for path in entries.chain([projects_record(root)]) {
         let removed = if path.is_dir() {
             std::fs::remove_dir_all(&path)
         } else {
@@ -357,7 +416,7 @@ pub fn safe_parents_once(
     root: &Path,
     path: &str,
     what: &str,
-    known: &Mutex<HashSet<PathBuf>>,
+    known: &RwLock<HashSet<PathBuf>>,
 ) -> Result<()> {
     check_parents(root, path, what, Some(known))
 }
@@ -366,17 +425,24 @@ fn check_parents(
     root: &Path,
     path: &str,
     what: &str,
-    known: Option<&Mutex<HashSet<PathBuf>>>,
+    known: Option<&RwLock<HashSet<PathBuf>>>,
 ) -> Result<()> {
     validate_path(path)?;
-    let mut current = root.to_owned();
-    for part in Path::new(path)
-        .parent()
-        .into_iter()
-        .flat_map(Path::components)
+    let parent = Path::new(path).parent();
+    // A directory is added only after every one above it was added or found
+    // to be a directory, so a known parent says all of them are known: most
+    // paths share their parent with one checked before, and look once rather
+    // than once for each directory above them. Threads checking many paths
+    // at once mostly read, which a read lock lets them do together.
+    if let (Some(known), Some(parent)) = (known, parent)
+        && known.read().unwrap().contains(&root.join(parent))
     {
+        return Ok(());
+    }
+    let mut current = root.to_owned();
+    for part in parent.into_iter().flat_map(Path::components) {
         current.push(part);
-        if known.is_some_and(|known| known.lock().unwrap().contains(&current)) {
+        if known.is_some_and(|known| known.read().unwrap().contains(&current)) {
             continue;
         }
         match std::fs::symlink_metadata(&current) {
@@ -388,7 +454,7 @@ fn check_parents(
             }
             Ok(_) => {
                 if let Some(known) = known {
-                    known.lock().unwrap().insert(current.clone());
+                    known.write().unwrap().insert(current.clone());
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -466,6 +532,10 @@ fn normalize(path: &str) -> Result<String> {
 
 type OutputEntries<'a> = Box<dyn Iterator<Item = Result<(String, std::fs::Metadata)>> + 'a>;
 
+/// Output roots a thread walks at least when a task's outputs are listed, so
+/// that the few roots most tasks declare are walked without starting one.
+const ROOTS_PER_THREAD: usize = 4;
+
 #[derive(Clone)]
 pub struct Outputs {
     patterns: Vec<Pattern>,
@@ -473,6 +543,8 @@ pub struct Outputs {
     globs: Vec<String>,
     /// Negated patterns: what they match is never an output.
     negations: Vec<Pattern>,
+    /// `negations` as written, without their `!`.
+    negated_globs: Vec<String>,
     /// `patterns` and `negations`, each matched as one set.
     matched: PatternSet,
     negated: PatternSet,
@@ -495,12 +567,14 @@ impl Outputs {
         let mut compiled = Vec::new();
         let mut globs = Vec::new();
         let mut negations = Vec::new();
+        let mut negated_globs = Vec::new();
         let mut anchors = BTreeSet::new();
         let mut complete = BTreeSet::new();
         for pattern in patterns {
             if let Some(excluded) = pattern.strip_prefix('!') {
                 validate_pattern(excluded)?;
                 negations.push(Pattern::new(excluded, false)?);
+                negated_globs.push(excluded.to_owned());
                 continue;
             }
             validate_pattern(pattern)?;
@@ -521,6 +595,7 @@ impl Outputs {
             patterns: compiled,
             globs,
             negations,
+            negated_globs,
             anchors,
             complete,
             explicit: true,
@@ -552,6 +627,7 @@ impl Outputs {
                 .map(|pattern| (*pattern).to_owned())
                 .collect(),
             negations: Vec::new(),
+            negated_globs: Vec::new(),
             explicit: true,
         }
     }
@@ -562,6 +638,7 @@ impl Outputs {
         let mut patterns = Vec::new();
         let mut globs = Vec::new();
         let mut negations = Vec::new();
+        let mut negated_globs = Vec::new();
         let mut anchors = BTreeSet::new();
         let mut complete = BTreeSet::new();
         for output in resolved {
@@ -572,6 +649,7 @@ impl Outputs {
             validate_pattern(&pattern)?;
             if negated {
                 negations.push(Pattern::new(&pattern, false)?);
+                negated_globs.push(pattern);
                 continue;
             }
             let (anchor, glob) = crate::ignored::partition(&pattern);
@@ -604,6 +682,7 @@ impl Outputs {
             patterns,
             globs,
             negations,
+            negated_globs,
             anchors,
             complete,
             explicit,
@@ -625,6 +704,13 @@ impl Outputs {
     /// The patterns as written, without the negated ones.
     pub(crate) fn globs(&self) -> &[String] {
         &self.globs
+    }
+
+    /// What decides which paths [`Self::matches`] and [`Self::complete_roots`]
+    /// accept: the patterns and negated patterns as written, and whether the
+    /// target declares them. Two outputs with equal descriptions match alike.
+    pub(crate) fn describe(&self) -> (&[String], &[String], bool) {
+        (&self.globs, &self.negated_globs, self.explicit)
     }
 
     /// Fixed directory prefixes; every matching path lies below one of them.
@@ -712,18 +798,41 @@ impl Outputs {
             for anchor in self.complete_roots() {
                 let absolute = root.join(anchor);
                 match std::fs::symlink_metadata(&absolute) {
-                    Ok(_) => walks.push(walkdir::WalkDir::new(absolute).follow_links(false)),
+                    Ok(_) => walks.push(absolute),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => return Err(error.into()),
                 }
             }
-            if !symlink {
-                return Ok(Box::new(walks.into_iter().flatten().map(move |entry| {
+            if !symlink && walks.len() < 2 * ROOTS_PER_THREAD {
+                // Too few for a second thread: listed as they are walked,
+                // without holding the whole listing at once.
+                let walked = walks
+                    .into_iter()
+                    .flat_map(|walk| walkdir::WalkDir::new(walk).follow_links(false));
+                return Ok(Box::new(walked.map(move |entry| {
                     let entry = entry?;
                     let path = relative(root, entry.path())?;
                     validate_path(&path)?;
                     Ok((path, entry.metadata()?))
                 })));
+            }
+            if !symlink {
+                // Each root is walked whole, and many of them on several
+                // threads: what is listed, and its order, is each root's
+                // walk in turn either way.
+                let walked = crate::hash::in_parallel(&walks, ROOTS_PER_THREAD, |walk| {
+                    let entries = walkdir::WalkDir::new(walk).follow_links(false);
+                    Ok(entries
+                        .into_iter()
+                        .map(|entry| {
+                            let entry = entry?;
+                            let path = relative(root, entry.path())?;
+                            validate_path(&path)?;
+                            Ok((path, entry.metadata()?))
+                        })
+                        .collect::<Vec<Result<_>>>())
+                })?;
+                return Ok(Box::new(walked.into_iter().flatten()));
             }
         }
         let (paths, mut traversal) = self.listing(root, true)?;
@@ -1857,7 +1966,7 @@ mod tests {
 
     #[test]
     fn git_dirs_answer_as_git_does_for_each_and_ask_again_until_there_is_a_repository() {
-        use super::{git, git_dirs, git_path};
+        use super::{git, git_dirs, git_path, git_toplevel};
         let scratch = tempfile::tempdir().unwrap();
         // As the directory is named, not made canonical: every path compared
         // below is one Git answered, and Git on Windows cannot be given the
@@ -1867,6 +1976,7 @@ mod tests {
         std::fs::create_dir_all(main.join("apps/web")).unwrap();
         // Not a repository yet: asked again once it is.
         assert_eq!(git_dirs(&main), None);
+        assert_eq!(git_toplevel(&main), None);
         let run = |root: &std::path::Path, args: &[&str]| {
             let output = git(root, args).unwrap();
             assert!(output.status.success(), "git {args:?}: {output:?}");
@@ -1901,6 +2011,9 @@ mod tests {
                 git_path(&root, "--git-common-dir").unwrap(),
             );
             assert_eq!(git_dirs(&root), Some(separately.clone()), "{root:?}");
+            let toplevel = git_path(&root, "--show-toplevel");
+            assert!(toplevel.is_some());
+            assert_eq!(git_toplevel(&root), toplevel, "{root:?}");
             // Asked again, by another name for the same root.
             let other_name = root.join("../").join(root.file_name().unwrap());
             assert_eq!(git_dirs(&other_name), Some(separately), "{other_name:?}");
@@ -2047,10 +2160,10 @@ mod tests {
     fn parents_checked_once_remember_only_directories_they_found() {
         let workspace = tempfile::tempdir().unwrap();
         let root = workspace.path();
-        let known = std::sync::Mutex::default();
+        let known = std::sync::RwLock::default();
         std::fs::create_dir_all(root.join("a/b")).unwrap();
         super::safe_parents_once(root, "a/b/c/file", "warm", &known).unwrap();
-        let seen = known.lock().unwrap().clone();
+        let seen = known.read().unwrap().clone();
         assert_eq!(seen.len(), 2);
         assert!(seen.contains(&root.join("a")) && seen.contains(&root.join("a/b")));
 
@@ -2410,6 +2523,44 @@ mod tests {
                 results => panic!("different results for {patterns:?}: {results:?}"),
             }
         }
+    }
+
+    /// Many output roots are walked on several threads, and listed as they
+    /// are when walked one after another: each root's walk in turn.
+    #[test]
+    fn many_output_roots_are_listed_in_the_order_of_the_roots() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        let mut declared: Vec<String> = (0..40).rev().map(|n| format!("out/{n:02}")).collect();
+        for (n, directory) in declared.iter().enumerate() {
+            std::fs::create_dir_all(root.join(directory).join("nested")).unwrap();
+            std::fs::write(root.join(directory).join("nested/file"), "x").unwrap();
+            if n % 3 == 0 {
+                std::fs::write(root.join(directory).join("top"), "x").unwrap();
+            }
+        }
+        // One that is not there is passed over.
+        declared.insert(7, "out/absent".into());
+        let outputs = Outputs::from_paths(&declared).unwrap();
+        let roots = outputs.complete_roots();
+        assert!(roots.len() > 8 * super::ROOTS_PER_THREAD);
+        let mut expected = Vec::new();
+        for directory in roots
+            .iter()
+            .filter(|directory| root.join(directory).exists())
+        {
+            let walked = walkdir::WalkDir::new(root.join(directory)).follow_links(false);
+            for entry in walked {
+                expected.push(super::relative(root, entry.unwrap().path()).unwrap());
+            }
+        }
+        let listed: Vec<String> = outputs
+            .entries(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().0)
+            .collect();
+        assert_eq!(listed, expected);
+        assert_eq!(listed.len(), 40 * 3 + 14);
     }
 
     #[test]

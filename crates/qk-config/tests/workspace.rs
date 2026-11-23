@@ -1517,3 +1517,124 @@ fn an_extended_file_another_revision_cannot_read_fails_the_load() {
         "{error:#}"
     );
 }
+
+/// A workspace of `count` projects, `libs/p000` onwards, enough to be read
+/// on several threads.
+fn many_projects(count: usize) -> TempDir {
+    let temp = TempDir::new().unwrap();
+    write(temp.path(), "nx.json", "{}");
+    for index in 0..count {
+        write(
+            temp.path(),
+            &format!("libs/p{index:03}/project.json"),
+            &format!(
+                r#"{{"name":"p{index:03}","targets":{{"build":{{"command":"echo {index}"}}}}}}"#
+            ),
+        );
+    }
+    temp
+}
+
+/// Loads the workspace with the first project's files read last: they take
+/// longer than every other project's, as a slow disk or a busy thread can
+/// make them.
+fn load_first_last(root: &Path) -> anyhow::Result<Workspace> {
+    let read = |path: &Path| -> anyhow::Result<Option<String>> {
+        if path.parent().and_then(Path::file_name) == Some("p000".as_ref()) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        match std::fs::read_to_string(path) {
+            Ok(text) => Ok(Some(text)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    };
+    Workspace::load_with(root, &read)
+}
+
+#[test]
+fn loads_many_projects_whichever_finishes_first() {
+    let temp = many_projects(200);
+    let workspace = load_first_last(temp.path()).unwrap();
+    let names: Vec<String> = (0..200).map(|index| format!("p{index:03}")).collect();
+    assert_eq!(
+        workspace.projects.keys().cloned().collect::<Vec<_>>(),
+        names
+    );
+    assert_eq!(
+        workspace.projects["p000"].targets["build"].options["command"],
+        json!("echo 0")
+    );
+    assert_eq!(workspace.configuration_directories["p199"], "libs/p199");
+}
+
+#[test]
+fn reports_the_first_directory_error_whichever_finishes_first() {
+    let temp = many_projects(200);
+    write(temp.path(), "libs/p000/project.json", "{broken}");
+    write(temp.path(), "libs/p199/project.json", "{broken}");
+    let error = format!("{:#}", load_first_last(temp.path()).unwrap_err());
+    assert!(error.contains("p000"), "{error}");
+}
+
+#[test]
+fn reports_duplicates_in_directory_order_whichever_finishes_first() {
+    let temp = many_projects(200);
+    write(temp.path(), "libs/p000/project.json", r#"{"name":"same"}"#);
+    write(temp.path(), "libs/p150/project.json", r#"{"name":"same"}"#);
+    // A later error is not reached: the duplicate comes first.
+    write(temp.path(), "libs/p199/project.json", "{broken}");
+    let error = format!("{:#}", load_first_last(temp.path()).unwrap_err());
+    assert!(
+        error.contains("duplicate project name") && error.contains("libs/p000 and libs/p150"),
+        "{error}"
+    );
+}
+
+#[test]
+fn reports_a_clash_before_the_package_of_a_given_root() {
+    let temp = many_projects(200);
+    // p000 gives p001's root, whose package.json is invalid: the clash of
+    // roots is found when p001 is taken, after p000's package was read.
+    write(
+        temp.path(),
+        "libs/p000/project.json",
+        r#"{"name":"moved","root":"libs/p001"}"#,
+    );
+    write(temp.path(), "libs/p001/package.json", r#"{"name":5}"#);
+    let error = format!("{:#}", load_first_last(temp.path()).unwrap_err());
+    // The file is named as the system joins paths.
+    let named = Path::new("libs/p001").join("package.json");
+    assert!(error.contains(named.to_str().unwrap()), "{error}");
+    // Without the invalid package, the clash itself is reported.
+    write(temp.path(), "libs/p001/package.json", r#"{"name":"p001"}"#);
+    let error = format!("{:#}", load_first_last(temp.path()).unwrap_err());
+    assert!(error.contains("both have root"), "{error}");
+}
+
+#[test]
+fn a_package_json_the_walk_ignores_is_not_in_the_workspaces() {
+    // The project is read while the walk goes on, as if its package.json
+    // were in the workspaces, and read again once the walk finds it ignored.
+    let temp = many_projects(100);
+    write(
+        temp.path(),
+        "package.json",
+        r#"{"name":"root","workspaces":["libs/*"]}"#,
+    );
+    write(temp.path(), "libs/p050/.gitignore", "package.json\n");
+    for index in [49, 50] {
+        write(
+            temp.path(),
+            &format!("libs/p{index:03}/package.json"),
+            &format!(r#"{{"name":"p{index:03}","scripts":{{"test":"true"}}}}"#),
+        );
+    }
+    let workspace = Workspace::load(temp.path()).unwrap();
+    let in_workspaces = |name: &str| {
+        workspace.projects[name].extra["metadata"]["js"]["isInPackageManagerWorkspaces"].clone()
+    };
+    assert_eq!(in_workspaces("p049"), json!(true));
+    assert_eq!(in_workspaces("p050"), json!(false));
+    assert!(workspace.projects["p050"].targets.contains_key("test"));
+}

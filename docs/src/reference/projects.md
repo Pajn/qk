@@ -37,6 +37,16 @@ hidden directories remain discoverable. Unlike Nx, qk does not read the
 machine's global Git excludes, or `.gitignore` files above a workspace that is
 not in a Git repository.
 
+Walking every directory of a large workspace takes a noticeable part of a
+command. qk remembers, in the worktree's state, which directories the last
+walk found holding a `project.json` or `package.json`, with the stamps of the
+directories and ignore files that decided it, and takes them from there while
+the stamps show that nothing changed. Anything changed, or written too
+recently for its stamp to tell, makes qk walk again. Which of those
+package.json files the workspaces take in, and each project's configuration,
+are read anew every time, so the workspace is the same as a walk gives.
+`qk reset` removes the record with the rest of the worktree's state.
+
 ## Configuration precedence
 
 Package scripts become `nx:run-script` targets, except a script that an

@@ -1682,7 +1682,7 @@ impl Cache {
         // A deep tree shares its ancestors between thousands of paths, so each
         // is looked at once. One seen as a directory stays one: a link is laid
         // out before any path below it, and is not laid over a directory.
-        let checked = Mutex::default();
+        let checked = std::sync::RwLock::default();
         for (path, artifact) in &group.artifacts {
             paths::safe_parents_once(&location.base, path, "cache artifact", &checked)?;
             if !location.matches(path) {

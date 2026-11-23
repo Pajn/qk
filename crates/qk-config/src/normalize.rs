@@ -245,10 +245,9 @@ pub(crate) fn project(
         },
     };
     value.insert("root".into(), Value::String(root));
-    let mut named_inputs = serde_json::to_value(&config.named_inputs)?
-        .as_object()
-        .cloned()
-        .expect("named inputs serialize as an object");
+    let Value::Object(mut named_inputs) = serde_json::to_value(&config.named_inputs)? else {
+        unreachable!("named inputs serialize as an object");
+    };
     if let Some(local) = value.shift_remove("namedInputs") {
         named_inputs.extend(object(local, "namedInputs")?);
     }
@@ -487,7 +486,11 @@ fn synthetic_default(
     root: &str,
 ) -> Result<Option<Map<String, Value>>> {
     let authored_executor = entry.contains_key("executor");
-    let mut synthetic = merge::desugar(&entry, root)?.into_owned();
+    let mut synthetic = match merge::desugar(&entry, root)? {
+        std::borrow::Cow::Owned(desugared) => desugared,
+        // Nothing to expand: the entry is ours already.
+        std::borrow::Cow::Borrowed(_) => entry,
+    };
     let executor = target.get("executor");
     let mut shape = Map::new();
     if let Some(executor) = executor {
@@ -777,14 +780,17 @@ fn target_default(
     keys.extend(globs);
     for key in keys {
         let entries = match &defaults[key] {
-            Value::Array(entries) => entries.clone(),
-            entry => vec![entry.clone()],
+            Value::Array(entries) => entries.as_slice(),
+            entry => std::slice::from_ref(entry),
         };
+        // Only the entries that apply are copied: they are a project's own
+        // from here on, and most entries of a long array apply to few.
         let mut matched = Vec::new();
-        for (index, entry) in entries.into_iter().enumerate() {
-            let mut entry = object(entry, "target default")?;
-            let filter = entry.shift_remove("filter");
-            if filter_matches(filter.as_ref(), executor, context)? {
+        for (index, entry) in entries.iter().enumerate() {
+            let entry = object_ref(entry, "target default")?;
+            if filter_matches(entry.get("filter"), executor, context)? {
+                let mut entry = entry.clone();
+                entry.shift_remove("filter");
                 matched.push((index, entry));
             }
         }

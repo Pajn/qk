@@ -475,7 +475,7 @@ impl Cache {
         let remembered = Published::load(root, outputs, boot.as_deref());
         // Nothing writes the outputs while they are gathered, so each
         // directory is checked not to be a link once, not once per file in it.
-        let directories = std::sync::Mutex::new(foldhash::HashSet::default());
+        let directories = std::sync::RwLock::new(foldhash::HashSet::default());
         let mut artifacts = BTreeMap::new();
         let mut pending = Vec::new();
         for entry in outputs.entries(root)? {

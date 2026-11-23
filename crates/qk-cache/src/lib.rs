@@ -15,7 +15,7 @@ mod record;
 pub mod recorded;
 mod remote;
 pub mod scratch;
-mod settle;
+use qk_state::settle;
 mod store;
 pub mod ultracache;
 mod verified;
@@ -35,8 +35,8 @@ use serde_json::Value;
 pub use evict::{Pruned, max_size, parse_size, prune, prune_automatic};
 pub use glob::Pattern;
 pub use hash::{
-    DependencyGlob, Selects, SourceIgnore, dependency_globs, keyed_definition, source_files,
-    task_configuration,
+    DependencyGlob, Selects, SourceIgnore, await_lockfile, dependency_globs, keyed_definition,
+    prefetch_lockfile, source_files, task_configuration,
 };
 pub use inputs::{
     InputChange, InputChanges, JsonFields, ROOT_TSCONFIG_FILES, Resolution, Resolved, TsConfig,
@@ -48,7 +48,7 @@ pub use paths::expand as expand_project_path;
 pub use paths::git as workspace_git;
 pub use paths::{
     Outputs, await_git_dirs, cache_directory, cache_location, clear_worktree_state,
-    prefetch_git_dirs, resolved_outputs, worktree_state,
+    prefetch_git_dirs, projects_record, resolved_outputs, worktree_state,
 };
 
 /// The nx.json settings of the workspace's remote store: its `s3`, as Nx's

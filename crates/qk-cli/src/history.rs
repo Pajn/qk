@@ -55,13 +55,24 @@ fn millis(time: SystemTime) -> u64 {
         .map_or(0, |duration| duration.as_millis() as u64)
 }
 
-/// Records a finished run and writes its report where asked. Failures are
-/// reported without failing the run.
+/// The commit checked out at the workspace, when Git names one.
+pub fn revision(root: &Path) -> Option<String> {
+    qk_cache::workspace_git(root, &["rev-parse", "HEAD"])
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|sha| sha.trim().to_owned())
+}
+
+/// Records a finished run with `sha`, the commit Git named when asked on a
+/// thread started just before the run's tasks, and writes its report where
+/// asked. Failures are reported without failing the run.
 pub fn record(
     workspace: &Workspace,
     graph: &TaskGraph,
     result: &RunResult,
     started: SystemTime,
+    sha: Option<String>,
     report: Option<&Path>,
 ) -> RunReport {
     let mut inputs = BTreeMap::new();
@@ -126,11 +137,7 @@ pub fn record(
         id: format!("{started}-{}", std::process::id()),
         command: std::env::args().collect(),
         worktree: Some(worktree(workspace)),
-        sha: qk_cache::workspace_git(&workspace.root, &["rev-parse", "HEAD"])
-            .ok()
-            .filter(|output| output.status.success())
-            .and_then(|output| String::from_utf8(output.stdout).ok())
-            .map(|sha| sha.trim().to_owned()),
+        sha,
         started,
         ended: millis(SystemTime::now()),
         exit_code: result.exit_code,
