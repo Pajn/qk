@@ -7135,6 +7135,83 @@ mod tests {
         assert!(!untouched.vouches(&[(root.join(".nxignore"), Some(String::new()))]));
     }
 
+    /// A link to a file, or to a directory, where the system has them.
+    fn link(target: &Path, link: &Path, directory: bool) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            let _ = directory;
+            std::os::unix::fs::symlink(target, link)
+        }
+        #[cfg(windows)]
+        {
+            if directory {
+                std::os::windows::fs::symlink_dir(target, link)
+            } else {
+                std::os::windows::fs::symlink_file(target, link)
+            }
+        }
+    }
+
+    /// An ignore file read through a link, by way of a linked directory
+    /// outside the workspace: an inventory stamping it is handed on only
+    /// where a stamp would show that link moved aside and put back, which
+    /// takes a change time. With the link swapped for another and put back
+    /// while it is listed, the inventory is not handed on anywhere.
+    #[test]
+    fn an_inventory_stamped_through_a_link_is_exact_only_where_stamps_show_it_put_back() {
+        let (_root, workspace, graph) = saved_listing_fixture(true);
+        let root = &workspace.root;
+        let outside = tempfile::tempdir().unwrap();
+        let outside = outside.path().canonicalize().unwrap();
+        for (directory, rules) in [("one", "skip.log\n"), ("two", "a.txt\n")] {
+            std::fs::create_dir(outside.join(directory)).unwrap();
+            std::fs::write(outside.join(directory).join("rules"), rules).unwrap();
+        }
+        let via = outside.join("via");
+        let policy = root.join("packages/app/.gitignore");
+        // Not everyone may make a link everywhere: then there is nothing
+        // to tell.
+        if link(&outside.join("one"), &via, true).is_err()
+            || link(&via.join("rules"), &policy, false).is_err()
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(2100));
+        let snapshot = snapshot(&workspace, &graph, false);
+        let take = |between: &dyn Fn()| {
+            let mut membership = Membership::new(
+                root,
+                &BTreeSet::new(),
+                &snapshot.built_ignore,
+                &snapshot.source_exclusions,
+                snapshot.cache_relative.as_deref(),
+                None,
+                snapshot.scope.as_ref(),
+            )
+            .unwrap();
+            between();
+            membership.list(&snapshot.extra_candidates, true).unwrap();
+            membership
+        };
+        let untouched = take(&|| {});
+        let stamp = untouched.stamps[&policy].as_ref().unwrap();
+        assert!(stamp.through_link());
+        assert!(untouched.settled);
+        assert_eq!(untouched.exact, cfg!(unix));
+
+        let aside = outside.join("aside");
+        let swapped = take(&|| {
+            std::fs::rename(&via, &aside).unwrap();
+            link(&outside.join("two"), &via, true).unwrap();
+            // A linked directory is removed as a directory where it is one.
+            std::fs::remove_file(&via)
+                .or_else(|_| std::fs::remove_dir(&via))
+                .unwrap();
+            std::fs::rename(&aside, &via).unwrap();
+        });
+        assert!(!swapped.exact);
+    }
+
     /// A workspace with both of the root's ignore files has its listing
     /// saved and taken: the rules of each are among those captured.
     #[test]
