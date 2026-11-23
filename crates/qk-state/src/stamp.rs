@@ -43,6 +43,12 @@ impl Stamp {
         Self(values)
     }
 
+    /// Whether [`look`] took this stamp of a symlink, so that it holds the
+    /// stamps of what the link leads through and to after the link's own.
+    pub fn through_link(&self) -> bool {
+        self.0.len() > WIDTH
+    }
+
     /// Whether a stamp [`look`] took, with the stamps of what a symlink
     /// leads through and to after its own, was older than `window` at
     /// `looked`: see [`Self::settled`].
@@ -220,6 +226,8 @@ mod tests {
         let (before, _) = look(&at("first")).unwrap().unwrap();
         // The link's own stamp, the middle link's and the file's.
         assert_eq!(before.0.len(), 3 * WIDTH);
+        assert!(before.through_link());
+        assert!(!look(&at("one")).unwrap().unwrap().0.through_link());
         assert_eq!(before, look(&at("first")).unwrap().unwrap().0);
 
         std::fs::remove_file(at("middle")).unwrap();
@@ -266,6 +274,17 @@ mod tests {
         assert_eq!(back.0[..WIDTH], before.0[..WIDTH]);
         assert_eq!(back.0[2 * WIDTH..], before.0[2 * WIDTH..]);
         assert_ne!(back, before);
+
+        // The same link moved aside and put back, with another in its place
+        // meanwhile, keeps everything but its change time, which a stamp
+        // holds on Unix.
+        std::fs::rename(at("via"), at("aside")).unwrap();
+        symlink("new", at("via")).unwrap();
+        std::fs::remove_file(at("via")).unwrap();
+        std::fs::rename(at("aside"), at("via")).unwrap();
+        let (returned, _) = look(&at("first")).unwrap().unwrap();
+        assert_ne!(returned, back);
+        let back = returned;
 
         // `..` is taken from where the links before it led, and an absolute
         // target from the top.

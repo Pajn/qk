@@ -151,7 +151,9 @@ struct Membership {
     /// matcher was built from are those it captured. A file removed and put
     /// back while the listing was taken leaves the names as captured and the
     /// listing without it; a run keeps such a listing for itself, as it
-    /// would take the same one again, but does not hand it on.
+    /// would take the same one again, but does not hand it on. Where stamps
+    /// hold no change time, neither is one that stamps anything through a
+    /// link.
     exact: bool,
     /// When the refresh that produced this inventory began listing.
     listed: Option<Instant>,
@@ -829,7 +831,13 @@ impl Membership {
         self.settled = rebuilt
             && self.covers(&self.files)
             && self.state_noting(None, self.stamped, &reread)?.1;
-        self.exact = self.settled && !reread.load(Ordering::Relaxed) && self.vouches(&read);
+        // A stamp holds a change time on Unix alone. Without one, a link
+        // moved aside while the listing was taken and put back afterwards
+        // has the stamp it had, so what was read through a link cannot be
+        // shown to be what was stamped, and such an inventory is not exact.
+        let through_link = !cfg!(unix) && self.stamps.values().flatten().any(Stamp::through_link);
+        self.exact =
+            self.settled && !reread.load(Ordering::Relaxed) && !through_link && self.vouches(&read);
         Ok(())
     }
 
